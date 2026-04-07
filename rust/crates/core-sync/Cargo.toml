@@ -1,0 +1,9 @@
+[package]
+name = "core-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+core-types = { path = "../core-types" }
+

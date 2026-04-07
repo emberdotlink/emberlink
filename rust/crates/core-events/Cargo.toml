@@ -1,0 +1,10 @@
+[package]
+name = "core-events"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+core-crypto = { path = "../core-crypto" }
+core-types = { path = "../core-types" }
+
