@@ -1,16 +1,18 @@
 [workspace]
 members = [
-    "rust/crates/core-types",
-    "rust/crates/core-crypto",
-    "rust/crates/core-events",
-    "rust/crates/core-state",
-    "rust/crates/core-identity",
-    "rust/crates/core-personas",
-    "rust/crates/core-policy",
-    "rust/crates/core-trust",
-    "rust/crates/core-recovery",
-    "rust/crates/core-sync",
-    "rust/crates/core-storage",
+    "crates/emberlink-cli",
+    "crates/emberlink-relay",
+    "crates/core-types",
+    "crates/core-crypto",
+    "crates/core-events",
+    "crates/core-state",
+    "crates/core-identity",
+    "crates/core-personas",
+    "crates/core-policy",
+    "crates/core-trust",
+    "crates/core-recovery",
+    "crates/core-sync",
+    "crates/core-storage",
 ]
 resolver = "2"
 
@@ -18,4 +20,3 @@ resolver = "2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 version = "0.1.0"
-

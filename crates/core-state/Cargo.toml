@@ -1,0 +1,20 @@
+[package]
+name = "core-state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+core-crypto = { path = "../core-crypto" }
+core-events = { path = "../core-events" }
+core-storage = { path = "../core-storage" }
+core-trust = { path = "../core-trust" }
+core-types = { path = "../core-types" }
+base64 = "0.22"
+ciborium = "0.2"
+csv = "1"
+ed25519-dalek = "2.1.1"
+rusqlite = "0.31"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"

@@ -1,0 +1,23 @@
+[package]
+name = "emberlink-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+core-crypto = { path = "../core-crypto" }
+core-events = { path = "../core-events" }
+core-identity = { path = "../core-identity" }
+core-personas = { path = "../core-personas" }
+core-policy = { path = "../core-policy" }
+core-recovery = { path = "../core-recovery" }
+core-sync = { path = "../core-sync" }
+core-state = { path = "../core-state" }
+core-storage = { path = "../core-storage" }
+core-trust = { path = "../core-trust" }
+core-types = { path = "../core-types" }
+base64 = "0.22"
+keyring = "3"
+serde_json = "1"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+webpki-roots = "0.26"
