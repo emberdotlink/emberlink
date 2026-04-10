@@ -1,0 +1,664 @@
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use core_crypto::Verifier;
+use core_events::{EventEnvelope, EventRef};
+use core_types::{
+    EventBody, EventRefRelation, EventSubject, EventType, FileManifest, KeyRole, PeerCursor,
+    SchemaVersion, SignerBinding, SubjectKind, Validate, ValidationError,
+};
+
+use crate::materialize::{apply_event, apply_storage_event};
+use crate::{AllowAllAuthorizer, Authorizer, EventLog, MaterializedState, SyncBatchRecord};
+
+/// In-memory event log implementation for WASM and testing.
+///
+/// All data is held in memory with no persistence layer. Suitable for
+/// browser extension runtimes (`wasm32-unknown-unknown`) and unit tests
+/// that don't need SQLite.
+#[derive(Debug)]
+pub struct MemoryEventLog {
+    events: Vec<EventEnvelope>,
+    event_index: HashMap<String, usize>,
+    type_index: HashMap<EventType, Vec<usize>>,
+    materialized: MaterializedState,
+    storage_manifests: BTreeMap<String, FileManifest>,
+    peer_cursors: HashMap<String, Option<String>>,
+    sync_batches: Vec<SyncBatchRecord>,
+}
+
+impl Default for MemoryEventLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MemoryEventLog {
+    pub fn new() -> Self {
+        Self {
+            events: Vec::new(),
+            event_index: HashMap::new(),
+            type_index: HashMap::new(),
+            materialized: MaterializedState::default(),
+            storage_manifests: BTreeMap::new(),
+            peer_cursors: HashMap::new(),
+            sync_batches: Vec::new(),
+        }
+    }
+
+    /// Access storage manifests (file manifests published via events).
+    pub fn storage_manifests(&self) -> &BTreeMap<String, FileManifest> {
+        &self.storage_manifests
+    }
+
+    fn append_validated(&mut self, event: EventEnvelope) -> Result<(), ValidationError> {
+        apply_event(&mut self.materialized, &event)?;
+        apply_storage_event(&mut self.storage_manifests, &event, &self.materialized)?;
+
+        let idx = self.events.len();
+        self.event_index.insert(event.event_id.clone(), idx);
+        self.type_index
+            .entry(event.event_type)
+            .or_default()
+            .push(idx);
+        self.events.push(event);
+        Ok(())
+    }
+
+    fn rebuild_indices(&mut self) {
+        self.event_index = self
+            .events
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.event_id.clone(), i))
+            .collect();
+        self.type_index.clear();
+        for (i, e) in self.events.iter().enumerate() {
+            self.type_index.entry(e.event_type).or_default().push(i);
+        }
+    }
+}
+
+impl EventLog for MemoryEventLog {
+    fn append(
+        &mut self,
+        event: EventEnvelope,
+        verifier: &dyn Verifier,
+    ) -> Result<(), ValidationError> {
+        self.append_with_authorizer(event, verifier, &AllowAllAuthorizer, 0)
+    }
+
+    fn append_with_authorizer(
+        &mut self,
+        event: EventEnvelope,
+        verifier: &dyn Verifier,
+        authorizer: &dyn Authorizer,
+        now_epoch_secs: u64,
+    ) -> Result<(), ValidationError> {
+        event.validate()?;
+        if !verifier.verify(&event.signer, &event.signed_bytes(), &event.signature) {
+            return Err(ValidationError::new("signature verification failed"));
+        }
+        authorizer.authorize(&event, &self.materialized, now_epoch_secs)?;
+        self.append_validated(event)
+    }
+
+    fn rebuild(&mut self) -> Result<(), ValidationError> {
+        let events = std::mem::take(&mut self.events);
+        self.materialized = MaterializedState::default();
+        self.storage_manifests.clear();
+
+        for event in &events {
+            apply_event(&mut self.materialized, event)?;
+            apply_storage_event(&mut self.storage_manifests, event, &self.materialized)?;
+        }
+
+        self.events = events;
+        self.rebuild_indices();
+        Ok(())
+    }
+
+    fn materialized(&self) -> &MaterializedState {
+        &self.materialized
+    }
+
+    fn events(&self) -> &[EventEnvelope] {
+        &self.events
+    }
+
+    fn event_count(&self) -> usize {
+        self.events.len()
+    }
+
+    fn has_event(&self, event_id: &str) -> bool {
+        self.event_index.contains_key(event_id)
+    }
+
+    fn current_event_type_for(&self, event_id: &str) -> Option<EventType> {
+        self.event_index
+            .get(event_id)
+            .map(|&idx| self.events[idx].event_type)
+    }
+
+    fn event_ids(&self) -> Vec<String> {
+        self.events
+            .iter()
+            .map(|event| event.event_id.clone())
+            .collect()
+    }
+
+    fn event_id_set(&self) -> &HashMap<String, usize> {
+        &self.event_index
+    }
+
+    fn events_by_ids(&self, event_ids: &[String]) -> Vec<EventEnvelope> {
+        event_ids
+            .iter()
+            .filter_map(|event_id| {
+                self.event_index
+                    .get(event_id.as_str())
+                    .map(|&idx| self.events[idx].clone())
+            })
+            .collect()
+    }
+
+    fn events_of_type(&self, event_type: EventType) -> Vec<EventEnvelope> {
+        self.type_index
+            .get(&event_type)
+            .map(|indices| indices.iter().map(|&idx| self.events[idx].clone()).collect())
+            .unwrap_or_default()
+    }
+
+    fn events_of_type_rev(&self, event_type: EventType) -> Vec<EventEnvelope> {
+        self.type_index
+            .get(&event_type)
+            .map(|indices| {
+                indices
+                    .iter()
+                    .rev()
+                    .map(|&idx| self.events[idx].clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn export_events(&self) -> String {
+        let mut lines = Vec::new();
+        for event in &self.events {
+            let refs_str = event
+                .refs
+                .iter()
+                .map(|r| format!("{}:{}", r.relation.as_str(), r.target_event_id))
+                .collect::<Vec<_>>()
+                .join(",");
+            let payload_hex = core_types::bytes_to_hex(&event.payload);
+            let signature_str = &event.signature.0;
+            lines.push(format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                event.event_id,
+                event.schema_version,
+                event.event_type.as_str(),
+                event.subject.kind.as_str(),
+                event.subject.subject_id,
+                event.signer_binding.signer.kind.as_str(),
+                event.signer_binding.signer.subject_id,
+                event.signer_binding.role.as_str(),
+                event.signer_binding.key_id,
+                event.signer.0,
+                payload_hex,
+                signature_str,
+                refs_str,
+            ));
+        }
+        lines.join("\n")
+    }
+
+    fn import_events(
+        &mut self,
+        data: &str,
+        verifier: &dyn Verifier,
+        authorizer: &dyn Authorizer,
+        now_epoch_secs: u64,
+    ) -> Result<usize, ValidationError> {
+        use core_crypto::{PublicKey, Signature};
+
+        let mut imported = 0;
+        for line in data.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let fields: Vec<&str> = line.split('\t').collect();
+            if fields.len() < 12 {
+                return Err(ValidationError::new(format!(
+                    "import line has {} fields, expected at least 12",
+                    fields.len()
+                )));
+            }
+
+            let event_id = fields[0];
+            if self.events.iter().any(|e| e.event_id == event_id) {
+                continue;
+            }
+
+            let schema_version = SchemaVersion::parse(fields[1]).ok_or_else(|| {
+                ValidationError::new(format!("invalid schema version: {}", fields[1]))
+            })?;
+            let event_type = EventType::parse(fields[2]).ok_or_else(|| {
+                ValidationError::new(format!("unknown event type: {}", fields[2]))
+            })?;
+            let subject_kind = SubjectKind::parse(fields[3]).ok_or_else(|| {
+                ValidationError::new(format!("unknown subject kind: {}", fields[3]))
+            })?;
+            let subject = EventSubject::new(subject_kind, fields[4]);
+            let signer_kind = SubjectKind::parse(fields[5]).ok_or_else(|| {
+                ValidationError::new(format!("unknown signer kind: {}", fields[5]))
+            })?;
+            let signer_binding = SignerBinding {
+                signer: EventSubject::new(signer_kind, fields[6]),
+                role: KeyRole::parse(fields[7]).ok_or_else(|| {
+                    ValidationError::new(format!("unknown key role: {}", fields[7]))
+                })?,
+                key_id: fields[8].to_string(),
+            };
+            let signer_public_key = PublicKey(fields[9].to_string());
+            let payload = core_types::hex_to_bytes(fields[10])
+                .map_err(|err| ValidationError::new(format!("invalid payload hex: {err}")))?;
+            let signature = Signature(fields[11].to_string());
+
+            let refs_str = if fields.len() > 12 { fields[12] } else { "" };
+            let refs = if refs_str.is_empty() {
+                Vec::new()
+            } else {
+                refs_str
+                    .split(',')
+                    .map(|r| {
+                        let parts: Vec<&str> = r.splitn(2, ':').collect();
+                        if parts.len() != 2 {
+                            return Err(ValidationError::new(format!("invalid ref: {r}")));
+                        }
+                        let relation = EventRefRelation::parse(parts[0]).ok_or_else(|| {
+                            ValidationError::new(format!("unknown ref relation: {}", parts[0]))
+                        })?;
+                        Ok(EventRef {
+                            relation,
+                            target_event_id: parts[1].to_string(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+
+            let body = EventBody::decode_canonical(&payload)?;
+
+            let envelope = EventEnvelope {
+                schema_version,
+                event_id: event_id.to_string(),
+                event_type,
+                subject,
+                signer_binding,
+                signer: signer_public_key,
+                payload,
+                refs,
+                signature,
+                body,
+            };
+
+            self.append_with_authorizer(envelope, verifier, authorizer, now_epoch_secs)?;
+            imported += 1;
+        }
+        Ok(imported)
+    }
+
+    fn peer_cursor(&self, peer_id: &str) -> Result<PeerCursor, ValidationError> {
+        Ok(PeerCursor {
+            peer_id: peer_id.to_string(),
+            last_event_id: self
+                .peer_cursors
+                .get(peer_id)
+                .cloned()
+                .unwrap_or(None),
+        })
+    }
+
+    fn peer_cursors(&self) -> Result<Vec<PeerCursor>, ValidationError> {
+        let mut cursors: Vec<PeerCursor> = self
+            .peer_cursors
+            .iter()
+            .map(|(peer_id, last_event_id)| PeerCursor {
+                peer_id: peer_id.clone(),
+                last_event_id: last_event_id.clone(),
+            })
+            .collect();
+        cursors.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
+        Ok(cursors)
+    }
+
+    fn sync_batches(&self) -> Result<Vec<SyncBatchRecord>, ValidationError> {
+        Ok(self.sync_batches.clone())
+    }
+
+    fn import_sync_batch(
+        &mut self,
+        peer_id: &str,
+        batch_id: &str,
+        events: &[EventEnvelope],
+        last_remote_event_id: Option<&str>,
+        verifier: &dyn Verifier,
+        authorizer: &dyn Authorizer,
+        now_epoch_secs: u64,
+    ) -> Result<usize, ValidationError> {
+        let seen_ids: BTreeSet<&str> = self.event_index.keys().map(|k| k.as_str()).collect();
+        let mut imported = Vec::new();
+
+        // Snapshot state for rollback on error
+        let snapshot_materialized = self.materialized.clone();
+        let snapshot_manifests = self.storage_manifests.clone();
+
+        for event in events {
+            event.validate()?;
+            if !verifier.verify(&event.signer, &event.signed_bytes(), &event.signature) {
+                self.materialized = snapshot_materialized;
+                self.storage_manifests = snapshot_manifests;
+                return Err(ValidationError::new("signature verification failed"));
+            }
+            if seen_ids.contains(event.event_id.as_str())
+                || imported.iter().any(|e: &EventEnvelope| e.event_id == event.event_id)
+            {
+                continue;
+            }
+            if let Err(err) = authorizer.authorize(event, &self.materialized, now_epoch_secs) {
+                self.materialized = snapshot_materialized;
+                self.storage_manifests = snapshot_manifests;
+                return Err(err);
+            }
+            if let Err(err) = apply_event(&mut self.materialized, event) {
+                self.materialized = snapshot_materialized;
+                self.storage_manifests = snapshot_manifests;
+                return Err(err);
+            }
+            if let Err(err) =
+                apply_storage_event(&mut self.storage_manifests, event, &self.materialized)
+            {
+                self.materialized = snapshot_materialized;
+                self.storage_manifests = snapshot_manifests;
+                return Err(err);
+            }
+            imported.push(event.clone());
+        }
+
+        // Record sync metadata
+        self.sync_batches.push(SyncBatchRecord {
+            batch_id: batch_id.to_string(),
+            peer_id: peer_id.to_string(),
+            last_event_id: last_remote_event_id.map(|s| s.to_string()),
+        });
+        if let Some(last_id) = last_remote_event_id {
+            self.peer_cursors
+                .insert(peer_id.to_string(), Some(last_id.to_string()));
+        }
+
+        let imported_count = imported.len();
+        let base = self.events.len();
+        for (offset, event) in imported.iter().enumerate() {
+            let idx = base + offset;
+            self.event_index.insert(event.event_id.clone(), idx);
+            self.type_index
+                .entry(event.event_type)
+                .or_default()
+                .push(idx);
+        }
+        self.events.extend(imported);
+        Ok(imported_count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core_crypto::{FixtureSigner, FixtureVerifier};
+    use core_events::EventEnvelope;
+    use core_types::{
+        DeviceAddedEvent, EventBody, KeyAlgorithm, PersonaCreatedEvent, PublicKeyMaterial,
+        RootCreatedEvent, SignerBinding, SurvivalMode,
+    };
+
+    use super::*;
+
+    fn test_key(key_id: &str) -> PublicKeyMaterial {
+        PublicKeyMaterial {
+            key_id: key_id.into(),
+            algorithm: KeyAlgorithm::Ed25519,
+            public_key: format!("ed25519:{key_id}"),
+        }
+    }
+
+    fn test_encryption_key(key_id: &str) -> PublicKeyMaterial {
+        PublicKeyMaterial {
+            key_id: format!("enc-{key_id}"),
+            algorithm: KeyAlgorithm::AgeX25519,
+            public_key: format!("age1{key_id}fixture"),
+        }
+    }
+
+    fn append_typed(
+        log: &mut MemoryEventLog,
+        event_id: &str,
+        body: EventBody,
+        signer_binding: SignerBinding,
+    ) {
+        let signer = FixtureSigner::new(signer_binding.key_id.clone());
+        let event =
+            EventEnvelope::from_body(event_id, body, Vec::new(), signer_binding, &signer).unwrap();
+        log.append(event, &FixtureVerifier).unwrap();
+    }
+
+    fn setup_identity(log: &mut MemoryEventLog) -> (String, String, String) {
+        append_typed(
+            log,
+            "evt-root-1",
+            EventBody::RootCreated(RootCreatedEvent {
+                root_id: "root-a".into(),
+                display_name: "Primary".into(),
+                initial_key: test_key("key-root-a"),
+            }),
+            SignerBinding::root("root-a", "key-root-a"),
+        );
+
+        append_typed(
+            log,
+            "evt-device-1",
+            EventBody::DeviceAdded(DeviceAddedEvent {
+                root_id: "root-a".into(),
+                device_id: "device-a".into(),
+                label: "Laptop".into(),
+                initial_key: test_key("key-device-a"),
+                initial_encryption_key: test_encryption_key("device-a"),
+            }),
+            SignerBinding::root("root-a", "key-root-a"),
+        );
+
+        append_typed(
+            log,
+            "evt-persona-1",
+            EventBody::PersonaCreated(PersonaCreatedEvent {
+                root_id: "root-a".into(),
+                persona_id: "persona-a".into(),
+                label: "Work".into(),
+                disclosure_profile: None,
+                survival_mode: SurvivalMode::Strict,
+                initial_key: test_key("key-persona-a"),
+            }),
+            SignerBinding::root("root-a", "key-root-a"),
+        );
+
+        (
+            "root-a".to_string(),
+            "device-a".to_string(),
+            "persona-a".to_string(),
+        )
+    }
+
+    #[test]
+    fn new_log_is_empty() {
+        let log = MemoryEventLog::new();
+        assert_eq!(log.event_count(), 0);
+        assert!(log.events().is_empty());
+        assert!(log.materialized().roots_current.is_empty());
+    }
+
+    #[test]
+    fn append_and_query_events() {
+        let mut log = MemoryEventLog::new();
+        let (root_id, device_id, persona_id) = setup_identity(&mut log);
+
+        assert_eq!(log.event_count(), 3);
+        assert!(log.has_event(&log.events()[0].event_id));
+        assert!(log.materialized().roots_current.contains_key(&root_id));
+        assert!(log.materialized().devices_current.contains_key(&device_id));
+        assert!(
+            log.materialized()
+                .personas_current
+                .contains_key(&persona_id)
+        );
+    }
+
+    #[test]
+    fn events_of_type_filtering() {
+        let mut log = MemoryEventLog::new();
+        setup_identity(&mut log);
+
+        let root_events = log.events_of_type(EventType::RootCreated);
+        assert_eq!(root_events.len(), 1);
+
+        let device_events = log.events_of_type(EventType::DeviceAdded);
+        assert_eq!(device_events.len(), 1);
+
+        let rev = log.events_of_type_rev(EventType::RootCreated);
+        assert_eq!(rev.len(), 1);
+        assert_eq!(rev[0].event_id, root_events[0].event_id);
+    }
+
+    #[test]
+    fn export_import_roundtrip() {
+        let mut log = MemoryEventLog::new();
+        setup_identity(&mut log);
+
+        let exported = log.export_events();
+
+        let mut log2 = MemoryEventLog::new();
+        let imported = log2
+            .import_events(&exported, &FixtureVerifier, &AllowAllAuthorizer, 0)
+            .unwrap();
+        assert_eq!(imported, 3);
+        assert_eq!(log2.event_count(), 3);
+        assert_eq!(log2.materialized().roots_current.len(), 1);
+    }
+
+    #[test]
+    fn rebuild_restores_state() {
+        let mut log = MemoryEventLog::new();
+        setup_identity(&mut log);
+
+        log.rebuild().unwrap();
+        assert_eq!(log.event_count(), 3);
+        assert_eq!(log.materialized().roots_current.len(), 1);
+        assert_eq!(log.materialized().devices_current.len(), 1);
+        assert_eq!(log.materialized().personas_current.len(), 1);
+    }
+
+    #[test]
+    fn peer_cursor_tracking() {
+        let log = MemoryEventLog::new();
+        let cursor = log.peer_cursor("peer-1").unwrap();
+        assert_eq!(cursor.peer_id, "peer-1");
+        assert!(cursor.last_event_id.is_none());
+
+        let all = log.peer_cursors().unwrap();
+        assert!(all.is_empty());
+    }
+
+    #[test]
+    fn sync_batch_import() {
+        let mut source = MemoryEventLog::new();
+        setup_identity(&mut source);
+
+        let events: Vec<EventEnvelope> = source.events().to_vec();
+
+        let mut target = MemoryEventLog::new();
+        let count = target
+            .import_sync_batch(
+                "peer-1",
+                "batch-1",
+                &events,
+                Some(&events.last().unwrap().event_id),
+                &FixtureVerifier,
+                &AllowAllAuthorizer,
+                0,
+            )
+            .unwrap();
+        assert_eq!(count, 3);
+        assert_eq!(target.event_count(), 3);
+
+        let cursor = target.peer_cursor("peer-1").unwrap();
+        assert_eq!(
+            cursor.last_event_id.as_deref(),
+            Some(events.last().unwrap().event_id.as_str())
+        );
+
+        let batches = target.sync_batches().unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].batch_id, "batch-1");
+    }
+
+    #[test]
+    fn events_by_ids_preserves_order() {
+        let mut log = MemoryEventLog::new();
+        setup_identity(&mut log);
+
+        let ids: Vec<String> = log.event_ids();
+        let reversed: Vec<String> = ids.iter().rev().cloned().collect();
+        let result = log.events_by_ids(&reversed);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].event_id, reversed[0]);
+        assert_eq!(result[2].event_id, reversed[2]);
+    }
+
+    #[test]
+    fn default_impl_works() {
+        let log = MemoryEventLog::default();
+        assert_eq!(log.event_count(), 0);
+    }
+
+    #[test]
+    fn duplicate_sync_events_skipped() {
+        let mut source = MemoryEventLog::new();
+        setup_identity(&mut source);
+        let events: Vec<EventEnvelope> = source.events().to_vec();
+
+        let mut target = MemoryEventLog::new();
+        target
+            .import_sync_batch(
+                "peer-1",
+                "batch-1",
+                &events,
+                Some(&events.last().unwrap().event_id),
+                &FixtureVerifier,
+                &AllowAllAuthorizer,
+                0,
+            )
+            .unwrap();
+
+        // Re-import same events — should all be skipped
+        let count = target
+            .import_sync_batch(
+                "peer-1",
+                "batch-2",
+                &events,
+                Some(&events.last().unwrap().event_id),
+                &FixtureVerifier,
+                &AllowAllAuthorizer,
+                0,
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(target.event_count(), 3);
+    }
+}

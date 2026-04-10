@@ -11,7 +11,7 @@ use crate::{
     RecoveryPolicyRecord, RecoveryRequestRecord, RecoveryRequestStatus, RootRecord, RootStatus,
 };
 
-pub(crate) fn apply_event(
+pub fn apply_event(
     state: &mut MaterializedState,
     event: &EventEnvelope,
 ) -> Result<(), ValidationError> {
@@ -533,7 +533,7 @@ pub(crate) fn apply_event(
 /// personas, trust, recovery, endpoints, storage relationships/ledger).
 /// Events that are no-ops for materialization (messages, content, shutdown notices)
 /// can skip the write_materialized_tables persistence step.
-pub(crate) fn event_affects_materialized_state(event: &EventEnvelope) -> bool {
+pub fn event_affects_materialized_state(event: &EventEnvelope) -> bool {
     !matches!(
         event.body,
         EventBody::MessageSent(_)
@@ -545,7 +545,7 @@ pub(crate) fn event_affects_materialized_state(event: &EventEnvelope) -> bool {
     )
 }
 
-pub(crate) fn push_key_history(
+pub fn push_key_history(
     history: &mut BTreeMap<String, Vec<String>>,
     entity_id: &str,
     key_id: &str,
@@ -556,7 +556,7 @@ pub(crate) fn push_key_history(
     }
 }
 
-pub(crate) fn recompute_derived_trust(state: &mut MaterializedState) {
+pub fn recompute_derived_trust(state: &mut MaterializedState) {
     state.derived_trust_current = derive_public_statements(
         &state
             .trust_edges_current
@@ -569,7 +569,7 @@ pub(crate) fn recompute_derived_trust(state: &mut MaterializedState) {
     .collect();
 }
 
-pub(crate) fn apply_storage_event(
+pub fn apply_storage_event(
     manifests: &mut BTreeMap<String, FileManifest>,
     event: &EventEnvelope,
     state: &MaterializedState,

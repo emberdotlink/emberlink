@@ -1,62 +1,69 @@
 # Emberlink
 
-Local-first identity brokerage, social trust, recovery, and reciprocal encrypted peer storage.
+Local-first identity brokerage with cryptographic multi-root identities, persona-scoped credentials, social trust, guardian recovery, privacy-preserving selective disclosure, and encrypted peer storage.
 
-This repository contains the Emberlink protocol types, core libraries, and application surfaces.
+## Architecture
 
-## Minimal client
+The Rust workspace contains the protocol, runtime, domain, CLI, relay, and application crates listed in `Cargo.toml`.
 
-The repository includes a Rust-only terminal shell client in `crates/emberlink-cli`. It is still useful for manual testing, but the protocol foundation is now being moved into the core crates.
+## Build and test
 
-Run the interactive client:
+```bash
+cargo build                    # Build all crates
+cargo test                     # Run all tests
+cargo clippy --workspace       # Lint (must be zero warnings)
+```
+
+## CLI
+
+Interactive shell for identity management, credential brokerage, and peer sync.
 
 ```bash
 cargo run -p emberlink-cli
 ```
 
-Run a specific screen directly:
+### Getting started
 
 ```bash
-cargo run -p emberlink-cli -- show broker
-cargo run -p emberlink-cli -- show state
-cargo run -p emberlink-cli -- show recovery
+# First-launch guided setup (root + device + persona)
+init --name "Alice"
+
+# Or create components individually
+root create --name "Alice"
+device add --root alice --label laptop
+persona create --root alice --label Work --template professional
 ```
 
-Create test data directly from the client:
+### Key command categories
+
+| Category | Examples |
+|----------|---------|
+| **Identity** | `root create`, `device add`, `persona create`, `persona grant-device` |
+| **Trust** | `trust attest`, `trust revoke`, `show trust` |
+| **Vault & Disclosure** | `vault write-record`, `vault issue`, `disclose --from --to --template` |
+| **Credentials** | `claim store`, `claim list`, `claim disclose` |
+| **Passkeys** | `passkey register`, `passkey authenticate`, `passkey list` |
+| **Services** | `service bind`, `service list`, `service unbind` |
+| **Import** | `import passwords --format bitwarden\|1password --file export.csv` |
+| **Recovery** | `recovery guardian-enroll`, `recovery request`, `recovery execute` |
+| **Sync** | `sync send`, `sync receive`, `sync mutual`, `sync relay-cycle` |
+| **Storage** | `vault store --file`, `vault export-file`, `storage audit` |
+| **Invites** | `invite create`, `invite accept` |
+
+Run `help` inside the shell for the full command reference.
+
+## Relay
+
+Headless daemon for asynchronous peer-to-peer message delivery.
 
 ```bash
-cargo run -p emberlink-cli -- root create --name Research Root
-cargo run -p emberlink-cli -- device add --root root-a --label laptop
-cargo run -p emberlink-cli -- persona create --root root-a --label Operations --template professional
-cargo run -p emberlink-cli -- persona create --root root-a --label Alias --profile persona.custom
-cargo run -p emberlink-cli -- persona grant-device --persona persona-professional --device laptop
+cargo run -p emberlink-relay -- --mode open
+cargo run -p emberlink-relay -- --mode trust-gated --threshold 0.5
+cargo run -p emberlink-relay -- --mode network-scoped --allow persona-alice
 ```
 
-Interactive commands:
+Supports TLS (self-signed by default, or bring your own certs), per-peer and global mailbox quotas, and graceful shutdown. See `--help` for all options.
 
-```text
-show broker
-show state
-show recovery
-root create --name <display name>
-device add --root <root-id-or-name> --label <device label>
-persona create --root <root-id-or-name> --label <persona label> --template <professional|friends|pseudonymous>
-persona create --root <root-id-or-name> --label <persona label> --profile <profile-id>
-persona grant-device --persona <persona-id-or-label> --device <device-id-or-label>
-persona revoke-device --persona <persona-id-or-label> --device <device-id-or-label>
-quit
-```
+## License
 
-Verify the foundation and client:
-
-```bash
-cargo test -p core-types -p core-events -p core-state
-cargo test -p emberlink-cli
-cargo test
-```
-
-Reset the local demo state:
-
-```bash
-cargo run -p emberlink-cli -- reset
-```
+MIT OR Apache-2.0

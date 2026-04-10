@@ -1376,12 +1376,19 @@ fn key_algorithm_from_public_key(public_key: &str) -> Result<KeyAlgorithm, Valid
     }
 }
 
+pub fn default_data_dir() -> PathBuf {
+    dirs_next::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".config")
+        .join("emberlink")
+}
+
 fn default_data_file() -> PathBuf {
-    Path::new(".emberlink").join("local-state.enc")
+    default_data_dir().join("local-state.enc")
 }
 
 #[cfg(not(test))]
-const KEYRING_SERVICE: &str = "com.emberlink.desktop";
+const KEYRING_SERVICE: &str = "com.emberlink";
 #[cfg(not(test))]
 const KEYRING_USER: &str = "local-state-key";
 const ENCRYPTED_MAGIC: &[u8] = b"EMBER_ENC\x01";

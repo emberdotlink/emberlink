@@ -1014,6 +1014,95 @@ impl EventType {
     }
 }
 
+// --- Retention classification ---
+
+/// Controls how long an event is retained before it becomes eligible for
+/// compaction after a snapshot checkpoint. See design.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RetentionClass {
+    /// Identity lifecycle events — never compacted.
+    Permanent,
+    /// Active protocol state — retained until superseded + grace period.
+    LongLived,
+    /// Routine operational events — compactable after next snapshot.
+    Ephemeral,
+}
+
+impl RetentionClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Permanent => "permanent",
+            Self::LongLived => "long_lived",
+            Self::Ephemeral => "ephemeral",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "permanent" => Some(Self::Permanent),
+            "long_lived" => Some(Self::LongLived),
+            "ephemeral" => Some(Self::Ephemeral),
+            _ => None,
+        }
+    }
+}
+
+impl EventType {
+    /// Returns the retention class for this event type.
+    pub fn retention_class(self) -> RetentionClass {
+        match self {
+            // Identity lifecycle — permanent record of what existed
+            Self::RootCreated
+            | Self::RootRevoked
+            | Self::DeviceAdded
+            | Self::DeviceRevoked
+            | Self::PersonaCreated
+            | Self::PersonaRevoked => RetentionClass::Permanent,
+
+            // Key rotations — permanent because they establish signing authority chains
+            Self::RootKeyRotated
+            | Self::DeviceKeyRotated
+            | Self::DeviceEncryptionKeyRotated
+            | Self::PersonaKeyRotated => RetentionClass::Permanent,
+
+            // Active protocol state — meaningful until superseded
+            Self::TrustAttested
+            | Self::TrustRevoked
+            | Self::LinkageAsserted
+            | Self::LinkageRevoked
+            | Self::RecoveryPolicyCreated
+            | Self::RecoveryPolicyUpdated
+            | Self::GuardianEnrolled
+            | Self::StorageRelationshipCreated
+            | Self::StorageManifestPublished
+            | Self::DisclosurePolicyUpdated
+            | Self::DisclosureRevoked => RetentionClass::LongLived,
+
+            // Recovery flow events — long-lived for audit trail
+            Self::RecoveryRequested
+            | Self::RecoveryApproved
+            | Self::RecoveryContested
+            | Self::RecoveryRejected
+            | Self::RecoveryExecuted
+            | Self::FreezeExecuted
+            | Self::DeviceFrozen
+            | Self::DeviceReplaced => RetentionClass::LongLived,
+
+            // Routine operations — compactable after snapshot
+            Self::DerivedTrustPublished
+            | Self::DerivedTrustRevoked
+            | Self::StorageRelationshipUpdated
+            | Self::StorageLedgerUpdated
+            | Self::StorageRetentionNotice
+            | Self::RelayHintUpdated
+            | Self::EndpointRotated
+            | Self::RelayShutdownNotice
+            | Self::MessageSent
+            | Self::ContentPublished => RetentionClass::Ephemeral,
+        }
+    }
+}
+
 // --- Validate impls ---
 
 impl Validate for EventSubject {
@@ -1768,3 +1857,122 @@ impl_typed_event_canonical_encode!(StorageManifestPublishedEvent, StorageManifes
 impl_typed_event_canonical_encode!(MessageSentEvent, MessageSent);
 impl_typed_event_canonical_encode!(ContentPublishedEvent, ContentPublished);
 impl_typed_event_canonical_encode!(DisclosureRevokedEvent, DisclosureRevoked);
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+
+    const ALL_EVENT_TYPES: &[EventType] = &[
+        EventType::RootCreated,
+        EventType::RootKeyRotated,
+        EventType::RootRevoked,
+        EventType::DeviceAdded,
+        EventType::DeviceKeyRotated,
+        EventType::DeviceEncryptionKeyRotated,
+        EventType::DeviceRevoked,
+        EventType::DeviceFrozen,
+        EventType::DeviceReplaced,
+        EventType::PersonaCreated,
+        EventType::PersonaKeyRotated,
+        EventType::PersonaRevoked,
+        EventType::LinkageAsserted,
+        EventType::LinkageRevoked,
+        EventType::TrustAttested,
+        EventType::TrustRevoked,
+        EventType::DerivedTrustPublished,
+        EventType::DerivedTrustRevoked,
+        EventType::RecoveryPolicyCreated,
+        EventType::RecoveryPolicyUpdated,
+        EventType::GuardianEnrolled,
+        EventType::RecoveryRequested,
+        EventType::RecoveryApproved,
+        EventType::RecoveryContested,
+        EventType::RecoveryRejected,
+        EventType::RecoveryExecuted,
+        EventType::FreezeExecuted,
+        EventType::MessageSent,
+        EventType::ContentPublished,
+        EventType::StorageRelationshipCreated,
+        EventType::StorageRelationshipUpdated,
+        EventType::StorageManifestPublished,
+        EventType::StorageLedgerUpdated,
+        EventType::StorageRetentionNotice,
+        EventType::RelayHintUpdated,
+        EventType::EndpointRotated,
+        EventType::RelayShutdownNotice,
+        EventType::DisclosurePolicyUpdated,
+        EventType::DisclosureRevoked,
+    ];
+
+    #[test]
+    fn every_event_type_has_retention_class() {
+        for et in ALL_EVENT_TYPES {
+            let _class = et.retention_class();
+        }
+    }
+
+    #[test]
+    fn identity_lifecycle_events_are_permanent() {
+        let permanent = [
+            EventType::RootCreated,
+            EventType::RootRevoked,
+            EventType::DeviceAdded,
+            EventType::DeviceRevoked,
+            EventType::PersonaCreated,
+            EventType::PersonaRevoked,
+            EventType::RootKeyRotated,
+            EventType::DeviceKeyRotated,
+            EventType::DeviceEncryptionKeyRotated,
+            EventType::PersonaKeyRotated,
+        ];
+        for et in permanent {
+            assert_eq!(
+                et.retention_class(),
+                RetentionClass::Permanent,
+                "{:?} should be Permanent",
+                et
+            );
+        }
+    }
+
+    #[test]
+    fn routine_operations_are_ephemeral() {
+        let ephemeral = [
+            EventType::DerivedTrustPublished,
+            EventType::DerivedTrustRevoked,
+            EventType::StorageRelationshipUpdated,
+            EventType::StorageLedgerUpdated,
+            EventType::StorageRetentionNotice,
+            EventType::RelayHintUpdated,
+            EventType::EndpointRotated,
+            EventType::RelayShutdownNotice,
+            EventType::MessageSent,
+            EventType::ContentPublished,
+        ];
+        for et in ephemeral {
+            assert_eq!(
+                et.retention_class(),
+                RetentionClass::Ephemeral,
+                "{:?} should be Ephemeral",
+                et
+            );
+        }
+    }
+
+    #[test]
+    fn retention_class_roundtrip() {
+        for class in [
+            RetentionClass::Permanent,
+            RetentionClass::LongLived,
+            RetentionClass::Ephemeral,
+        ] {
+            assert_eq!(RetentionClass::parse(class.as_str()), Some(class));
+        }
+    }
+
+    #[test]
+    fn retention_class_parse_rejects_unknown() {
+        assert_eq!(RetentionClass::parse("unknown"), None);
+        assert_eq!(RetentionClass::parse(""), None);
+    }
+}

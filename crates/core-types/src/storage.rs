@@ -460,6 +460,204 @@ pub trait ServiceAdapter {
     fn verify_binding(&self, binding: &ServiceBinding) -> Result<bool, ValidationError>;
 }
 
+// --- Access grant types ---
+
+/// UX-layer classification of a grant recipient.
+/// Not a new transport primitive — layered on top of Peer/Service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecipientProfile {
+    Human,
+    Agent,
+    Service,
+}
+
+impl RecipientProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Agent => "agent",
+            Self::Service => "service",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "human" => Some(Self::Human),
+            "agent" => Some(Self::Agent),
+            "service" => Some(Self::Service),
+            _ => None,
+        }
+    }
+}
+
+/// Lifecycle status of an access grant.
+/// `Expired` and `Pending` are derived at query time from timestamps.
+/// Only `Active` and `Revoked` are persisted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessGrantStatus {
+    Active,
+    Revoked,
+    Expired,
+    Pending,
+}
+
+impl AccessGrantStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Revoked => "revoked",
+            Self::Expired => "expired",
+            Self::Pending => "pending",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "active" => Some(Self::Active),
+            "revoked" => Some(Self::Revoked),
+            "expired" => Some(Self::Expired),
+            "pending" => Some(Self::Pending),
+            _ => None,
+        }
+    }
+
+    /// Derive the effective status from stored status and timestamps.
+    pub fn derive(stored_status: &str, not_before: Option<u64>, expires_at: Option<u64>, now: u64) -> Self {
+        if stored_status == "revoked" {
+            return Self::Revoked;
+        }
+        if let Some(nb) = not_before
+            && now < nb
+        {
+            return Self::Pending;
+        }
+        if let Some(exp) = expires_at
+            && now > exp
+        {
+            return Self::Expired;
+        }
+        Self::Active
+    }
+}
+
+/// Access duration model for a grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessGrantMode {
+    /// One disclosure or approval, then done.
+    OneShot,
+    /// Short-lived, refreshable within existing scope.
+    Renewable,
+    /// Durable ongoing relationship until explicit revocation.
+    Standing,
+}
+
+impl AccessGrantMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OneShot => "one_shot",
+            Self::Renewable => "renewable",
+            Self::Standing => "standing",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "one_shot" => Some(Self::OneShot),
+            "renewable" => Some(Self::Renewable),
+            "standing" => Some(Self::Standing),
+            _ => None,
+        }
+    }
+}
+
+/// What a grant authorizes. Capabilities are additive — the grant
+/// authorizes the union of all capabilities in its list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantCapability {
+    /// Disclose specific fields from a vault object.
+    DiscloseFields {
+        object_id: String,
+        field_paths: Vec<String>,
+    },
+    /// Read an account credential (all fields).
+    ReadCredential {
+        object_id: String,
+    },
+    /// Use a passkey registration on behalf of the persona.
+    UsePasskey {
+        binding_id: String,
+    },
+    /// Mint fresh disclosure artifacts from an existing template.
+    RefreshDisclosure {
+        template_id: String,
+    },
+    /// Invoke actions through a service binding on behalf of the persona.
+    UseServiceBinding {
+        binding_id: String,
+    },
+}
+
+/// Local-only runtime object representing delegated access with explicit lifecycle.
+/// Never appears in the protocol event log or crosses the disclosure boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessGrant {
+    pub id: String,
+    pub version: u32,
+    pub issuing_persona_id: String,
+    pub recipient_kind: PresentationAudienceKind,
+    pub recipient_id: String,
+    pub recipient_profile: RecipientProfile,
+    pub status: AccessGrantStatus,
+    pub mode: AccessGrantMode,
+    pub capabilities: Vec<GrantCapability>,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub not_before: Option<u64>,
+    pub expires_at: Option<u64>,
+    pub renewable_until: Option<u64>,
+    pub revoked_at: Option<u64>,
+    pub revoked_reason: Option<String>,
+    pub last_used_at: Option<u64>,
+    pub label: Option<String>,
+}
+
+/// Summary view for grant listings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessGrantSummary {
+    pub id: String,
+    pub label: Option<String>,
+    pub issuing_persona_id: String,
+    pub recipient_kind: PresentationAudienceKind,
+    pub recipient_id: String,
+    pub recipient_profile: RecipientProfile,
+    pub status: AccessGrantStatus,
+    pub mode: AccessGrantMode,
+    pub capability_count: usize,
+    pub expires_at: Option<u64>,
+    pub last_used_at: Option<u64>,
+}
+
+/// A lifecycle event in the grant audit history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessGrantHistoryEntry {
+    pub history_id: String,
+    pub grant_id: String,
+    pub version: u32,
+    pub action: String,
+    pub timestamp: u64,
+    pub capabilities_snapshot: Option<String>,
+    pub note: Option<String>,
+}
+
+/// Full detail view of a grant including linked artifacts and history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessGrantDetail {
+    pub grant: AccessGrant,
+    pub linked_artifact_count: usize,
+    pub linked_artifact_ids: Vec<String>,
+    pub history: Vec<AccessGrantHistoryEntry>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VaultCatalog {
     pub namespace: VaultNamespace,
@@ -755,6 +953,86 @@ impl Validate for ServiceBinding {
         if self.created_at == 0 {
             return Err(ValidationError::new(
                 "service binding created_at must be non-zero",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Validate for GrantCapability {
+    fn validate(&self) -> Result<(), ValidationError> {
+        match self {
+            Self::DiscloseFields {
+                object_id,
+                field_paths,
+            } => {
+                validate_non_empty(object_id, "disclose_fields object_id")?;
+                if field_paths.is_empty() {
+                    return Err(ValidationError::new(
+                        "disclose_fields requires at least one field path",
+                    ));
+                }
+                for fp in field_paths {
+                    validate_non_empty(fp, "disclose_fields field path")?;
+                }
+            }
+            Self::ReadCredential { object_id } => {
+                validate_non_empty(object_id, "read_credential object_id")?;
+            }
+            Self::UsePasskey { binding_id } => {
+                validate_non_empty(binding_id, "use_passkey binding_id")?;
+            }
+            Self::RefreshDisclosure { template_id } => {
+                validate_non_empty(template_id, "refresh_disclosure template_id")?;
+            }
+            Self::UseServiceBinding { binding_id } => {
+                validate_non_empty(binding_id, "use_service_binding binding_id")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Validate for AccessGrant {
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_non_empty(&self.id, "access grant id")?;
+        if self.version == 0 {
+            return Err(ValidationError::new(
+                "access grant version must be at least 1",
+            ));
+        }
+        validate_non_empty(&self.issuing_persona_id, "access grant issuing persona id")?;
+        validate_non_empty(&self.recipient_id, "access grant recipient id")?;
+        if self.capabilities.is_empty() {
+            return Err(ValidationError::new(
+                "access grant must have at least one capability",
+            ));
+        }
+        for cap in &self.capabilities {
+            cap.validate()?;
+        }
+        if self.created_at == 0 {
+            return Err(ValidationError::new(
+                "access grant created_at must be non-zero",
+            ));
+        }
+        if self.updated_at < self.created_at {
+            return Err(ValidationError::new(
+                "access grant updated_at must not precede created_at",
+            ));
+        }
+        if let (Some(nb), Some(exp)) = (self.not_before, self.expires_at)
+            && exp <= nb
+        {
+            return Err(ValidationError::new(
+                "access grant expires_at must be after not_before",
+            ));
+        }
+        if let Some(exp) = self.expires_at
+            && exp <= self.created_at
+        {
+            return Err(ValidationError::new(
+                "access grant expires_at must be after created_at",
             ));
         }
         Ok(())
@@ -1585,4 +1863,160 @@ fn decode_vault_catalog_canonical(payload: &[u8]) -> Result<VaultCatalog, Valida
     };
     catalog.validate()?;
     Ok(catalog)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_grant() -> AccessGrant {
+        AccessGrant {
+            id: "grant-01".into(),
+            version: 1,
+            issuing_persona_id: "persona-abc".into(),
+            recipient_kind: PresentationAudienceKind::Peer,
+            recipient_id: "persona-xyz".into(),
+            recipient_profile: RecipientProfile::Human,
+            status: AccessGrantStatus::Active,
+            mode: AccessGrantMode::Renewable,
+            capabilities: vec![GrantCapability::ReadCredential {
+                object_id: "vault-obj-1".into(),
+            }],
+            created_at: 1000,
+            updated_at: 1000,
+            not_before: None,
+            expires_at: Some(2000),
+            renewable_until: Some(5000),
+            revoked_at: None,
+            revoked_reason: None,
+            last_used_at: None,
+            label: Some("Test grant".into()),
+        }
+    }
+
+    #[test]
+    fn valid_grant_passes_validation() {
+        sample_grant().validate().unwrap();
+    }
+
+    #[test]
+    fn grant_empty_id_fails() {
+        let mut g = sample_grant();
+        g.id = String::new();
+        assert!(g.validate().is_err());
+    }
+
+    #[test]
+    fn grant_zero_version_fails() {
+        let mut g = sample_grant();
+        g.version = 0;
+        assert!(g.validate().is_err());
+    }
+
+    #[test]
+    fn grant_empty_capabilities_fails() {
+        let mut g = sample_grant();
+        g.capabilities.clear();
+        assert!(g.validate().is_err());
+    }
+
+    #[test]
+    fn grant_expires_before_created_fails() {
+        let mut g = sample_grant();
+        g.expires_at = Some(500);
+        assert!(g.validate().is_err());
+    }
+
+    #[test]
+    fn grant_updated_before_created_fails() {
+        let mut g = sample_grant();
+        g.updated_at = 999;
+        assert!(g.validate().is_err());
+    }
+
+    #[test]
+    fn grant_expires_before_not_before_fails() {
+        let mut g = sample_grant();
+        g.not_before = Some(3000);
+        g.expires_at = Some(2000);
+        assert!(g.validate().is_err());
+    }
+
+    #[test]
+    fn disclose_fields_empty_paths_fails() {
+        let cap = GrantCapability::DiscloseFields {
+            object_id: "obj-1".into(),
+            field_paths: vec![],
+        };
+        assert!(cap.validate().is_err());
+    }
+
+    #[test]
+    fn read_credential_empty_id_fails() {
+        let cap = GrantCapability::ReadCredential {
+            object_id: String::new(),
+        };
+        assert!(cap.validate().is_err());
+    }
+
+    #[test]
+    fn status_derive_active() {
+        assert_eq!(
+            AccessGrantStatus::derive("active", None, None, 1500),
+            AccessGrantStatus::Active
+        );
+    }
+
+    #[test]
+    fn status_derive_revoked() {
+        assert_eq!(
+            AccessGrantStatus::derive("revoked", None, None, 1500),
+            AccessGrantStatus::Revoked
+        );
+    }
+
+    #[test]
+    fn status_derive_pending() {
+        assert_eq!(
+            AccessGrantStatus::derive("active", Some(2000), None, 1500),
+            AccessGrantStatus::Pending
+        );
+    }
+
+    #[test]
+    fn status_derive_expired() {
+        assert_eq!(
+            AccessGrantStatus::derive("active", None, Some(1000), 1500),
+            AccessGrantStatus::Expired
+        );
+    }
+
+    #[test]
+    fn recipient_profile_roundtrip() {
+        for profile in [RecipientProfile::Human, RecipientProfile::Agent, RecipientProfile::Service] {
+            assert_eq!(RecipientProfile::parse(profile.as_str()), Some(profile));
+        }
+        assert_eq!(RecipientProfile::parse("unknown"), None);
+    }
+
+    #[test]
+    fn access_grant_mode_roundtrip() {
+        for mode in [AccessGrantMode::OneShot, AccessGrantMode::Renewable, AccessGrantMode::Standing] {
+            assert_eq!(AccessGrantMode::parse(mode.as_str()), Some(mode));
+        }
+        assert_eq!(AccessGrantMode::parse("unknown"), None);
+    }
+
+    #[test]
+    fn access_grant_status_roundtrip() {
+        for status in [
+            AccessGrantStatus::Active,
+            AccessGrantStatus::Revoked,
+            AccessGrantStatus::Expired,
+            AccessGrantStatus::Pending,
+        ] {
+            assert_eq!(AccessGrantStatus::parse(status.as_str()), Some(status));
+        }
+        assert_eq!(AccessGrantStatus::parse("unknown"), None);
+    }
 }

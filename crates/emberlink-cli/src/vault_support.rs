@@ -1091,6 +1091,7 @@ impl DemoApp {
             issued_at,
             expires_at,
             recipients,
+            None,
         ) {
             Ok(record) => {
                 if let Err(err) = self.persist_to_disk() {

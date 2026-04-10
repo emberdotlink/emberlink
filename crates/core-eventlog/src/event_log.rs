@@ -52,7 +52,7 @@ pub trait EventLog {
     /// All event IDs in insertion order.
     fn event_ids(&self) -> Vec<String>;
 
-    /// The event ID index (event_id → position). Avoids cloning full ID list.
+    /// The event ID index (event_id -> position). Avoids cloning full ID list.
     fn event_id_set(&self) -> &HashMap<String, usize>;
 
     /// Retrieve events by a list of IDs (preserving request order, skipping missing).

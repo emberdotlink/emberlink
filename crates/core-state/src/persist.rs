@@ -32,8 +32,9 @@ pub(crate) fn persist_event(
             signer_role,
             signer_key_id,
             signer_public_key,
-            payload
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            payload,
+            retention_class
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             &event.event_id,
             event.schema_version.to_string(),
@@ -46,6 +47,7 @@ pub(crate) fn persist_event(
             &event.signer_binding.key_id,
             &event.signer.0,
             &event.payload,
+            event.event_type.retention_class().as_str(),
         ],
     )
     .map_err(|err| ValidationError::new(format!("insert event row: {err}")))?;
@@ -950,20 +952,23 @@ pub(crate) fn write_local_presentation_artifact(
             artifact_payload,
             owner_kind,
             owner_id,
-            template_id
+            template_id,
+            grant_id
          )
-         VALUES (?1, ?2, ?3, ?4, ?5)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(artifact_id) DO UPDATE SET
             artifact_payload = excluded.artifact_payload,
             owner_kind = excluded.owner_kind,
             owner_id = excluded.owner_id,
-            template_id = excluded.template_id",
+            template_id = excluded.template_id,
+            grant_id = excluded.grant_id",
         params![
             &record.artifact.id,
             record.artifact.canonical_encode(),
             record.namespace.owner_kind.as_str(),
             &record.namespace.owner_id,
-            &record.template_id
+            &record.template_id,
+            &record.grant_id
         ],
     )
     .map_err(|err| ValidationError::new(format!("write local presentation artifact: {err}")))?;
@@ -975,7 +980,7 @@ pub(crate) fn load_local_presentation_artifact(
     artifact_id: &str,
 ) -> Result<Option<LocalPresentationArtifactRecord>, ValidationError> {
     conn.query_row(
-        "SELECT artifact_payload, owner_kind, owner_id, template_id
+        "SELECT artifact_payload, owner_kind, owner_id, template_id, grant_id
          FROM local_presentation_artifacts
          WHERE artifact_id = ?1",
         params![artifact_id],
@@ -985,12 +990,13 @@ pub(crate) fn load_local_presentation_artifact(
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
             ))
         },
     )
     .optional()
     .map_err(|err| ValidationError::new(format!("load local presentation artifact: {err}")))?
-    .map(|(payload, owner_kind, owner_id, template_id)| {
+    .map(|(payload, owner_kind, owner_id, template_id, grant_id)| {
         let owner_kind = VaultOwnerKind::parse(&owner_kind).ok_or_else(|| {
             ValidationError::new(format!(
                 "unknown local presentation artifact owner kind: {owner_kind}"
@@ -1003,6 +1009,7 @@ pub(crate) fn load_local_presentation_artifact(
                 owner_id,
             },
             template_id,
+            grant_id,
         })
     })
     .transpose()
@@ -1013,7 +1020,7 @@ pub(crate) fn load_local_presentation_artifacts(
 ) -> Result<Vec<LocalPresentationArtifactRecord>, ValidationError> {
     let mut stmt = conn
         .prepare(
-            "SELECT artifact_payload, owner_kind, owner_id, template_id
+            "SELECT artifact_payload, owner_kind, owner_id, template_id, grant_id
              FROM local_presentation_artifacts
              ORDER BY artifact_id ASC",
         )
@@ -1040,6 +1047,9 @@ pub(crate) fn load_local_presentation_artifacts(
         let template_id = row.get::<_, String>(3).map_err(|err| {
             ValidationError::new(format!("read presentation artifact template id: {err}"))
         })?;
+        let grant_id = row.get::<_, Option<String>>(4).map_err(|err| {
+            ValidationError::new(format!("read presentation artifact grant id: {err}"))
+        })?;
         let owner_kind = VaultOwnerKind::parse(&owner_kind).ok_or_else(|| {
             ValidationError::new(format!(
                 "unknown local presentation artifact owner kind: {owner_kind}"
@@ -1052,9 +1062,39 @@ pub(crate) fn load_local_presentation_artifacts(
                 owner_id,
             },
             template_id,
+            grant_id,
         });
     }
     Ok(artifacts)
+}
+
+pub(crate) fn load_artifact_ids_by_grant(
+    conn: &Connection,
+    grant_id: &str,
+) -> Result<Vec<String>, ValidationError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT artifact_id FROM local_presentation_artifacts
+             WHERE grant_id = ?1
+             ORDER BY artifact_id ASC",
+        )
+        .map_err(|err| {
+            ValidationError::new(format!("prepare artifact-by-grant query: {err}"))
+        })?;
+    let mut rows = stmt.query(params![grant_id]).map_err(|err| {
+        ValidationError::new(format!("query artifacts by grant: {err}"))
+    })?;
+    let mut ids = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .map_err(|err| ValidationError::new(format!("iterate artifacts by grant: {err}")))?
+    {
+        ids.push(
+            row.get::<_, String>(0)
+                .map_err(|err| ValidationError::new(format!("read artifact id: {err}")))?,
+        );
+    }
+    Ok(ids)
 }
 
 pub(crate) fn write_local_received_presentation_artifact(
@@ -1960,5 +2000,491 @@ pub(crate) fn delete_service_binding(
             params![binding_id],
         )
         .map_err(|err| ValidationError::new(format!("delete service binding: {err}")))?;
+    Ok(count > 0)
+}
+
+// --- Access Grant persistence ---
+
+pub(crate) fn capabilities_to_json(
+    capabilities: &[core_types::GrantCapability],
+) -> Result<String, ValidationError> {
+    let json_values: Vec<serde_json::Value> = capabilities
+        .iter()
+        .map(|cap| match cap {
+            core_types::GrantCapability::DiscloseFields {
+                object_id,
+                field_paths,
+            } => serde_json::json!({
+                "kind": "disclose_fields",
+                "object_id": object_id,
+                "field_paths": field_paths,
+            }),
+            core_types::GrantCapability::ReadCredential { object_id } => serde_json::json!({
+                "kind": "read_credential",
+                "object_id": object_id,
+            }),
+            core_types::GrantCapability::UsePasskey { binding_id } => serde_json::json!({
+                "kind": "use_passkey",
+                "binding_id": binding_id,
+            }),
+            core_types::GrantCapability::RefreshDisclosure { template_id } => serde_json::json!({
+                "kind": "refresh_disclosure",
+                "template_id": template_id,
+            }),
+            core_types::GrantCapability::UseServiceBinding { binding_id } => serde_json::json!({
+                "kind": "use_service_binding",
+                "binding_id": binding_id,
+            }),
+        })
+        .collect();
+    serde_json::to_string(&json_values)
+        .map_err(|err| ValidationError::new(format!("serialize capabilities: {err}")))
+}
+
+pub(crate) fn capabilities_from_json(
+    json: &str,
+) -> Result<Vec<core_types::GrantCapability>, ValidationError> {
+    let values: Vec<serde_json::Value> = serde_json::from_str(json)
+        .map_err(|err| ValidationError::new(format!("deserialize capabilities: {err}")))?;
+    let mut caps = Vec::new();
+    for val in &values {
+        let kind = val
+            .get("kind")
+            .and_then(|k| k.as_str())
+            .unwrap_or("");
+        match kind {
+            "disclose_fields" => {
+                let object_id = val
+                    .get("object_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let field_paths = val
+                    .get("field_paths")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                caps.push(core_types::GrantCapability::DiscloseFields {
+                    object_id,
+                    field_paths,
+                });
+            }
+            "read_credential" => {
+                let object_id = val
+                    .get("object_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                caps.push(core_types::GrantCapability::ReadCredential { object_id });
+            }
+            "use_passkey" => {
+                let binding_id = val
+                    .get("binding_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                caps.push(core_types::GrantCapability::UsePasskey { binding_id });
+            }
+            "refresh_disclosure" => {
+                let template_id = val
+                    .get("template_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                caps.push(core_types::GrantCapability::RefreshDisclosure { template_id });
+            }
+            "use_service_binding" => {
+                let binding_id = val
+                    .get("binding_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                caps.push(core_types::GrantCapability::UseServiceBinding { binding_id });
+            }
+            _ => {
+                // Unknown capability kinds are preserved but ignored per design
+            }
+        }
+    }
+    Ok(caps)
+}
+
+pub(crate) fn write_access_grant(
+    conn: &Connection,
+    grant: &core_types::AccessGrant,
+) -> Result<(), ValidationError> {
+    let caps_json = capabilities_to_json(&grant.capabilities)?;
+    // Only persist "active" or "revoked" — derived statuses aren't stored.
+    let stored_status = match grant.status {
+        core_types::AccessGrantStatus::Revoked => "revoked",
+        _ => "active",
+    };
+    conn.execute(
+        "INSERT INTO access_grants (
+            grant_id, version, issuing_persona_id, recipient_kind, recipient_id,
+            recipient_profile, status, mode, capabilities_json, label,
+            created_at, updated_at, not_before, expires_at, renewable_until,
+            revoked_at, revoked_reason, last_used_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+        ON CONFLICT(grant_id) DO UPDATE SET
+            version = excluded.version,
+            status = excluded.status,
+            mode = excluded.mode,
+            capabilities_json = excluded.capabilities_json,
+            label = excluded.label,
+            updated_at = excluded.updated_at,
+            not_before = excluded.not_before,
+            expires_at = excluded.expires_at,
+            renewable_until = excluded.renewable_until,
+            revoked_at = excluded.revoked_at,
+            revoked_reason = excluded.revoked_reason,
+            last_used_at = excluded.last_used_at",
+        params![
+            &grant.id,
+            grant.version as i64,
+            &grant.issuing_persona_id,
+            grant.recipient_kind.as_str(),
+            &grant.recipient_id,
+            grant.recipient_profile.as_str(),
+            stored_status,
+            grant.mode.as_str(),
+            &caps_json,
+            &grant.label,
+            grant.created_at as i64,
+            grant.updated_at as i64,
+            grant.not_before.map(|v| v as i64),
+            grant.expires_at.map(|v| v as i64),
+            grant.renewable_until.map(|v| v as i64),
+            grant.revoked_at.map(|v| v as i64),
+            &grant.revoked_reason,
+            grant.last_used_at.map(|v| v as i64),
+        ],
+    )
+    .map_err(|err| ValidationError::new(format!("write access grant: {err}")))?;
+    Ok(())
+}
+
+pub(crate) fn write_access_grant_history(
+    conn: &Connection,
+    entry: &core_types::AccessGrantHistoryEntry,
+) -> Result<(), ValidationError> {
+    conn.execute(
+        "INSERT INTO access_grant_history (
+            history_id, grant_id, version, action, timestamp, capabilities_snapshot, note
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            &entry.history_id,
+            &entry.grant_id,
+            entry.version as i64,
+            &entry.action,
+            entry.timestamp as i64,
+            &entry.capabilities_snapshot,
+            &entry.note,
+        ],
+    )
+    .map_err(|err| ValidationError::new(format!("write access grant history: {err}")))?;
+    Ok(())
+}
+
+fn row_to_access_grant(
+    row: &rusqlite::Row,
+    now: u64,
+) -> rusqlite::Result<core_types::AccessGrant> {
+    let grant_id: String = row.get(0)?;
+    let version: i64 = row.get(1)?;
+    let issuing_persona_id: String = row.get(2)?;
+    let recipient_kind_str: String = row.get(3)?;
+    let recipient_id: String = row.get(4)?;
+    let recipient_profile_str: String = row.get(5)?;
+    let stored_status: String = row.get(6)?;
+    let mode_str: String = row.get(7)?;
+    let caps_json: String = row.get(8)?;
+    let label: Option<String> = row.get(9)?;
+    let created_at: i64 = row.get(10)?;
+    let updated_at: i64 = row.get(11)?;
+    let not_before: Option<i64> = row.get(12)?;
+    let expires_at: Option<i64> = row.get(13)?;
+    let renewable_until: Option<i64> = row.get(14)?;
+    let revoked_at: Option<i64> = row.get(15)?;
+    let revoked_reason: Option<String> = row.get(16)?;
+    let last_used_at: Option<i64> = row.get(17)?;
+
+    let recipient_kind = core_types::PresentationAudienceKind::parse(&recipient_kind_str)
+        .unwrap_or(core_types::PresentationAudienceKind::Service);
+    let recipient_profile = core_types::RecipientProfile::parse(&recipient_profile_str)
+        .unwrap_or(core_types::RecipientProfile::Human);
+    let mode = core_types::AccessGrantMode::parse(&mode_str)
+        .unwrap_or(core_types::AccessGrantMode::Renewable);
+    let capabilities = capabilities_from_json(&caps_json).unwrap_or_default();
+    let nb = not_before.map(|v| v as u64);
+    let exp = expires_at.map(|v| v as u64);
+    let status = core_types::AccessGrantStatus::derive(&stored_status, nb, exp, now);
+
+    Ok(core_types::AccessGrant {
+        id: grant_id,
+        version: version as u32,
+        issuing_persona_id,
+        recipient_kind,
+        recipient_id,
+        recipient_profile,
+        status,
+        mode,
+        capabilities,
+        created_at: created_at as u64,
+        updated_at: updated_at as u64,
+        not_before: nb,
+        expires_at: exp,
+        renewable_until: renewable_until.map(|v| v as u64),
+        revoked_at: revoked_at.map(|v| v as u64),
+        revoked_reason,
+        last_used_at: last_used_at.map(|v| v as u64),
+        label,
+    })
+}
+
+const ACCESS_GRANT_COLUMNS: &str =
+    "grant_id, version, issuing_persona_id, recipient_kind, recipient_id,
+     recipient_profile, status, mode, capabilities_json, label,
+     created_at, updated_at, not_before, expires_at, renewable_until,
+     revoked_at, revoked_reason, last_used_at";
+
+pub(crate) fn load_access_grant(
+    conn: &Connection,
+    grant_id: &str,
+    now: u64,
+) -> Result<Option<core_types::AccessGrant>, ValidationError> {
+    let sql = format!(
+        "SELECT {ACCESS_GRANT_COLUMNS} FROM access_grants WHERE grant_id = ?1"
+    );
+    conn.query_row(&sql, params![grant_id], |row| row_to_access_grant(row, now))
+        .optional()
+        .map_err(|err| ValidationError::new(format!("load access grant: {err}")))
+}
+
+pub(crate) fn load_access_grants_by_persona(
+    conn: &Connection,
+    persona_id: Option<&str>,
+    recipient_profile: Option<core_types::RecipientProfile>,
+    status_filter: Option<&str>,
+    now: u64,
+) -> Result<Vec<core_types::AccessGrant>, ValidationError> {
+    let mut conditions = Vec::new();
+    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+    if let Some(pid) = persona_id {
+        conditions.push(format!("issuing_persona_id = ?{}", param_values.len() + 1));
+        param_values.push(Box::new(pid.to_string()));
+    }
+    if let Some(rp) = recipient_profile {
+        conditions.push(format!("recipient_profile = ?{}", param_values.len() + 1));
+        param_values.push(Box::new(rp.as_str().to_string()));
+    }
+    if let Some(sf) = status_filter {
+        conditions.push(format!("status = ?{}", param_values.len() + 1));
+        param_values.push(Box::new(sf.to_string()));
+    }
+
+    let where_clause = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conditions.join(" AND "))
+    };
+
+    let sql = format!(
+        "SELECT {ACCESS_GRANT_COLUMNS} FROM access_grants{where_clause} ORDER BY created_at DESC"
+    );
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|err| ValidationError::new(format!("prepare access grants query: {err}")))?;
+
+    let params: Vec<&dyn rusqlite::types::ToSql> =
+        param_values.iter().map(|p| p.as_ref()).collect();
+    let rows = stmt
+        .query_map(params.as_slice(), |row| row_to_access_grant(row, now))
+        .map_err(|err| ValidationError::new(format!("query access grants: {err}")))?;
+
+    let mut grants = Vec::new();
+    for row in rows {
+        grants
+            .push(row.map_err(|err| ValidationError::new(format!("read access grant row: {err}")))?);
+    }
+    Ok(grants)
+}
+
+pub(crate) fn load_access_grants_for_recipient(
+    conn: &Connection,
+    recipient_kind: core_types::PresentationAudienceKind,
+    recipient_id: &str,
+    now: u64,
+) -> Result<Vec<core_types::AccessGrant>, ValidationError> {
+    let sql = format!(
+        "SELECT {ACCESS_GRANT_COLUMNS} FROM access_grants
+         WHERE recipient_kind = ?1 AND recipient_id = ?2
+         ORDER BY created_at DESC"
+    );
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|err| ValidationError::new(format!("prepare recipient grants query: {err}")))?;
+
+    let rows = stmt
+        .query_map(
+            params![recipient_kind.as_str(), recipient_id],
+            |row| row_to_access_grant(row, now),
+        )
+        .map_err(|err| ValidationError::new(format!("query recipient grants: {err}")))?;
+
+    let mut grants = Vec::new();
+    for row in rows {
+        grants
+            .push(row.map_err(|err| ValidationError::new(format!("read grant row: {err}")))?);
+    }
+    Ok(grants)
+}
+
+pub(crate) fn load_access_grant_history(
+    conn: &Connection,
+    grant_id: &str,
+) -> Result<Vec<core_types::AccessGrantHistoryEntry>, ValidationError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT history_id, grant_id, version, action, timestamp, capabilities_snapshot, note
+             FROM access_grant_history WHERE grant_id = ?1 ORDER BY timestamp ASC",
+        )
+        .map_err(|err| ValidationError::new(format!("prepare grant history query: {err}")))?;
+
+    let rows = stmt
+        .query_map(params![grant_id], |row| {
+            Ok(core_types::AccessGrantHistoryEntry {
+                history_id: row.get(0)?,
+                grant_id: row.get(1)?,
+                version: row.get::<_, i64>(2)? as u32,
+                action: row.get(3)?,
+                timestamp: row.get::<_, i64>(4)? as u64,
+                capabilities_snapshot: row.get(5)?,
+                note: row.get(6)?,
+            })
+        })
+        .map_err(|err| ValidationError::new(format!("query grant history: {err}")))?;
+
+    let mut entries = Vec::new();
+    for row in rows {
+        entries.push(
+            row.map_err(|err| ValidationError::new(format!("read grant history row: {err}")))?,
+        );
+    }
+    Ok(entries)
+}
+
+pub(crate) fn load_grant_history_timeline(
+    conn: &Connection,
+    persona_id: Option<&str>,
+    limit: usize,
+    before: Option<u64>,
+) -> Result<Vec<core_types::AccessGrantHistoryEntry>, ValidationError> {
+    let (sql, param_values): (String, Vec<Box<dyn rusqlite::types::ToSql>>) =
+        match (persona_id, before) {
+            (Some(pid), Some(ts)) => (
+                "SELECT h.history_id, h.grant_id, h.version, h.action, h.timestamp,
+                        h.capabilities_snapshot, h.note
+                 FROM access_grant_history h
+                 JOIN access_grants g ON h.grant_id = g.grant_id
+                 WHERE g.issuing_persona_id = ?1 AND h.timestamp < ?2
+                 ORDER BY h.timestamp DESC LIMIT ?3"
+                    .to_string(),
+                vec![
+                    Box::new(pid.to_string()) as Box<dyn rusqlite::types::ToSql>,
+                    Box::new(ts as i64),
+                    Box::new(limit as i64),
+                ],
+            ),
+            (Some(pid), None) => (
+                "SELECT h.history_id, h.grant_id, h.version, h.action, h.timestamp,
+                        h.capabilities_snapshot, h.note
+                 FROM access_grant_history h
+                 JOIN access_grants g ON h.grant_id = g.grant_id
+                 WHERE g.issuing_persona_id = ?1
+                 ORDER BY h.timestamp DESC LIMIT ?2"
+                    .to_string(),
+                vec![
+                    Box::new(pid.to_string()) as Box<dyn rusqlite::types::ToSql>,
+                    Box::new(limit as i64),
+                ],
+            ),
+            (None, Some(ts)) => (
+                "SELECT history_id, grant_id, version, action, timestamp,
+                        capabilities_snapshot, note
+                 FROM access_grant_history
+                 WHERE timestamp < ?1
+                 ORDER BY timestamp DESC LIMIT ?2"
+                    .to_string(),
+                vec![
+                    Box::new(ts as i64) as Box<dyn rusqlite::types::ToSql>,
+                    Box::new(limit as i64),
+                ],
+            ),
+            (None, None) => (
+                "SELECT history_id, grant_id, version, action, timestamp,
+                        capabilities_snapshot, note
+                 FROM access_grant_history
+                 ORDER BY timestamp DESC LIMIT ?1"
+                    .to_string(),
+                vec![Box::new(limit as i64) as Box<dyn rusqlite::types::ToSql>],
+            ),
+        };
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|err| ValidationError::new(format!("prepare grant timeline query: {err}")))?;
+
+    let params: Vec<&dyn rusqlite::types::ToSql> =
+        param_values.iter().map(|p| p.as_ref()).collect();
+
+    let rows = stmt
+        .query_map(params.as_slice(), |row| {
+            Ok(core_types::AccessGrantHistoryEntry {
+                history_id: row.get(0)?,
+                grant_id: row.get(1)?,
+                version: row.get::<_, i64>(2)? as u32,
+                action: row.get(3)?,
+                timestamp: row.get::<_, i64>(4)? as u64,
+                capabilities_snapshot: row.get(5)?,
+                note: row.get(6)?,
+            })
+        })
+        .map_err(|err| ValidationError::new(format!("query grant timeline: {err}")))?;
+
+    let mut entries = Vec::new();
+    for row in rows {
+        entries.push(
+            row.map_err(|err| {
+                ValidationError::new(format!("read grant timeline row: {err}"))
+            })?,
+        );
+    }
+    Ok(entries)
+}
+
+pub(crate) fn delete_access_grant(
+    conn: &Connection,
+    grant_id: &str,
+) -> Result<bool, ValidationError> {
+    // Delete history first, then the grant itself
+    conn.execute(
+        "DELETE FROM access_grant_history WHERE grant_id = ?1",
+        params![grant_id],
+    )
+    .map_err(|err| ValidationError::new(format!("delete grant history: {err}")))?;
+    let count = conn
+        .execute(
+            "DELETE FROM access_grants WHERE grant_id = ?1",
+            params![grant_id],
+        )
+        .map_err(|err| ValidationError::new(format!("delete access grant: {err}")))?;
     Ok(count > 0)
 }

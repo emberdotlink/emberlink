@@ -2,14 +2,14 @@ use std::env;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use emberlink_cli::DemoApp;
+use emberlink_cli::{default_data_dir, DemoApp};
 
 fn main() {
     let options = parse_launch_args(env::args().skip(1).collect());
     let mut app = if options.no_demo {
         let path = options
             .state_file
-            .unwrap_or_else(|| PathBuf::from(".emberlink/local-state.tsv"));
+            .unwrap_or_else(|| default_data_dir().join("local-state.enc"));
         eprintln!(
             "Starting without demo data. Run `init --name <your name>` to create an identity."
         );
@@ -310,5 +310,147 @@ mod tests {
         );
 
         assert!(output.contains("published content\tcontent-"));
+    }
+
+    #[test]
+    fn grant_create_list_show_revoke_lifecycle() {
+        let mut app = DemoApp::ephemeral();
+
+        // Create a grant
+        let output = app.handle_command(
+            "grant create --persona persona-professional --recipient agent-123 \
+             --kind peer --profile agent --mode standing --label test-grant \
+             --cap read_credential:obj-abc",
+        );
+        assert!(output.contains("created grant\tgrant-"));
+
+        // Extract grant ID from output
+        let grant_id = output
+            .split('\t')
+            .nth(1)
+            .unwrap()
+            .trim();
+
+        // List grants — should include it
+        let output = app.handle_command("grant list");
+        assert!(output.contains("Active grants"));
+        assert!(output.contains("standing"));
+
+        // Show grant detail
+        let output = app.handle_command(&format!("grant show {grant_id}"));
+        assert!(output.contains(&format!("Grant {grant_id}")));
+        assert!(output.contains("standing"));
+        assert!(output.contains("agent"));
+        assert!(output.contains("test-grant"));
+        assert!(output.contains("read_credential:obj-abc"));
+        assert!(output.contains("v1 created at"));
+
+        // Edit grant label
+        let output = app.handle_command(&format!("grant edit {grant_id} --label renamed-grant"));
+        assert!(output.contains("edited grant"));
+
+        // Show updated label
+        let output = app.handle_command(&format!("grant show {grant_id}"));
+        assert!(output.contains("renamed-grant"));
+
+        // Revoke grant
+        let output = app.handle_command(&format!("grant revoke {grant_id} --reason testing"));
+        assert!(output.contains("revoked grant"));
+
+        // Show revoked state
+        let output = app.handle_command(&format!("grant show {grant_id}"));
+        assert!(output.contains("revoked"));
+        assert!(output.contains("testing"));
+
+        // List should now be empty (only active)
+        let output = app.handle_command("grant list");
+        assert!(output.contains("No active grants"));
+    }
+
+    #[test]
+    fn grant_renew_requires_renewable_mode() {
+        let mut app = DemoApp::ephemeral();
+
+        // Create a renewable grant
+        let output = app.handle_command(
+            "grant create --persona persona-professional --recipient svc-1 --kind service --profile service --mode renewable --expires-in 3600 --cap read_credential:obj-1",
+        );
+        let grant_id = output.split('\t').nth(1).unwrap().trim();
+
+        // Renew it
+        let output = app.handle_command(&format!("grant renew {grant_id} --expires-in 7200"));
+        assert!(output.contains("renewed grant"));
+
+        // Create a standing grant — renew should fail
+        let output2 = app.handle_command(
+            "grant create --persona persona-professional --recipient svc-2 --kind service --profile service --mode standing --cap read_credential:obj-2",
+        );
+        let standing_id = output2.split('\t').nth(1).unwrap().trim();
+
+        let output = app.handle_command(&format!("grant renew {standing_id} --expires-in 7200"));
+        assert!(output.contains("Failed to renew grant"));
+    }
+
+    #[test]
+    fn grant_recipient_shows_all_grants_for_recipient() {
+        let mut app = DemoApp::ephemeral();
+
+        // Create two grants for the same recipient
+        let output1 = app.handle_command(
+            "grant create --persona persona-professional --recipient agent-x \
+             --kind peer --profile agent --mode standing --label first-grant \
+             --cap read_credential:obj-1",
+        );
+        let grant_id1 = output1.split('\t').nth(1).unwrap().trim().to_string();
+
+        app.handle_command(
+            "grant create --persona persona-professional --recipient agent-x \
+             --kind peer --profile agent --mode renewable --expires-in 3600 \
+             --label second-grant --cap read_credential:obj-2",
+        );
+
+        // Revoke the first grant
+        app.handle_command(&format!("grant revoke {grant_id1} --reason done"));
+
+        // Recipient detail should show both (active + revoked)
+        let output = app.handle_command("grant recipient --kind peer --id agent-x");
+        assert!(output.contains("Recipient agent-x (peer)"));
+        assert!(output.contains("revoked"));
+        assert!(output.contains("renewable"));
+
+        // Empty recipient should show no grants
+        let output = app.handle_command("grant recipient --kind service --id nonexistent");
+        assert!(output.contains("No grants for this recipient"));
+    }
+
+    #[test]
+    fn grant_history_shows_timeline() {
+        let mut app = DemoApp::ephemeral();
+
+        // Create a grant
+        let output = app.handle_command(
+            "grant create --persona persona-professional --recipient svc-hist \
+             --kind service --profile service --mode standing --cap read_credential:obj-h1",
+        );
+        let grant_id = output.split('\t').nth(1).unwrap().trim().to_string();
+
+        // Edit it
+        app.handle_command(&format!("grant edit {grant_id} --label updated-label"));
+
+        // History should show both events
+        let output = app.handle_command("grant history");
+        assert!(output.contains("Grant history"));
+        assert!(output.contains("created"));
+        assert!(output.contains("edited"));
+
+        // History filtered by persona
+        let output = app.handle_command("grant history --persona persona-professional");
+        assert!(output.contains("created"));
+
+        // History with limit
+        let output = app.handle_command("grant history --limit 1");
+        // Should have header + column header + 1 data line = 3 lines
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 3);
     }
 }

@@ -1,8 +1,5 @@
 mod adapters;
-mod authorize;
 mod blockstore;
-mod event_log;
-mod materialize;
 mod persist;
 mod schema;
 
@@ -12,6 +9,15 @@ pub use adapters::{
 };
 pub use blockstore::SqliteBlockStore;
 
+// Re-export shared types from core-eventlog so downstream crates can continue
+// importing from core-state without changes.
+pub use core_eventlog::{
+    AllowAllAuthorizer, Authorizer, DeviceRecord, DeviceStatus, EventLog, GuardianRecord,
+    IdentityAuthorizer, MaterializedState, PersonaRecord, PersonaStatus, RecoveryPolicyRecord,
+    RecoveryRequestRecord, RecoveryRequestStatus, RootRecord, RootStatus, SyncBatchRecord,
+};
+pub use core_eventlog::MemoryEventLog;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -20,6 +26,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use core_crypto::{
     EncryptedContent, LocalKeyPair, Signer as CryptoSigner, Verifier, generate_content_key,
     generate_random_identifier,
+};
+use core_eventlog::materialize::{
+    apply_event, apply_storage_event, event_affects_materialized_state,
 };
 use core_events::EventEnvelope;
 use core_storage::{
@@ -33,18 +42,17 @@ use core_storage::{
     wrap_manifest_key_for_recipients,
 };
 use core_types::{
-    BlockStore, ChunkReference, DerivedTrustStatement, DurabilityPolicy, EndpointDescriptor,
-    EventBody, EventType, FileManifest, ImportedClaim, ManifestDeviceAccess, PeerCursor,
-    PresentationArtifact, PresentationTemplate, PublicKeyMaterial, RecoveryScope, RetentionPolicy,
-    ServiceBinding, StructuredRecordMeta, SurvivalMode, TrustAttestation, Validate,
+    AccessGrant, AccessGrantDetail, AccessGrantHistoryEntry, AccessGrantMode, AccessGrantStatus,
+    AccessGrantSummary, BlockStore, ChunkReference, DurabilityPolicy,
+    EventBody, EventType, FileManifest, ImportedClaim,
+    ManifestDeviceAccess, PeerCursor, PresentationArtifact, PresentationAudienceKind,
+    PresentationTemplate, RecipientProfile, RetentionPolicy,
+    ServiceBinding, StructuredRecordMeta, Validate,
     ValidationError, VaultCatalog, VaultNamespace, VaultOwnerKind,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value as JsonValue;
 
-pub use authorize::{AllowAllAuthorizer, Authorizer, IdentityAuthorizer};
-pub use event_log::EventLog;
-use materialize::{apply_event, apply_storage_event, event_affects_materialized_state};
 use persist::{
     delete_local_block, delete_local_file_manifest, delete_local_manifest_key,
     delete_local_vault_catalog_manifest_history,
@@ -65,96 +73,13 @@ use persist::{
     write_materialized_tables, write_peer_cursor,
     write_service_binding as persist_write_service_binding,
 };
+use persist::{
+    capabilities_to_json, delete_access_grant as persist_delete_access_grant,
+    load_access_grant, load_access_grant_history, load_access_grants_by_persona,
+    load_access_grants_for_recipient, load_artifact_ids_by_grant,
+    load_grant_history_timeline, write_access_grant, write_access_grant_history,
+};
 use schema::{SQLITE_MIGRATION_V1, ensure_runtime_columns};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RootStatus {
-    Active,
-    Revoked,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DeviceStatus {
-    Active,
-    Revoked,
-    Frozen,
-    Replaced,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PersonaStatus {
-    Active,
-    Revoked,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RecoveryRequestStatus {
-    Requested,
-    Approved,
-    Contested,
-    Rejected,
-    Executed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RootRecord {
-    pub root_id: String,
-    pub display_name: String,
-    pub active_key: PublicKeyMaterial,
-    pub status: RootStatus,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeviceRecord {
-    pub root_id: String,
-    pub device_id: String,
-    pub label: String,
-    pub active_key: PublicKeyMaterial,
-    pub active_encryption_key: PublicKeyMaterial,
-    pub status: DeviceStatus,
-    pub replacement_device_id: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PersonaRecord {
-    pub root_id: String,
-    pub persona_id: String,
-    pub label: String,
-    pub disclosure_profile: Option<String>,
-    pub survival_mode: SurvivalMode,
-    pub active_key: PublicKeyMaterial,
-    pub status: PersonaStatus,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RecoveryPolicyRecord {
-    pub root_id: String,
-    pub guardian_threshold: u8,
-    pub cooldown_seconds: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GuardianRecord {
-    pub guardian_id: String,
-    pub root_id: String,
-    pub label: String,
-    pub public_key: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RecoveryRequestRecord {
-    pub request_id: String,
-    pub root_id: String,
-    pub target_device_id: String,
-    pub approvals: BTreeSet<String>,
-    pub contested_by: BTreeSet<String>,
-    pub status: RecoveryRequestStatus,
-    pub executed_scope: Option<RecoveryScope>,
-    /// Epoch seconds until which execution is blocked. `None` means no cooldown.
-    pub cooldown_until: Option<u64>,
-    pub contest_reason: Option<String>,
-    pub rejection_reason: Option<String>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersonaDeviceAccessRecord {
@@ -279,6 +204,7 @@ pub struct LocalPresentationArtifactRecord {
     pub artifact: PresentationArtifact,
     pub namespace: VaultNamespace,
     pub template_id: String,
+    pub grant_id: Option<String>,
 }
 
 impl LocalPresentationArtifactRecord {
@@ -305,50 +231,6 @@ impl LocalPresentationArtifactRecord {
 pub struct LocalEncryptedManifest {
     pub manifest: FileManifest,
     pub blocks: Vec<EncryptedBlock>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SyncBatchRecord {
-    pub batch_id: String,
-    pub peer_id: String,
-    pub last_event_id: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct MaterializedState {
-    pub roots_current: BTreeMap<String, RootRecord>,
-    pub devices_current: BTreeMap<String, DeviceRecord>,
-    pub personas_current: BTreeMap<String, PersonaRecord>,
-    pub trust_edges_current: BTreeMap<String, TrustAttestation>,
-    pub derived_trust_current: BTreeMap<String, DerivedTrustStatement>,
-    pub recovery_policies_current: BTreeMap<String, RecoveryPolicyRecord>,
-    pub guardians_current: BTreeMap<String, GuardianRecord>,
-    pub recovery_requests_current: BTreeMap<String, RecoveryRequestRecord>,
-    pub storage_relationships_current: BTreeMap<String, core_types::StorageRelationship>,
-    pub storage_balances_current: BTreeMap<String, core_types::StorageLedgerEntry>,
-    pub endpoints_current: BTreeMap<String, EndpointDescriptor>,
-    pub root_key_history: BTreeMap<String, Vec<String>>,
-    pub device_key_history: BTreeMap<String, Vec<String>>,
-    pub device_encryption_key_history: BTreeMap<String, Vec<String>>,
-    pub persona_key_history: BTreeMap<String, Vec<String>>,
-}
-
-impl MaterializedState {
-    pub fn root(&self, root_id: &str) -> Option<&RootRecord> {
-        self.roots_current.get(root_id)
-    }
-
-    pub fn device(&self, device_id: &str) -> Option<&DeviceRecord> {
-        self.devices_current.get(device_id)
-    }
-
-    pub fn persona(&self, persona_id: &str) -> Option<&PersonaRecord> {
-        self.personas_current.get(persona_id)
-    }
-
-    pub fn endpoint(&self, peer_id: &str) -> Option<&EndpointDescriptor> {
-        self.endpoints_current.get(peer_id)
-    }
 }
 
 pub struct EventStore {
@@ -1355,6 +1237,275 @@ impl EventStore {
 
     pub fn delete_service_binding(&mut self, binding_id: &str) -> Result<bool, ValidationError> {
         persist_delete_service_binding(&self.conn, binding_id)
+    }
+
+    // --- Access Grant CRUD ---
+
+    fn now_epoch_secs(&self) -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    /// Create a new access grant. Validates the issuing persona exists and is active.
+    /// Records a "created" history entry.
+    pub fn create_access_grant(
+        &mut self,
+        grant: &AccessGrant,
+    ) -> Result<(), ValidationError> {
+        grant.validate()?;
+        let persona = self
+            .materialized
+            .personas_current
+            .get(&grant.issuing_persona_id)
+            .ok_or_else(|| {
+                ValidationError::new(format!("unknown persona: {}", grant.issuing_persona_id))
+            })?;
+        if persona.status != PersonaStatus::Active {
+            return Err(ValidationError::new(
+                "cannot create grant for a revoked persona",
+            ));
+        }
+
+        write_access_grant(&self.conn, grant)?;
+
+        let caps_json = capabilities_to_json(&grant.capabilities)?;
+        let history_entry = AccessGrantHistoryEntry {
+            history_id: generate_random_identifier("history"),
+            grant_id: grant.id.clone(),
+            version: grant.version,
+            action: "created".to_string(),
+            timestamp: grant.created_at,
+            capabilities_snapshot: Some(caps_json),
+            note: None,
+        };
+        write_access_grant_history(&self.conn, &history_entry)?;
+        Ok(())
+    }
+
+    /// Edit an existing grant's mutable fields. Bumps version and updated_at.
+    /// Records an "edited" history entry.
+    pub fn edit_access_grant(
+        &mut self,
+        grant: &AccessGrant,
+        note: Option<&str>,
+    ) -> Result<(), ValidationError> {
+        grant.validate()?;
+        let existing = load_access_grant(&self.conn, &grant.id, self.now_epoch_secs())?
+            .ok_or_else(|| ValidationError::new(format!("grant not found: {}", grant.id)))?;
+        if existing.status == AccessGrantStatus::Revoked {
+            return Err(ValidationError::new("cannot edit a revoked grant"));
+        }
+        // Immutable fields must not change
+        if grant.issuing_persona_id != existing.issuing_persona_id
+            || grant.recipient_kind != existing.recipient_kind
+            || grant.recipient_id != existing.recipient_id
+        {
+            return Err(ValidationError::new(
+                "cannot change issuing persona, recipient kind, or recipient id",
+            ));
+        }
+
+        write_access_grant(&self.conn, grant)?;
+
+        let caps_json = capabilities_to_json(&grant.capabilities)?;
+        let history_entry = AccessGrantHistoryEntry {
+            history_id: generate_random_identifier("history"),
+            grant_id: grant.id.clone(),
+            version: grant.version,
+            action: "edited".to_string(),
+            timestamp: grant.updated_at,
+            capabilities_snapshot: Some(caps_json),
+            note: note.map(String::from),
+        };
+        write_access_grant_history(&self.conn, &history_entry)?;
+        Ok(())
+    }
+
+    /// Revoke an access grant. Sets revoked_at, bumps version.
+    /// Records a "revoked" history entry.
+    pub fn revoke_access_grant(
+        &mut self,
+        grant_id: &str,
+        reason: Option<&str>,
+    ) -> Result<(), ValidationError> {
+        let now = self.now_epoch_secs();
+        let mut grant = load_access_grant(&self.conn, grant_id, now)?
+            .ok_or_else(|| ValidationError::new(format!("grant not found: {grant_id}")))?;
+        if grant.status == AccessGrantStatus::Revoked {
+            return Err(ValidationError::new("grant is already revoked"));
+        }
+
+        grant.version += 1;
+        grant.status = AccessGrantStatus::Revoked;
+        grant.revoked_at = Some(now);
+        grant.revoked_reason = reason.map(String::from);
+        grant.updated_at = now;
+
+        write_access_grant(&self.conn, &grant)?;
+
+        let history_entry = AccessGrantHistoryEntry {
+            history_id: generate_random_identifier("history"),
+            grant_id: grant.id.clone(),
+            version: grant.version,
+            action: "revoked".to_string(),
+            timestamp: now,
+            capabilities_snapshot: None,
+            note: reason.map(String::from),
+        };
+        write_access_grant_history(&self.conn, &history_entry)?;
+        Ok(())
+    }
+
+    /// Renew a renewable grant by extending expires_at. Does not expand scope.
+    /// Records a "renewed" history entry.
+    pub fn renew_access_grant(
+        &mut self,
+        grant_id: &str,
+        new_expires_at: u64,
+    ) -> Result<(), ValidationError> {
+        let now = self.now_epoch_secs();
+        let mut grant = load_access_grant(&self.conn, grant_id, now)?
+            .ok_or_else(|| ValidationError::new(format!("grant not found: {grant_id}")))?;
+
+        if grant.mode != AccessGrantMode::Renewable {
+            return Err(ValidationError::new("only renewable grants can be renewed"));
+        }
+        if grant.status == AccessGrantStatus::Revoked {
+            return Err(ValidationError::new("cannot renew a revoked grant"));
+        }
+        if let Some(renewable_until) = grant.renewable_until
+            && now > renewable_until
+        {
+            return Err(ValidationError::new(
+                "renewable_until has passed; grant must be re-created",
+            ));
+        }
+
+        grant.version += 1;
+        grant.expires_at = Some(new_expires_at);
+        grant.updated_at = now;
+
+        write_access_grant(&self.conn, &grant)?;
+
+        let history_entry = AccessGrantHistoryEntry {
+            history_id: generate_random_identifier("history"),
+            grant_id: grant.id.clone(),
+            version: grant.version,
+            action: "renewed".to_string(),
+            timestamp: now,
+            capabilities_snapshot: None,
+            note: None,
+        };
+        write_access_grant_history(&self.conn, &history_entry)?;
+        Ok(())
+    }
+
+    /// Record that a grant was used (update last_used_at).
+    pub fn touch_access_grant(&mut self, grant_id: &str) -> Result<(), ValidationError> {
+        let now = self.now_epoch_secs();
+        let mut grant = load_access_grant(&self.conn, grant_id, now)?
+            .ok_or_else(|| ValidationError::new(format!("grant not found: {grant_id}")))?;
+        grant.last_used_at = Some(now);
+        grant.updated_at = now;
+        write_access_grant(&self.conn, &grant)
+    }
+
+    /// Get a single grant by ID.
+    pub fn access_grant(&self, grant_id: &str) -> Result<Option<AccessGrant>, ValidationError> {
+        load_access_grant(&self.conn, grant_id, self.now_epoch_secs())
+    }
+
+    /// Get full grant detail including linked artifacts and history.
+    pub fn access_grant_detail(
+        &self,
+        grant_id: &str,
+    ) -> Result<Option<AccessGrantDetail>, ValidationError> {
+        let now = self.now_epoch_secs();
+        let grant = match load_access_grant(&self.conn, grant_id, now)? {
+            Some(g) => g,
+            None => return Ok(None),
+        };
+        let history = load_access_grant_history(&self.conn, grant_id)?;
+        let linked_artifact_ids = load_artifact_ids_by_grant(&self.conn, grant_id)?;
+        Ok(Some(AccessGrantDetail {
+            grant,
+            linked_artifact_count: linked_artifact_ids.len(),
+            linked_artifact_ids,
+            history,
+        }))
+    }
+
+    /// List active grants, optionally filtered by persona and/or recipient profile.
+    pub fn list_active_grants(
+        &self,
+        persona_id: Option<&str>,
+        recipient_profile: Option<RecipientProfile>,
+    ) -> Result<Vec<AccessGrantSummary>, ValidationError> {
+        let now = self.now_epoch_secs();
+        let grants =
+            load_access_grants_by_persona(&self.conn, persona_id, recipient_profile, Some("active"), now)?;
+        // Filter out derived Expired/Pending from the "active" stored status
+        Ok(grants
+            .into_iter()
+            .filter(|g| g.status == AccessGrantStatus::Active)
+            .map(|g| AccessGrantSummary {
+                id: g.id,
+                label: g.label,
+                issuing_persona_id: g.issuing_persona_id,
+                recipient_kind: g.recipient_kind,
+                recipient_id: g.recipient_id,
+                recipient_profile: g.recipient_profile,
+                status: g.status,
+                mode: g.mode,
+                capability_count: g.capabilities.len(),
+                expires_at: g.expires_at,
+                last_used_at: g.last_used_at,
+            })
+            .collect())
+    }
+
+    /// List all grants for a specific recipient (active, expired, revoked).
+    pub fn list_grants_for_recipient(
+        &self,
+        recipient_kind: PresentationAudienceKind,
+        recipient_id: &str,
+    ) -> Result<Vec<AccessGrantSummary>, ValidationError> {
+        let now = self.now_epoch_secs();
+        let grants = load_access_grants_for_recipient(&self.conn, recipient_kind, recipient_id, now)?;
+        Ok(grants
+            .into_iter()
+            .map(|g| AccessGrantSummary {
+                id: g.id,
+                label: g.label,
+                issuing_persona_id: g.issuing_persona_id,
+                recipient_kind: g.recipient_kind,
+                recipient_id: g.recipient_id,
+                recipient_profile: g.recipient_profile,
+                status: g.status,
+                mode: g.mode,
+                capability_count: g.capabilities.len(),
+                expires_at: g.expires_at,
+                last_used_at: g.last_used_at,
+            })
+            .collect())
+    }
+
+    /// Reverse-chronological timeline of grant lifecycle events.
+    pub fn grant_history_timeline(
+        &self,
+        persona_id: Option<&str>,
+        limit: usize,
+        before: Option<u64>,
+    ) -> Result<Vec<AccessGrantHistoryEntry>, ValidationError> {
+        load_grant_history_timeline(&self.conn, persona_id, limit, before)
+    }
+
+    /// Delete a grant and its history. Use revoke for normal lifecycle;
+    /// delete is for cleanup only.
+    pub fn delete_access_grant(&mut self, grant_id: &str) -> Result<bool, ValidationError> {
+        persist_delete_access_grant(&self.conn, grant_id)
     }
 
     pub fn upsert_file_manifest(&mut self, manifest: &FileManifest) -> Result<(), ValidationError> {
@@ -2638,6 +2789,7 @@ impl EventStore {
         issued_at: u64,
         expires_at: Option<u64>,
         recipients: Vec<ManifestKeyRecipient>,
+        grant_id: Option<&str>,
     ) -> Result<LocalPresentationArtifactRecord, ValidationError> {
         if recipients.is_empty() {
             return Err(ValidationError::new(
@@ -2706,6 +2858,7 @@ impl EventStore {
             artifact,
             namespace: namespace.clone(),
             template_id: template_id.to_string(),
+            grant_id: grant_id.map(|s| s.to_string()),
         };
 
         self.upsert_local_manifest_key(&manifest.id, &artifact_content_key)?;
@@ -3343,7 +3496,7 @@ mod tests {
         PersonaRevokedEvent, PublicKeyMaterial, RecoveryApprovedEvent, RecoveryContestedEvent,
         RecoveryExecutedEvent, RecoveryPolicyCreatedEvent, RecoveryRejectedEvent,
         RecoveryRequestedEvent, RecoveryScope, RelayHintUpdatedEvent, RootCreatedEvent,
-        RootKeyRotatedEvent, RootRevokedEvent, SignerBinding, TrustAttestedEvent,
+        RootKeyRotatedEvent, RootRevokedEvent, SignerBinding, SurvivalMode, TrustAttestedEvent,
         TrustRevokedEvent,
     };
     use rusqlite::OptionalExtension;
@@ -5024,6 +5177,7 @@ mod tests {
                 owner_id: "persona-a".into(),
             },
             template_id: "template-1".into(),
+            grant_id: None,
         };
 
         {
@@ -5139,6 +5293,7 @@ mod tests {
                     10,
                     Some(3700),
                     vec![test_manifest_recipient("device-a")],
+                    None,
                 )
                 .unwrap();
 
@@ -5285,6 +5440,7 @@ mod tests {
                 10,
                 Some(3610),
                 vec![test_manifest_recipient("device-a")],
+                None,
             )
             .unwrap();
 
@@ -5776,6 +5932,7 @@ mod tests {
                     10,
                     Some(3700),
                     vec![test_manifest_recipient("device-a")],
+                    None,
                 )
                 .unwrap_err();
             assert!(err.message.contains("deleted"));
@@ -8002,5 +8159,314 @@ mod tests {
             "non-existent root should be rejected: {}",
             err.message
         );
+    }
+
+    // --- Access Grant CRUD tests ---
+
+    fn store_with_persona() -> EventStore {
+        let mut store = EventStore::default();
+        append_typed(
+            &mut store,
+            "evt-root-1",
+            EventBody::RootCreated(RootCreatedEvent {
+                root_id: "root-a".into(),
+                display_name: "Primary".into(),
+                initial_key: test_key("key-root-a-v1"),
+            }),
+            SignerBinding::root("root-a", "key-root-a-v1"),
+        );
+        append_typed(
+            &mut store,
+            "evt-device-1",
+            EventBody::DeviceAdded(DeviceAddedEvent {
+                root_id: "root-a".into(),
+                device_id: "device-a".into(),
+                label: "Laptop".into(),
+                initial_key: test_key("key-device-a-v1"),
+                initial_encryption_key: test_encryption_key("key-device-a-v1"),
+            }),
+            SignerBinding::root("root-a", "key-root-a-v1"),
+        );
+        append_typed(
+            &mut store,
+            "evt-persona-1",
+            EventBody::PersonaCreated(PersonaCreatedEvent {
+                root_id: "root-a".into(),
+                persona_id: "persona-a".into(),
+                label: "Work".into(),
+                disclosure_profile: Some("work-public".into()),
+                survival_mode: SurvivalMode::Strict,
+                initial_key: test_key("key-persona-a-v1"),
+            }),
+            SignerBinding::root("root-a", "key-root-a-v1"),
+        );
+        store
+    }
+
+    fn sample_grant(id: &str, persona_id: &str) -> AccessGrant {
+        AccessGrant {
+            id: id.into(),
+            version: 1,
+            issuing_persona_id: persona_id.into(),
+            recipient_kind: PresentationAudienceKind::Service,
+            recipient_id: "svc-claude".into(),
+            recipient_profile: RecipientProfile::Agent,
+            status: AccessGrantStatus::Active,
+            mode: AccessGrantMode::Renewable,
+            capabilities: vec![core_types::GrantCapability::ReadCredential {
+                object_id: "vault-obj-abc".into(),
+            }],
+            created_at: 1000,
+            updated_at: 1000,
+            not_before: None,
+            expires_at: Some(u64::MAX / 2),
+            renewable_until: Some(u64::MAX / 2),
+            revoked_at: None,
+            revoked_reason: None,
+            last_used_at: None,
+            label: Some("Claude assistant".into()),
+        }
+    }
+
+    #[test]
+    fn create_and_get_access_grant() {
+        let mut store = store_with_persona();
+        let grant = sample_grant("grant-1", "persona-a");
+        store.create_access_grant(&grant).unwrap();
+
+        let loaded = store.access_grant("grant-1").unwrap().unwrap();
+        assert_eq!(loaded.id, "grant-1");
+        assert_eq!(loaded.version, 1);
+        assert_eq!(loaded.issuing_persona_id, "persona-a");
+        assert_eq!(loaded.recipient_profile, RecipientProfile::Agent);
+        assert_eq!(loaded.mode, AccessGrantMode::Renewable);
+        assert_eq!(loaded.capabilities.len(), 1);
+        assert_eq!(loaded.label.as_deref(), Some("Claude assistant"));
+    }
+
+    #[test]
+    fn create_grant_rejects_unknown_persona() {
+        let mut store = store_with_persona();
+        let grant = sample_grant("grant-1", "persona-nonexistent");
+        let err = store.create_access_grant(&grant).unwrap_err();
+        assert!(err.message.contains("unknown persona"));
+    }
+
+    #[test]
+    fn edit_access_grant_bumps_version() {
+        let mut store = store_with_persona();
+        let grant = sample_grant("grant-1", "persona-a");
+        store.create_access_grant(&grant).unwrap();
+
+        let mut edited = grant.clone();
+        edited.version = 2;
+        edited.updated_at = 1500;
+        edited.label = Some("Updated label".into());
+        store.edit_access_grant(&edited, Some("changed label")).unwrap();
+
+        let loaded = store.access_grant("grant-1").unwrap().unwrap();
+        assert_eq!(loaded.version, 2);
+        assert_eq!(loaded.label.as_deref(), Some("Updated label"));
+    }
+
+    #[test]
+    fn edit_rejects_immutable_field_change() {
+        let mut store = store_with_persona();
+        let grant = sample_grant("grant-1", "persona-a");
+        store.create_access_grant(&grant).unwrap();
+
+        let mut edited = grant.clone();
+        edited.version = 2;
+        edited.updated_at = 1500;
+        edited.recipient_id = "svc-other".into();
+        let err = store.edit_access_grant(&edited, None).unwrap_err();
+        assert!(err.message.contains("cannot change"));
+    }
+
+    #[test]
+    fn revoke_access_grant() {
+        let mut store = store_with_persona();
+        let grant = sample_grant("grant-1", "persona-a");
+        store.create_access_grant(&grant).unwrap();
+
+        store.revoke_access_grant("grant-1", Some("no longer needed")).unwrap();
+
+        let loaded = store.access_grant("grant-1").unwrap().unwrap();
+        assert_eq!(loaded.status, AccessGrantStatus::Revoked);
+        assert!(loaded.revoked_at.is_some());
+        assert_eq!(loaded.revoked_reason.as_deref(), Some("no longer needed"));
+        assert_eq!(loaded.version, 2);
+    }
+
+    #[test]
+    fn revoke_already_revoked_fails() {
+        let mut store = store_with_persona();
+        let grant = sample_grant("grant-1", "persona-a");
+        store.create_access_grant(&grant).unwrap();
+        store.revoke_access_grant("grant-1", None).unwrap();
+
+        let err = store.revoke_access_grant("grant-1", None).unwrap_err();
+        assert!(err.message.contains("already revoked"));
+    }
+
+    #[test]
+    fn renew_access_grant() {
+        let mut store = store_with_persona();
+        let grant = sample_grant("grant-1", "persona-a");
+        store.create_access_grant(&grant).unwrap();
+
+        store.renew_access_grant("grant-1", 3000).unwrap();
+
+        let loaded = store.access_grant("grant-1").unwrap().unwrap();
+        assert_eq!(loaded.expires_at, Some(3000));
+        assert_eq!(loaded.version, 2);
+    }
+
+    #[test]
+    fn renew_rejects_non_renewable() {
+        let mut store = store_with_persona();
+        let mut grant = sample_grant("grant-1", "persona-a");
+        grant.mode = AccessGrantMode::Standing;
+        store.create_access_grant(&grant).unwrap();
+
+        let err = store.renew_access_grant("grant-1", 3000).unwrap_err();
+        assert!(err.message.contains("only renewable"));
+    }
+
+    #[test]
+    fn list_active_grants_filters_correctly() {
+        let mut store = store_with_persona();
+
+        let grant1 = sample_grant("grant-1", "persona-a");
+        store.create_access_grant(&grant1).unwrap();
+
+        let mut grant2 = sample_grant("grant-2", "persona-a");
+        grant2.recipient_profile = RecipientProfile::Human;
+        grant2.recipient_id = "peer-bob".into();
+        grant2.recipient_kind = PresentationAudienceKind::Peer;
+        store.create_access_grant(&grant2).unwrap();
+
+        // All active
+        let active = store.list_active_grants(Some("persona-a"), None).unwrap();
+        assert_eq!(active.len(), 2);
+
+        // Filter by agent profile
+        let agents = store
+            .list_active_grants(Some("persona-a"), Some(RecipientProfile::Agent))
+            .unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].id, "grant-1");
+
+        // Revoke one, should disappear from active list
+        store.revoke_access_grant("grant-1", None).unwrap();
+        let active = store.list_active_grants(Some("persona-a"), None).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, "grant-2");
+    }
+
+    #[test]
+    fn list_grants_for_recipient() {
+        let mut store = store_with_persona();
+        let grant = sample_grant("grant-1", "persona-a");
+        store.create_access_grant(&grant).unwrap();
+
+        let results = store
+            .list_grants_for_recipient(PresentationAudienceKind::Service, "svc-claude")
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "grant-1");
+
+        let empty = store
+            .list_grants_for_recipient(PresentationAudienceKind::Peer, "svc-claude")
+            .unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn grant_detail_includes_history() {
+        let mut store = store_with_persona();
+        let grant = sample_grant("grant-1", "persona-a");
+        store.create_access_grant(&grant).unwrap();
+        store.revoke_access_grant("grant-1", Some("done")).unwrap();
+
+        let detail = store.access_grant_detail("grant-1").unwrap().unwrap();
+        assert_eq!(detail.grant.status, AccessGrantStatus::Revoked);
+        assert_eq!(detail.history.len(), 2);
+        assert_eq!(detail.history[0].action, "created");
+        assert_eq!(detail.history[1].action, "revoked");
+    }
+
+    #[test]
+    fn grant_history_timeline() {
+        let mut store = store_with_persona();
+        let grant1 = sample_grant("grant-1", "persona-a");
+        store.create_access_grant(&grant1).unwrap();
+
+        let mut grant2 = sample_grant("grant-2", "persona-a");
+        grant2.created_at = 1100;
+        grant2.updated_at = 1100;
+        grant2.recipient_id = "svc-other".into();
+        store.create_access_grant(&grant2).unwrap();
+
+        let timeline = store.grant_history_timeline(None, 10, None).unwrap();
+        assert_eq!(timeline.len(), 2);
+        // Reverse chronological — grant-2 created at 1100 should be first
+        assert_eq!(timeline[0].grant_id, "grant-2");
+        assert_eq!(timeline[1].grant_id, "grant-1");
+    }
+
+    #[test]
+    fn delete_access_grant_removes_history() {
+        let mut store = store_with_persona();
+        let grant = sample_grant("grant-1", "persona-a");
+        store.create_access_grant(&grant).unwrap();
+
+        assert!(store.delete_access_grant("grant-1").unwrap());
+        assert!(store.access_grant("grant-1").unwrap().is_none());
+        let timeline = store.grant_history_timeline(None, 10, None).unwrap();
+        assert!(timeline.is_empty());
+    }
+
+    #[test]
+    fn capabilities_json_roundtrip() {
+        use persist::{capabilities_from_json, capabilities_to_json};
+
+        let caps = vec![
+            core_types::GrantCapability::ReadCredential {
+                object_id: "obj-1".into(),
+            },
+            core_types::GrantCapability::DiscloseFields {
+                object_id: "obj-2".into(),
+                field_paths: vec!["email".into(), "name".into()],
+            },
+            core_types::GrantCapability::UsePasskey {
+                binding_id: "bind-1".into(),
+            },
+            core_types::GrantCapability::RefreshDisclosure {
+                template_id: "tmpl-1".into(),
+            },
+            core_types::GrantCapability::UseServiceBinding {
+                binding_id: "bind-2".into(),
+            },
+        ];
+        let json = capabilities_to_json(&caps).unwrap();
+        let decoded = capabilities_from_json(&json).unwrap();
+        assert_eq!(caps, decoded);
+    }
+
+    #[test]
+    fn expired_grant_derived_from_timestamps() {
+        let mut store = store_with_persona();
+        let mut grant = sample_grant("grant-1", "persona-a");
+        // Set expires_at to just after created_at (way in the past relative to now)
+        grant.expires_at = Some(1001);
+        store.create_access_grant(&grant).unwrap();
+
+        let loaded = store.access_grant("grant-1").unwrap().unwrap();
+        assert_eq!(loaded.status, AccessGrantStatus::Expired);
+
+        // Should not appear in active grants
+        let active = store.list_active_grants(Some("persona-a"), None).unwrap();
+        assert!(active.is_empty());
     }
 }

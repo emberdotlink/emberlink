@@ -14,7 +14,8 @@ CREATE TABLE IF NOT EXISTS events (
     signer_role TEXT NOT NULL,
     signer_key_id TEXT NOT NULL,
     signer_public_key TEXT NOT NULL,
-    payload BLOB NOT NULL
+    payload BLOB NOT NULL,
+    retention_class TEXT NOT NULL DEFAULT 'ephemeral'
 );
 
 CREATE TABLE IF NOT EXISTS event_refs (
@@ -243,7 +244,8 @@ CREATE TABLE IF NOT EXISTS local_presentation_artifacts (
     artifact_payload BLOB NOT NULL,
     owner_kind TEXT NOT NULL,
     owner_id TEXT NOT NULL,
-    template_id TEXT NOT NULL
+    template_id TEXT NOT NULL,
+    grant_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS local_received_presentation_artifacts (
@@ -283,7 +285,45 @@ CREATE INDEX IF NOT EXISTS idx_devices_current_root_id ON devices_current(root_i
 CREATE INDEX IF NOT EXISTS idx_personas_current_root_id ON personas_current(root_id);
 CREATE INDEX IF NOT EXISTS idx_persona_device_access_device_id ON persona_device_access(device_id);
 CREATE INDEX IF NOT EXISTS idx_local_artifacts_owner ON local_presentation_artifacts(owner_kind, owner_id);
+CREATE INDEX IF NOT EXISTS idx_local_artifacts_grant ON local_presentation_artifacts(grant_id);
 CREATE INDEX IF NOT EXISTS idx_received_artifacts_issuer ON local_received_presentation_artifacts(issuer_persona_id);
+
+CREATE TABLE IF NOT EXISTS access_grants (
+    grant_id TEXT NOT NULL PRIMARY KEY,
+    version INTEGER NOT NULL DEFAULT 1,
+    issuing_persona_id TEXT NOT NULL,
+    recipient_kind TEXT NOT NULL,
+    recipient_id TEXT NOT NULL,
+    recipient_profile TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    mode TEXT NOT NULL,
+    capabilities_json TEXT NOT NULL,
+    label TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    not_before INTEGER,
+    expires_at INTEGER,
+    renewable_until INTEGER,
+    revoked_at INTEGER,
+    revoked_reason TEXT,
+    last_used_at INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_grants_persona ON access_grants(issuing_persona_id);
+CREATE INDEX IF NOT EXISTS idx_grants_recipient ON access_grants(recipient_kind, recipient_id);
+CREATE INDEX IF NOT EXISTS idx_grants_status ON access_grants(status);
+
+CREATE TABLE IF NOT EXISTS access_grant_history (
+    history_id TEXT NOT NULL PRIMARY KEY,
+    grant_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    action TEXT NOT NULL,
+    timestamp INTEGER NOT NULL,
+    capabilities_snapshot TEXT,
+    note TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_grant_history_grant_id ON access_grant_history(grant_id);
 "#;
 
 pub(crate) fn ensure_runtime_columns(conn: &Connection) -> Result<(), ValidationError> {
@@ -346,6 +386,13 @@ pub(crate) fn ensure_runtime_columns(conn: &Connection) -> Result<(), Validation
     )?;
     allow_duplicate_column(
         conn.execute(
+            "ALTER TABLE local_presentation_artifacts ADD COLUMN grant_id TEXT",
+            [],
+        ),
+        "ensure local_presentation_artifacts grant_id column",
+    )?;
+    allow_duplicate_column(
+        conn.execute(
             "ALTER TABLE local_received_presentation_artifacts ADD COLUMN issuer_persona_id TEXT",
             [],
         ),
@@ -372,6 +419,44 @@ pub(crate) fn ensure_runtime_columns(conn: &Connection) -> Result<(), Validation
         ),
         "ensure local_received_presentation_artifacts issuer_signature_hex column",
     )?;
+
+    // Ensure access_grants tables exist for existing databases.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS access_grants (
+            grant_id TEXT NOT NULL PRIMARY KEY,
+            version INTEGER NOT NULL DEFAULT 1,
+            issuing_persona_id TEXT NOT NULL,
+            recipient_kind TEXT NOT NULL,
+            recipient_id TEXT NOT NULL,
+            recipient_profile TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            mode TEXT NOT NULL,
+            capabilities_json TEXT NOT NULL,
+            label TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            not_before INTEGER,
+            expires_at INTEGER,
+            renewable_until INTEGER,
+            revoked_at INTEGER,
+            revoked_reason TEXT,
+            last_used_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_grants_persona ON access_grants(issuing_persona_id);
+        CREATE INDEX IF NOT EXISTS idx_grants_recipient ON access_grants(recipient_kind, recipient_id);
+        CREATE INDEX IF NOT EXISTS idx_grants_status ON access_grants(status);
+        CREATE TABLE IF NOT EXISTS access_grant_history (
+            history_id TEXT NOT NULL PRIMARY KEY,
+            grant_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            timestamp INTEGER NOT NULL,
+            capabilities_snapshot TEXT,
+            note TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_grant_history_grant_id ON access_grant_history(grant_id);",
+    )
+    .map_err(|err| ValidationError::new(format!("ensure access_grants tables: {err}")))?;
 
     // Ensure service_bindings table exists for existing databases.
     conn.execute_batch(

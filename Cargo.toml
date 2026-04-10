@@ -5,6 +5,7 @@ members = [
     "crates/core-types",
     "crates/core-crypto",
     "crates/core-events",
+    "crates/core-eventlog",
     "crates/core-state",
     "crates/core-identity",
     "crates/core-personas",

@@ -24,8 +24,10 @@ use core_sync::{
 };
 use core_trust::{derive_score, trust_attested_event, trust_revoked_event};
 use core_types::{
-    AdmissionToken, ContentPublishedEvent, ContentVisibility, EventBody, MessageSentEvent,
-    SignerBinding, SurvivalMode, SyncProfile, TrustThreshold, Validate, ValidationError,
+    AccessGrant, AccessGrantMode, AccessGrantStatus, GrantCapability, AdmissionToken,
+    ContentPublishedEvent, ContentVisibility, EventBody, MessageSentEvent,
+    PresentationAudienceKind, RecipientProfile, SignerBinding, SurvivalMode, SyncProfile,
+    TrustThreshold, Validate, ValidationError,
 };
 
 use super::*;
@@ -38,6 +40,69 @@ fn parse_limit_arg(tokens: &[&str]) -> usize {
         }
     }
     0
+}
+
+fn truncate_id(id: &str) -> &str {
+    if id.len() > 12 {
+        &id[..12]
+    } else {
+        id
+    }
+}
+
+fn parse_capabilities(cap_strs: &[String]) -> Result<Vec<GrantCapability>, ValidationError> {
+    let mut caps = Vec::new();
+    for s in cap_strs {
+        let (kind, arg) = s.split_once(':').ok_or_else(|| {
+            ValidationError::new(format!(
+                "invalid capability: {s}. Format: read_credential:<object_id>, \
+                 use_passkey:<binding_id>, refresh_disclosure:<template_id>, \
+                 use_service_binding:<binding_id>"
+            ))
+        })?;
+        let cap = match kind {
+            "read_credential" => GrantCapability::ReadCredential {
+                object_id: arg.to_string(),
+            },
+            "use_passkey" => GrantCapability::UsePasskey {
+                binding_id: arg.to_string(),
+            },
+            "refresh_disclosure" => GrantCapability::RefreshDisclosure {
+                template_id: arg.to_string(),
+            },
+            "use_service_binding" => GrantCapability::UseServiceBinding {
+                binding_id: arg.to_string(),
+            },
+            _ => {
+                return Err(ValidationError::new(format!(
+                    "unknown capability type: {kind}"
+                )));
+            }
+        };
+        caps.push(cap);
+    }
+    Ok(caps)
+}
+
+fn format_capability(cap: &GrantCapability) -> String {
+    match cap {
+        GrantCapability::DiscloseFields {
+            object_id,
+            field_paths,
+        } => format!("disclose_fields:{} [{}]", object_id, field_paths.join(", ")),
+        GrantCapability::ReadCredential { object_id } => {
+            format!("read_credential:{}", object_id)
+        }
+        GrantCapability::UsePasskey { binding_id } => {
+            format!("use_passkey:{}", binding_id)
+        }
+        GrantCapability::RefreshDisclosure { template_id } => {
+            format!("refresh_disclosure:{}", template_id)
+        }
+        GrantCapability::UseServiceBinding { binding_id } => {
+            format!("use_service_binding:{}", binding_id)
+        }
+    }
 }
 
 impl DemoApp {
@@ -95,6 +160,7 @@ impl DemoApp {
             ["passkey", rest @ ..] => self.handle_passkey(rest),
             ["import", rest @ ..] => self.handle_import(rest),
             ["show", "vault", rest @ ..] | ["vault", rest @ ..] => self.handle_vault(rest),
+            ["show", "grant", rest @ ..] | ["grant", rest @ ..] => self.handle_grant(rest),
             ["show", "storage", rest @ ..] | ["storage", rest @ ..] => self.handle_storage(rest),
             ["show", "sync", rest @ ..] | ["sync", rest @ ..] => self.handle_sync(rest),
             ["show", "state"] | ["state"] => self.render_state(),
@@ -2420,6 +2486,54 @@ impl DemoApp {
         writeln!(
             &mut out,
             "  storage gc-apply [--namespace <ns>]            Execute garbage collection"
+        )
+        .unwrap();
+        writeln!(&mut out).unwrap();
+
+        writeln!(&mut out, "Access Grants").unwrap();
+        writeln!(
+            &mut out,
+            "  grant list [--persona <p>] [--profile human|agent|service]"
+        )
+        .unwrap();
+        writeln!(
+            &mut out,
+            "                                                 List active grants"
+        )
+        .unwrap();
+        writeln!(
+            &mut out,
+            "  grant show <id>                                Show grant details and history"
+        )
+        .unwrap();
+        writeln!(
+            &mut out,
+            "  grant create --persona <p> --recipient <id> --kind peer|service"
+        )
+        .unwrap();
+        writeln!(
+            &mut out,
+            "               --profile human|agent|service --mode one_shot|renewable|standing"
+        )
+        .unwrap();
+        writeln!(
+            &mut out,
+            "               [--label <label>] [--expires-in <sec>] [--cap <type:arg> ...]"
+        )
+        .unwrap();
+        writeln!(
+            &mut out,
+            "  grant revoke <id> [--reason <reason>]          Revoke a grant"
+        )
+        .unwrap();
+        writeln!(
+            &mut out,
+            "  grant renew <id> --expires-in <sec>            Extend a renewable grant"
+        )
+        .unwrap();
+        writeln!(
+            &mut out,
+            "  grant edit <id> [--label <label>] [--mode <mode>] [--note <note>]"
         )
         .unwrap();
         writeln!(&mut out).unwrap();
@@ -4950,5 +5064,586 @@ impl DemoApp {
             "revoked persona device access\t{}\t{}\n",
             persona_id, device_id
         ))
+    }
+
+    // ── Access Grant CLI ─────────────────────────────────────────────
+
+    pub(crate) fn handle_grant(&mut self, tokens: &[&str]) -> String {
+        match tokens {
+            ["create", rest @ ..] => self.handle_grant_create(rest),
+            ["list", rest @ ..] => self.handle_grant_list(rest),
+            ["show", id] => self.handle_grant_show(id),
+            ["revoke", id, rest @ ..] => self.handle_grant_revoke(id, rest),
+            ["renew", id, rest @ ..] => self.handle_grant_renew(id, rest),
+            ["edit", id, rest @ ..] => self.handle_grant_edit(id, rest),
+            ["recipient", rest @ ..] => self.handle_grant_recipient(rest),
+            ["history", rest @ ..] => self.handle_grant_history(rest),
+            [] => self.handle_grant_list(&[]),
+            _ => "Usage: grant create|list|show|revoke|renew|edit|recipient|history ...\n".to_string(),
+        }
+    }
+
+    fn handle_grant_create(&mut self, tokens: &[&str]) -> String {
+        let mut persona = None;
+        let mut recipient = None;
+        let mut kind = None;
+        let mut profile = None;
+        let mut mode = None;
+        let mut label = None;
+        let mut expires_in: Option<u64> = None;
+        let mut caps: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < tokens.len() {
+            match tokens[i] {
+                "--persona" if i + 1 < tokens.len() => {
+                    persona = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "--recipient" if i + 1 < tokens.len() => {
+                    recipient = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "--kind" if i + 1 < tokens.len() => {
+                    kind = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "--profile" if i + 1 < tokens.len() => {
+                    profile = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "--mode" if i + 1 < tokens.len() => {
+                    mode = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "--label" if i + 1 < tokens.len() => {
+                    label = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "--expires-in" if i + 1 < tokens.len() => {
+                    expires_in = tokens[i + 1].parse().ok();
+                    i += 2;
+                }
+                "--cap" if i + 1 < tokens.len() => {
+                    caps.push(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                _ => {
+                    return "Usage: grant create --persona <p> --recipient <id> --kind peer|service \
+                            --profile human|agent|service --mode one_shot|renewable|standing \
+                            [--label <label>] [--expires-in <sec>] [--cap <type:arg> ...]\n"
+                        .to_string();
+                }
+            }
+        }
+
+        let (Some(persona_ref), Some(recipient_id), Some(kind_str), Some(profile_str), Some(mode_str)) =
+            (persona, recipient, kind, profile, mode)
+        else {
+            return "Usage: grant create --persona <p> --recipient <id> --kind peer|service \
+                    --profile human|agent|service --mode one_shot|renewable|standing\n"
+                .to_string();
+        };
+
+        match self.create_grant_command(
+            &persona_ref,
+            &recipient_id,
+            &kind_str,
+            &profile_str,
+            &mode_str,
+            label.as_deref(),
+            expires_in,
+            &caps,
+        ) {
+            Ok(msg) => msg,
+            Err(err) => format!("Failed to create grant: {}\n", err),
+        }
+    }
+
+    fn handle_grant_list(&self, tokens: &[&str]) -> String {
+        let mut persona = None;
+        let mut profile = None;
+        let mut i = 0;
+        while i < tokens.len() {
+            match tokens[i] {
+                "--persona" if i + 1 < tokens.len() => {
+                    persona = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "--profile" if i + 1 < tokens.len() => {
+                    profile = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                _ => i += 1,
+            }
+        }
+
+        let persona_id = match persona.as_deref() {
+            Some(ref_str) => match self.resolve_persona(ref_str) {
+                Some(p) => Some(p.id.clone()),
+                None => return format!("Unknown persona: {ref_str}\n"),
+            },
+            None => None,
+        };
+
+        let recipient_profile = match profile.as_deref() {
+            Some(s) => match RecipientProfile::parse(s) {
+                Some(rp) => Some(rp),
+                None => return "Invalid profile. Use: human, agent, service\n".to_string(),
+            },
+            None => None,
+        };
+
+        match self
+            .event_store
+            .list_active_grants(persona_id.as_deref(), recipient_profile)
+        {
+            Ok(grants) => self.render_grant_list(&grants),
+            Err(err) => format!("Failed to list grants: {}\n", err),
+        }
+    }
+
+    fn handle_grant_show(&self, grant_ref: &str) -> String {
+        match self.event_store.access_grant_detail(grant_ref) {
+            Ok(Some(detail)) => self.render_grant_detail(&detail),
+            Ok(None) => format!("Grant not found: {grant_ref}\n"),
+            Err(err) => format!("Failed to show grant: {}\n", err),
+        }
+    }
+
+    fn handle_grant_revoke(&mut self, grant_id: &str, tokens: &[&str]) -> String {
+        let mut reason = None;
+        let mut i = 0;
+        while i < tokens.len() {
+            match tokens[i] {
+                "--reason" if i + 1 < tokens.len() => {
+                    reason = Some(tokens[i + 1..].join(" "));
+                    break;
+                }
+                _ => i += 1,
+            }
+        }
+
+        match self
+            .event_store
+            .revoke_access_grant(grant_id, reason.as_deref())
+        {
+            Ok(()) => format!("revoked grant\t{}\n", grant_id),
+            Err(err) => format!("Failed to revoke grant: {}\n", err),
+        }
+    }
+
+    fn handle_grant_renew(&mut self, grant_id: &str, tokens: &[&str]) -> String {
+        let mut expires_in: Option<u64> = None;
+        let mut i = 0;
+        while i < tokens.len() {
+            match tokens[i] {
+                "--expires-in" if i + 1 < tokens.len() => {
+                    expires_in = tokens[i + 1].parse().ok();
+                    i += 2;
+                }
+                _ => {
+                    return "Usage: grant renew <id> --expires-in <seconds>\n".to_string();
+                }
+            }
+        }
+
+        let Some(seconds) = expires_in else {
+            return "Usage: grant renew <id> --expires-in <seconds>\n".to_string();
+        };
+
+        let new_expires_at = now_epoch_secs() + seconds;
+        match self.event_store.renew_access_grant(grant_id, new_expires_at) {
+            Ok(()) => format!("renewed grant\t{}\texpires_at={}\n", grant_id, new_expires_at),
+            Err(err) => format!("Failed to renew grant: {}\n", err),
+        }
+    }
+
+    fn handle_grant_edit(&mut self, grant_id: &str, tokens: &[&str]) -> String {
+        let mut label: Option<String> = None;
+        let mut mode: Option<String> = None;
+        let mut note: Option<String> = None;
+        let mut i = 0;
+        while i < tokens.len() {
+            match tokens[i] {
+                "--label" if i + 1 < tokens.len() => {
+                    label = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "--mode" if i + 1 < tokens.len() => {
+                    mode = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "--note" if i + 1 < tokens.len() => {
+                    note = Some(tokens[i + 1..].join(" "));
+                    break;
+                }
+                _ => {
+                    return "Usage: grant edit <id> [--label <label>] [--mode <mode>] [--note <note>]\n"
+                        .to_string();
+                }
+            }
+        }
+
+        match self.edit_grant_command(grant_id, label.as_deref(), mode.as_deref(), note.as_deref()) {
+            Ok(msg) => msg,
+            Err(err) => format!("Failed to edit grant: {}\n", err),
+        }
+    }
+
+    fn handle_grant_recipient(&self, tokens: &[&str]) -> String {
+        let mut kind = None;
+        let mut recipient = None;
+        let mut i = 0;
+        while i < tokens.len() {
+            match tokens[i] {
+                "--kind" if i + 1 < tokens.len() => {
+                    kind = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "--id" if i + 1 < tokens.len() => {
+                    recipient = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                _ => {
+                    return "Usage: grant recipient --kind peer|service --id <recipient-id>\n"
+                        .to_string();
+                }
+            }
+        }
+
+        let (Some(kind_str), Some(recipient_id)) = (kind, recipient) else {
+            return "Usage: grant recipient --kind peer|service --id <recipient-id>\n".to_string();
+        };
+
+        let Some(recipient_kind) = PresentationAudienceKind::parse(&kind_str) else {
+            return "Invalid kind. Use: peer, service\n".to_string();
+        };
+
+        match self
+            .event_store
+            .list_grants_for_recipient(recipient_kind, &recipient_id)
+        {
+            Ok(grants) => self.render_recipient_detail(&recipient_id, &kind_str, &grants),
+            Err(err) => format!("Failed to list grants for recipient: {}\n", err),
+        }
+    }
+
+    fn handle_grant_history(&self, tokens: &[&str]) -> String {
+        let mut persona = None;
+        let mut limit: usize = 20;
+        let mut i = 0;
+        while i < tokens.len() {
+            match tokens[i] {
+                "--persona" if i + 1 < tokens.len() => {
+                    persona = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "--limit" if i + 1 < tokens.len() => {
+                    limit = tokens[i + 1].parse().unwrap_or(20);
+                    i += 2;
+                }
+                _ => {
+                    return "Usage: grant history [--persona <p>] [--limit <n>]\n".to_string();
+                }
+            }
+        }
+
+        let persona_id = match persona.as_deref() {
+            Some(ref_str) => match self.resolve_persona(ref_str) {
+                Some(p) => Some(p.id.clone()),
+                None => return format!("Unknown persona: {ref_str}\n"),
+            },
+            None => None,
+        };
+
+        match self
+            .event_store
+            .grant_history_timeline(persona_id.as_deref(), limit, None)
+        {
+            Ok(entries) => self.render_grant_history_timeline(&entries),
+            Err(err) => format!("Failed to load grant history: {}\n", err),
+        }
+    }
+
+    // ── Grant business logic ─────────────────────────────────────────
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_grant_command(
+        &mut self,
+        persona_ref: &str,
+        recipient_id: &str,
+        kind_str: &str,
+        profile_str: &str,
+        mode_str: &str,
+        label: Option<&str>,
+        expires_in: Option<u64>,
+        cap_strs: &[String],
+    ) -> Result<String, ValidationError> {
+        let persona_id = self
+            .resolve_persona(persona_ref)
+            .map(|p| p.id.clone())
+            .ok_or_else(|| ValidationError::new(format!("unknown persona: {persona_ref}")))?;
+
+        let recipient_kind = PresentationAudienceKind::parse(kind_str)
+            .ok_or_else(|| ValidationError::new(format!("invalid kind: {kind_str}. Use: peer, service")))?;
+
+        let recipient_profile = RecipientProfile::parse(profile_str)
+            .ok_or_else(|| {
+                ValidationError::new(format!(
+                    "invalid profile: {profile_str}. Use: human, agent, service"
+                ))
+            })?;
+
+        let mode = AccessGrantMode::parse(mode_str)
+            .ok_or_else(|| {
+                ValidationError::new(format!(
+                    "invalid mode: {mode_str}. Use: one_shot, renewable, standing"
+                ))
+            })?;
+
+        let capabilities = parse_capabilities(cap_strs)?;
+
+        let now = now_epoch_secs();
+        let grant_id = self.allocate_subject_id("grant");
+        let expires_at = expires_in.map(|s| now + s);
+
+        let grant = AccessGrant {
+            id: grant_id.clone(),
+            version: 1,
+            issuing_persona_id: persona_id.clone(),
+            recipient_kind,
+            recipient_id: recipient_id.to_string(),
+            recipient_profile,
+            status: AccessGrantStatus::Active,
+            mode,
+            capabilities,
+            created_at: now,
+            updated_at: now,
+            not_before: None,
+            expires_at,
+            renewable_until: None,
+            revoked_at: None,
+            revoked_reason: None,
+            last_used_at: None,
+            label: label.map(String::from),
+        };
+
+        self.event_store.create_access_grant(&grant)?;
+        self.persist_to_disk()?;
+
+        Ok(format!(
+            "created grant\t{}\t{}\t{}\t{}\n",
+            grant_id,
+            persona_id,
+            recipient_id,
+            mode.as_str()
+        ))
+    }
+
+    fn edit_grant_command(
+        &mut self,
+        grant_id: &str,
+        new_label: Option<&str>,
+        new_mode: Option<&str>,
+        note: Option<&str>,
+    ) -> Result<String, ValidationError> {
+        let mut grant = self
+            .event_store
+            .access_grant(grant_id)?
+            .ok_or_else(|| ValidationError::new(format!("grant not found: {grant_id}")))?;
+
+        if let Some(lbl) = new_label {
+            grant.label = Some(lbl.to_string());
+        }
+        if let Some(mode_str) = new_mode {
+            grant.mode = AccessGrantMode::parse(mode_str).ok_or_else(|| {
+                ValidationError::new(format!(
+                    "invalid mode: {mode_str}. Use: one_shot, renewable, standing"
+                ))
+            })?;
+        }
+
+        grant.version += 1;
+        grant.updated_at = now_epoch_secs();
+
+        self.event_store.edit_access_grant(&grant, note)?;
+        self.persist_to_disk()?;
+
+        Ok(format!("edited grant\t{}\tv{}\n", grant_id, grant.version))
+    }
+
+    // ── Grant rendering ──────────────────────────────────────────────
+
+    fn render_grant_list(&self, grants: &[core_types::AccessGrantSummary]) -> String {
+        if grants.is_empty() {
+            return "No active grants.\n".to_string();
+        }
+        let mut out = String::new();
+        writeln!(&mut out, "Active grants").unwrap();
+        writeln!(
+            &mut out,
+            "{:<14} {:<14} {:<16} {:<10} {:<10} CAPS",
+            "GRANT", "PERSONA", "RECIPIENT", "MODE", "PROFILE"
+        )
+        .unwrap();
+        for g in grants {
+            let persona_label = self
+                .resolve_persona(&g.issuing_persona_id)
+                .map(|p| p.label.as_str())
+                .unwrap_or(&g.issuing_persona_id);
+            writeln!(
+                &mut out,
+                "{:<14} {:<14} {:<16} {:<10} {:<10} {}",
+                truncate_id(&g.id),
+                persona_label,
+                truncate_id(&g.recipient_id),
+                g.mode.as_str(),
+                g.recipient_profile.as_str(),
+                g.capability_count,
+            )
+            .unwrap();
+        }
+        out
+    }
+
+    fn render_grant_detail(&self, detail: &core_types::AccessGrantDetail) -> String {
+        let g = &detail.grant;
+        let mut out = String::new();
+        writeln!(&mut out, "Grant {}", g.id).unwrap();
+        writeln!(&mut out, "  status:    {}", g.status.as_str()).unwrap();
+        writeln!(&mut out, "  mode:      {}", g.mode.as_str()).unwrap();
+        if let Some(ref lbl) = g.label {
+            writeln!(&mut out, "  label:     {}", lbl).unwrap();
+        }
+        let persona_label = self
+            .resolve_persona(&g.issuing_persona_id)
+            .map(|p| p.label.clone())
+            .unwrap_or_else(|| g.issuing_persona_id.clone());
+        writeln!(&mut out, "  persona:   {} ({})", persona_label, g.issuing_persona_id).unwrap();
+        writeln!(
+            &mut out,
+            "  recipient: {} ({})",
+            g.recipient_id,
+            g.recipient_kind.as_str()
+        )
+        .unwrap();
+        writeln!(&mut out, "  profile:   {}", g.recipient_profile.as_str()).unwrap();
+        writeln!(&mut out, "  version:   {}", g.version).unwrap();
+        writeln!(&mut out, "  created:   {}", g.created_at).unwrap();
+        writeln!(&mut out, "  updated:   {}", g.updated_at).unwrap();
+        if let Some(exp) = g.expires_at {
+            writeln!(&mut out, "  expires:   {}", exp).unwrap();
+        }
+        if let Some(ru) = g.renewable_until {
+            writeln!(&mut out, "  renewable_until: {}", ru).unwrap();
+        }
+        if let Some(rev) = g.revoked_at {
+            writeln!(&mut out, "  revoked:   {}", rev).unwrap();
+        }
+        if let Some(ref reason) = g.revoked_reason {
+            writeln!(&mut out, "  reason:    {}", reason).unwrap();
+        }
+        if let Some(lu) = g.last_used_at {
+            writeln!(&mut out, "  last_used: {}", lu).unwrap();
+        }
+
+        if !g.capabilities.is_empty() {
+            writeln!(&mut out, "  capabilities:").unwrap();
+            for cap in &g.capabilities {
+                writeln!(&mut out, "    - {}", format_capability(cap)).unwrap();
+            }
+        }
+
+        if detail.linked_artifact_count > 0 {
+            writeln!(&mut out, "  linked artifacts: {}", detail.linked_artifact_count).unwrap();
+        }
+
+        if !detail.history.is_empty() {
+            writeln!(&mut out, "  history:").unwrap();
+            for entry in &detail.history {
+                let note_suffix = entry
+                    .note
+                    .as_deref()
+                    .map(|n| format!(" — {n}"))
+                    .unwrap_or_default();
+                writeln!(
+                    &mut out,
+                    "    v{} {} at {}{}",
+                    entry.version, entry.action, entry.timestamp, note_suffix
+                )
+                .unwrap();
+            }
+        }
+
+        out
+    }
+
+    fn render_recipient_detail(
+        &self,
+        recipient_id: &str,
+        kind: &str,
+        grants: &[core_types::AccessGrantSummary],
+    ) -> String {
+        let mut out = String::new();
+        writeln!(&mut out, "Recipient {} ({})", recipient_id, kind).unwrap();
+        if grants.is_empty() {
+            writeln!(&mut out, "  No grants for this recipient.").unwrap();
+            return out;
+        }
+        writeln!(
+            &mut out,
+            "{:<14} {:<14} {:<10} {:<10} {:<10} CAPS",
+            "GRANT", "PERSONA", "STATUS", "MODE", "PROFILE"
+        )
+        .unwrap();
+        for g in grants {
+            let persona_label = self
+                .resolve_persona(&g.issuing_persona_id)
+                .map(|p| p.label.as_str())
+                .unwrap_or(&g.issuing_persona_id);
+            writeln!(
+                &mut out,
+                "{:<14} {:<14} {:<10} {:<10} {:<10} {}",
+                truncate_id(&g.id),
+                persona_label,
+                g.status.as_str(),
+                g.mode.as_str(),
+                g.recipient_profile.as_str(),
+                g.capability_count,
+            )
+            .unwrap();
+        }
+        out
+    }
+
+    fn render_grant_history_timeline(
+        &self,
+        entries: &[core_types::AccessGrantHistoryEntry],
+    ) -> String {
+        if entries.is_empty() {
+            return "No grant history.\n".to_string();
+        }
+        let mut out = String::new();
+        writeln!(&mut out, "Grant history").unwrap();
+        writeln!(
+            &mut out,
+            "{:<14} {:<10} {:<4} {:<12}  NOTE",
+            "GRANT", "ACTION", "VER", "TIMESTAMP"
+        )
+        .unwrap();
+        for entry in entries {
+            let note = entry.note.as_deref().unwrap_or("");
+            writeln!(
+                &mut out,
+                "{:<14} {:<10} v{:<3} {:<12}  {}",
+                truncate_id(&entry.grant_id),
+                entry.action,
+                entry.version,
+                entry.timestamp,
+                note,
+            )
+            .unwrap();
+        }
+        out
     }
 }
