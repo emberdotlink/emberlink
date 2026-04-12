@@ -70,7 +70,7 @@ impl DemoApp {
             owner_kind: core_types::VaultOwnerKind::Persona,
             owner_id: persona.id.clone(),
         };
-        let catalog = match self.event_store.local_vault_catalog(&namespace) {
+        let catalog = match self.app_runtime.store.local_vault_catalog(&namespace) {
             Ok(Some(catalog)) => catalog,
             Ok(None) => {
                 return format!(
@@ -159,7 +159,7 @@ impl DemoApp {
             owner_kind: core_types::VaultOwnerKind::Persona,
             owner_id: persona.id.clone(),
         };
-        let catalog = match self.event_store.local_vault_catalog(&namespace) {
+        let catalog = match self.app_runtime.store.local_vault_catalog(&namespace) {
             Ok(Some(catalog)) => catalog,
             Ok(None) => return "Claim unavailable: persona has no claim catalog\n".to_string(),
             Err(err) => return format!("Failed to load claim catalog: {}\n", err),
@@ -187,7 +187,7 @@ impl DemoApp {
             );
         };
         let payload = match self
-            .event_store
+            .app_runtime.store
             .local_manifest_payload_bytes(&revision.manifest_id)
         {
             Ok(payload) => payload,
@@ -349,7 +349,7 @@ impl DemoApp {
             external_credential_id,
         };
 
-        match self.event_store.upsert_local_persona_credential(
+        match self.app_runtime.store.upsert_local_persona_credential(
             &namespace,
             &object_id,
             &revision_id,
@@ -443,7 +443,7 @@ impl DemoApp {
             owner_kind: core_types::VaultOwnerKind::Persona,
             owner_id: persona.id.clone(),
         };
-        let catalog = match self.event_store.local_vault_catalog(&namespace) {
+        let catalog = match self.app_runtime.store.local_vault_catalog(&namespace) {
             Ok(Some(catalog)) => catalog,
             Ok(None) => {
                 return "Failed to disclose claim: persona has no claim catalog\n".to_string();
@@ -561,7 +561,7 @@ impl DemoApp {
             Ok(namespace) => namespace,
             Err(err) => return format!("Failed to resolve vault namespace: {}\n", err),
         };
-        let catalog = match self.event_store.local_vault_catalog(&namespace) {
+        let catalog = match self.app_runtime.store.local_vault_catalog(&namespace) {
             Ok(Some(catalog)) => catalog,
             Ok(None) => return "Vault record unavailable: namespace is empty\n".to_string(),
             Err(err) => return format!("Failed to load vault catalog: {}\n", err),
@@ -583,7 +583,7 @@ impl DemoApp {
             );
         };
         match self
-            .event_store
+            .app_runtime.store
             .local_manifest_payload_bytes(&revision.manifest_id)
         {
             Ok(payload) => format!(
@@ -635,7 +635,7 @@ impl DemoApp {
         };
         let catalog_manifest_id = generate_random_identifier("vault-catalog");
 
-        match self.event_store.tombstone_local_vault_object(
+        match self.app_runtime.store.tombstone_local_vault_object(
             &namespace,
             &object_id,
             &catalog_manifest_id,
@@ -671,7 +671,7 @@ impl DemoApp {
         let Some(artifact_id) = artifact_id else {
             return usage.to_string();
         };
-        let record = match self.event_store.local_presentation_artifact(&artifact_id) {
+        let record = match self.app_runtime.store.local_presentation_artifact(&artifact_id) {
             Ok(Some(record)) => record,
             Ok(None) => {
                 return format!("Vault artifact unavailable: unknown artifact: {artifact_id}\n");
@@ -679,7 +679,7 @@ impl DemoApp {
             Err(err) => return format!("Failed to load vault artifacts: {}\n", err),
         };
         match self
-            .event_store
+            .app_runtime.store
             .local_manifest_payload_bytes(&record.artifact.manifest_id)
         {
             Ok(payload) => format!(
@@ -770,7 +770,7 @@ impl DemoApp {
             Err(err) => return format!("Failed to resolve vault recipients: {}\n", err),
         };
         let catalog_manifest_id = self
-            .event_store
+            .app_runtime.store
             .plan_local_vault_gc(&namespace)
             .ok()
             .flatten()
@@ -796,7 +796,7 @@ impl DemoApp {
         let payload_manifest_id = generate_random_identifier("vault-manifest");
         let created_at = now_epoch_secs();
 
-        match self.event_store.upsert_local_structured_record(
+        match self.app_runtime.store.upsert_local_structured_record(
             &namespace,
             &object_id,
             &revision_id,
@@ -849,11 +849,11 @@ impl DemoApp {
         };
 
         match self
-            .event_store
+            .app_runtime.store
             .local_received_presentation_artifact(&artifact_id)
         {
             Ok(Some(record)) => {
-                let verification = self.event_store.verify_disclosure_issuer(&record.envelope);
+                let verification = self.app_runtime.store.verify_disclosure_issuer(&record.envelope);
                 format!(
                     "Received Disclosure\n-------------------\nArtifact: {}\nStatus: {}\nVerification: {}\nIssuer: {}\nIssuer key: {}\nRecipient: {}\t{}\nSchema: {}\nManifest: {}\nReceipts: {}\nFirst received: {}\nLast received: {}\nFirst source: {}\t{}\nLast source: {}\t{}\nPayload:\n{}\n",
                     record.envelope.artifact.id,
@@ -957,7 +957,7 @@ impl DemoApp {
             expires_after_secs,
         ) {
             Ok(template) => match self
-                .event_store
+                .app_runtime.store
                 .upsert_local_presentation_template(&template)
             {
                 Ok(()) => {
@@ -1019,7 +1019,7 @@ impl DemoApp {
             return usage.to_string();
         };
 
-        let template = match self.event_store.local_presentation_template(&template_id) {
+        let template = match self.app_runtime.store.local_presentation_template(&template_id) {
             Ok(Some(template)) => template,
             Ok(None) => {
                 return format!(
@@ -1045,7 +1045,7 @@ impl DemoApp {
             },
             None => template.namespace.clone(),
         };
-        let catalog = match self.event_store.local_vault_catalog(&namespace) {
+        let catalog = match self.app_runtime.store.local_vault_catalog(&namespace) {
             Ok(Some(catalog)) => catalog,
             Ok(None) => {
                 return format!(
@@ -1081,7 +1081,7 @@ impl DemoApp {
         let artifact_id = generate_random_identifier("artifact");
         let artifact_manifest_id = generate_random_identifier("manifest-artifact");
 
-        match self.event_store.issue_local_presentation_artifact(
+        match self.app_runtime.store.issue_local_presentation_artifact(
             &namespace,
             &object.latest_revision_id,
             &template_id,
@@ -1155,7 +1155,7 @@ impl DemoApp {
                 );
             }
         };
-        let record = match self.event_store.local_presentation_artifact(&artifact_id) {
+        let record = match self.app_runtime.store.local_presentation_artifact(&artifact_id) {
             Ok(Some(record)) => record,
             Ok(None) => {
                 return format!(
@@ -1226,7 +1226,7 @@ impl DemoApp {
             return usage.to_string();
         };
 
-        let record = match self.event_store.local_presentation_artifact(&artifact_id) {
+        let record = match self.app_runtime.store.local_presentation_artifact(&artifact_id) {
             Ok(Some(record)) => record,
             Ok(None) => {
                 return format!(
@@ -1239,7 +1239,7 @@ impl DemoApp {
         let issuer_ref = match issuer_ref {
             Some(issuer_ref) => issuer_ref,
             None => match self
-                .event_store
+                .app_runtime.store
                 .default_local_presentation_artifact_issuer_persona_id(&record.artifact.id)
             {
                 Ok(Some(persona_id)) => persona_id,
@@ -1339,12 +1339,12 @@ impl DemoApp {
             Err(err) => return format!("Failed to read disclosure artifact export: {}\n", err),
         };
         if let Err(err) = self
-            .event_store
+            .app_runtime.store
             .validate_received_presentation_artifact(&envelope)
         {
             return format!("Failed to import disclosure artifact export: {}\n", err);
         }
-        match self.event_store.receive_presentation_artifact(
+        match self.app_runtime.store.receive_presentation_artifact(
             &envelope,
             core_state::ReceivedDisclosureSourceKind::ExportFile,
             &file_path,
@@ -1393,12 +1393,12 @@ impl DemoApp {
             );
         }
         if let Err(err) = self
-            .event_store
+            .app_runtime.store
             .validate_received_presentation_artifact(&envelope)
         {
             return format!("Failed to import disclosure message: {}\n", err);
         }
-        match self.event_store.receive_presentation_artifact(
+        match self.app_runtime.store.receive_presentation_artifact(
             &envelope,
             core_state::ReceivedDisclosureSourceKind::Message,
             &message_id,
@@ -1420,7 +1420,7 @@ impl DemoApp {
         let mut imported = 0;
         let cursor = self.disclosure_import_cursor;
         let new_messages: Vec<_> = self
-            .event_store
+            .app_runtime.store
             .events_of_type(core_types::EventType::MessageSent)
             .skip(cursor)
             .collect();
@@ -1450,7 +1450,7 @@ impl DemoApp {
 
         for (message_id, envelope) in candidates {
             if self
-                .event_store
+                .app_runtime.store
                 .local_received_presentation_artifact(&envelope.artifact.id)
                 .ok()
                 .flatten()
@@ -1459,14 +1459,14 @@ impl DemoApp {
                 continue;
             }
             if self
-                .event_store
+                .app_runtime.store
                 .validate_received_presentation_artifact(&envelope)
                 .is_err()
             {
                 continue;
             }
             if self
-                .event_store
+                .app_runtime.store
                 .receive_presentation_artifact(
                     &envelope,
                     core_state::ReceivedDisclosureSourceKind::Message,
@@ -1486,7 +1486,7 @@ impl DemoApp {
         message_ref: &str,
     ) -> Option<(String, String, core_storage::PresentationArtifactEnvelope)> {
         for event in self
-            .event_store
+            .app_runtime.store
             .events_of_type_rev(core_types::EventType::MessageSent)
         {
             if let EventBody::MessageSent(body) = &event.body {
@@ -1543,7 +1543,7 @@ impl DemoApp {
         };
 
         // Look up the artifact to find the issuer persona
-        let record = match self.event_store.local_presentation_artifact(&artifact_id) {
+        let record = match self.app_runtime.store.local_presentation_artifact(&artifact_id) {
             Ok(Some(record)) => record,
             Ok(None) => {
                 return format!("Failed to revoke disclosure: unknown artifact: {artifact_id}\n");
@@ -1552,7 +1552,7 @@ impl DemoApp {
         };
 
         // Check not already revoked
-        if self.event_store.is_disclosure_revoked(&artifact_id) {
+        if self.app_runtime.store.is_disclosure_revoked(&artifact_id) {
             return format!("Disclosure artifact {artifact_id} is already revoked\n");
         }
 
@@ -1563,7 +1563,7 @@ impl DemoApp {
                     .to_string()
             }
         };
-        let persona = match self.event_store.materialized().persona(&issuer_persona_id) {
+        let persona = match self.app_runtime.store.materialized().persona(&issuer_persona_id) {
             Some(persona) => persona.clone(),
             None => {
                 return format!(
@@ -1774,7 +1774,7 @@ impl DemoApp {
             Err(err) => return format!("Failed to resolve vault recipients: {}\n", err),
         };
         let catalog_manifest_id = self
-            .event_store
+            .app_runtime.store
             .plan_local_vault_gc(&namespace)
             .ok()
             .flatten()
@@ -1791,7 +1791,7 @@ impl DemoApp {
         let payload_manifest_id = generate_random_identifier("vault-manifest");
         let created_at = now_epoch_secs();
 
-        match self.event_store.store_local_file(
+        match self.app_runtime.store.store_local_file(
             &namespace,
             &object_id,
             &revision_id,
@@ -1856,7 +1856,7 @@ impl DemoApp {
             Ok(namespace) => namespace,
             Err(err) => return format!("Failed to resolve vault namespace: {}\n", err),
         };
-        let catalog = match self.event_store.local_vault_catalog(&namespace) {
+        let catalog = match self.app_runtime.store.local_vault_catalog(&namespace) {
             Ok(Some(catalog)) => catalog,
             Ok(None) => return "Export failed: namespace is empty\n".to_string(),
             Err(err) => return format!("Failed to load vault catalog: {}\n", err),
@@ -1878,7 +1878,7 @@ impl DemoApp {
             );
         };
         let payload_bytes = match self
-            .event_store
+            .app_runtime.store
             .local_manifest_payload_bytes(&revision.manifest_id)
         {
             Ok(bytes) => bytes,
@@ -1890,14 +1890,14 @@ impl DemoApp {
             // The payload is [header_chunk, file_content_chunk...]
             // Header format: "emberlink-file-header\nfilename=...\n"
             // We need to split on the header boundary
-            let manifest = match self.event_store.local_file_manifest(&revision.manifest_id) {
+            let manifest = match self.app_runtime.store.local_file_manifest(&revision.manifest_id) {
                 Ok(Some(m)) => m,
                 _ => return "Export failed: cannot load manifest\n".to_string(),
             };
             if manifest.chunks.len() >= 2 {
                 // Re-read just the file content chunks (skip first chunk which is the header)
                 match self
-                    .event_store
+                    .app_runtime.store
                     .local_manifest_payload_chunks(&revision.manifest_id)
                 {
                     Ok(chunks) if chunks.len() >= 2 => {
@@ -1991,7 +1991,7 @@ impl DemoApp {
             created_at: now_epoch_secs(),
         };
 
-        match self.event_store.upsert_service_binding(&binding) {
+        match self.app_runtime.store.upsert_service_binding(&binding) {
             Ok(()) => format!(
                 "bound service\t{}\t{}\t{}\t{}\n",
                 binding_id, persona_id, adapter_kind, external_account_id
@@ -2020,12 +2020,12 @@ impl DemoApp {
                 Ok(p) => p,
                 Err(err) => return format!("Failed to resolve persona: {}\n", err),
             };
-            match self.event_store.service_bindings_for_persona(&persona.id) {
+            match self.app_runtime.store.service_bindings_for_persona(&persona.id) {
                 Ok(b) => b,
                 Err(err) => return format!("Failed to load service bindings: {}\n", err),
             }
         } else {
-            match self.event_store.service_bindings() {
+            match self.app_runtime.store.service_bindings() {
                 Ok(b) => b,
                 Err(err) => return format!("Failed to load service bindings: {}\n", err),
             }
@@ -2077,7 +2077,7 @@ impl DemoApp {
             return usage.to_string();
         };
 
-        match self.event_store.delete_service_binding(&binding_id) {
+        match self.app_runtime.store.delete_service_binding(&binding_id) {
             Ok(true) => format!("unbound service\t{}\n", binding_id),
             Ok(false) => format!("Service binding not found: {}\n", binding_id),
             Err(err) => format!("Failed to unbind service: {}\n", err),
@@ -2209,7 +2209,7 @@ impl DemoApp {
                 external_credential_id: None,
             };
 
-            match self.event_store.upsert_local_persona_credential(
+            match self.app_runtime.store.upsert_local_persona_credential(
                 &namespace,
                 &object_id,
                 &revision_id,
@@ -2356,7 +2356,7 @@ impl DemoApp {
             created_at: now_epoch_secs(),
         };
 
-        match self.event_store.upsert_service_binding(&binding) {
+        match self.app_runtime.store.upsert_service_binding(&binding) {
             Ok(()) => {
                 use std::fmt::Write;
                 let mut out = String::new();
@@ -2414,7 +2414,7 @@ impl DemoApp {
             None => None,
         };
 
-        let bindings = match self.event_store.service_bindings() {
+        let bindings = match self.app_runtime.store.service_bindings() {
             Ok(b) => b,
             Err(err) => return format!("Failed to load bindings: {}\n", err),
         };
@@ -2486,7 +2486,7 @@ impl DemoApp {
             return usage.to_string();
         };
 
-        let bindings = match self.event_store.service_bindings() {
+        let bindings = match self.app_runtime.store.service_bindings() {
             Ok(b) => b,
             Err(err) => return format!("Failed to load bindings: {}\n", err),
         };
@@ -2561,7 +2561,7 @@ impl DemoApp {
             external_account_id: serde_json::to_string(&meta).unwrap_or_default(),
             ..binding
         };
-        if let Err(err) = self.event_store.upsert_service_binding(&updated_binding) {
+        if let Err(err) = self.app_runtime.store.upsert_service_binding(&updated_binding) {
             return format!("Warning: failed to update sign count: {}\n", err);
         }
 
@@ -2624,7 +2624,7 @@ impl DemoApp {
             return usage.to_string();
         };
 
-        match self.event_store.delete_service_binding(&binding_id) {
+        match self.app_runtime.store.delete_service_binding(&binding_id) {
             Ok(true) => format!("removed passkey\t{}\n", binding_id),
             Ok(false) => format!("Passkey binding not found: {}\n", binding_id),
             Err(err) => format!("Failed to remove passkey: {}\n", err),

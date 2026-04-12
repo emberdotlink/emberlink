@@ -117,16 +117,26 @@ impl fmt::Display for SchemaVersion {
 
 pub(crate) mod encoding;
 mod events;
+mod grant_link;
 mod identity;
 mod network;
+pub mod approval;
+pub mod credential_delivery;
+pub mod grant_conditions;
+pub mod qr_encoding;
 mod recovery;
 pub(crate) mod storage;
 mod trust;
 
 pub use encoding::{bytes_to_hex, decode_hex_nibble, hex_to_bytes};
 pub use events::*;
+pub use grant_link::GrantLink;
 pub use identity::*;
 pub use network::*;
+pub use qr_encoding::{
+    QrError, QR_MAX_ALPHANUMERIC_CHARS, QR_PREFIX, SealedOffer, decode_sealed_offer,
+    encode_sealed_offer,
+};
 pub use recovery::*;
 pub use storage::*;
 pub use trust::*;
@@ -586,7 +596,7 @@ mod tests {
                 service_label: "GitHub".into(),
                 endpoint: "https://github.com".into(),
             },
-            external_account_id: "operator".into(),
+            external_account_id: "alice".into(),
             created_at: 100,
         };
 
@@ -602,7 +612,7 @@ mod tests {
     fn imported_claim_requires_json_object_and_external_issuer() {
         let claim = ImportedClaim {
             claim_type: "service-issued".into(),
-            payload_json: "{\"username\":\"operator\"}".into(),
+            payload_json: "{\"username\":\"alice\"}".into(),
             external_issuer: String::new(),
             external_issued_at: Some(10),
             external_expires_at: Some(20),
@@ -625,7 +635,7 @@ mod tests {
     fn imported_claim_accepts_valid_json_object_payload() {
         let claim = ImportedClaim {
             claim_type: "service-issued".into(),
-            payload_json: "{\"username\":\"operator\",\"password\":\"secret\"}".into(),
+            payload_json: "{\"username\":\"alice\",\"password\":\"secret\"}".into(),
             external_issuer: "1password".into(),
             external_issued_at: Some(10),
             external_expires_at: Some(20),
@@ -1416,6 +1426,80 @@ mod proptest_canonical {
                         reason,
                     })
                 }),
+            // Grant exchange events
+            (
+                any::<String>(),
+                any::<String>(),
+                any::<String>(),
+                any::<String>(),
+                proptest::option::of(any::<String>()),
+                any::<u64>()
+            )
+                .prop_map(|(oid, issuer, ek, payload, relay, exp)| {
+                    EventBody::GrantOfferCreated(GrantOfferCreatedEvent {
+                        offer_id: oid,
+                        issuer_persona_id: issuer,
+                        ephemeral_public_key_hex: ek,
+                        sealed_payload_hex: payload,
+                        relay_hint: relay,
+                        expires_at: exp,
+                        conditions_json: String::new(),
+                    })
+                }),
+            (
+                any::<String>(),
+                any::<String>(),
+                any::<String>(),
+                any::<u64>()
+            )
+                .prop_map(|(oid, recipient, response, claimed)| {
+                    EventBody::GrantOfferClaimed(GrantOfferClaimedEvent {
+                        offer_id: oid,
+                        recipient_persona_id: recipient,
+                        claim_response_hex: response,
+                        claimed_at: claimed,
+                    })
+                }),
+            (any::<String>(), any::<String>(), any::<String>()).prop_map(|(oid, issuer, reason)| {
+                EventBody::GrantOfferRevoked(GrantOfferRevokedEvent {
+                    offer_id: oid,
+                    issuer_persona_id: issuer,
+                    reason,
+                })
+            }),
+            // Badge events
+            (
+                any::<String>(),
+                any::<String>(),
+                any::<String>(),
+                any::<String>(),
+                any::<String>(),
+                proptest::option::of((any::<String>(), any::<String>())),
+                any::<u64>(),
+                proptest::option::of(any::<u64>())
+            )
+                .prop_map(|(bid, issuer, recipient, btype, dname, evidence, issued, expires)| {
+                    EventBody::BadgeIssued(BadgeIssuedEvent {
+                        badge_id: bid,
+                        issuer_persona_id: issuer,
+                        recipient_persona_id: recipient,
+                        badge_type: btype,
+                        display_name: dname,
+                        evidence: evidence.map(|(et, ph)| BadgeEvidence {
+                            evidence_type: et,
+                            payload_hex: ph,
+                        }),
+                        issued_at: issued,
+                        expires_at: expires,
+                    })
+                }),
+            (any::<String>(), any::<String>(), any::<String>()).prop_map(|(bid, revoker, reason)| {
+                EventBody::BadgeRevoked(BadgeRevokedEvent {
+                    badge_id: bid,
+                    revoker_persona_id: revoker,
+                    reason,
+                })
+            }),
         ]
     }
 

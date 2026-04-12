@@ -1,4 +1,6 @@
-use std::collections::BTreeSet;
+pub mod queries;
+
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use core_crypto::Signer;
 use core_events::EventEnvelope;
@@ -6,6 +8,469 @@ use core_types::{
     DerivedTrustStatement, EventBody, EventRefRelation, SignerBinding, TrustAttestation,
     TrustAttestedEvent, TrustExplanation, TrustRevokedEvent, TrustThreshold,
 };
+
+// ---------------------------------------------------------------------------
+// Badge authority weighting (design)
+// ---------------------------------------------------------------------------
+
+/// Default maximum trust graph traversal depth for authority weighting.
+pub const DEFAULT_MAX_DEPTH: u32 = 3;
+
+/// Authority weight scores for a badge as seen from a specific viewer's trust graph.
+///
+/// All sub-scores are normalized to `[0.0, 1.0]`. `total` is a weighted combination.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BadgeWeight {
+    /// Score based on how many identities in the trust graph recognize this issuer.
+    /// Normalized: `convergence_count / first_degree_peer_count` (capped at 1.0).
+    pub convergence_score: f32,
+    /// How many first-degree peers have a trust edge toward the issuer.
+    pub convergence_count: u32,
+    /// Score based on shortest path from viewer to issuer (1.0 = direct, 0.0 = beyond max depth).
+    pub distance_score: f32,
+    /// Shortest path in hops from viewer to issuer. `None` means unreachable within max depth.
+    pub graph_distance: Option<u32>,
+    /// Score based on the issuer's inbound trust signals relative to badges issued.
+    /// High issue-to-trust ratio signals spam; balanced ratio signals reputation.
+    pub issuer_score: f32,
+    /// Inbound trust attestations pointing at the issuer.
+    pub issuer_inbound_trust_count: u32,
+    /// Total badges the issuer has issued (across all recipients).
+    pub issuer_badges_issued: u32,
+    /// Weighted combination of all sub-scores. Range: `[0.0, 1.0]`.
+    pub total: f32,
+}
+
+/// Input data for badge authority weight computation.
+/// Passed as a single struct to keep the pure function signature clean.
+pub struct BadgeWeightInput<'a> {
+    /// Persona ID of the badge issuer being evaluated.
+    pub issuer_id: &'a str,
+    /// Persona ID of the viewer computing authority.
+    pub viewer_id: &'a str,
+    /// All trust attestations available in the viewer's local store.
+    pub trust_edges: &'a [TrustAttestation],
+    /// Total number of badges the issuer has issued (supplied by caller from badge store).
+    pub issuer_badges_issued: u32,
+    /// Maximum graph traversal depth. Use [`DEFAULT_MAX_DEPTH`] if unsure.
+    pub max_depth: u32,
+}
+
+/// Compute authority weight for a badge issuer as seen from a viewer's trust graph.
+///
+/// This is a pure function — no I/O, no side effects, deterministic given the same inputs.
+///
+/// # Scoring
+/// - **distance_score**: `1.0` if issuer == viewer, `1/(depth)` for each hop, `0.0` if unreachable.
+/// - **convergence_score**: fraction of first-degree peers who have any trust edge to the issuer.
+/// - **issuer_score**: based on inbound trust signals vs badges issued. High badge volume with few
+///   inbound trust signals signals spam; balanced ratio signals genuine reputation.
+/// - **total**: weighted sum — distance 40%, convergence 40%, issuer reputation 20%.
+pub fn compute_badge_weight(input: &BadgeWeightInput<'_>) -> BadgeWeight {
+    let issuer_id = input.issuer_id;
+    let viewer_id = input.viewer_id;
+    let trust_edges = input.trust_edges;
+    let max_depth = input.max_depth.max(1);
+
+    // --- Graph distance via BFS over trust edges ---
+    // Build adjacency list: attester -> set of subjects they trust
+    let mut adj: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for edge in trust_edges {
+        adj.entry(edge.attester.as_str()).or_default().push(edge.subject.as_str());
+    }
+
+    let graph_distance: Option<u32> = if issuer_id == viewer_id {
+        Some(0)
+    } else {
+        bfs_shortest_path(viewer_id, issuer_id, &adj, max_depth)
+    };
+
+    // If issuer is unreachable within max_depth, all scores are zero.
+    // Authority from an identity you can't reach through your trust graph is meaningless.
+    if graph_distance.is_none() {
+        return BadgeWeight {
+            convergence_score: 0.0,
+            convergence_count: 0,
+            distance_score: 0.0,
+            graph_distance: None,
+            issuer_score: 0.0,
+            issuer_inbound_trust_count: 0,
+            issuer_badges_issued: input.issuer_badges_issued,
+            total: 0.0,
+        };
+    }
+
+    let distance_score: f32 = match graph_distance {
+        Some(0) => 1.0,
+        Some(d) => 1.0 / (d as f32),
+        None => 0.0,
+    };
+
+    // --- Convergence: first-degree peers who have a trust edge to the issuer ---
+    // First-degree peers = identities that viewer directly trusts (one hop)
+    let first_degree_peers: Vec<&str> = adj
+        .get(viewer_id)
+        .map(|v| v.as_slice())
+        .unwrap_or(&[])
+        .to_vec();
+
+    let first_degree_count = first_degree_peers.len() as u32;
+
+    // Among all nodes reachable within max_depth, count those with a trust edge to issuer
+    let reachable = reachable_nodes(viewer_id, &adj, max_depth);
+
+    let convergence_count: u32 = trust_edges
+        .iter()
+        .filter(|e| e.subject == issuer_id && reachable.contains(e.attester.as_str()))
+        .count() as u32;
+
+    let convergence_score: f32 = if first_degree_count == 0 {
+        // No peers at all — convergence is unknowable; treat as neutral (0.5) since issuer is reachable
+        0.5
+    } else {
+        // Normalize by first-degree count, cap at 1.0
+        (convergence_count as f32 / first_degree_count as f32).min(1.0)
+    };
+
+    // --- Issuer reputation: inbound trust signals vs badges issued ---
+    let issuer_inbound_trust_count: u32 = trust_edges
+        .iter()
+        .filter(|e| e.subject == issuer_id)
+        .count() as u32;
+
+    let badges_issued = input.issuer_badges_issued;
+
+    let issuer_score: f32 = compute_issuer_score(issuer_inbound_trust_count, badges_issued);
+
+    // --- Weighted total: distance 40%, convergence 40%, issuer 20% ---
+    let total = (0.40 * distance_score + 0.40 * convergence_score + 0.20 * issuer_score)
+        .clamp(0.0, 1.0);
+
+    BadgeWeight {
+        convergence_score,
+        convergence_count,
+        distance_score,
+        graph_distance,
+        issuer_score,
+        issuer_inbound_trust_count,
+        issuer_badges_issued: badges_issued,
+        total,
+    }
+}
+
+/// BFS to find shortest path length from `start` to `target`, bounded by `max_depth`.
+fn bfs_shortest_path<'a>(
+    start: &'a str,
+    target: &'a str,
+    adj: &BTreeMap<&'a str, Vec<&'a str>>,
+    max_depth: u32,
+) -> Option<u32> {
+    let mut visited: BTreeSet<&str> = BTreeSet::new();
+    let mut queue: VecDeque<(&str, u32)> = VecDeque::new();
+    visited.insert(start);
+    queue.push_back((start, 0));
+
+    while let Some((node, depth)) = queue.pop_front() {
+        if depth >= max_depth {
+            continue;
+        }
+        if let Some(neighbors) = adj.get(node) {
+            for &neighbor in neighbors {
+                if neighbor == target {
+                    return Some(depth + 1);
+                }
+                if !visited.contains(neighbor) {
+                    visited.insert(neighbor);
+                    queue.push_back((neighbor, depth + 1));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Collect all node IDs reachable from `start` within `max_depth` hops.
+fn reachable_nodes<'a>(
+    start: &'a str,
+    adj: &BTreeMap<&'a str, Vec<&'a str>>,
+    max_depth: u32,
+) -> BTreeSet<&'a str> {
+    let mut visited: BTreeSet<&str> = BTreeSet::new();
+    let mut queue: VecDeque<(&str, u32)> = VecDeque::new();
+    visited.insert(start);
+    queue.push_back((start, 0));
+
+    while let Some((node, depth)) = queue.pop_front() {
+        if depth >= max_depth {
+            continue;
+        }
+        if let Some(neighbors) = adj.get(node) {
+            for &neighbor in neighbors {
+                if !visited.contains(neighbor) {
+                    visited.insert(neighbor);
+                    queue.push_back((neighbor, depth + 1));
+                }
+            }
+        }
+    }
+    visited
+}
+
+/// Compute a normalized issuer reputation score from inbound trust signals and badge volume.
+///
+/// - An issuer with many inbound trust signals and moderate badge volume scores high.
+/// - An issuer with zero inbound signals and high badge volume scores low (spam signal).
+/// - A new issuer with no history scores neutral (0.5).
+fn compute_issuer_score(inbound_trust: u32, badges_issued: u32) -> f32 {
+    if inbound_trust == 0 && badges_issued == 0 {
+        // Unknown issuer — neutral
+        return 0.5;
+    }
+    if inbound_trust == 0 {
+        // Issues badges but nobody trusts them
+        return 0.0;
+    }
+    // Ratio: inbound trust / badges issued, capped at 1.0
+    // High trust-to-badge ratio = high quality issuer
+    // Low ratio (spammer) approaches 0
+    let ratio = inbound_trust as f32 / (badges_issued as f32).max(1.0);
+    ratio.min(1.0)
+}
+
+// ---------------------------------------------------------------------------
+// Dispute weighting (design counter-attestation)
+// ---------------------------------------------------------------------------
+
+/// A single dispute to factor into badge authority scoring.
+pub struct DisputeInput<'a> {
+    /// Persona ID of the identity that filed the dispute.
+    pub disputer_id: &'a str,
+}
+
+/// Compute a dispute penalty for a badge, reducing authority based on disputes
+/// from identities in the viewer's trust graph. Closer/more-trusted disputers
+/// carry more weight.
+///
+/// Returns a penalty in `[0.0, 1.0]` — subtract from or multiply against the badge weight total.
+/// - 0.0 = no disputes or all disputers are unreachable
+/// - 1.0 = maximum penalty (many close disputers)
+pub fn compute_dispute_penalty(
+    viewer_id: &str,
+    disputes: &[DisputeInput<'_>],
+    trust_edges: &[TrustAttestation],
+    max_depth: u32,
+) -> f32 {
+    if disputes.is_empty() {
+        return 0.0;
+    }
+
+    let max_depth = max_depth.max(1);
+
+    // Build adjacency list
+    let mut adj: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for edge in trust_edges {
+        adj.entry(edge.attester.as_str())
+            .or_default()
+            .push(edge.subject.as_str());
+    }
+
+    // For each dispute, compute a weight based on graph distance from viewer to disputer.
+    // Close disputers (distance=1) contribute more penalty than distant ones.
+    let mut total_weight: f32 = 0.0;
+
+    for dispute in disputes {
+        let distance = if dispute.disputer_id == viewer_id {
+            Some(0)
+        } else {
+            bfs_shortest_path(viewer_id, dispute.disputer_id, &adj, max_depth)
+        };
+
+        match distance {
+            Some(0) => total_weight += 1.0,      // viewer themselves disputes
+            Some(1) => total_weight += 0.8,      // direct peer disputes
+            Some(2) => total_weight += 0.4,      // two hops away
+            Some(d) => total_weight += 1.0 / (d as f32), // diminishing
+            None => {}                           // unreachable = no weight
+        }
+    }
+
+    // Normalize: cap penalty at 1.0. A single close dispute can cause significant penalty,
+    // multiple distant disputes accumulate.
+    total_weight.min(1.0)
+}
+
+/// Adjust a badge weight total by applying the dispute penalty.
+/// Returns the adjusted total, clamped to `[0.0, 1.0]`.
+pub fn apply_dispute_penalty(badge_weight_total: f32, dispute_penalty: f32) -> f32 {
+    (badge_weight_total * (1.0 - dispute_penalty)).clamp(0.0, 1.0)
+}
+
+// ---------------------------------------------------------------------------
+// Badge-gated grant condition evaluation
+// ---------------------------------------------------------------------------
+
+/// Input for evaluating badge-gated grant conditions.
+pub struct BadgeGateInput<'a> {
+    /// Persona ID of the grant issuer (viewer for trust graph).
+    pub issuer_persona_id: &'a str,
+    /// Persona ID of the claimant whose badges are checked.
+    pub claimant_persona_id: &'a str,
+    /// All badges held by the claimant (active, non-revoked, non-expired).
+    pub claimant_badges: &'a [ClaimantBadge<'a>],
+    /// Trust edges available in the issuer's local store.
+    pub trust_edges: &'a [TrustAttestation],
+    /// Badge issuance counts per issuer persona, for issuer_score computation.
+    /// Key: issuer persona ID, Value: total badges issued by that persona.
+    pub issuer_badge_counts: &'a std::collections::BTreeMap<String, u32>,
+    /// Maximum graph traversal depth. Use [`DEFAULT_MAX_DEPTH`] if unsure.
+    pub max_depth: u32,
+}
+
+/// A badge held by the claimant, with enough metadata for gate evaluation.
+pub struct ClaimantBadge<'a> {
+    pub badge_type: &'a str,
+    pub issuer_persona_id: &'a str,
+}
+
+/// Result of evaluating a single `GrantCondition` against a claimant.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConditionResult {
+    /// The condition is satisfied.
+    Met,
+    /// The condition is not satisfied, with a human-readable reason.
+    Unmet(String),
+}
+
+impl ConditionResult {
+    pub fn is_met(&self) -> bool {
+        matches!(self, Self::Met)
+    }
+}
+
+/// Evaluate a list of grant conditions against a claimant's badges.
+///
+/// Returns `Met` only if ALL conditions are satisfied. On first failure,
+/// returns `Unmet` with the reason.
+pub fn evaluate_grant_conditions(
+    conditions: &[core_types::grant_conditions::GrantCondition],
+    input: &BadgeGateInput<'_>,
+) -> ConditionResult {
+    if conditions.is_empty() {
+        return ConditionResult::Met;
+    }
+    for condition in conditions {
+        let result = evaluate_single_condition(condition, input);
+        if !result.is_met() {
+            return result;
+        }
+    }
+    ConditionResult::Met
+}
+
+fn evaluate_single_condition(
+    condition: &core_types::grant_conditions::GrantCondition,
+    input: &BadgeGateInput<'_>,
+) -> ConditionResult {
+    use core_types::grant_conditions::GrantCondition;
+
+    match condition {
+        GrantCondition::BadgeGate {
+            badge_type,
+            min_convergence,
+            max_distance,
+            min_authority,
+        } => {
+            // Find matching badges held by the claimant.
+            let matching_badges: Vec<_> = input
+                .claimant_badges
+                .iter()
+                .filter(|b| b.badge_type == badge_type)
+                .collect();
+
+            if matching_badges.is_empty() {
+                return ConditionResult::Unmet(format!(
+                    "claimant does not hold badge of type '{badge_type}'"
+                ));
+            }
+
+            // Check if ANY matching badge satisfies all threshold requirements.
+            for badge in &matching_badges {
+                let badges_issued = input
+                    .issuer_badge_counts
+                    .get(badge.issuer_persona_id)
+                    .copied()
+                    .unwrap_or(0);
+
+                let weight = compute_badge_weight(&BadgeWeightInput {
+                    issuer_id: badge.issuer_persona_id,
+                    viewer_id: input.issuer_persona_id,
+                    trust_edges: input.trust_edges,
+                    issuer_badges_issued: badges_issued,
+                    max_depth: input.max_depth,
+                });
+
+                // Check convergence threshold.
+                if let Some(min_c) = min_convergence
+                    && (weight.convergence_score as f64) < *min_c
+                {
+                    continue; // try next matching badge
+                }
+
+                // Check distance threshold.
+                if let Some(max_d) = max_distance {
+                    match weight.graph_distance {
+                        Some(d) if d <= *max_d => {}
+                        _ => continue, // unreachable or too far
+                    }
+                }
+
+                // Check authority threshold.
+                if let Some(min_a) = min_authority
+                    && (weight.total as f64) < *min_a
+                {
+                    continue;
+                }
+
+                // All thresholds met for this badge.
+                return ConditionResult::Met;
+            }
+
+            // No matching badge met all thresholds.
+            ConditionResult::Unmet(format!(
+                "badge '{badge_type}' held but does not meet threshold requirements"
+            ))
+        }
+
+        GrantCondition::All(sub_conditions) => {
+            for sub in sub_conditions {
+                let result = evaluate_single_condition(sub, input);
+                if !result.is_met() {
+                    return result;
+                }
+            }
+            ConditionResult::Met
+        }
+
+        GrantCondition::Any(sub_conditions) => {
+            if sub_conditions.is_empty() {
+                return ConditionResult::Met;
+            }
+            let mut last_reason = String::new();
+            for sub in sub_conditions {
+                let result = evaluate_single_condition(sub, input);
+                if result.is_met() {
+                    return ConditionResult::Met;
+                }
+                if let ConditionResult::Unmet(reason) = result {
+                    last_reason = reason;
+                }
+            }
+            ConditionResult::Unmet(format!(
+                "none of the alternatives were satisfied: {last_reason}"
+            ))
+        }
+    }
+}
 
 pub fn trust_attested_event(
     event_id: impl Into<String>,
@@ -348,5 +813,361 @@ mod tests {
         assert_eq!(attested.event_type, EventType::TrustAttested);
         assert_eq!(revoked.event_type, EventType::TrustRevoked);
         assert_eq!(revoked.refs.len(), 1);
+    }
+
+    // --- Badge weight tests ---
+
+    fn make_edge(attester: &str, subject: &str) -> TrustAttestation {
+        TrustAttestation {
+            id: format!("edge:{attester}:{subject}"),
+            attester: attester.to_string(),
+            subject: subject.to_string(),
+            domain: "general".to_string(),
+            score: 1.0,
+            recipient_bound: None,
+        }
+    }
+
+    #[test]
+    fn badge_weight_direct_trust_scores_high() {
+        // viewer directly trusts issuer
+        let edges = vec![make_edge("viewer", "issuer")];
+        let weight = compute_badge_weight(&BadgeWeightInput {
+            issuer_id: "issuer",
+            viewer_id: "viewer",
+            trust_edges: &edges,
+            issuer_badges_issued: 5,
+            max_depth: DEFAULT_MAX_DEPTH,
+        });
+
+        assert_eq!(weight.graph_distance, Some(1));
+        assert!((weight.distance_score - 1.0).abs() < 0.01);
+        assert!(weight.total > 0.5, "direct trust should score above 0.5");
+    }
+
+    #[test]
+    fn badge_weight_issuer_equals_viewer_distance_zero() {
+        let edges: Vec<TrustAttestation> = vec![];
+        let weight = compute_badge_weight(&BadgeWeightInput {
+            issuer_id: "alice",
+            viewer_id: "alice",
+            trust_edges: &edges,
+            issuer_badges_issued: 0,
+            max_depth: DEFAULT_MAX_DEPTH,
+        });
+
+        assert_eq!(weight.graph_distance, Some(0));
+        assert!((weight.distance_score - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn badge_weight_two_hop_path() {
+        // viewer -> peer -> issuer
+        let edges = vec![make_edge("viewer", "peer"), make_edge("peer", "issuer")];
+        let weight = compute_badge_weight(&BadgeWeightInput {
+            issuer_id: "issuer",
+            viewer_id: "viewer",
+            trust_edges: &edges,
+            issuer_badges_issued: 2,
+            max_depth: DEFAULT_MAX_DEPTH,
+        });
+
+        assert_eq!(weight.graph_distance, Some(2));
+        assert!((weight.distance_score - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn badge_weight_unreachable_issuer_distance_score_zero() {
+        let edges = vec![make_edge("viewer", "peer")];
+        let weight = compute_badge_weight(&BadgeWeightInput {
+            issuer_id: "stranger",
+            viewer_id: "viewer",
+            trust_edges: &edges,
+            issuer_badges_issued: 100,
+            max_depth: DEFAULT_MAX_DEPTH,
+        });
+
+        assert_eq!(weight.graph_distance, None);
+        assert!((weight.distance_score - 0.0).abs() < f32::EPSILON);
+        assert_eq!(weight.total, 0.0);
+    }
+
+    #[test]
+    fn badge_weight_convergence_multiple_peers_trust_issuer() {
+        // viewer trusts peer_a and peer_b; both trust issuer
+        let edges = vec![
+            make_edge("viewer", "peer_a"),
+            make_edge("viewer", "peer_b"),
+            make_edge("peer_a", "issuer"),
+            make_edge("peer_b", "issuer"),
+        ];
+        let weight = compute_badge_weight(&BadgeWeightInput {
+            issuer_id: "issuer",
+            viewer_id: "viewer",
+            trust_edges: &edges,
+            issuer_badges_issued: 10,
+            max_depth: DEFAULT_MAX_DEPTH,
+        });
+
+        // Both first-degree peers trust issuer -> convergence_count = 2, first_degree = 2
+        assert_eq!(weight.convergence_count, 2);
+        assert!((weight.convergence_score - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn badge_weight_issuer_score_spam_signal() {
+        // Issuer has zero inbound trust and high badge count → spam signal
+        let edges: Vec<TrustAttestation> = vec![make_edge("viewer", "issuer")];
+        let weight = compute_badge_weight(&BadgeWeightInput {
+            issuer_id: "issuer",
+            viewer_id: "viewer",
+            trust_edges: &edges,
+            issuer_badges_issued: 10000,
+            max_depth: DEFAULT_MAX_DEPTH,
+        });
+
+        // inbound_trust = 1 (viewer->issuer), ratio = 1/10000 ≈ 0.0001 → near zero
+        assert!(weight.issuer_score < 0.01);
+    }
+
+    #[test]
+    fn badge_weight_issuer_score_well_trusted() {
+        // Issuer has many inbound trust signals relative to badges issued
+        let mut edges: Vec<TrustAttestation> = Vec::new();
+        for i in 0..5u32 {
+            edges.push(make_edge(&format!("peer_{i}"), "issuer"));
+        }
+        edges.push(make_edge("viewer", "peer_0"));
+
+        let weight = compute_badge_weight(&BadgeWeightInput {
+            issuer_id: "issuer",
+            viewer_id: "viewer",
+            trust_edges: &edges,
+            issuer_badges_issued: 3,
+            max_depth: DEFAULT_MAX_DEPTH,
+        });
+
+        // ratio = 5 inbound / 3 issued = 1.67 → capped at 1.0
+        assert!((weight.issuer_score - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn badge_weight_total_is_weighted_combination() {
+        // Verify the total formula: 40% distance + 40% convergence + 20% issuer
+        let edges = vec![make_edge("viewer", "issuer"), make_edge("other", "issuer")];
+        let weight = compute_badge_weight(&BadgeWeightInput {
+            issuer_id: "issuer",
+            viewer_id: "viewer",
+            trust_edges: &edges,
+            issuer_badges_issued: 1,
+            max_depth: DEFAULT_MAX_DEPTH,
+        });
+
+        let expected_total = (0.40 * weight.distance_score
+            + 0.40 * weight.convergence_score
+            + 0.20 * weight.issuer_score)
+            .clamp(0.0, 1.0);
+        assert!((weight.total - expected_total).abs() < 1e-6);
+    }
+
+    #[test]
+    fn badge_weight_max_depth_limits_traversal() {
+        // issuer is 4 hops away; max_depth=3 → unreachable
+        let edges = vec![
+            make_edge("viewer", "a"),
+            make_edge("a", "b"),
+            make_edge("b", "c"),
+            make_edge("c", "issuer"),
+        ];
+        let weight = compute_badge_weight(&BadgeWeightInput {
+            issuer_id: "issuer",
+            viewer_id: "viewer",
+            trust_edges: &edges,
+            issuer_badges_issued: 1,
+            max_depth: 3,
+        });
+
+        assert_eq!(weight.graph_distance, None);
+        assert_eq!(weight.total, 0.0);
+    }
+
+    // --- Dispute penalty tests ---
+
+    #[test]
+    fn dispute_penalty_no_disputes() {
+        let edges = vec![make_edge("viewer", "issuer")];
+        let penalty = compute_dispute_penalty("viewer", &[], &edges, DEFAULT_MAX_DEPTH);
+        assert!((penalty - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn dispute_penalty_direct_peer_dispute() {
+        let edges = vec![make_edge("viewer", "disputer")];
+        let disputes = vec![DisputeInput { disputer_id: "disputer" }];
+        let penalty = compute_dispute_penalty("viewer", &disputes, &edges, DEFAULT_MAX_DEPTH);
+        // Direct peer: 0.8
+        assert!((penalty - 0.8).abs() < 0.01);
+    }
+
+    #[test]
+    fn dispute_penalty_viewer_self_disputes() {
+        let edges: Vec<TrustAttestation> = vec![];
+        let disputes = vec![DisputeInput { disputer_id: "viewer" }];
+        let penalty = compute_dispute_penalty("viewer", &disputes, &edges, DEFAULT_MAX_DEPTH);
+        // Viewer themselves: 1.0
+        assert!((penalty - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn dispute_penalty_unreachable_disputer() {
+        let edges = vec![make_edge("viewer", "peer")];
+        let disputes = vec![DisputeInput { disputer_id: "stranger" }];
+        let penalty = compute_dispute_penalty("viewer", &disputes, &edges, DEFAULT_MAX_DEPTH);
+        assert!((penalty - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn dispute_penalty_multiple_disputes_accumulate() {
+        let edges = vec![
+            make_edge("viewer", "peer_a"),
+            make_edge("viewer", "peer_b"),
+        ];
+        let disputes = vec![
+            DisputeInput { disputer_id: "peer_a" },
+            DisputeInput { disputer_id: "peer_b" },
+        ];
+        let penalty = compute_dispute_penalty("viewer", &disputes, &edges, DEFAULT_MAX_DEPTH);
+        // Two direct peers: 0.8 + 0.8 = 1.6, capped at 1.0
+        assert!((penalty - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn apply_dispute_penalty_reduces_weight() {
+        let total = 0.8;
+        let penalty = 0.5;
+        let adjusted = apply_dispute_penalty(total, penalty);
+        assert!((adjusted - 0.4).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn apply_dispute_penalty_zero_preserves_weight() {
+        let total = 0.7;
+        let adjusted = apply_dispute_penalty(total, 0.0);
+        assert!((adjusted - 0.7).abs() < f32::EPSILON);
+    }
+
+    // --- Badge-gated grant condition tests ---
+
+    fn badge_gate_input<'a>(
+        issuer: &'a str,
+        claimant: &'a str,
+        badges: &'a [ClaimantBadge<'a>],
+        edges: &'a [TrustAttestation],
+        counts: &'a std::collections::BTreeMap<String, u32>,
+    ) -> BadgeGateInput<'a> {
+        BadgeGateInput {
+            issuer_persona_id: issuer,
+            claimant_persona_id: claimant,
+            claimant_badges: badges,
+            trust_edges: edges,
+            issuer_badge_counts: counts,
+            max_depth: DEFAULT_MAX_DEPTH,
+        }
+    }
+
+    #[test]
+    fn badge_gate_no_conditions_always_met() {
+        let empty_counts = std::collections::BTreeMap::new();
+        let input = badge_gate_input("issuer", "claimant", &[], &[], &empty_counts);
+        let result = evaluate_grant_conditions(&[], &input);
+        assert!(result.is_met());
+    }
+
+    #[test]
+    fn badge_gate_simple_badge_held() {
+        let badges = [ClaimantBadge { badge_type: "verified-dev", issuer_persona_id: "badge-issuer" }];
+        let edges = vec![make_edge("issuer", "badge-issuer")];
+        let mut counts = std::collections::BTreeMap::new();
+        counts.insert("badge-issuer".into(), 5);
+
+        let conditions = vec![core_types::grant_conditions::GrantCondition::badge("verified-dev")];
+        let input = badge_gate_input("issuer", "claimant", &badges, &edges, &counts);
+        let result = evaluate_grant_conditions(&conditions, &input);
+        assert!(result.is_met());
+    }
+
+    #[test]
+    fn badge_gate_badge_not_held() {
+        let conditions = vec![core_types::grant_conditions::GrantCondition::badge("verified-dev")];
+        let empty_counts = std::collections::BTreeMap::new();
+        let input = badge_gate_input("issuer", "claimant", &[], &[], &empty_counts);
+        let result = evaluate_grant_conditions(&conditions, &input);
+        assert!(!result.is_met());
+        if let ConditionResult::Unmet(reason) = result {
+            assert!(reason.contains("does not hold badge"));
+        }
+    }
+
+    #[test]
+    fn badge_gate_with_distance_threshold() {
+        let badges = [ClaimantBadge { badge_type: "subway-rider", issuer_persona_id: "far-issuer" }];
+        // far-issuer is 3 hops from issuer
+        let edges = vec![
+            make_edge("issuer", "a"),
+            make_edge("a", "b"),
+            make_edge("b", "far-issuer"),
+        ];
+        let mut counts = std::collections::BTreeMap::new();
+        counts.insert("far-issuer".into(), 1);
+
+        // max_distance=2 should fail (issuer is 3 hops away)
+        let conditions = vec![core_types::grant_conditions::GrantCondition::badge_with_thresholds(
+            "subway-rider", None, Some(2), None,
+        )];
+        let input = badge_gate_input("issuer", "claimant", &badges, &edges, &counts);
+        let result = evaluate_grant_conditions(&conditions, &input);
+        assert!(!result.is_met());
+
+        // max_distance=3 should pass
+        let conditions = vec![core_types::grant_conditions::GrantCondition::badge_with_thresholds(
+            "subway-rider", None, Some(3), None,
+        )];
+        let result = evaluate_grant_conditions(&conditions, &input);
+        assert!(result.is_met());
+    }
+
+    #[test]
+    fn badge_gate_all_combinator() {
+        let badges = [
+            ClaimantBadge { badge_type: "verified-dev", issuer_persona_id: "badge-issuer" },
+            ClaimantBadge { badge_type: "subway-rider", issuer_persona_id: "badge-issuer" },
+        ];
+        let edges = vec![make_edge("issuer", "badge-issuer")];
+        let mut counts = std::collections::BTreeMap::new();
+        counts.insert("badge-issuer".into(), 2);
+
+        let conditions = vec![core_types::grant_conditions::GrantCondition::All(vec![
+            core_types::grant_conditions::GrantCondition::badge("verified-dev"),
+            core_types::grant_conditions::GrantCondition::badge("subway-rider"),
+        ])];
+        let input = badge_gate_input("issuer", "claimant", &badges, &edges, &counts);
+        let result = evaluate_grant_conditions(&conditions, &input);
+        assert!(result.is_met());
+    }
+
+    #[test]
+    fn badge_gate_any_combinator() {
+        let badges = [ClaimantBadge { badge_type: "subway-rider", issuer_persona_id: "badge-issuer" }];
+        let edges = vec![make_edge("issuer", "badge-issuer")];
+        let mut counts = std::collections::BTreeMap::new();
+        counts.insert("badge-issuer".into(), 1);
+
+        let conditions = vec![core_types::grant_conditions::GrantCondition::Any(vec![
+            core_types::grant_conditions::GrantCondition::badge("verified-dev"),
+            core_types::grant_conditions::GrantCondition::badge("subway-rider"),
+        ])];
+        let input = badge_gate_input("issuer", "claimant", &badges, &edges, &counts);
+        let result = evaluate_grant_conditions(&conditions, &input);
+        assert!(result.is_met());
     }
 }

@@ -1,5 +1,8 @@
 [workspace]
 members = [
+    "crates/emberlink-agent",
+    "crates/emberlink-mcp",
+    "crates/emberlink-app",
     "crates/emberlink-cli",
     "crates/emberlink-relay",
     "crates/core-types",

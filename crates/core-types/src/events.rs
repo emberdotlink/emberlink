@@ -14,6 +14,9 @@ pub enum SubjectKind {
     TrustStatement,
     StorageRelationship,
     Endpoint,
+    GrantOffer,
+    Badge,
+    CredentialDeposit,
     Unknown,
 }
 
@@ -28,6 +31,9 @@ impl SubjectKind {
             Self::TrustStatement => "trust-statement",
             Self::StorageRelationship => "storage-relationship",
             Self::Endpoint => "endpoint",
+            Self::GrantOffer => "grant-offer",
+            Self::Badge => "badge",
+            Self::CredentialDeposit => "credential-deposit",
             Self::Unknown => "unknown",
         }
     }
@@ -42,6 +48,9 @@ impl SubjectKind {
             "trust-statement" => Some(Self::TrustStatement),
             "storage-relationship" => Some(Self::StorageRelationship),
             "endpoint" => Some(Self::Endpoint),
+            "grant-offer" => Some(Self::GrantOffer),
+            "badge" => Some(Self::Badge),
+            "credential-deposit" => Some(Self::CredentialDeposit),
             "unknown" => Some(Self::Unknown),
             _ => None,
         }
@@ -88,6 +97,18 @@ impl EventSubject {
 
     pub fn guardian(guardian_id: impl Into<String>) -> Self {
         Self::new(SubjectKind::Guardian, guardian_id)
+    }
+
+    pub fn grant_offer(offer_id: impl Into<String>) -> Self {
+        Self::new(SubjectKind::GrantOffer, offer_id)
+    }
+
+    pub fn badge(badge_id: impl Into<String>) -> Self {
+        Self::new(SubjectKind::Badge, badge_id)
+    }
+
+    pub fn credential_deposit(deposit_id: impl Into<String>) -> Self {
+        Self::new(SubjectKind::CredentialDeposit, deposit_id)
     }
 
     pub fn unknown(subject_id: impl Into<String>) -> Self {
@@ -465,6 +486,156 @@ pub struct DisclosureRevokedEvent {
     pub reason: String,
 }
 
+// --- Grant exchange events (design) ---
+
+/// A grant offer created by an issuer, ready for a recipient to claim.
+/// The sealed payload contains the proposed grant parameters encrypted
+/// to the ephemeral key. The offer can be deposited at a relay for
+/// async pickup or embedded directly in a QR code for offline exchange.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantOfferCreatedEvent {
+    /// Unique offer identifier. Format: `offer-{ulid}`.
+    pub offer_id: String,
+    /// The persona that created this offer.
+    pub issuer_persona_id: String,
+    /// Hex-encoded ephemeral public key. The sealed payload is encrypted
+    /// to this key; the recipient proves possession of the corresponding
+    /// private key during claim.
+    pub ephemeral_public_key_hex: String,
+    /// Hex-encoded sealed grant payload. Contains the proposed grant
+    /// parameters (scope, mode, capabilities, expiry) encrypted to
+    /// the ephemeral key.
+    pub sealed_payload_hex: String,
+    /// Optional relay endpoint hint for async pickup. Omitted for
+    /// offline/direct exchange.
+    pub relay_hint: Option<String>,
+    /// Expiry timestamp (epoch seconds). After this time, the offer
+    /// is dead and relays may discard it.
+    pub expires_at: u64,
+    /// JSON-encoded grant conditions the claimant must satisfy (e.g., badge gates).
+    /// Empty string or `"[]"` means unconditional.
+    /// Deserialized via [`crate::grant_conditions::GrantCondition`].
+    pub conditions_json: String,
+}
+
+/// A grant offer claimed by a recipient. Establishes the grant
+/// relationship between issuer and recipient.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantOfferClaimedEvent {
+    /// The offer being claimed.
+    pub offer_id: String,
+    /// The persona claiming the offer.
+    pub recipient_persona_id: String,
+    /// Hex-encoded claim response. Contains the recipient's persona
+    /// public key and a signature proving possession of the private key.
+    pub claim_response_hex: String,
+    /// Epoch seconds when the claim was made.
+    pub claimed_at: u64,
+}
+
+/// An unclaimed grant offer revoked by its issuer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantOfferRevokedEvent {
+    /// The offer being revoked.
+    pub offer_id: String,
+    /// The persona that issued (and is now revoking) this offer.
+    pub issuer_persona_id: String,
+    /// Reason for revocation.
+    pub reason: String,
+}
+
+// --- Badge events (design) ---
+
+/// Opaque evidence attached to a badge issuance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BadgeEvidence {
+    /// Freeform evidence type identifier (e.g. "proof-of-ride", "photo-hash").
+    pub evidence_type: String,
+    /// Hex-encoded opaque bytes — interpretation is up to the evidence_type.
+    pub payload_hex: String,
+}
+
+/// A soulbound badge issued from one persona to another.
+/// The badge_type is freeform, namespaced by convention (e.g. "subway:king:A").
+/// Signature lives in the event envelope, not here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BadgeIssuedEvent {
+    pub badge_id: String,
+    pub issuer_persona_id: String,
+    pub recipient_persona_id: String,
+    /// Freeform badge type, namespaced by convention (e.g. "subway:king:A").
+    pub badge_type: String,
+    pub display_name: String,
+    pub evidence: Option<BadgeEvidence>,
+    /// Epoch seconds when the badge was issued.
+    pub issued_at: u64,
+    /// Optional expiry (epoch seconds). None means the badge never expires.
+    pub expires_at: Option<u64>,
+}
+
+/// Revocation of a previously issued badge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BadgeRevokedEvent {
+    pub badge_id: String,
+    pub revoker_persona_id: String,
+    pub reason: String,
+}
+
+/// A dispute attestation targeting a specific badge (design counter-attestation).
+/// Disputes are weighted by the viewer's trust graph — a dispute from a closer/more-trusted
+/// identity reduces badge authority score more than a dispute from a distant identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BadgeDisputedEvent {
+    pub dispute_id: String,
+    pub target_badge_id: String,
+    pub disputer_persona_id: String,
+    /// Freeform reason for the dispute.
+    pub reason: String,
+    /// Optional evidence supporting the dispute (hex-encoded).
+    pub evidence: Option<String>,
+}
+
+// --- Credential delivery events ---
+
+/// Maximum size of encrypted_blocks_json in bytes (1 MB).
+pub const MAX_ENCRYPTED_BLOCKS_JSON_BYTES: usize = 1_048_576;
+
+/// A credential deposited by a grant issuer for a recipient.
+/// The encrypted blocks are stored for async pickup. The deposit_id
+/// is a unique identifier for idempotent replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialDepositedEvent {
+    /// Unique deposit identifier. Format: `deposit-{ulid}`.
+    pub deposit_id: String,
+    /// The grant this deposit fulfills.
+    pub grant_id: String,
+    /// The credential being deposited.
+    pub credential_id: String,
+    /// The persona that issued the grant and is depositing the credential.
+    pub issuer_id: String,
+    /// JSON-encoded encrypted blocks. The relay stores this opaque blob;
+    /// the recipient decrypts using their persona key.
+    pub encrypted_blocks_json: String,
+    /// Epoch seconds when this deposit was created.
+    pub created_at: u64,
+    /// Optional expiry (epoch seconds). None means the deposit never expires.
+    pub expires_at: Option<u64>,
+}
+
+/// Revocation of a previously deposited credential.
+/// The revoker must be the original issuer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialRevokedEvent {
+    /// The deposit being revoked (looked up by grant_id).
+    pub grant_id: String,
+    /// The persona that issued (and is now revoking) this credential.
+    pub revoker_id: String,
+    /// Reason for revocation.
+    pub reason: String,
+    /// Epoch seconds when the revocation occurred.
+    pub revoked_at: u64,
+}
+
 /// A content item published by a persona into the event graph.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContentPublishedEvent {
@@ -512,6 +683,14 @@ pub enum EventBody {
     MessageSent(MessageSentEvent),
     ContentPublished(ContentPublishedEvent),
     DisclosureRevoked(DisclosureRevokedEvent),
+    GrantOfferCreated(GrantOfferCreatedEvent),
+    GrantOfferClaimed(GrantOfferClaimedEvent),
+    GrantOfferRevoked(GrantOfferRevokedEvent),
+    BadgeIssued(BadgeIssuedEvent),
+    BadgeRevoked(BadgeRevokedEvent),
+    BadgeDisputed(BadgeDisputedEvent),
+    CredentialDeposited(CredentialDepositedEvent),
+    CredentialRevoked(CredentialRevokedEvent),
     LegacyOpaque {
         declared_type: EventType,
         subject: EventSubject,
@@ -552,6 +731,14 @@ impl EventBody {
             Self::MessageSent(_) => EventType::MessageSent,
             Self::ContentPublished(_) => EventType::ContentPublished,
             Self::DisclosureRevoked(_) => EventType::DisclosureRevoked,
+            Self::GrantOfferCreated(_) => EventType::GrantOfferCreated,
+            Self::GrantOfferClaimed(_) => EventType::GrantOfferClaimed,
+            Self::GrantOfferRevoked(_) => EventType::GrantOfferRevoked,
+            Self::BadgeIssued(_) => EventType::BadgeIssued,
+            Self::BadgeRevoked(_) => EventType::BadgeRevoked,
+            Self::BadgeDisputed(_) => EventType::BadgeDisputed,
+            Self::CredentialDeposited(_) => EventType::CredentialDeposited,
+            Self::CredentialRevoked(_) => EventType::CredentialRevoked,
             Self::LegacyOpaque { declared_type, .. } => *declared_type,
         }
     }
@@ -598,6 +785,18 @@ impl EventBody {
             Self::MessageSent(body) => EventSubject::persona(body.sender_persona_id.clone()),
             Self::ContentPublished(body) => EventSubject::persona(body.author_persona_id.clone()),
             Self::DisclosureRevoked(body) => EventSubject::persona(body.revoker_persona_id.clone()),
+            Self::GrantOfferCreated(body) => EventSubject::grant_offer(body.offer_id.clone()),
+            Self::GrantOfferClaimed(body) => EventSubject::grant_offer(body.offer_id.clone()),
+            Self::GrantOfferRevoked(body) => EventSubject::grant_offer(body.offer_id.clone()),
+            Self::BadgeIssued(body) => EventSubject::badge(body.badge_id.clone()),
+            Self::BadgeRevoked(body) => EventSubject::badge(body.badge_id.clone()),
+            Self::BadgeDisputed(body) => EventSubject::badge(body.target_badge_id.clone()),
+            Self::CredentialDeposited(body) => {
+                EventSubject::credential_deposit(body.deposit_id.clone())
+            }
+            Self::CredentialRevoked(body) => {
+                EventSubject::credential_deposit(body.grant_id.clone())
+            }
             Self::LegacyOpaque { subject, .. } => subject.clone(),
         }
     }
@@ -858,6 +1057,100 @@ impl EventBody {
                 revoker_persona_id: required_field(&fields, "revoker_persona_id")?,
                 reason: required_field(&fields, "reason")?,
             })),
+            "grant-offer-created" => Ok(Self::GrantOfferCreated(GrantOfferCreatedEvent {
+                offer_id: required_field(&fields, "offer_id")?,
+                issuer_persona_id: required_field(&fields, "issuer_persona_id")?,
+                ephemeral_public_key_hex: required_field(&fields, "ephemeral_public_key_hex")?,
+                sealed_payload_hex: required_field(&fields, "sealed_payload_hex")?,
+                relay_hint: optional_non_empty_field(&fields, "relay_hint"),
+                expires_at: required_field(&fields, "expires_at")?
+                    .parse::<u64>()
+                    .map_err(|_| {
+                        ValidationError::invalid_format("expires_at must be a valid u64")
+                    })?,
+                conditions_json: optional_non_empty_field(&fields, "conditions_json")
+                    .unwrap_or_default(),
+            })),
+            "grant-offer-claimed" => Ok(Self::GrantOfferClaimed(GrantOfferClaimedEvent {
+                offer_id: required_field(&fields, "offer_id")?,
+                recipient_persona_id: required_field(&fields, "recipient_persona_id")?,
+                claim_response_hex: required_field(&fields, "claim_response_hex")?,
+                claimed_at: required_field(&fields, "claimed_at")?
+                    .parse::<u64>()
+                    .map_err(|_| {
+                        ValidationError::invalid_format("claimed_at must be a valid u64")
+                    })?,
+            })),
+            "grant-offer-revoked" => Ok(Self::GrantOfferRevoked(GrantOfferRevokedEvent {
+                offer_id: required_field(&fields, "offer_id")?,
+                issuer_persona_id: required_field(&fields, "issuer_persona_id")?,
+                reason: required_field(&fields, "reason")?,
+            })),
+            "badge-issued" => {
+                let evidence = {
+                    let etype = fields.get("evidence_type").cloned().unwrap_or_default();
+                    let payload = fields.get("evidence_payload_hex").cloned().unwrap_or_default();
+                    if etype.is_empty() && payload.is_empty() {
+                        None
+                    } else {
+                        Some(BadgeEvidence {
+                            evidence_type: etype,
+                            payload_hex: payload,
+                        })
+                    }
+                };
+                Ok(Self::BadgeIssued(BadgeIssuedEvent {
+                    badge_id: required_field(&fields, "badge_id")?,
+                    issuer_persona_id: required_field(&fields, "issuer_persona_id")?,
+                    recipient_persona_id: required_field(&fields, "recipient_persona_id")?,
+                    badge_type: required_field(&fields, "badge_type")?,
+                    display_name: required_field(&fields, "display_name")?,
+                    evidence,
+                    issued_at: required_field(&fields, "issued_at")?
+                        .parse::<u64>()
+                        .map_err(|_| {
+                            ValidationError::invalid_format("issued_at must be a valid u64")
+                        })?,
+                    expires_at: optional_non_empty_field(&fields, "expires_at")
+                        .and_then(|v| v.parse::<u64>().ok()),
+                }))
+            }
+            "badge-revoked" => Ok(Self::BadgeRevoked(BadgeRevokedEvent {
+                badge_id: required_field(&fields, "badge_id")?,
+                revoker_persona_id: required_field(&fields, "revoker_persona_id")?,
+                reason: required_field(&fields, "reason")?,
+            })),
+            "badge-disputed" => Ok(Self::BadgeDisputed(BadgeDisputedEvent {
+                dispute_id: required_field(&fields, "dispute_id")?,
+                target_badge_id: required_field(&fields, "target_badge_id")?,
+                disputer_persona_id: required_field(&fields, "disputer_persona_id")?,
+                reason: required_field(&fields, "reason")?,
+                evidence: optional_non_empty_field(&fields, "evidence"),
+            })),
+            "credential-deposited" => Ok(Self::CredentialDeposited(CredentialDepositedEvent {
+                deposit_id: required_field(&fields, "deposit_id")?,
+                grant_id: required_field(&fields, "grant_id")?,
+                credential_id: required_field(&fields, "credential_id")?,
+                issuer_id: required_field(&fields, "issuer_id")?,
+                encrypted_blocks_json: required_field(&fields, "encrypted_blocks_json")?,
+                created_at: required_field(&fields, "created_at")?
+                    .parse::<u64>()
+                    .map_err(|_| {
+                        ValidationError::invalid_format("created_at must be a valid u64")
+                    })?,
+                expires_at: optional_non_empty_field(&fields, "expires_at")
+                    .and_then(|v| v.parse::<u64>().ok()),
+            })),
+            "credential-revoked" => Ok(Self::CredentialRevoked(CredentialRevokedEvent {
+                grant_id: required_field(&fields, "grant_id")?,
+                revoker_id: required_field(&fields, "revoker_id")?,
+                reason: required_field(&fields, "reason")?,
+                revoked_at: required_field(&fields, "revoked_at")?
+                    .parse::<u64>()
+                    .map_err(|_| {
+                        ValidationError::invalid_format("revoked_at must be a valid u64")
+                    })?,
+            })),
             "legacy-opaque" => Ok(Self::LegacyOpaque {
                 declared_type: EventType::parse(&required_field(&fields, "declared_type")?)
                     .ok_or_else(|| {
@@ -921,6 +1214,14 @@ pub enum EventType {
     RelayShutdownNotice,
     DisclosurePolicyUpdated,
     DisclosureRevoked,
+    GrantOfferCreated,
+    GrantOfferClaimed,
+    GrantOfferRevoked,
+    BadgeIssued,
+    BadgeRevoked,
+    BadgeDisputed,
+    CredentialDeposited,
+    CredentialRevoked,
 }
 
 impl EventType {
@@ -965,6 +1266,14 @@ impl EventType {
             Self::RelayShutdownNotice => "relay_shutdown_notice",
             Self::DisclosurePolicyUpdated => "disclosure_policy_updated",
             Self::DisclosureRevoked => "disclosure_revoked",
+            Self::GrantOfferCreated => "grant_offer_created",
+            Self::GrantOfferClaimed => "grant_offer_claimed",
+            Self::GrantOfferRevoked => "grant_offer_revoked",
+            Self::BadgeIssued => "badge_issued",
+            Self::BadgeRevoked => "badge_revoked",
+            Self::BadgeDisputed => "badge_disputed",
+            Self::CredentialDeposited => "credential_deposited",
+            Self::CredentialRevoked => "credential_revoked",
         }
     }
 
@@ -1009,6 +1318,14 @@ impl EventType {
             "relay_shutdown_notice" => Some(Self::RelayShutdownNotice),
             "disclosure_policy_updated" => Some(Self::DisclosurePolicyUpdated),
             "disclosure_revoked" => Some(Self::DisclosureRevoked),
+            "grant_offer_created" => Some(Self::GrantOfferCreated),
+            "grant_offer_claimed" => Some(Self::GrantOfferClaimed),
+            "grant_offer_revoked" => Some(Self::GrantOfferRevoked),
+            "badge_issued" => Some(Self::BadgeIssued),
+            "badge_revoked" => Some(Self::BadgeRevoked),
+            "badge_disputed" => Some(Self::BadgeDisputed),
+            "credential_deposited" => Some(Self::CredentialDeposited),
+            "credential_revoked" => Some(Self::CredentialRevoked),
             _ => None,
         }
     }
@@ -1076,7 +1393,15 @@ impl EventType {
             | Self::StorageRelationshipCreated
             | Self::StorageManifestPublished
             | Self::DisclosurePolicyUpdated
-            | Self::DisclosureRevoked => RetentionClass::LongLived,
+            | Self::DisclosureRevoked
+            | Self::GrantOfferCreated
+            | Self::GrantOfferClaimed
+            | Self::GrantOfferRevoked
+            | Self::BadgeIssued
+            | Self::BadgeRevoked
+            | Self::BadgeDisputed
+            | Self::CredentialDeposited
+            | Self::CredentialRevoked => RetentionClass::LongLived,
 
             // Recovery flow events — long-lived for audit trail
             Self::RecoveryRequested
@@ -1392,6 +1717,133 @@ impl Validate for DisclosureRevokedEvent {
     }
 }
 
+impl Validate for GrantOfferCreatedEvent {
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_non_empty(&self.offer_id, "offer id")?;
+        validate_non_empty(&self.issuer_persona_id, "issuer persona id")?;
+        validate_non_empty(&self.ephemeral_public_key_hex, "ephemeral public key")?;
+        validate_non_empty(&self.sealed_payload_hex, "sealed payload")?;
+        if self.expires_at == 0 {
+            return Err(ValidationError::invalid_format(
+                "grant offer must have a non-zero expiry",
+            ));
+        }
+        // relay_hint must use a TLS-secured scheme (https:// or wss://) to
+        // prevent SSRF via arbitrary or plaintext schemes when clients follow it.
+        if let Some(hint) = &self.relay_hint
+            && !hint.is_empty()
+            && !hint.starts_with("https://")
+            && !hint.starts_with("wss://")
+        {
+            return Err(ValidationError::invalid_format(
+                "relay_hint must be an https:// or wss:// URL",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Validate for GrantOfferClaimedEvent {
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_non_empty(&self.offer_id, "offer id")?;
+        validate_non_empty(&self.recipient_persona_id, "recipient persona id")?;
+        validate_non_empty(&self.claim_response_hex, "claim response")?;
+        if self.claimed_at == 0 {
+            return Err(ValidationError::invalid_format(
+                "claim timestamp must be non-zero",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Validate for GrantOfferRevokedEvent {
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_non_empty(&self.offer_id, "offer id")?;
+        validate_non_empty(&self.issuer_persona_id, "issuer persona id")?;
+        validate_non_empty(&self.reason, "revocation reason")
+    }
+}
+
+impl Validate for BadgeEvidence {
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_non_empty(&self.evidence_type, "evidence type")?;
+        validate_non_empty(&self.payload_hex, "evidence payload")
+    }
+}
+
+impl Validate for BadgeIssuedEvent {
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_non_empty(&self.badge_id, "badge id")?;
+        validate_non_empty(&self.issuer_persona_id, "issuer persona id")?;
+        validate_non_empty(&self.recipient_persona_id, "recipient persona id")?;
+        validate_non_empty(&self.badge_type, "badge type")?;
+        validate_non_empty(&self.display_name, "display name")?;
+        if let Some(ref evidence) = self.evidence {
+            evidence.validate()?;
+        }
+        if self.issued_at == 0 {
+            return Err(ValidationError::invalid_format(
+                "badge issued_at must be non-zero",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Validate for BadgeRevokedEvent {
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_non_empty(&self.badge_id, "badge id")?;
+        validate_non_empty(&self.revoker_persona_id, "revoker persona id")?;
+        validate_non_empty(&self.reason, "revocation reason")
+    }
+}
+
+impl Validate for BadgeDisputedEvent {
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_non_empty(&self.dispute_id, "dispute id")?;
+        validate_non_empty(&self.target_badge_id, "target badge id")?;
+        validate_non_empty(&self.disputer_persona_id, "disputer persona id")?;
+        validate_non_empty(&self.reason, "dispute reason")
+    }
+}
+
+impl Validate for CredentialDepositedEvent {
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_non_empty(&self.deposit_id, "deposit id")?;
+        validate_non_empty(&self.grant_id, "grant id")?;
+        validate_non_empty(&self.credential_id, "credential id")?;
+        validate_non_empty(&self.issuer_id, "issuer id")?;
+        validate_non_empty(&self.encrypted_blocks_json, "encrypted blocks json")?;
+        if self.encrypted_blocks_json.len() > MAX_ENCRYPTED_BLOCKS_JSON_BYTES {
+            return Err(ValidationError::invalid_format(format!(
+                "encrypted_blocks_json exceeds maximum size of {} bytes",
+                MAX_ENCRYPTED_BLOCKS_JSON_BYTES
+            )));
+        }
+        if self.created_at == 0 {
+            return Err(ValidationError::invalid_format(
+                "credential deposit created_at must be non-zero",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Validate for CredentialRevokedEvent {
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_non_empty(&self.grant_id, "grant id")?;
+        validate_non_empty(&self.revoker_id, "revoker id")?;
+        validate_non_empty(&self.reason, "revocation reason")?;
+        if self.revoked_at == 0 {
+            return Err(ValidationError::invalid_format(
+                "credential revocation revoked_at must be non-zero",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Validate for StorageRelationshipCreatedEvent {
     fn validate(&self) -> Result<(), ValidationError> {
         validate_non_empty(&self.root_id, "storage relationship root id")?;
@@ -1447,6 +1899,14 @@ impl Validate for EventBody {
             Self::MessageSent(body) => body.validate(),
             Self::ContentPublished(body) => body.validate(),
             Self::DisclosureRevoked(body) => body.validate(),
+            Self::GrantOfferCreated(body) => body.validate(),
+            Self::GrantOfferClaimed(body) => body.validate(),
+            Self::GrantOfferRevoked(body) => body.validate(),
+            Self::BadgeIssued(body) => body.validate(),
+            Self::BadgeRevoked(body) => body.validate(),
+            Self::BadgeDisputed(body) => body.validate(),
+            Self::CredentialDeposited(body) => body.validate(),
+            Self::CredentialRevoked(body) => body.validate(),
             Self::LegacyOpaque {
                 subject,
                 canonical_payload,
@@ -1801,6 +2261,106 @@ impl CanonicalEncode for EventBody {
                     ("reason", body.reason.clone()),
                 ],
             ),
+            Self::GrantOfferCreated(body) => canonical_record(
+                "grant-offer-created",
+                &[
+                    ("offer_id", body.offer_id.clone()),
+                    ("issuer_persona_id", body.issuer_persona_id.clone()),
+                    (
+                        "ephemeral_public_key_hex",
+                        body.ephemeral_public_key_hex.clone(),
+                    ),
+                    ("sealed_payload_hex", body.sealed_payload_hex.clone()),
+                    (
+                        "relay_hint",
+                        body.relay_hint.clone().unwrap_or_default(),
+                    ),
+                    ("expires_at", body.expires_at.to_string()),
+                    ("conditions_json", body.conditions_json.clone()),
+                ],
+            ),
+            Self::GrantOfferClaimed(body) => canonical_record(
+                "grant-offer-claimed",
+                &[
+                    ("offer_id", body.offer_id.clone()),
+                    ("recipient_persona_id", body.recipient_persona_id.clone()),
+                    ("claim_response_hex", body.claim_response_hex.clone()),
+                    ("claimed_at", body.claimed_at.to_string()),
+                ],
+            ),
+            Self::GrantOfferRevoked(body) => canonical_record(
+                "grant-offer-revoked",
+                &[
+                    ("offer_id", body.offer_id.clone()),
+                    ("issuer_persona_id", body.issuer_persona_id.clone()),
+                    ("reason", body.reason.clone()),
+                ],
+            ),
+            Self::BadgeIssued(body) => {
+                let (ev_type, ev_payload) = match &body.evidence {
+                    Some(e) => (e.evidence_type.clone(), e.payload_hex.clone()),
+                    None => (String::new(), String::new()),
+                };
+                canonical_record(
+                    "badge-issued",
+                    &[
+                        ("badge_id", body.badge_id.clone()),
+                        ("issuer_persona_id", body.issuer_persona_id.clone()),
+                        ("recipient_persona_id", body.recipient_persona_id.clone()),
+                        ("badge_type", body.badge_type.clone()),
+                        ("display_name", body.display_name.clone()),
+                        ("evidence_type", ev_type),
+                        ("evidence_payload_hex", ev_payload),
+                        ("issued_at", body.issued_at.to_string()),
+                        (
+                            "expires_at",
+                            body.expires_at.map(|v| v.to_string()).unwrap_or_default(),
+                        ),
+                    ],
+                )
+            }
+            Self::BadgeRevoked(body) => canonical_record(
+                "badge-revoked",
+                &[
+                    ("badge_id", body.badge_id.clone()),
+                    ("revoker_persona_id", body.revoker_persona_id.clone()),
+                    ("reason", body.reason.clone()),
+                ],
+            ),
+            Self::BadgeDisputed(body) => canonical_record(
+                "badge-disputed",
+                &[
+                    ("dispute_id", body.dispute_id.clone()),
+                    ("target_badge_id", body.target_badge_id.clone()),
+                    ("disputer_persona_id", body.disputer_persona_id.clone()),
+                    ("reason", body.reason.clone()),
+                    ("evidence", body.evidence.clone().unwrap_or_default()),
+                ],
+            ),
+            Self::CredentialDeposited(body) => canonical_record(
+                "credential-deposited",
+                &[
+                    ("deposit_id", body.deposit_id.clone()),
+                    ("grant_id", body.grant_id.clone()),
+                    ("credential_id", body.credential_id.clone()),
+                    ("issuer_id", body.issuer_id.clone()),
+                    ("encrypted_blocks_json", body.encrypted_blocks_json.clone()),
+                    ("created_at", body.created_at.to_string()),
+                    (
+                        "expires_at",
+                        body.expires_at.map(|v| v.to_string()).unwrap_or_default(),
+                    ),
+                ],
+            ),
+            Self::CredentialRevoked(body) => canonical_record(
+                "credential-revoked",
+                &[
+                    ("grant_id", body.grant_id.clone()),
+                    ("revoker_id", body.revoker_id.clone()),
+                    ("reason", body.reason.clone()),
+                    ("revoked_at", body.revoked_at.to_string()),
+                ],
+            ),
             Self::LegacyOpaque {
                 declared_type,
                 subject,
@@ -1857,6 +2417,14 @@ impl_typed_event_canonical_encode!(StorageManifestPublishedEvent, StorageManifes
 impl_typed_event_canonical_encode!(MessageSentEvent, MessageSent);
 impl_typed_event_canonical_encode!(ContentPublishedEvent, ContentPublished);
 impl_typed_event_canonical_encode!(DisclosureRevokedEvent, DisclosureRevoked);
+impl_typed_event_canonical_encode!(GrantOfferCreatedEvent, GrantOfferCreated);
+impl_typed_event_canonical_encode!(GrantOfferClaimedEvent, GrantOfferClaimed);
+impl_typed_event_canonical_encode!(GrantOfferRevokedEvent, GrantOfferRevoked);
+impl_typed_event_canonical_encode!(BadgeIssuedEvent, BadgeIssued);
+impl_typed_event_canonical_encode!(BadgeRevokedEvent, BadgeRevoked);
+impl_typed_event_canonical_encode!(BadgeDisputedEvent, BadgeDisputed);
+impl_typed_event_canonical_encode!(CredentialDepositedEvent, CredentialDeposited);
+impl_typed_event_canonical_encode!(CredentialRevokedEvent, CredentialRevoked);
 
 #[cfg(test)]
 mod retention_tests {
@@ -1902,6 +2470,14 @@ mod retention_tests {
         EventType::RelayShutdownNotice,
         EventType::DisclosurePolicyUpdated,
         EventType::DisclosureRevoked,
+        EventType::GrantOfferCreated,
+        EventType::GrantOfferClaimed,
+        EventType::GrantOfferRevoked,
+        EventType::BadgeIssued,
+        EventType::BadgeRevoked,
+        EventType::BadgeDisputed,
+        EventType::CredentialDeposited,
+        EventType::CredentialRevoked,
     ];
 
     #[test]
@@ -1974,5 +2550,38 @@ mod retention_tests {
     fn retention_class_parse_rejects_unknown() {
         assert_eq!(RetentionClass::parse("unknown"), None);
         assert_eq!(RetentionClass::parse(""), None);
+    }
+}
+
+#[cfg(test)]
+mod credential_validation_tests {
+    use super::*;
+
+    fn valid_credential_deposited() -> CredentialDepositedEvent {
+        CredentialDepositedEvent {
+            deposit_id: "deposit-001".into(),
+            grant_id: "grant-001".into(),
+            credential_id: "cred-001".into(),
+            issuer_id: "persona-001".into(),
+            encrypted_blocks_json: r#"{"blocks":[]}"#.into(),
+            created_at: 1_700_000_000,
+            expires_at: None,
+        }
+    }
+
+    #[test]
+    fn valid_credential_deposited_passes() {
+        assert!(valid_credential_deposited().validate().is_ok());
+    }
+
+    #[test]
+    fn oversized_encrypted_blocks_json_rejected() {
+        let mut event = valid_credential_deposited();
+        event.encrypted_blocks_json = "x".repeat(MAX_ENCRYPTED_BLOCKS_JSON_BYTES + 1);
+        let err = event.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds maximum size"),
+            "expected size error, got: {err}"
+        );
     }
 }

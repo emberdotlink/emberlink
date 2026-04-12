@@ -11,6 +11,7 @@ use hkdf::Hkdf;
 use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 const PUBLIC_KEY_PREFIX: &str = "ed25519:";
 const PRIVATE_KEY_PREFIX: &str = "ed25519-secret:";
@@ -29,9 +30,10 @@ pub struct EncryptedContent {
     pub ciphertext: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct LocalKeyPair {
     pub key_id: String,
+    #[zeroize(skip)]
     pub algorithm: KeyAlgorithm,
     pub public_key: String,
     pub private_key: String,
@@ -111,7 +113,9 @@ pub fn generate_local_key_pair_version(
     );
     let mut secret_bytes = [0u8; 32];
     OsRng.fill_bytes(&mut secret_bytes);
-    local_key_pair_from_secret_bytes(key_id, secret_bytes)
+    let pair = local_key_pair_from_secret_bytes(key_id, secret_bytes);
+    secret_bytes.zeroize();
+    pair
 }
 
 pub fn generate_local_encryption_key_pair_version(
@@ -238,6 +242,58 @@ pub fn public_key_raw_bytes(public_key: &PublicKey) -> Result<[u8; 32], Validati
     Ok(bytes)
 }
 
+/// An ephemeral X25519 keypair for grant offer exchange.
+///
+/// The public key is shared in the grant link. The private key is held
+/// locally until the offer is claimed or expires, at which point it can
+/// be discarded.
+#[derive(Debug, Clone)]
+pub struct EphemeralKeyPair {
+    /// Hex-encoded age X25519 public key (the recipient address).
+    pub public_key_hex: String,
+    /// The raw age X25519 public key string (for encryption).
+    pub public_key_age: String,
+    /// The raw age X25519 private key string (for decryption).
+    pub private_key_age: String,
+}
+
+/// Generate an ephemeral X25519 keypair for grant offer exchange.
+///
+/// Returns an [`EphemeralKeyPair`] whose public key can be embedded in
+/// a grant link and whose private key can decrypt claim responses.
+pub fn generate_ephemeral_keypair() -> EphemeralKeyPair {
+    let identity = age::x25519::Identity::generate();
+    let recipient = identity.to_public();
+    let public_key_age = recipient.to_string();
+    // Hash the age public key string to get a stable hex representation
+    let public_key_hex = sha256_digest_hex(public_key_age.as_bytes());
+    EphemeralKeyPair {
+        public_key_hex,
+        public_key_age,
+        private_key_age: identity.to_string().expose_secret().to_string(),
+    }
+}
+
+/// Seal a grant offer payload to an ephemeral public key.
+///
+/// The payload (JSON-serialized grant parameters) is encrypted using
+/// age X25519 so only the holder of the corresponding private key
+/// can decrypt it.
+pub fn seal_grant_payload(
+    ephemeral_public_key_age: &str,
+    payload: &[u8],
+) -> Result<String, ValidationError> {
+    wrap_secret_to_recipient(ephemeral_public_key_age, payload)
+}
+
+/// Unseal a grant offer payload using the ephemeral private key.
+pub fn unseal_grant_payload(
+    ephemeral_private_key_age: &str,
+    sealed_hex: &str,
+) -> Result<Vec<u8>, ValidationError> {
+    unwrap_secret_with_identity(ephemeral_private_key_age, sealed_hex)
+}
+
 pub fn wrap_secret_to_recipient(
     recipient_public_key: &str,
     plaintext: &[u8],
@@ -336,16 +392,18 @@ impl Verifier for Ed25519Verifier {
     }
 }
 
-fn local_key_pair_from_secret_bytes(key_id: String, secret_bytes: [u8; 32]) -> LocalKeyPair {
+fn local_key_pair_from_secret_bytes(key_id: String, mut secret_bytes: [u8; 32]) -> LocalKeyPair {
     let signing_key = SigningKey::from_bytes(&secret_bytes);
     let verifying_key = signing_key.verifying_key();
 
-    LocalKeyPair {
+    let pair = LocalKeyPair {
         key_id,
         algorithm: KeyAlgorithm::Ed25519,
         public_key: encode_public_key(&verifying_key),
         private_key: encode_private_key(&secret_bytes),
-    }
+    };
+    secret_bytes.zeroize();
+    pair
 }
 
 fn random_hex_segment(byte_len: usize) -> String {

@@ -5,3 +5,6 @@ memory/
 *.pem
 *.p12
 *.pfx
+ember-ext/extension/pkg/
+web/node_modules/
+web/dist/

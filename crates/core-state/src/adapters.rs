@@ -562,6 +562,419 @@ fn build_attestation_object(auth_data: &[u8]) -> Result<Vec<u8>, ValidationError
     Ok(buf)
 }
 
+// ---------------------------------------------------------------------------
+// OAuthAdapter — OAuth2 Authorization Code flow with PKCE
+// ---------------------------------------------------------------------------
+
+/// Metadata stored in `ServiceBinding.external_account_id` for OAuth bindings.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OAuthBindingMeta {
+    /// OAuth2 client identifier registered with the provider.
+    pub client_id: String,
+    /// Authorization endpoint URL (e.g., "https://accounts.google.com/o/oauth2/v2/auth").
+    pub authorization_endpoint: String,
+    /// Token endpoint URL (e.g., "https://oauth2.googleapis.com/token").
+    pub token_endpoint: String,
+    /// Redirect URI registered with the provider.
+    pub redirect_uri: String,
+    /// Space-separated OAuth scopes (e.g., "openid profile email").
+    pub scopes: String,
+}
+
+/// Request to start an OAuth2 authorization flow.
+/// Returned from `present()` when action is "authorize".
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OAuthAuthorizeRequest {
+    /// Full authorization URL the caller should redirect to.
+    pub authorization_url: String,
+    /// PKCE code verifier — caller must store this and send it back in the exchange step.
+    pub code_verifier: String,
+    /// State parameter for CSRF protection.
+    pub state: String,
+}
+
+/// Request to exchange an authorization code for tokens.
+/// Returned from `present()` when action is "exchange".
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OAuthTokenExchangeRequest {
+    /// Token endpoint URL to POST to.
+    pub token_endpoint: String,
+    /// Form-encoded body parameters for the token exchange.
+    pub body_params: BTreeMap<String, String>,
+}
+
+/// Result of parsing an OIDC ID token's claims.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OAuthTokenClaims {
+    pub subject: Option<String>,
+    pub email: Option<String>,
+    pub name: Option<String>,
+    pub issuer: Option<String>,
+    pub issued_at: Option<u64>,
+    pub expires_at: Option<u64>,
+}
+
+/// OAuth2 adapter implementing the ServiceAdapter trait.
+///
+/// This adapter does NOT make HTTP calls. It builds authorization URLs and
+/// token exchange request parameters. The caller (CLI, GUI, extension) is
+/// responsible for executing the actual HTTP requests.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OAuthAdapter;
+
+impl OAuthAdapter {
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Build an OAuth2 authorization URL with PKCE S256 challenge.
+    pub fn build_authorize_request(
+        meta: &OAuthBindingMeta,
+    ) -> Result<OAuthAuthorizeRequest, ValidationError> {
+        // Generate code_verifier: 32 random bytes, base64url-encoded (43-128 chars per RFC 7636).
+        let random_id = core_crypto::generate_random_identifier("pkce");
+        let verifier_bytes = sha256_digest_raw(random_id.as_bytes());
+        let code_verifier = URL_SAFE_NO_PAD.encode(verifier_bytes);
+
+        // code_challenge = BASE64URL(SHA256(code_verifier))
+        let challenge_hash = sha256_digest_raw(code_verifier.as_bytes());
+        let code_challenge = URL_SAFE_NO_PAD.encode(challenge_hash);
+
+        // State parameter for CSRF protection.
+        let state_id = core_crypto::generate_random_identifier("state");
+        let state = URL_SAFE_NO_PAD.encode(sha256_digest_raw(state_id.as_bytes()));
+
+        let authorization_url = format!(
+            "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&state={}",
+            meta.authorization_endpoint,
+            urlencoding::encode(&meta.client_id),
+            urlencoding::encode(&meta.redirect_uri),
+            urlencoding::encode(&meta.scopes),
+            urlencoding::encode(&code_challenge),
+            urlencoding::encode(&state),
+        );
+
+        Ok(OAuthAuthorizeRequest {
+            authorization_url,
+            code_verifier,
+            state,
+        })
+    }
+
+    /// Build a token exchange request from an authorization code and PKCE verifier.
+    pub fn build_token_exchange_request(
+        meta: &OAuthBindingMeta,
+        code: &str,
+        code_verifier: &str,
+    ) -> Result<OAuthTokenExchangeRequest, ValidationError> {
+        if code.is_empty() {
+            return Err(ValidationError::new(
+                "authorization code must not be empty",
+            ));
+        }
+        if code_verifier.is_empty() {
+            return Err(ValidationError::new(
+                "code_verifier must not be empty",
+            ));
+        }
+
+        let mut body_params = BTreeMap::new();
+        body_params.insert("grant_type".into(), "authorization_code".into());
+        body_params.insert("code".into(), code.into());
+        body_params.insert("redirect_uri".into(), meta.redirect_uri.clone());
+        body_params.insert("client_id".into(), meta.client_id.clone());
+        body_params.insert("code_verifier".into(), code_verifier.into());
+
+        Ok(OAuthTokenExchangeRequest {
+            token_endpoint: meta.token_endpoint.clone(),
+            body_params,
+        })
+    }
+
+    /// Parse the claims portion of an OIDC ID token (JWT payload, already base64url-decoded).
+    /// This does NOT verify the JWT signature — the caller should verify with the provider's JWK.
+    pub fn parse_id_token_claims(
+        id_token_jwt: &str,
+    ) -> Result<OAuthTokenClaims, ValidationError> {
+        // JWT format: header.payload.signature — we extract the payload.
+        let parts: Vec<&str> = id_token_jwt.split('.').collect();
+        if parts.len() != 3 {
+            return Err(ValidationError::new(
+                "invalid JWT format: expected header.payload.signature",
+            ));
+        }
+        let payload_bytes = URL_SAFE_NO_PAD
+            .decode(parts[1])
+            .map_err(|err| ValidationError::new(format!("decode JWT payload: {err}")))?;
+        let payload: serde_json::Value = serde_json::from_slice(&payload_bytes)
+            .map_err(|err| ValidationError::new(format!("parse JWT payload JSON: {err}")))?;
+
+        Ok(OAuthTokenClaims {
+            subject: payload["sub"].as_str().map(String::from),
+            email: payload["email"].as_str().map(String::from),
+            name: payload["name"].as_str().map(String::from),
+            issuer: payload["iss"].as_str().map(String::from),
+            issued_at: payload["iat"].as_u64(),
+            expires_at: payload["exp"].as_u64(),
+        })
+    }
+}
+
+fn validate_oauth_binding(binding: &ServiceBinding) -> Result<OAuthBindingMeta, ValidationError> {
+    binding.validate()?;
+    if binding.descriptor.adapter_kind != "oauth2" {
+        return Err(ValidationError::new(format!(
+            "oauth adapter requires adapter_kind=oauth2, got {}",
+            binding.descriptor.adapter_kind
+        )));
+    }
+    let meta: OAuthBindingMeta = serde_json::from_str(&binding.external_account_id)
+        .map_err(|err| ValidationError::new(format!("parse oauth binding meta: {err}")))?;
+    if meta.client_id.is_empty() {
+        return Err(ValidationError::new("oauth binding client_id is empty"));
+    }
+    if meta.authorization_endpoint.is_empty() {
+        return Err(ValidationError::new(
+            "oauth binding authorization_endpoint is empty",
+        ));
+    }
+    if meta.token_endpoint.is_empty() {
+        return Err(ValidationError::new(
+            "oauth binding token_endpoint is empty",
+        ));
+    }
+    Ok(meta)
+}
+
+impl ServiceAdapter for OAuthAdapter {
+    fn present(
+        &self,
+        binding: &ServiceBinding,
+        disclosure_payload: &[u8],
+    ) -> Result<PresentationResult, ValidationError> {
+        let meta = validate_oauth_binding(binding)?;
+
+        let request: serde_json::Value = serde_json::from_slice(disclosure_payload)
+            .map_err(|err| ValidationError::new(format!("parse oauth request: {err}")))?;
+
+        let action = request["action"]
+            .as_str()
+            .ok_or_else(|| ValidationError::new("missing 'action' in oauth request"))?;
+
+        match action {
+            "authorize" => {
+                let auth_req = Self::build_authorize_request(&meta)?;
+                Ok(PresentationResult::Accepted {
+                    response_payload: Some(serde_json::to_string(&auth_req).map_err(|err| {
+                        ValidationError::new(format!("serialize authorize response: {err}"))
+                    })?),
+                })
+            }
+            "exchange" => {
+                let code = request["code"]
+                    .as_str()
+                    .ok_or_else(|| ValidationError::new("missing 'code' in exchange request"))?;
+                let code_verifier = request["code_verifier"].as_str().ok_or_else(|| {
+                    ValidationError::new("missing 'code_verifier' in exchange request")
+                })?;
+                let exchange_req =
+                    Self::build_token_exchange_request(&meta, code, code_verifier)?;
+                Ok(PresentationResult::Accepted {
+                    response_payload: Some(
+                        serde_json::to_string(&exchange_req).map_err(|err| {
+                            ValidationError::new(format!("serialize exchange response: {err}"))
+                        })?,
+                    ),
+                })
+            }
+            other => Ok(PresentationResult::Rejected {
+                reason: format!("unknown oauth action: {other}"),
+            }),
+        }
+    }
+
+    fn import(&self, binding: &ServiceBinding) -> Result<Vec<ImportedClaim>, ValidationError> {
+        let meta = validate_oauth_binding(binding)?;
+
+        // Import parses an OIDC ID token stored in the binding's descriptor endpoint
+        // as a fallback. In practice, the caller passes token responses through present().
+        // Here we return empty — tokens are ephemeral and not directly importable.
+        let _ = meta;
+        Ok(vec![])
+    }
+
+    fn verify_binding(&self, binding: &ServiceBinding) -> Result<bool, ValidationError> {
+        validate_oauth_binding(binding)?;
+        Ok(true)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OidcClaimAdapter — Translates Emberlink disclosure artifacts into OIDC claims
+// ---------------------------------------------------------------------------
+
+/// Standard OIDC claim names that Emberlink disclosure fields can map to.
+const OIDC_CLAIM_MAPPINGS: &[(&str, &str)] = &[
+    ("full_name", "name"),
+    ("name", "name"),
+    ("given_name", "given_name"),
+    ("first_name", "given_name"),
+    ("family_name", "family_name"),
+    ("last_name", "family_name"),
+    ("email", "email"),
+    ("email_address", "email"),
+    ("phone", "phone_number"),
+    ("phone_number", "phone_number"),
+    ("birthdate", "birthdate"),
+    ("date_of_birth", "birthdate"),
+    ("address", "address"),
+    ("picture", "picture"),
+    ("profile_url", "profile"),
+    ("website", "website"),
+    ("gender", "gender"),
+    ("locale", "locale"),
+    ("timezone", "zoneinfo"),
+    ("zoneinfo", "zoneinfo"),
+    ("nickname", "nickname"),
+    ("preferred_username", "preferred_username"),
+    ("username", "preferred_username"),
+];
+
+/// Adapter that translates Emberlink disclosure artifacts into OIDC-compatible
+/// claim sets for presentation to relying parties.
+///
+/// The adapter receives a disclosure payload (JSON with Emberlink field names)
+/// and maps recognized fields to standard OIDC claim names (RFC 5.1).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OidcClaimAdapter;
+
+impl OidcClaimAdapter {
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Map Emberlink disclosure fields to standard OIDC claim names.
+    /// Unknown fields are passed through with an "emberlink:" prefix.
+    pub fn map_to_oidc_claims(
+        disclosure_fields: &serde_json::Value,
+    ) -> Result<serde_json::Value, ValidationError> {
+        let obj = disclosure_fields
+            .as_object()
+            .ok_or_else(|| ValidationError::new("disclosure payload must be a JSON object"))?;
+
+        let mut oidc_claims = serde_json::Map::new();
+
+        for (key, value) in obj {
+            let oidc_key = OIDC_CLAIM_MAPPINGS
+                .iter()
+                .find(|(ember_name, _)| *ember_name == key.as_str())
+                .map(|(_, oidc_name)| (*oidc_name).to_string())
+                .unwrap_or_else(|| format!("emberlink:{key}"));
+
+            oidc_claims.insert(oidc_key, value.clone());
+        }
+
+        Ok(serde_json::Value::Object(oidc_claims))
+    }
+
+    /// Parse an OIDC ID token and convert its claims into ImportedClaims.
+    pub fn import_id_token(
+        id_token_jwt: &str,
+        provider_label: &str,
+    ) -> Result<Vec<ImportedClaim>, ValidationError> {
+        let claims = OAuthAdapter::parse_id_token_claims(id_token_jwt)?;
+        let mut imported = Vec::new();
+
+        if let Some(ref email) = claims.email {
+            imported.push(ImportedClaim {
+                claim_type: ClaimType::ServiceIssued.as_str().into(),
+                payload_json: json!({
+                    "schema": "emberlink:claim:email:1.0",
+                    "email": email,
+                })
+                .to_string(),
+                external_issuer: provider_label.into(),
+                external_issued_at: claims.issued_at,
+                external_expires_at: claims.expires_at,
+            });
+        }
+
+        if let Some(ref name) = claims.name {
+            imported.push(ImportedClaim {
+                claim_type: ClaimType::ServiceIssued.as_str().into(),
+                payload_json: json!({
+                    "schema": "emberlink:claim:name:1.0",
+                    "name": name,
+                })
+                .to_string(),
+                external_issuer: provider_label.into(),
+                external_issued_at: claims.issued_at,
+                external_expires_at: claims.expires_at,
+            });
+        }
+
+        if let Some(ref subject) = claims.subject {
+            imported.push(ImportedClaim {
+                claim_type: ClaimType::ServiceIssued.as_str().into(),
+                payload_json: json!({
+                    "schema": "emberlink:claim:oidc-subject:1.0",
+                    "subject": subject,
+                    "issuer": claims.issuer,
+                })
+                .to_string(),
+                external_issuer: provider_label.into(),
+                external_issued_at: claims.issued_at,
+                external_expires_at: claims.expires_at,
+            });
+        }
+
+        Ok(imported)
+    }
+}
+
+fn validate_oidc_binding(binding: &ServiceBinding) -> Result<(), ValidationError> {
+    binding.validate()?;
+    if binding.descriptor.adapter_kind != "oidc" {
+        return Err(ValidationError::new(format!(
+            "oidc claim adapter requires adapter_kind=oidc, got {}",
+            binding.descriptor.adapter_kind
+        )));
+    }
+    Ok(())
+}
+
+impl ServiceAdapter for OidcClaimAdapter {
+    fn present(
+        &self,
+        binding: &ServiceBinding,
+        disclosure_payload: &[u8],
+    ) -> Result<PresentationResult, ValidationError> {
+        validate_oidc_binding(binding)?;
+
+        let fields: serde_json::Value = serde_json::from_slice(disclosure_payload)
+            .map_err(|err| ValidationError::new(format!("parse oidc disclosure: {err}")))?;
+
+        let oidc_claims = Self::map_to_oidc_claims(&fields)?;
+
+        Ok(PresentationResult::Accepted {
+            response_payload: Some(serde_json::to_string(&oidc_claims).map_err(|err| {
+                ValidationError::new(format!("serialize oidc claims: {err}"))
+            })?),
+        })
+    }
+
+    fn import(&self, binding: &ServiceBinding) -> Result<Vec<ImportedClaim>, ValidationError> {
+        validate_oidc_binding(binding)?;
+        // OIDC import happens through OAuthAdapter's token flow + import_id_token.
+        Ok(vec![])
+    }
+
+    fn verify_binding(&self, binding: &ServiceBinding) -> Result<bool, ValidationError> {
+        validate_oidc_binding(binding)?;
+        Ok(true)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,7 +995,7 @@ mod tests {
 
     #[test]
     fn bitwarden_csv_import_produces_password_claims() {
-        let csv = "folder,favorite,type,name,notes,fields,reprompt,login_uri,login_username,login_password,login_totp\nPersonal,0,login,GitHub,work account,,,https://github.com,operator,secret,ABC123\n";
+        let csv = "folder,favorite,type,name,notes,fields,reprompt,login_uri,login_username,login_password,login_totp\nPersonal,0,login,GitHub,work account,,,https://github.com,alice,secret,ABC123\n";
         let adapter = PasswordImportAdapter::new(PasswordImportFormat::BitwardenCsv, csv);
 
         let claims = adapter.import(&password_binding()).unwrap();
@@ -609,7 +1022,7 @@ mod tests {
 
     #[test]
     fn onepassword_csv_import_extracts_otpauth_secret() {
-        let csv = "Title,Url,Username,Password,OTPAuth,Favorite,Archived,Tags,Notes\nGitHub,https://github.com,operator,secret,otpauth://totp/GitHub?secret=ABC123&issuer=GitHub,0,0,,work account\n";
+        let csv = "Title,Url,Username,Password,OTPAuth,Favorite,Archived,Tags,Notes\nGitHub,https://github.com,alice,secret,otpauth://totp/GitHub?secret=ABC123&issuer=GitHub,0,0,,work account\n";
         let adapter = PasswordImportAdapter::new(PasswordImportFormat::OnePasswordCsv, csv);
 
         let claims = adapter.import(&password_binding()).unwrap();
@@ -674,7 +1087,7 @@ mod tests {
         let challenge = b"test-challenge-32-bytes-padding!";
 
         let (result, meta) = adapter
-            .register("github.com", "https://github.com", b"user1", "operator", challenge)
+            .register("github.com", "https://github.com", b"user1", "alice", challenge)
             .unwrap();
 
         // Credential ID should be non-empty base64url.
@@ -716,7 +1129,7 @@ mod tests {
         let challenge = b"registration-challenge-padding!!";
 
         let (_reg_result, mut meta) = adapter
-            .register("github.com", "https://github.com", b"user1", "operator", challenge)
+            .register("github.com", "https://github.com", b"user1", "alice", challenge)
             .unwrap();
 
         let auth_challenge = b"authentication-challenge-pad!!!!";
@@ -745,7 +1158,7 @@ mod tests {
         let challenge = b"registration-challenge-padding!!";
 
         let (_reg_result, meta) = adapter
-            .register("github.com", "https://github.com", b"user1", "operator", challenge)
+            .register("github.com", "https://github.com", b"user1", "alice", challenge)
             .unwrap();
 
         let binding = passkey_binding(&meta);
@@ -794,7 +1207,7 @@ mod tests {
         let (adapter, _key_id) = fixture_passkey_adapter();
         let challenge = b"registration-challenge-padding!!";
         let (_reg_result, mut meta) = adapter
-            .register("github.com", "https://github.com", b"user1", "operator", challenge)
+            .register("github.com", "https://github.com", b"user1", "alice", challenge)
             .unwrap();
 
         assert_eq!(meta.sign_count, 0);
@@ -815,14 +1228,325 @@ mod tests {
         let (adapter, _key_id) = fixture_passkey_adapter();
 
         let (_r1, meta1) = adapter
-            .register("github.com", "https://github.com", b"u1", "operator", b"c1-padding-bytes!!!")
+            .register("github.com", "https://github.com", b"u1", "alice", b"c1-padding-bytes!!!")
             .unwrap();
         let (_r2, meta2) = adapter
-            .register("gitlab.com", "https://gitlab.com", b"u1", "operator", b"c2-padding-bytes!!!")
+            .register("gitlab.com", "https://gitlab.com", b"u1", "alice", b"c2-padding-bytes!!!")
             .unwrap();
 
         assert_eq!(meta1.rp_id, "github.com");
         assert_eq!(meta2.rp_id, "gitlab.com");
         assert_ne!(meta1.credential_id, meta2.credential_id);
+    }
+
+    // --- OAuth adapter tests ---
+
+    fn oauth_binding_meta() -> OAuthBindingMeta {
+        OAuthBindingMeta {
+            client_id: "test-client-id".into(),
+            authorization_endpoint: "https://auth.example.com/authorize".into(),
+            token_endpoint: "https://auth.example.com/token".into(),
+            redirect_uri: "http://localhost:8080/callback".into(),
+            scopes: "openid profile email".into(),
+        }
+    }
+
+    fn oauth_binding() -> ServiceBinding {
+        ServiceBinding {
+            id: "binding-oauth-github".into(),
+            persona_id: "persona-a".into(),
+            descriptor: core_types::ServiceDescriptor {
+                adapter_kind: "oauth2".into(),
+                service_label: "GitHub".into(),
+                endpoint: "https://github.com".into(),
+            },
+            external_account_id: serde_json::to_string(&oauth_binding_meta()).unwrap(),
+            created_at: 1,
+        }
+    }
+
+    #[test]
+    fn oauth_authorize_builds_valid_url() {
+        let meta = oauth_binding_meta();
+        let req = OAuthAdapter::build_authorize_request(&meta).unwrap();
+
+        assert!(req.authorization_url.starts_with("https://auth.example.com/authorize?"));
+        assert!(req.authorization_url.contains("response_type=code"));
+        assert!(req.authorization_url.contains("client_id=test-client-id"));
+        assert!(req.authorization_url.contains("code_challenge_method=S256"));
+        assert!(req.authorization_url.contains("scope=openid%20profile%20email"));
+        assert!(!req.code_verifier.is_empty());
+        assert!(!req.state.is_empty());
+    }
+
+    #[test]
+    fn oauth_authorize_pkce_verifier_differs_each_call() {
+        let meta = oauth_binding_meta();
+        let req1 = OAuthAdapter::build_authorize_request(&meta).unwrap();
+        let req2 = OAuthAdapter::build_authorize_request(&meta).unwrap();
+        assert_ne!(req1.code_verifier, req2.code_verifier);
+        assert_ne!(req1.state, req2.state);
+    }
+
+    #[test]
+    fn oauth_token_exchange_builds_correct_params() {
+        let meta = oauth_binding_meta();
+        let req =
+            OAuthAdapter::build_token_exchange_request(&meta, "auth-code-123", "verifier-abc")
+                .unwrap();
+
+        assert_eq!(req.token_endpoint, "https://auth.example.com/token");
+        assert_eq!(req.body_params["grant_type"], "authorization_code");
+        assert_eq!(req.body_params["code"], "auth-code-123");
+        assert_eq!(req.body_params["code_verifier"], "verifier-abc");
+        assert_eq!(req.body_params["client_id"], "test-client-id");
+        assert_eq!(
+            req.body_params["redirect_uri"],
+            "http://localhost:8080/callback"
+        );
+    }
+
+    #[test]
+    fn oauth_token_exchange_rejects_empty_code() {
+        let meta = oauth_binding_meta();
+        let err = OAuthAdapter::build_token_exchange_request(&meta, "", "verifier").unwrap_err();
+        assert!(err.to_string().contains("authorization code"));
+    }
+
+    #[test]
+    fn oauth_token_exchange_rejects_empty_verifier() {
+        let meta = oauth_binding_meta();
+        let err = OAuthAdapter::build_token_exchange_request(&meta, "code", "").unwrap_err();
+        assert!(err.to_string().contains("code_verifier"));
+    }
+
+    #[test]
+    fn oauth_parse_id_token_claims() {
+        // Build a fake JWT with base64url-encoded header.payload.signature.
+        let header = URL_SAFE_NO_PAD.encode(b"{}");
+        let payload_json = json!({
+            "sub": "user-123",
+            "email": "alice@example.com",
+            "name": "Alice Example",
+            "iss": "https://auth.example.com",
+            "iat": 1700000000u64,
+            "exp": 1700003600u64,
+        });
+        let payload = URL_SAFE_NO_PAD.encode(payload_json.to_string().as_bytes());
+        let signature = URL_SAFE_NO_PAD.encode(b"fake-sig");
+        let jwt = format!("{header}.{payload}.{signature}");
+
+        let claims = OAuthAdapter::parse_id_token_claims(&jwt).unwrap();
+        assert_eq!(claims.subject.as_deref(), Some("user-123"));
+        assert_eq!(claims.email.as_deref(), Some("alice@example.com"));
+        assert_eq!(claims.name.as_deref(), Some("Alice Example"));
+        assert_eq!(claims.issuer.as_deref(), Some("https://auth.example.com"));
+        assert_eq!(claims.issued_at, Some(1700000000));
+        assert_eq!(claims.expires_at, Some(1700003600));
+    }
+
+    #[test]
+    fn oauth_parse_id_token_rejects_invalid_jwt() {
+        assert!(OAuthAdapter::parse_id_token_claims("not-a-jwt").is_err());
+        assert!(OAuthAdapter::parse_id_token_claims("a.b").is_err());
+    }
+
+    #[test]
+    fn oauth_service_adapter_authorize_roundtrip() {
+        let adapter = OAuthAdapter::new();
+        let binding = oauth_binding();
+        let payload = json!({"action": "authorize"});
+
+        let result = adapter
+            .present(&binding, serde_json::to_vec(&payload).unwrap().as_slice())
+            .unwrap();
+
+        match result {
+            PresentationResult::Accepted {
+                response_payload: Some(resp),
+            } => {
+                let parsed: OAuthAuthorizeRequest = serde_json::from_str(&resp).unwrap();
+                assert!(parsed.authorization_url.contains("response_type=code"));
+                assert!(!parsed.code_verifier.is_empty());
+            }
+            other => panic!("expected Accepted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn oauth_service_adapter_exchange_roundtrip() {
+        let adapter = OAuthAdapter::new();
+        let binding = oauth_binding();
+        let payload = json!({
+            "action": "exchange",
+            "code": "auth-code-xyz",
+            "code_verifier": "verifier-abc",
+        });
+
+        let result = adapter
+            .present(&binding, serde_json::to_vec(&payload).unwrap().as_slice())
+            .unwrap();
+
+        match result {
+            PresentationResult::Accepted {
+                response_payload: Some(resp),
+            } => {
+                let parsed: OAuthTokenExchangeRequest = serde_json::from_str(&resp).unwrap();
+                assert_eq!(parsed.body_params["code"], "auth-code-xyz");
+                assert_eq!(parsed.body_params["code_verifier"], "verifier-abc");
+            }
+            other => panic!("expected Accepted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn oauth_service_adapter_rejects_unknown_action() {
+        let adapter = OAuthAdapter::new();
+        let binding = oauth_binding();
+        let payload = json!({"action": "unknown"});
+
+        let result = adapter
+            .present(&binding, serde_json::to_vec(&payload).unwrap().as_slice())
+            .unwrap();
+
+        assert!(matches!(result, PresentationResult::Rejected { .. }));
+    }
+
+    #[test]
+    fn oauth_verify_binding_rejects_wrong_adapter_kind() {
+        let adapter = OAuthAdapter::new();
+        let binding = ServiceBinding {
+            id: "binding-wrong".into(),
+            persona_id: "persona-a".into(),
+            descriptor: core_types::ServiceDescriptor {
+                adapter_kind: "passkey".into(),
+                service_label: "Wrong".into(),
+                endpoint: "https://example.com".into(),
+            },
+            external_account_id: "{}".into(),
+            created_at: 1,
+        };
+        assert!(adapter.verify_binding(&binding).is_err());
+    }
+
+    // --- OIDC claim adapter tests ---
+
+    fn oidc_binding() -> ServiceBinding {
+        ServiceBinding {
+            id: "binding-oidc-google".into(),
+            persona_id: "persona-a".into(),
+            descriptor: core_types::ServiceDescriptor {
+                adapter_kind: "oidc".into(),
+                service_label: "Google".into(),
+                endpoint: "https://accounts.google.com".into(),
+            },
+            external_account_id: "google-user-123".into(),
+            created_at: 1,
+        }
+    }
+
+    #[test]
+    fn oidc_maps_standard_fields() {
+        let disclosure = json!({
+            "full_name": "Alice Example",
+            "email": "alice@example.com",
+            "phone": "+1-555-0100",
+            "birthdate": "1990-01-01",
+        });
+
+        let oidc = OidcClaimAdapter::map_to_oidc_claims(&disclosure).unwrap();
+        let obj = oidc.as_object().unwrap();
+
+        assert_eq!(obj["name"], "Alice Example");
+        assert_eq!(obj["email"], "alice@example.com");
+        assert_eq!(obj["phone_number"], "+1-555-0100");
+        assert_eq!(obj["birthdate"], "1990-01-01");
+    }
+
+    #[test]
+    fn oidc_prefixes_unknown_fields() {
+        let disclosure = json!({
+            "email": "alice@example.com",
+            "custom_field": "custom_value",
+        });
+
+        let oidc = OidcClaimAdapter::map_to_oidc_claims(&disclosure).unwrap();
+        let obj = oidc.as_object().unwrap();
+
+        assert_eq!(obj["email"], "alice@example.com");
+        assert_eq!(obj["emberlink:custom_field"], "custom_value");
+    }
+
+    #[test]
+    fn oidc_rejects_non_object_payload() {
+        let disclosure = json!("not an object");
+        assert!(OidcClaimAdapter::map_to_oidc_claims(&disclosure).is_err());
+    }
+
+    #[test]
+    fn oidc_service_adapter_present_roundtrip() {
+        let adapter = OidcClaimAdapter::new();
+        let binding = oidc_binding();
+        let payload = json!({
+            "full_name": "Alice Example",
+            "email": "alice@example.com",
+        });
+
+        let result = adapter
+            .present(&binding, serde_json::to_vec(&payload).unwrap().as_slice())
+            .unwrap();
+
+        match result {
+            PresentationResult::Accepted {
+                response_payload: Some(resp),
+            } => {
+                let parsed: serde_json::Value = serde_json::from_str(&resp).unwrap();
+                assert_eq!(parsed["name"], "Alice Example");
+                assert_eq!(parsed["email"], "alice@example.com");
+            }
+            other => panic!("expected Accepted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn oidc_verify_binding_rejects_wrong_adapter_kind() {
+        let adapter = OidcClaimAdapter::new();
+        let binding = ServiceBinding {
+            id: "binding-wrong".into(),
+            persona_id: "persona-a".into(),
+            descriptor: core_types::ServiceDescriptor {
+                adapter_kind: "oauth2".into(),
+                service_label: "Wrong".into(),
+                endpoint: "https://example.com".into(),
+            },
+            external_account_id: "id".into(),
+            created_at: 1,
+        };
+        assert!(adapter.verify_binding(&binding).is_err());
+    }
+
+    #[test]
+    fn oidc_import_id_token_produces_claims() {
+        let header = URL_SAFE_NO_PAD.encode(b"{}");
+        let payload_json = json!({
+            "sub": "user-456",
+            "email": "bob@example.com",
+            "name": "Bob Example",
+            "iss": "https://accounts.google.com",
+            "iat": 1700000000u64,
+            "exp": 1700003600u64,
+        });
+        let payload = URL_SAFE_NO_PAD.encode(payload_json.to_string().as_bytes());
+        let signature = URL_SAFE_NO_PAD.encode(b"fake-sig");
+        let jwt = format!("{header}.{payload}.{signature}");
+
+        let claims = OidcClaimAdapter::import_id_token(&jwt, "google").unwrap();
+
+        assert_eq!(claims.len(), 3); // email, name, subject
+        assert!(claims.iter().any(|c| c.payload_json.contains("bob@example.com")));
+        assert!(claims.iter().any(|c| c.payload_json.contains("Bob Example")));
+        assert!(claims.iter().any(|c| c.payload_json.contains("user-456")));
+        assert!(claims.iter().all(|c| c.external_issuer == "google"));
+        assert!(claims.iter().all(|c| c.claim_type == "service-issued"));
     }
 }

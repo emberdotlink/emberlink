@@ -632,7 +632,7 @@ impl DemoApp {
             .batch
             .event_ids
             .iter()
-            .filter(|event_id| !self.event_store.has_event(event_id))
+            .filter(|event_id| !self.app_runtime.store.has_event(event_id))
             .cloned()
             .collect();
 
@@ -672,7 +672,7 @@ impl DemoApp {
         writeln!(
             &mut out,
             "Local known events: {}",
-            self.event_store.event_count()
+            self.app_runtime.store.event_count()
         )
         .unwrap();
         writeln!(&mut out, "Missing locally: {}", missing_event_ids.len()).unwrap();
@@ -815,10 +815,10 @@ impl DemoApp {
     }
 
     pub(super) fn render_compare_with(&self, other: &Self, other_state_path: &str) -> String {
-        let local_index = self.event_store.event_id_set();
-        let other_index = other.event_store.event_id_set();
-        let local_count = self.event_store.event_count();
-        let other_count = other.event_store.event_count();
+        let local_index = self.app_runtime.store.event_id_set();
+        let other_index = other.app_runtime.store.event_id_set();
+        let local_count = self.app_runtime.store.event_count();
+        let other_count = other.app_runtime.store.event_count();
         let shared = local_index
             .keys()
             .filter(|id| other_index.contains_key(id.as_str()))
@@ -895,41 +895,41 @@ impl DemoApp {
     ) -> String {
         let peer_id = other.current_peer_id();
         let local_cursor =
-            self.event_store
+            self.app_runtime.store
                 .peer_cursor(&peer_id)
                 .unwrap_or(core_types::PeerCursor {
                     peer_id: peer_id.clone(),
                     last_event_id: None,
                 });
-        let other_event_ids = other.event_store.event_ids();
+        let other_event_ids = other.app_runtime.store.event_ids();
         let other_to_local_raw =
             plan_pull_batch(&local_cursor, "other-to-local", &other_event_ids, |id| {
-                self.event_store.has_event(id)
+                self.app_runtime.store.has_event(id)
             });
         let relevant_remote_ids =
-            relevant_event_ids_for_context(other.event_store.events(), &self.light_sync_context());
+            relevant_event_ids_for_context(other.app_runtime.store.events(), &self.light_sync_context());
         let other_to_local =
             filter_batch_by_profile(&other_to_local_raw, profile, &relevant_remote_ids);
 
         let reverse_peer_id = self.current_peer_id();
         let other_cursor =
             other
-                .event_store
+                .app_runtime.store
                 .peer_cursor(&reverse_peer_id)
                 .unwrap_or(core_types::PeerCursor {
                     peer_id: reverse_peer_id.clone(),
                     last_event_id: None,
                 });
-        let local_event_ids = self.event_store.event_ids();
+        let local_event_ids = self.app_runtime.store.event_ids();
         let local_to_other_raw =
             plan_pull_batch(&other_cursor, "local-to-other", &local_event_ids, |id| {
-                other.event_store.has_event(id)
+                other.app_runtime.store.has_event(id)
             });
         let relevant_local_ids =
-            relevant_event_ids_for_context(self.event_store.events(), &other.light_sync_context());
+            relevant_event_ids_for_context(self.app_runtime.store.events(), &other.light_sync_context());
         let local_to_other =
             filter_batch_by_profile(&local_to_other_raw, profile, &relevant_local_ids);
-        let local_to_other_events = self.event_store.events_by_ids(&local_to_other.event_ids);
+        let local_to_other_events = self.app_runtime.store.events_by_ids(&local_to_other.event_ids);
         let local_to_other_message_count = local_to_other_events
             .iter()
             .filter(|event| matches!(event.body, EventBody::MessageSent(_)))
@@ -938,7 +938,7 @@ impl DemoApp {
             .iter()
             .filter(|event| matches!(event.body, EventBody::ContentPublished(_)))
             .count();
-        let other_to_local_events = other.event_store.events_by_ids(&other_to_local.event_ids);
+        let other_to_local_events = other.app_runtime.store.events_by_ids(&other_to_local.event_ids);
         let other_to_local_message_count = other_to_local_events
             .iter()
             .filter(|event| matches!(event.body, EventBody::MessageSent(_)))

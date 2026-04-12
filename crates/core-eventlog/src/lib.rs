@@ -8,7 +8,8 @@ pub use authorize::{AllowAllAuthorizer, Authorizer, IdentityAuthorizer};
 pub use event_log::EventLog;
 pub use memory::MemoryEventLog;
 pub use types::{
-    DeviceRecord, DeviceStatus, GuardianRecord, MaterializedState, PersonaRecord, PersonaStatus,
-    RecoveryPolicyRecord, RecoveryRequestRecord, RecoveryRequestStatus, RootRecord, RootStatus,
-    SyncBatchRecord,
+    BadgeDisputeRecord, BadgeRecord, CredentialDepositRecord, CredentialDepositStatus,
+    DeviceRecord, DeviceStatus, GrantOfferRecord, GrantOfferStatus, GuardianRecord,
+    MaterializedState, PersonaRecord, PersonaStatus, RecoveryPolicyRecord, RecoveryRequestRecord,
+    RecoveryRequestStatus, RootRecord, RootStatus, SyncBatchRecord,
 };

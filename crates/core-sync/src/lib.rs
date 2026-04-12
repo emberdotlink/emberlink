@@ -657,6 +657,31 @@ fn is_event_relevant_to_context(event: &EventEnvelope, context: &LightSyncContex
         EventBody::DisclosureRevoked(body) => {
             context.persona_ids.contains(&body.revoker_persona_id)
         }
+        EventBody::GrantOfferCreated(body) => {
+            context.persona_ids.contains(&body.issuer_persona_id)
+        }
+        EventBody::GrantOfferClaimed(body) => {
+            context.persona_ids.contains(&body.recipient_persona_id)
+        }
+        EventBody::GrantOfferRevoked(body) => {
+            context.persona_ids.contains(&body.issuer_persona_id)
+        }
+        EventBody::BadgeIssued(body) => {
+            context.persona_ids.contains(&body.issuer_persona_id)
+                || context.persona_ids.contains(&body.recipient_persona_id)
+        }
+        EventBody::BadgeRevoked(body) => {
+            context.persona_ids.contains(&body.revoker_persona_id)
+        }
+        EventBody::BadgeDisputed(body) => {
+            context.persona_ids.contains(&body.disputer_persona_id)
+        }
+        EventBody::CredentialDeposited(body) => {
+            context.persona_ids.contains(&body.issuer_id)
+        }
+        EventBody::CredentialRevoked(body) => {
+            context.persona_ids.contains(&body.revoker_id)
+        }
         EventBody::LegacyOpaque { subject, .. } => {
             context.root_ids.contains(&subject.subject_id)
                 || context.persona_ids.contains(&subject.subject_id)

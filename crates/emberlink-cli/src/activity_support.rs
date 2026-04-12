@@ -16,7 +16,7 @@ impl DemoApp {
         writeln!(&mut out, "--------").unwrap();
 
         let message_events: Vec<_> = self
-            .event_store
+            .app_runtime.store
             .events_of_type_rev(EventType::MessageSent)
             .collect();
         let total = message_events.len();
@@ -84,7 +84,7 @@ impl DemoApp {
         writeln!(&mut out, "-------").unwrap();
 
         let content_events: Vec<_> = self
-            .event_store
+            .app_runtime.store
             .events_of_type_rev(EventType::ContentPublished)
             .collect();
         let total = content_events.len();
@@ -132,7 +132,7 @@ impl DemoApp {
 
         let mut count = 0usize;
         let mut shown = 0usize;
-        for event in self.event_store.events_of_type_rev(EventType::MessageSent) {
+        for event in self.app_runtime.store.events_of_type_rev(EventType::MessageSent) {
             if let EventBody::MessageSent(body) = &event.body
                 && let Some(disclosure) = decode_disclosure_artifact_message(&body.ciphertext_hex)
             {
@@ -174,7 +174,7 @@ impl DemoApp {
     }
 
     pub fn render_disclosure_message(&self, message_ref: &str) -> String {
-        for event in self.event_store.events_of_type_rev(EventType::MessageSent) {
+        for event in self.app_runtime.store.events_of_type_rev(EventType::MessageSent) {
             if let EventBody::MessageSent(body) = &event.body {
                 if body.message_id != message_ref && event.event_id != message_ref {
                     continue;
@@ -204,7 +204,7 @@ impl DemoApp {
     }
 
     pub(crate) fn message_compare_entries(&self) -> Vec<(String, String)> {
-        self.event_store
+        self.app_runtime.store
             .events_of_type(EventType::MessageSent)
             .filter_map(|event| match &event.body {
                 EventBody::MessageSent(body) => {
@@ -251,7 +251,7 @@ impl DemoApp {
             .ok_or_else(|| ValidationError::new(format!("unknown issuer persona: {issuer_ref}")))?;
         let signer = self.persona_signer(&issuer.id)?;
         let envelope = self
-            .event_store
+            .app_runtime.store
             .build_local_presentation_artifact_envelope(artifact_id, &issuer.id, &signer)?;
         Ok(core_storage::encode_presentation_artifact_envelope(
             &envelope,
@@ -259,7 +259,7 @@ impl DemoApp {
     }
 
     pub(crate) fn content_compare_entries(&self) -> Vec<(String, String)> {
-        self.event_store
+        self.app_runtime.store
             .events_of_type(EventType::ContentPublished)
             .filter_map(|event| match &event.body {
                 EventBody::ContentPublished(body) => Some((

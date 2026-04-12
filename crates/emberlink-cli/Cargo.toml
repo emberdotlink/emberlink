@@ -13,6 +13,7 @@ core-policy = { path = "../core-policy" }
 core-recovery = { path = "../core-recovery" }
 core-sync = { path = "../core-sync" }
 core-state = { path = "../core-state" }
+emberlink-app = { path = "../emberlink-app" }
 core-storage = { path = "../core-storage" }
 core-trust = { path = "../core-trust" }
 core-types = { path = "../core-types" }

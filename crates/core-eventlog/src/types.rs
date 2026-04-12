@@ -94,6 +94,76 @@ pub struct RecoveryRequestRecord {
     pub rejection_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BadgeRecord {
+    pub badge_id: String,
+    pub issuer_persona_id: String,
+    pub recipient_persona_id: String,
+    pub badge_type: String,
+    pub display_name: String,
+    pub evidence: Option<core_types::BadgeEvidence>,
+    pub issued_at: u64,
+    pub expires_at: Option<u64>,
+    pub revoked: bool,
+    pub revoked_reason: Option<String>,
+}
+
+/// A dispute attestation targeting a specific badge (design counter-attestation).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BadgeDisputeRecord {
+    pub dispute_id: String,
+    pub target_badge_id: String,
+    pub disputer_persona_id: String,
+    pub reason: String,
+    pub evidence: Option<String>,
+}
+
+/// Status of a credential deposit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialDepositStatus {
+    Active,
+    Revoked,
+}
+
+/// A credential deposit record for materialized state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialDepositRecord {
+    pub deposit_id: String,
+    pub grant_id: String,
+    pub credential_id: String,
+    pub issuer_id: String,
+    pub encrypted_blocks_json: String,
+    pub status: CredentialDepositStatus,
+    pub created_at: u64,
+    pub expires_at: Option<u64>,
+    pub revoked_at: Option<u64>,
+    pub revoked_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantOfferStatus {
+    Pending,
+    Claimed,
+    Revoked,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantOfferRecord {
+    pub offer_id: String,
+    pub issuer_persona_id: String,
+    pub ephemeral_public_key_hex: String,
+    pub sealed_payload_hex: String,
+    pub relay_hint: Option<String>,
+    pub expires_at: u64,
+    /// JSON-encoded grant conditions. Empty string or `"[]"` = unconditional.
+    pub conditions_json: String,
+    pub status: GrantOfferStatus,
+    /// Set when status transitions to `Claimed`.
+    pub recipient_persona_id: Option<String>,
+    pub claim_response_hex: Option<String>,
+    pub claimed_at: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct MaterializedState {
     pub roots_current: BTreeMap<String, RootRecord>,
@@ -107,6 +177,10 @@ pub struct MaterializedState {
     pub storage_relationships_current: BTreeMap<String, StorageRelationship>,
     pub storage_balances_current: BTreeMap<String, StorageLedgerEntry>,
     pub endpoints_current: BTreeMap<String, EndpointDescriptor>,
+    pub grant_offers_current: BTreeMap<String, GrantOfferRecord>,
+    pub badges_current: BTreeMap<String, BadgeRecord>,
+    pub badge_disputes_current: BTreeMap<String, BadgeDisputeRecord>,
+    pub credential_deposits_current: BTreeMap<String, CredentialDepositRecord>,
     pub root_key_history: BTreeMap<String, Vec<String>>,
     pub device_key_history: BTreeMap<String, Vec<String>>,
     pub device_encryption_key_history: BTreeMap<String, Vec<String>>,

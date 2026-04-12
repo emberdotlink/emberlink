@@ -1,8 +1,10 @@
 use std::fmt::Write as _;
 
 use crate::activity_support::disclosure_payload_preview;
+use crate::commands::truncate_id;
 use core_identity::disclosure_view;
 use core_sync::{check_relay_admission, wrap_for_relay};
+use core_trust::queries;
 use core_trust::{derive_score, derive_score_for_recipient, explain};
 use core_types::{EventType, RelayAdmission, RelayMode, TrustThreshold};
 
@@ -17,6 +19,7 @@ impl DemoApp {
         writeln!(&mut out, "Show data").unwrap();
         writeln!(&mut out, "  show broker").unwrap();
         writeln!(&mut out, "  show broker --disclose-links").unwrap();
+        writeln!(&mut out, "  trust dashboard").unwrap();
         writeln!(&mut out, "  show trust").unwrap();
         writeln!(&mut out, "  trust --recipient peer-demo").unwrap();
         writeln!(
@@ -74,7 +77,7 @@ impl DemoApp {
         .unwrap();
         writeln!(
             &mut out,
-            "  vault write-record --namespace persona:persona-professional --object vault-object-custom-profile --schema com.example.profile/custom --app com.example.profile --json {{\"display_name\":\"operator\"}}"
+            "  vault write-record --namespace persona:persona-professional --object vault-object-custom-profile --schema com.example.profile/custom --app com.example.profile --json {{\"display_name\":\"alice\"}}"
         )
         .unwrap();
         writeln!(
@@ -192,43 +195,43 @@ impl DemoApp {
         writeln!(&mut out, "  sync history").unwrap();
         writeln!(&mut out, "  show state").unwrap();
         writeln!(&mut out, "  show keys").unwrap();
-        writeln!(&mut out, "  show root operator").unwrap();
+        writeln!(&mut out, "  show root alice").unwrap();
         writeln!(&mut out, "  show device laptop").unwrap();
-        writeln!(&mut out, "  show persona operator@work").unwrap();
+        writeln!(&mut out, "  show persona alice@work").unwrap();
         writeln!(&mut out, "  list roots").unwrap();
         writeln!(&mut out, "  list devices").unwrap();
         writeln!(&mut out, "  list personas").unwrap();
         writeln!(&mut out, "  list keys").unwrap();
         writeln!(&mut out).unwrap();
         writeln!(&mut out, "Create data").unwrap();
-        writeln!(&mut out, "  root create --name operator").unwrap();
-        writeln!(&mut out, "  root rotate-key --root operator").unwrap();
-        writeln!(&mut out, "  device add --root operator --label laptop").unwrap();
+        writeln!(&mut out, "  root create --name alice").unwrap();
+        writeln!(&mut out, "  root rotate-key --root alice").unwrap();
+        writeln!(&mut out, "  device add --root alice --label laptop").unwrap();
         writeln!(&mut out, "  device revoke --device laptop").unwrap();
         writeln!(&mut out, "  device rotate-key --device laptop").unwrap();
         writeln!(&mut out, "  device rotate-encryption-key --device laptop").unwrap();
         writeln!(
             &mut out,
-            "  persona create --root operator --label operator@work --template professional"
+            "  persona create --root alice --label alice@work --template professional"
         )
         .unwrap();
         writeln!(
             &mut out,
-            "  persona create --root operator --label alias@elsewhere --profile persona.custom"
+            "  persona create --root alice --label alias@elsewhere --profile persona.custom"
         )
         .unwrap();
         writeln!(
             &mut out,
-            "  persona grant-device --persona operator@work --device laptop"
+            "  persona grant-device --persona alice@work --device laptop"
         )
         .unwrap();
         writeln!(
             &mut out,
-            "  persona revoke-device --persona operator@work --device laptop"
+            "  persona revoke-device --persona alice@work --device laptop"
         )
         .unwrap();
-        writeln!(&mut out, "  persona rotate-key --persona operator@work").unwrap();
-        writeln!(&mut out, "  persona revoke --persona operator@work").unwrap();
+        writeln!(&mut out, "  persona rotate-key --persona alice@work").unwrap();
+        writeln!(&mut out, "  persona revoke --persona alice@work").unwrap();
         writeln!(
             &mut out,
             "  message send --from persona-professional --to persona-pseudonymous --ciphertext deadbeef"
@@ -239,7 +242,7 @@ impl DemoApp {
             "  content publish --from persona-professional --type post --payload cafefood --visibility public"
         )
         .unwrap();
-        writeln!(&mut out, "  recovery request --root operator --device laptop").unwrap();
+        writeln!(&mut out, "  recovery request --root alice --device laptop").unwrap();
         writeln!(&mut out, "  recovery approve --guardian guardian-alex").unwrap();
         writeln!(
             &mut out,
@@ -694,30 +697,182 @@ impl DemoApp {
         } else {
             writeln!(&mut out, "No derived trust score available yet").unwrap();
         }
+        // design: only display publicly-visible attestations.
+        // Recipient-bound attestations are filtered out to prevent leaking
+        // private trust signals to arbitrary viewers.
+        let visible: Vec<_> = self
+            .trust_attestations
+            .iter()
+            .filter(|a| a.recipient_bound.is_none())
+            .collect();
         writeln!(
             &mut out,
             "Attestations loaded: {}",
-            self.trust_attestations.len()
+            visible.len()
         )
         .unwrap();
-        if self.trust_attestations.is_empty() {
+        if visible.is_empty() {
             writeln!(&mut out, "Attestations: none").unwrap();
         } else {
             writeln!(&mut out, "Attestations:").unwrap();
-            for attestation in &self.trust_attestations {
+            for attestation in &visible {
                 writeln!(
                     &mut out,
-                    "  - {}\t{}\t{}\t{}\t{:.2}\t{}",
+                    "  - {}\t{}\t{}\t{}\t{:.2}\t(public)",
                     attestation.id,
                     attestation.attester,
                     attestation.subject,
                     attestation.domain,
                     attestation.score,
-                    attestation.recipient_bound.as_deref().unwrap_or("(public)")
                 )
                 .unwrap();
             }
         }
+
+        out
+    }
+
+    pub fn render_trust_dashboard(&self, persona_id: &str, max_depth: u32) -> String {
+        let mut out = String::new();
+        let persona_label = self
+            .resolve_persona(persona_id)
+            .map(|p| p.label.as_str())
+            .unwrap_or(persona_id);
+        writeln!(&mut out, "=== Trust Dashboard ===").unwrap();
+        writeln!(&mut out, "Persona: {} ({})", persona_label, persona_id).unwrap();
+        writeln!(&mut out).unwrap();
+
+        // -- Active Outbound Grants --
+        writeln!(&mut out, "── Active Outbound Grants ──").unwrap();
+        match self
+            .app_runtime
+            .store
+            .list_active_grants(Some(persona_id), None)
+        {
+            Ok(grants) => {
+                if grants.is_empty() {
+                    writeln!(&mut out, "  (none)").unwrap();
+                } else {
+                    for g in &grants {
+                        let expires = match g.expires_at {
+                            Some(ts) => format!("expires {ts}"),
+                            None => "no expiry".to_string(),
+                        };
+                        writeln!(
+                            &mut out,
+                            "  → {} | {} caps | {}",
+                            truncate_id(&g.recipient_id),
+                            g.capability_count,
+                            expires,
+                        )
+                        .unwrap();
+                    }
+                    writeln!(&mut out, "  ({} total)", grants.len()).unwrap();
+                }
+            }
+            Err(err) => {
+                writeln!(&mut out, "  (error: {})", err).unwrap();
+            }
+        }
+        writeln!(&mut out).unwrap();
+
+        // -- Active Inbound Grants --
+        // Inbound = grants where this persona is the recipient.
+        // We list all grants (no persona filter) and filter for recipient match.
+        writeln!(&mut out, "── Active Inbound Grants ──").unwrap();
+        match self.app_runtime.store.list_active_grants(None, None) {
+            Ok(all_grants) => {
+                let inbound: Vec<_> = all_grants
+                    .iter()
+                    .filter(|g| g.recipient_id == persona_id)
+                    .collect();
+                if inbound.is_empty() {
+                    writeln!(&mut out, "  (none)").unwrap();
+                } else {
+                    for g in &inbound {
+                        let issuer_label = self
+                            .resolve_persona(&g.issuing_persona_id)
+                            .map(|p| p.label.as_str())
+                            .unwrap_or(&g.issuing_persona_id);
+                        let expires = match g.expires_at {
+                            Some(ts) => format!("expires {ts}"),
+                            None => "no expiry".to_string(),
+                        };
+                        writeln!(
+                            &mut out,
+                            "  ← {} | {} caps | {}",
+                            truncate_id(issuer_label),
+                            g.capability_count,
+                            expires,
+                        )
+                        .unwrap();
+                    }
+                    writeln!(&mut out, "  ({} total)", inbound.len()).unwrap();
+                }
+            }
+            Err(err) => {
+                writeln!(&mut out, "  (error: {})", err).unwrap();
+            }
+        }
+        writeln!(&mut out).unwrap();
+
+        // -- Who Trusts You --
+        // design: use query helpers that filter out recipient-bound attestations.
+        writeln!(&mut out, "── Who Trusts You ──").unwrap();
+        let who_trusts_results = queries::who_trusts(&self.trust_attestations, persona_id);
+        if who_trusts_results.is_empty() {
+            writeln!(&mut out, "  (none)").unwrap();
+        } else {
+            for s in &who_trusts_results {
+                writeln!(
+                    &mut out,
+                    "  {} | {} | {:.2}",
+                    truncate_id(&s.attestor),
+                    s.domain,
+                    s.score,
+                )
+                .unwrap();
+            }
+            writeln!(&mut out, "  ({} total)", who_trusts_results.len()).unwrap();
+        }
+        writeln!(&mut out).unwrap();
+
+        // -- Who You Trust --
+        writeln!(&mut out, "── Who You Trust ──").unwrap();
+        let who_you_trust_results = queries::who_i_trust(&self.trust_attestations, persona_id);
+        if who_you_trust_results.is_empty() {
+            writeln!(&mut out, "  (none)").unwrap();
+        } else {
+            for s in &who_you_trust_results {
+                writeln!(
+                    &mut out,
+                    "  {} | {} | {:.2}",
+                    truncate_id(&s.subject),
+                    s.domain,
+                    s.score,
+                )
+                .unwrap();
+            }
+            writeln!(&mut out, "  ({} total)", who_you_trust_results.len()).unwrap();
+        }
+        writeln!(&mut out).unwrap();
+
+        // -- Trust Network --
+        // design: use trust_network() which excludes recipient-bound attestations.
+        writeln!(&mut out, "── Trust Network ──").unwrap();
+        let graph = queries::trust_network(
+            &self.trust_attestations,
+            persona_id,
+            max_depth as usize,
+        );
+        writeln!(
+            &mut out,
+            "  {} nodes, {} edges (depth up to {})",
+            graph.nodes.len(),
+            graph.edges.len(),
+            max_depth,
+        )
+        .unwrap();
 
         out
     }
@@ -734,7 +889,7 @@ impl DemoApp {
         .unwrap();
         if let Some(session) = &self.recovery_session {
             let request_record = self
-                .event_store
+                .app_runtime.store
                 .materialized()
                 .recovery_requests_current
                 .get(&session.request_id);
@@ -846,7 +1001,7 @@ impl DemoApp {
             ledger.stored_bytes_delta
         )
         .unwrap();
-        match self.event_store.local_block_coverage(&manifest.id) {
+        match self.app_runtime.store.local_block_coverage(&manifest.id) {
             Ok(Some(coverage)) => {
                 writeln!(
                     &mut out,
@@ -912,7 +1067,7 @@ impl DemoApp {
         )
         .unwrap();
 
-        let catalog = match self.event_store.local_vault_catalog(&namespace) {
+        let catalog = match self.app_runtime.store.local_vault_catalog(&namespace) {
             Ok(Some(catalog)) => catalog,
             Ok(None) => {
                 writeln!(&mut out, "Catalog: none").unwrap();
@@ -968,7 +1123,7 @@ impl DemoApp {
             }
         }
 
-        let templates = match self.event_store.local_presentation_templates() {
+        let templates = match self.app_runtime.store.local_presentation_templates() {
             Ok(templates) => templates
                 .into_iter()
                 .filter(|template| {
@@ -1005,7 +1160,7 @@ impl DemoApp {
             }
         }
 
-        let artifacts = match self.event_store.local_presentation_artifacts() {
+        let artifacts = match self.app_runtime.store.local_presentation_artifacts() {
             Ok(artifacts) => artifacts
                 .into_iter()
                 .filter(|record| {
@@ -1039,7 +1194,7 @@ impl DemoApp {
             }
         }
 
-        let received = match self.event_store.local_received_presentation_artifacts() {
+        let received = match self.app_runtime.store.local_received_presentation_artifacts() {
             Ok(records) => records,
             Err(err) => {
                 writeln!(&mut out, "Received artifacts error: {}", err.message).unwrap();
@@ -1064,7 +1219,7 @@ impl DemoApp {
         writeln!(&mut out, "Received Artifacts").unwrap();
         writeln!(&mut out, "------------------").unwrap();
 
-        let records = match self.event_store.local_received_presentation_artifacts() {
+        let records = match self.app_runtime.store.local_received_presentation_artifacts() {
             Ok(records) => records,
             Err(err) => {
                 writeln!(&mut out, "Load error: {}", err.message).unwrap();
@@ -1083,7 +1238,7 @@ impl DemoApp {
             &records
         };
         for record in display_records {
-            let verification = self.event_store.verify_disclosure_issuer(&record.envelope);
+            let verification = self.app_runtime.store.verify_disclosure_issuer(&record.envelope);
             writeln!(
                 &mut out,
                 "  - {}\tstatus {}\tverification {}\tissuer {}\t{}\t{}\tschema {}\treceipts {}\tlast-source {}\t{}",
@@ -1179,7 +1334,7 @@ impl DemoApp {
         writeln!(&mut out, "Relay mode: trust-gated").unwrap();
         writeln!(&mut out, "Threshold: 0.75").unwrap();
         if let Some(endpoint) = self
-            .event_store
+            .app_runtime.store
             .materialized()
             .endpoint(&self.current_peer_id())
         {
@@ -1196,7 +1351,7 @@ impl DemoApp {
         if let RelayAdmission::Reject { reason } = admission {
             writeln!(&mut out, "Reason: {}", reason).unwrap();
         }
-        match self.event_store.peer_cursors() {
+        match self.app_runtime.store.peer_cursors() {
             Ok(cursors) if cursors.is_empty() => {
                 writeln!(&mut out, "Tracked peers: none").unwrap();
             }
@@ -1216,11 +1371,11 @@ impl DemoApp {
                 writeln!(&mut out, "Tracked peers: unavailable ({})", err.message).unwrap();
             }
         }
-        if self.event_store.materialized().endpoints_current.is_empty() {
+        if self.app_runtime.store.materialized().endpoints_current.is_empty() {
             writeln!(&mut out, "Known endpoints: none").unwrap();
         } else {
             writeln!(&mut out, "Known endpoints:").unwrap();
-            for endpoint in self.event_store.materialized().endpoints_current.values() {
+            for endpoint in self.app_runtime.store.materialized().endpoints_current.values() {
                 writeln!(
                     &mut out,
                     "  - {}\t{}\tvia {}",
@@ -1229,7 +1384,7 @@ impl DemoApp {
                 .unwrap();
             }
         }
-        match self.event_store.sync_batches() {
+        match self.app_runtime.store.sync_batches() {
             Ok(batches) if batches.is_empty() => {
                 writeln!(&mut out, "Sync batches: none").unwrap();
             }
@@ -1261,7 +1416,7 @@ impl DemoApp {
         let mut out = String::new();
         writeln!(&mut out, "Sync History").unwrap();
         writeln!(&mut out, "------------").unwrap();
-        match self.event_store.peer_cursors() {
+        match self.app_runtime.store.peer_cursors() {
             Ok(cursors) if cursors.is_empty() => {
                 writeln!(&mut out, "Tracked peers: none").unwrap();
             }
@@ -1281,7 +1436,7 @@ impl DemoApp {
                 writeln!(&mut out, "Tracked peers: unavailable ({})", err.message).unwrap();
             }
         }
-        match self.event_store.sync_batches() {
+        match self.app_runtime.store.sync_batches() {
             Ok(batches) if batches.is_empty() => {
                 writeln!(&mut out, "Batches: none").unwrap();
             }
@@ -1318,7 +1473,7 @@ impl DemoApp {
             }
         };
 
-        match self.event_store.plan_local_vault_gc(&namespace) {
+        match self.app_runtime.store.plan_local_vault_gc(&namespace) {
             Ok(Some(plan)) => {
                 writeln!(
                     &mut out,
@@ -1374,7 +1529,7 @@ impl DemoApp {
         writeln!(&mut out, "Storage Audit").unwrap();
         writeln!(&mut out, "-------------").unwrap();
 
-        match self.event_store.audit_local_blocks() {
+        match self.app_runtime.store.audit_local_blocks() {
             Ok(audit) => {
                 writeln!(
                     &mut out,
@@ -1430,13 +1585,13 @@ impl DemoApp {
         writeln!(
             &mut out,
             "Appended events: {}",
-            self.event_store.event_count()
+            self.app_runtime.store.event_count()
         )
         .unwrap();
         writeln!(
             &mut out,
             "Message events: {}",
-            self.event_store
+            self.app_runtime.store
                 .events()
                 .iter()
                 .filter(|event| event.event_type == EventType::MessageSent)
@@ -1446,7 +1601,7 @@ impl DemoApp {
         writeln!(
             &mut out,
             "Content events: {}",
-            self.event_store
+            self.app_runtime.store
                 .events()
                 .iter()
                 .filter(|event| event.event_type == EventType::ContentPublished)
@@ -1456,7 +1611,7 @@ impl DemoApp {
         writeln!(
             &mut out,
             "Known endpoints: {}",
-            self.event_store.materialized().endpoints_current.len()
+            self.app_runtime.store.materialized().endpoints_current.len()
         )
         .unwrap();
         writeln!(&mut out, "Roots in memory: {}", self.roots.len()).unwrap();
@@ -1469,7 +1624,7 @@ impl DemoApp {
             self.revoked_personas.len()
         )
         .unwrap();
-        match self.event_store.peer_cursors() {
+        match self.app_runtime.store.peer_cursors() {
             Ok(cursors) => {
                 writeln!(&mut out, "Tracked peers: {}", cursors.len()).unwrap();
             }
@@ -1479,7 +1634,7 @@ impl DemoApp {
         }
 
         if let Some(event) = self
-            .event_store
+            .app_runtime.store
             .events()
             .iter()
             .find(|event| event.event_type == EventType::RootCreated)
@@ -1493,7 +1648,7 @@ impl DemoApp {
         }
 
         if let Some(event) = self
-            .event_store
+            .app_runtime.store
             .events()
             .iter()
             .find(|event| event.event_type == EventType::PersonaCreated)
@@ -1506,7 +1661,7 @@ impl DemoApp {
             .unwrap();
         }
 
-        if let Some(event) = self.event_store.events().last() {
+        if let Some(event) = self.app_runtime.store.events().last() {
             writeln!(
                 &mut out,
                 "Latest event:\t{}\t{:?}",

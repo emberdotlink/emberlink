@@ -1,6 +1,8 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+use emberlink_app::UiAction;
+
 use core_crypto::FixtureSigner;
 use core_identity::{
     device_added_event, device_encryption_key_rotated_event, device_frozen_event,
@@ -42,7 +44,31 @@ fn parse_limit_arg(tokens: &[&str]) -> usize {
     0
 }
 
-fn truncate_id(id: &str) -> &str {
+/// Parse a human-friendly duration string into seconds.
+///
+/// Supported suffixes: `s` (seconds), `m` (minutes), `h` (hours), `d` (days).
+/// Plain integers are treated as seconds.
+fn parse_duration_to_secs(s: &str) -> Result<u64, String> {
+    if let Some(n) = s.strip_suffix('d') {
+        n.parse::<u64>()
+            .map(|v| v * 86400)
+            .map_err(|e| e.to_string())
+    } else if let Some(n) = s.strip_suffix('h') {
+        n.parse::<u64>()
+            .map(|v| v * 3600)
+            .map_err(|e| e.to_string())
+    } else if let Some(n) = s.strip_suffix('m') {
+        n.parse::<u64>()
+            .map(|v| v * 60)
+            .map_err(|e| e.to_string())
+    } else if let Some(n) = s.strip_suffix('s') {
+        n.parse::<u64>().map_err(|e| e.to_string())
+    } else {
+        s.parse::<u64>().map_err(|e| e.to_string())
+    }
+}
+
+pub(crate) fn truncate_id(id: &str) -> &str {
     if id.len() > 12 {
         &id[..12]
     } else {
@@ -161,6 +187,8 @@ impl DemoApp {
             ["import", rest @ ..] => self.handle_import(rest),
             ["show", "vault", rest @ ..] | ["vault", rest @ ..] => self.handle_vault(rest),
             ["show", "grant", rest @ ..] | ["grant", rest @ ..] => self.handle_grant(rest),
+            ["badge", rest @ ..] => self.handle_badge(rest),
+            ["credential", rest @ ..] => self.handle_credential(rest),
             ["show", "storage", rest @ ..] | ["storage", rest @ ..] => self.handle_storage(rest),
             ["show", "sync", rest @ ..] | ["sync", rest @ ..] => self.handle_sync(rest),
             ["show", "state"] | ["state"] => self.render_state(),
@@ -372,7 +400,7 @@ impl DemoApp {
             SignerBinding::persona(attester_persona_id, &attester.active_key.key_id),
             &signer,
         )?;
-        self.event_store.append_with_authorizer(
+        self.app_runtime.store.append_with_authorizer(
             event,
             &self.verifier,
             &IdentityAuthorizer,
@@ -435,7 +463,7 @@ impl DemoApp {
         let attester_key_id = attester.active_key.key_id.clone();
         let signer = self.persona_signer(&attester_id)?;
         let previous_event_id = self
-            .event_store
+            .app_runtime.store
             .events()
             .iter()
             .rev()
@@ -456,7 +484,7 @@ impl DemoApp {
             SignerBinding::persona(&attester_id, &attester_key_id),
             &signer,
         )?;
-        self.event_store.append_with_authorizer(
+        self.app_runtime.store.append_with_authorizer(
             event,
             &self.verifier,
             &IdentityAuthorizer,
@@ -719,13 +747,13 @@ impl DemoApp {
         )?;
         let vault_namespaces = self.vault_namespaces_for_root(&session.root_id)?;
         if let Some(replacement_device) = &replacement_device {
-            self.event_store
+            self.app_runtime.store
                 .restore_persona_access_to_replacement_device(
                     &session.target_device_id,
                     &replacement_device.device_id,
                 )?;
             for namespace in &vault_namespaces {
-                self.event_store
+                self.app_runtime.store
                     .restore_local_vault_access_to_replacement_device(
                         namespace,
                         &session.target_device_id,
@@ -734,14 +762,14 @@ impl DemoApp {
             }
         } else {
             for namespace in &vault_namespaces {
-                self.event_store
+                self.app_runtime.store
                     .revoke_local_vault_access_for_inactive_device(
                         namespace,
                         &session.target_device_id,
                     )?;
             }
         }
-        if let Some(mut manifest) = self.event_store.file_manifest(&self.storage_manifest.id) {
+        if let Some(mut manifest) = self.app_runtime.store.file_manifest(&self.storage_manifest.id) {
             if let Some(replacement_device) = &replacement_device {
                 let manifest_id = manifest.id.clone();
                 let replacement_access = self
@@ -971,7 +999,7 @@ impl DemoApp {
         let signer = self.device_signer(&device_id)?;
         let signing_key_id = self.devices[index].active_key.key_id.clone();
         let next_version = self
-            .event_store
+            .app_runtime.store
             .materialized()
             .device_encryption_key_history
             .get(&device_id)
@@ -997,7 +1025,7 @@ impl DemoApp {
             &signer,
         )?;
         self.devices[index].active_encryption_key = new_encryption_key.clone();
-        self.event_store
+        self.app_runtime.store
             .upsert_local_device_encryption_key(&device_id, &key_pair)?;
         self.rewrap_manifest_access_for_device(&device_id)?;
         self.persist_to_disk()?;
@@ -1012,7 +1040,7 @@ impl DemoApp {
         &mut self,
         device_id: &str,
     ) -> Result<(), ValidationError> {
-        self.event_store.prime_manifest_keys_for_device(device_id)?;
+        self.app_runtime.store.prime_manifest_keys_for_device(device_id)?;
         Ok(())
     }
 
@@ -1020,7 +1048,7 @@ impl DemoApp {
         &mut self,
         device_id: &str,
     ) -> Result<(), ValidationError> {
-        for mut manifest in self.event_store.file_manifests() {
+        for mut manifest in self.app_runtime.store.file_manifests() {
             if !manifest
                 .authorized_devices
                 .iter()
@@ -1073,7 +1101,7 @@ impl DemoApp {
             .ok_or_else(|| ValidationError::new(format!("unknown device: {device_ref}")))?;
         let peer_id = self.current_peer_id();
         let current_endpoint = self
-            .event_store
+            .app_runtime.store
             .materialized()
             .endpoint(&peer_id)
             .cloned()
@@ -1228,7 +1256,7 @@ impl DemoApp {
             owner_id: device.device_id.clone(),
             key_pair,
         });
-        self.event_store
+        self.app_runtime.store
             .upsert_local_device_encryption_key(device_id, &encryption_key_pair)?;
         self.devices.push(device);
         self.persist_to_disk()?;
@@ -1242,7 +1270,7 @@ impl DemoApp {
 
         let root_id = self.storage_manifest_root_id(&self.storage_manifest)?;
         if !self
-            .event_store
+            .app_runtime.store
             .materialized()
             .storage_relationships_current
             .contains_key(&self.storage_relationship.id)
@@ -1254,7 +1282,7 @@ impl DemoApp {
             )?;
         }
         if !self
-            .event_store
+            .app_runtime.store
             .materialized()
             .storage_balances_current
             .contains_key(&self.storage_ledger.relationship_id)
@@ -1266,7 +1294,7 @@ impl DemoApp {
             )?;
         }
         if self
-            .event_store
+            .app_runtime.store
             .file_manifest(&self.storage_manifest.id)
             .is_none()
         {
@@ -1283,7 +1311,7 @@ impl DemoApp {
 
     pub(crate) fn initialize_runtime_vault_state(&mut self) -> Result<(), ValidationError> {
         let namespace = self.seed_vault_namespace();
-        if self.event_store.local_vault_catalog(&namespace)?.is_none() {
+        if self.app_runtime.store.local_vault_catalog(&namespace)?.is_none() {
             let recipients = self.manifest_key_recipients_for_namespace(&namespace)?;
             if recipients.is_empty() {
                 return Err(ValidationError::new(
@@ -1296,7 +1324,7 @@ impl DemoApp {
                 encoding: core_types::StructuredEncoding::Json,
                 app_namespace: "com.emberlink.profile".into(),
             };
-            self.event_store.upsert_local_structured_record(
+            self.app_runtime.store.upsert_local_structured_record(
                 &namespace,
                 "vault-object-professional-profile",
                 "vault-rev-professional-v1",
@@ -1310,7 +1338,7 @@ impl DemoApp {
                 core_types::RetentionPolicy::KeepLatest,
                 recipients.clone(),
             )?;
-            self.event_store.upsert_local_structured_record(
+            self.app_runtime.store.upsert_local_structured_record(
                 &namespace,
                 "vault-object-professional-profile",
                 "vault-rev-professional-v2",
@@ -1326,7 +1354,7 @@ impl DemoApp {
             )?;
         }
         if self
-            .event_store
+            .app_runtime.store
             .local_presentation_template("template-professional-card")?
             .is_none()
         {
@@ -1344,11 +1372,11 @@ impl DemoApp {
                 ],
                 Some(3600),
             )?;
-            self.event_store
+            self.app_runtime.store
                 .upsert_local_presentation_template(&template)?;
         }
         if self
-            .event_store
+            .app_runtime.store
             .local_presentation_template("template-professional-peer-card")?
             .is_none()
         {
@@ -1365,7 +1393,7 @@ impl DemoApp {
                 ],
                 Some(3600),
             )?;
-            self.event_store
+            self.app_runtime.store
                 .upsert_local_presentation_template(&template)?;
         }
         Ok(())
@@ -1419,7 +1447,7 @@ impl DemoApp {
                 .map(|persona| persona.root_id.as_str())
         };
         Ok(self
-            .event_store
+            .app_runtime.store
             .local_vault_namespaces()?
             .into_iter()
             .filter(|namespace| match namespace.owner_kind {
@@ -1433,7 +1461,7 @@ impl DemoApp {
 
     pub(crate) fn refresh_storage_manifest_from_runtime(&mut self) -> Result<(), ValidationError> {
         if let Some(relationship) = self
-            .event_store
+            .app_runtime.store
             .materialized()
             .storage_relationships_current
             .get(&self.storage_relationship.id)
@@ -1441,14 +1469,14 @@ impl DemoApp {
             self.storage_relationship = relationship.clone();
         }
         if let Some(balance) = self
-            .event_store
+            .app_runtime.store
             .materialized()
             .storage_balances_current
             .get(&self.storage_ledger.relationship_id)
         {
             self.storage_ledger = balance.clone();
         }
-        if let Some(manifest) = self.event_store.file_manifest(&self.storage_manifest.id) {
+        if let Some(manifest) = self.app_runtime.store.file_manifest(&self.storage_manifest.id) {
             self.storage_manifest = manifest;
         }
         Ok(())
@@ -1458,7 +1486,7 @@ impl DemoApp {
         &self,
     ) -> Result<core_types::FileManifest, ValidationError> {
         Ok(self
-            .event_store
+            .app_runtime.store
             .file_manifest(&self.storage_manifest.id)
             .unwrap_or_else(|| self.storage_manifest.clone()))
     }
@@ -1488,7 +1516,7 @@ impl DemoApp {
             )?);
         }
         for block in &encrypted_blocks {
-            self.event_store.upsert_encrypted_block(block)?;
+            self.app_runtime.store.upsert_encrypted_block(block)?;
         }
 
         let manifest = publish_manifest(
@@ -1505,7 +1533,7 @@ impl DemoApp {
 
     pub(crate) fn current_storage_relationship(&self) -> core_types::StorageRelationship {
         match self
-            .event_store
+            .app_runtime.store
             .materialized()
             .storage_relationships_current
             .get(&self.storage_relationship.id)
@@ -1519,7 +1547,7 @@ impl DemoApp {
 
     pub(crate) fn current_storage_ledger(&self) -> core_types::StorageLedgerEntry {
         match self
-            .event_store
+            .app_runtime.store
             .materialized()
             .storage_balances_current
             .get(&self.storage_ledger.relationship_id)
@@ -1542,9 +1570,9 @@ impl DemoApp {
     > {
         let relationship = self.current_storage_relationship();
         let manifest = self.current_storage_manifest()?;
-        let chunks = if self.event_store.file_manifest(&manifest.id).is_some() {
+        let chunks = if self.app_runtime.store.file_manifest(&manifest.id).is_some() {
             let (restore_device_id, chunks) = self
-                .event_store
+                .app_runtime.store
                 .plan_storage_restore(&manifest.id, &relationship)?;
             return Ok((relationship, manifest, restore_device_id, chunks));
         } else {
@@ -1571,9 +1599,9 @@ impl DemoApp {
                     ValidationError::new(format!("unknown active device: {device_ref}"))
                 })?,
             None => {
-                if self.event_store.file_manifest(&manifest.id).is_some() {
+                if self.app_runtime.store.file_manifest(&manifest.id).is_some() {
                     let (device_id, chunks) =
-                        self.event_store.open_manifest_payload(&manifest.id)?;
+                        self.app_runtime.store.open_manifest_payload(&manifest.id)?;
                     return Ok((manifest, device_id, chunks));
                 }
                 manifest
@@ -1583,13 +1611,13 @@ impl DemoApp {
                     .ok_or_else(|| ValidationError::new("no authorized restore device"))?
             }
         };
-        if self.event_store.file_manifest(&manifest.id).is_none() {
+        if self.app_runtime.store.file_manifest(&manifest.id).is_none() {
             return Err(ValidationError::new(
                 "current storage manifest is not available in runtime state",
             ));
         }
         let chunks = self
-            .event_store
+            .app_runtime.store
             .manifest_payload_chunks_for_device(&manifest.id, &device_id)?;
         Ok((manifest, device_id, chunks))
     }
@@ -1795,7 +1823,7 @@ impl DemoApp {
             .map(|device| device.device_id.clone())
             .collect();
         for device_id in &device_ids {
-            self.event_store
+            self.app_runtime.store
                 .grant_persona_device_access(persona_id, device_id)?;
         }
         Ok(device_ids)
@@ -1806,7 +1834,7 @@ impl DemoApp {
         persona_id: &str,
     ) -> Result<Vec<String>, ValidationError> {
         Ok(self
-            .event_store
+            .app_runtime.store
             .persona_device_access_for_persona(persona_id)?
             .into_iter()
             .map(|record| record.device_id)
@@ -1859,7 +1887,7 @@ impl DemoApp {
     ) -> Result<Vec<String>, ValidationError> {
         let mut lines = Vec::new();
         for record in self
-            .event_store
+            .app_runtime.store
             .persona_device_access_for_device(device_id)?
         {
             if let Some(persona) = self
@@ -1946,7 +1974,7 @@ impl DemoApp {
         writeln!(&mut out, "Emberlink identity status").unwrap();
         writeln!(&mut out, "  peer:    {}", self.peer_id).unwrap();
         writeln!(&mut out, "  state:   {}", self.state_location_label()).unwrap();
-        writeln!(&mut out, "  events:  {}", self.event_store.event_count()).unwrap();
+        writeln!(&mut out, "  events:  {}", self.app_runtime.store.event_count()).unwrap();
         writeln!(&mut out).unwrap();
 
         if self.roots.is_empty() {
@@ -2133,6 +2161,11 @@ impl DemoApp {
         writeln!(&mut out).unwrap();
 
         writeln!(&mut out, "Trust").unwrap();
+        writeln!(
+            &mut out,
+            "  trust dashboard [--persona <p>] [--depth <n>]  Trust dashboard (grants, attestations, network)"
+        )
+        .unwrap();
         writeln!(
             &mut out,
             "  show trust                                     Show trust graph"
@@ -2536,6 +2569,36 @@ impl DemoApp {
             "  grant edit <id> [--label <label>] [--mode <mode>] [--note <note>]"
         )
         .unwrap();
+        writeln!(
+            &mut out,
+            "  grant offer create --capability <cap> [--expires <d>] [--mode <m>] [--relay <url>] [--condition badge:<type>[,...]]"
+        )
+        .unwrap();
+        writeln!(
+            &mut out,
+            "                                                 Create grant offer (URL)"
+        )
+        .unwrap();
+        writeln!(
+            &mut out,
+            "  grant offer qr --capability <cap> [--expires <d>] [--mode <m>]"
+        )
+        .unwrap();
+        writeln!(
+            &mut out,
+            "                                                 Create grant offer (QR string, offline)"
+        )
+        .unwrap();
+        writeln!(
+            &mut out,
+            "  grant claim <link-or-qr> [--persona <id>] [--name <n>] [--relay <addr>]"
+        )
+        .unwrap();
+        writeln!(
+            &mut out,
+            "                                                 Claim a grant offer"
+        )
+        .unwrap();
         writeln!(&mut out).unwrap();
 
         writeln!(&mut out, "Inspect & Debug").unwrap();
@@ -2695,11 +2758,11 @@ impl DemoApp {
         };
 
         // Validate persona exists
-        let persona = match self.event_store.materialized().persona(&persona_id) {
+        let persona = match self.app_runtime.store.materialized().persona(&persona_id) {
             Some(p) => p.clone(),
             None => {
                 let available: Vec<_> = self
-                    .event_store
+                    .app_runtime.store
                     .materialized()
                     .personas_current
                     .keys()
@@ -2720,7 +2783,7 @@ impl DemoApp {
             inviter_name: persona.label.clone(),
             inviter_persona_id: persona_id.clone(),
             relay_bind_address: relay_bind.clone(),
-            identity_events: self.event_store.events().to_vec(),
+            identity_events: self.app_runtime.store.events().to_vec(),
         };
 
         let out_file = PathBuf::from(
@@ -2814,7 +2877,7 @@ impl DemoApp {
         writeln!(&mut out).unwrap();
 
         // Create identity if none exists
-        let has_identity = !self.event_store.materialized().roots_current.is_empty();
+        let has_identity = !self.app_runtime.store.materialized().roots_current.is_empty();
         if !has_identity {
             let Some(my_name) = name else {
                 return format!(
@@ -2834,7 +2897,7 @@ impl DemoApp {
         let batch_id = generate_random_identifier("invite-batch");
         let peer_id = format!("invite:{}", invite.inviter_persona_id);
         let last_event_id = invite.identity_events.last().map(|e| e.event_id.as_str());
-        match self.event_store.import_sync_batch(
+        match self.app_runtime.store.import_sync_batch(
             &peer_id,
             &batch_id,
             &invite.identity_events,
@@ -2985,11 +3048,11 @@ impl DemoApp {
             return "Usage: export-events --out <path>\n".to_string();
         };
 
-        let data = self.event_store.export_events();
+        let data = self.app_runtime.store.export_events();
         match fs::write(&path, &data) {
             Ok(()) => format!(
                 "exported {} events to {}\n",
-                self.event_store.event_count(),
+                self.app_runtime.store.event_count(),
                 path
             ),
             Err(err) => format!("Failed to write export file: {err}\n"),
@@ -3019,7 +3082,7 @@ impl DemoApp {
             Err(err) => return format!("Failed to read import file: {err}\n"),
         };
 
-        match self.event_store.import_events(
+        match self.app_runtime.store.import_events(
             &data,
             &self.verifier,
             &IdentityAuthorizer,
@@ -3205,7 +3268,7 @@ impl DemoApp {
             Ok(namespace) => namespace,
             Err(err) => return format!("Failed to resolve storage namespace: {}\n", err),
         };
-        match self.event_store.apply_local_vault_gc(&namespace) {
+        match self.app_runtime.store.apply_local_vault_gc(&namespace) {
             Ok(Some(plan)) => format!(
                 "Applied Storage GC\n------------------\nNamespace: {}:{}\nRemoved manifests: {}\nRemoved chunks: {}\n",
                 namespace.owner_kind.as_str(),
@@ -4042,7 +4105,7 @@ impl DemoApp {
                 .map_err(|err| ValidationError::new(format!("decode relay submission: {err}")))?;
             let batch = PortableSyncBatch::decode(&submission.envelope.opaque_payload)
                 .map_err(|err| ValidationError::new(format!("decode sync batch: {err}")))?;
-            let imported = self.event_store.import_sync_batch(
+            let imported = self.app_runtime.store.import_sync_batch(
                 &batch.source_peer_id,
                 &batch.batch.id,
                 &batch.events,
@@ -4229,7 +4292,7 @@ impl DemoApp {
             );
         }
 
-        match self.event_store.import_sync_batch(
+        match self.app_runtime.store.import_sync_batch(
             &batch.source_peer_id,
             &batch.batch.id,
             &batch.events,
@@ -4266,25 +4329,25 @@ impl DemoApp {
         profile: SyncProfile,
     ) -> Result<String, ValidationError> {
         let peer_id = other.current_peer_id();
-        let cursor = self.event_store.peer_cursor(&peer_id)?;
-        let remote_event_ids = other.event_store.event_ids();
+        let cursor = self.app_runtime.store.peer_cursor(&peer_id)?;
+        let remote_event_ids = other.app_runtime.store.event_ids();
         let raw_batch = plan_pull_batch(
             &cursor,
             generate_random_identifier("sync-batch"),
             &remote_event_ids,
-            |id| self.event_store.has_event(id),
+            |id| self.app_runtime.store.has_event(id),
         );
         let relevant_remote_ids =
-            relevant_event_ids_for_context(other.event_store.events(), &self.light_sync_context());
+            relevant_event_ids_for_context(other.app_runtime.store.events(), &self.light_sync_context());
         let batch = filter_batch_by_profile(&raw_batch, profile, &relevant_remote_ids);
-        let remote_events = other.event_store.events_by_ids(&batch.event_ids);
+        let remote_events = other.app_runtime.store.events_by_ids(&batch.event_ids);
         let cursor_event_id = self.next_sync_cursor_event_id(
             cursor.last_event_id.as_deref(),
             &remote_event_ids,
-            |id| self.event_store.has_event(id),
+            |id| self.app_runtime.store.has_event(id),
             &batch.event_ids,
         );
-        let imported = self.event_store.import_sync_batch(
+        let imported = self.app_runtime.store.import_sync_batch(
             &peer_id,
             &batch.id,
             &remote_events,
@@ -4366,15 +4429,15 @@ impl DemoApp {
         profile: SyncProfile,
         peer_state_path: Option<&str>,
     ) -> Result<PortableSyncBatch, ValidationError> {
-        let all_events = self.event_store.events();
-        let all_event_ids = self.event_store.event_ids();
+        let all_events = self.app_runtime.store.events();
+        let all_event_ids = self.app_runtime.store.event_ids();
         let current_cursor = if let Some(peer_state_path) = peer_state_path {
             let peer_state_file = PathBuf::from(peer_state_path);
             let peer_sqlite_file = sqlite_path_for_local_state(&peer_state_file);
             if peer_state_file.exists() || peer_sqlite_file.exists() {
                 let peer = Self::open_existing(peer_state_file)?;
                 let source_peer_id = self.current_peer_id();
-                Some(peer.event_store.peer_cursor(&source_peer_id)?.last_event_id)
+                Some(peer.app_runtime.store.peer_cursor(&source_peer_id)?.last_event_id)
             } else {
                 None
             }
@@ -4401,7 +4464,7 @@ impl DemoApp {
         };
         let relevant_ids = relevant_event_ids_for_context(all_events, &self.light_sync_context());
         let batch = filter_batch_by_profile(&raw_batch, profile, &relevant_ids);
-        let events = self.event_store.events_by_ids(&batch.event_ids);
+        let events = self.app_runtime.store.events_by_ids(&batch.event_ids);
         let cursor_event_id = self.next_sync_cursor_event_id(
             current_cursor.as_ref().and_then(|value| value.as_deref()),
             &all_event_ids,
@@ -4482,7 +4545,7 @@ impl DemoApp {
         peer_id: &str,
     ) -> Result<String, ValidationError> {
         let endpoint = self
-            .event_store
+            .app_runtime.store
             .materialized()
             .endpoint(peer_id)
             .ok_or_else(|| {
@@ -4549,6 +4612,9 @@ impl DemoApp {
     }
 
     pub(crate) fn handle_trust(&mut self, tokens: &[&str]) -> String {
+        if let ["dashboard", rest @ ..] = tokens {
+            return self.handle_trust_dashboard(rest);
+        }
         if let ["attest", rest @ ..] = tokens {
             return self.handle_trust_attest(rest);
         }
@@ -4641,6 +4707,38 @@ impl DemoApp {
             Ok(message) => message,
             Err(err) => format!("Failed to revoke trust: {}\n", err),
         }
+    }
+
+    pub(crate) fn handle_trust_dashboard(&self, tokens: &[&str]) -> String {
+        let mut persona_ref = None;
+        let mut max_depth: u32 = 3;
+        let mut i = 0;
+        while i < tokens.len() {
+            match tokens[i] {
+                "--persona" if i + 1 < tokens.len() => {
+                    persona_ref = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "--depth" if i + 1 < tokens.len() => {
+                    max_depth = tokens[i + 1].parse().unwrap_or(3);
+                    i += 2;
+                }
+                _ => i += 1,
+            }
+        }
+
+        let persona_id = match persona_ref.as_deref() {
+            Some(r) => match self.resolve_persona(r) {
+                Some(p) => p.id.clone(),
+                None => return format!("Unknown persona: {r}\n"),
+            },
+            None => match self.personas.first() {
+                Some(p) => p.id.clone(),
+                None => return "No personas exist. Run `init` first.\n".to_string(),
+            },
+        };
+
+        self.render_trust_dashboard(&persona_id, max_depth)
     }
 
     pub(crate) fn handle_recovery_execute(&mut self, tokens: &[&str]) -> String {
@@ -4985,7 +5083,7 @@ impl DemoApp {
             .map(|device| device.device_id.clone())
             .ok_or_else(|| ValidationError::new(format!("unknown active device: {device_ref}")))?;
 
-        self.event_store
+        self.app_runtime.store
             .grant_persona_device_access(&persona_id, &device_id)?;
 
         let rewrapped = self.wrap_vault_keys_for_new_device(&persona_id, &device_id)?;
@@ -5017,7 +5115,7 @@ impl DemoApp {
             owner_id: persona_id.to_string(),
         };
         let manifests_with_keys = self
-            .event_store
+            .app_runtime.store
             .local_vault_manifests_with_keys(&namespace)?;
         let mut count = 0;
         for (mut manifest, content_key) in manifests_with_keys {
@@ -5037,7 +5135,7 @@ impl DemoApp {
                 &content_key,
             )?;
             grant_manifest_access(&mut manifest, access)?;
-            self.event_store.upsert_local_file_manifest(&manifest)?;
+            self.app_runtime.store.upsert_local_file_manifest(&manifest)?;
             count += 1;
         }
         Ok(count)
@@ -5057,7 +5155,7 @@ impl DemoApp {
             .map(|device| device.device_id.clone())
             .ok_or_else(|| ValidationError::new(format!("unknown device: {device_ref}")))?;
 
-        self.event_store
+        self.app_runtime.store
             .revoke_persona_device_access(&persona_id, &device_id)?;
 
         Ok(format!(
@@ -5071,6 +5169,8 @@ impl DemoApp {
     pub(crate) fn handle_grant(&mut self, tokens: &[&str]) -> String {
         match tokens {
             ["create", rest @ ..] => self.handle_grant_create(rest),
+            ["offer", rest @ ..] => self.handle_grant_offer(rest),
+            ["claim", rest @ ..] => self.handle_grant_claim(rest),
             ["list", rest @ ..] => self.handle_grant_list(rest),
             ["show", id] => self.handle_grant_show(id),
             ["revoke", id, rest @ ..] => self.handle_grant_revoke(id, rest),
@@ -5079,8 +5179,384 @@ impl DemoApp {
             ["recipient", rest @ ..] => self.handle_grant_recipient(rest),
             ["history", rest @ ..] => self.handle_grant_history(rest),
             [] => self.handle_grant_list(&[]),
-            _ => "Usage: grant create|list|show|revoke|renew|edit|recipient|history ...\n".to_string(),
+            _ => "Usage: grant create|offer|claim|list|show|revoke|renew|edit|recipient|history ...\n"
+                .to_string(),
         }
+    }
+
+    fn handle_grant_offer(&mut self, tokens: &[&str]) -> String {
+        match tokens {
+            ["create", rest @ ..] => self.handle_grant_offer_create(rest),
+            ["qr", rest @ ..] => self.handle_grant_offer_qr(rest),
+            _ => "Usage: grant offer create|qr --capability <cap> [--expires <duration>] [--mode <mode>]\n".to_string(),
+        }
+    }
+
+    fn handle_grant_offer_create(&mut self, tokens: &[&str]) -> String {
+        let mut capabilities: Vec<String> = Vec::new();
+        let mut expires_in_secs: Option<u64> = None;
+        let mut mode = "one_shot".to_string();
+        let mut relay: Option<String> = None;
+        let mut conditions: Vec<core_types::grant_conditions::GrantCondition> = Vec::new();
+
+        let mut i = 0;
+        while i < tokens.len() {
+            match tokens[i] {
+                "--capability" | "--cap" if i + 1 < tokens.len() => {
+                    capabilities.push(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "--expires" if i + 1 < tokens.len() => {
+                    match parse_duration_to_secs(tokens[i + 1]) {
+                        Ok(secs) => expires_in_secs = Some(secs),
+                        Err(e) => return format!("invalid --expires: {e}\n"),
+                    }
+                    i += 2;
+                }
+                "--mode" if i + 1 < tokens.len() => {
+                    mode = tokens[i + 1].to_string();
+                    i += 2;
+                }
+                "--relay" if i + 1 < tokens.len() => {
+                    relay = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "--condition" if i + 1 < tokens.len() => {
+                    match core_types::grant_conditions::GrantCondition::parse_cli(tokens[i + 1]) {
+                        Ok(cond) => conditions.push(cond),
+                        Err(e) => return format!("invalid --condition: {e}\n"),
+                    }
+                    i += 2;
+                }
+                _ => {
+                    return format!("unknown flag: {}\n", tokens[i]);
+                }
+            }
+        }
+
+        if capabilities.is_empty() {
+            return "error: at least one --capability is required\n".to_string();
+        }
+
+        // Find the first persona to use as issuer
+        let persona_id = match self
+            .app_runtime
+            .store
+            .materialized()
+            .personas_current
+            .keys()
+            .next()
+        {
+            Some(id) => id.clone(),
+            None => return "error: no personas found; run `init` first\n".to_string(),
+        };
+
+        let action = emberlink_app::UiAction::CreateGrantOffer {
+            issuing_persona_id: persona_id,
+            mode,
+            capabilities,
+            expires_in_secs,
+            relay_hint: relay,
+            conditions,
+        };
+
+        match self.app_runtime.handle_action(action) {
+            Ok((result, _mutated)) => {
+                let offer_id = result["offer_id"].as_str().unwrap_or("unknown");
+                let grant_link = result["grant_link"].as_str().unwrap_or("unknown");
+                let web_link = result["web_link"].as_str().unwrap_or("unknown");
+                format!(
+                    "grant offer created\t{offer_id}\n\
+                     link\t{grant_link}\n\
+                     web\t{web_link}\n"
+                )
+            }
+            Err(e) => format!("error: {e}\n"),
+        }
+    }
+
+    /// `grant offer qr` — create a grant offer and output a QR-encodable string.
+    ///
+    /// Same flags as `grant offer create`. Outputs the EL1:... string that can
+    /// be rendered as a QR code for offline (subway sticker) grant exchange.
+    fn handle_grant_offer_qr(&mut self, tokens: &[&str]) -> String {
+        let mut capabilities: Vec<String> = Vec::new();
+        let mut expires_in_secs: Option<u64> = None;
+        let mut mode = "one_shot".to_string();
+        let mut conditions: Vec<core_types::grant_conditions::GrantCondition> = Vec::new();
+
+        let mut i = 0;
+        while i < tokens.len() {
+            match tokens[i] {
+                "--capability" | "--cap" if i + 1 < tokens.len() => {
+                    capabilities.push(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "--expires" if i + 1 < tokens.len() => {
+                    match parse_duration_to_secs(tokens[i + 1]) {
+                        Ok(secs) => expires_in_secs = Some(secs),
+                        Err(e) => return format!("invalid --expires: {e}\n"),
+                    }
+                    i += 2;
+                }
+                "--mode" if i + 1 < tokens.len() => {
+                    mode = tokens[i + 1].to_string();
+                    i += 2;
+                }
+                "--condition" if i + 1 < tokens.len() => {
+                    match core_types::grant_conditions::GrantCondition::parse_cli(tokens[i + 1]) {
+                        Ok(cond) => conditions.push(cond),
+                        Err(e) => return format!("invalid --condition: {e}\n"),
+                    }
+                    i += 2;
+                }
+                _ => {
+                    return format!("unknown flag: {}\n", tokens[i]);
+                }
+            }
+        }
+
+        if capabilities.is_empty() {
+            return "error: at least one --capability is required\n".to_string();
+        }
+
+        let persona_id = match self
+            .app_runtime
+            .store
+            .materialized()
+            .personas_current
+            .keys()
+            .next()
+        {
+            Some(id) => id.clone(),
+            None => return "error: no personas found; run `init` first\n".to_string(),
+        };
+
+        let action = emberlink_app::UiAction::CreateGrantOffer {
+            issuing_persona_id: persona_id,
+            mode,
+            capabilities,
+            expires_in_secs,
+            relay_hint: None, // QR offers are offline — no relay
+            conditions,
+        };
+
+        match self.app_runtime.handle_action(action) {
+            Ok((result, _mutated)) => {
+                let offer_id = result["offer_id"].as_str().unwrap_or("unknown");
+                match result["qr_string"].as_str() {
+                    Some(qr) => format!("grant offer qr\t{offer_id}\n{qr}\n"),
+                    None => format!(
+                        "error: offer '{offer_id}' sealed payload is too large for QR v25 (max 1800 chars)\n"
+                    ),
+                }
+            }
+            Err(e) => format!("error: {e}\n"),
+        }
+    }
+
+    /// `grant claim <link-url-or-qr-string> [--persona <persona-id>] [--name <display-name>]
+    ///              [--relay <addr>]`
+    ///
+    /// Claim a grant offer. Supports:
+    /// - Offline QR strings (`EL1:...`) — fully self-contained, no relay needed.
+    /// - Relay-assisted URL claims (`emberlink://...` or web URL) — FETCH_OFFER
+    ///   from the relay, then CLAIM_OFFER after success.
+    ///
+    /// : If no identity exists, one is created automatically.
+    /// : If `--persona` is supplied, that persona claims the offer.
+    ///        Otherwise the first active persona is used.
+    fn handle_grant_claim(&mut self, tokens: &[&str]) -> String {
+        use core_types::{GrantLink, SealedOffer, encode_sealed_offer};
+
+        let usage = "Usage: grant claim <link-url-or-qr-string> [--persona <persona-id>] \
+                     [--name <display-name>] [--relay <addr>]\n";
+
+        if tokens.is_empty() {
+            return usage.to_string();
+        }
+
+        let link_arg = tokens[0];
+        let mut claiming_persona_id: Option<String> = None;
+        let mut new_user_name: Option<String> = None;
+        let mut relay_override: Option<String> = None;
+
+        let mut i = 1;
+        while i < tokens.len() {
+            match tokens[i] {
+                "--persona" if i + 1 < tokens.len() => {
+                    claiming_persona_id = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "--name" if i + 1 < tokens.len() => {
+                    new_user_name = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "--relay" if i + 1 < tokens.len() => {
+                    relay_override = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                _ => {
+                    return format!("unrecognised argument: {}\n{}", tokens[i], usage);
+                }
+            }
+        }
+
+        // Determine what to pass to ClaimGrantOffer.
+        // QR strings are self-contained — pass directly.
+        // URL-based links require a relay round-trip to fetch the sealed payload.
+        //
+        // We track whether a relay was involved so we can send CLAIM_OFFER afterwards.
+        let mut relay_addr_for_claim: Option<String> = None;
+        let mut offer_id_for_relay_claim: Option<String> = None;
+
+        let effective_link = if link_arg.starts_with("EL1:") {
+            // Offline QR — already has sealed payload embedded.
+            link_arg.to_string()
+        } else {
+            // URL path: parse the grant link and fetch from relay.
+            let grant_link = match GrantLink::parse(link_arg) {
+                Ok(l) => l,
+                Err(e) => return format!("error: invalid grant link: {e}\n"),
+            };
+
+            // Check expiry before relay round-trip.
+            let now = now_epoch_secs();
+            if grant_link.expires_at > 0 && now > grant_link.expires_at {
+                return format!(
+                    "error: offer '{}' expired at epoch {}\n",
+                    grant_link.offer_id, grant_link.expires_at
+                );
+            }
+
+            // Determine relay address.
+            let relay_addr = relay_override
+                .clone()
+                .or_else(|| grant_link.relay_hint.clone());
+            let Some(relay_addr) = relay_addr else {
+                return format!(
+                    "error: grant link '{}' has no relay hint and no --relay was provided.\n\
+                     For offline QR exchange, use the EL1:... string from `grant offer qr`.\n",
+                    grant_link.offer_id
+                );
+            };
+
+            // FETCH_OFFER <offer-id>
+            let fetch_cmd = format!("FETCH_OFFER {}", grant_link.offer_id);
+            let fetch_response = match self.relay_round_trip(&relay_addr, fetch_cmd.as_bytes()) {
+                Ok(frames) => {
+                    if frames.len() != 1 {
+                        return format!(
+                            "error: unexpected relay response frame count: {}\n",
+                            frames.len()
+                        );
+                    }
+                    match String::from_utf8(frames.into_iter().next().unwrap()) {
+                        Ok(s) => s,
+                        Err(_) => return "error: relay returned non-utf8 response\n".to_string(),
+                    }
+                }
+                Err(e) => return format!("error: relay fetch failed: {e}\n"),
+            };
+
+            // Parse relay response.
+            if fetch_response == "CLAIMED" {
+                return format!(
+                    "error: offer '{}' has already been claimed\n",
+                    grant_link.offer_id
+                );
+            }
+            if fetch_response == "NOT-FOUND" {
+                return format!(
+                    "error: offer '{}' not found on relay (expired or never deposited)\n",
+                    grant_link.offer_id
+                );
+            }
+            if fetch_response.starts_with("REJECTED") {
+                return format!("error: relay rejected fetch: {fetch_response}\n");
+            }
+
+            // Parse "OFFER <offer-id> <hex-payload>"
+            let sealed_payload_hex =
+                match fetch_response.strip_prefix(&format!("OFFER {} ", grant_link.offer_id)) {
+                    Some(hex) => hex.trim().to_string(),
+                    None => {
+                        return format!(
+                            "error: unexpected relay response: {fetch_response}\n"
+                        );
+                    }
+                };
+
+            // Build a SealedOffer and encode it as an EL1 string so the runtime
+            // can handle it uniformly regardless of transport path.
+            let sealed_offer = SealedOffer {
+                offer_id: grant_link.offer_id.clone(),
+                ephemeral_public_key_hex: grant_link.ephemeral_public_key_hex.clone(),
+                sealed_payload_hex,
+                expires_at: grant_link.expires_at,
+                issuer_signature: grant_link.issuer_signature.clone(),
+            };
+
+            match encode_sealed_offer(&sealed_offer) {
+                Ok(qr) => {
+                    // Remember for CLAIM_OFFER notification after success.
+                    relay_addr_for_claim = Some(relay_addr);
+                    offer_id_for_relay_claim = Some(grant_link.offer_id.clone());
+                    qr
+                }
+                Err(e) => {
+                    return format!(
+                        "error: failed to encode fetched offer payload: {e}\n\
+                         (payload may be too large; this is unexpected for relay-fetched offers)\n"
+                    );
+                }
+            }
+        };
+
+        // Dispatch to runtime.
+        let action = UiAction::ClaimGrantOffer {
+            link_url: effective_link,
+            claiming_persona_id,
+            new_user_name,
+        };
+
+        let result = match self.app_runtime.handle_action(action) {
+            Ok((result, _mutated)) => result,
+            Err(e) => return format!("error: {e}\n"),
+        };
+
+        let offer_id = result["offer_id"].as_str().unwrap_or("unknown");
+        let persona_id = result["persona_id"].as_str().unwrap_or("unknown");
+        let issuer_persona_id = result["issuer_persona_id"].as_str().unwrap_or("unknown");
+        let claimed_at = result["claimed_at"].as_u64().unwrap_or(0);
+
+        // If this was a relay-assisted claim, send CLAIM_OFFER to mark it consumed.
+        let relay_notice = if let (Some(addr), Some(oid)) =
+            (relay_addr_for_claim, offer_id_for_relay_claim)
+        {
+            let claim_cmd = format!("CLAIM_OFFER {oid}");
+            match self.relay_round_trip(&addr, claim_cmd.as_bytes()) {
+                Ok(frames) => {
+                    let resp = frames
+                        .into_iter()
+                        .next()
+                        .and_then(|f| String::from_utf8(f).ok())
+                        .unwrap_or_default();
+                    if resp.starts_with("OK") {
+                        format!("\trelay-claimed\t{addr}\t{resp}")
+                    } else {
+                        format!("\trelay-claim-warning\t{resp}")
+                    }
+                }
+                Err(e) => format!("\trelay-claim-warning\tfailed to notify relay: {e}"),
+            }
+        } else {
+            String::new()
+        };
+
+        format!(
+            "grant claimed\t{offer_id}\tpersona\t{persona_id}\tissuer\t{issuer_persona_id}\tat\t{claimed_at}{relay_notice}\n"
+        )
     }
 
     fn handle_grant_create(&mut self, tokens: &[&str]) -> String {
@@ -5194,7 +5670,7 @@ impl DemoApp {
         };
 
         match self
-            .event_store
+            .app_runtime.store
             .list_active_grants(persona_id.as_deref(), recipient_profile)
         {
             Ok(grants) => self.render_grant_list(&grants),
@@ -5203,7 +5679,7 @@ impl DemoApp {
     }
 
     fn handle_grant_show(&self, grant_ref: &str) -> String {
-        match self.event_store.access_grant_detail(grant_ref) {
+        match self.app_runtime.store.access_grant_detail(grant_ref) {
             Ok(Some(detail)) => self.render_grant_detail(&detail),
             Ok(None) => format!("Grant not found: {grant_ref}\n"),
             Err(err) => format!("Failed to show grant: {}\n", err),
@@ -5224,7 +5700,7 @@ impl DemoApp {
         }
 
         match self
-            .event_store
+            .app_runtime.store
             .revoke_access_grant(grant_id, reason.as_deref())
         {
             Ok(()) => format!("revoked grant\t{}\n", grant_id),
@@ -5252,7 +5728,7 @@ impl DemoApp {
         };
 
         let new_expires_at = now_epoch_secs() + seconds;
-        match self.event_store.renew_access_grant(grant_id, new_expires_at) {
+        match self.app_runtime.store.renew_access_grant(grant_id, new_expires_at) {
             Ok(()) => format!("renewed grant\t{}\texpires_at={}\n", grant_id, new_expires_at),
             Err(err) => format!("Failed to renew grant: {}\n", err),
         }
@@ -5320,7 +5796,7 @@ impl DemoApp {
         };
 
         match self
-            .event_store
+            .app_runtime.store
             .list_grants_for_recipient(recipient_kind, &recipient_id)
         {
             Ok(grants) => self.render_recipient_detail(&recipient_id, &kind_str, &grants),
@@ -5357,7 +5833,7 @@ impl DemoApp {
         };
 
         match self
-            .event_store
+            .app_runtime.store
             .grant_history_timeline(persona_id.as_deref(), limit, None)
         {
             Ok(entries) => self.render_grant_history_timeline(&entries),
@@ -5428,7 +5904,7 @@ impl DemoApp {
             label: label.map(String::from),
         };
 
-        self.event_store.create_access_grant(&grant)?;
+        self.app_runtime.store.create_access_grant(&grant)?;
         self.persist_to_disk()?;
 
         Ok(format!(
@@ -5448,7 +5924,7 @@ impl DemoApp {
         note: Option<&str>,
     ) -> Result<String, ValidationError> {
         let mut grant = self
-            .event_store
+            .app_runtime.store
             .access_grant(grant_id)?
             .ok_or_else(|| ValidationError::new(format!("grant not found: {grant_id}")))?;
 
@@ -5466,7 +5942,7 @@ impl DemoApp {
         grant.version += 1;
         grant.updated_at = now_epoch_secs();
 
-        self.event_store.edit_access_grant(&grant, note)?;
+        self.app_runtime.store.edit_access_grant(&grant, note)?;
         self.persist_to_disk()?;
 
         Ok(format!("edited grant\t{}\tv{}\n", grant_id, grant.version))
@@ -5645,5 +6121,670 @@ impl DemoApp {
             .unwrap();
         }
         out
+    }
+
+    // -------------------------------------------------------------------------
+    // badge — issue, revoke, list
+    // -------------------------------------------------------------------------
+
+    pub(crate) fn handle_badge(&mut self, tokens: &[&str]) -> String {
+        match tokens {
+            ["issue", rest @ ..] => self.handle_badge_issue(rest),
+            ["revoke", rest @ ..] => self.handle_badge_revoke(rest),
+            ["dispute", rest @ ..] => self.handle_badge_dispute(rest),
+            ["list", rest @ ..] => self.handle_badge_list(rest),
+            ["gallery", rest @ ..] => self.handle_badge_gallery(rest),
+            ["visibility", rest @ ..] => self.handle_badge_visibility(rest),
+            ["weight", rest @ ..] => self.handle_badge_weight(rest),
+            [] | ["help"] => {
+                "badge issue --issuer <persona> --recipient <persona> --type <badge_type> \
+                 --name <display_name> [--evidence-type <et> --evidence-payload <hex>] \
+                 [--expires <duration>]\n\
+                 badge revoke --badge <badge_id> --by <persona> [--reason <text>]\n\
+                 badge dispute --badge <badge_id> --by <persona> --reason <text> \
+                 [--evidence <hex>]\n\
+                 badge list [--persona <persona>] [--role issuer|recipient] \
+                 [--type <badge_type>] [--weighted]\n\
+                 badge gallery <persona_id> [--visible-only]\n\
+                 badge visibility set --badge <badge_id> --persona <persona_id> \
+                 --visible | --hidden\n\
+                 badge weight --badge <badge_id> [--viewer <persona>] [--depth <n>]\n"
+                    .to_string()
+            }
+            _ => format!("Unknown badge subcommand: {}\nUse: badge issue|revoke|dispute|list|gallery|visibility|weight\n", tokens.join(" ")),
+        }
+    }
+
+    fn handle_badge_issue(&mut self, tokens: &[&str]) -> String {
+        let mut issuer: Option<String> = None;
+        let mut recipient: Option<String> = None;
+        let mut badge_type: Option<String> = None;
+        let mut display_name: Option<String> = None;
+        let mut evidence_type: Option<String> = None;
+        let mut evidence_payload: Option<String> = None;
+        let mut expires_in_secs: Option<u64> = None;
+
+        let mut i = 0;
+        while i < tokens.len() {
+            match tokens[i] {
+                "--issuer" if i + 1 < tokens.len() => {
+                    issuer = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "--recipient" if i + 1 < tokens.len() => {
+                    recipient = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "--type" if i + 1 < tokens.len() => {
+                    badge_type = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "--name" if i + 1 < tokens.len() => {
+                    display_name = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "--evidence-type" if i + 1 < tokens.len() => {
+                    evidence_type = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "--evidence-payload" if i + 1 < tokens.len() => {
+                    evidence_payload = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "--expires" if i + 1 < tokens.len() => {
+                    match parse_duration_to_secs(tokens[i + 1]) {
+                        Ok(secs) => expires_in_secs = Some(secs),
+                        Err(e) => return format!("invalid --expires: {e}\n"),
+                    }
+                    i += 2;
+                }
+                _ => {
+                    return format!("unknown flag: {}\n", tokens[i]);
+                }
+            }
+        }
+
+        // Default: self-issue if no recipient specified
+        let issuer_ref = match issuer.as_deref() {
+            Some(r) => r.to_string(),
+            None => match self.app_runtime.store.materialized().personas_current.keys().next() {
+                Some(id) => id.clone(),
+                None => return "error: no personas found; run `init` first\n".to_string(),
+            },
+        };
+
+        let issuer_id = match self.resolve_persona(&issuer_ref) {
+            Some(p) => p.id.clone(),
+            None => return format!("error: unknown issuer persona: {issuer_ref}\n"),
+        };
+
+        let recipient_id = match recipient.as_deref() {
+            Some(r) => match self.resolve_persona(r) {
+                Some(p) => p.id.clone(),
+                None => return format!("error: unknown recipient persona: {r}\n"),
+            },
+            None => issuer_id.clone(), // self-issue
+        };
+
+        let Some(badge_type) = badge_type else {
+            return "error: --type is required\n".to_string();
+        };
+        let Some(display_name) = display_name else {
+            return "error: --name is required\n".to_string();
+        };
+
+        let action = UiAction::IssueBadge {
+            issuer_persona_id: issuer_id,
+            recipient_persona_id: recipient_id,
+            badge_type,
+            display_name,
+            evidence_type,
+            evidence_payload_hex: evidence_payload,
+            expires_in_secs,
+        };
+
+        match self.app_runtime.handle_action(action) {
+            Ok((result, _)) => {
+                let badge_id = result["badge_id"].as_str().unwrap_or("unknown");
+                let badge_type = result["badge_type"].as_str().unwrap_or("unknown");
+                let display_name = result["display_name"].as_str().unwrap_or("unknown");
+                let issuer = result["issuer_persona_id"].as_str().unwrap_or("unknown");
+                let recipient = result["recipient_persona_id"].as_str().unwrap_or("unknown");
+                let self_issued = issuer == recipient;
+                format!(
+                    "badge issued\t{}\t{}\t{}\t{issuer} → {recipient}{}\n",
+                    badge_id,
+                    badge_type,
+                    display_name,
+                    if self_issued { " (self)" } else { "" },
+                )
+            }
+            Err(e) => format!("error: {e}\n"),
+        }
+    }
+
+    fn handle_badge_revoke(&mut self, tokens: &[&str]) -> String {
+        let mut badge_id: Option<String> = None;
+        let mut by: Option<String> = None;
+        let mut reason = "revoked".to_string();
+
+        let mut i = 0;
+        while i < tokens.len() {
+            match tokens[i] {
+                "--badge" if i + 1 < tokens.len() => {
+                    badge_id = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "--by" if i + 1 < tokens.len() => {
+                    by = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "--reason" if i + 1 < tokens.len() => {
+                    reason = tokens[i + 1].to_string();
+                    i += 2;
+                }
+                _ => {
+                    return format!("unknown flag: {}\n", tokens[i]);
+                }
+            }
+        }
+
+        let Some(badge_id) = badge_id else {
+            return "error: --badge <badge_id> is required\n".to_string();
+        };
+
+        let revoker_id = match by.as_deref() {
+            Some(r) => match self.resolve_persona(r) {
+                Some(p) => p.id.clone(),
+                None => return format!("error: unknown persona: {r}\n"),
+            },
+            None => match self.app_runtime.store.materialized().personas_current.keys().next() {
+                Some(id) => id.clone(),
+                None => return "error: no personas found\n".to_string(),
+            },
+        };
+
+        let action = UiAction::RevokeBadge {
+            badge_id: badge_id.clone(),
+            revoker_persona_id: revoker_id,
+            reason,
+        };
+
+        match self.app_runtime.handle_action(action) {
+            Ok((result, _)) => {
+                let badge_id = result["badge_id"].as_str().unwrap_or("unknown");
+                format!("badge revoked\t{badge_id}\n")
+            }
+            Err(e) => format!("error: {e}\n"),
+        }
+    }
+
+    fn handle_badge_dispute(&mut self, tokens: &[&str]) -> String {
+        let mut badge_id: Option<String> = None;
+        let mut by: Option<String> = None;
+        let mut reason: Option<String> = None;
+        let mut evidence: Option<String> = None;
+
+        let mut i = 0;
+        while i < tokens.len() {
+            match tokens[i] {
+                "--badge" if i + 1 < tokens.len() => {
+                    badge_id = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "--by" if i + 1 < tokens.len() => {
+                    by = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "--reason" if i + 1 < tokens.len() => {
+                    reason = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "--evidence" if i + 1 < tokens.len() => {
+                    evidence = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                _ => {
+                    return format!("unknown flag: {}\n", tokens[i]);
+                }
+            }
+        }
+
+        let Some(badge_id) = badge_id else {
+            return "error: --badge <badge_id> is required\n".to_string();
+        };
+
+        let Some(reason) = reason else {
+            return "error: --reason <text> is required\n".to_string();
+        };
+
+        let disputer_id = match by.as_deref() {
+            Some(r) => match self.resolve_persona(r) {
+                Some(p) => p.id.clone(),
+                None => return format!("error: unknown persona: {r}\n"),
+            },
+            None => match self.app_runtime.store.materialized().personas_current.keys().next() {
+                Some(id) => id.clone(),
+                None => return "error: no personas found\n".to_string(),
+            },
+        };
+
+        let action = UiAction::DisputeBadge {
+            target_badge_id: badge_id.clone(),
+            disputer_persona_id: disputer_id,
+            reason,
+            evidence,
+        };
+
+        match self.app_runtime.handle_action(action) {
+            Ok((result, _)) => {
+                let dispute_id = result["dispute_id"].as_str().unwrap_or("unknown");
+                let target = result["target_badge_id"].as_str().unwrap_or("unknown");
+                format!("badge disputed\t{dispute_id}\ttarget={target}\n")
+            }
+            Err(e) => format!("error: {e}\n"),
+        }
+    }
+
+    fn handle_badge_list(&mut self, tokens: &[&str]) -> String {
+        let mut persona: Option<String> = None;
+        let mut role: Option<String> = None;
+        let mut badge_type: Option<String> = None;
+        let mut weighted = false;
+
+        let mut i = 0;
+        while i < tokens.len() {
+            match tokens[i] {
+                "--persona" if i + 1 < tokens.len() => {
+                    persona = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "--role" if i + 1 < tokens.len() => {
+                    role = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "--type" if i + 1 < tokens.len() => {
+                    badge_type = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "--weighted" => {
+                    weighted = true;
+                    i += 1;
+                }
+                _ => {
+                    return format!("unknown flag: {}\n", tokens[i]);
+                }
+            }
+        }
+
+        let persona_id = match persona.as_deref() {
+            Some(r) => match self.resolve_persona(r) {
+                Some(p) => Some(p.id.clone()),
+                None => return format!("error: unknown persona: {r}\n"),
+            },
+            None => None,
+        };
+
+        let action = UiAction::ListBadges {
+            persona_id,
+            role,
+            badge_type,
+        };
+
+        match self.app_runtime.handle_action(action) {
+            Ok((result, _)) => {
+                let badges = match result.as_array() {
+                    Some(b) => b,
+                    None => return "No badges.\n".to_string(),
+                };
+                if badges.is_empty() {
+                    return "No badges.\n".to_string();
+                }
+                let mut out = String::new();
+                use std::fmt::Write as _;
+                if weighted {
+                    writeln!(
+                        &mut out,
+                        "{:<14} {:<20} {:<14} {:<14} {:<8} WEIGHT",
+                        "BADGE", "TYPE", "ISSUER", "RECIPIENT", "STATUS"
+                    )
+                    .unwrap();
+                } else {
+                    writeln!(
+                        &mut out,
+                        "{:<14} {:<20} {:<14} {:<14} STATUS",
+                        "BADGE", "TYPE", "ISSUER", "RECIPIENT"
+                    )
+                    .unwrap();
+                }
+                for b in badges {
+                    let badge_id = b["badge_id"].as_str().unwrap_or("?");
+                    let btype = b["badge_type"].as_str().unwrap_or("?");
+                    let issuer = b["issuer_persona_id"].as_str().unwrap_or("?");
+                    let recipient = b["recipient_persona_id"].as_str().unwrap_or("?");
+                    let status = if b["revoked"].as_bool().unwrap_or(false) {
+                        "revoked"
+                    } else {
+                        "active"
+                    };
+                    if weighted {
+                        // Compute weight for each badge inline
+                        let weight_action = UiAction::BadgeWeight {
+                            badge_id: badge_id.to_string(),
+                            viewer_persona_id: None,
+                            max_depth: None,
+                        };
+                        let weight_str = match self.app_runtime.handle_action(weight_action) {
+                            Ok((w, _)) => {
+                                let total = w["total"].as_f64().unwrap_or(0.0);
+                                format!("{:.2}", total)
+                            }
+                            Err(_) => "?".to_string(),
+                        };
+                        writeln!(
+                            &mut out,
+                            "{:<14} {:<20} {:<14} {:<14} {:<8} {}",
+                            truncate_id(badge_id),
+                            btype,
+                            truncate_id(issuer),
+                            truncate_id(recipient),
+                            status,
+                            weight_str,
+                        )
+                        .unwrap();
+                    } else {
+                        writeln!(
+                            &mut out,
+                            "{:<14} {:<20} {:<14} {:<14} {}",
+                            truncate_id(badge_id),
+                            btype,
+                            truncate_id(issuer),
+                            truncate_id(recipient),
+                            status,
+                        )
+                        .unwrap();
+                    }
+                }
+                out
+            }
+            Err(e) => format!("error: {e}\n"),
+        }
+    }
+
+    fn handle_badge_gallery(&mut self, tokens: &[&str]) -> String {
+        // badge gallery <persona_id> [--visible-only]
+        let mut persona: Option<String> = None;
+        let mut visible_only = false;
+        let mut i = 0;
+        while i < tokens.len() {
+            match tokens[i] {
+                "--visible-only" => {
+                    visible_only = true;
+                    i += 1;
+                }
+                tok if !tok.starts_with("--") && persona.is_none() => {
+                    persona = Some(tok.to_string());
+                    i += 1;
+                }
+                _ => {
+                    i += 1;
+                }
+            }
+        }
+
+        let Some(persona_ref) = persona else {
+            return "error: <persona_id> is required\nUsage: badge gallery <persona_id> [--visible-only]\n".to_string();
+        };
+
+        let persona_id = match self.resolve_persona(&persona_ref) {
+            Some(p) => p.id.clone(),
+            None => return format!("error: unknown persona: {persona_ref}\n"),
+        };
+
+        let action = UiAction::GetBadgeGallery { persona_id, visible_only };
+        match self.app_runtime.handle_action(action) {
+            Ok((result, _)) => {
+                let entries = match result.as_array() {
+                    Some(e) => e,
+                    None => return "No badges in gallery.\n".to_string(),
+                };
+                if entries.is_empty() {
+                    return if visible_only {
+                        "Gallery is empty — no visible badges.\n".to_string()
+                    } else {
+                        "No received badges.\n".to_string()
+                    };
+                }
+                let mut out = String::new();
+                use std::fmt::Write as _;
+                writeln!(
+                    &mut out,
+                    "{:<14} {:<20} {:<14} VISIBLE",
+                    "BADGE", "TYPE", "ISSUER",
+                )
+                .unwrap();
+                for e in entries {
+                    let badge_id = e["badge_id"].as_str().unwrap_or("?");
+                    let btype = e["badge_type"].as_str().unwrap_or("?");
+                    let issuer = e["issuer_persona_id"].as_str().unwrap_or("?");
+                    let visible = if e["visible"].as_bool().unwrap_or(false) {
+                        "yes"
+                    } else {
+                        "no"
+                    };
+                    writeln!(
+                        &mut out,
+                        "{:<14} {:<20} {:<14} {}",
+                        truncate_id(badge_id),
+                        btype,
+                        truncate_id(issuer),
+                        visible,
+                    )
+                    .unwrap();
+                }
+                out
+            }
+            Err(e) => format!("error: {e}\n"),
+        }
+    }
+
+    fn handle_badge_visibility(&mut self, tokens: &[&str]) -> String {
+        // badge visibility set --badge <id> --persona <id> --visible | --hidden
+        match tokens {
+            ["set", rest @ ..] => self.handle_badge_visibility_set(rest),
+            _ => "Usage: badge visibility set --badge <badge_id> --persona <persona_id> --visible | --hidden\n".to_string(),
+        }
+    }
+
+    fn handle_badge_visibility_set(&mut self, tokens: &[&str]) -> String {
+        let mut badge_id: Option<String> = None;
+        let mut persona: Option<String> = None;
+        let mut visible: Option<bool> = None;
+
+        let mut i = 0;
+        while i < tokens.len() {
+            match tokens[i] {
+                "--badge" if i + 1 < tokens.len() => {
+                    badge_id = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "--persona" if i + 1 < tokens.len() => {
+                    persona = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "--visible" => {
+                    visible = Some(true);
+                    i += 1;
+                }
+                "--hidden" => {
+                    visible = Some(false);
+                    i += 1;
+                }
+                _ => {
+                    i += 1;
+                }
+            }
+        }
+
+        let Some(badge_id) = badge_id else {
+            return "error: --badge <badge_id> is required\n".to_string();
+        };
+        let Some(persona_id) = persona else {
+            return "error: --persona <persona_id> is required\n".to_string();
+        };
+        let Some(visible) = visible else {
+            return "error: --visible or --hidden is required\n".to_string();
+        };
+
+        let persona_id = match self.resolve_persona(&persona_id) {
+            Some(p) => p.id.clone(),
+            None => return format!("error: unknown persona: {persona_id}\n"),
+        };
+
+        let action = UiAction::SetBadgeVisibility {
+            badge_id: badge_id.clone(),
+            persona_id,
+            visible,
+        };
+
+        match self.app_runtime.handle_action(action) {
+            Ok((result, _)) => {
+                let badge_id = result["badge_id"].as_str().unwrap_or("unknown");
+                let state = if visible { "visible" } else { "hidden" };
+                format!("badge visibility set\t{badge_id}\t{state}\n")
+            }
+            Err(e) => format!("error: {e}\n"),
+        }
+    }
+
+    fn handle_badge_weight(&mut self, tokens: &[&str]) -> String {
+        let mut badge_id: Option<String> = None;
+        let mut viewer: Option<String> = None;
+        let mut max_depth: Option<u32> = None;
+
+        let mut i = 0;
+        while i < tokens.len() {
+            match tokens[i] {
+                "--badge" if i + 1 < tokens.len() => {
+                    badge_id = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "--viewer" if i + 1 < tokens.len() => {
+                    viewer = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                "--depth" if i + 1 < tokens.len() => {
+                    match tokens[i + 1].parse::<u32>() {
+                        Ok(d) => max_depth = Some(d),
+                        Err(_) => return format!("invalid --depth: {}\n", tokens[i + 1]),
+                    }
+                    i += 2;
+                }
+                _ => {
+                    return format!("unknown flag: {}\n", tokens[i]);
+                }
+            }
+        }
+
+        let Some(badge_id) = badge_id else {
+            return "error: --badge <badge_id> is required\n".to_string();
+        };
+
+        let viewer_persona_id = match viewer.as_deref() {
+            Some(r) => match self.resolve_persona(r) {
+                Some(p) => Some(p.id.clone()),
+                None => return format!("error: unknown viewer persona: {r}\n"),
+            },
+            None => None,
+        };
+
+        let action = UiAction::BadgeWeight {
+            badge_id: badge_id.clone(),
+            viewer_persona_id,
+            max_depth,
+        };
+
+        match self.app_runtime.handle_action(action) {
+            Ok((result, _)) => {
+                let badge_short = truncate_id(&badge_id);
+                let issuer = result["issuer_persona_id"].as_str().unwrap_or("?");
+                let viewer_id = result["viewer_persona_id"].as_str().unwrap_or("?");
+                let depth = result["max_depth"].as_u64().unwrap_or(3);
+
+                let total = result["total"].as_f64().unwrap_or(0.0);
+                let dist_score = result["distance_score"].as_f64().unwrap_or(0.0);
+                let graph_dist = result["graph_distance"].as_u64();
+                let conv_score = result["convergence_score"].as_f64().unwrap_or(0.0);
+                let conv_count = result["convergence_count"].as_u64().unwrap_or(0);
+                let issuer_score = result["issuer_score"].as_f64().unwrap_or(0.0);
+                let inbound = result["issuer_inbound_trust_count"].as_u64().unwrap_or(0);
+                let issued = result["issuer_badges_issued"].as_u64().unwrap_or(0);
+
+                let dist_str = match graph_dist {
+                    Some(d) => format!("{d} hop(s)"),
+                    None => format!("unreachable (>{depth} hops)"),
+                };
+
+                format!(
+                    "badge weight\t{badge_short}\n\
+                     issuer\t\t{issuer}\n\
+                     viewer\t\t{viewer_id}\n\
+                     \n\
+                     TOTAL\t\t{total:.3}\n\
+                     distance\t{dist_score:.3}  ({dist_str})\n\
+                     convergence\t{conv_score:.3}  ({conv_count} graph peer(s) recognize issuer)\n\
+                     issuer rep\t{issuer_score:.3}  ({inbound} inbound trust / {issued} badges issued)\n"
+                )
+            }
+            Err(e) => format!("error: {e}\n"),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // credential — dispatched through AppRuntime::handle_action
+    // -------------------------------------------------------------------------
+
+    pub(crate) fn handle_credential(&mut self, tokens: &[&str]) -> String {
+        match tokens {
+            ["create", persona_id, device_id, claim_type, payload_json] => {
+                let action = UiAction::CreateCredential {
+                    persona_id: persona_id.to_string(),
+                    device_id: device_id.to_string(),
+                    claim_type: claim_type.to_string(),
+                    payload_json: payload_json.to_string(),
+                };
+                match self.app_runtime.handle_action(action) {
+                    Ok((json, _)) => format!("{}\n", serde_json::to_string_pretty(&json).unwrap_or_default()),
+                    Err(e) => format!("Error: {e}\n"),
+                }
+            }
+            ["list", persona_id] => {
+                let action = UiAction::ListCredentials { persona_id: persona_id.to_string() };
+                match self.app_runtime.handle_action(action) {
+                    Ok((json, _)) => format!("{}\n", serde_json::to_string_pretty(&json).unwrap_or_default()),
+                    Err(e) => format!("Error: {e}\n"),
+                }
+            }
+            ["get", persona_id, object_id] => {
+                let action = UiAction::GetCredential {
+                    object_id: object_id.to_string(),
+                    persona_id: persona_id.to_string(),
+                };
+                match self.app_runtime.handle_action(action) {
+                    Ok((json, _)) => format!("{}\n", serde_json::to_string_pretty(&json).unwrap_or_default()),
+                    Err(e) => format!("Error: {e}\n"),
+                }
+            }
+            [] | ["help"] => {
+                "credential create <persona_id> <device_id> <claim_type> <payload_json>\n\
+                 \x20  create a credential (claim_type: self-asserted|service-issued|...)\n\
+                 \x20  payload_json must include a top-level \"schema\" field\n\
+                 \x20  example: credential create persona-abc device-xyz self-asserted '{\"schema\":\"password\",\"username\":\"alice\",\"password\":\"s3cr3t\"}'\n\
+                 credential list <persona_id>           list credential summaries for a persona\n\
+                 credential get <persona_id> <obj_id>   show credential metadata\n"
+                    .to_string()
+            }
+            _ => format!("Unknown credential subcommand: {}\n", tokens.join(" ")),
+        }
     }
 }

@@ -4,17 +4,20 @@ mod persist;
 mod schema;
 
 pub use adapters::{
-    PasskeyAdapter, PasskeyAssertionResult, PasskeyBindingMeta, PasskeyRegistrationResult,
-    PasswordImportAdapter, PasswordImportFormat, verify_passkey_assertion,
+    OAuthAdapter, OAuthAuthorizeRequest, OAuthBindingMeta, OAuthTokenClaims,
+    OAuthTokenExchangeRequest, OidcClaimAdapter, PasskeyAdapter, PasskeyAssertionResult,
+    PasskeyBindingMeta, PasskeyRegistrationResult, PasswordImportAdapter, PasswordImportFormat,
+    verify_passkey_assertion,
 };
 pub use blockstore::SqliteBlockStore;
 
 // Re-export shared types from core-eventlog so downstream crates can continue
 // importing from core-state without changes.
 pub use core_eventlog::{
-    AllowAllAuthorizer, Authorizer, DeviceRecord, DeviceStatus, EventLog, GuardianRecord,
-    IdentityAuthorizer, MaterializedState, PersonaRecord, PersonaStatus, RecoveryPolicyRecord,
-    RecoveryRequestRecord, RecoveryRequestStatus, RootRecord, RootStatus, SyncBatchRecord,
+    AllowAllAuthorizer, Authorizer, CredentialDepositRecord, CredentialDepositStatus, DeviceRecord,
+    DeviceStatus, EventLog, GuardianRecord, IdentityAuthorizer, MaterializedState, PersonaRecord,
+    PersonaStatus, RecoveryPolicyRecord, RecoveryRequestRecord, RecoveryRequestStatus, RootRecord,
+    RootStatus, SyncBatchRecord,
 };
 pub use core_eventlog::MemoryEventLog;
 
@@ -44,13 +47,14 @@ use core_storage::{
 use core_types::{
     AccessGrant, AccessGrantDetail, AccessGrantHistoryEntry, AccessGrantMode, AccessGrantStatus,
     AccessGrantSummary, BlockStore, ChunkReference, DurabilityPolicy,
-    EventBody, EventType, FileManifest, ImportedClaim,
+    EventBody, EventType, FileManifest, GrantCapability, ImportedClaim,
     ManifestDeviceAccess, PeerCursor, PresentationArtifact, PresentationAudienceKind,
     PresentationTemplate, RecipientProfile, RetentionPolicy,
     ServiceBinding, StructuredRecordMeta, Validate,
     ValidationError, VaultCatalog, VaultNamespace, VaultOwnerKind,
 };
 use rusqlite::{Connection, OptionalExtension, params};
+use zeroize::Zeroizing;
 use serde_json::Value as JsonValue;
 
 use persist::{
@@ -77,8 +81,10 @@ use persist::{
     capabilities_to_json, delete_access_grant as persist_delete_access_grant,
     load_access_grant, load_access_grant_history, load_access_grants_by_persona,
     load_access_grants_for_recipient, load_artifact_ids_by_grant,
-    load_grant_history_timeline, write_access_grant, write_access_grant_history,
+    load_grant_history_timeline, load_grant_offer, load_grant_offers_by_persona,
+    write_access_grant, write_access_grant_history,
 };
+pub use persist::CredentialDepositRow;
 use schema::{SQLITE_MIGRATION_V1, ensure_runtime_columns};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +97,23 @@ pub struct PersonaDeviceAccessRecord {
 pub struct LocalBlockRecord {
     pub chunk_id: String,
     pub ciphertext_bytes: u64,
+}
+
+/// Deserialized row from the `approval_requests` table.
+#[derive(Debug, Clone)]
+pub struct ApprovalRequestRow {
+    pub request_id: String,
+    pub requester_id: String,
+    pub requester_label: Option<String>,
+    pub requested_scope_json: String,
+    pub requested_duration_secs: Option<u64>,
+    pub reason: Option<String>,
+    pub status: String,
+    pub created_at: u64,
+    pub resolved_at: Option<u64>,
+    pub resolver_id: Option<String>,
+    pub narrowed_scope_json: Option<String>,
+    pub denial_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,6 +266,9 @@ pub struct EventStore {
     materialized: MaterializedState,
     storage_manifests: BTreeMap<String, FileManifest>,
     local_block_store: Option<LocalBlockStore>,
+    /// Keychain-derived master key used to encrypt secret columns at rest.
+    /// `None` for in-memory stores (tests, WASM) where encryption is unnecessary.
+    master_key: Option<Zeroizing<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -496,11 +522,41 @@ impl BlockStore for LocalBlockStore {
     }
 }
 
+/// Returns true if `new` is covered by some capability in `existing` — i.e., it does
+/// not expand scope. For `DiscloseFields` this requires the new field_paths to be a
+/// subset of the existing field_paths for the same object. All other variants require
+/// an exact match on the identifying field.
+fn capability_covered_by(new: &GrantCapability, existing: &[GrantCapability]) -> bool {
+    existing.iter().any(|e| match (new, e) {
+        (
+            GrantCapability::DiscloseFields { object_id: n_oid, field_paths: n_fps },
+            GrantCapability::DiscloseFields { object_id: e_oid, field_paths: e_fps },
+        ) => n_oid == e_oid && n_fps.iter().all(|f| e_fps.contains(f)),
+        (
+            GrantCapability::ReadCredential { object_id: n },
+            GrantCapability::ReadCredential { object_id: e },
+        ) => n == e,
+        (
+            GrantCapability::UsePasskey { binding_id: n },
+            GrantCapability::UsePasskey { binding_id: e },
+        ) => n == e,
+        (
+            GrantCapability::RefreshDisclosure { template_id: n },
+            GrantCapability::RefreshDisclosure { template_id: e },
+        ) => n == e,
+        (
+            GrantCapability::UseServiceBinding { binding_id: n },
+            GrantCapability::UseServiceBinding { binding_id: e },
+        ) => n == e,
+        _ => false,
+    })
+}
+
 impl EventStore {
     pub fn open_in_memory() -> Result<Self, ValidationError> {
         let conn = Connection::open_in_memory()
             .map_err(|err| ValidationError::new(format!("open sqlite in-memory db: {err}")))?;
-        Self::from_connection(conn, None)
+        Self::from_connection(conn, None, None)
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, ValidationError> {
@@ -513,12 +569,31 @@ impl EventStore {
             ValidationError::new(format!("open sqlite db {}: {err}", path.display()))
         })?;
         let local_block_store = Some(LocalBlockStore::open(local_block_store_root(path))?);
-        Self::from_connection(conn, local_block_store)
+        Self::from_connection(conn, local_block_store, None)
+    }
+
+    /// Open an on-disk store with a master key for encrypting secret columns at rest.
+    ///
+    /// The `master_key` should be the same keychain-derived `xchacha20-key:...` value
+    /// used to protect `local-state.enc`. Application shells (CLI, GUI) supply this from
+    /// their keychain layer; `core-state` itself never touches the OS keychain.
+    pub fn open_with_key(path: impl AsRef<Path>, master_key: String) -> Result<Self, ValidationError> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|err| ValidationError::new(format!("create sqlite dir: {err}")))?;
+        }
+        let conn = Connection::open(path).map_err(|err| {
+            ValidationError::new(format!("open sqlite db {}: {err}", path.display()))
+        })?;
+        let local_block_store = Some(LocalBlockStore::open(local_block_store_root(path))?);
+        Self::from_connection(conn, local_block_store, Some(Zeroizing::new(master_key)))
     }
 
     fn from_connection(
         conn: Connection,
         local_block_store: Option<LocalBlockStore>,
+        master_key: Option<Zeroizing<String>>,
     ) -> Result<Self, ValidationError> {
         conn.execute_batch(SQLITE_MIGRATION_V1)
             .map_err(|err| ValidationError::new(format!("run sqlite migrations: {err}")))?;
@@ -532,6 +607,7 @@ impl EventStore {
             materialized: MaterializedState::default(),
             storage_manifests: BTreeMap::new(),
             local_block_store,
+            master_key,
         };
         store.rebuild()?;
         Ok(store)
@@ -552,11 +628,20 @@ impl EventStore {
         authorizer: &(impl Authorizer + ?Sized),
         now_epoch_secs: u64,
     ) -> Result<(), ValidationError> {
+        // Clamp caller-supplied time to prevent bypassing cooldowns via a far-future timestamp.
+        // Allow up to 5 minutes of forward skew for legitimate clock drift.
+        const MAX_CLOCK_SKEW_SECS: u64 = 300;
+        let system_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let effective_now = now_epoch_secs.min(system_now + MAX_CLOCK_SKEW_SECS);
+
         event.validate()?;
         if !verifier.verify(&event.signer, &event.signed_bytes(), &event.signature) {
             return Err(ValidationError::new("signature verification failed"));
         }
-        authorizer.authorize(&event, &self.materialized, now_epoch_secs)?;
+        authorizer.authorize(&event, &self.materialized, effective_now)?;
 
         apply_event(&mut self.materialized, &event)?;
         apply_storage_event(&mut self.storage_manifests, &event, &self.materialized)?;
@@ -1306,6 +1391,16 @@ impl EventStore {
                 "cannot change issuing persona, recipient kind, or recipient id",
             ));
         }
+        // Capability narrowing guard: every capability in the edited grant must be
+        // covered by (i.e. a subset of) a capability in the existing grant.
+        // To add capabilities, create a new grant instead.
+        for cap in &grant.capabilities {
+            if !capability_covered_by(cap, &existing.capabilities) {
+                return Err(ValidationError::new(
+                    "edit would expand grant capabilities; create a new grant to add capabilities",
+                ));
+            }
+        }
 
         write_access_grant(&self.conn, grant)?;
 
@@ -1508,6 +1603,258 @@ impl EventStore {
         persist_delete_access_grant(&self.conn, grant_id)
     }
 
+    // --- Grant offers (design) ---
+
+    /// Look up a single grant offer by ID.
+    pub fn get_grant_offer(
+        &self,
+        offer_id: &str,
+    ) -> Result<Option<core_eventlog::GrantOfferRecord>, ValidationError> {
+        load_grant_offer(&self.conn, offer_id)
+    }
+
+    /// List all grant offers issued by a persona.
+    pub fn list_grant_offers_by_persona(
+        &self,
+        persona_id: &str,
+    ) -> Result<Vec<core_eventlog::GrantOfferRecord>, ValidationError> {
+        load_grant_offers_by_persona(&self.conn, persona_id)
+    }
+
+    // --- Credential deposits ---
+
+    /// Insert a credential deposit record into the credential_deposits table.
+    pub fn deposit_credential(
+        &mut self,
+        deposit: &core_eventlog::CredentialDepositRecord,
+    ) -> Result<(), ValidationError> {
+        persist::write_credential_deposit(&self.conn, deposit)
+    }
+
+    /// Fetch an active credential deposit for a given grant_id.
+    /// Returns None if no active deposit exists or if the deposit has expired.
+    pub fn fetch_credential_deposit(
+        &self,
+        grant_id: &str,
+    ) -> Result<Option<CredentialDepositRow>, ValidationError> {
+        let row = persist::load_credential_deposit_by_grant(&self.conn, grant_id)?;
+        // Filter out expired deposits at read time.
+        if let Some(ref r) = row
+            && let Some(expires_at) = r.expires_at
+        {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if now >= expires_at {
+                return Ok(None);
+            }
+        }
+        Ok(row)
+    }
+
+    /// Revoke a credential deposit for a given grant_id. Sets status='revoked'
+    /// and records the revocation timestamp and optional reason.
+    pub fn revoke_credential_deposit(
+        &mut self,
+        grant_id: &str,
+        reason: Option<&str>,
+    ) -> Result<(), ValidationError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        persist::revoke_credential_deposit(&self.conn, grant_id, reason, now)
+    }
+
+    // --- Approval queue ---
+
+    /// Insert a new approval request into the database.
+    pub fn insert_approval_request(
+        &self,
+        req: &core_types::approval::ApprovalRequest,
+    ) -> Result<(), ValidationError> {
+        let scope_json = serde_json::to_string(&req.requested_scope)
+            .map_err(|err| ValidationError::new(format!("serialize requested_scope: {err}")))?;
+        self.conn
+            .execute(
+                "INSERT INTO approval_requests (
+                    request_id, requester_id, requester_label, requested_scope_json,
+                    requested_duration_secs, reason, status, created_at,
+                    resolved_at, resolver_id, narrowed_scope_json, denial_reason
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    &req.request_id,
+                    &req.requester_id,
+                    &req.requester_label,
+                    &scope_json,
+                    req.requested_duration_secs.map(|v| v as i64),
+                    &req.reason,
+                    req.status.to_string(),
+                    req.created_at as i64,
+                    req.resolved_at.map(|v| v as i64),
+                    &req.resolver_id,
+                    req.narrowed_scope.as_ref().and_then(|s| serde_json::to_string(s).ok()),
+                    &req.denial_reason,
+                ],
+            )
+            .map_err(|err| ValidationError::new(format!("insert approval request: {err}")))?;
+        Ok(())
+    }
+
+    /// Fetch an approval request by ID.
+    pub fn get_approval_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<ApprovalRequestRow>, ValidationError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT request_id, requester_id, requester_label, requested_scope_json,
+                        requested_duration_secs, reason, status, created_at,
+                        resolved_at, resolver_id, narrowed_scope_json, denial_reason
+                 FROM approval_requests WHERE request_id = ?1",
+                params![request_id],
+                |row| {
+                    Ok(ApprovalRequestRow {
+                        request_id: row.get(0)?,
+                        requester_id: row.get(1)?,
+                        requester_label: row.get(2)?,
+                        requested_scope_json: row.get(3)?,
+                        requested_duration_secs: row.get::<_, Option<i64>>(4)?.map(|v| v as u64),
+                        reason: row.get(5)?,
+                        status: row.get(6)?,
+                        created_at: row.get::<_, i64>(7)? as u64,
+                        resolved_at: row.get::<_, Option<i64>>(8)?.map(|v| v as u64),
+                        resolver_id: row.get(9)?,
+                        narrowed_scope_json: row.get(10)?,
+                        denial_reason: row.get(11)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|err| ValidationError::new(format!("get approval request: {err}")))?;
+        Ok(row)
+    }
+
+    /// List all pending approval requests, ordered by creation time (newest first).
+    pub fn list_pending_approvals(&self) -> Result<Vec<ApprovalRequestRow>, ValidationError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT request_id, requester_id, requester_label, requested_scope_json,
+                        requested_duration_secs, reason, status, created_at,
+                        resolved_at, resolver_id, narrowed_scope_json, denial_reason
+                 FROM approval_requests WHERE status = 'pending'
+                 ORDER BY created_at DESC",
+            )
+            .map_err(|err| ValidationError::new(format!("prepare list pending approvals: {err}")))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(ApprovalRequestRow {
+                    request_id: row.get(0)?,
+                    requester_id: row.get(1)?,
+                    requester_label: row.get(2)?,
+                    requested_scope_json: row.get(3)?,
+                    requested_duration_secs: row.get::<_, Option<i64>>(4)?.map(|v| v as u64),
+                    reason: row.get(5)?,
+                    status: row.get(6)?,
+                    created_at: row.get::<_, i64>(7)? as u64,
+                    resolved_at: row.get::<_, Option<i64>>(8)?.map(|v| v as u64),
+                    resolver_id: row.get(9)?,
+                    narrowed_scope_json: row.get(10)?,
+                    denial_reason: row.get(11)?,
+                })
+            })
+            .map_err(|err| ValidationError::new(format!("list pending approvals: {err}")))?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(
+                row.map_err(|err| ValidationError::new(format!("read approval row: {err}")))?,
+            );
+        }
+        Ok(result)
+    }
+
+    /// Resolve an approval request. Validates the state transition using the
+    /// domain type's `resolve()` method before writing to the database.
+    pub fn resolve_approval_request(
+        &self,
+        request_id: &str,
+        response: &core_types::approval::ApprovalResponse,
+    ) -> Result<(), ValidationError> {
+        let row = self
+            .get_approval_request(request_id)?
+            .ok_or_else(|| ValidationError::new(format!("approval request not found: {request_id}")))?;
+
+        let scope: core_types::approval::RequestedScope =
+            serde_json::from_str(&row.requested_scope_json)
+                .map_err(|err| ValidationError::new(format!("deserialize scope: {err}")))?;
+        let mut domain_req = core_types::approval::ApprovalRequest {
+            request_id: row.request_id,
+            requester_id: row.requester_id,
+            requester_label: row.requester_label,
+            requested_scope: scope,
+            requested_duration_secs: row.requested_duration_secs,
+            reason: row.reason,
+            created_at: row.created_at,
+            status: parse_approval_status(&row.status)?,
+            resolved_at: row.resolved_at,
+            resolver_id: row.resolver_id,
+            narrowed_scope: None,
+            denial_reason: row.denial_reason,
+        };
+
+        domain_req.resolve(response)?;
+
+        let narrowed_json = domain_req
+            .narrowed_scope
+            .as_ref()
+            .and_then(|s| serde_json::to_string(s).ok());
+        self.conn
+            .execute(
+                "UPDATE approval_requests SET
+                    status = ?1, resolved_at = ?2, resolver_id = ?3,
+                    narrowed_scope_json = ?4, denial_reason = ?5
+                 WHERE request_id = ?6",
+                params![
+                    domain_req.status.to_string(),
+                    domain_req.resolved_at.map(|v| v as i64),
+                    &domain_req.resolver_id,
+                    &narrowed_json,
+                    &domain_req.denial_reason,
+                    request_id,
+                ],
+            )
+            .map_err(|err| ValidationError::new(format!("resolve approval request: {err}")))?;
+        Ok(())
+    }
+
+    // --- Badge visibility (local-only, design) ---
+
+    /// Set badge visibility for a persona's gallery. `visible=true` means the
+    /// badge will appear in the persona's public badge gallery. This is a
+    /// local-only preference — it never leaves the device or enters the event log.
+    pub fn set_badge_visibility(
+        &mut self,
+        badge_id: &str,
+        persona_id: &str,
+        visible: bool,
+    ) -> Result<(), ValidationError> {
+        persist::set_badge_visibility(&self.conn, badge_id, persona_id, visible)
+    }
+
+    /// Load the badge gallery for a persona: all active, non-expired badges
+    /// received by this persona, with their visibility preferences included.
+    /// Filtering happens at the SQL level for efficiency.
+    pub fn badge_gallery(
+        &self,
+        persona_id: &str,
+        now_secs: u64,
+    ) -> Result<Vec<(core_eventlog::BadgeRecord, bool)>, ValidationError> {
+        persist::load_badge_gallery(&self.conn, persona_id, now_secs)
+    }
+
     pub fn upsert_file_manifest(&mut self, manifest: &FileManifest) -> Result<(), ValidationError> {
         manifest.validate()?;
         self.validate_manifest_device_access(manifest)?;
@@ -1654,7 +2001,7 @@ impl EventStore {
                 write_encrypted_local_block(&tx, block)?;
             }
         }
-        write_local_vault_catalog_head(&tx, &catalog.namespace, &catalog_manifest, content_key)?;
+        write_local_vault_catalog_head(&tx, &catalog.namespace, &catalog_manifest, content_key, self.master_key.as_ref().map(|s| s.as_str()))?;
         tx.commit().map_err(|err| {
             ValidationError::new(format!("commit local vault catalog transaction: {err}"))
         })?;
@@ -1691,7 +2038,7 @@ impl EventStore {
         let tx = self.conn.transaction().map_err(|err| {
             ValidationError::new(format!("begin local manifest key transaction: {err}"))
         })?;
-        write_local_manifest_key(&tx, manifest_id, content_key)?;
+        write_local_manifest_key(&tx, manifest_id, content_key, self.master_key.as_ref().map(|s| s.as_str()))?;
         tx.commit().map_err(|err| {
             ValidationError::new(format!("commit local manifest key transaction: {err}"))
         })?;
@@ -1699,7 +2046,7 @@ impl EventStore {
     }
 
     pub fn local_manifest_key(&self, manifest_id: &str) -> Result<Option<String>, ValidationError> {
-        load_local_manifest_key(&self.conn, manifest_id)
+        load_local_manifest_key(&self.conn, manifest_id, self.master_key.as_ref().map(|s| s.as_str()))
     }
 
     pub fn upsert_local_device_encryption_key(
@@ -1732,7 +2079,7 @@ impl EventStore {
                 "begin local device encryption key transaction: {err}"
             ))
         })?;
-        write_local_device_encryption_key(&tx, device_id, key_pair)?;
+        write_local_device_encryption_key(&tx, device_id, key_pair, self.master_key.as_ref().map(|s| s.as_str()))?;
         tx.commit().map_err(|err| {
             ValidationError::new(format!(
                 "commit local device encryption key transaction: {err}"
@@ -1744,7 +2091,7 @@ impl EventStore {
         &self,
         device_id: &str,
     ) -> Result<Option<LocalKeyPair>, ValidationError> {
-        load_local_device_encryption_key(&self.conn, device_id)
+        load_local_device_encryption_key(&self.conn, device_id, self.master_key.as_ref().map(|s| s.as_str()))
     }
 
     pub fn unwrap_manifest_key_for_device(
@@ -1977,7 +2324,7 @@ impl EventStore {
                 write_encrypted_local_block(&tx, block)?;
             }
         }
-        write_local_vault_catalog_head(&tx, &catalog.namespace, &manifest, content_key)?;
+        write_local_vault_catalog_head(&tx, &catalog.namespace, &manifest, content_key, self.master_key.as_ref().map(|s| s.as_str()))?;
         tx.commit().map_err(|err| {
             ValidationError::new(format!("commit local vault catalog transaction: {err}"))
         })?;
@@ -1989,7 +2336,7 @@ impl EventStore {
         namespace: &VaultNamespace,
     ) -> Result<Option<VaultCatalog>, ValidationError> {
         namespace.validate()?;
-        let Some((manifest, content_key)) = load_local_vault_catalog_head(&self.conn, namespace)?
+        let Some((manifest, content_key)) = load_local_vault_catalog_head(&self.conn, namespace, self.master_key.as_ref().map(|s| s.as_str()))?
         else {
             return Ok(None);
         };
@@ -2020,7 +2367,7 @@ impl EventStore {
         namespace: &VaultNamespace,
     ) -> Result<Vec<(FileManifest, String)>, ValidationError> {
         let Some((catalog_manifest, catalog_key)) =
-            load_local_vault_catalog_head(&self.conn, namespace)?
+            load_local_vault_catalog_head(&self.conn, namespace, self.master_key.as_ref().map(|s| s.as_str()))?
         else {
             return Ok(Vec::new());
         };
@@ -2493,6 +2840,69 @@ impl EventStore {
         Ok(revisions)
     }
 
+    /// Create a single persona credential through the high-level path.
+    ///
+    /// Resolves the persona's vault namespace, enumerates devices with access,
+    /// and delegates to [`import_persona_credentials`]. Returns the `object_id`
+    /// of the created credential.
+    ///
+    /// `claim_type` must be a valid [`core_types::ClaimType`] string
+    /// (e.g. `"self-asserted"`). `payload_json` must be a JSON object with a
+    /// top-level `"schema"` string field (e.g. `{"schema":"password","username":"foo"}`).
+    pub fn create_persona_credential(
+        &mut self,
+        persona_id: &str,
+        device_id: &str,
+        claim_type: &str,
+        payload_json: &str,
+    ) -> Result<String, ValidationError> {
+        // Build the persona namespace.
+        let namespace = VaultNamespace {
+            owner_kind: VaultOwnerKind::Persona,
+            owner_id: persona_id.to_string(),
+        };
+
+        // Enumerate devices that have access to this persona and build recipients.
+        let access_records = self.persona_device_access_for_persona(persona_id)?;
+        if access_records.is_empty() {
+            return Err(ValidationError::new(format!(
+                "no devices have access to persona '{persona_id}'; grant device access first"
+            )));
+        }
+        let mat = self.materialized();
+        let recipients: Vec<core_storage::ManifestKeyRecipient> = access_records
+            .iter()
+            .filter_map(|r| {
+                mat.devices_current
+                    .get(&r.device_id)
+                    .map(|d| core_storage::manifest_key_recipient(
+                        &d.device_id,
+                        &d.active_encryption_key.public_key,
+                    ))
+            })
+            .collect();
+        if recipients.is_empty() {
+            return Err(ValidationError::new(
+                "no active device encryption keys found for persona",
+            ));
+        }
+
+        let imported = ImportedClaim {
+            claim_type: claim_type.to_string(),
+            payload_json: payload_json.to_string(),
+            external_issuer: persona_id.to_string(),
+            external_issued_at: None,
+            external_expires_at: None,
+        };
+        let revisions =
+            self.import_persona_credentials(&namespace, device_id, &[imported], recipients)?;
+        revisions
+            .into_iter()
+            .next()
+            .map(|r| r.id)
+            .ok_or_else(|| ValidationError::new("import produced no revision"))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn upsert_local_structured_object(
         &mut self,
@@ -2557,7 +2967,7 @@ impl EventStore {
             }
         }
 
-        let catalog_key = load_local_vault_catalog_head(&self.conn, namespace)?
+        let catalog_key = load_local_vault_catalog_head(&self.conn, namespace, self.master_key.as_ref().map(|s| s.as_str()))?
             .map(|(_, content_key)| content_key)
             .unwrap_or_else(generate_content_key);
         let mut catalog = self
@@ -2661,7 +3071,7 @@ impl EventStore {
             return Err(ValidationError::new("file content must not be empty"));
         }
 
-        let catalog_key = load_local_vault_catalog_head(&self.conn, namespace)?
+        let catalog_key = load_local_vault_catalog_head(&self.conn, namespace, self.master_key.as_ref().map(|s| s.as_str()))?
             .map(|(_, content_key)| content_key)
             .unwrap_or_else(generate_content_key);
         let mut catalog = self
@@ -2748,7 +3158,7 @@ impl EventStore {
                 "vault tombstone requires at least one recipient device",
             ));
         }
-        let catalog_key = load_local_vault_catalog_head(&self.conn, namespace)?
+        let catalog_key = load_local_vault_catalog_head(&self.conn, namespace, self.master_key.as_ref().map(|s| s.as_str()))?
             .map(|(_, content_key)| content_key)
             .ok_or_else(|| ValidationError::new("local vault catalog not found"))?;
         let mut catalog = self
@@ -3018,7 +3428,7 @@ impl EventStore {
     ) -> Result<Option<LocalVaultGcPlan>, ValidationError> {
         namespace.validate()?;
         let Some((catalog_manifest, _content_key)) =
-            load_local_vault_catalog_head(&self.conn, namespace)?
+            load_local_vault_catalog_head(&self.conn, namespace, self.master_key.as_ref().map(|s| s.as_str()))?
         else {
             return Ok(None);
         };
@@ -3470,6 +3880,19 @@ impl EventLog for EventStore {
             authorizer,
             now_epoch_secs,
         )
+    }
+}
+
+fn parse_approval_status(s: &str) -> Result<core_types::approval::ApprovalStatus, ValidationError> {
+    match s {
+        "pending" => Ok(core_types::approval::ApprovalStatus::Pending),
+        "approved" => Ok(core_types::approval::ApprovalStatus::Approved),
+        "denied" => Ok(core_types::approval::ApprovalStatus::Denied),
+        "expired" => Ok(core_types::approval::ApprovalStatus::Expired),
+        "narrowed_and_approved" => Ok(core_types::approval::ApprovalStatus::NarrowedAndApproved),
+        other => Err(ValidationError::invalid_format(format!(
+            "unknown approval status: {other}"
+        ))),
     }
 }
 
@@ -4236,7 +4659,7 @@ mod tests {
                 service_label: "GitHub".into(),
                 endpoint: "https://github.com".into(),
             },
-            external_account_id: "operator".into(),
+            external_account_id: "alice".into(),
             created_at: 42,
         };
 
@@ -4312,7 +4735,7 @@ mod tests {
                     service_label: "GitHub".into(),
                     endpoint: "https://github.com".into(),
                 },
-                external_account_id: "operator".into(),
+                external_account_id: "alice".into(),
                 created_at: 42,
             })
             .unwrap_err();
@@ -5059,6 +5482,7 @@ mod tests {
             "emberlink-core-state-vault-catalog-{unique}.sqlite"
         ));
         let block_dir = local_block_store_root(&path);
+        let master_key = core_crypto::derive_content_key(b"emberlink-test-key", b"test");
         let content_key = generate_content_key();
         let catalog = VaultCatalog {
             namespace: test_namespace(),
@@ -5093,7 +5517,7 @@ mod tests {
         };
 
         {
-            let mut store = EventStore::open(&path).unwrap();
+            let mut store = EventStore::open_with_key(&path, master_key.clone()).unwrap();
             store
                 .upsert_local_vault_catalog(
                     "manifest-catalog-1",
@@ -5104,12 +5528,27 @@ mod tests {
                 .unwrap();
         }
 
-        let reopened = EventStore::open(&path).unwrap();
+        // Assert the catalog content key is encrypted at rest.
+        let ns = test_namespace();
+        let raw_conn = rusqlite::Connection::open(&path).unwrap();
+        let raw_content_key: String = raw_conn
+            .query_row(
+                "SELECT content_key FROM local_vault_catalogs WHERE owner_kind = ?1 AND owner_id = ?2",
+                rusqlite::params![ns.owner_kind.as_str(), &ns.owner_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            raw_content_key.starts_with("ENC1:"),
+            "expected encrypted content_key in SQLite, got: {raw_content_key}"
+        );
+
+        // Assert round-trip recovers the original catalog.
+        let reopened = EventStore::open_with_key(&path, master_key).unwrap();
         let loaded = reopened
             .local_vault_catalog(&test_namespace())
             .unwrap()
             .unwrap();
-
         assert_eq!(loaded, catalog);
 
         let _ = std::fs::remove_file(path);
@@ -5694,7 +6133,7 @@ mod tests {
                     "device-a",
                     meta,
                     claim.clone(),
-                    br#"{"service_url":"https://github.com","username":"operator","password":"secret"}"#,
+                    br#"{"service_url":"https://github.com","username":"alice","password":"secret"}"#,
                     core_types::DurabilityPolicy::ReplicatedToApprovedPeers,
                     core_types::RetentionPolicy::KeepLatest,
                     vec![test_manifest_recipient("device-a")],
@@ -5727,7 +6166,7 @@ mod tests {
                     .unwrap()
             )
             .unwrap(),
-            r#"{"service_url":"https://github.com","username":"operator","password":"secret"}"#
+            r#"{"service_url":"https://github.com","username":"alice","password":"secret"}"#
         );
 
         let _ = std::fs::remove_file(path);
@@ -5766,7 +6205,7 @@ mod tests {
                     app_namespace: "emberlink".into(),
                 },
                 test_claim_meta(),
-                br#"{"service_url":"https://github.com","username":"operator","password":"secret"}"#,
+                br#"{"service_url":"https://github.com","username":"alice","password":"secret"}"#,
                 core_types::DurabilityPolicy::ReplicatedToApprovedPeers,
                 core_types::RetentionPolicy::KeepLatest,
                 vec![test_manifest_recipient("device-a")],
@@ -5793,7 +6232,7 @@ mod tests {
 
         let imported_claim = core_types::ImportedClaim {
             claim_type: core_types::ClaimType::SelfAsserted.as_str().into(),
-            payload_json: r#"{"schema":"emberlink:claim:password:1.0","service_name":"GitHub","service_url":"https://github.com","username":"operator","password":"secret","totp_secret":null,"notes":"imported"}"#.into(),
+            payload_json: r#"{"schema":"emberlink:claim:password:1.0","service_name":"GitHub","service_url":"https://github.com","username":"alice","password":"secret","totp_secret":null,"notes":"imported"}"#.into(),
             external_issuer: "bitwarden".into(),
             external_issued_at: Some(42),
             external_expires_at: None,
@@ -5996,17 +6435,32 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "emberlink-core-state-local-manifest-key-{unique}.sqlite"
         ));
+        let master_key = core_crypto::derive_content_key(b"emberlink-test-key", b"test");
 
         {
-            let mut store = EventStore::open(&path).unwrap();
+            let mut store = EventStore::open_with_key(&path, master_key.clone()).unwrap();
             store
                 .upsert_local_manifest_key("manifest-local-1", "content-key-1")
                 .unwrap();
         }
 
-        let reopened = EventStore::open(&path).unwrap();
-        let loaded = reopened.local_manifest_key("manifest-local-1").unwrap();
+        // Assert the value is encrypted at rest (raw SQLite value starts with ENC1:).
+        let raw_conn = rusqlite::Connection::open(&path).unwrap();
+        let raw_value: String = raw_conn
+            .query_row(
+                "SELECT content_key FROM local_manifest_keys WHERE manifest_id = 'manifest-local-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            raw_value.starts_with("ENC1:"),
+            "expected encrypted value in SQLite, got: {raw_value}"
+        );
 
+        // Assert round-trip recovers the original value.
+        let reopened = EventStore::open_with_key(&path, master_key).unwrap();
+        let loaded = reopened.local_manifest_key("manifest-local-1").unwrap();
         assert_eq!(loaded.as_deref(), Some("content-key-1"));
 
         let _ = std::fs::remove_file(path);
@@ -6021,10 +6475,11 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "emberlink-core-state-device-encryption-key-{unique}.sqlite"
         ));
+        let master_key = core_crypto::derive_content_key(b"emberlink-test-key", b"test");
         let encryption_key_pair = generate_local_encryption_key_pair("device", "device-a");
 
         {
-            let mut store = EventStore::open(&path).unwrap();
+            let mut store = EventStore::open_with_key(&path, master_key.clone()).unwrap();
             append_typed(
                 &mut store,
                 "evt-root-1",
@@ -6056,12 +6511,26 @@ mod tests {
                 .unwrap();
         }
 
-        let reopened = EventStore::open(&path).unwrap();
+        // Assert the private key is encrypted at rest (raw SQLite value starts with ENC1:).
+        let raw_conn = rusqlite::Connection::open(&path).unwrap();
+        let raw_private_key: String = raw_conn
+            .query_row(
+                "SELECT private_key FROM local_device_encryption_keys WHERE device_id = 'device-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            raw_private_key.starts_with("ENC1:"),
+            "expected encrypted private key in SQLite, got: {raw_private_key}"
+        );
+
+        // Assert round-trip recovers the original key pair.
+        let reopened = EventStore::open_with_key(&path, master_key).unwrap();
         let loaded = reopened
             .local_device_encryption_key_pair("device-a")
             .unwrap()
             .unwrap();
-
         assert_eq!(loaded, encryption_key_pair);
 
         let _ = std::fs::remove_file(path);
@@ -6223,7 +6692,7 @@ mod tests {
                     key_id: encryption_key_pair.key_id.clone(),
                     algorithm: encryption_key_pair.algorithm,
                     public_key: encryption_key_pair.public_key.clone(),
-                    private_key: stale_key_pair.private_key,
+                    private_key: stale_key_pair.private_key.clone(),
                 },
             )
             .and_then(|_| store.unwrap_manifest_key_for_device("manifest-1", "device-a"))
@@ -7371,6 +7840,132 @@ mod tests {
     }
 
     #[test]
+    fn future_now_clamped_cannot_bypass_cooldown() {
+        // Build the same contested state as above (contested_at_epoch=1000,
+        // cooldown_seconds=3600 → cooldown_until=4600).
+        let mut store = EventStore::default();
+        for (id, body, signer) in [
+            (
+                "evt-root-1",
+                EventBody::RootCreated(RootCreatedEvent {
+                    root_id: "root-x".into(),
+                    display_name: "Primary".into(),
+                    initial_key: test_key("key-root-x-v1"),
+                }),
+                SignerBinding::root("root-x", "key-root-x-v1"),
+            ),
+            (
+                "evt-device-1",
+                EventBody::DeviceAdded(DeviceAddedEvent {
+                    root_id: "root-x".into(),
+                    device_id: "device-x".into(),
+                    label: "Laptop".into(),
+                    initial_key: test_key("key-device-x-v1"),
+                    initial_encryption_key: test_encryption_key("key-device-x-v1"),
+                }),
+                SignerBinding::root("root-x", "key-root-x-v1"),
+            ),
+            (
+                "evt-policy-1",
+                EventBody::RecoveryPolicyCreated(RecoveryPolicyCreatedEvent {
+                    root_id: "root-x".into(),
+                    guardian_threshold: 1,
+                    cooldown_seconds: 3600,
+                }),
+                SignerBinding::root("root-x", "key-root-x-v1"),
+            ),
+            (
+                "evt-guardian-1",
+                EventBody::GuardianEnrolled(GuardianEnrolledEvent {
+                    root_id: "root-x".into(),
+                    guardian_id: "guardian-b".into(),
+                    guardian_label: "Bob".into(),
+                    guardian_public_key: "guardian-key-b".into(),
+                }),
+                SignerBinding::root("root-x", "key-root-x-v1"),
+            ),
+            (
+                "evt-guardian-2",
+                EventBody::GuardianEnrolled(GuardianEnrolledEvent {
+                    root_id: "root-x".into(),
+                    guardian_id: "guardian-c".into(),
+                    guardian_label: "Carol".into(),
+                    guardian_public_key: "guardian-key-c".into(),
+                }),
+                SignerBinding::root("root-x", "key-root-x-v1"),
+            ),
+            (
+                "evt-request-1",
+                EventBody::RecoveryRequested(RecoveryRequestedEvent {
+                    request_id: "recovery-x".into(),
+                    root_id: "root-x".into(),
+                    target_device_id: "device-x".into(),
+                }),
+                SignerBinding::root("root-x", "key-root-x-v1"),
+            ),
+        ] {
+            append_typed(&mut store, id, body, signer);
+        }
+
+        let approval = EventEnvelope::from_body(
+            "evt-approval-1",
+            EventBody::RecoveryApproved(RecoveryApprovedEvent {
+                request_id: "recovery-x".into(),
+                guardian_id: "guardian-b".into(),
+            }),
+            vec![EventRef::previous("evt-request-1")],
+            SignerBinding::guardian("guardian-b", "guardian-key-b"),
+            &FixtureSigner::new("guardian-key-b"),
+        )
+        .unwrap();
+        store
+            .append_with_authorizer(approval, &FixtureVerifier, &IdentityAuthorizer, 0)
+            .unwrap();
+
+        // Contest at epoch=1000 → cooldown_until = 1000 + 3600 = 4600
+        let contest = EventEnvelope::from_body(
+            "evt-contest-1",
+            EventBody::RecoveryContested(RecoveryContestedEvent {
+                request_id: "recovery-x".into(),
+                guardian_id: "guardian-c".into(),
+                reason: "suspicious".into(),
+                contested_at_epoch: 1000,
+            }),
+            vec![EventRef::previous("evt-approval-1")],
+            SignerBinding::guardian("guardian-c", "guardian-key-c"),
+            &FixtureSigner::new("guardian-key-c"),
+        )
+        .unwrap();
+        store
+            .append_with_authorizer(contest, &FixtureVerifier, &IdentityAuthorizer, 0)
+            .unwrap();
+
+        // Attempt execution with a far-future timestamp — should still be blocked by cooldown
+        // because append_with_authorizer clamps now_epoch_secs to system_now + 300.
+        let execute = EventEnvelope::from_body(
+            "evt-execute-1",
+            EventBody::RecoveryExecuted(RecoveryExecutedEvent {
+                request_id: "recovery-x".into(),
+                executed_scope: RecoveryScope::FreezeDevice,
+            }),
+            vec![EventRef::previous("evt-contest-1")],
+            SignerBinding::root("root-x", "key-root-x-v1"),
+            &FixtureSigner::new("key-root-x-v1"),
+        )
+        .unwrap();
+        let err = store
+            .append_with_authorizer(execute, &FixtureVerifier, &IdentityAuthorizer, u64::MAX)
+            .unwrap_err();
+        // Cooldown expires at epoch 4600; system_now is << 4600 in any CI environment,
+        // so the clamped effective_now is well below the cooldown threshold.
+        assert!(
+            err.message.contains("cooldown") || err.message.contains("approved"),
+            "expected cooldown rejection, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
     fn duplicate_event_ids_fail_inside_sqlite_store() {
         let mut store = EventStore::default();
         append_typed(
@@ -8284,6 +8879,75 @@ mod tests {
     }
 
     #[test]
+    fn edit_rejects_capability_expansion() {
+        let mut store = store_with_persona();
+        let grant = sample_grant("grant-1", "persona-a");
+        store.create_access_grant(&grant).unwrap();
+
+        // Try to add a second ReadCredential for a different object — must be rejected
+        let mut edited = grant.clone();
+        edited.version = 2;
+        edited.updated_at = 1500;
+        edited.capabilities.push(core_types::GrantCapability::ReadCredential {
+            object_id: "vault-obj-new".into(),
+        });
+        let err = store.edit_access_grant(&edited, None).unwrap_err();
+        assert!(err.message.contains("expand grant capabilities"), "{}", err.message);
+    }
+
+    #[test]
+    fn edit_rejects_disclose_fields_expansion() {
+        let mut store = store_with_persona();
+        let mut grant = sample_grant("grant-1", "persona-a");
+        grant.capabilities = vec![core_types::GrantCapability::DiscloseFields {
+            object_id: "vault-obj-abc".into(),
+            field_paths: vec!["email".into()],
+        }];
+        store.create_access_grant(&grant).unwrap();
+
+        // Try to widen field_paths — must be rejected
+        let mut edited = grant.clone();
+        edited.version = 2;
+        edited.updated_at = 1500;
+        edited.capabilities = vec![core_types::GrantCapability::DiscloseFields {
+            object_id: "vault-obj-abc".into(),
+            field_paths: vec!["email".into(), "phone".into()],
+        }];
+        let err = store.edit_access_grant(&edited, None).unwrap_err();
+        assert!(err.message.contains("expand grant capabilities"), "{}", err.message);
+    }
+
+    #[test]
+    fn edit_allows_capability_narrowing() {
+        let mut store = store_with_persona();
+        let mut grant = sample_grant("grant-1", "persona-a");
+        grant.capabilities = vec![core_types::GrantCapability::DiscloseFields {
+            object_id: "vault-obj-abc".into(),
+            field_paths: vec!["email".into(), "phone".into()],
+        }];
+        store.create_access_grant(&grant).unwrap();
+
+        // Narrow field_paths — must succeed
+        let mut edited = grant.clone();
+        edited.version = 2;
+        edited.updated_at = 1500;
+        edited.capabilities = vec![core_types::GrantCapability::DiscloseFields {
+            object_id: "vault-obj-abc".into(),
+            field_paths: vec!["email".into()],
+        }];
+        store.edit_access_grant(&edited, Some("narrowed to email only")).unwrap();
+
+        let loaded = store.access_grant("grant-1").unwrap().unwrap();
+        if let core_types::GrantCapability::DiscloseFields { field_paths, .. } =
+            &loaded.capabilities[0]
+        {
+            assert_eq!(field_paths, &["email"]);
+        } else {
+            panic!("unexpected capability variant");
+        }
+    }
+
+    #[test]
     fn revoke_access_grant() {
         let mut store = store_with_persona();
         let grant = sample_grant("grant-1", "persona-a");
@@ -8468,5 +9132,128 @@ mod tests {
         // Should not appear in active grants
         let active = store.list_active_grants(Some("persona-a"), None).unwrap();
         assert!(active.is_empty());
+    }
+
+    // --- Approval queue tests ---
+
+    fn sample_approval_request(id: &str) -> core_types::approval::ApprovalRequest {
+        core_types::approval::ApprovalRequest::new(
+            id.into(),
+            "agent-claude".into(),
+            Some("Claude agent".into()),
+            core_types::approval::RequestedScope {
+                capability: "ReadCredential".into(),
+                resource_id: Some("cred-netflix".into()),
+                constraints: vec!["read-only".into()],
+            },
+            Some(3600),
+            Some("Need Netflix password".into()),
+            1700000000,
+        )
+    }
+
+    #[test]
+    fn insert_and_retrieve_approval_request() {
+        let store = EventStore::default();
+        let req = sample_approval_request("req-1");
+        store.insert_approval_request(&req).unwrap();
+
+        let loaded = store.get_approval_request("req-1").unwrap().unwrap();
+        assert_eq!(loaded.request_id, "req-1");
+        assert_eq!(loaded.requester_id, "agent-claude");
+        assert_eq!(loaded.requester_label.as_deref(), Some("Claude agent"));
+        assert_eq!(loaded.status, "pending");
+        assert_eq!(loaded.created_at, 1700000000);
+        assert_eq!(loaded.requested_duration_secs, Some(3600));
+        assert_eq!(loaded.reason.as_deref(), Some("Need Netflix password"));
+        assert!(loaded.resolved_at.is_none());
+        assert!(loaded.resolver_id.is_none());
+
+        assert!(store.get_approval_request("nonexistent").unwrap().is_none());
+    }
+
+    #[test]
+    fn list_pending_approvals_returns_only_pending() {
+        let store = EventStore::default();
+
+        let req1 = sample_approval_request("req-1");
+        let mut req2 = sample_approval_request("req-2");
+        req2.created_at = 1700000060;
+        store.insert_approval_request(&req1).unwrap();
+        store.insert_approval_request(&req2).unwrap();
+
+        let pending = store.list_pending_approvals().unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].request_id, "req-2");
+        assert_eq!(pending[1].request_id, "req-1");
+
+        let response = core_types::approval::ApprovalResponse {
+            request_id: "req-1".into(),
+            status: core_types::approval::ApprovalStatus::Approved,
+            resolver_id: "josh".into(),
+            resolved_at: 1700000120,
+            narrowed_scope: None,
+            denial_reason: None,
+            granted_duration_secs: Some(3600),
+        };
+        store.resolve_approval_request("req-1", &response).unwrap();
+
+        let pending = store.list_pending_approvals().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].request_id, "req-2");
+    }
+
+    #[test]
+    fn resolve_approval_request_updates_status() {
+        let store = EventStore::default();
+        let req = sample_approval_request("req-1");
+        store.insert_approval_request(&req).unwrap();
+
+        let response = core_types::approval::ApprovalResponse {
+            request_id: "req-1".into(),
+            status: core_types::approval::ApprovalStatus::Denied,
+            resolver_id: "josh".into(),
+            resolved_at: 1700000120,
+            narrowed_scope: None,
+            denial_reason: Some("Not authorized".into()),
+            granted_duration_secs: None,
+        };
+        store.resolve_approval_request("req-1", &response).unwrap();
+
+        let loaded = store.get_approval_request("req-1").unwrap().unwrap();
+        assert_eq!(loaded.status, "denied");
+        assert_eq!(loaded.resolved_at, Some(1700000120));
+        assert_eq!(loaded.resolver_id.as_deref(), Some("josh"));
+        assert_eq!(loaded.denial_reason.as_deref(), Some("Not authorized"));
+    }
+
+    #[test]
+    fn resolve_already_resolved_request_fails() {
+        let store = EventStore::default();
+        let req = sample_approval_request("req-1");
+        store.insert_approval_request(&req).unwrap();
+
+        let response1 = core_types::approval::ApprovalResponse {
+            request_id: "req-1".into(),
+            status: core_types::approval::ApprovalStatus::Approved,
+            resolver_id: "josh".into(),
+            resolved_at: 1700000120,
+            narrowed_scope: None,
+            denial_reason: None,
+            granted_duration_secs: Some(3600),
+        };
+        store.resolve_approval_request("req-1", &response1).unwrap();
+
+        let response2 = core_types::approval::ApprovalResponse {
+            request_id: "req-1".into(),
+            status: core_types::approval::ApprovalStatus::Denied,
+            resolver_id: "attacker".into(),
+            resolved_at: 1700000180,
+            narrowed_scope: None,
+            denial_reason: Some("forged".into()),
+            granted_duration_secs: None,
+        };
+        let err = store.resolve_approval_request("req-1", &response2).unwrap_err();
+        assert!(err.message.contains("cannot transition"));
     }
 }

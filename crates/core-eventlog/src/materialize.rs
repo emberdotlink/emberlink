@@ -7,8 +7,10 @@ use core_types::{
 };
 
 use crate::{
-    DeviceRecord, DeviceStatus, GuardianRecord, MaterializedState, PersonaRecord, PersonaStatus,
-    RecoveryPolicyRecord, RecoveryRequestRecord, RecoveryRequestStatus, RootRecord, RootStatus,
+    BadgeDisputeRecord, BadgeRecord, CredentialDepositRecord, CredentialDepositStatus,
+    DeviceRecord, DeviceStatus, GrantOfferRecord, GrantOfferStatus, GuardianRecord,
+    MaterializedState, PersonaRecord, PersonaStatus, RecoveryPolicyRecord, RecoveryRequestRecord,
+    RecoveryRequestStatus, RootRecord, RootStatus,
 };
 
 pub fn apply_event(
@@ -523,6 +525,99 @@ pub fn apply_event(
         EventBody::MessageSent(_) | EventBody::ContentPublished(_) => {}
         EventBody::DisclosureRevoked(_) => {}
         EventBody::RelayShutdownNotice(_) => {}
+        EventBody::GrantOfferCreated(body) => {
+            state.grant_offers_current.insert(
+                body.offer_id.clone(),
+                GrantOfferRecord {
+                    offer_id: body.offer_id.clone(),
+                    issuer_persona_id: body.issuer_persona_id.clone(),
+                    ephemeral_public_key_hex: body.ephemeral_public_key_hex.clone(),
+                    sealed_payload_hex: body.sealed_payload_hex.clone(),
+                    relay_hint: body.relay_hint.clone(),
+                    expires_at: body.expires_at,
+                    conditions_json: body.conditions_json.clone(),
+                    status: GrantOfferStatus::Pending,
+                    recipient_persona_id: None,
+                    claim_response_hex: None,
+                    claimed_at: None,
+                },
+            );
+        }
+        EventBody::GrantOfferClaimed(body) => {
+            if let Some(offer) = state.grant_offers_current.get_mut(&body.offer_id) {
+                offer.status = GrantOfferStatus::Claimed;
+                offer.recipient_persona_id = Some(body.recipient_persona_id.clone());
+                offer.claim_response_hex = Some(body.claim_response_hex.clone());
+                offer.claimed_at = Some(body.claimed_at);
+            }
+        }
+        EventBody::GrantOfferRevoked(body) => {
+            if let Some(offer) = state.grant_offers_current.get_mut(&body.offer_id) {
+                offer.status = GrantOfferStatus::Revoked;
+            }
+        }
+        EventBody::BadgeIssued(body) => {
+            state.badges_current.insert(
+                body.badge_id.clone(),
+                BadgeRecord {
+                    badge_id: body.badge_id.clone(),
+                    issuer_persona_id: body.issuer_persona_id.clone(),
+                    recipient_persona_id: body.recipient_persona_id.clone(),
+                    badge_type: body.badge_type.clone(),
+                    display_name: body.display_name.clone(),
+                    evidence: body.evidence.clone(),
+                    issued_at: body.issued_at,
+                    expires_at: body.expires_at,
+                    revoked: false,
+                    revoked_reason: None,
+                },
+            );
+        }
+        EventBody::BadgeRevoked(body) => {
+            if let Some(badge) = state.badges_current.get_mut(&body.badge_id) {
+                badge.revoked = true;
+                badge.revoked_reason = Some(body.reason.clone());
+            }
+        }
+        EventBody::BadgeDisputed(body) => {
+            state.badge_disputes_current.insert(
+                body.dispute_id.clone(),
+                BadgeDisputeRecord {
+                    dispute_id: body.dispute_id.clone(),
+                    target_badge_id: body.target_badge_id.clone(),
+                    disputer_persona_id: body.disputer_persona_id.clone(),
+                    reason: body.reason.clone(),
+                    evidence: body.evidence.clone(),
+                },
+            );
+        }
+        EventBody::CredentialDeposited(body) => {
+            state.credential_deposits_current.insert(
+                body.deposit_id.clone(),
+                CredentialDepositRecord {
+                    deposit_id: body.deposit_id.clone(),
+                    grant_id: body.grant_id.clone(),
+                    credential_id: body.credential_id.clone(),
+                    issuer_id: body.issuer_id.clone(),
+                    encrypted_blocks_json: body.encrypted_blocks_json.clone(),
+                    status: CredentialDepositStatus::Active,
+                    created_at: body.created_at,
+                    expires_at: body.expires_at,
+                    revoked_at: None,
+                    revoked_reason: None,
+                },
+            );
+        }
+        EventBody::CredentialRevoked(body) => {
+            // Find the deposit by grant_id and mark it revoked.
+            for deposit in state.credential_deposits_current.values_mut() {
+                if deposit.grant_id == body.grant_id {
+                    deposit.status = CredentialDepositStatus::Revoked;
+                    deposit.revoked_at = Some(body.revoked_at);
+                    deposit.revoked_reason = Some(body.reason.clone());
+                }
+            }
+        }
         EventBody::LegacyOpaque { .. } => {}
     }
 

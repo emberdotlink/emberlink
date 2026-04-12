@@ -32,6 +32,7 @@ use core_recovery::create_policy;
 use core_state::{
     DeviceStatus, EventStore, IdentityAuthorizer, PersonaStatus, RecoveryRequestStatus,
 };
+use emberlink_app::{AppRuntime, LocalState};
 use core_storage::{
     create_relationship, encrypt_block, ledger_delta, manifest_chunk, manifest_device_access,
     manifest_key_recipient, plan_restore, publish_manifest, storage_relationship_created_event,
@@ -102,7 +103,7 @@ pub struct DemoApp {
     seed_demo: bool,
     peer_id: String,
     verifier: FixtureVerifier,
-    event_store: EventStore,
+    app_runtime: AppRuntime<EventStore>,
     next_root_id: usize,
     next_persona_id: usize,
     next_device_id: usize,
@@ -143,21 +144,31 @@ impl DemoApp {
     }
 
     fn bootstrap(data_file: Option<PathBuf>, seed_demo: bool) -> Self {
+        match Self::try_bootstrap(data_file, seed_demo) {
+            Ok(app) => app,
+            Err(err) => {
+                eprintln!("Error: {err}");
+                eprintln!(
+                    "Hint: existing state files were preserved when possible; check permissions, keychain access, disk space, or use an explicit repair/reset path"
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
+    fn try_bootstrap(data_file: Option<PathBuf>, seed_demo: bool) -> Result<Self, ValidationError> {
         let verifier = FixtureVerifier;
         let event_store = match data_file.as_deref() {
-            Some(path) => match EventStore::open(sqlite_path_for_local_state(path)) {
-                Ok(store) => store,
-                Err(err) => {
-                    eprintln!(
-                        "Error: could not open event store at {}: {err}",
-                        path.display()
-                    );
-                    eprintln!(
-                        "Hint: check file permissions, available disk space, or try --state with a different path"
-                    );
-                    std::process::exit(1);
-                }
-            },
+            Some(path) => {
+                let master_key = resolve_encryption_key()?;
+                EventStore::open_with_key(sqlite_path_for_local_state(path), master_key)
+                    .map_err(|err| {
+                        ValidationError::new(format!(
+                            "could not open event store at {}: {err}",
+                            path.display()
+                        ))
+                    })?
+            }
             None => EventStore::default(),
         };
         let mut app = Self::new_unhydrated(data_file, seed_demo, verifier, event_store);
@@ -171,72 +182,42 @@ impl DemoApp {
             let mut seeded_identities = false;
             if local_state_exists {
                 app.hydrate_identity_state();
-                if app.load_from_disk().is_err() {
-                    let sqlite_file = sqlite_path_for_local_state(&path);
-                    let _ = fs::remove_file(&path);
-                    let _ = fs::remove_file(&sqlite_file);
-                    app.event_store = match EventStore::open(&sqlite_file) {
-                        Ok(store) => store,
-                        Err(err) => {
-                            eprintln!(
-                                "Error: could not recreate event store at {}: {err}",
-                                sqlite_file.display()
-                            );
-                            eprintln!("Hint: check file permissions and available disk space");
-                            std::process::exit(1);
-                        }
-                    };
-                    app.clear_local_runtime();
-                    if app.seed_demo {
-                        if let Err(err) = app.seed_initial_identities() {
-                            eprintln!("Error: failed to seed initial identities: {err}");
-                            std::process::exit(1);
-                        }
-                        seeded_identities = true;
-                    }
-                    if let Err(err) = app.persist_to_disk() {
-                        eprintln!(
-                            "Error: failed to persist state to {}: {err}",
-                            path.display()
-                        );
-                        std::process::exit(1);
-                    }
-                }
+                app.load_from_disk().map_err(|err| {
+                    ValidationError::new(format!(
+                        "failed to load local state from {}: {err}",
+                        path.display()
+                    ))
+                })?;
             }
-            if app.event_store.event_count() == 0 && app.seed_demo && app.roots.is_empty() {
-                if let Err(err) = app.seed_initial_identities() {
-                    eprintln!("Error: failed to seed initial identities: {err}");
-                    std::process::exit(1);
-                }
+            if app.app_runtime.store.event_count() == 0 && app.seed_demo && app.roots.is_empty() {
+                app.seed_initial_identities().map_err(|err| {
+                    ValidationError::new(format!("failed to seed initial identities: {err}"))
+                })?;
                 seeded_identities = true;
             }
             if (!local_state_exists || seeded_identities)
                 && let Err(err) = app.persist_to_disk()
             {
-                eprintln!(
-                    "Error: failed to persist state to {}: {err}",
+                return Err(ValidationError::new(format!(
+                    "failed to persist state to {}: {err}",
                     path.display()
-                );
-                std::process::exit(1);
+                )));
             }
             app.hydrate_identity_state();
             app.reconcile_recovery_session_from_state();
-            if let Err(err) = app.initialize_runtime_storage_state() {
-                eprintln!("Error: failed to initialize storage state: {err}");
-                std::process::exit(1);
-            }
+            app.initialize_runtime_storage_state().map_err(|err| {
+                ValidationError::new(format!("failed to initialize storage state: {err}"))
+            })?;
             app.refresh_identity_counters();
         } else {
-            if let Err(err) = app.seed_initial_identities() {
-                eprintln!("Error: failed to seed initial identities: {err}");
-                std::process::exit(1);
-            }
-            if let Err(err) = app.initialize_runtime_storage_state() {
-                eprintln!("Error: failed to initialize storage state: {err}");
-                std::process::exit(1);
-            }
+            app.seed_initial_identities().map_err(|err| {
+                ValidationError::new(format!("failed to seed initial identities: {err}"))
+            })?;
+            app.initialize_runtime_storage_state().map_err(|err| {
+                ValidationError::new(format!("failed to initialize storage state: {err}"))
+            })?;
         }
-        app
+        Ok(app)
     }
 
     fn open_existing(data_file: PathBuf) -> Result<Self, ValidationError> {
@@ -249,7 +230,8 @@ impl DemoApp {
         }
 
         let verifier = FixtureVerifier;
-        let event_store = EventStore::open(&sqlite_file)?;
+        let master_key = resolve_encryption_key()?;
+        let event_store = EventStore::open_with_key(&sqlite_file, master_key)?;
         let mut app = Self::new_unhydrated(Some(data_file.clone()), false, verifier, event_store);
         if data_file.exists() {
             app.load_from_disk()?;
@@ -272,7 +254,7 @@ impl DemoApp {
             seed_demo,
             peer_id: generate_random_identifier("peer"),
             verifier,
-            event_store,
+            app_runtime: AppRuntime::new(event_store, LocalState::default()),
             next_root_id: 3,
             next_persona_id: 4,
             next_device_id: 3,
@@ -413,7 +395,7 @@ impl DemoApp {
         let plaintext = lines.join("\n");
         let key = resolve_encryption_key()?;
         let encrypted = encrypt_state(plaintext.as_bytes(), &key)?;
-        fs::write(data_file, encrypted)
+        atomic_write_bytes(data_file, &encrypted)
             .map_err(|err| ValidationError::new(format!("write data file: {err}")))?;
         Ok(())
     }
@@ -477,7 +459,7 @@ impl DemoApp {
                     });
                 }
                 ["manifest_key", manifest_id, content_key] => {
-                    self.event_store
+                    self.app_runtime.store
                         .upsert_local_manifest_key(manifest_id, content_key)?;
                 }
                 [
@@ -559,7 +541,7 @@ impl DemoApp {
         signer: &impl CryptoSigner,
     ) -> Result<(), ValidationError> {
         let event = EventEnvelope::from_body(event_id, body, Vec::new(), signer_binding, signer)?;
-        self.event_store.append_with_authorizer(
+        self.app_runtime.store.append_with_authorizer(
             event,
             &self.verifier,
             &IdentityAuthorizer,
@@ -589,7 +571,7 @@ impl DemoApp {
         self.revoked_personas.clear();
         self.trust_attestations.clear();
 
-        for root in self.event_store.materialized().roots_current.values() {
+        for root in self.app_runtime.store.materialized().roots_current.values() {
             self.roots.push(create_root(
                 &root.root_id,
                 &root.display_name,
@@ -597,7 +579,7 @@ impl DemoApp {
             ));
         }
 
-        for device in self.event_store.materialized().devices_current.values() {
+        for device in self.app_runtime.store.materialized().devices_current.values() {
             let membership = DeviceMembership {
                 root_id: device.root_id.clone(),
                 device_id: device.device_id.clone(),
@@ -614,7 +596,7 @@ impl DemoApp {
             }
         }
 
-        for persona in self.event_store.materialized().personas_current.values() {
+        for persona in self.app_runtime.store.materialized().personas_current.values() {
             let identity = create_persona(
                 &persona.persona_id,
                 &persona.root_id,
@@ -632,7 +614,7 @@ impl DemoApp {
         }
 
         self.trust_attestations.extend(
-            self.event_store
+            self.app_runtime.store
                 .materialized()
                 .trust_edges_current
                 .values()
@@ -683,7 +665,7 @@ impl DemoApp {
     }
 
     fn local_manifest_key(&self, manifest_id: &str) -> Result<Option<String>, ValidationError> {
-        self.event_store.local_manifest_key(manifest_id)
+        self.app_runtime.store.local_manifest_key(manifest_id)
     }
 
     fn ensure_local_manifest_key(&mut self, manifest_id: &str) -> Result<String, ValidationError> {
@@ -691,7 +673,7 @@ impl DemoApp {
             return Ok(content_key);
         }
         let content_key = generate_content_key();
-        self.event_store
+        self.app_runtime.store
             .upsert_local_manifest_key(manifest_id, &content_key)?;
         Ok(content_key)
     }
@@ -702,7 +684,7 @@ impl DemoApp {
         }
 
         let manifest = self
-            .event_store
+            .app_runtime.store
             .file_manifest(manifest_id)
             .or_else(|| {
                 (self.storage_manifest.id == manifest_id).then(|| self.storage_manifest.clone())
@@ -711,7 +693,7 @@ impl DemoApp {
 
         for access in &manifest.authorized_devices {
             if let Ok(content_key) = self
-                .event_store
+                .app_runtime.store
                 .unwrap_manifest_key_for_device(manifest_id, &access.device_id)
             {
                 return Ok(content_key);
@@ -801,7 +783,7 @@ impl DemoApp {
         manifest_id: &str,
         device_id: &str,
     ) -> Result<String, ValidationError> {
-        self.event_store
+        self.app_runtime.store
             .unwrap_manifest_key_for_device(manifest_id, device_id)
     }
 
@@ -834,7 +816,7 @@ impl DemoApp {
         loop {
             let candidate = format!("evt-{label}-{}", generate_random_identifier("id"));
             if self
-                .event_store
+                .app_runtime.store
                 .current_event_type_for(&candidate)
                 .is_none()
             {
@@ -1010,7 +992,7 @@ impl DemoApp {
     }
 
     fn reconcile_recovery_session_from_state(&mut self) {
-        let requests = &self.event_store.materialized().recovery_requests_current;
+        let requests = &self.app_runtime.store.materialized().recovery_requests_current;
         if requests.is_empty() {
             self.recovery_session = None;
             return;
@@ -1031,7 +1013,7 @@ impl DemoApp {
         };
 
         let replacement_device_id = self
-            .event_store
+            .app_runtime.store
             .materialized()
             .devices_current
             .get(&request.target_device_id)
@@ -1041,7 +1023,7 @@ impl DemoApp {
             .as_ref()
             .map(|session| session.notified_devices.clone())
             .unwrap_or_else(|| {
-                self.event_store
+                self.app_runtime.store
                     .materialized()
                     .devices_current
                     .values()
@@ -1165,9 +1147,9 @@ impl DemoApp {
                     ValidationError::new(format!("remove legacy state file: {err}"))
                 })?;
             }
-            self.event_store = EventStore::open(&sqlite_file)?;
+            self.app_runtime = AppRuntime::new(EventStore::open(&sqlite_file)?, LocalState::default());
         } else {
-            self.event_store = EventStore::default();
+            self.app_runtime = AppRuntime::new(EventStore::default(), LocalState::default());
         }
 
         self.clear_local_runtime();
@@ -1474,6 +1456,40 @@ fn sqlite_path_for_local_state(local_state_file: &Path) -> PathBuf {
         .join(format!("{stem}.sqlite"))
 }
 
+fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("local-state");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp_path = parent.join(format!(".{file_name}.{unique}.tmp"));
+
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp_path, path)?;
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+
+    result
+}
+
 fn join_or_none(values: &BTreeSet<String>) -> String {
     if values.is_empty() {
         "none".into()
@@ -1538,6 +1554,66 @@ mod tests {
             .as_nanos();
         let counter = TEMP_STATE_COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("emberlink-relay-{tag}-{timestamp}-{counter}.relay"))
+    }
+
+    #[test]
+    fn atomic_write_replaces_existing_file_without_leaving_temp_files() {
+        let data_file = temp_state_file("atomic-write");
+        let file_name = data_file
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap()
+            .to_string();
+
+        atomic_write_bytes(&data_file, b"first").unwrap();
+        atomic_write_bytes(&data_file, b"second").unwrap();
+
+        assert_eq!(fs::read(&data_file).unwrap(), b"second");
+
+        let tmp_prefix = format!(".{file_name}.");
+        let leftovers: Vec<_> = fs::read_dir(data_file.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                let name = path.file_name()?.to_str()?;
+                if name.starts_with(&tmp_prefix) && name.ends_with(".tmp") {
+                    Some(path)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+
+        let _ = fs::remove_file(&data_file);
+    }
+
+    #[test]
+    fn try_bootstrap_preserves_existing_files_on_load_error() {
+        let data_file = temp_state_file("bootstrap-preserve");
+        let sqlite_file = sqlite_path_for_local_state(&data_file);
+
+        {
+            let app = DemoApp::bootstrap(Some(data_file.clone()), true);
+            assert!(app.app_runtime.store.event_count() > 0);
+        }
+
+        let corrupted = b"not-an-encrypted-state-file".to_vec();
+        fs::write(&data_file, &corrupted).unwrap();
+        let sqlite_len_before = fs::metadata(&sqlite_file).unwrap().len();
+
+        let err = DemoApp::try_bootstrap(Some(data_file.clone()), true).unwrap_err();
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("failed to load local state"),
+            "unexpected error: {err_text}"
+        );
+        assert_eq!(fs::read(&data_file).unwrap(), corrupted);
+        assert_eq!(fs::metadata(&sqlite_file).unwrap().len(), sqlite_len_before);
+        assert!(EventStore::open(&sqlite_file).unwrap().event_count() > 0);
+
+        let _ = fs::remove_file(&data_file);
+        let _ = fs::remove_file(&sqlite_file);
     }
 
     fn spawn_test_relay(expected_connections: usize) -> Option<(String, thread::JoinHandle<()>)> {
@@ -1642,7 +1718,8 @@ mod tests {
         let scorecard = app.handle_command("trust");
 
         assert!(output.contains("attested trust\ttrust-"));
-        assert!(scorecard.contains("Attestations loaded: 3"));
+        // design: only public attestations are shown; trust-2 is recipient-bound.
+        assert!(scorecard.contains("Attestations loaded: 2"));
         assert!(scorecard.contains("Normalized score: 0.85"));
     }
 
@@ -1699,7 +1776,7 @@ mod tests {
     fn storage_gc_plan_reports_retained_and_collectable_vault_state() {
         let mut app = DemoApp::ephemeral();
         let gc_plan = app
-            .event_store
+            .app_runtime.store
             .plan_local_vault_gc(&app.seed_vault_namespace())
             .unwrap()
             .unwrap();
@@ -1757,9 +1834,9 @@ mod tests {
         app.add_root_with_id("root-a", "Primary").unwrap();
         app.add_device_with_id("device-a", "root-a", "Laptop", true)
             .unwrap();
-        app.event_store.upsert_file_manifest(&manifest).unwrap();
+        app.app_runtime.store.upsert_file_manifest(&manifest).unwrap();
         for chunk in &manifest.chunks {
-            app.event_store
+            app.app_runtime.store
                 .upsert_encrypted_block(&core_storage::EncryptedBlock {
                     chunk: chunk.clone(),
                     encrypted: core_crypto::EncryptedContent {
@@ -1769,7 +1846,7 @@ mod tests {
                 })
                 .unwrap();
         }
-        app.event_store
+        app.app_runtime.store
             .upsert_local_block(&core_state::LocalBlockRecord {
                 chunk_id: "orphan-metadata".into(),
                 ciphertext_bytes: 64,
@@ -1817,7 +1894,7 @@ mod tests {
             "vault issue --template template-professional-card --recipient svc.example",
         );
         let vault = app.handle_command("vault");
-        let artifacts = app.event_store.local_presentation_artifacts().unwrap();
+        let artifacts = app.app_runtime.store.local_presentation_artifacts().unwrap();
 
         assert!(output.contains("issued artifact\tartifact-"));
         assert_eq!(artifacts.len(), 1);
@@ -1845,7 +1922,7 @@ mod tests {
         let mut app = DemoApp::ephemeral();
 
         let output = app.handle_command(
-            "vault write-record --namespace persona:persona-professional --object vault-object-custom-profile --schema com.example.profile/custom --app com.example.profile --json {\"display_name\":\"operator\",\"skills\":[\"rust\"]}",
+            "vault write-record --namespace persona:persona-professional --object vault-object-custom-profile --schema com.example.profile/custom --app com.example.profile --json {\"display_name\":\"alice\",\"skills\":[\"rust\"]}",
         );
         let vault = app.handle_command("vault");
 
@@ -1899,7 +1976,7 @@ mod tests {
         let mut app = DemoApp::ephemeral();
 
         let write = app.handle_command(
-            "vault write-record --namespace persona:persona-professional --object vault-object-custom-card --schema com.example.profile/custom-card --app com.example.profile --json {\"display_name\":\"operator\",\"skills\":[\"rust\",\"p2p\"],\"private\":{\"note\":\"hidden\"}}",
+            "vault write-record --namespace persona:persona-professional --object vault-object-custom-card --schema com.example.profile/custom-card --app com.example.profile --json {\"display_name\":\"alice\",\"skills\":[\"rust\",\"p2p\"],\"private\":{\"note\":\"hidden\"}}",
         );
         let add_template = app.handle_command(
             "vault template add --id template-custom-card --object vault-object-custom-card --schema com.example.profile/custom-card --audience service --namespace persona:persona-professional --field display_name --field skills",
@@ -2810,13 +2887,13 @@ mod tests {
     #[test]
     fn create_persona_command_resolves_root_by_display_name() {
         let mut app = DemoApp::ephemeral();
-        app.handle_command("root create --name operator");
+        app.handle_command("root create --name alice");
 
         let output = app
-            .handle_command("persona create --root operator --label operator@work --template professional");
+            .handle_command("persona create --root alice --label alice@work --template professional");
 
         assert!(output.contains("created persona"));
-        assert!(app.render_personas().contains("operator@work"));
+        assert!(app.render_personas().contains("alice@work"));
     }
 
     #[test]
@@ -3047,7 +3124,7 @@ mod tests {
             let raw_str = String::from_utf8_lossy(&raw);
             assert!(!raw_str.contains("device-encryption"));
             assert!(
-                app.event_store
+                app.app_runtime.store
                     .local_device_encryption_key_pair("device-a")
                     .unwrap()
                     .is_some()
@@ -3056,7 +3133,7 @@ mod tests {
 
         let reopened = DemoApp::open_existing(data_file.clone()).unwrap();
         let key_pair = reopened
-            .event_store
+            .app_runtime.store
             .local_device_encryption_key_pair("device-a")
             .unwrap()
             .unwrap();
@@ -3207,13 +3284,13 @@ mod tests {
 
         // Verify the new device can unwrap the manifest key
         // Get the manifest id from the vault
-        let namespaces = app.event_store.local_vault_namespaces().unwrap();
+        let namespaces = app.app_runtime.store.local_vault_namespaces().unwrap();
         let persona_ns = namespaces
             .iter()
             .find(|ns| ns.owner_id == "persona-professional")
             .expect("expected persona namespace");
         let manifests = app
-            .event_store
+            .app_runtime.store
             .local_vault_manifests_with_keys(persona_ns)
             .unwrap();
         assert!(!manifests.is_empty(), "expected at least one manifest");
@@ -3232,7 +3309,7 @@ mod tests {
 
         // Verify the new device can actually unwrap the key via the wrapped access entry
         let enc_key_pair = app
-            .event_store
+            .app_runtime.store
             .local_device_encryption_key_pair(&device_id)
             .unwrap()
             .expect("missing local encryption key pair");
@@ -3379,7 +3456,7 @@ mod tests {
             "vault-manifest-professional-v2",
         ] {
             let manifest = app
-                .event_store
+                .app_runtime.store
                 .local_file_manifest(manifest_id)
                 .unwrap()
                 .unwrap();
@@ -4711,8 +4788,8 @@ mod tests {
 
         assert!(target.render_roots().contains("Export Test Root"));
         assert_eq!(
-            source.event_store.event_count(),
-            target.event_store.event_count()
+            source.app_runtime.store.event_count(),
+            target.app_runtime.store.event_count()
         );
 
         let _ = fs::remove_file(&export_file);
@@ -4724,7 +4801,7 @@ mod tests {
     fn import_events_skips_duplicates() {
         let export_file = temp_state_file("event-export-dedup");
         let mut app = DemoApp::ephemeral();
-        let count_before = app.event_store.event_count();
+        let count_before = app.app_runtime.store.event_count();
 
         let exported =
             app.handle_command(&format!("export-events --out {}", export_file.display()));
@@ -4733,7 +4810,7 @@ mod tests {
         let imported =
             app.handle_command(&format!("import-events --file {}", export_file.display()));
         assert!(imported.contains("imported 0 events"));
-        assert_eq!(app.event_store.event_count(), count_before);
+        assert_eq!(app.app_runtime.store.event_count(), count_before);
 
         let _ = fs::remove_file(&export_file);
     }
@@ -4746,7 +4823,9 @@ mod tests {
             .join("../../target/debug/emberlink-relay");
         if !relay_binary.exists() {
             // Skip if relay binary not built
-            eprintln!("skipping e2e test: relay binary not built (run cargo build -p emberlink-relay)");
+            eprintln!(
+                "skipping e2e test: relay binary not built (run cargo build -p emberlink-relay)"
+            );
             return;
         }
 
@@ -4939,11 +5018,11 @@ mod tests {
 
         // Event stores should have the same events
         assert_eq!(
-            app_a.event_store.event_count(),
-            app_b.event_store.event_count(),
+            app_a.app_runtime.store.event_count(),
+            app_b.app_runtime.store.event_count(),
             "event counts diverged: A={} B={}",
-            app_a.event_store.event_count(),
-            app_b.event_store.event_count(),
+            app_a.app_runtime.store.event_count(),
+            app_b.app_runtime.store.event_count(),
         );
 
         // Compare should show full convergence
@@ -5350,7 +5429,7 @@ mod tests {
             owner_id: persona_id.clone(),
         };
         let manifests = app
-            .event_store
+            .app_runtime.store
             .local_vault_manifests_with_keys(&namespace)
             .unwrap();
         assert!(!manifests.is_empty(), "expected vault manifests");
@@ -5378,7 +5457,7 @@ mod tests {
 
             // Verify device B can actually unwrap the content key
             let enc_key_pair = app
-                .event_store
+                .app_runtime.store
                 .local_device_encryption_key_pair(&device_b_id)
                 .unwrap()
                 .expect("missing device B encryption key");
@@ -5545,7 +5624,7 @@ mod tests {
         let mut alice = DemoApp::bootstrap(Some(file_a.clone()), true);
 
         let alice_persona = alice
-            .event_store
+            .app_runtime.store
             .materialized()
             .personas_current
             .keys()
@@ -5582,17 +5661,17 @@ mod tests {
 
         // Bob should now have his own identity
         assert!(
-            !bob.event_store.materialized().roots_current.is_empty(),
+            !bob.app_runtime.store.materialized().roots_current.is_empty(),
             "Bob should have a root after invite accept"
         );
         assert!(
-            !bob.event_store.materialized().personas_current.is_empty(),
+            !bob.app_runtime.store.materialized().personas_current.is_empty(),
             "Bob should have a persona after invite accept"
         );
 
         // Bob should also have Alice's persona in his store
         assert!(
-            bob.event_store
+            bob.app_runtime.store
                 .materialized()
                 .persona(&alice_persona)
                 .is_some(),
@@ -5857,16 +5936,16 @@ mod tests {
         let mut app = DemoApp::ephemeral();
 
         let bind = app.handle_command(
-            "service bind --persona persona-professional --kind oauth2 --label GitHub --account operator --endpoint https://github.com",
+            "service bind --persona persona-professional --kind oauth2 --label GitHub --account alice --endpoint https://github.com",
         );
         assert!(bind.contains("bound service\t"), "bind: {bind}");
         assert!(bind.contains("oauth2"));
-        assert!(bind.contains("operator"));
+        assert!(bind.contains("alice"));
 
         let list = app.handle_command("service list");
         assert!(list.contains("oauth2"));
         assert!(list.contains("GitHub"));
-        assert!(list.contains("operator"));
+        assert!(list.contains("alice"));
 
         let list_persona = app.handle_command("service list --persona persona-professional");
         assert!(list_persona.contains("oauth2"));
@@ -5890,7 +5969,7 @@ mod tests {
         let csv_file = std::env::temp_dir().join("emberlink-test-bitwarden.csv");
         fs::write(
             &csv_file,
-            "folder,favorite,type,name,notes,fields,reprompt,login_uri,login_username,login_password,login_totp\nPersonal,0,login,GitHub,work account,,,https://github.com,operator,secret123,\nPersonal,0,login,GitLab,,,,https://gitlab.com,operator,pass456,\n",
+            "folder,favorite,type,name,notes,fields,reprompt,login_uri,login_username,login_password,login_totp\nPersonal,0,login,GitHub,work account,,,https://github.com,alice,secret123,\nPersonal,0,login,GitLab,,,,https://gitlab.com,alice,pass456,\n",
         )
         .unwrap();
 

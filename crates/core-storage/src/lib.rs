@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use core_crypto::{
-    EncryptedContent, FixtureVerifier, PublicKey, Signature, Signer as CryptoSigner, Verifier,
+    Ed25519Verifier, EncryptedContent, PublicKey, Signature, Signer as CryptoSigner, Verifier,
     decrypt_content, encrypt_content, sha256_digest_hex, unwrap_secret_with_identity,
     wrap_secret_to_recipient,
 };
@@ -32,16 +32,32 @@ pub struct PresentationArtifactEnvelope {
 }
 
 impl PresentationArtifactEnvelope {
+    /// Canonical signing payload using length-prefixed binary encoding.
+    ///
+    /// Each field is encoded as:
+    ///   [4-byte big-endian key length][key bytes][4-byte big-endian value length][value bytes]
+    ///
+    /// This prevents injection attacks where a field value containing the field
+    /// separator could shift the parsing boundary and forge a different payload.
     pub fn signing_payload(&self) -> Vec<u8> {
-        format!(
-            "type=presentation-artifact-envelope\nartifact_payload_hex={}\npayload_hex={}\nissuer_persona_id={}\nissuer_key_id={}\nissuer_public_key={}\n",
-            bytes_to_hex(&self.artifact.canonical_encode()),
-            bytes_to_hex(&self.payload_bytes),
-            self.issuer_persona_id,
-            self.issuer_key_id,
-            self.issuer_public_key,
-        )
-        .into_bytes()
+        let artifact_hex = bytes_to_hex(&self.artifact.canonical_encode());
+        let payload_hex = bytes_to_hex(&self.payload_bytes);
+        let fields: &[(&[u8], &[u8])] = &[
+            (b"type", b"presentation-artifact-envelope"),
+            (b"artifact_payload_hex", artifact_hex.as_bytes()),
+            (b"payload_hex", payload_hex.as_bytes()),
+            (b"issuer_persona_id", self.issuer_persona_id.as_bytes()),
+            (b"issuer_key_id", self.issuer_key_id.as_bytes()),
+            (b"issuer_public_key", self.issuer_public_key.as_bytes()),
+        ];
+        let mut buf = Vec::with_capacity(256);
+        for (key, val) in fields {
+            buf.extend_from_slice(&(key.len() as u32).to_be_bytes());
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(&(val.len() as u32).to_be_bytes());
+            buf.extend_from_slice(val);
+        }
+        buf
     }
 }
 
@@ -70,7 +86,7 @@ pub fn verify_presentation_artifact_envelope(
     envelope: &PresentationArtifactEnvelope,
 ) -> Result<(), ValidationError> {
     validate_presentation_artifact_envelope(envelope, true)?;
-    let verifier = FixtureVerifier;
+    let verifier = Ed25519Verifier;
     let signature = Signature(envelope.issuer_signature_hex.clone());
     let public_key = PublicKey(envelope.issuer_public_key.clone());
     if !verifier.verify(&public_key, &envelope.signing_payload(), &signature) {

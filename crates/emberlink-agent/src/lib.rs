@@ -1,0 +1,11 @@
+//! Emberlink Agent Protocol.
+//!
+//! JSON-over-stdio protocol for AI agent integration. Agents connect via
+//! stdin/stdout and can list grants, request access, use credentials, and
+//! check status — all through the Emberlink trust model.
+//!
+//! Protocol: one JSON object per line on stdin, one JSON response per line
+//! on stdout. Compatible with MCP, LangChain, and any tool-use framework.
+
+pub mod protocol;
+pub mod runtime;

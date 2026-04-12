@@ -7,6 +7,9 @@ license.workspace = true
 [dependencies]
 hex = "0.4"
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+ciborium = { version = "0.2", default-features = false }
+base45 = "3"
 
 [dev-dependencies]
 proptest = "1"

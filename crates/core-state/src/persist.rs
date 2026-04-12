@@ -1,14 +1,63 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use core_crypto::{EncryptedContent, LocalKeyPair, PublicKey, Signature};
+use core_crypto::{EncryptedContent, LocalKeyPair, PublicKey, Signature, decrypt_content, encrypt_content};
 use core_events::{EventEnvelope, EventRef};
 use core_storage::{EncryptedBlock, PresentationArtifactEnvelope};
 use core_types::{
     CanonicalEncode, ChunkReference, EventRefRelation, EventSubject, EventType, FileManifest,
     KeyRole, ManifestDeviceAccess, PresentationArtifact, PresentationTemplate, SchemaVersion,
     SignerBinding, SubjectKind, Validate, ValidationError, VaultNamespace, VaultOwnerKind,
+    bytes_to_hex, hex_to_bytes,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
+
+const COLUMN_ENC_TAG: &str = "ENC1:";
+
+/// Encrypt a plaintext column value using the master key.
+/// Output format: `ENC1:{nonce_hex}:{ciphertext_hex}`
+pub(crate) fn encrypt_column(
+    master_key: &str,
+    plaintext: &str,
+    aad: &[u8],
+) -> Result<String, ValidationError> {
+    let enc = encrypt_content(master_key, plaintext.as_bytes(), aad)?;
+    Ok(format!(
+        "{}{}:{}",
+        COLUMN_ENC_TAG,
+        enc.nonce_hex,
+        bytes_to_hex(&enc.ciphertext)
+    ))
+}
+
+/// Decrypt a column value encrypted with [`encrypt_column`].
+///
+/// If the stored value does not start with `ENC1:` it is returned as-is,
+/// allowing existing plaintext rows to be read without a migration step.
+pub(crate) fn decrypt_column(
+    master_key: &str,
+    stored: &str,
+    aad: &[u8],
+) -> Result<String, ValidationError> {
+    let Some(rest) = stored.strip_prefix(COLUMN_ENC_TAG) else {
+        // Plaintext fallback: row was written before encryption was enabled.
+        return Ok(stored.to_string());
+    };
+    let (nonce_hex, ciphertext_hex) = rest.split_once(':').ok_or_else(|| {
+        ValidationError::new("malformed encrypted column value: missing ':' separator".to_string())
+    })?;
+    let ciphertext = hex_to_bytes(ciphertext_hex)
+        .map_err(|e| ValidationError::new(format!("encrypted column ciphertext hex decode: {e}")))?;
+    let plaintext_bytes = decrypt_content(
+        master_key,
+        &EncryptedContent {
+            nonce_hex: nonce_hex.to_string(),
+            ciphertext,
+        },
+        aad,
+    )?;
+    String::from_utf8(plaintext_bytes)
+        .map_err(|e| ValidationError::new(format!("decrypted column is not valid UTF-8: {e}")))
+}
 
 use crate::{
     DeviceStatus, LocalBlockRecord, LocalPresentationArtifactRecord, MaterializedState,
@@ -581,7 +630,18 @@ pub(crate) fn write_local_vault_catalog_head(
     namespace: &VaultNamespace,
     manifest: &FileManifest,
     content_key: &str,
+    master_key: Option<&str>,
 ) -> Result<(), ValidationError> {
+    let stored_key = if let Some(mk) = master_key {
+        let aad = format!(
+            "vault-catalog-key:{}:{}",
+            namespace.owner_kind.as_str(),
+            &namespace.owner_id
+        );
+        encrypt_column(mk, content_key, aad.as_bytes())?
+    } else {
+        content_key.to_string()
+    };
     tx.execute(
         "INSERT INTO local_vault_catalogs (
             owner_kind,
@@ -600,7 +660,7 @@ pub(crate) fn write_local_vault_catalog_head(
             &namespace.owner_id,
             &manifest.id,
             manifest.canonical_encode(),
-            content_key
+            stored_key
         ],
     )
     .map_err(|err| ValidationError::new(format!("write local vault catalog head: {err}")))?;
@@ -659,8 +719,9 @@ pub(crate) fn validate_encrypted_manifest_blocks(
 pub(crate) fn load_local_vault_catalog_head(
     conn: &Connection,
     namespace: &VaultNamespace,
+    master_key: Option<&str>,
 ) -> Result<Option<(FileManifest, String)>, ValidationError> {
-    conn.query_row(
+    let row = conn.query_row(
         "SELECT manifest_payload, content_key
          FROM local_vault_catalogs
          WHERE owner_kind = ?1 AND owner_id = ?2",
@@ -672,14 +733,25 @@ pub(crate) fn load_local_vault_catalog_head(
         },
     )
     .optional()
-    .map_err(|err| ValidationError::new(format!("load local vault catalog head: {err}")))?
-    .map(|(manifest_payload, content_key)| {
-        Ok((
-            FileManifest::decode_canonical(&manifest_payload)?,
-            content_key,
-        ))
-    })
-    .transpose()
+    .map_err(|err| ValidationError::new(format!("load local vault catalog head: {err}")))?;
+
+    let Some((manifest_payload, stored_key)) = row else {
+        return Ok(None);
+    };
+
+    let content_key = if let Some(mk) = master_key {
+        let aad = format!(
+            "vault-catalog-key:{}:{}",
+            namespace.owner_kind.as_str(),
+            &namespace.owner_id
+        );
+        decrypt_column(mk, &stored_key, aad.as_bytes())?
+    } else {
+        stored_key
+    };
+
+    let manifest = FileManifest::decode_canonical(&manifest_payload)?;
+    Ok(Some((manifest, content_key)))
 }
 
 pub(crate) fn load_local_vault_catalog_manifest_ids(
@@ -839,13 +911,19 @@ pub(crate) fn write_local_manifest_key(
     tx: &Transaction<'_>,
     manifest_id: &str,
     content_key: &str,
+    master_key: Option<&str>,
 ) -> Result<(), ValidationError> {
+    let stored_key = if let Some(mk) = master_key {
+        encrypt_column(mk, content_key, format!("manifest-key:{manifest_id}").as_bytes())?
+    } else {
+        content_key.to_string()
+    };
     tx.execute(
         "INSERT INTO local_manifest_keys (manifest_id, content_key)
          VALUES (?1, ?2)
          ON CONFLICT(manifest_id) DO UPDATE SET
             content_key = excluded.content_key",
-        params![manifest_id, content_key],
+        params![manifest_id, stored_key],
     )
     .map_err(|err| ValidationError::new(format!("write local manifest key: {err}")))?;
     Ok(())
@@ -855,7 +933,13 @@ pub(crate) fn write_local_device_encryption_key(
     tx: &Transaction<'_>,
     device_id: &str,
     key_pair: &LocalKeyPair,
+    master_key: Option<&str>,
 ) -> Result<(), ValidationError> {
+    let stored_private_key = if let Some(mk) = master_key {
+        encrypt_column(mk, &key_pair.private_key, format!("device-enc-key:{device_id}").as_bytes())?
+    } else {
+        key_pair.private_key.clone()
+    };
     tx.execute(
         "INSERT INTO local_device_encryption_keys (
             device_id,
@@ -875,7 +959,7 @@ pub(crate) fn write_local_device_encryption_key(
             &key_pair.key_id,
             key_pair.algorithm.as_str(),
             &key_pair.public_key,
-            &key_pair.private_key
+            stored_private_key
         ],
     )
     .map_err(|err| ValidationError::new(format!("write local device encryption key: {err}")))?;
@@ -885,8 +969,9 @@ pub(crate) fn write_local_device_encryption_key(
 pub(crate) fn load_local_device_encryption_key(
     conn: &Connection,
     device_id: &str,
+    master_key: Option<&str>,
 ) -> Result<Option<LocalKeyPair>, ValidationError> {
-    conn.query_row(
+    let row = conn.query_row(
         "SELECT key_id, algorithm, public_key, private_key
          FROM local_device_encryption_keys
          WHERE device_id = ?1",
@@ -912,7 +997,19 @@ pub(crate) fn load_local_device_encryption_key(
         },
     )
     .optional()
-    .map_err(|err| ValidationError::new(format!("load local device encryption key: {err}")))
+    .map_err(|err| ValidationError::new(format!("load local device encryption key: {err}")))?;
+
+    match (row, master_key) {
+        (Some(mut kp), Some(mk)) => {
+            kp.private_key = decrypt_column(
+                mk,
+                &kp.private_key,
+                format!("device-enc-key:{device_id}").as_bytes(),
+            )?;
+            Ok(Some(kp))
+        }
+        (row, _) => Ok(row),
+    }
 }
 
 pub(crate) fn delete_local_manifest_key(
@@ -930,8 +1027,9 @@ pub(crate) fn delete_local_manifest_key(
 pub(crate) fn load_local_manifest_key(
     conn: &Connection,
     manifest_id: &str,
+    master_key: Option<&str>,
 ) -> Result<Option<String>, ValidationError> {
-    conn.query_row(
+    let stored = conn.query_row(
         "SELECT content_key
          FROM local_manifest_keys
          WHERE manifest_id = ?1",
@@ -939,7 +1037,16 @@ pub(crate) fn load_local_manifest_key(
         |row| row.get::<_, String>(0),
     )
     .optional()
-    .map_err(|err| ValidationError::new(format!("load local manifest key: {err}")))
+    .map_err(|err| ValidationError::new(format!("load local manifest key: {err}")))?;
+
+    match (stored, master_key) {
+        (Some(s), Some(mk)) => Ok(Some(decrypt_column(
+            mk,
+            &s,
+            format!("manifest-key:{manifest_id}").as_bytes(),
+        )?)),
+        (stored, _) => Ok(stored),
+    }
 }
 
 pub(crate) fn write_local_presentation_artifact(
@@ -1787,6 +1894,97 @@ pub(crate) fn write_materialized_tables(
         materialized.endpoints_current.keys(),
     )?;
 
+    // --- Upsert grant offers ---
+    for offer in materialized.grant_offers_current.values() {
+        let status_str = match offer.status {
+            core_eventlog::GrantOfferStatus::Pending => "pending",
+            core_eventlog::GrantOfferStatus::Claimed => "claimed",
+            core_eventlog::GrantOfferStatus::Revoked => "revoked",
+        };
+        let conditions_json = if offer.conditions_json.is_empty() {
+            "[]".to_string()
+        } else {
+            offer.conditions_json.clone()
+        };
+        tx.execute(
+            "INSERT INTO grant_offers (
+                offer_id, issuer_persona_id, ephemeral_public_key_hex, sealed_payload_hex,
+                relay_hint, expires_at, conditions_json, status, recipient_persona_id, claim_response_hex, claimed_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            ON CONFLICT(offer_id) DO UPDATE SET
+                status = excluded.status,
+                recipient_persona_id = excluded.recipient_persona_id,
+                claim_response_hex = excluded.claim_response_hex,
+                claimed_at = excluded.claimed_at",
+            params![
+                &offer.offer_id,
+                &offer.issuer_persona_id,
+                &offer.ephemeral_public_key_hex,
+                &offer.sealed_payload_hex,
+                &offer.relay_hint,
+                offer.expires_at as i64,
+                &conditions_json,
+                status_str,
+                &offer.recipient_persona_id,
+                &offer.claim_response_hex,
+                offer.claimed_at.map(|v| v as i64),
+            ],
+        )
+        .map_err(|err| ValidationError::io_error(format!("upsert grant_offers: {err}")))?;
+    }
+    // Note: grant offers are append-only (no pruning) — they stay for audit purposes.
+
+    // --- Upsert badges ---
+    for badge in materialized.badges_current.values() {
+        let status_str = if badge.revoked { "revoked" } else { "active" };
+        let (ev_type, ev_payload) = match &badge.evidence {
+            Some(e) => (Some(e.evidence_type.as_str()), Some(e.payload_hex.as_str())),
+            None => (None, None),
+        };
+        tx.execute(
+            "INSERT INTO badges (
+                badge_id, issuer_persona_id, recipient_persona_id, badge_type, display_name,
+                evidence_type, evidence_payload_hex, issued_at, expires_at, status, revoked_reason
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            ON CONFLICT(badge_id) DO UPDATE SET
+                status = excluded.status,
+                revoked_reason = excluded.revoked_reason",
+            params![
+                &badge.badge_id,
+                &badge.issuer_persona_id,
+                &badge.recipient_persona_id,
+                &badge.badge_type,
+                &badge.display_name,
+                ev_type,
+                ev_payload,
+                badge.issued_at as i64,
+                badge.expires_at.map(|v| v as i64),
+                status_str,
+                &badge.revoked_reason,
+            ],
+        )
+        .map_err(|err| ValidationError::io_error(format!("upsert badges: {err}")))?;
+    }
+    // Note: badges are append-only (no pruning) — they stay for audit purposes.
+
+    // --- Upsert badge disputes ---
+    for dispute in materialized.badge_disputes_current.values() {
+        tx.execute(
+            "INSERT INTO badge_disputes (
+                dispute_id, target_badge_id, disputer_persona_id, reason, evidence
+            ) VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(dispute_id) DO NOTHING",
+            params![
+                &dispute.dispute_id,
+                &dispute.target_badge_id,
+                &dispute.disputer_persona_id,
+                &dispute.reason,
+                &dispute.evidence,
+            ],
+        )
+        .map_err(|err| ValidationError::io_error(format!("upsert badge_disputes: {err}")))?;
+    }
+
     Ok(())
 }
 
@@ -2487,4 +2685,503 @@ pub(crate) fn delete_access_grant(
         )
         .map_err(|err| ValidationError::new(format!("delete access grant: {err}")))?;
     Ok(count > 0)
+}
+
+// ---------------------------------------------------------------------------
+// Grant offers (design)
+// ---------------------------------------------------------------------------
+
+pub(crate) fn load_grant_offer(
+    conn: &Connection,
+    offer_id: &str,
+) -> Result<Option<core_eventlog::GrantOfferRecord>, ValidationError> {
+    conn.query_row(
+        "SELECT offer_id, issuer_persona_id, ephemeral_public_key_hex, sealed_payload_hex,
+                relay_hint, expires_at, status, recipient_persona_id, claim_response_hex, claimed_at,
+                conditions_json
+         FROM grant_offers WHERE offer_id = ?1",
+        params![offer_id],
+        |row| {
+            let status_str: String = row.get(6)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)? as u64,
+                status_str,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<i64>>(9)?.map(|v| v as u64),
+                row.get::<_, String>(10).unwrap_or_else(|_| "[]".to_string()),
+            ))
+        },
+    )
+    .optional()
+    .map_err(|err| ValidationError::new(format!("load grant offer: {err}")))?
+    .map(|(offer_id, issuer_persona_id, ek_hex, payload_hex, relay_hint, expires_at, status_str, recipient, claim_response, claimed_at, cond_json)| {
+        let status = match status_str.as_str() {
+            "claimed" => core_eventlog::GrantOfferStatus::Claimed,
+            "revoked" => core_eventlog::GrantOfferStatus::Revoked,
+            _ => core_eventlog::GrantOfferStatus::Pending,
+        };
+        Ok(core_eventlog::GrantOfferRecord {
+            offer_id,
+            issuer_persona_id,
+            ephemeral_public_key_hex: ek_hex,
+            sealed_payload_hex: payload_hex,
+            relay_hint,
+            expires_at,
+            conditions_json: cond_json,
+            status,
+            recipient_persona_id: recipient,
+            claim_response_hex: claim_response,
+            claimed_at,
+        })
+    })
+    .transpose()
+}
+
+pub(crate) fn load_grant_offers_by_persona(
+    conn: &Connection,
+    persona_id: &str,
+) -> Result<Vec<core_eventlog::GrantOfferRecord>, ValidationError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT offer_id, issuer_persona_id, ephemeral_public_key_hex, sealed_payload_hex,
+                    relay_hint, expires_at, status, recipient_persona_id, claim_response_hex, claimed_at,
+                    conditions_json
+             FROM grant_offers WHERE issuer_persona_id = ?1 ORDER BY expires_at DESC",
+        )
+        .map_err(|err| ValidationError::new(format!("prepare grant offer query: {err}")))?;
+    let rows = stmt
+        .query_map(params![persona_id], |row| {
+            let status_str: String = row.get(6)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)? as u64,
+                status_str,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<i64>>(9)?.map(|v| v as u64),
+                row.get::<_, String>(10).unwrap_or_else(|_| "[]".to_string()),
+            ))
+        })
+        .map_err(|err| ValidationError::new(format!("query grant offers: {err}")))?;
+    let mut result = Vec::new();
+    for row in rows {
+        let (offer_id, issuer_persona_id, ek_hex, payload_hex, relay_hint, expires_at, status_str, recipient, claim_response, claimed_at, cond_json) =
+            row.map_err(|err| ValidationError::new(format!("read grant offer row: {err}")))?;
+        let status = match status_str.as_str() {
+            "claimed" => core_eventlog::GrantOfferStatus::Claimed,
+            "revoked" => core_eventlog::GrantOfferStatus::Revoked,
+            _ => core_eventlog::GrantOfferStatus::Pending,
+        };
+        result.push(core_eventlog::GrantOfferRecord {
+            offer_id,
+            issuer_persona_id,
+            ephemeral_public_key_hex: ek_hex,
+            sealed_payload_hex: payload_hex,
+            relay_hint,
+            expires_at,
+            conditions_json: cond_json,
+            status,
+            recipient_persona_id: recipient,
+            claim_response_hex: claim_response,
+            claimed_at,
+        });
+    }
+    Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// Badge persistence
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+pub(crate) fn write_badge(
+    conn: &Connection,
+    badge: &core_eventlog::BadgeRecord,
+) -> Result<(), ValidationError> {
+    let status_str = if badge.revoked { "revoked" } else { "active" };
+    let (ev_type, ev_payload) = match &badge.evidence {
+        Some(e) => (Some(e.evidence_type.as_str()), Some(e.payload_hex.as_str())),
+        None => (None, None),
+    };
+    conn.execute(
+        "INSERT INTO badges (
+            badge_id, issuer_persona_id, recipient_persona_id, badge_type, display_name,
+            evidence_type, evidence_payload_hex, issued_at, expires_at, status, revoked_reason
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        ON CONFLICT(badge_id) DO UPDATE SET
+            status = excluded.status,
+            revoked_reason = excluded.revoked_reason",
+        params![
+            &badge.badge_id,
+            &badge.issuer_persona_id,
+            &badge.recipient_persona_id,
+            &badge.badge_type,
+            &badge.display_name,
+            ev_type,
+            ev_payload,
+            badge.issued_at as i64,
+            badge.expires_at.map(|v| v as i64),
+            status_str,
+            &badge.revoked_reason,
+        ],
+    )
+    .map_err(|err| ValidationError::io_error(format!("write badge: {err}")))?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) fn load_badges(
+    conn: &Connection,
+    persona_id: &str,
+) -> Result<Vec<core_eventlog::BadgeRecord>, ValidationError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT badge_id, issuer_persona_id, recipient_persona_id, badge_type, display_name,
+                    evidence_type, evidence_payload_hex, issued_at, expires_at, status, revoked_reason
+             FROM badges WHERE issuer_persona_id = ?1 OR recipient_persona_id = ?1
+             ORDER BY issued_at DESC",
+        )
+        .map_err(|err| ValidationError::new(format!("prepare badge query: {err}")))?;
+    let rows = stmt
+        .query_map(params![persona_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, i64>(7)? as u64,
+                row.get::<_, Option<i64>>(8)?.map(|v| v as u64),
+                row.get::<_, String>(9)?,
+                row.get::<_, Option<String>>(10)?,
+            ))
+        })
+        .map_err(|err| ValidationError::new(format!("query badges: {err}")))?;
+    let mut result = Vec::new();
+    for row in rows {
+        let (badge_id, issuer, recipient, btype, dname, ev_type, ev_payload, issued_at, expires_at, status_str, revoked_reason) =
+            row.map_err(|err| ValidationError::new(format!("read badge row: {err}")))?;
+        let evidence = match (ev_type, ev_payload) {
+            (Some(et), Some(ph)) if !et.is_empty() => Some(core_types::BadgeEvidence {
+                evidence_type: et,
+                payload_hex: ph,
+            }),
+            _ => None,
+        };
+        result.push(core_eventlog::BadgeRecord {
+            badge_id,
+            issuer_persona_id: issuer,
+            recipient_persona_id: recipient,
+            badge_type: btype,
+            display_name: dname,
+            evidence,
+            issued_at,
+            expires_at,
+            revoked: status_str == "revoked",
+            revoked_reason,
+        });
+    }
+    Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// Badge visibility persistence (local-only, design)
+// ---------------------------------------------------------------------------
+
+/// Set badge visibility for a persona. `visible=true` means the badge appears
+/// in the persona's public gallery. This is local-only data — it never leaves
+/// the device or appears in the event log.
+pub(crate) fn set_badge_visibility(
+    conn: &Connection,
+    badge_id: &str,
+    persona_id: &str,
+    visible: bool,
+) -> Result<(), ValidationError> {
+    conn.execute(
+        "INSERT INTO badge_visibility (badge_id, persona_id, visible)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(badge_id, persona_id) DO UPDATE SET visible = excluded.visible",
+        params![badge_id, persona_id, visible as i64],
+    )
+    .map_err(|err| ValidationError::io_error(format!("set badge visibility: {err}")))?;
+    Ok(())
+}
+
+/// Load the badge gallery for a persona: all active, non-expired recipient badges
+/// that the persona has explicitly marked visible. Filtered at the SQL level.
+pub(crate) fn load_badge_gallery(
+    conn: &Connection,
+    persona_id: &str,
+    now_secs: u64,
+) -> Result<Vec<(core_eventlog::BadgeRecord, bool)>, ValidationError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT b.badge_id, b.issuer_persona_id, b.recipient_persona_id, b.badge_type,
+                    b.display_name, b.evidence_type, b.evidence_payload_hex, b.issued_at,
+                    b.expires_at, b.status, b.revoked_reason,
+                    COALESCE(bv.visible, 0) AS visible
+             FROM badges b
+             LEFT JOIN badge_visibility bv
+                ON b.badge_id = bv.badge_id AND bv.persona_id = ?1
+             WHERE b.recipient_persona_id = ?1
+               AND b.status = 'active'
+               AND (b.expires_at IS NULL OR b.expires_at > ?2)
+             ORDER BY b.issued_at DESC",
+        )
+        .map_err(|err| ValidationError::new(format!("prepare gallery query: {err}")))?;
+    let rows = stmt
+        .query_map(params![persona_id, now_secs as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, Option<i64>>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, i64>(11)?,
+            ))
+        })
+        .map_err(|err| ValidationError::new(format!("query gallery: {err}")))?;
+    let mut result = Vec::new();
+    for row in rows {
+        let (badge_id, issuer, recipient, btype, dname, ev_type, ev_payload, issued_at, expires_at, status_str, revoked_reason, visible_int) =
+            row.map_err(|err| ValidationError::new(format!("read gallery row: {err}")))?;
+        let evidence = match (ev_type, ev_payload) {
+            (Some(et), Some(ph)) if !et.is_empty() => Some(core_types::BadgeEvidence {
+                evidence_type: et,
+                payload_hex: ph,
+            }),
+            _ => None,
+        };
+        result.push((
+            core_eventlog::BadgeRecord {
+                badge_id,
+                issuer_persona_id: issuer,
+                recipient_persona_id: recipient,
+                badge_type: btype,
+                display_name: dname,
+                evidence,
+                issued_at: issued_at as u64,
+                expires_at: expires_at.map(|v| v as u64),
+                revoked: status_str == "revoked",
+                revoked_reason,
+            },
+            visible_int != 0,
+        ));
+    }
+    Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// Badge dispute persistence (design counter-attestation)
+// ---------------------------------------------------------------------------
+
+/// Write a badge dispute record to the database.
+#[allow(dead_code)]
+pub(crate) fn write_badge_dispute(
+    conn: &Connection,
+    dispute: &core_eventlog::BadgeDisputeRecord,
+) -> Result<(), ValidationError> {
+    conn.execute(
+        "INSERT INTO badge_disputes (
+            dispute_id, target_badge_id, disputer_persona_id, reason, evidence
+        ) VALUES (?1, ?2, ?3, ?4, ?5)
+        ON CONFLICT(dispute_id) DO NOTHING",
+        params![
+            &dispute.dispute_id,
+            &dispute.target_badge_id,
+            &dispute.disputer_persona_id,
+            &dispute.reason,
+            &dispute.evidence,
+        ],
+    )
+    .map_err(|err| ValidationError::io_error(format!("write badge dispute: {err}")))?;
+    Ok(())
+}
+
+/// Load all disputes targeting a specific badge.
+#[allow(dead_code)]
+pub(crate) fn load_badge_disputes(
+    conn: &Connection,
+    target_badge_id: &str,
+) -> Result<Vec<core_eventlog::BadgeDisputeRecord>, ValidationError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT dispute_id, target_badge_id, disputer_persona_id, reason, evidence
+             FROM badge_disputes WHERE target_badge_id = ?1",
+        )
+        .map_err(|err| ValidationError::new(format!("prepare dispute query: {err}")))?;
+    let rows = stmt
+        .query_map(params![target_badge_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })
+        .map_err(|err| ValidationError::new(format!("query disputes: {err}")))?;
+    let mut result = Vec::new();
+    for row in rows {
+        let (dispute_id, target, disputer, reason, evidence) =
+            row.map_err(|err| ValidationError::new(format!("read dispute row: {err}")))?;
+        result.push(core_eventlog::BadgeDisputeRecord {
+            dispute_id,
+            target_badge_id: target,
+            disputer_persona_id: disputer,
+            reason,
+            evidence,
+        });
+    }
+    Ok(result)
+}
+
+/// Count disputes for a badge from identities within a given set (e.g. trust graph reachable set).
+#[allow(dead_code)]
+pub(crate) fn count_badge_disputes_from_set(
+    conn: &Connection,
+    target_badge_id: &str,
+    persona_ids: &[&str],
+) -> Result<u32, ValidationError> {
+    if persona_ids.is_empty() {
+        return Ok(0);
+    }
+    // For small sets, use IN clause. For large sets, a temp table would be better.
+    let placeholders: Vec<String> = persona_ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 2)).collect();
+    let sql = format!(
+        "SELECT COUNT(*) FROM badge_disputes WHERE target_badge_id = ?1 AND disputer_persona_id IN ({})",
+        placeholders.join(", ")
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|err| ValidationError::new(format!("prepare dispute count: {err}")))?;
+
+    let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    params_vec.push(Box::new(target_badge_id.to_string()));
+    for &pid in persona_ids {
+        params_vec.push(Box::new(pid.to_string()));
+    }
+    let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+
+    let count: u32 = stmt
+        .query_row(params_refs.as_slice(), |row| row.get(0))
+        .map_err(|err| ValidationError::new(format!("count disputes: {err}")))?;
+    Ok(count)
+}
+
+// ---------------------------------------------------------------------------
+// Credential deposit persistence
+// ---------------------------------------------------------------------------
+
+/// Row type returned by credential deposit queries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialDepositRow {
+    pub deposit_id: String,
+    pub grant_id: String,
+    pub credential_id: String,
+    pub issuer_id: String,
+    pub encrypted_blocks_json: String,
+    pub status: String,
+    pub created_at: u64,
+    pub expires_at: Option<u64>,
+    pub revoked_at: Option<u64>,
+    pub revoked_reason: Option<String>,
+}
+
+pub(crate) fn write_credential_deposit(
+    conn: &Connection,
+    deposit: &core_eventlog::CredentialDepositRecord,
+) -> Result<(), ValidationError> {
+    let status_str = match deposit.status {
+        core_eventlog::CredentialDepositStatus::Active => "active",
+        core_eventlog::CredentialDepositStatus::Revoked => "revoked",
+    };
+    conn.execute(
+        "INSERT INTO credential_deposits (
+            deposit_id, grant_id, credential_id, issuer_id,
+            encrypted_blocks_json, status, created_at, expires_at,
+            revoked_at, revoked_reason
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        ON CONFLICT(deposit_id) DO UPDATE SET
+            status = excluded.status,
+            revoked_at = excluded.revoked_at,
+            revoked_reason = excluded.revoked_reason",
+        params![
+            &deposit.deposit_id,
+            &deposit.grant_id,
+            &deposit.credential_id,
+            &deposit.issuer_id,
+            &deposit.encrypted_blocks_json,
+            status_str,
+            deposit.created_at as i64,
+            deposit.expires_at.map(|v| v as i64),
+            deposit.revoked_at.map(|v| v as i64),
+            &deposit.revoked_reason,
+        ],
+    )
+    .map_err(|err| ValidationError::new(format!("write credential deposit: {err}")))?;
+    Ok(())
+}
+
+pub(crate) fn load_credential_deposit_by_grant(
+    conn: &Connection,
+    grant_id: &str,
+) -> Result<Option<CredentialDepositRow>, ValidationError> {
+    conn.query_row(
+        "SELECT deposit_id, grant_id, credential_id, issuer_id,
+                encrypted_blocks_json, status, created_at, expires_at,
+                revoked_at, revoked_reason
+         FROM credential_deposits WHERE grant_id = ?1 AND status = 'active'
+         LIMIT 1",
+        params![grant_id],
+        |row| {
+            Ok(CredentialDepositRow {
+                deposit_id: row.get(0)?,
+                grant_id: row.get(1)?,
+                credential_id: row.get(2)?,
+                issuer_id: row.get(3)?,
+                encrypted_blocks_json: row.get(4)?,
+                status: row.get(5)?,
+                created_at: row.get::<_, i64>(6)? as u64,
+                expires_at: row.get::<_, Option<i64>>(7)?.map(|v| v as u64),
+                revoked_at: row.get::<_, Option<i64>>(8)?.map(|v| v as u64),
+                revoked_reason: row.get(9)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|err| ValidationError::new(format!("load credential deposit: {err}")))
+}
+
+pub(crate) fn revoke_credential_deposit(
+    conn: &Connection,
+    grant_id: &str,
+    reason: Option<&str>,
+    revoked_at: u64,
+) -> Result<(), ValidationError> {
+    conn.execute(
+        "UPDATE credential_deposits SET status = 'revoked', revoked_at = ?1, revoked_reason = ?2
+         WHERE grant_id = ?3 AND status = 'active'",
+        params![revoked_at as i64, reason, grant_id],
+    )
+    .map_err(|err| ValidationError::new(format!("revoke credential deposit: {err}")))?;
+    Ok(())
 }
