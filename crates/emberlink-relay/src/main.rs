@@ -6,7 +6,7 @@ use std::net::TcpListener;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use core_crypto::Ed25519Verifier;
 use core_sync::{PortableRelaySubmission, check_relay_submission_admission};
@@ -48,6 +48,12 @@ pub struct RelayConfig {
     /// Maximum offer TTL in seconds. Deposits requesting a longer TTL are
     /// capped to this value.  Default: 72 hours (259200).
     pub max_offer_ttl_secs: u64,
+    /// TCP port for the HTTP /health endpoint (None = disabled).
+    /// Default: 9101.
+    pub health_port: Option<u16>,
+    /// TCP port for the WebSocket listener (None = disabled).
+    /// Default: 9200.
+    pub ws_port: Option<u16>,
 }
 
 impl RelayConfig {
@@ -69,6 +75,8 @@ impl RelayConfig {
         let mut max_offers_per_peer: usize = 100;
         let mut max_offer_bytes_total: usize = 50 * 1024 * 1024; // 50 MB
         let mut max_offer_ttl_secs: u64 = 72 * 3600; // 72 hours
+        let mut health_port: Option<u16> = Some(9101);
+        let mut ws_port: Option<u16> = Some(9200);
 
         let mut i = 0;
         while i < args.len() {
@@ -204,6 +212,30 @@ impl RelayConfig {
                         .parse()
                         .map_err(|e| format!("invalid max-offer-ttl: {e}"))?;
                 }
+                "--health-port" => {
+                    i += 1;
+                    let port: u16 = args
+                        .get(i)
+                        .ok_or("--health-port requires a port number")?
+                        .parse()
+                        .map_err(|e| format!("invalid health-port: {e}"))?;
+                    health_port = Some(port);
+                }
+                "--no-health" => {
+                    health_port = None;
+                }
+                "--ws-port" => {
+                    i += 1;
+                    let port: u16 = args
+                        .get(i)
+                        .ok_or("--ws-port requires a port number")?
+                        .parse()
+                        .map_err(|e| format!("invalid ws-port: {e}"))?;
+                    ws_port = Some(port);
+                }
+                "--no-ws" => {
+                    ws_port = None;
+                }
                 other => return Err(format!("unknown flag: {other}")),
             }
             i += 1;
@@ -251,6 +283,8 @@ impl RelayConfig {
             max_offers_per_peer,
             max_offer_bytes_total,
             max_offer_ttl_secs,
+            health_port,
+            ws_port,
         })
     }
 }
@@ -279,6 +313,39 @@ struct StoredOffer {
     source: String,
 }
 
+/// A stored credential envelope.
+///
+/// The relay stores credentials as opaque encrypted blobs indexed by grant ID.
+/// Unlike offers, credentials are not consumed on fetch — they persist until
+/// explicitly revoked or the 30-day TTL expires.
+#[derive(Debug)]
+struct StoredCredential {
+    /// Opaque encrypted credential payload (bytes).
+    payload: Vec<u8>,
+    /// Unix timestamp when this credential was deposited.
+    deposit_time: u64,
+}
+
+/// Status of a grant request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GrantRequestStatus {
+    Pending,
+    Approved,
+    Denied,
+}
+
+/// A grant request from an agent to a human identity.
+#[derive(Debug, Clone)]
+struct GrantRequest {
+    request_id: String,
+    target_id: String,
+    requester_id: String,
+    scope: String,
+    justification: String,
+    created_at: u64,
+    status: GrantRequestStatus,
+}
+
 /// Shared relay state: queued envelopes waiting for pickup by downstream peers.
 #[derive(Debug, Default)]
 struct RelayState {
@@ -289,6 +356,12 @@ struct RelayState {
     offer_counts_by_source: HashMap<String, usize>,
     /// Running total of offer payload bytes (updated on insert/purge).
     offer_bytes_total: usize,
+    /// Credential store: grant_id → StoredCredential.
+    credential_store: HashMap<String, StoredCredential>,
+    /// Grant request store: target_id → pending requests from agents.
+    grant_requests: HashMap<String, Vec<GrantRequest>>,
+    /// Monotonically increasing counter for grant request IDs.
+    next_grant_request_id: u64,
     stats: RelayStats,
     shutdown_notice: Option<ShutdownNotice>,
 }
@@ -340,6 +413,12 @@ impl RelayState {
             false
         });
         self.offer_counts_by_source.retain(|_, c| *c > 0);
+    }
+
+    /// Remove credentials older than `ttl_secs` (default: 30 days).
+    fn purge_expired_credentials(&mut self, now: u64, ttl_secs: u64) {
+        self.credential_store
+            .retain(|_, c| now.saturating_sub(c.deposit_time) < ttl_secs);
     }
 }
 
@@ -405,9 +484,25 @@ fn main() {
         }
     };
 
+    let start_time = Instant::now();
+
     let state = Arc::new(Mutex::new(RelayState::default()));
     let config = Arc::new(config);
     let active_connections = Arc::new(AtomicUsize::new(0));
+
+    if let Some(port) = config.health_port {
+        let mode = config.mode;
+        let ws_port = config.ws_port;
+        thread::spawn(move || run_health_server(port, mode, start_time, ws_port));
+    }
+
+    if let Some(ws_port) = config.ws_port {
+        let ws_config = Arc::clone(&config);
+        let ws_state = Arc::clone(&state);
+        let ws_active = Arc::clone(&active_connections);
+        thread::spawn(move || run_ws_listener(ws_port, ws_config, ws_state, ws_active));
+        eprintln!("  ws port: {ws_port}");
+    }
 
     let listener = match TcpListener::bind(&config.bind_address) {
         Ok(l) => l,
@@ -499,42 +594,89 @@ fn handle_connection(
         }
     };
 
-    match parse_command(&payload, config.admin_token.as_deref()) {
-        Command::Stats => handle_stats(&mut stream, state),
-        Command::Shutdown => handle_shutdown(&mut stream, state),
-        Command::ShutdownNotice(notice) => handle_shutdown_notice(&mut stream, state, notice),
-        Command::Drain(peer_id) => handle_drain(&mut stream, state, &peer_id),
-        Command::Submission => handle_envelope_submission(&mut stream, &payload, config, state),
+    dispatch_command(&mut stream, &payload, config, state);
+}
+
+/// Core command dispatch: parse the payload, execute the appropriate handler,
+/// and write the response to the provided writer.  Shared by both the TCP and
+/// WebSocket code paths.
+fn dispatch_command(
+    stream: &mut impl io::Write,
+    payload: &[u8],
+    config: &RelayConfig,
+    state: &Arc<Mutex<RelayState>>,
+) {
+    match parse_command(payload, config.admin_token.as_deref()) {
+        Command::Stats => handle_stats(stream, state),
+        Command::Shutdown => handle_shutdown(stream, state),
+        Command::ShutdownNotice(notice) => handle_shutdown_notice(stream, state, notice),
+        Command::Drain(peer_id) => handle_drain(stream, state, &peer_id),
+        Command::Submission => handle_envelope_submission(stream, payload, config, state),
         Command::DepositOffer { offer_id, expires_at, payload: offer_payload } => {
             // R-H1: Gate offer commands behind relay admission policy.
             if !offer_admission_ok(config) {
-                respond(&mut stream, b"REJECTED relay admission policy requires authenticated submission");
+                respond(stream, b"REJECTED relay admission policy requires authenticated submission");
                 return;
             }
-            handle_deposit_offer(&mut stream, state, config, offer_id, expires_at, offer_payload, "anon");
+            handle_deposit_offer(stream, state, config, offer_id, expires_at, offer_payload, "anon");
         }
         Command::FetchOffer(offer_id) => {
             if !offer_admission_ok(config) {
-                respond(&mut stream, b"REJECTED relay admission policy requires authenticated submission");
+                respond(stream, b"REJECTED relay admission policy requires authenticated submission");
                 return;
             }
-            handle_fetch_offer(&mut stream, state, &offer_id);
+            handle_fetch_offer(stream, state, &offer_id);
         }
         Command::ClaimOffer(offer_id) => {
             if !offer_admission_ok(config) {
-                respond(&mut stream, b"REJECTED relay admission policy requires authenticated submission");
+                respond(stream, b"REJECTED relay admission policy requires authenticated submission");
                 return;
             }
-            handle_claim_offer(&mut stream, state, &offer_id);
+            handle_claim_offer(stream, state, &offer_id);
         }
         Command::FetchAndClaimOffer(offer_id) => {
             if !offer_admission_ok(config) {
-                respond(&mut stream, b"REJECTED relay admission policy requires authenticated submission");
+                respond(stream, b"REJECTED relay admission policy requires authenticated submission");
                 return;
             }
-            handle_fetch_and_claim_offer(&mut stream, state, &offer_id);
+            handle_fetch_and_claim_offer(stream, state, &offer_id);
         }
-        Command::AdminRequired => respond(&mut stream, b"AUTH-REQUIRED admin token required for this command"),
+        Command::DepositCredential { grant_id, payload } => {
+            if !offer_admission_ok(config) {
+                respond(stream, b"REJECTED relay admission policy requires authenticated submission");
+                return;
+            }
+            handle_deposit_credential(stream, state, grant_id, payload);
+        }
+        Command::FetchCredential(grant_id) => {
+            if !offer_admission_ok(config) {
+                respond(stream, b"REJECTED relay admission policy requires authenticated submission");
+                return;
+            }
+            handle_fetch_credential(stream, state, &grant_id);
+        }
+        Command::RequestGrant { target_id, requester_id, scope, justification } => {
+            if !offer_admission_ok(config) {
+                respond(stream, b"REJECTED relay admission policy requires authenticated submission");
+                return;
+            }
+            handle_request_grant(stream, state, target_id, requester_id, scope, justification);
+        }
+        Command::FetchGrantRequests(target_id) => {
+            if !offer_admission_ok(config) {
+                respond(stream, b"REJECTED relay admission policy requires authenticated submission");
+                return;
+            }
+            handle_fetch_grant_requests(stream, state, &target_id);
+        }
+        Command::RespondGrantRequest { request_id, approved } => {
+            if !offer_admission_ok(config) {
+                respond(stream, b"REJECTED relay admission policy requires authenticated submission");
+                return;
+            }
+            handle_respond_grant_request(stream, state, &request_id, approved);
+        }
+        Command::AdminRequired => respond(stream, b"AUTH-REQUIRED admin token required for this command"),
     }
 }
 
@@ -557,6 +699,27 @@ enum Command {
     ClaimOffer(String),
     /// Atomically fetch and claim a grant offer: FETCH_AND_CLAIM <offer-id>
     FetchAndClaimOffer(String),
+    /// Deposit an encrypted credential: DEPOSIT_CREDENTIAL <grant-id> <hex-payload>
+    DepositCredential {
+        grant_id: String,
+        payload: Vec<u8>,
+    },
+    /// Fetch a stored credential: FETCH_CREDENTIAL <grant-id>
+    FetchCredential(String),
+    /// Request a grant from a human identity: REQUEST_GRANT <target-id> <requester-id> <scope> <justification>
+    RequestGrant {
+        target_id: String,
+        requester_id: String,
+        scope: String,
+        justification: String,
+    },
+    /// Fetch pending grant requests for a target identity: FETCH_GRANT_REQUESTS <target-id>
+    FetchGrantRequests(String),
+    /// Respond to a grant request: RESPOND_GRANT_REQUEST <request-id> <approved|denied>
+    RespondGrantRequest {
+        request_id: String,
+        approved: bool,
+    },
     /// Admin command detected but token missing or wrong.
     AdminRequired,
 }
@@ -696,6 +859,39 @@ fn parse_command(payload: &[u8], admin_token: Option<&str>) -> Command {
         return Command::FetchAndClaimOffer(offer_id.to_string());
     }
 
+    // DEPOSIT_CREDENTIAL <grant-id> <hex-payload>
+    if let Some(rest) = text.strip_prefix("DEPOSIT_CREDENTIAL ") {
+        return parse_deposit_credential(rest);
+    }
+
+    // FETCH_CREDENTIAL <grant-id>
+    if let Some(rest) = text.strip_prefix("FETCH_CREDENTIAL ") {
+        let grant_id = rest.trim();
+        if grant_id.is_empty() {
+            return Command::Submission;
+        }
+        return Command::FetchCredential(grant_id.to_string());
+    }
+
+    // REQUEST_GRANT <target-id> <requester-id> <scope> <justification>
+    if let Some(rest) = text.strip_prefix("REQUEST_GRANT ") {
+        return parse_request_grant(rest);
+    }
+
+    // FETCH_GRANT_REQUESTS <target-id>
+    if let Some(rest) = text.strip_prefix("FETCH_GRANT_REQUESTS ") {
+        let target_id = rest.trim();
+        if target_id.is_empty() {
+            return Command::Submission;
+        }
+        return Command::FetchGrantRequests(target_id.to_string());
+    }
+
+    // RESPOND_GRANT_REQUEST <request-id> <approved|denied>
+    if let Some(rest) = text.strip_prefix("RESPOND_GRANT_REQUEST ") {
+        return parse_respond_grant_request(rest);
+    }
+
     Command::Submission
 }
 
@@ -757,8 +953,261 @@ fn parse_deposit_offer(remainder: &str) -> Command {
     Command::DepositOffer { offer_id, expires_at, payload }
 }
 
+/// Parse the remainder of a `DEPOSIT_CREDENTIAL` command.
+///
+/// Expected format: `<grant-id> <hex-payload>`
+fn parse_deposit_credential(remainder: &str) -> Command {
+    let mut parts = remainder.splitn(2, ' ');
+    let grant_id = match parts.next() {
+        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+        _ => return Command::Submission,
+    };
+    let hex_payload = match parts.next() {
+        Some(s) if !s.trim().is_empty() => s.trim(),
+        _ => return Command::Submission,
+    };
+    let payload = match hex::decode(hex_payload) {
+        Ok(b) => b,
+        Err(_) => return Command::Submission,
+    };
+    Command::DepositCredential { grant_id, payload }
+}
+
+/// Store an encrypted credential envelope indexed by `grant_id`.
+///
+/// Wire response:
+/// - `OK credential deposited\n` on success.
+/// - `ERR payload too large\n` if payload exceeds 1 MB.
+/// - `ERR invalid grant-id\n` if grant-id is empty or whitespace.
+fn handle_deposit_credential(
+    stream: &mut impl io::Write,
+    state: &Arc<Mutex<RelayState>>,
+    grant_id: String,
+    payload: Vec<u8>,
+) {
+    const MAX_CREDENTIAL_BYTES: usize = 1024 * 1024; // 1 MB
+
+    if grant_id.trim().is_empty() {
+        respond(stream, b"ERR invalid grant-id");
+        return;
+    }
+    if payload.len() > MAX_CREDENTIAL_BYTES {
+        respond(stream, b"ERR payload too large");
+        return;
+    }
+
+    let now = now_epoch_secs();
+    let mut s = acquire_state(state);
+
+    // Purge stale credentials (30-day TTL) before inserting.
+    const CREDENTIAL_TTL_SECS: u64 = 30 * 24 * 3600;
+    s.purge_expired_credentials(now, CREDENTIAL_TTL_SECS);
+
+    s.credential_store.insert(
+        grant_id,
+        StoredCredential {
+            payload,
+            deposit_time: now,
+        },
+    );
+
+    respond(stream, b"OK credential deposited");
+}
+
+/// Fetch a stored credential envelope by `grant_id`.
+///
+/// Wire response:
+/// - `OK <hex-payload>` on success.
+/// - `ERR not found` if no credential is stored for this grant-id.
+///
+/// Credentials are NOT deleted on fetch — they persist until TTL expiry.
+fn handle_fetch_credential(
+    stream: &mut impl io::Write,
+    state: &Arc<Mutex<RelayState>>,
+    grant_id: &str,
+) {
+    let now = now_epoch_secs();
+    let mut s = acquire_state(state);
+
+    // Purge stale credentials before lookup.
+    const CREDENTIAL_TTL_SECS: u64 = 30 * 24 * 3600;
+    s.purge_expired_credentials(now, CREDENTIAL_TTL_SECS);
+
+    match s.credential_store.get(grant_id) {
+        None => respond(stream, b"ERR not found"),
+        Some(cred) => {
+            let hex_payload = hex::encode(&cred.payload);
+            respond(stream, format!("OK {hex_payload}").as_bytes());
+        }
+    }
+}
+
+/// Parse the remainder of a `REQUEST_GRANT` command.
+///
+/// Expected format: `<target-id> <requester-id> <scope> <justification>`
+/// Justification consumes the rest of the line (may contain spaces).
+fn parse_request_grant(remainder: &str) -> Command {
+    let mut parts = remainder.splitn(4, ' ');
+    let target_id = match parts.next() {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return Command::Submission,
+    };
+    let requester_id = match parts.next() {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return Command::Submission,
+    };
+    let scope = match parts.next() {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return Command::Submission,
+    };
+    let justification = match parts.next() {
+        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+        _ => return Command::Submission,
+    };
+    Command::RequestGrant { target_id, requester_id, scope, justification }
+}
+
+/// Parse the remainder of a `RESPOND_GRANT_REQUEST` command.
+///
+/// Expected format: `<request-id> <approved|denied>`
+fn parse_respond_grant_request(remainder: &str) -> Command {
+    let mut parts = remainder.splitn(2, ' ');
+    let request_id = match parts.next() {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return Command::Submission,
+    };
+    let verdict = match parts.next() {
+        Some(s) => s.trim(),
+        None => return Command::Submission,
+    };
+    let approved = match verdict {
+        "approved" => true,
+        "denied" => false,
+        _ => return Command::Submission,
+    };
+    Command::RespondGrantRequest { request_id, approved }
+}
+
+/// Store a grant request from an agent targeting a human identity.
+///
+/// Wire response: `OK <request-id>` on success.
+fn handle_request_grant(
+    stream: &mut impl io::Write,
+    state: &Arc<Mutex<RelayState>>,
+    target_id: String,
+    requester_id: String,
+    scope: String,
+    justification: String,
+) {
+    let now = now_epoch_secs();
+    let mut s = acquire_state(state);
+
+    // Rate limit: cap at 100 pending requests per target to prevent memory exhaustion.
+    {
+        let existing = s.grant_requests.entry(target_id.clone()).or_default();
+        let pending_count = existing.iter().filter(|r| matches!(r.status, GrantRequestStatus::Pending)).count();
+        if pending_count >= 100 {
+            respond(stream, b"RATE_LIMITED");
+            return;
+        }
+    }
+
+    // Use hex-encoded random ID to prevent enumeration attacks.
+    s.next_grant_request_id += 1;
+    let n = s.next_grant_request_id;
+    let mixed = n.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let request_id = format!("gr-{:016x}", mixed);
+
+    let request = GrantRequest {
+        request_id: request_id.clone(),
+        target_id: target_id.clone(),
+        requester_id,
+        scope,
+        justification,
+        created_at: now,
+        status: GrantRequestStatus::Pending,
+    };
+
+    s.grant_requests.entry(target_id).or_default().push(request);
+
+    respond(stream, format!("OK {request_id}").as_bytes());
+}
+
+/// Fetch all pending grant requests for a target identity.
+///
+/// Wire response:
+/// - `NONE` if no requests exist for this target.
+/// - Newline-separated JSON objects for each request, followed by `END`.
+fn handle_fetch_grant_requests(
+    stream: &mut impl io::Write,
+    state: &Arc<Mutex<RelayState>>,
+    target_id: &str,
+) {
+    let s = acquire_state(state);
+
+    let requests = match s.grant_requests.get(target_id) {
+        Some(reqs) if !reqs.is_empty() => reqs,
+        _ => {
+            respond(stream, b"NONE");
+            return;
+        }
+    };
+
+    let mut lines = Vec::new();
+    for r in requests {
+        let status = match r.status {
+            GrantRequestStatus::Pending => "pending",
+            GrantRequestStatus::Approved => "approved",
+            GrantRequestStatus::Denied => "denied",
+        };
+        // Escape JSON-sensitive characters in user-provided fields.
+        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+        lines.push(format!(
+            r#"{{"request_id":"{}","target_id":"{}","requester_id":"{}","scope":"{}","justification":"{}","created_at":{},"status":"{}"}}"#,
+            esc(&r.request_id), esc(&r.target_id), esc(&r.requester_id), esc(&r.scope), esc(&r.justification), r.created_at, status
+        ));
+    }
+    lines.push("END".to_string());
+
+    respond(stream, lines.join("\n").as_bytes());
+}
+
+/// Respond to a grant request (approve or deny).
+///
+/// Wire response:
+/// - `OK` on success.
+/// - `NOT_FOUND` if no request with the given ID exists.
+fn handle_respond_grant_request(
+    stream: &mut impl io::Write,
+    state: &Arc<Mutex<RelayState>>,
+    request_id: &str,
+    approved: bool,
+) {
+    let mut s = acquire_state(state);
+
+    // Search across all target_ids for the request.
+    for requests in s.grant_requests.values_mut() {
+        if let Some(req) = requests.iter_mut().find(|r| r.request_id == request_id) {
+            // Replay guard: only pending requests can be responded to.
+            if !matches!(req.status, GrantRequestStatus::Pending) {
+                respond(stream, b"ALREADY_RESOLVED");
+                return;
+            }
+            req.status = if approved {
+                GrantRequestStatus::Approved
+            } else {
+                GrantRequestStatus::Denied
+            };
+            respond(stream, b"OK");
+            return;
+        }
+    }
+
+    respond(stream, b"NOT_FOUND");
+}
+
 fn handle_envelope_submission(
-    stream: &mut RelayStream,
+    stream: &mut impl io::Write,
     payload: &[u8],
     config: &RelayConfig,
     state: &Arc<Mutex<RelayState>>,
@@ -835,7 +1284,7 @@ fn handle_envelope_submission(
 /// - `REJECTED <reason>` if the offer already exists, quotas are exceeded,
 ///   or the relay is shutting down.
 fn handle_deposit_offer(
-    stream: &mut RelayStream,
+    stream: &mut impl io::Write,
     state: &Arc<Mutex<RelayState>>,
     config: &RelayConfig,
     offer_id: String,
@@ -926,7 +1375,7 @@ fn handle_deposit_offer(
 /// - `NOT-FOUND` if the offer is unknown or expired.
 /// - `CLAIMED` if the offer has already been consumed.
 fn handle_fetch_offer(
-    stream: &mut RelayStream,
+    stream: &mut impl io::Write,
     state: &Arc<Mutex<RelayState>>,
     offer_id: &str,
 ) {
@@ -956,7 +1405,7 @@ fn handle_fetch_offer(
 /// - `NOT-FOUND` if the offer is unknown or expired.
 /// - `CLAIMED` if the offer has already been consumed.
 fn handle_claim_offer(
-    stream: &mut RelayStream,
+    stream: &mut impl io::Write,
     state: &Arc<Mutex<RelayState>>,
     offer_id: &str,
 ) {
@@ -993,7 +1442,7 @@ fn handle_claim_offer(
 /// - `NOT-FOUND` if the offer is unknown or expired.
 /// - `CLAIMED` if the offer has already been consumed.
 fn handle_fetch_and_claim_offer(
-    stream: &mut RelayStream,
+    stream: &mut impl io::Write,
     state: &Arc<Mutex<RelayState>>,
     offer_id: &str,
 ) {
@@ -1041,7 +1490,7 @@ fn admit_submission_payload(
     }
 }
 
-fn handle_drain(stream: &mut RelayStream, state: &Arc<Mutex<RelayState>>, peer_id: &str) {
+fn handle_drain(stream: &mut impl io::Write, state: &Arc<Mutex<RelayState>>, peer_id: &str) {
     let mut s = acquire_state(state);
     let count = s.mailboxes.get(peer_id).map(Vec::len).unwrap_or(0);
     let notice = s.shutdown_notice.clone();
@@ -1073,7 +1522,7 @@ fn handle_drain(stream: &mut RelayStream, state: &Arc<Mutex<RelayState>>, peer_i
     }
 }
 
-fn handle_stats(stream: &mut RelayStream, state: &Arc<Mutex<RelayState>>) {
+fn handle_stats(stream: &mut impl io::Write, state: &Arc<Mutex<RelayState>>) {
     let s = acquire_state(state);
     let uptime = now_epoch_secs().saturating_sub(s.stats.started_at);
     let offers_stored = s.offers.len();
@@ -1094,7 +1543,7 @@ fn handle_stats(stream: &mut RelayStream, state: &Arc<Mutex<RelayState>>) {
 }
 
 fn handle_shutdown_notice(
-    stream: &mut RelayStream,
+    stream: &mut impl io::Write,
     state: &Arc<Mutex<RelayState>>,
     notice: ShutdownNotice,
 ) {
@@ -1117,7 +1566,7 @@ fn handle_shutdown_notice(
     );
 }
 
-fn handle_shutdown(stream: &mut RelayStream, state: &Arc<Mutex<RelayState>>) {
+fn handle_shutdown(stream: &mut impl io::Write, state: &Arc<Mutex<RelayState>>) {
     let mut s = acquire_state(state);
     let queued = s.queued_count();
     s.mailboxes.clear();
@@ -1136,7 +1585,7 @@ fn acquire_state(state: &Mutex<RelayState>) -> std::sync::MutexGuard<'_, RelaySt
 }
 
 /// Write a response frame to the client, logging failures for operator visibility.
-fn respond(stream: &mut RelayStream, payload: &[u8]) {
+fn respond(stream: &mut impl io::Write, payload: &[u8]) {
     if let Err(e) = write_frame(stream, payload) {
         eprintln!(
             "warning: failed to write response frame ({} bytes): {e}",
@@ -1176,6 +1625,111 @@ fn write_frame(stream: &mut impl Write, payload: &[u8]) -> io::Result<()> {
     stream.flush()
 }
 
+/// WebSocket listener that speaks the same relay protocol in a WS envelope.
+///
+/// Each incoming connection performs a WebSocket handshake, reads one Binary
+/// message (the command payload — no 4-byte length prefix, WS provides framing),
+/// dispatches the command through `dispatch_command`, and sends the response
+/// bytes as a Binary WebSocket message before closing the connection.
+fn run_ws_listener(
+    port: u16,
+    config: Arc<RelayConfig>,
+    state: Arc<Mutex<RelayState>>,
+    active_connections: Arc<AtomicUsize>,
+) {
+    let addr = format!("0.0.0.0:{port}");
+    let listener = match TcpListener::bind(&addr) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("ws listener: failed to bind {addr}: {e}");
+            return;
+        }
+    };
+    eprintln!("ws listener on {addr}");
+
+    for stream in listener.incoming() {
+        let Ok(tcp_stream) = stream else {
+            continue;
+        };
+
+        // Enforce connection limit.
+        if config.max_connections > 0 {
+            let current = active_connections.load(Ordering::Relaxed);
+            if current >= config.max_connections {
+                eprintln!(
+                    "ws: connection limit reached ({current}/{}) — dropping",
+                    config.max_connections
+                );
+                continue;
+            }
+        }
+
+        // Apply read/write timeouts before the WS handshake.
+        if config.read_timeout_secs > 0 {
+            let timeout = Duration::from_secs(config.read_timeout_secs);
+            let _ = tcp_stream
+                .set_read_timeout(Some(timeout))
+                .and(tcp_stream.set_write_timeout(Some(timeout)));
+        }
+
+        let config = Arc::clone(&config);
+        let state = Arc::clone(&state);
+        let active_connections = Arc::clone(&active_connections);
+
+        thread::spawn(move || {
+            active_connections.fetch_add(1, Ordering::Relaxed);
+            handle_ws_connection(tcp_stream, &config, &state);
+            active_connections.fetch_sub(1, Ordering::Relaxed);
+        });
+    }
+}
+
+/// Handle a single WebSocket connection: handshake, read one Binary message,
+/// dispatch, respond, close.
+fn handle_ws_connection(
+    tcp_stream: std::net::TcpStream,
+    config: &RelayConfig,
+    state: &Arc<Mutex<RelayState>>,
+) {
+    let mut ws = match tungstenite::accept(tcp_stream) {
+        Ok(ws) => ws,
+        Err(e) => {
+            eprintln!("ws handshake error: {e}");
+            return;
+        }
+    };
+
+    // Read exactly one Binary message.
+    let payload = loop {
+        match ws.read() {
+            Ok(tungstenite::Message::Binary(data)) => break data,
+            Ok(tungstenite::Message::Close(_)) | Err(_) => return,
+            // Ignore Ping/Pong/Text — keep reading until Binary or close.
+            Ok(_) => continue,
+        }
+    };
+
+    // Dispatch through the shared handler, collecting response into a buffer.
+    // The buffer receives length-prefixed frames (same wire format as TCP).
+    let mut response_buf: Vec<u8> = Vec::new();
+    dispatch_command(&mut response_buf, &payload, config, state);
+
+    // Send the complete response as a single Binary WS message.
+    if let Err(e) = ws.send(tungstenite::Message::Binary(response_buf.into())) {
+        eprintln!("ws send error: {e}");
+    }
+
+    // Graceful close.
+    let _ = ws.close(None);
+    // Drain any remaining messages to complete the closing handshake.
+    loop {
+        match ws.read() {
+            Ok(tungstenite::Message::Close(_)) | Err(_) => break,
+            _ => continue,
+        }
+    }
+}
+
 fn print_usage() {
     eprintln!(
         "\
@@ -1210,6 +1764,10 @@ CONNECTION LIMITS:
     --max-connections <n>  Max simultaneous TCP connections (default: 1000, 0 = unlimited)
     --read-timeout <secs>  Read/write timeout per connection in seconds (default: 30, 0 = none)
 
+WEBSOCKET:
+    --ws-port <port>       WebSocket listener port (default: 9200)
+    --no-ws                Disable the WebSocket listener
+
 TLS OPTIONS:
     --tls-self-signed   Generate a self-signed certificate at startup (default)
     --tls-cert <path>   Path to PEM certificate file (e.g., Let's Encrypt fullchain.pem)
@@ -1242,6 +1800,69 @@ EXAMPLES:
     emberlink-relay --mode network-scoped --allow persona-alice --allow persona-bob
 "
     );
+}
+
+/// Minimal HTTP server for the /health readiness probe.
+///
+/// Listens on a plain TCP port (no TLS) and responds to `GET /health` with
+/// a 200 JSON body containing relay status, mode, and uptime in seconds.
+/// Any other request receives a 404.  The listener runs in its own OS thread
+/// and never terminates; it is intended to be spawned before the main accept
+/// loop starts.
+fn run_health_server(port: u16, mode: RelayMode, start_time: Instant, ws_port: Option<u16>) {
+    let addr = format!("0.0.0.0:{port}");
+    let listener = match TcpListener::bind(&addr) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("health server: failed to bind {addr}: {e}");
+            return;
+        }
+    };
+    eprintln!("health server listening on {addr}");
+
+    for stream in listener.incoming() {
+        let Ok(mut tcp) = stream else { continue };
+
+        // Set a tight timeout so a slow client does not hold the thread.
+        let timeout = Duration::from_secs(5);
+        let _ = tcp.set_read_timeout(Some(timeout));
+        let _ = tcp.set_write_timeout(Some(timeout));
+
+        let mut buf = [0u8; 512];
+        let n = match tcp.read(&mut buf) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        let request = std::str::from_utf8(&buf[..n]).unwrap_or("");
+
+        // Only serve GET /health; everything else is 404.
+        let is_health = request.starts_with("GET /health ")
+            || request.starts_with("GET /health\r")
+            || request == "GET /health";
+
+        if is_health {
+            let uptime = start_time.elapsed().as_secs();
+            let ws_field = match ws_port {
+                Some(p) => format!(r#","ws_port":{p}"#),
+                None => String::new(),
+            };
+            let body = format!(
+                r#"{{"status":"ok","mode":"{}","uptime_secs":{}{}}}"#,
+                mode.as_str(),
+                uptime,
+                ws_field,
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = tcp.write_all(response.as_bytes());
+        } else {
+            let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ = tcp.write_all(response.as_bytes());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1453,6 +2074,8 @@ mod tests {
             max_offers_per_peer: 100,
             max_offer_bytes_total: 50 * 1024 * 1024,
             max_offer_ttl_secs: 72 * 3600,
+            health_port: None,
+            ws_port: None,
         };
 
         let result = admit_submission_payload(&submission.encode(), &config, 150).unwrap();
@@ -1484,6 +2107,8 @@ mod tests {
             max_offers_per_peer: 100,
             max_offer_bytes_total: 50 * 1024 * 1024,
             max_offer_ttl_secs: 72 * 3600,
+            health_port: None,
+            ws_port: None,
         };
 
         let result = admit_submission_payload(&submission.encode(), &config, 0).unwrap_err();
@@ -1514,6 +2139,8 @@ mod tests {
             max_offers_per_peer: 100,
             max_offer_bytes_total: 50 * 1024 * 1024,
             max_offer_ttl_secs: 72 * 3600,
+            health_port: None,
+            ws_port: None,
         };
 
         let result = admit_submission_payload(&submission.encode(), &config, 0).unwrap_err();
@@ -1732,6 +2359,8 @@ mod tests {
             max_offers_per_peer: 100,
             max_offer_bytes_total: 50 * 1024 * 1024,
             max_offer_ttl_secs: 72 * 3600,
+            health_port: None,
+            ws_port: None,
         }
     }
 
@@ -2287,5 +2916,286 @@ mod tests {
         });
         let resp = read_response(&buf);
         assert!(resp.starts_with("OK deposited offer-reuse"), "got: {resp}");
+    }
+
+    #[test]
+    fn health_endpoint_returns_ok_json() {
+        use std::net::TcpStream;
+
+        // Bind to port 0 to get an OS-assigned free port.
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let start = Instant::now();
+        thread::spawn(move || run_health_server(port, RelayMode::Open, start, None));
+        // Give the server thread a moment to bind.
+        thread::sleep(Duration::from_millis(50));
+
+        let mut conn = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        conn.write_all(b"GET /health HTTP/1.0\r\nHost: localhost\r\n\r\n").unwrap();
+
+        let mut response = String::new();
+        conn.read_to_string(&mut response).unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "unexpected response: {response}");
+        assert!(response.contains("\"status\":\"ok\""), "missing status field: {response}");
+        assert!(response.contains("\"mode\":\"open\""), "missing mode field: {response}");
+        assert!(response.contains("\"uptime_secs\":"), "missing uptime field: {response}");
+    }
+
+    #[test]
+    fn health_endpoint_returns_404_for_unknown_path() {
+        use std::net::TcpStream;
+
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let start = Instant::now();
+        thread::spawn(move || run_health_server(port, RelayMode::Open, start, None));
+        thread::sleep(Duration::from_millis(50));
+
+        let mut conn = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        conn.write_all(b"GET /metrics HTTP/1.0\r\n\r\n").unwrap();
+
+        let mut response = String::new();
+        conn.read_to_string(&mut response).unwrap();
+
+        assert!(response.starts_with("HTTP/1.1 404"), "expected 404, got: {response}");
+    }
+
+    /// WebSocket: send a STATS command over WS Binary, receive a valid STATS response.
+    #[test]
+    fn ws_stats_command_returns_valid_response() {
+        use tungstenite::{connect, Message};
+
+        let state = Arc::new(Mutex::new(RelayState::default()));
+        let config = Arc::new(RelayConfig {
+            ws_port: None, // irrelevant, we bind manually
+            ..test_offer_config()
+        });
+        let active = Arc::new(AtomicUsize::new(0));
+
+        // Bind a WS listener on an ephemeral port.
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let ws_config = Arc::clone(&config);
+        let ws_state = Arc::clone(&state);
+        let ws_active = Arc::clone(&active);
+        thread::spawn(move || run_ws_listener(port, ws_config, ws_state, ws_active));
+        thread::sleep(Duration::from_millis(50));
+
+        // Connect via tungstenite client.
+        let (mut ws, _resp) =
+            connect(format!("ws://127.0.0.1:{port}")).expect("ws connect failed");
+
+        // Send STATS as a Binary message (no length prefix — WS provides framing).
+        ws.send(Message::Binary(b"STATS".to_vec().into()))
+            .expect("ws send failed");
+
+        // Read the response — should be a Binary message containing the
+        // length-prefixed STATS response (same wire format as TCP).
+        let msg = ws.read().expect("ws read failed");
+        let data = match msg {
+            Message::Binary(b) => b.to_vec(),
+            other => panic!("expected Binary, got: {other:?}"),
+        };
+
+        // The response is length-prefixed (4 bytes BE + payload), same as TCP.
+        assert!(data.len() > 4, "response too short: {} bytes", data.len());
+        let len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        let payload = std::str::from_utf8(&data[4..4 + len]).expect("invalid utf-8");
+        assert!(
+            payload.starts_with("STATS accepted="),
+            "unexpected stats response: {payload}"
+        );
+    }
+
+    /// WebSocket: health endpoint includes ws_port when configured.
+    #[test]
+    fn health_endpoint_includes_ws_port() {
+        use std::net::TcpStream;
+
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let start = Instant::now();
+        thread::spawn(move || run_health_server(port, RelayMode::Open, start, Some(9200)));
+        thread::sleep(Duration::from_millis(50));
+
+        let mut conn = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        conn.write_all(b"GET /health HTTP/1.0\r\n\r\n").unwrap();
+
+        let mut response = String::new();
+        conn.read_to_string(&mut response).unwrap();
+
+        assert!(response.contains("\"ws_port\":9200"), "missing ws_port: {response}");
+    }
+
+    // ── Grant request protocol tests ────────────────────────────────────────
+
+    #[test]
+    fn parse_request_grant_valid() {
+        let cmd = parse_command(
+            b"REQUEST_GRANT human-alice agent-bot netflix-password need to stream movies",
+            None,
+        );
+        assert!(matches!(
+            cmd,
+            Command::RequestGrant { target_id, requester_id, scope, justification }
+                if target_id == "human-alice"
+                    && requester_id == "agent-bot"
+                    && scope == "netflix-password"
+                    && justification == "need to stream movies"
+        ));
+    }
+
+    #[test]
+    fn parse_request_grant_missing_justification() {
+        let cmd = parse_command(b"REQUEST_GRANT human-alice agent-bot scope", None);
+        assert!(matches!(cmd, Command::Submission));
+    }
+
+    #[test]
+    fn parse_fetch_grant_requests_valid() {
+        let cmd = parse_command(b"FETCH_GRANT_REQUESTS human-alice", None);
+        assert!(matches!(cmd, Command::FetchGrantRequests(id) if id == "human-alice"));
+    }
+
+    #[test]
+    fn parse_respond_grant_request_approved() {
+        let cmd = parse_command(b"RESPOND_GRANT_REQUEST gr-0 approved", None);
+        assert!(matches!(cmd, Command::RespondGrantRequest { request_id, approved }
+            if request_id == "gr-0" && approved));
+    }
+
+    #[test]
+    fn parse_respond_grant_request_denied() {
+        let cmd = parse_command(b"RESPOND_GRANT_REQUEST gr-0 denied", None);
+        assert!(matches!(cmd, Command::RespondGrantRequest { request_id, approved }
+            if request_id == "gr-0" && !approved));
+    }
+
+    #[test]
+    fn parse_respond_grant_request_invalid_verdict() {
+        let cmd = parse_command(b"RESPOND_GRANT_REQUEST gr-0 maybe", None);
+        assert!(matches!(cmd, Command::Submission));
+    }
+
+    #[test]
+    fn grant_request_deposit_fetch_lifecycle() {
+        let state = Arc::new(Mutex::new(RelayState::default()));
+
+        // Deposit a grant request.
+        let s = Arc::clone(&state);
+        let buf = with_loopback(move |stream| {
+            handle_request_grant(
+                stream,
+                &s,
+                "human-alice".into(),
+                "agent-bot".into(),
+                "netflix-password".into(),
+                "need to stream movies".into(),
+            );
+        });
+        let resp = read_response(&buf);
+        assert!(resp.starts_with("OK gr-"), "got: {resp}");
+
+        // Fetch grant requests for alice.
+        let s = Arc::clone(&state);
+        let buf = with_loopback(move |stream| {
+            handle_fetch_grant_requests(stream, &s, "human-alice");
+        });
+        let resp = read_response(&buf);
+        assert!(resp.contains("\"request_id\":\"gr-"), "got: {resp}");
+        assert!(resp.contains("\"scope\":\"netflix-password\""), "got: {resp}");
+        assert!(resp.contains("\"status\":\"pending\""), "got: {resp}");
+        assert!(resp.ends_with("\nEND"), "got: {resp}");
+    }
+
+    #[test]
+    fn grant_request_respond_approved() {
+        let state = Arc::new(Mutex::new(RelayState::default()));
+
+        // Deposit a request.
+        let s = Arc::clone(&state);
+        let buf = with_loopback(move |stream| {
+            handle_request_grant(
+                stream,
+                &s,
+                "human-alice".into(),
+                "agent-bot".into(),
+                "ssh-key".into(),
+                "deploying".into(),
+            );
+        });
+        let resp = read_response(&buf);
+        let request_id = resp.strip_prefix("OK ").unwrap().to_string();
+        assert!(request_id.starts_with("gr-"), "got: {resp}");
+
+        // Approve it.
+        let rid = request_id.clone();
+        let s = Arc::clone(&state);
+        let buf = with_loopback(move |stream| {
+            handle_respond_grant_request(stream, &s, &rid, true);
+        });
+        let resp = read_response(&buf);
+        assert_eq!(resp, "OK", "got: {resp}");
+
+        // Fetch and verify status changed.
+        let s = Arc::clone(&state);
+        let buf = with_loopback(move |stream| {
+            handle_fetch_grant_requests(stream, &s, "human-alice");
+        });
+        let resp = read_response(&buf);
+        assert!(resp.contains("\"status\":\"approved\""), "got: {resp}");
+    }
+
+    #[test]
+    fn grant_request_fetch_unknown_target_returns_none() {
+        let state = Arc::new(Mutex::new(RelayState::default()));
+        let s = Arc::clone(&state);
+        let buf = with_loopback(move |stream| {
+            handle_fetch_grant_requests(stream, &s, "nobody");
+        });
+        let resp = read_response(&buf);
+        assert_eq!(resp, "NONE", "got: {resp}");
+    }
+
+    #[test]
+    fn grant_request_respond_unknown_returns_not_found() {
+        let state = Arc::new(Mutex::new(RelayState::default()));
+        let s = Arc::clone(&state);
+        let buf = with_loopback(move |stream| {
+            handle_respond_grant_request(stream, &s, "gr-999", true);
+        });
+        let resp = read_response(&buf);
+        assert_eq!(resp, "NOT_FOUND", "got: {resp}");
+    }
+
+    #[test]
+    fn grant_request_ids_are_unique() {
+        let state = Arc::new(Mutex::new(RelayState::default()));
+
+        // Deposit two requests.
+        let s = Arc::clone(&state);
+        let buf = with_loopback(move |stream| {
+            handle_request_grant(stream, &s, "alice".into(), "bot-a".into(), "s1".into(), "j1".into());
+        });
+        let resp1 = read_response(&buf);
+
+        let s = Arc::clone(&state);
+        let buf = with_loopback(move |stream| {
+            handle_request_grant(stream, &s, "bob".into(), "bot-b".into(), "s2".into(), "j2".into());
+        });
+        let resp2 = read_response(&buf);
+
+        assert_ne!(resp1, resp2, "request IDs should differ: {resp1} vs {resp2}");
+        assert!(resp1.starts_with("OK gr-"), "got: {resp1}");
+        assert!(resp2.starts_with("OK gr-"), "got: {resp2}");
     }
 }

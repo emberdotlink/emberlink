@@ -1,11 +1,17 @@
 //! Agent runtime — processes protocol commands against local state.
 
 use std::rc::Rc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use core_state::EventStore;
-use core_types::PresentationAudienceKind;
+use core_types::approval::{ApprovalRequest, RequestedScope};
+use core_types::{AccessGrantStatus, PresentationAudienceKind};
 
-use crate::protocol::*;
+use crate::protocol::{
+    methods, AgentRequest, AgentResponse, GrantInfo, GrantStatusParams, RelayGrantStatusParams,
+    RelayRequestGrantParams, RequestGrantParams, RequestGrantResponse, UseCredentialParams,
+    WhoamiResponse,
+};
 
 /// Configuration for the agent runtime.
 #[derive(Debug, Clone)]
@@ -35,6 +41,8 @@ impl AgentRuntime {
             methods::REQUEST_GRANT => self.handle_request_grant(request),
             methods::GRANT_STATUS => self.handle_grant_status(request),
             methods::USE_CREDENTIAL => self.handle_use_credential(request),
+            methods::RELAY_REQUEST_GRANT => self.handle_relay_request_grant(request),
+            methods::RELAY_GRANT_STATUS => self.handle_relay_grant_status(request),
             _ => AgentResponse::err(
                 &request.id,
                 "UNKNOWN_METHOD",
@@ -94,15 +102,42 @@ impl AgentRuntime {
             }
         };
 
-        // TODO: create ApprovalRequest in the approval queue
-        AgentResponse::err(
-            &request.id,
-            "PENDING_APPROVAL",
-            format!(
-                "Grant request submitted for {} — awaiting human approval",
-                params.scope
-            ),
-        )
+        let created_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let request_id = format!("req-{created_at}");
+
+        let scope = RequestedScope {
+            capability: params.scope.clone(),
+            resource_id: params.resource_id.clone(),
+            constraints: vec![],
+        };
+
+        let approval_req = ApprovalRequest::new(
+            request_id.clone(),
+            self.config.persona_id.clone(),
+            self.config.label.clone(),
+            scope,
+            params.duration_secs,
+            params.reason.clone(),
+            created_at,
+        );
+
+        if let Err(e) = self.store.insert_approval_request(&approval_req) {
+            return AgentResponse::err(
+                &request.id,
+                "STORE_ERROR",
+                format!("Failed to queue approval request: {e}"),
+            );
+        }
+
+        let resp = RequestGrantResponse {
+            request_id,
+            status: "pending".to_string(),
+        };
+        AgentResponse::ok(&request.id, serde_json::to_value(resp).unwrap())
     }
 
     fn handle_grant_status(&self, request: &AgentRequest) -> AgentResponse {
@@ -121,11 +156,26 @@ impl AgentRuntime {
         let grant = match self.store.access_grant(&params.grant_id) {
             Ok(Some(g)) => g,
             Ok(None) => {
-                return AgentResponse::err(
-                    &request.id,
-                    "NOT_FOUND",
-                    format!("Grant {} not found", params.grant_id),
-                );
+                // Not a grant — check the approval queue for a pending request.
+                return match self.store.get_approval_request(&params.grant_id) {
+                    Ok(Some(row)) => {
+                        let resp = RequestGrantResponse {
+                            request_id: row.request_id,
+                            status: row.status,
+                        };
+                        AgentResponse::ok(&request.id, serde_json::to_value(resp).unwrap())
+                    }
+                    Ok(None) => AgentResponse::err(
+                        &request.id,
+                        "NOT_FOUND",
+                        format!("Grant or approval request {} not found", params.grant_id),
+                    ),
+                    Err(e) => AgentResponse::err(
+                        &request.id,
+                        "STORE_ERROR",
+                        format!("Failed to query approval request: {e}"),
+                    ),
+                };
             }
             Err(e) => {
                 return AgentResponse::err(
@@ -148,7 +198,7 @@ impl AgentRuntime {
     }
 
     fn handle_use_credential(&self, request: &AgentRequest) -> AgentResponse {
-        let _params: UseCredentialParams = match serde_json::from_value(request.params.clone()) {
+        let params: UseCredentialParams = match serde_json::from_value(request.params.clone()) {
             Ok(p) => p,
             Err(e) => {
                 return AgentResponse::err(
@@ -159,13 +209,146 @@ impl AgentRuntime {
             }
         };
 
-        // TODO(+): check grant is active, not revoked, within scope,
-        // then return credential metadata (handles actual delivery)
-        AgentResponse::err(
-            &request.id,
-            "NOT_IMPLEMENTED",
-            "Credential use via grants is not yet wired (see /)",
-        )
+        // Step 1: Look up the grant and verify it exists and is active.
+        let grant = match self.store.access_grant(&params.grant_id) {
+            Ok(Some(g)) => g,
+            Ok(None) => {
+                let _ = self.store.log_credential_access(
+                    &params.grant_id,
+                    &self.config.persona_id,
+                    &params.credential_id,
+                    "denied:grant_not_found",
+                );
+                return AgentResponse::err(
+                    &request.id,
+                    "NOT_FOUND",
+                    format!("Grant {} not found", params.grant_id),
+                );
+            }
+            Err(e) => {
+                return AgentResponse::err(
+                    &request.id,
+                    "STORE_ERROR",
+                    format!("Failed to query grant: {e}"),
+                );
+            }
+        };
+
+        // Step 2: Verify the grant is active (not revoked, not expired).
+        if grant.status != AccessGrantStatus::Active {
+            let outcome = format!("denied:grant_{}", grant.status.as_str());
+            let _ = self.store.log_credential_access(
+                &params.grant_id,
+                &self.config.persona_id,
+                &params.credential_id,
+                &outcome,
+            );
+            return AgentResponse::err(
+                &request.id,
+                "GRANT_INACTIVE",
+                format!(
+                    "Grant {} is {} and cannot be used",
+                    params.grant_id,
+                    grant.status.as_str()
+                ),
+            );
+        }
+
+        // Step 3: Fetch the credential deposit for this grant.
+        let deposit = match self.store.fetch_credential_deposit(&params.grant_id) {
+            Ok(Some(d)) => d,
+            Ok(None) => {
+                let _ = self.store.log_credential_access(
+                    &params.grant_id,
+                    &self.config.persona_id,
+                    &params.credential_id,
+                    "denied:no_deposit",
+                );
+                return AgentResponse::err(
+                    &request.id,
+                    "NO_CREDENTIAL",
+                    "Credential not yet deposited — issuer must deposit first",
+                );
+            }
+            Err(e) => {
+                return AgentResponse::err(
+                    &request.id,
+                    "STORE_ERROR",
+                    format!("Failed to fetch credential deposit: {e}"),
+                );
+            }
+        };
+
+        // Step 4: Log the successful access.
+        let _ = self.store.log_credential_access(
+            &params.grant_id,
+            &self.config.persona_id,
+            &deposit.credential_id,
+            "granted",
+        );
+
+        // Step 5: Return the credential info to the caller.
+        let result = serde_json::json!({
+            "status": "ok",
+            "credential": {
+                "value": deposit.encrypted_blocks_json,
+                "scope": deposit.credential_id,
+                "grant_id": deposit.grant_id,
+            }
+        });
+        AgentResponse::ok(&request.id, result)
+    }
+
+    fn handle_relay_request_grant(&self, request: &AgentRequest) -> AgentResponse {
+        let params: RelayRequestGrantParams = match serde_json::from_value(request.params.clone())
+        {
+            Ok(p) => p,
+            Err(e) => {
+                return AgentResponse::err(
+                    &request.id,
+                    "INVALID_PARAMS",
+                    format!("Invalid relay_request_grant params: {e}"),
+                );
+            }
+        };
+
+        match crate::relay::request_grant(
+            &params.relay,
+            &params.target,
+            &self.config.persona_id,
+            &params.scope,
+            &params.justification,
+        ) {
+            Ok(request_id) => {
+                let resp = serde_json::json!({
+                    "request_id": request_id,
+                    "status": "pending",
+                });
+                AgentResponse::ok(&request.id, resp)
+            }
+            Err(e) => AgentResponse::err(&request.id, "RELAY_ERROR", e),
+        }
+    }
+
+    fn handle_relay_grant_status(&self, request: &AgentRequest) -> AgentResponse {
+        let params: RelayGrantStatusParams = match serde_json::from_value(request.params.clone()) {
+            Ok(p) => p,
+            Err(e) => {
+                return AgentResponse::err(
+                    &request.id,
+                    "INVALID_PARAMS",
+                    format!("Invalid relay_grant_status params: {e}"),
+                );
+            }
+        };
+
+        match crate::relay::fetch_grant_requests(&params.relay, &params.target) {
+            Ok(requests) => {
+                let resp = serde_json::json!({ "requests": requests });
+                AgentResponse::ok(&request.id, resp)
+            }
+            Err(e) => AgentResponse::err(&request.id, "RELAY_ERROR", e),
+        }
     }
 }
 
@@ -241,13 +424,28 @@ mod tests {
     }
 
     #[test]
-    fn request_grant_returns_pending() {
-        let rt = test_runtime();
+    fn request_grant_creates_db_record() {
+        let store = Rc::new(EventStore::open_in_memory().unwrap());
+        let rt = AgentRuntime::new(
+            AgentConfig {
+                persona_id: "agent-test-001".into(),
+                label: Some("Test Agent".into()),
+            },
+            Rc::clone(&store),
+        );
         let line = r#"{"id":"4","method":"request_grant","params":{"scope":"ReadCredential","reason":"test"}}"#;
         let resp_json = process_line(&rt, line);
         let resp: AgentResponse = serde_json::from_str(&resp_json).unwrap();
-        let err = resp.error.unwrap();
-        assert_eq!(err.code, "PENDING_APPROVAL");
+        assert!(resp.error.is_none(), "expected success, got error: {:?}", resp.error);
+        let result = resp.result.unwrap();
+        assert_eq!(result["status"], "pending");
+        let request_id = result["request_id"].as_str().unwrap().to_string();
+        assert!(request_id.starts_with("req-"), "request_id should start with 'req-'");
+
+        // Verify the record is in the DB.
+        let row = store.get_approval_request(&request_id).unwrap().unwrap();
+        assert_eq!(row.status, "pending");
+        assert_eq!(row.requester_id, "agent-test-001");
     }
 
     #[test]
@@ -261,13 +459,24 @@ mod tests {
     }
 
     #[test]
-    fn use_credential_not_implemented() {
+    fn use_credential_grant_not_found() {
         let rt = test_runtime();
-        let line = r#"{"id":"6","method":"use_credential","params":{"grant_id":"g1","credential_id":"c1"}}"#;
+        let line = r#"{"id":"6","method":"use_credential","params":{"grant_id":"g-nonexistent","credential_id":"c1"}}"#;
         let resp_json = process_line(&rt, line);
         let resp: AgentResponse = serde_json::from_str(&resp_json).unwrap();
         let err = resp.error.unwrap();
-        assert_eq!(err.code, "NOT_IMPLEMENTED");
+        assert_eq!(err.code, "NOT_FOUND");
+    }
+
+    #[test]
+    fn use_credential_invalid_params_returns_error() {
+        let rt = test_runtime();
+        // Missing required credential_id field.
+        let line = r#"{"id":"7","method":"use_credential","params":{"grant_id":"g1"}}"#;
+        let resp_json = process_line(&rt, line);
+        let resp: AgentResponse = serde_json::from_str(&resp_json).unwrap();
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, "INVALID_PARAMS");
     }
 
     #[test]
@@ -279,5 +488,48 @@ mod tests {
         let resp: AgentResponse = serde_json::from_str(&resp_json).unwrap();
         let err = resp.error.unwrap();
         assert_eq!(err.code, "INVALID_PARAMS");
+    }
+
+    #[test]
+    fn relay_request_grant_invalid_params() {
+        let rt = test_runtime();
+        // Missing required fields
+        let line = r#"{"id":"8","method":"relay_request_grant","params":{"relay":"wss://x"}}"#;
+        let resp_json = process_line(&rt, line);
+        let resp: AgentResponse = serde_json::from_str(&resp_json).unwrap();
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, "INVALID_PARAMS");
+    }
+
+    #[test]
+    fn relay_grant_status_invalid_params() {
+        let rt = test_runtime();
+        // Missing required fields
+        let line = r#"{"id":"9","method":"relay_grant_status","params":{}}"#;
+        let resp_json = process_line(&rt, line);
+        let resp: AgentResponse = serde_json::from_str(&resp_json).unwrap();
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, "INVALID_PARAMS");
+    }
+
+    #[test]
+    fn relay_request_grant_bad_url() {
+        let rt = test_runtime();
+        // Valid params but unreachable URL — should return RELAY_ERROR
+        let line = r#"{"id":"10","method":"relay_request_grant","params":{"relay":"wss://127.0.0.1:1","target":"alice","scope":"read","justification":"test"}}"#;
+        let resp_json = process_line(&rt, line);
+        let resp: AgentResponse = serde_json::from_str(&resp_json).unwrap();
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, "RELAY_ERROR");
+    }
+
+    #[test]
+    fn relay_grant_status_bad_url() {
+        let rt = test_runtime();
+        let line = r#"{"id":"11","method":"relay_grant_status","params":{"relay":"wss://127.0.0.1:1","target":"alice"}}"#;
+        let resp_json = process_line(&rt, line);
+        let resp: AgentResponse = serde_json::from_str(&resp_json).unwrap();
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, "RELAY_ERROR");
     }
 }

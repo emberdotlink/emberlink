@@ -157,6 +157,68 @@ pub fn trust_network(
 }
 
 // ---------------------------------------------------------------------------
+// Trust graph export
+// ---------------------------------------------------------------------------
+
+/// A node in the exported visualization graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphNode {
+    pub id: String,
+    pub node_type: String,
+}
+
+/// An edge in the exported visualization graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphEdge {
+    pub from: String,
+    pub to: String,
+    pub edge_type: String,
+    pub label: Option<String>,
+    pub weight: Option<f64>,
+}
+
+/// Combined trust graph export for visualization tools.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustGraphExport {
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+}
+
+/// Export a visualization-ready trust graph rooted at `start`, combining trust
+/// attestations into a unified node/edge format. Filters out recipient-bound
+/// attestations (design).
+pub fn export_trust_graph(
+    attestations: &[TrustAttestation],
+    start: &str,
+    max_depth: usize,
+) -> TrustGraphExport {
+    let graph = trust_network(attestations, start, max_depth);
+
+    let nodes = graph
+        .nodes
+        .into_iter()
+        .map(|n| GraphNode {
+            id: n.id,
+            node_type: "persona".to_string(),
+        })
+        .collect();
+
+    let edges = graph
+        .edges
+        .into_iter()
+        .map(|e| GraphEdge {
+            from: e.from,
+            to: e.to,
+            edge_type: "trust".to_string(),
+            label: Some(e.domain),
+            weight: Some(e.score as f64),
+        })
+        .collect();
+
+    TrustGraphExport { nodes, edges }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

@@ -86,6 +86,26 @@ pub struct UseCredentialParams {
     pub credential_id: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct RelayRequestGrantParams {
+    /// WebSocket relay URL (e.g., "wss://relay.example.com").
+    pub relay: String,
+    /// Target identity to request a grant from.
+    pub target: String,
+    /// Desired capability scope.
+    pub scope: String,
+    /// Human-readable justification.
+    pub justification: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RelayGrantStatusParams {
+    /// WebSocket relay URL.
+    pub relay: String,
+    /// Target identity whose pending requests to fetch.
+    pub target: String,
+}
+
 // ---------------------------------------------------------------------------
 // Response payloads
 // ---------------------------------------------------------------------------
@@ -126,6 +146,8 @@ pub mod methods {
     pub const REQUEST_GRANT: &str = "request_grant";
     pub const GRANT_STATUS: &str = "grant_status";
     pub const USE_CREDENTIAL: &str = "use_credential";
+    pub const RELAY_REQUEST_GRANT: &str = "relay_request_grant";
+    pub const RELAY_GRANT_STATUS: &str = "relay_grant_status";
 }
 
 #[cfg(test)]

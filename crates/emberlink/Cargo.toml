@@ -1,0 +1,12 @@
+[package]
+name = "emberlink"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Programmable trust between humans and machines — local-first, scoped, time-bound, revocable delegation of authority"
+repository = "https://github.com/emberdotlink/emberlink"
+homepage = "https://ember.link"
+documentation = "https://docs.rs/emberlink"
+keywords = ["authorization", "credentials", "agent", "identity", "trust"]
+categories = ["authentication", "cryptography"]
+readme = "README.md"

@@ -301,6 +301,20 @@ pub fn apply_event(
                 },
             );
         }
+        EventBody::GuardianKeyRotated(body) => {
+            let guardian = state
+                .guardians_current
+                .get_mut(&body.guardian_id)
+                .ok_or_else(|| {
+                    ValidationError::new(format!("unknown guardian: {}", body.guardian_id))
+                })?;
+            if guardian.public_key != body.previous_key_id {
+                return Err(ValidationError::new(
+                    "guardian rotation previous key does not match current state",
+                ));
+            }
+            guardian.public_key = body.new_guardian_public_key.clone();
+        }
         EventBody::RecoveryRequested(body) => {
             if !state.devices_current.contains_key(&body.target_device_id) {
                 return Err(ValidationError::new(format!(

@@ -5,6 +5,8 @@ memory/
 *.pem
 *.p12
 *.pfx
+.headless-control
+.headless-metrics.jsonl
 ember-ext/extension/pkg/
 web/node_modules/
 web/dist/

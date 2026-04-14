@@ -8,4 +8,5 @@
 //! on stdout. Compatible with MCP, LangChain, and any tool-use framework.
 
 pub mod protocol;
+pub mod relay;
 pub mod runtime;

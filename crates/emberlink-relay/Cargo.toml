@@ -13,4 +13,5 @@ hex = "0.4"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 rustls-pemfile = "2"
 rcgen = "0.13"
-webpki-roots = "0.26"
+tungstenite = "0.26"
+webpki-roots = "1.0"

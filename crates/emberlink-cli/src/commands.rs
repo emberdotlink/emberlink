@@ -31,6 +31,7 @@ use core_types::{
     PresentationAudienceKind, RecipientProfile, SignerBinding, SurvivalMode, SyncProfile,
     TrustThreshold, Validate, ValidationError,
 };
+use core_types::approval::{ApprovalResponse, ApprovalStatus};
 
 use super::*;
 
@@ -1917,6 +1918,8 @@ impl DemoApp {
             ["root", "create", rest @ ..] => self.handle_root_create(rest),
             ["root", "rotate-key", rest @ ..] => self.handle_root_rotate_key(rest),
             ["recovery", "guardian-enroll", rest @ ..] => self.handle_guardian_enroll(rest),
+            ["recovery", "guardian-invite", rest @ ..] => self.handle_guardian_invite(rest),
+            ["recovery", "guardian-list", rest @ ..] => self.handle_guardian_list(rest),
             ["recovery", "request", rest @ ..] => self.handle_recovery_request(rest),
             ["recovery", "approve", rest @ ..] => self.handle_recovery_approve(rest),
             ["recovery", "contest", rest @ ..] => self.handle_recovery_contest(rest),
@@ -2597,6 +2600,11 @@ impl DemoApp {
         writeln!(
             &mut out,
             "                                                 Claim a grant offer"
+        )
+        .unwrap();
+        writeln!(
+            &mut out,
+            "  grant audit <id>                               Show credential access log for a grant"
         )
         .unwrap();
         writeln!(&mut out).unwrap();
@@ -4615,6 +4623,9 @@ impl DemoApp {
         if let ["dashboard", rest @ ..] = tokens {
             return self.handle_trust_dashboard(rest);
         }
+        if let ["export", rest @ ..] = tokens {
+            return self.handle_trust_export(rest);
+        }
         if let ["attest", rest @ ..] = tokens {
             return self.handle_trust_attest(rest);
         }
@@ -4636,6 +4647,34 @@ impl DemoApp {
         }
 
         self.render_trust_for_recipient(recipient.as_deref())
+    }
+
+    fn handle_trust_export(&self, tokens: &[&str]) -> String {
+        let mut persona_id = self.personas.first().map(|p| p.id.as_str()).unwrap_or("");
+        let mut depth: usize = 3;
+        let mut i = 0;
+        while i < tokens.len() {
+            match tokens[i] {
+                "--persona" if i + 1 < tokens.len() => {
+                    persona_id = tokens[i + 1];
+                    i += 2;
+                }
+                "--depth" if i + 1 < tokens.len() => {
+                    depth = tokens[i + 1].parse().unwrap_or(3);
+                    i += 2;
+                }
+                _ => i += 1,
+            }
+        }
+        let export = core_trust::queries::export_trust_graph(
+            &self.trust_attestations,
+            persona_id,
+            depth,
+        );
+        match serde_json::to_string_pretty(&export) {
+            Ok(json) => format!("{json}\n"),
+            Err(e) => format!("Failed to serialize trust graph: {e}\n"),
+        }
     }
 
     pub(crate) fn handle_trust_attest(&mut self, tokens: &[&str]) -> String {
@@ -5171,6 +5210,7 @@ impl DemoApp {
             ["create", rest @ ..] => self.handle_grant_create(rest),
             ["offer", rest @ ..] => self.handle_grant_offer(rest),
             ["claim", rest @ ..] => self.handle_grant_claim(rest),
+            ["use", id, rest @ ..] => self.handle_grant_use(id, rest),
             ["list", rest @ ..] => self.handle_grant_list(rest),
             ["show", id] => self.handle_grant_show(id),
             ["revoke", id, rest @ ..] => self.handle_grant_revoke(id, rest),
@@ -5178,8 +5218,10 @@ impl DemoApp {
             ["edit", id, rest @ ..] => self.handle_grant_edit(id, rest),
             ["recipient", rest @ ..] => self.handle_grant_recipient(rest),
             ["history", rest @ ..] => self.handle_grant_history(rest),
+            ["requests", rest @ ..] => self.handle_grant_requests(rest),
+            ["audit", id] => self.handle_grant_audit(id),
             [] => self.handle_grant_list(&[]),
-            _ => "Usage: grant create|offer|claim|list|show|revoke|renew|edit|recipient|history ...\n"
+            _ => "Usage: grant create|offer|claim|use|list|show|revoke|renew|edit|recipient|history|requests|audit ...\n"
                 .to_string(),
         }
     }
@@ -5568,6 +5610,7 @@ impl DemoApp {
         let mut label = None;
         let mut expires_in: Option<u64> = None;
         let mut caps: Vec<String> = Vec::new();
+        let mut relay: Option<String> = None;
         let mut i = 0;
         while i < tokens.len() {
             match tokens[i] {
@@ -5603,10 +5646,14 @@ impl DemoApp {
                     caps.push(tokens[i + 1].to_string());
                     i += 2;
                 }
+                "--relay" if i + 1 < tokens.len() => {
+                    relay = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
                 _ => {
                     return "Usage: grant create --persona <p> --recipient <id> --kind peer|service \
                             --profile human|agent|service --mode one_shot|renewable|standing \
-                            [--label <label>] [--expires-in <sec>] [--cap <type:arg> ...]\n"
+                            [--label <label>] [--expires-in <sec>] [--cap <type:arg> ...] [--relay <addr>]\n"
                         .to_string();
                 }
             }
@@ -5620,6 +5667,11 @@ impl DemoApp {
                 .to_string();
         };
 
+        let parsed_caps = match parse_capabilities(&caps) {
+            Ok(c) => c,
+            Err(e) => return format!("Failed to parse capabilities: {}\n", e),
+        };
+
         match self.create_grant_command(
             &persona_ref,
             &recipient_id,
@@ -5630,9 +5682,254 @@ impl DemoApp {
             expires_in,
             &caps,
         ) {
-            Ok(msg) => msg,
+            Ok(msg) => {
+                // : after grant creation, attempt auto-deposit for ReadCredential caps.
+                let deposit_note = self.attempt_credential_deposit_for_caps(
+                    &msg,
+                    &parsed_caps,
+                    relay.as_deref(),
+                );
+                format!("{}{}", msg, deposit_note)
+            }
             Err(err) => format!("Failed to create grant: {}\n", err),
         }
+    }
+
+    // ── : grant use <id> ────────────────────────────────────────
+    //
+    // Fetch and display the credential associated with an active grant.
+    // Checks local deposit first; falls back to relay fetch if not found locally.
+
+    fn handle_grant_use(&mut self, grant_id: &str, tokens: &[&str]) -> String {
+        let mut relay_override: Option<String> = None;
+        let mut i = 0;
+        while i < tokens.len() {
+            match tokens[i] {
+                "--relay" if i + 1 < tokens.len() => {
+                    relay_override = Some(tokens[i + 1].to_string());
+                    i += 2;
+                }
+                _ => {
+                    return format!(
+                        "unrecognised argument: {}\nUsage: grant use <id> [--relay <addr>]\n",
+                        tokens[i]
+                    );
+                }
+            }
+        }
+
+        // 1. Look up the grant — verify it exists and is active.
+        let detail = match self.app_runtime.store.access_grant_detail(grant_id) {
+            Ok(Some(d)) => d,
+            Ok(None) => return format!("grant not found: {grant_id}\n"),
+            Err(e) => return format!("error looking up grant: {e}\n"),
+        };
+        if detail.grant.status != AccessGrantStatus::Active {
+            return format!(
+                "grant {} is not active (status: {:?})\n",
+                grant_id, detail.grant.status
+            );
+        }
+
+        // Build a human-readable scope label from the first ReadCredential cap (if any).
+        let object_id: Option<String> = detail.grant.capabilities.iter().find_map(|cap| {
+            if let GrantCapability::ReadCredential { object_id } = cap {
+                Some(object_id.clone())
+            } else {
+                None
+            }
+        });
+        let scope_label = object_id
+            .as_deref()
+            .unwrap_or("(no read_credential capability)");
+
+        // 2. Check for local credential deposit.
+        let local_payload: Option<Vec<u8>> = match self
+            .app_runtime
+            .store
+            .fetch_credential_deposit(grant_id)
+        {
+            Ok(Some(row)) => {
+                // The deposit stores the raw payload bytes hex-encoded in encrypted_blocks_json.
+                // Try hex-decode first, fall back to treating it as raw UTF-8 payload.
+                Some(
+                    core_types::hex_to_bytes(row.encrypted_blocks_json.trim())
+                        .unwrap_or_else(|_| row.encrypted_blocks_json.into_bytes()),
+                )
+            }
+            Ok(None) => None,
+            Err(e) => {
+                eprintln!("warning: could not read local credential deposit: {e}");
+                None
+            }
+        };
+
+        // 3. If no local deposit, try to fetch from relay.
+        let credential_bytes: Vec<u8> = if let Some(b) = local_payload {
+            b
+        } else {
+            // Determine relay address — override first, then default.
+            let relay_addr = relay_override
+                .clone()
+                .unwrap_or_else(|| "relay.ember.link:7700".to_string());
+            let fetch_cmd = format!("FETCH_CREDENTIAL {grant_id}");
+            match self.relay_round_trip(&relay_addr, fetch_cmd.as_bytes()) {
+                Err(e) => return format!("error: relay fetch failed: {e}\n"),
+                Ok(frames) => {
+                    let response_str = frames
+                        .into_iter()
+                        .next()
+                        .and_then(|f| String::from_utf8(f).ok())
+                        .unwrap_or_default();
+
+                    if response_str == "NOT-FOUND" {
+                        return format!(
+                            "no credential available for grant {grant_id}\n\
+                             (issuer may not have deposited one yet)\n"
+                        );
+                    }
+                    if response_str.starts_with("ERROR") || response_str.starts_with("REJECTED") {
+                        return format!("relay returned error: {response_str}\n");
+                    }
+
+                    // Expect: CREDENTIAL <grant-id> <hex-payload>
+                    let hex_payload = response_str
+                        .strip_prefix(&format!("CREDENTIAL {grant_id} "))
+                        .map(str::trim)
+                        .unwrap_or(response_str.trim());
+
+                    core_types::hex_to_bytes(hex_payload)
+                        .unwrap_or_else(|_| hex_payload.as_bytes().to_vec())
+                }
+            }
+        };
+
+        // 4. Render the credential.
+        let credential_text = String::from_utf8_lossy(&credential_bytes);
+        let formatted_value = if let Ok(v) = serde_json::from_str::<serde_json::Value>(&credential_text) {
+            serde_json::to_string_pretty(&v).unwrap_or_else(|_| credential_text.to_string())
+        } else {
+            credential_text.to_string()
+        };
+
+        format!(
+            "grant  {grant_id}\nscope  {scope_label}\n{}\n{formatted_value}\n",
+            "\u{2500}".repeat(18),
+        )
+    }
+
+    // ── : auto-deposit helper ────────────────────────────────────
+    //
+    // After a grant is created, attempt to deposit the referenced credential
+    // to the relay so the recipient can fetch it with `grant use`.
+    //
+    // `creation_msg` is the tab-delimited output from create_grant_command
+    // (format: "created grant\t<grant-id>\t...").
+
+    fn attempt_credential_deposit_for_caps(
+        &self,
+        creation_msg: &str,
+        caps: &[GrantCapability],
+        relay_addr: Option<&str>,
+    ) -> String {
+        // Extract grant_id from "created grant\t<grant-id>\t..."
+        let grant_id = match creation_msg.trim().split('\t').nth(1) {
+            Some(id) => id.to_string(),
+            None => return String::new(),
+        };
+
+        // Find the first ReadCredential capability.
+        let object_id = caps.iter().find_map(|cap| {
+            if let GrantCapability::ReadCredential { object_id } = cap {
+                Some(object_id.clone())
+            } else {
+                None
+            }
+        });
+
+        let Some(object_id) = object_id else {
+            return String::new(); // No ReadCredential cap — nothing to deposit.
+        };
+
+        // Find a namespace that contains this object.
+        let payload_bytes: Option<Vec<u8>> =
+            self.find_vault_object_payload(&object_id);
+
+        let Some(payload) = payload_bytes else {
+            return format!(
+                "(no local credential found for object {object_id} — recipient must request manually)\n"
+            );
+        };
+
+        // Determine relay address.
+        let relay_addr = match relay_addr {
+            Some(addr) => addr.to_string(),
+            None => "relay.ember.link:7700".to_string(),
+        };
+
+        // Hex-encode and send DEPOSIT_CREDENTIAL.
+        let hex_payload = core_types::bytes_to_hex(&payload);
+        let deposit_cmd = format!("DEPOSIT_CREDENTIAL {grant_id} {hex_payload}");
+        match self.relay_round_trip(&relay_addr, deposit_cmd.as_bytes()) {
+            Err(e) => format!("(credential deposit failed: {e})\n"),
+            Ok(frames) => {
+                let response = frames
+                    .into_iter()
+                    .next()
+                    .and_then(|f| String::from_utf8(f).ok())
+                    .unwrap_or_default();
+                if response.starts_with("OK") || response.starts_with("ACCEPTED") {
+                    "\u{2713} credential deposited to relay\n".to_string()
+                } else {
+                    format!("(credential deposit relay response: {response})\n")
+                }
+            }
+        }
+    }
+
+    /// Find the raw payload bytes of a vault object by object_id, searching
+    /// across all known persona namespaces on this device.
+    fn find_vault_object_payload(&self, object_id: &str) -> Option<Vec<u8>> {
+        let mat = self.app_runtime.store.materialized();
+        // Try persona namespaces first.
+        for persona_id in mat.personas_current.keys() {
+            let ns = core_types::VaultNamespace {
+                owner_kind: core_types::VaultOwnerKind::Persona,
+                owner_id: persona_id.clone(),
+            };
+            if let Ok(Some(catalog)) = self.app_runtime.store.local_vault_catalog(&ns)
+                && let Some(object) =
+                    catalog.objects.iter().find(|o| o.id == *object_id && !o.deleted)
+                && let Some(revision) = catalog
+                    .revisions
+                    .iter()
+                    .find(|r| r.id == object.latest_revision_id)
+                && let Ok(bytes) =
+                    self.app_runtime.store.local_manifest_payload_bytes(&revision.manifest_id)
+            {
+                return Some(bytes);
+            }
+        }
+        // Try root namespaces.
+        for root_id in mat.roots_current.keys() {
+            let ns = core_types::VaultNamespace {
+                owner_kind: core_types::VaultOwnerKind::Root,
+                owner_id: root_id.clone(),
+            };
+            if let Ok(Some(catalog)) = self.app_runtime.store.local_vault_catalog(&ns)
+                && let Some(object) =
+                    catalog.objects.iter().find(|o| o.id == *object_id && !o.deleted)
+                && let Some(revision) = catalog
+                    .revisions
+                    .iter()
+                    .find(|r| r.id == object.latest_revision_id)
+                && let Ok(bytes) =
+                    self.app_runtime.store.local_manifest_payload_bytes(&revision.manifest_id)
+            {
+                return Some(bytes);
+            }
+        }
+        None
     }
 
     fn handle_grant_list(&self, tokens: &[&str]) -> String {
@@ -5838,6 +6135,210 @@ impl DemoApp {
         {
             Ok(entries) => self.render_grant_history_timeline(&entries),
             Err(err) => format!("Failed to load grant history: {}\n", err),
+        }
+    }
+
+    // ── Grant credential access audit log ───────────────────
+
+    fn handle_grant_audit(&self, grant_id: &str) -> String {
+        let entries = match self.app_runtime.store.get_credential_access_log(grant_id) {
+            Ok(e) => e,
+            Err(err) => return format!("Failed to load access log: {}\n", err),
+        };
+        let sep = "─".repeat(50);
+        let mut out = String::new();
+        writeln!(&mut out, "{sep}").unwrap();
+        writeln!(&mut out, "grant   {grant_id}").unwrap();
+        writeln!(&mut out, "{sep}").unwrap();
+        if entries.is_empty() {
+            writeln!(&mut out, "(no access log entries)").unwrap();
+        } else {
+            for entry in &entries {
+                // Format Unix timestamp as YYYY-MM-DD HH:MM:SS UTC
+                let ts = entry.accessed_at;
+                let secs = ts.unsigned_abs();
+                let days_since_epoch = secs / 86400;
+                let time_of_day = secs % 86400;
+                let h = time_of_day / 3600;
+                let m = (time_of_day % 3600) / 60;
+                let s = time_of_day % 60;
+                // Simple Gregorian calendar calculation (no leap seconds)
+                let mut year = 1970u64;
+                let mut remaining_days = days_since_epoch;
+                loop {
+                    let days_in_year = if year.is_multiple_of(400) || (year.is_multiple_of(4) && !year.is_multiple_of(100)) { 366 } else { 365 };
+                    if remaining_days < days_in_year {
+                        break;
+                    }
+                    remaining_days -= days_in_year;
+                    year += 1;
+                }
+                let is_leap = year.is_multiple_of(400) || (year.is_multiple_of(4) && !year.is_multiple_of(100));
+                let month_days: [u64; 12] = [31, if is_leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+                let mut month = 1u64;
+                for &md in &month_days {
+                    if remaining_days < md {
+                        break;
+                    }
+                    remaining_days -= md;
+                    month += 1;
+                }
+                let day = remaining_days + 1;
+                writeln!(
+                    &mut out,
+                    "{year:04}-{month:02}-{day:02} {h:02}:{m:02}:{s:02}  {:<22}  {:<24}  {}",
+                    entry.agent_id,
+                    entry.scope,
+                    entry.outcome,
+                )
+                .unwrap();
+            }
+        }
+        writeln!(&mut out, "{sep}").unwrap();
+        writeln!(&mut out, "{} entries", entries.len()).unwrap();
+        out
+    }
+
+    // ── Grant approval queue ───────────────────────────────────
+
+    fn handle_grant_requests(&mut self, tokens: &[&str]) -> String {
+        match tokens {
+            ["list", rest @ ..] => self.handle_grant_requests_list(rest),
+            ["approve", id, rest @ ..] => self.handle_grant_requests_approve(id, rest),
+            ["deny", id, rest @ ..] => self.handle_grant_requests_deny(id, rest),
+            _ => "Usage: grant requests list|approve|deny ...\n".to_string(),
+        }
+    }
+
+    fn handle_grant_requests_list(&self, _tokens: &[&str]) -> String {
+        match self.app_runtime.store.list_pending_approvals() {
+            Err(err) => format!("Failed to list approval requests: {}\n", err),
+            Ok(rows) if rows.is_empty() => "No pending approval requests.\n".to_string(),
+            Ok(rows) => {
+                let mut out = String::new();
+                writeln!(
+                    &mut out,
+                    "Pending Approval Requests:\n  {:<12}  {:<16}  {:<18}  {:<9}  {:<10}",
+                    "ID", "Requester", "Scope", "Duration", "Reason"
+                )
+                .unwrap();
+                for row in &rows {
+                    let requester = row
+                        .requester_label
+                        .as_deref()
+                        .unwrap_or(row.requester_id.as_str());
+                    // Parse capability from scope JSON; fall back to raw JSON on error.
+                    let capability = serde_json::from_str::<serde_json::Value>(
+                        &row.requested_scope_json,
+                    )
+                    .ok()
+                    .and_then(|v| v["capability"].as_str().map(str::to_owned))
+                    .unwrap_or_else(|| row.requested_scope_json.clone());
+                    let duration = match row.requested_duration_secs {
+                        Some(s) => format!("{}s", s),
+                        None => "unbounded".to_string(),
+                    };
+                    let reason = row.reason.as_deref().unwrap_or("-");
+                    writeln!(
+                        &mut out,
+                        "  {:<12}  {:<16}  {:<18}  {:<9}  {}",
+                        truncate_id(&row.request_id),
+                        &requester[..requester.len().min(16)],
+                        &capability[..capability.len().min(18)],
+                        duration,
+                        reason,
+                    )
+                    .unwrap();
+                }
+                out
+            }
+        }
+    }
+
+    fn handle_grant_requests_approve(&mut self, request_id: &str, tokens: &[&str]) -> String {
+        let mut duration: Option<u64> = None;
+        let mut i = 0;
+        while i < tokens.len() {
+            match tokens[i] {
+                "--duration" if i + 1 < tokens.len() => {
+                    match parse_duration_to_secs(tokens[i + 1]) {
+                        Ok(secs) => {
+                            duration = Some(secs);
+                            i += 2;
+                        }
+                        Err(e) => return format!("Invalid --duration value: {}\n", e),
+                    }
+                }
+                _ => i += 1,
+            }
+        }
+
+        let resolver_id = self
+            .personas
+            .first()
+            .map(|p| p.id.clone())
+            .unwrap_or_else(|| "cli-user".to_string());
+
+        let response = ApprovalResponse {
+            request_id: request_id.to_string(),
+            status: ApprovalStatus::Approved,
+            resolver_id,
+            resolved_at: now_epoch_secs(),
+            narrowed_scope: None,
+            denial_reason: None,
+            granted_duration_secs: duration,
+        };
+
+        match self
+            .app_runtime
+            .store
+            .resolve_approval_request(request_id, &response)
+        {
+            Ok(()) => format!("approved\t{}\n", request_id),
+            Err(err) => format!("Failed to approve request: {}\n", err),
+        }
+    }
+
+    fn handle_grant_requests_deny(&mut self, request_id: &str, tokens: &[&str]) -> String {
+        let mut reason: Option<String> = None;
+        let mut i = 0;
+        while i < tokens.len() {
+            match tokens[i] {
+                "--reason" if i + 1 < tokens.len() => {
+                    reason = Some(tokens[i + 1..].join(" "));
+                    break;
+                }
+                _ => i += 1,
+            }
+        }
+
+        if reason.is_none() {
+            return "Usage: grant requests deny <id> --reason <reason>\n".to_string();
+        }
+
+        let resolver_id = self
+            .personas
+            .first()
+            .map(|p| p.id.clone())
+            .unwrap_or_else(|| "cli-user".to_string());
+
+        let response = ApprovalResponse {
+            request_id: request_id.to_string(),
+            status: ApprovalStatus::Denied,
+            resolver_id,
+            resolved_at: now_epoch_secs(),
+            narrowed_scope: None,
+            denial_reason: reason,
+            granted_duration_secs: None,
+        };
+
+        match self
+            .app_runtime
+            .store
+            .resolve_approval_request(request_id, &response)
+        {
+            Ok(()) => format!("denied\t{}\n", request_id),
+            Err(err) => format!("Failed to deny request: {}\n", err),
         }
     }
 

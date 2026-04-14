@@ -1,8 +1,8 @@
 use core_types::{
-    EventBody, GuardianEnrolledEvent, RecoveryApproval, RecoveryApprovedEvent,
-    RecoveryContestedEvent, RecoveryExecutedEvent, RecoveryExecution, RecoveryPolicy,
-    RecoveryPolicyCreatedEvent, RecoveryRejectedEvent, RecoveryRequest, RecoveryRequestedEvent,
-    RecoveryScope,
+    EventBody, GuardianEnrolledEvent, GuardianKeyRotatedEvent, RecoveryApproval,
+    RecoveryApprovedEvent, RecoveryContestedEvent, RecoveryExecutedEvent, RecoveryExecution,
+    RecoveryPolicy, RecoveryPolicyCreatedEvent, RecoveryRejectedEvent, RecoveryRequest,
+    RecoveryRequestedEvent, RecoveryScope,
 };
 
 pub fn create_policy(
@@ -59,6 +59,20 @@ pub fn guardian_enrolled_event(
         guardian_id: guardian_id.into(),
         guardian_label: guardian_label.into(),
         guardian_public_key: guardian_public_key.into(),
+    })
+}
+
+pub fn guardian_key_rotated_event(
+    root_id: impl Into<String>,
+    guardian_id: impl Into<String>,
+    previous_key_id: impl Into<String>,
+    new_guardian_public_key: impl Into<String>,
+) -> EventBody {
+    EventBody::GuardianKeyRotated(GuardianKeyRotatedEvent {
+        guardian_id: guardian_id.into(),
+        root_id: root_id.into(),
+        previous_key_id: previous_key_id.into(),
+        new_guardian_public_key: new_guardian_public_key.into(),
     })
 }
 
@@ -217,6 +231,25 @@ mod tests {
             execution.executed_scope,
             RecoveryScope::FreezeDevice
         ));
+    }
+
+    #[test]
+    fn guardian_key_rotated_event_emits_typed_event() {
+        let rotated = guardian_key_rotated_event(
+            "root-a",
+            "guardian-alex",
+            "guardian-key-alex",
+            "guardian-key-alex-v2",
+        );
+        assert_eq!(rotated.event_type(), EventType::GuardianKeyRotated);
+        if let EventBody::GuardianKeyRotated(e) = &rotated {
+            assert_eq!(e.root_id, "root-a");
+            assert_eq!(e.guardian_id, "guardian-alex");
+            assert_eq!(e.previous_key_id, "guardian-key-alex");
+            assert_eq!(e.new_guardian_public_key, "guardian-key-alex-v2");
+        } else {
+            panic!("expected GuardianKeyRotated");
+        }
     }
 
     #[test]

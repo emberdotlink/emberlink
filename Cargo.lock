@@ -264,7 +264,7 @@ dependencies = [
 
 [[package]]
 name = "core-crypto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "age",
  "chacha20poly1305",
@@ -279,7 +279,7 @@ dependencies = [
 
 [[package]]
 name = "core-eventlog"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "core-crypto",
  "core-events",
@@ -290,7 +290,7 @@ dependencies = [
 
 [[package]]
 name = "core-events"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "core-crypto",
  "core-types",
@@ -298,32 +298,32 @@ dependencies = [
 
 [[package]]
 name = "core-identity"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "core-types",
 ]
 
 [[package]]
 name = "core-personas"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "core-types",
 ]
 
 [[package]]
 name = "core-policy"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "core-recovery"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "core-types",
 ]
 
 [[package]]
 name = "core-state"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "ciborium",
@@ -345,7 +345,7 @@ dependencies = [
 
 [[package]]
 name = "core-storage"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "core-crypto",
  "core-types",
@@ -354,7 +354,7 @@ dependencies = [
 
 [[package]]
 name = "core-sync"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "core-crypto",
  "core-events",
@@ -366,7 +366,7 @@ dependencies = [
 
 [[package]]
 name = "core-trust"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "core-crypto",
  "core-events",
@@ -377,7 +377,7 @@ dependencies = [
 
 [[package]]
 name = "core-types"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base45",
  "ciborium",
@@ -460,6 +460,12 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "data-encoding"
+version = "2.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7a1e2f27636f116493b8b860f5546edb47c8d8f8ea73e1d2a20be88e28d1fea"
 
 [[package]]
 name = "der"
@@ -548,19 +554,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "emberlink"
+version = "0.2.0"
+
+[[package]]
 name = "emberlink-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "core-state",
  "core-types",
  "serde",
  "serde_json",
  "tokio",
+ "tungstenite",
 ]
 
 [[package]]
 name = "emberlink-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "core-crypto",
  "core-eventlog",
@@ -577,7 +588,7 @@ dependencies = [
 
 [[package]]
 name = "emberlink-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "core-crypto",
@@ -596,12 +607,12 @@ dependencies = [
  "keyring",
  "rustls",
  "serde_json",
- "webpki-roots 0.26.11",
+ "webpki-roots",
 ]
 
 [[package]]
 name = "emberlink-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "core-state",
  "core-types",
@@ -613,7 +624,7 @@ dependencies = [
 
 [[package]]
 name = "emberlink-relay"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "core-crypto",
  "core-sync",
@@ -623,7 +634,8 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustls-pemfile",
- "webpki-roots 0.26.11",
+ "tungstenite",
+ "webpki-roots",
 ]
 
 [[package]]
@@ -722,7 +734,7 @@ version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a530c4694a6a8d528794ee9bbd8ba0122e779629ac908d15ad5a7ae7763a33d"
 dependencies = [
- "thiserror",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -948,6 +960,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "http"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3ba2a386d7f85a81f119ad7498ebe444d2e22c2af0b86b069416ace48b3311a"
+dependencies = [
+ "bytes",
+ "itoa",
+]
+
+[[package]]
+name = "httparse"
+version = "1.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
+
+[[package]]
 name = "i18n-config"
 version = "0.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -957,7 +985,7 @@ dependencies = [
  "log",
  "serde",
  "serde_derive",
- "thiserror",
+ "thiserror 1.0.69",
  "unic-langid",
 ]
 
@@ -976,7 +1004,7 @@ dependencies = [
  "log",
  "parking_lot",
  "rust-embed",
- "thiserror",
+ "thiserror 1.0.69",
  "unic-langid",
  "walkdir",
 ]
@@ -1495,7 +1523,7 @@ checksum = "ba009ff324d1fc1b900bd1fdb31564febe58a8ccc8a6fdbb93b543d33b13ca43"
 dependencies = [
  "getrandom 0.2.17",
  "libredox",
- "thiserror",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -1805,6 +1833,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1894,7 +1933,16 @@ version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
 dependencies = [
- "thiserror-impl",
+ "thiserror-impl 1.0.69",
+]
+
+[[package]]
+name = "thiserror"
+version = "2.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4288b5bcbc7920c07a1149a35cf9590a2aa808e0bc1eafaade0b80947865fbc4"
+dependencies = [
+ "thiserror-impl 2.0.18",
 ]
 
 [[package]]
@@ -1902,6 +1950,17 @@ name = "thiserror-impl"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "2.0.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ebc4ee7f67670e9b64d05fa4253e753e016c6c95ff35b89b7941d6b856dec1d5"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1967,6 +2026,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f4f7f0dd8d50a853a531c426359045b1998f04219d88799810762cd4ad314234"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "tungstenite"
+version = "0.26.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4793cb5e56680ecbb1d843515b23b6de9a75eb04b66643e256a396d43be33c13"
+dependencies = [
+ "bytes",
+ "data-encoding",
+ "http",
+ "httparse",
+ "log",
+ "rand 0.9.3",
+ "sha1",
+ "thiserror 2.0.18",
+ "utf-8",
 ]
 
 [[package]]
@@ -2042,6 +2118,12 @@ name = "urlencoding"
 version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
+
+[[package]]
+name = "utf-8"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09cc8ee72d2a9becf2f2febe0205bbed8fc6615b7cb429ad062dc7b7ddd036a9"
 
 [[package]]
 name = "vcpkg"
@@ -2175,15 +2257,6 @@ dependencies = [
  "hashbrown 0.15.5",
  "indexmap",
  "semver",
-]
-
-[[package]]
-name = "webpki-roots"
-version = "0.26.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
-dependencies = [
- "webpki-roots 1.0.6",
 ]
 
 [[package]]

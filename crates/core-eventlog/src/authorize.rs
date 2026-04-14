@@ -109,6 +109,19 @@ impl Authorizer for IdentityAuthorizer {
             EventBody::GuardianEnrolled(body) => {
                 authorize_root_key(&event.signer_binding, &body.root_id, state)
             }
+            EventBody::GuardianKeyRotated(body) => {
+                // Root can rotate a guardian's key (same authority as enrollment).
+                // Guardian can also rotate their own key using their current key.
+                if authorize_root_key(&event.signer_binding, &body.root_id, state).is_ok() {
+                    return Ok(());
+                }
+                authorize_enrolled_guardian(
+                    &event.signer_binding,
+                    &body.guardian_id,
+                    &body.root_id,
+                    state,
+                )
+            }
             EventBody::RecoveryApproved(body) => {
                 if event.signer_binding.role != KeyRole::Guardian {
                     return Err(ValidationError::unauthorized(

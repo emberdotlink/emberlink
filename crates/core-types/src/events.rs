@@ -359,6 +359,14 @@ pub struct GuardianEnrolledEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardianKeyRotatedEvent {
+    pub guardian_id: String,
+    pub root_id: String,
+    pub previous_key_id: String,
+    pub new_guardian_public_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryRequestedEvent {
     pub request_id: String,
     pub root_id: String,
@@ -669,6 +677,7 @@ pub enum EventBody {
     TrustRevoked(TrustRevokedEvent),
     RecoveryPolicyCreated(RecoveryPolicyCreatedEvent),
     GuardianEnrolled(GuardianEnrolledEvent),
+    GuardianKeyRotated(GuardianKeyRotatedEvent),
     RecoveryRequested(RecoveryRequestedEvent),
     RecoveryApproved(RecoveryApprovedEvent),
     RecoveryContested(RecoveryContestedEvent),
@@ -717,6 +726,7 @@ impl EventBody {
             Self::TrustRevoked(_) => EventType::TrustRevoked,
             Self::RecoveryPolicyCreated(_) => EventType::RecoveryPolicyCreated,
             Self::GuardianEnrolled(_) => EventType::GuardianEnrolled,
+            Self::GuardianKeyRotated(_) => EventType::GuardianKeyRotated,
             Self::RecoveryRequested(_) => EventType::RecoveryRequested,
             Self::RecoveryApproved(_) => EventType::RecoveryApproved,
             Self::RecoveryContested(_) => EventType::RecoveryContested,
@@ -761,6 +771,7 @@ impl EventBody {
             Self::TrustRevoked(body) => EventSubject::persona(body.attester_persona_id.clone()),
             Self::RecoveryPolicyCreated(body) => EventSubject::root(body.root_id.clone()),
             Self::GuardianEnrolled(body) => EventSubject::guardian(body.guardian_id.clone()),
+            Self::GuardianKeyRotated(body) => EventSubject::guardian(body.guardian_id.clone()),
             Self::RecoveryRequested(body) => {
                 EventSubject::recovery_request(body.request_id.clone())
             }
@@ -937,6 +948,12 @@ impl EventBody {
                 guardian_id: required_field(&fields, "guardian_id")?,
                 guardian_label: required_field(&fields, "guardian_label")?,
                 guardian_public_key: required_field(&fields, "guardian_public_key")?,
+            })),
+            "guardian-key-rotated" => Ok(Self::GuardianKeyRotated(GuardianKeyRotatedEvent {
+                guardian_id: required_field(&fields, "guardian_id")?,
+                root_id: required_field(&fields, "root_id")?,
+                previous_key_id: required_field(&fields, "previous_key_id")?,
+                new_guardian_public_key: required_field(&fields, "new_guardian_public_key")?,
             })),
             "recovery-requested" => Ok(Self::RecoveryRequested(RecoveryRequestedEvent {
                 request_id: required_field(&fields, "request_id")?,
@@ -1196,6 +1213,7 @@ pub enum EventType {
     RecoveryPolicyCreated,
     RecoveryPolicyUpdated,
     GuardianEnrolled,
+    GuardianKeyRotated,
     RecoveryRequested,
     RecoveryApproved,
     RecoveryContested,
@@ -1248,6 +1266,7 @@ impl EventType {
             Self::RecoveryPolicyCreated => "recovery_policy_created",
             Self::RecoveryPolicyUpdated => "recovery_policy_updated",
             Self::GuardianEnrolled => "guardian_enrolled",
+            Self::GuardianKeyRotated => "guardian_key_rotated",
             Self::RecoveryRequested => "recovery_requested",
             Self::RecoveryApproved => "recovery_approved",
             Self::RecoveryContested => "recovery_contested",
@@ -1300,6 +1319,7 @@ impl EventType {
             "recovery_policy_created" => Some(Self::RecoveryPolicyCreated),
             "recovery_policy_updated" => Some(Self::RecoveryPolicyUpdated),
             "guardian_enrolled" => Some(Self::GuardianEnrolled),
+            "guardian_key_rotated" => Some(Self::GuardianKeyRotated),
             "recovery_requested" => Some(Self::RecoveryRequested),
             "recovery_approved" => Some(Self::RecoveryApproved),
             "recovery_contested" => Some(Self::RecoveryContested),
@@ -1380,7 +1400,8 @@ impl EventType {
             Self::RootKeyRotated
             | Self::DeviceKeyRotated
             | Self::DeviceEncryptionKeyRotated
-            | Self::PersonaKeyRotated => RetentionClass::Permanent,
+            | Self::PersonaKeyRotated
+            | Self::GuardianKeyRotated => RetentionClass::Permanent,
 
             // Active protocol state — meaningful until superseded
             Self::TrustAttested
@@ -1595,6 +1616,21 @@ impl Validate for GuardianEnrolledEvent {
         validate_non_empty(&self.guardian_id, "guardian id")?;
         validate_non_empty(&self.guardian_label, "guardian label")?;
         validate_non_empty(&self.guardian_public_key, "guardian public key")
+    }
+}
+
+impl Validate for GuardianKeyRotatedEvent {
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_non_empty(&self.guardian_id, "guardian id")?;
+        validate_non_empty(&self.root_id, "root id")?;
+        validate_non_empty(&self.previous_key_id, "previous key id")?;
+        validate_non_empty(&self.new_guardian_public_key, "new guardian public key")?;
+        if self.previous_key_id == self.new_guardian_public_key {
+            return Err(ValidationError::state_violation(
+                "rotated guardian key must change key id",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1885,6 +1921,7 @@ impl Validate for EventBody {
             Self::TrustRevoked(body) => body.validate(),
             Self::RecoveryPolicyCreated(body) => body.validate(),
             Self::GuardianEnrolled(body) => body.validate(),
+            Self::GuardianKeyRotated(body) => body.validate(),
             Self::RecoveryRequested(body) => body.validate(),
             Self::RecoveryApproved(body) => body.validate(),
             Self::RecoveryContested(body) => body.validate(),
@@ -2111,6 +2148,18 @@ impl CanonicalEncode for EventBody {
                     ("guardian_id", body.guardian_id.clone()),
                     ("guardian_label", body.guardian_label.clone()),
                     ("guardian_public_key", body.guardian_public_key.clone()),
+                ],
+            ),
+            Self::GuardianKeyRotated(body) => canonical_record(
+                "guardian-key-rotated",
+                &[
+                    ("guardian_id", body.guardian_id.clone()),
+                    ("root_id", body.root_id.clone()),
+                    ("previous_key_id", body.previous_key_id.clone()),
+                    (
+                        "new_guardian_public_key",
+                        body.new_guardian_public_key.clone(),
+                    ),
                 ],
             ),
             Self::RecoveryRequested(body) => canonical_record(
@@ -2404,6 +2453,7 @@ impl_typed_event_canonical_encode!(PersonaKeyRotatedEvent, PersonaKeyRotated);
 impl_typed_event_canonical_encode!(PersonaRevokedEvent, PersonaRevoked);
 impl_typed_event_canonical_encode!(RecoveryPolicyCreatedEvent, RecoveryPolicyCreated);
 impl_typed_event_canonical_encode!(GuardianEnrolledEvent, GuardianEnrolled);
+impl_typed_event_canonical_encode!(GuardianKeyRotatedEvent, GuardianKeyRotated);
 impl_typed_event_canonical_encode!(RecoveryRequestedEvent, RecoveryRequested);
 impl_typed_event_canonical_encode!(RecoveryApprovedEvent, RecoveryApproved);
 impl_typed_event_canonical_encode!(RecoveryContestedEvent, RecoveryContested);
@@ -2452,6 +2502,7 @@ mod retention_tests {
         EventType::RecoveryPolicyCreated,
         EventType::RecoveryPolicyUpdated,
         EventType::GuardianEnrolled,
+        EventType::GuardianKeyRotated,
         EventType::RecoveryRequested,
         EventType::RecoveryApproved,
         EventType::RecoveryContested,
@@ -2500,6 +2551,7 @@ mod retention_tests {
             EventType::DeviceKeyRotated,
             EventType::DeviceEncryptionKeyRotated,
             EventType::PersonaKeyRotated,
+            EventType::GuardianKeyRotated,
         ];
         for et in permanent {
             assert_eq!(

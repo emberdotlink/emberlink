@@ -99,6 +99,16 @@ pub struct LocalBlockRecord {
     pub ciphertext_bytes: u64,
 }
 
+/// Deserialized row from the `credential_access_log` table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialAccessEntry {
+    pub grant_id: String,
+    pub agent_id: String,
+    pub accessed_at: i64,
+    pub scope: String,
+    pub outcome: String,
+}
+
 /// Deserialized row from the `approval_requests` table.
 #[derive(Debug, Clone)]
 pub struct ApprovalRequestRow {
@@ -1666,6 +1676,61 @@ impl EventStore {
             .unwrap_or(0);
         persist::revoke_credential_deposit(&self.conn, grant_id, reason, now)
     }
+
+    // --- Credential access audit log ---
+
+    /// Log a credential access attempt (granted or denied) by an agent.
+    pub fn log_credential_access(
+        &self,
+        grant_id: &str,
+        agent_id: &str,
+        scope: &str,
+        outcome: &str,
+    ) -> Result<(), ValidationError> {
+        let accessed_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        self.conn
+            .execute(
+                "INSERT INTO credential_access_log (grant_id, agent_id, accessed_at, scope, outcome)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![grant_id, agent_id, accessed_at, scope, outcome],
+            )
+            .map_err(|err| ValidationError::new(format!("log credential access: {err}")))?;
+        Ok(())
+    }
+
+    /// Query the credential access log for a specific grant, ordered oldest-first.
+    pub fn get_credential_access_log(
+        &self,
+        grant_id: &str,
+    ) -> Result<Vec<CredentialAccessEntry>, ValidationError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT grant_id, agent_id, accessed_at, scope, outcome
+                 FROM credential_access_log
+                 WHERE grant_id = ?1
+                 ORDER BY accessed_at ASC",
+            )
+            .map_err(|err| ValidationError::new(format!("prepare credential_access_log query: {err}")))?;
+        let rows = stmt
+            .query_map(params![grant_id], |row| {
+                Ok(CredentialAccessEntry {
+                    grant_id: row.get(0)?,
+                    agent_id: row.get(1)?,
+                    accessed_at: row.get(2)?,
+                    scope: row.get(3)?,
+                    outcome: row.get(4)?,
+                })
+            })
+            .map_err(|err| ValidationError::new(format!("query credential_access_log: {err}")))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| ValidationError::new(format!("collect credential_access_log rows: {err}")))?;
+        Ok(rows)
+    }
+
 
     // --- Approval queue ---
 

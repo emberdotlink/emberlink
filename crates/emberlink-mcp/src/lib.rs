@@ -380,10 +380,11 @@ mod tests {
         let resp = server.handle_request(&req).unwrap();
         assert!(resp.error.is_none());
         let result = resp.result.unwrap();
-        // request_grant returns isError=true with PENDING_APPROVAL message
-        assert_eq!(result["isError"], true);
+        // request_grant now creates a real approval request and returns pending status
         let text = result["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("awaiting human approval"));
+        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["status"], "pending");
+        assert!(parsed["request_id"].as_str().unwrap().starts_with("req-"));
     }
 
     #[test]

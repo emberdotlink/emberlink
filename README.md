@@ -1,68 +1,63 @@
 # Emberlink
 
-Local-first identity brokerage with cryptographic multi-root identities, persona-scoped credentials, social trust, guardian recovery, privacy-preserving selective disclosure, and encrypted peer storage.
+Programmable trust between humans and machines.
 
-## Architecture
+A person saves a credential, clicks Link, and a QR code appears. A second person
+scans it with their phone. A passkey ceremony sets up their device on the spot.
+They're linked. The credential arrives. The first person can unlink at any time.
+No server brokered the exchange. No account was required on either side.
 
-The Rust workspace contains the protocol, runtime, domain, CLI, relay, and application crates listed in `Cargo.toml`.
+## The link
 
-## Build and test
+The link is the primitive. A persistent, inspectable, revocable connection between
+two parties — scoped to specific access, time-bound, signed by the issuer, encrypted
+for the recipient. Exchange it over any transport: QR, deep link, NFC, local network.
+No relay required. No blockchain. No validator.
 
-```bash
-cargo build                    # Build all crates
-cargo test                     # Run all tests
-cargo clippy --workspace       # Lint (must be zero warnings)
-```
+The same primitive works whether the recipient is a friend, an AI agent, a service,
+or a device you own. The issuer stays in control. Unlink anytime. The protocol is open.
 
-## CLI
+## Surfaces
 
-Interactive shell for identity management, credential brokerage, and peer sync.
+**Extension** — Install in Chrome. Create an identity via passkey. Save a credential.
+Click Link to generate a QR code.
 
-```bash
-cargo run -p emberlink-cli
-```
+**Web** (`ember.link`) — Scans open here. A passkey ceremony sets up the recipient's
+device in the browser. The link activates. A card appears showing who linked you,
+what access you have, and when it expires.
 
-### Getting started
+**Mobile** — Approval surface. When an agent or service requests access, your phone
+gets the request. You approve or deny from the lock screen.
 
-```bash
-# First-launch guided setup (root + device + persona)
-init --name "Alice"
+**Agent SDK** — TypeScript and Python SDKs, plus an MCP server. AI agents request
+named credentials by access type. The check is local. The secret never leaves the
+device unless the link allows it.
 
-# Or create components individually
-root create --name "Alice"
-device add --root alice --label laptop
-persona create --root alice --label Work --template professional
-```
+## Vocabulary
 
-### Key command categories
+Emberlink uses a deliberate vocabulary stack:
 
-| Category | Examples |
-|----------|---------|
-| **Identity** | `root create`, `device add`, `persona create`, `persona grant-device` |
-| **Trust** | `trust attest`, `trust revoke`, `show trust` |
-| **Vault & Disclosure** | `vault write-record`, `vault issue`, `disclose --from --to --template` |
-| **Credentials** | `claim store`, `claim list`, `claim disclose` |
-| **Passkeys** | `passkey register`, `passkey authenticate`, `passkey list` |
-| **Services** | `service bind`, `service list`, `service unbind` |
-| **Import** | `import passwords --format bitwarden\|1password --file export.csv` |
-| **Recovery** | `recovery guardian-enroll`, `recovery request`, `recovery execute` |
-| **Sync** | `sync send`, `sync receive`, `sync mutual`, `sync relay-cycle` |
-| **Storage** | `vault store --file`, `vault export-file`, `storage audit` |
-| **Invites** | `invite create`, `invite accept` |
+| You see | Protocol calls it |
+|---------|------------------|
+| link | grant |
+| unlink | revoke |
+| accept | claim |
+| access | scope |
+| profile | persona |
 
-Run `help` inside the shell for the full command reference.
+User-facing surfaces speak in relationships. Developer APIs speak in protocol.
 
-## Relay
-
-Headless daemon for asynchronous peer-to-peer message delivery.
+## Build
 
 ```bash
-cargo run -p emberlink-relay -- --mode open
-cargo run -p emberlink-relay -- --mode trust-gated --threshold 0.5
-cargo run -p emberlink-relay -- --mode network-scoped --allow persona-alice
+cargo build
+cargo test
+cargo clippy --workspace
 ```
 
-Supports TLS (self-signed by default, or bring your own certs), per-peer and global mailbox quotas, and graceful shutdown. See `--help` for all options.
+## Docs
+
+Brand thesis in [MANIFESTO.md](MANIFESTO.md).
 
 ## License
 

@@ -76,13 +76,6 @@ The barrier is nothing: a basic smartphone, a network connection, a camera (or N
 
 QR codes, deep links, NFC taps, shared URLs, printed cards — these are all vehicles for the same primitive: a grant link (design) that carries everything needed to onboard in one interaction.
 
-## The app layer
-
-Protocol is the base. Clients are the runtime. Apps are portable WebAssembly payloads.
-
-WASM apps run on top of the identity and trust layer. Each benefits from every identity already in the network. No new account per app. No social graph rebuild. Identity, reputation, and trust relationships travel with you.
-
-Distribution is trust-based: apps are published by identities with reputation from the social graph. Trust graph convergence replaces app store review. The web of trust that secures identity delegation is the same web of trust that filters the app ecosystem.
 
 ## Permissionless communities
 
@@ -102,6 +95,14 @@ Engaged participants earn the right to physically expand the network. At a reput
 
 Communities pool to claim territory — crowdfund onboarding materials, get permanent founding credit in the badge graph. Marketing cost scales with engagement, not ad spend.
 
+## Can't, not won't
+
+The difference between "can't" and "won't" is architectural. "Won't" is a policy — it changes under pressure, under a subpoena, under a board vote. "Can't" is structure. Build systems that are incapable of the thing you don't want, and you never have to trust anyone's promise not to do it (design).
+
+The protocol has no censorship surface. No transaction blocklist. No admin kill switch on participation. No central server that could be compelled to block a grant exchange. It is structurally incapable of preventing a valid interaction between two identities, the same way TCP is structurally incapable of refusing a packet based on its contents.
+
+Accountability still exists — on the individual. Each participant is responsible for their own transactions and who they transact with, mediated by their trust graph. The protocol doesn't enforce that. The protocol *can't* enforce that. That's the point.
+
 ## The escape vector
 
 This is bigger than a company. The protocol is open. Identities belong to their creators. If Emberlink disappeared tomorrow, every community, badge, and trust relationship would still work. Nothing to shut down. Nothing to acquire. Nothing to enshittify.
@@ -110,10 +111,10 @@ The protocol outlives all of us. That's the point.
 
 ## Design principles
 
-- **The first experience is receiving, not creating.** Someone shares something with you, or you scan a code on a wall. You claim it. You exist. Generosity pulls people in. Reciprocity keeps them.
-- **The home screen is your trust network.** Who trusts you with what. Who you trust with what. Active agents. Pending approvals. "Who knows what now?"
-- **Sharing is the core interaction.** Scoped, time-bound, one action — as fast as sending a Venmo payment.
-- **Revocation is a feature, not a failure.** Every revocation that works builds trust.
+- **The first experience is receiving, not creating.** Someone links you to something, or you scan a code on a wall. You accept it. You exist. Generosity pulls people in. Reciprocity keeps them.
+- **The home screen is your trust network.** Who's linked to you. Who you're linked to. Active agents. Pending approvals. "Who knows what now?"
+- **Linking is the core interaction.** Scoped, time-bound, one action — as fast as sending a Venmo payment. A link is a persistent connection, not a one-time transfer.
+- **Unlinking is a feature, not a failure.** Every unlink that works builds trust.
 - **Recovery is social onboarding.** Adding a guardian is an invitation. Security features are growth features.
 - **Agents are a multiplier, not the foundation.** Humans grow the network. Agents make each human 10x more active.
 - **The network grows from the ground up.** Not from a launch event. From one person telling another.
@@ -126,6 +127,8 @@ The grant primitive composes:
 - **Transitive delegation.** Alice grants Bob disclosure rights. Bob acts within Alice's scope. Alice watches. Alice revokes anytime.
 - **Threshold co-authorization.** N-of-M parties must independently authorize before an action proceeds.
 - **Conditional autonomous delegation.** Agent gets purchasing authority with spending limits, vendor allow-lists, time windows. Exceeds bounds, enforcement stops it.
+- **Just-in-time escalation.** Request elevated access, a designated approver signs approval from their phone, the grant is time-bound and auto-revokes. The same guardian pattern that secures recovery secures production database access, household spending limits, and WiFi password sharing (design).
+- **Rotating credentials.** Grants reference living credentials that rotate on a schedule. Active grantees get the new version. Revoked grantees don't. Your WiFi password rotates weekly; your approved guests always have the current one.
 - **Flash coalitions.** Strangers pool single-use disclosure grants to collectively prove something without revealing individual data. Grants self-destruct after proof.
 - **Proxy actions.** Act on my behalf, within these bounds, and I can see everything you did.
 

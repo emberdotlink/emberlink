@@ -1,5 +1,6 @@
 mod activity_support;
 mod commands;
+mod recovery;
 mod screens;
 mod sync_support;
 mod vault_support;

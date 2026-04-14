@@ -1,0 +1,35 @@
+{
+  "name": "@emberlink/agent",
+  "description": "TypeScript SDK for the Emberlink agent authorization protocol",
+  "homepage": "https://github.com/emberdotlink/emberlink",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/emberdotlink/emberlink.git",
+    "directory": "packages/agent-sdk-ts"
+  },
+  "license": "MIT",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "tsc --project tsconfig.test.json && node --test dist-test/tests/integration.test.js"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^6.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

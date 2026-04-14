@@ -581,6 +581,7 @@ fn is_event_relevant_to_context(event: &EventEnvelope, context: &LightSyncContex
         EventBody::RootRevoked(body) => context.root_ids.contains(&body.root_id),
         EventBody::RecoveryPolicyCreated(body) => context.root_ids.contains(&body.root_id),
         EventBody::GuardianEnrolled(body) => context.root_ids.contains(&body.root_id),
+        EventBody::GuardianKeyRotated(body) => context.root_ids.contains(&body.root_id),
         EventBody::DeviceAdded(body) => {
             context.root_ids.contains(&body.root_id) || context.device_ids.contains(&body.device_id)
         }

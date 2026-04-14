@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/emberlink",
     "crates/emberlink-agent",
     "crates/emberlink-mcp",
     "crates/emberlink-app",
@@ -23,4 +24,4 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 license = "MIT OR Apache-2.0"
-version = "0.1.0"
+version = "0.2.0"

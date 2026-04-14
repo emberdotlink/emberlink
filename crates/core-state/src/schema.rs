@@ -412,6 +412,17 @@ CREATE TABLE IF NOT EXISTS approval_requests (
 );
 CREATE INDEX IF NOT EXISTS idx_approval_requests_status ON approval_requests(status);
 CREATE INDEX IF NOT EXISTS idx_approval_requests_requester ON approval_requests(requester_id);
+
+CREATE TABLE IF NOT EXISTS credential_access_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    grant_id    TEXT NOT NULL,
+    agent_id    TEXT NOT NULL,
+    accessed_at INTEGER NOT NULL,
+    scope       TEXT NOT NULL,
+    outcome     TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_credential_access_log_grant ON credential_access_log(grant_id);
 "#;
 
 pub(crate) fn ensure_runtime_columns(conn: &Connection) -> Result<(), ValidationError> {
@@ -659,6 +670,20 @@ pub(crate) fn ensure_runtime_columns(conn: &Connection) -> Result<(), Validation
     )
     .map_err(|err| ValidationError::new(format!("ensure credential_deposits table: {err}")))?;
 
+    // Ensure credential_access_log table exists for existing databases.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS credential_access_log (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            grant_id    TEXT NOT NULL,
+            agent_id    TEXT NOT NULL,
+            accessed_at INTEGER NOT NULL,
+            scope       TEXT NOT NULL,
+            outcome     TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_credential_access_log_grant ON credential_access_log(grant_id);",
+    )
+    .map_err(|err| ValidationError::new(format!("ensure credential_access_log table: {err}")))?;
+
     // Ensure approval_requests table exists for existing databases.
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS approval_requests (
@@ -679,6 +704,21 @@ pub(crate) fn ensure_runtime_columns(conn: &Connection) -> Result<(), Validation
         CREATE INDEX IF NOT EXISTS idx_approval_requests_requester ON approval_requests(requester_id);",
     )
     .map_err(|err| ValidationError::new(format!("ensure approval_requests table: {err}")))?;
+
+    // Ensure credential_access_log table exists for existing databases.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS credential_access_log (
+            log_id TEXT NOT NULL PRIMARY KEY,
+            grant_id TEXT NOT NULL,
+            agent_id TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            accessed_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_credential_access_log_grant ON credential_access_log(grant_id);
+        CREATE INDEX IF NOT EXISTS idx_credential_access_log_agent ON credential_access_log(agent_id);",
+    )
+    .map_err(|err| ValidationError::new(format!("ensure credential_access_log table: {err}")))?;
 
     Ok(())
 }
