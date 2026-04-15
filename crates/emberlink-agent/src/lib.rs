@@ -9,4 +9,7 @@
 
 pub mod protocol;
 pub mod relay;
+pub mod revocation;
 pub mod runtime;
+#[cfg(unix)]
+pub mod socket_transport;

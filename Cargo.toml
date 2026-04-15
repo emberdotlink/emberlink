@@ -18,6 +18,7 @@ members = [
     "crates/core-recovery",
     "crates/core-sync",
     "crates/core-storage",
+    "crates/ember-daemon",
 ]
 resolver = "2"
 

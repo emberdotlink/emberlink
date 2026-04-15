@@ -1,3 +1,5 @@
+pub mod secret_handle;
+
 use age::Decryptor;
 use age::secrecy::ExposeSecret;
 use chacha20poly1305::aead::{Aead, Payload};

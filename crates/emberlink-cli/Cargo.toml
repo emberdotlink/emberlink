@@ -4,6 +4,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "emberlink-cli"
+path = "src/main.rs"
+
+[[bin]]
+name = "ember"
+path = "src/bin/ember.rs"
+
 [dependencies]
 core-crypto = { path = "../core-crypto" }
 core-events = { path = "../core-events" }
@@ -18,8 +26,12 @@ core-storage = { path = "../core-storage" }
 core-trust = { path = "../core-trust" }
 core-types = { path = "../core-types" }
 base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
 dirs-next = "2"
+ember-daemon = { path = "../ember-daemon" }
 keyring = "3"
 serde_json = "1"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+tokio = { version = "1", features = ["full"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 webpki-roots = "1.0"
