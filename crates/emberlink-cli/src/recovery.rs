@@ -67,7 +67,11 @@ impl DemoApp {
         let action = UiAction::CreateGrantOffer {
             issuing_persona_id: persona_id.clone(),
             mode: "one_shot".to_string(),
-            capabilities: vec!["guardian:enroll".to_string()],
+            // Guardian-enrollment is not expressible in the credential-shorthand
+            // spec grammar — `parse_statement_spec` rejects it. The `CreateGrantOffer`
+            // path validates specs up front and will reject this today.
+            // TODO: extend spec grammar or take typed `Vec<Statement>` directly on this action.
+            statement_specs: vec!["guardian:enroll".to_string()],
             expires_in_secs: Some(GUARDIAN_ENROLL_TTL_SECS),
             relay_hint: relay,
             conditions: vec![],

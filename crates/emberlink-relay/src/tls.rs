@@ -39,10 +39,24 @@ pub fn build_server_config(mode: &TlsMode) -> Result<Option<Arc<ServerConfig>>, 
     }
 }
 
+/// Install the rustls ring crypto provider as the process default. rustls 0.23
+/// no longer auto-selects a provider from enabled features; callers must
+/// install one before the first `ServerConfig::builder()`. Idempotent across
+/// parallel tests and repeat calls via `Once`.
+fn ensure_rustls_provider_installed() {
+    use std::sync::Once;
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        // Ignore `Err` — means a provider was installed by another path earlier.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 fn server_config_from_parts(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
 ) -> Result<ServerConfig, String> {
+    ensure_rustls_provider_installed();
     ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
@@ -56,8 +70,9 @@ fn generate_self_signed_cert()
         .map_err(|err| format!("generate self-signed cert: {err}"))?;
 
     let cert_der = CertificateDer::from(cert.cert.der().to_vec());
+    // rcgen 0.14 renamed `CertifiedKey::key_pair` → `signing_key`.
     let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-        cert.key_pair.serialize_der().to_vec(),
+        cert.signing_key.serialize_der().to_vec(),
     ));
 
     Ok((vec![cert_der], key_der))

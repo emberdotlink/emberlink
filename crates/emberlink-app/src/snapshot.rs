@@ -126,6 +126,10 @@ pub struct BadgeGalleryEntry {
 }
 
 /// Summary view of a grant for list displays.
+///
+/// Composite-grant shape per design: statements are enumerated across all
+/// blocks in the chain; distinct resource_types are surfaced for the persona
+/// chip / badge rendering.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct GrantSummaryView {
     pub id: String,
@@ -136,12 +140,22 @@ pub struct GrantSummaryView {
     pub recipient_profile: String,
     pub status: String,
     pub mode: String,
-    pub capability_count: usize,
+    pub block_count: usize,
+    pub statement_count: usize,
+    /// Distinct resource types across all statements, first-seen order. Used
+    /// by the dashboard to render persona chip badges.
+    pub resource_types: Vec<String>,
+    /// Effective chain expiry — earliest `expires_at` across all blocks.
     pub expires_at: Option<u64>,
     pub last_used_at: Option<u64>,
 }
 
 /// Full grant detail including lifecycle history.
+///
+/// Composite-grant shape per design: `blocks` is the signed, append-only
+/// chain; each block carries typed `Statement`s with per-statement budgets,
+/// resource selectors, and conditions. Envelope-level `not_before`/
+/// `renewable_until` are gone — that metadata lives on blocks now.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct GrantDetailView {
     pub id: String,
@@ -153,17 +167,34 @@ pub struct GrantDetailView {
     pub recipient_profile: String,
     pub status: String,
     pub mode: String,
-    pub capabilities: Vec<String>,
+    pub blocks: Vec<BlockView>,
     pub created_at: u64,
     pub updated_at: u64,
-    pub not_before: Option<u64>,
+    /// Effective chain expiry — earliest `expires_at` across all blocks.
     pub expires_at: Option<u64>,
-    pub renewable_until: Option<u64>,
     pub revoked_at: Option<u64>,
     pub revoked_reason: Option<String>,
     pub last_used_at: Option<u64>,
     pub linked_artifact_count: usize,
     pub history: Vec<GrantHistoryView>,
+}
+
+/// View of a single signed block in the grant chain. `Statement`,
+/// `ApprovalChallenge`, and related leaves already derive `Serialize`,
+/// so we re-export them directly instead of building parallel wire types.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct BlockView {
+    pub statements: Vec<core_types::Statement>,
+    pub nbf: Option<u64>,
+    pub expires_at: Option<u64>,
+    pub issued_by: String,
+    pub issued_at: u64,
+    pub approval: Option<core_types::ApprovalChallenge>,
+    pub note: Option<String>,
+    /// Hex-encoded public key that signs the next appended block.
+    pub pubkey_next: String,
+    /// Hex-encoded Ed25519 signature over the block's canonical bytes.
+    pub signature: String,
 }
 
 /// Single entry in a grant's lifecycle history.
@@ -238,7 +269,13 @@ impl AppSnapshot {
                 recipient_profile: g.recipient_profile.as_str().to_string(),
                 status: g.status.as_str().to_string(),
                 mode: g.mode.as_str().to_string(),
-                capability_count: g.capability_count,
+                block_count: g.block_count,
+                statement_count: g.statement_count,
+                resource_types: g
+                    .resource_types
+                    .into_iter()
+                    .map(|rt| rt.as_str().to_string())
+                    .collect(),
                 expires_at: g.expires_at,
                 last_used_at: g.last_used_at,
             })
@@ -288,12 +325,24 @@ impl GrantDetailView {
             recipient_profile: g.recipient_profile.as_str().to_string(),
             status: g.status.as_str().to_string(),
             mode: g.mode.as_str().to_string(),
-            capabilities: g.capabilities.iter().map(format_capability).collect(),
+            blocks: g
+                .blocks
+                .iter()
+                .map(|sb| BlockView {
+                    statements: sb.block.statements.clone(),
+                    nbf: sb.block.nbf,
+                    expires_at: sb.block.expires_at,
+                    issued_by: sb.block.issued_by.clone(),
+                    issued_at: sb.block.issued_at,
+                    approval: sb.block.approval.clone(),
+                    note: sb.block.note.clone(),
+                    pubkey_next: sb.pubkey_next.clone(),
+                    signature: sb.signature.clone(),
+                })
+                .collect(),
             created_at: g.created_at,
             updated_at: g.updated_at,
-            not_before: g.not_before,
-            expires_at: g.expires_at,
-            renewable_until: g.renewable_until,
+            expires_at: g.effective_expires_at(),
             revoked_at: g.revoked_at,
             revoked_reason: g.revoked_reason.clone(),
             last_used_at: g.last_used_at,
@@ -308,26 +357,6 @@ impl GrantDetailView {
                     note: h.note.clone(),
                 })
                 .collect(),
-        }
-    }
-}
-
-fn format_capability(cap: &core_types::GrantCapability) -> String {
-    match cap {
-        core_types::GrantCapability::DiscloseFields { object_id, field_paths } => {
-            format!("disclose_fields:{} ({})", object_id, field_paths.join(", "))
-        }
-        core_types::GrantCapability::ReadCredential { object_id } => {
-            format!("read_credential:{object_id}")
-        }
-        core_types::GrantCapability::UsePasskey { binding_id } => {
-            format!("use_passkey:{binding_id}")
-        }
-        core_types::GrantCapability::RefreshDisclosure { template_id } => {
-            format!("refresh_disclosure:{template_id}")
-        }
-        core_types::GrantCapability::UseServiceBinding { binding_id } => {
-            format!("use_service_binding:{binding_id}")
         }
     }
 }

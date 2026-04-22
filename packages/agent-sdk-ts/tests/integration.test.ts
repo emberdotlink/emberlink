@@ -68,7 +68,7 @@ describe('emberlink-agent integration', { skip: skipReason }, () => {
   test('grant_status for pending request returns pending status', async () => {
     const granted = await agent.requestGrant({ scope: 'ReadCredential', reason: 'integration test' });
     const status = await agent.grantStatus(granted.request_id);
-    assert.ok(typeof (status as Record<string, unknown>)['status'] === 'string');
+    assert.ok(typeof (status as unknown as Record<string, unknown>)['status'] === 'string');
   });
 
   test('grant_status for nonexistent grant returns NOT_FOUND error', async () => {

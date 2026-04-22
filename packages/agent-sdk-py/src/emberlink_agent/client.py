@@ -3,17 +3,20 @@ from __future__ import annotations
 import json
 import subprocess
 import threading
-from typing import Any
+from typing import Any, Callable, Optional
 
 from .types import (
     AgentConfig,
     CredentialValue,
     GrantInfo,
+    GrantRevokedNotification,
     GrantStatusResult,
     RequestGrantResult,
     UseCredentialResult,
     WhoAmIResult,
 )
+
+_DEFAULT_TIMEOUT_SECS = 30
 
 
 class EmberAgentError(Exception):
@@ -32,6 +35,12 @@ class EmberAgent:
         self._process: subprocess.Popen[bytes] | None = None
         self._counter = 0
         self._lock = threading.Lock()
+        self._responses: dict[str, tuple[threading.Event, dict[str, Any]]] = {}
+        self._reader_thread: threading.Thread | None = None
+
+        # Called when the daemon pushes a ``grant_revoked`` notification.
+        # Assign before calling ``connect()`` to avoid missing early notifications.
+        self.on_grant_revoked: Optional[Callable[[GrantRevokedNotification], None]] = None
 
     def connect(self) -> None:
         cmd = [
@@ -47,6 +56,40 @@ class EmberAgent:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
         )
+        self._responses = {}
+        self._reader_thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader_thread.start()
+
+    def _read_loop(self) -> None:
+        assert self._process is not None
+        assert self._process.stdout is not None
+        for line_bytes in self._process.stdout:
+            line = line_bytes.decode("utf-8").strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if msg.get("id") is not None:
+                req_id = msg["id"]
+                with self._lock:
+                    slot = self._responses.get(req_id)
+                if slot is not None:
+                    slot[1].update(msg)
+                    slot[0].set()
+            elif msg.get("method") == "grant_revoked":
+                cb = self.on_grant_revoked
+                if cb is not None:
+                    params = msg.get("params", {})
+                    notif = GrantRevokedNotification(
+                        grant_id=params.get("grant_id", ""),
+                        persona_id=params.get("persona_id", ""),
+                    )
+                    try:
+                        cb(notif)
+                    except Exception:
+                        pass
 
     def close(self) -> None:
         if self._process is not None:
@@ -59,6 +102,13 @@ class EmberAgent:
                 self._process.kill()
             finally:
                 self._process = None
+        # Wake any pending waiters so they don't block forever.
+        with self._lock:
+            pending = list(self._responses.values())
+        for event, slot in pending:
+            if not event.is_set():
+                slot.update({"error": {"code": "CLOSED", "message": "agent process closed"}})
+                event.set()
 
     def __enter__(self) -> EmberAgent:
         self.connect()
@@ -77,31 +127,32 @@ class EmberAgent:
             raise RuntimeError("Not connected. Call connect() or use as context manager.")
 
         req_id = self._next_id()
+        event = threading.Event()
+        slot: dict[str, Any] = {}
+        with self._lock:
+            self._responses[req_id] = (event, slot)
+
         payload = {"id": req_id, "method": method, "params": params or {}}
         line = json.dumps(payload) + "\n"
 
         assert self._process.stdin is not None
-        assert self._process.stdout is not None
-
-        self._process.stdin.write(line.encode())
+        self._process.stdin.write(line.encode("utf-8"))
         self._process.stdin.flush()
 
-        raw = self._process.stdout.readline()
-        if not raw:
-            raise RuntimeError("Agent process closed stdout unexpectedly.")
+        timeout = _DEFAULT_TIMEOUT_SECS
+        if not event.wait(timeout=timeout):
+            with self._lock:
+                self._responses.pop(req_id, None)
+            raise EmberAgentError("TIMEOUT", f"no response to {method} within {timeout}s")
 
-        response = json.loads(raw.decode())
+        with self._lock:
+            self._responses.pop(req_id, None)
 
-        if response.get("id") != req_id:
-            raise RuntimeError(
-                f"Response ID mismatch: expected {req_id!r}, got {response.get('id')!r}"
-            )
+        if slot.get("error") is not None:
+            err = slot["error"]
+            raise EmberAgentError(str(err.get("code", "UNKNOWN")), err.get("message", "unknown error"))
 
-        if "error" in response:
-            err = response["error"]
-            raise EmberAgentError(code=err.get("code", "UNKNOWN"), message=err.get("message", ""))
-
-        return response.get("result")
+        return slot.get("result")
 
     def whoami(self) -> WhoAmIResult:
         result = self._send("whoami")
@@ -153,8 +204,8 @@ class EmberAgent:
             expires_at=result.get("expires_at"),
         )
 
-    def use_credential(self, grant_id: str, credential_id: str) -> UseCredentialResult:
-        result = self._send("use_credential", {"grant_id": grant_id, "credential_id": credential_id})
+    def use_credential(self, grant_id: str, credential_name: str) -> UseCredentialResult:
+        result = self._send("use_credential", {"grant_id": grant_id, "credential_name": credential_name})
         cred = result["credential"]
         return UseCredentialResult(
             status=result["status"],

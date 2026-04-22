@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -14,11 +15,19 @@ pub enum PidError {
 
 pub struct PidFile {
     path: PathBuf,
+    // True only if this handle wrote the file. Read-only handles (CLI `daemon
+    // status` / `daemon stop`) must not remove a running daemon's pid file on
+    // drop — the daemon itself owns the file and will clean up via its own
+    // PidFile::drop when it exits.
+    owns_file: Cell<bool>,
 }
 
 impl PidFile {
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            owns_file: Cell::new(false),
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -35,6 +44,7 @@ impl PidFile {
         }
         let pid = std::process::id();
         fs::write(&self.path, format!("{pid}\n"))?;
+        self.owns_file.set(true);
         Ok(())
     }
 
@@ -61,13 +71,16 @@ impl PidFile {
 
     pub fn remove(&self) -> Result<(), PidError> {
         fs::remove_file(&self.path)?;
+        self.owns_file.set(false);
         Ok(())
     }
 }
 
 impl Drop for PidFile {
     fn drop(&mut self) {
-        let _ = self.remove();
+        if self.owns_file.get() {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -92,8 +105,6 @@ mod tests {
         pf.write().unwrap();
         let read_pid = pf.read().unwrap().expect("should have a PID");
         assert_eq!(read_pid, std::process::id());
-        // Suppress Drop removal since file is already gone after the test
-        // (Drop will silently fail — that's fine).
     }
 
     #[test]
@@ -109,29 +120,22 @@ mod tests {
     fn remove_makes_read_return_none() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("remove.pid");
-        // Wrap in a block so Drop doesn't fight our explicit remove.
         {
             let pf = PidFile::new(path.clone());
             pf.write().unwrap();
             pf.remove().unwrap();
-            // Inhibit the Drop removal (file is gone) by using std::mem::forget.
-            std::mem::forget(pf);
         }
         let pf2 = PidFile::new(path);
         assert!(pf2.read().unwrap().is_none());
-        std::mem::forget(pf2);
     }
 
     #[test]
     fn stale_pid_file_is_overwritten() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("stale.pid");
-        // Write a PID that cannot be running (PID 0 is never a user process).
-        // Use a large number that's almost certainly not running.
         let stale_pid: u32 = 9_999_999;
         fs::write(&path, format!("{stale_pid}\n")).unwrap();
         let pf = PidFile::new(path);
-        // write() should succeed because the stale PID is not running.
         pf.write().unwrap();
         let read_pid = pf.read().unwrap().unwrap();
         assert_eq!(read_pid, std::process::id());
@@ -141,14 +145,12 @@ mod tests {
     fn already_running_returns_error() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("alive.pid");
-        // Write the current PID manually — simulates a live daemon.
         fs::write(&path, format!("{}\n", std::process::id())).unwrap();
         let pf = PidFile::new(path);
         match pf.write() {
             Err(PidError::AlreadyRunning(pid)) => assert_eq!(pid, std::process::id()),
             other => panic!("expected AlreadyRunning, got {other:?}"),
         }
-        std::mem::forget(pf);
     }
 
     #[test]
@@ -161,6 +163,46 @@ mod tests {
             Err(PidError::InvalidPid(s)) => assert_eq!(s, "not-a-number"),
             other => panic!("expected InvalidPid, got {other:?}"),
         }
-        std::mem::forget(pf);
+    }
+
+    // Regression: CLI `daemon status` / `daemon stop` construct a PidFile purely
+    // to read the running daemon's PID. That transient handle dropping must NOT
+    // remove the file — the daemon still owns it. ()
+    #[test]
+    fn readonly_handle_does_not_remove_file_on_drop() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("owned.pid");
+
+        // Writer holds the file for the duration of the test.
+        let writer = PidFile::new(path.clone());
+        writer.write().unwrap();
+        assert!(path.exists());
+
+        // Simulate CLI-side read-only handle: construct, read, drop.
+        {
+            let reader = PidFile::new(path.clone());
+            let pid = reader.read().unwrap().expect("reader should see writer's PID");
+            assert_eq!(pid, std::process::id());
+        }
+
+        assert!(path.exists(), "reader's drop must not remove writer's file");
+        assert_eq!(writer.read().unwrap(), Some(std::process::id()));
+    }
+
+    #[test]
+    fn failed_write_does_not_claim_ownership() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("contested.pid");
+        // Simulate a live daemon by writing its PID manually.
+        fs::write(&path, format!("{}\n", std::process::id())).unwrap();
+
+        {
+            let pf = PidFile::new(path.clone());
+            // write() returns AlreadyRunning and must not set owns_file.
+            assert!(matches!(pf.write(), Err(PidError::AlreadyRunning(_))));
+        }
+
+        // If owns_file had been set incorrectly, drop would have removed the file.
+        assert!(path.exists(), "failed write must not take ownership");
     }
 }

@@ -1,51 +1,63 @@
-# Ember Quickstart
+# Quickstart
 
-Get from zero to a running agent sandbox in 5 minutes.
+Get ember running in under 5 minutes.
 
-## Prerequisites
-
-- Rust toolchain (`cargo`)
-- Docker (for sandboxes)
-
-## 1. Install
+## Install
 
 ```bash
 cargo install --path crates/emberlink-cli --bin ember
 ```
 
-## 2. Initialize
+## Initialize
 
 ```bash
-ember init --name "Your Name"
+ember init --name "your-name"
 ```
 
-Creates `~/.ember/` with config, database, and your root identity.
+This creates:
+- Config file at `~/.ember/config.toml`
+- Policy file at `~/.ember/policy.toml` (default rules)
+- SQLite database at `~/.ember/data/daemon.db`
+- Root persona (your identity)
+- Vault encryption key stored in the OS keychain
 
-## 3. Start the daemon
+Output shows each path and the keychain status. Ends with `Run 'ember daemon start' to start the daemon.`
+
+## Start the daemon
 
 ```bash
 ember daemon start
 ```
 
-The daemon listens on `~/.ember/run/daemon.sock`. It is your trust broker — every agent request passes through here.
-
-## 4. Add a credential
+Or run in the background:
 
 ```bash
-ember vault add --name github-token --value ghp_your_token_here
+ember daemon start --background
 ```
 
-Credentials live in the vault. Agents never receive raw values — the daemon proxies and logs every access.
+The daemon prints on startup:
+- **Socket**: `~/.ember/run/daemon.sock` (agent communication)
+- **Database**: `~/.ember/data/daemon.db`
+- **PID**: process ID
+- **Dashboard**: http://localhost:3141 (browser UI; approve/deny/revoke require a CSRF token embedded in the page — curl-style POSTs from other origins are rejected)
 
-## 5. Create an agent persona
+Stop with `Ctrl+C` (foreground) or `ember daemon stop` (both modes).
+
+## Create an agent persona
 
 ```bash
-ember persona create --name coding-agent
+ember persona create --name "coding-agent"
 ```
 
-Note the persona ID from the output. A persona is a scoped identity for an agent — it carries grants, not credentials.
+Note the persona ID from the output.
 
-## 6. Grant access
+## Add a credential
+
+```bash
+ember vault add --name "github-token" --value "ghp_yourtoken"
+```
+
+## Grant access
 
 ```bash
 ember grant create \
@@ -55,36 +67,122 @@ ember grant create \
   --ttl 3600
 ```
 
-The agent now has read access to your GitHub token for 1 hour. The grant auto-expires.
+Optional conditions: `--rate-limit 10`, `--hours-start 9 --hours-end 17`, `--allowed-targets "github.com,api.github.com"`, `--delegation-depth 1`
 
-## 7. Create a sandbox
-
-```bash
-ember sandbox create --name coding-agent --image ubuntu:24.04
-```
-
-The sandbox runs the agent in an isolated container with access only to what its grants allow.
-
-## 8. Check status
+## Create a sandbox
 
 ```bash
-ember grant list --active
-ember audit show --limit 10
-ember persona list
+ember sandbox create --name "coding-agent" --image ubuntu:24.04
 ```
 
-## What just happened
+Requires Docker. The sandbox runs the agent in an isolated container with access only to what its grants allow.
 
-You created a **trust broker** — a daemon that controls which agents can access which credentials, for how long, with what scope. The agent never sees your raw token. The daemon proxies API calls and logs everything.
+## Check status
 
-Grants are scoped, time-bound, and revocable. You stay in control.
+```bash
+ember status
+```
+
+Shows active personas, grants, running sandboxes, pending approvals, and recent audit events.
+
+## Claude Code integration
+
+Route Claude Code's tool calls through the ember daemon as an MCP server. Add to `~/.claude/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "ember": {
+      "command": "emberlink-mcp",
+      "args": ["--daemon-socket", "${HOME}/.ember/run/daemon.sock"]
+    }
+  }
+}
+```
+
+With the daemon running, Claude Code gets five MCP tools that route through the policy engine:
+- `whoami` — get agent identity
+- `list_grants` — list active grants
+- `request_grant` — request a new grant (may require approval)
+- `grant_status` — check grant status
+- `use_credential` — use a credential via an active grant
+
+Requests that require approval fire a desktop notification and block until you approve from the dashboard or CLI.
+
+Confirm wiring: start the daemon, then in Claude Code run `/mcp` to verify `ember` is connected, then call `whoami` to confirm the agent identity comes back.
+
+## Scope narrowing
+
+When approving a request, you can narrow the scope:
+
+```bash
+ember approval narrow <approval-id> --scope "read"
+```
+
+This creates a grant with reduced permissions instead of the full requested scope.
+
+## View audit log
+
+```bash
+ember audit show --limit 20
+ember audit show --agent <persona-id>
+```
+
+## Manage approvals
+
+```bash
+ember approval list
+ember approval approve <id>
+ember approval deny <id> --reason "out of scope"
+ember approval narrow <id> --scope read
+```
+
+## Stop the daemon
+
+```bash
+ember daemon stop
+```
+
+## Troubleshooting
+
+**Machine-readable status for scripting** — pass `--json` to get a single JSON object with all status fields:
+```bash
+ember status --json | jq .
+```
+This outputs `version`, `daemon` (running/pid/socket), `personas` count, `grants`, `approvals`, `standing_grants`, and `audit_events`. Useful for CI health checks and monitoring scripts.
+
+**Daemon already running**
+```
+ember daemon status
+ember daemon stop && ember daemon start
+```
+
+**Keyring permission denied** — ember stores the vault encryption key in the OS keychain. On Linux, install `gnome-keyring` or `kwallet`, or run `ember daemon start` inside a desktop session.
+
+**Docker not installed** — the sandbox commands require Docker. Install Docker Desktop (macOS/Windows) or Docker Engine (Linux). The rest of ember works without it; skip `ember sandbox create` if you don't need container isolation.
 
 ## Next steps
 
 - Daemon vision — what the daemon becomes
 - Grant conditions — rate limits, time windows, allow lists
-- Claude Code integration — run Claude Code in a sandbox (coming soon)
-- Approval flow — `ember approval list` for agent requests that need your sign-off
+- Approval flow — JIT escalation for agent requests
+- Policy syntax — `ember policy show` / `ember policy eval <action>`
+
+## Auto-start on login
+
+### macOS
+```bash
+cp contrib/ember-daemon.plist ~/Library/LaunchAgents/link.ember.daemon.plist
+launchctl load ~/Library/LaunchAgents/link.ember.daemon.plist
+```
+
+### Linux (systemd)
+```bash
+mkdir -p ~/.config/systemd/user
+cp contrib/ember-daemon.service ~/.config/systemd/user/
+systemctl --user enable ember-daemon
+systemctl --user start ember-daemon
+```
 
 ---
 

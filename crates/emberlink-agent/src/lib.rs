@@ -7,6 +7,9 @@
 //! Protocol: one JSON object per line on stdin, one JSON response per line
 //! on stdout. Compatible with MCP, LangChain, and any tool-use framework.
 
+#[cfg(unix)]
+pub mod async_client;
+pub mod cached_secret;
 pub mod protocol;
 pub mod relay;
 pub mod revocation;

@@ -342,7 +342,10 @@ mod tests {
         assert!(output.contains("standing"));
         assert!(output.contains("agent"));
         assert!(output.contains("test-grant"));
-        assert!(output.contains("read_credential:obj-abc"));
+        // Composite-grant shape (design): `grant show` walks blocks/statements
+        // directly and prints `[sid] <resource_type> actions=[...] resource=<...>`.
+        assert!(output.contains("actions=[credential:read]"));
+        assert!(output.contains("resource=obj-abc"));
         assert!(output.contains("v1 created at"));
 
         // Edit grant label

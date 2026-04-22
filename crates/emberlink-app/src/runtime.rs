@@ -104,32 +104,35 @@ impl<S: AppBackend> AppRuntime<S> {
                 recipient_id,
                 recipient_profile,
                 mode,
-                capabilities,
+                statement_specs,
                 label,
                 not_before,
                 expires_at,
-                renewable_until,
             } => self.do_create_grant(
                 &issuing_persona_id,
                 &recipient_kind,
                 &recipient_id,
                 &recipient_profile,
                 &mode,
-                &capabilities,
+                &statement_specs,
                 label,
                 not_before,
                 expires_at,
-                renewable_until,
             )?,
 
             UiAction::EditGrant {
                 grant_id,
                 label,
-                capabilities,
+                statement_specs,
                 expires_at,
-                renewable_until,
                 note,
-            } => self.do_edit_grant(&grant_id, label, capabilities, expires_at, renewable_until, note.as_deref())?,
+            } => self.do_edit_grant(
+                &grant_id,
+                label,
+                statement_specs,
+                expires_at,
+                note.as_deref(),
+            )?,
 
             UiAction::CreateCredential { persona_id, device_id, claim_type, payload_json } => {
                 self.do_create_credential(&persona_id, &device_id, &claim_type, &payload_json)?
@@ -146,14 +149,14 @@ impl<S: AppBackend> AppRuntime<S> {
             UiAction::CreateGrantOffer {
                 issuing_persona_id,
                 mode,
-                capabilities,
+                statement_specs,
                 expires_in_secs,
                 relay_hint,
                 conditions,
             } => self.do_create_grant_offer(
                 &issuing_persona_id,
                 &mode,
-                &capabilities,
+                &statement_specs,
                 expires_in_secs,
                 relay_hint,
                 &conditions,
@@ -509,30 +512,39 @@ impl<S: AppBackend> AppRuntime<S> {
         recipient_id: &str,
         recipient_profile: &str,
         mode: &str,
-        capabilities: &[String],
+        statement_specs: &[String],
         label: Option<String>,
         not_before: Option<u64>,
         expires_at: Option<u64>,
-        renewable_until: Option<u64>,
     ) -> Result<serde_json::Value, String> {
         use core_types::{
-            AccessGrant, AccessGrantMode, AccessGrantStatus, PresentationAudienceKind,
-            RecipientProfile,
+            AccessGrant, AttestationBinding, Block, GrantMode, GrantStatus,
+            PresentationAudienceKind, RecipientProfile, SignedBlock,
         };
 
         let recipient_kind = PresentationAudienceKind::parse(recipient_kind)
             .ok_or_else(|| format!("invalid recipient_kind: {recipient_kind}"))?;
         let recipient_profile = RecipientProfile::parse(recipient_profile)
             .ok_or_else(|| format!("invalid recipient_profile: {recipient_profile}"))?;
-        let mode = AccessGrantMode::parse(mode)
+        let mode = GrantMode::parse(mode)
             .ok_or_else(|| format!("invalid mode: {mode}"))?;
-        let parsed_capabilities = capabilities
+        let parsed_statements = statement_specs
             .iter()
-            .map(|s| parse_capability(s))
+            .enumerate()
+            .map(|(i, s)| parse_statement_spec(s, i))
             .collect::<Result<Vec<_>, _>>()?;
 
         let now = now_epoch_secs();
         let grant_id = generate_random_identifier("grant");
+        let block = Block {
+            statements: parsed_statements,
+            nbf: not_before,
+            expires_at,
+            issued_by: issuing_persona_id.to_string(),
+            issued_at: now,
+            approval: None,
+            note: None,
+        };
         let grant = AccessGrant {
             id: grant_id.clone(),
             version: 1,
@@ -540,14 +552,19 @@ impl<S: AppBackend> AppRuntime<S> {
             recipient_kind,
             recipient_id: recipient_id.to_string(),
             recipient_profile,
-            status: AccessGrantStatus::Active,
+            status: GrantStatus::Active,
             mode,
-            capabilities: parsed_capabilities,
+            blocks: vec![SignedBlock {
+                block,
+                // Phase-1 placeholder — biscuit-auth chain signing lands in a
+                // follow-up PR per design. Validate() rejects empty strings,
+                // so we use stable non-empty markers here.
+                pubkey_next: "unsigned-phase1".into(),
+                signature: "unsigned-phase1".into(),
+            }],
+            attestation: AttestationBinding::default(),
             created_at: now,
             updated_at: now,
-            not_before,
-            expires_at,
-            renewable_until,
             revoked_at: None,
             revoked_reason: None,
             last_used_at: None,
@@ -562,9 +579,8 @@ impl<S: AppBackend> AppRuntime<S> {
         &mut self,
         grant_id: &str,
         label: Option<String>,
-        capabilities: Option<Vec<String>>,
+        statement_specs: Option<Vec<String>>,
         expires_at: Option<u64>,
-        renewable_until: Option<u64>,
         note: Option<&str>,
     ) -> Result<serde_json::Value, String> {
         let mut detail = self
@@ -577,17 +593,24 @@ impl<S: AppBackend> AppRuntime<S> {
         if let Some(l) = label {
             grant.label = Some(l);
         }
-        if let Some(caps) = capabilities {
-            grant.capabilities = caps
+        if let Some(specs) = statement_specs {
+            let new_statements = specs
                 .iter()
-                .map(|s| parse_capability(s))
+                .enumerate()
+                .map(|(i, s)| parse_statement_spec(s, i))
                 .collect::<Result<Vec<_>, _>>()?;
+            let block = grant
+                .blocks
+                .first_mut()
+                .ok_or_else(|| format!("grant '{grant_id}' has no blocks"))?;
+            block.block.statements = new_statements;
         }
         if let Some(ea) = expires_at {
-            grant.expires_at = Some(ea);
-        }
-        if let Some(ru) = renewable_until {
-            grant.renewable_until = Some(ru);
+            let block = grant
+                .blocks
+                .first_mut()
+                .ok_or_else(|| format!("grant '{grant_id}' has no blocks"))?;
+            block.block.expires_at = Some(ea);
         }
 
         self.store
@@ -604,12 +627,12 @@ impl<S: AppBackend> AppRuntime<S> {
         &mut self,
         issuing_persona_id: &str,
         mode: &str,
-        capabilities: &[String],
+        statement_specs: &[String],
         expires_in_secs: Option<u64>,
         relay_hint: Option<String>,
         conditions: &[core_types::grant_conditions::GrantCondition],
     ) -> Result<serde_json::Value, String> {
-        use core_types::{AccessGrantMode, GrantLink, GrantOfferCreatedEvent};
+        use core_types::{GrantLink, GrantMode, GrantOfferCreatedEvent};
 
         // Validate persona exists
         if !self
@@ -622,13 +645,14 @@ impl<S: AppBackend> AppRuntime<S> {
         }
 
         // Validate mode
-        let grant_mode = AccessGrantMode::parse(mode)
+        let grant_mode = GrantMode::parse(mode)
             .ok_or_else(|| format!("invalid mode: {mode}"))?;
 
-        // Validate capabilities parse correctly
-        let _parsed_caps: Vec<core_types::GrantCapability> = capabilities
+        // Validate every spec parses into a Statement before minting the offer.
+        let _parsed_stmts: Vec<core_types::Statement> = statement_specs
             .iter()
-            .map(|s| parse_capability(s))
+            .enumerate()
+            .map(|(i, s)| parse_statement_spec(s, i))
             .collect::<Result<Vec<_>, _>>()?;
 
         // Look up the persona's root so we can find the signing key
@@ -666,7 +690,7 @@ impl<S: AppBackend> AppRuntime<S> {
         // Build sealed payload: JSON of grant parameters
         let payload = serde_json::json!({
             "mode": grant_mode.as_str(),
-            "capabilities": capabilities,
+            "statement_specs": statement_specs,
             "issuer_persona_id": issuing_persona_id,
             "expires_at": expires_at,
         });
@@ -1584,44 +1608,76 @@ impl<S: AppBackend> AppRuntime<S> {
 // Module-private helpers
 // ---------------------------------------------------------------------------
 
-/// Parse a capability string produced by `snapshot::format_capability`.
-/// Format examples:
+/// Parse a CLI / UI action spec into a composite-grant `Statement`. The
+/// syntax is a convenience shorthand for common credential-shaped
+/// statements — richer composites (budgets, conditions, non-Credential
+/// resource types) must be built client-side as typed `Statement`s.
+///
+/// Spec examples:
 ///   `disclose_fields:<object_id> (field1, field2)`
 ///   `read_credential:<object_id>`
 ///   `use_passkey:<binding_id>`
 ///   `refresh_disclosure:<template_id>`
 ///   `use_service_binding:<binding_id>`
-fn parse_capability(s: &str) -> Result<core_types::GrantCapability, String> {
-    use core_types::GrantCapability;
+///
+/// `index` is the 0-based position in the caller's Vec, used to assign a
+/// stable `sid` of the form `s<N+1>`. Deterministic per position so tests
+/// can assert on the produced grant shape.
+fn parse_statement_spec(s: &str, index: usize) -> Result<core_types::Statement, String> {
+    use core_types::{Condition, ResourceSelector, ResourceType, Statement, Usage};
+
+    fn build(sid: String, actions: Vec<String>, resource: String) -> Statement {
+        Statement {
+            sid,
+            resource_type: ResourceType::Credential,
+            actions,
+            resource: ResourceSelector::Exact { value: resource },
+            budget: None,
+            usage: Usage::default(),
+            conditions: Vec::<Condition>::new(),
+        }
+    }
+
+    let sid = format!("s{}", index + 1);
+
     if let Some(rest) = s.strip_prefix("disclose_fields:") {
-        // Format: `<object_id> (<field1>, <field2>, ...)`
         let (object_id, fields_part) = rest
             .split_once(" (")
-            .ok_or_else(|| format!("malformed disclose_fields capability: {s}"))?;
+            .ok_or_else(|| format!("malformed disclose_fields spec: {s}"))?;
         let fields_part = fields_part.trim_end_matches(')');
-        let field_paths = fields_part
+        let actions: Vec<String> = fields_part
             .split(", ")
-            .map(|f| f.trim().to_string())
+            .map(|f| f.trim())
             .filter(|f| !f.is_empty())
+            .map(|f| format!("credential:disclose:{f}"))
             .collect();
-        return Ok(GrantCapability::DiscloseFields {
-            object_id: object_id.to_string(),
-            field_paths,
-        });
+        return Ok(build(sid, actions, object_id.to_string()));
     }
     if let Some(id) = s.strip_prefix("read_credential:") {
-        return Ok(GrantCapability::ReadCredential { object_id: id.to_string() });
+        return Ok(build(sid, vec!["credential:read".into()], id.to_string()));
     }
     if let Some(id) = s.strip_prefix("use_passkey:") {
-        return Ok(GrantCapability::UsePasskey { binding_id: id.to_string() });
+        return Ok(build(
+            sid,
+            vec!["credential:use_passkey".into()],
+            id.to_string(),
+        ));
     }
     if let Some(id) = s.strip_prefix("refresh_disclosure:") {
-        return Ok(GrantCapability::RefreshDisclosure { template_id: id.to_string() });
+        return Ok(build(
+            sid,
+            vec!["credential:refresh_disclosure".into()],
+            id.to_string(),
+        ));
     }
     if let Some(id) = s.strip_prefix("use_service_binding:") {
-        return Ok(GrantCapability::UseServiceBinding { binding_id: id.to_string() });
+        return Ok(build(
+            sid,
+            vec!["credential:use_service_binding".into()],
+            id.to_string(),
+        ));
     }
-    Err(format!("unrecognised capability string: {s}"))
+    Err(format!("unrecognised statement spec: {s}"))
 }
 
 fn now_epoch_secs() -> u64 {
@@ -2055,7 +2111,7 @@ mod tests {
             .handle_action(UiAction::CreateGrantOffer {
                 issuing_persona_id: issuer_persona_id.clone(),
                 mode: "one_shot".into(),
-                capabilities: vec!["read_credential:obj-1".into()],
+                statement_specs: vec!["read_credential:obj-1".into()],
                 expires_in_secs: Some(86400),
                 relay_hint: None,
                 conditions: Vec::new(),
@@ -2141,7 +2197,7 @@ mod tests {
             .handle_action(UiAction::CreateGrantOffer {
                 issuing_persona_id: persona_a.clone(),
                 mode: "one_shot".into(),
-                capabilities: vec!["read_credential:obj-same".into()],
+                statement_specs: vec!["read_credential:obj-same".into()],
                 expires_in_secs: Some(86400),
                 relay_hint: None,
                 conditions: Vec::new(),
@@ -2189,7 +2245,7 @@ mod tests {
             .handle_action(UiAction::CreateGrantOffer {
                 issuing_persona_id: issuer_persona_id,
                 mode: "standing".into(),
-                capabilities: vec!["use_passkey:bind-xyz".into()],
+                statement_specs: vec!["use_passkey:bind-xyz".into()],
                 expires_in_secs: Some(3600),
                 relay_hint: None,
                 conditions: Vec::new(),
@@ -2238,7 +2294,7 @@ mod tests {
             .handle_action(UiAction::CreateGrantOffer {
                 issuing_persona_id: issuer_persona_id,
                 mode: "one_shot".into(),
-                capabilities: vec!["read_credential:obj-2".into()],
+                statement_specs: vec!["read_credential:obj-2".into()],
                 expires_in_secs: Some(3600),
                 relay_hint: None,
                 conditions: Vec::new(),
@@ -2288,7 +2344,7 @@ mod tests {
             .handle_action(UiAction::CreateGrantOffer {
                 issuing_persona_id: issuer_persona_id,
                 mode: "one_shot".into(),
-                capabilities: vec!["read_credential:obj-3".into()],
+                statement_specs: vec!["read_credential:obj-3".into()],
                 expires_in_secs: Some(0), // now + 0 = already past
                 relay_hint: None,
                 conditions: Vec::new(),
@@ -2335,7 +2391,7 @@ mod tests {
             .handle_action(UiAction::CreateGrantOffer {
                 issuing_persona_id: issuer_persona.clone(),
                 mode: "one_shot".into(),
-                capabilities: vec!["read_credential:secret-1".into()],
+                statement_specs: vec!["read_credential:secret-1".into()],
                 expires_in_secs: Some(86400),
                 relay_hint: None,
                 conditions: Vec::new(),

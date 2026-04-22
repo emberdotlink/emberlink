@@ -96,12 +96,16 @@ export class SocketTransport {
       persona_id: personaId,
       credential_name: credentialName,
       scope,
-      duration_secs: ttlSecs,
+      ttl_secs: ttlSecs,
     });
   }
 
-  async useCredential(grantId: string): Promise<unknown> {
-    return this.send('use_credential', { grant_id: grantId });
+  async useCredential(personaId: string, credentialName: string): Promise<unknown> {
+    return this.send('use_credential', { persona_id: personaId, credential_name: credentialName });
+  }
+
+  async requestAccess(personaId: string, action: string, resource: string): Promise<unknown> {
+    return this.send('request_access', { persona_id: personaId, action, resource });
   }
 
   close(): void {

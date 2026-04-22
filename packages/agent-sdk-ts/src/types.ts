@@ -62,3 +62,15 @@ export interface CredentialResult {
     grant_id: string;
   };
 }
+
+/** Server-initiated notification pushed by the daemon when a grant is revoked. */
+export interface GrantRevokedNotification {
+  grant_id: string;
+  persona_id: string;
+}
+
+/** A JSON-RPC notification (no `id` field) pushed from the daemon. */
+export interface AgentNotification {
+  method: string;
+  params: unknown;
+}

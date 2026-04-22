@@ -1243,8 +1243,22 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
     }
 }
 
+/// Install the rustls ring crypto provider as the process default. rustls 0.23
+/// no longer auto-selects a provider from enabled features; callers must
+/// install one before the first `ClientConfig::builder()` / `ServerConfig::builder()`.
+/// Idempotent across parallel tests and repeat calls via `Once`.
+fn ensure_rustls_provider_installed() {
+    use std::sync::Once;
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        // Ignore `Err` — means a provider was installed by another path earlier.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 /// Build the TLS client configuration once (expensive due to verifier setup).
 fn build_tls_client_config() -> rustls::ClientConfig {
+    ensure_rustls_provider_installed();
     rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCert))

@@ -3,6 +3,8 @@ import { createInterface } from 'node:readline';
 import type {
   AgentConfig,
   AgentResponse,
+  AgentNotification,
+  GrantRevokedNotification,
   WhoAmIResult,
   GrantInfo,
   RequestGrantParams,
@@ -32,6 +34,12 @@ export class EmberAgent {
   private pending: Map<string, PendingRequest> = new Map();
   private counter = 0;
 
+  /**
+   * Called when the daemon pushes a `grant_revoked` notification.
+   * Assign this before calling `connect()` to ensure no notifications are missed.
+   */
+  onGrantRevoked?: (params: GrantRevokedNotification) => void;
+
   constructor(config: AgentConfig) {
     this.config = config;
   }
@@ -55,19 +63,27 @@ export class EmberAgent {
         const rl = createInterface({ input: proc.stdout!, crlfDelay: Infinity });
         rl.on('line', (line) => {
           if (!line.trim()) return;
-          let msg: AgentResponse;
+          let msg: AgentResponse | AgentNotification;
           try {
-            msg = JSON.parse(line) as AgentResponse;
+            msg = JSON.parse(line) as AgentResponse | AgentNotification;
           } catch {
             return;
           }
-          const pending = this.pending.get(msg.id);
-          if (!pending) return;
-          this.pending.delete(msg.id);
-          if (msg.error) {
-            pending.reject(new EmberAgentError(msg.error.code, msg.error.message));
+          if ((msg as AgentResponse).id != null) {
+            const resp = msg as AgentResponse;
+            const pending = this.pending.get(resp.id);
+            if (!pending) return;
+            this.pending.delete(resp.id);
+            if (resp.error) {
+              pending.reject(new EmberAgentError(resp.error.code, resp.error.message));
+            } else {
+              pending.resolve(resp.result);
+            }
           } else {
-            pending.resolve(msg.result);
+            const notif = msg as AgentNotification;
+            if (notif.method === 'grant_revoked') {
+              this.onGrantRevoked?.(notif.params as GrantRevokedNotification);
+            }
           }
         });
         resolve();

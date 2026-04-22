@@ -3,6 +3,8 @@
 //! Wraps the agent protocol as an MCP server using JSON-RPC 2.0 over stdio.
 //! Each tool maps 1:1 to an AgentRuntime method.
 
+pub mod daemon_transport;
+
 use emberlink_agent::protocol::methods::{
     GRANT_STATUS, LIST_GRANTS, REQUEST_GRANT, USE_CREDENTIAL, WHOAMI,
 };
@@ -63,7 +65,7 @@ fn tool_definitions() -> serde_json::Value {
         },
         {
             "name": "request_grant",
-            "description": "Request a new grant with scope and duration",
+            "description": "Request a new grant with scope and duration. Subject to the daemon's policy engine and pre-evaluation rate limit — the request may be auto-approved, queued for human approval, or denied.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -72,7 +74,7 @@ fn tool_definitions() -> serde_json::Value {
                     "duration_secs": { "type": "integer" },
                     "reason": { "type": "string" }
                 },
-                "required": ["scope", "duration_secs"]
+                "required": ["scope", "resource_id", "duration_secs"]
             }
         },
         {
@@ -341,7 +343,11 @@ mod tests {
     }
 
     #[test]
-    fn tools_call_list_grants() {
+    fn tools_call_list_grants_without_daemon_fails_closed() {
+        // Post-TODO-69I.1 behavior: `list_grants` now routes through the
+        // daemon so the agent can't serve stale state out of its local
+        // EventStore. The legacy in-process test server has no daemon
+        // link, so the call MUST fail closed with `DAEMON_UNAVAILABLE`.
         let server = test_server();
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -353,16 +359,22 @@ mod tests {
             })),
         };
         let resp = server.handle_request(&req).unwrap();
-        assert!(resp.error.is_none());
+        assert!(resp.error.is_none(), "tool calls surface agent errors via isError");
         let result = resp.result.unwrap();
+        assert_eq!(result["isError"], serde_json::json!(true), "expected isError=true for fail-closed");
         let text = result["content"][0]["text"].as_str().unwrap();
-        // list_grants returns an empty array when no grants exist
-        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
-        assert_eq!(parsed, serde_json::json!([]));
+        assert!(
+            text.contains("daemon unreachable"),
+            "expected 'daemon unreachable' in error text, got: {text}"
+        );
     }
 
     #[test]
-    fn tools_call_request_grant() {
+    fn tools_call_request_grant_without_daemon_fails_closed() {
+        // TODO 69.1 follow-up: when the wrapped `AgentRuntime` has no daemon
+        // link (as in this legacy in-process MCP bridge), `request_grant`
+        // MUST fail closed rather than silently write an approval into the
+        // local store. This locks in the bypass closure.
         let server = test_server();
         let req = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
@@ -372,19 +384,24 @@ mod tests {
                 "name": "request_grant",
                 "arguments": {
                     "scope": "read:passwords",
+                    "resource_id": "passwords",
                     "duration_secs": 3600,
                     "reason": "need access"
                 }
             })),
         };
         let resp = server.handle_request(&req).unwrap();
-        assert!(resp.error.is_none());
+        assert!(resp.error.is_none(), "tool calls surface agent errors via isError");
         let result = resp.result.unwrap();
-        // request_grant now creates a real approval request and returns pending status
+        assert_eq!(
+            result["isError"], true,
+            "request_grant without a daemon link must be reported as an error"
+        );
         let text = result["content"][0]["text"].as_str().unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
-        assert_eq!(parsed["status"], "pending");
-        assert!(parsed["request_id"].as_str().unwrap().starts_with("req-"));
+        assert!(
+            text.contains("access denied") || text.contains("policy engine"),
+            "error text should indicate the bypass was closed, got: {text}"
+        );
     }
 
     #[test]

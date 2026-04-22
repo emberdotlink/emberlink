@@ -40,6 +40,27 @@ pub struct PolicyConfig {
     pub default_risk: RiskLevel,
 }
 
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            rules: Vec::new(),
+            default_decision: default_decision(),
+            default_risk: default_risk(),
+        }
+    }
+}
+
+impl PolicyConfig {
+    /// Merge another config into this one. The other config's rules are
+    /// prepended (higher priority, first-match-wins). Defaults are NOT
+    /// overridden — user-level defaults always win.
+    pub fn merge(&mut self, other: PolicyConfig) {
+        let mut merged_rules = other.rules;
+        merged_rules.append(&mut self.rules);
+        self.rules = merged_rules;
+    }
+}
+
 fn default_decision() -> PolicyDecision {
     PolicyDecision::RequireApproval
 }
@@ -58,6 +79,42 @@ pub struct PolicyEvaluation {
 pub enum PolicyError {
     #[error("policy parse error: {0}")]
     Parse(#[from] toml::de::Error),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("invalid action: {0}")]
+    InvalidAction(String),
+}
+
+/// Normalize an action string: lowercase, strip leading/trailing dots,
+/// collapse consecutive dots, reject empty or invalid segments.
+pub fn normalize_action(action: &str) -> Result<String, PolicyError> {
+    let trimmed = action.trim().to_lowercase();
+
+    if trimmed.is_empty() {
+        return Err(PolicyError::InvalidAction("empty action string".to_string()));
+    }
+
+    let stripped = trimmed.trim_matches('.');
+
+    if stripped.is_empty() {
+        return Err(PolicyError::InvalidAction("action contains only dots".to_string()));
+    }
+
+    let segments: Vec<&str> = stripped.split('.').filter(|s| !s.is_empty()).collect();
+
+    if segments.is_empty() {
+        return Err(PolicyError::InvalidAction("no valid segments".to_string()));
+    }
+
+    for seg in &segments {
+        if !seg.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '*') {
+            return Err(PolicyError::InvalidAction(
+                format!("invalid character in segment '{seg}'"),
+            ));
+        }
+    }
+
+    Ok(segments.join("."))
 }
 
 pub struct PolicyEngine {
@@ -81,14 +138,52 @@ impl PolicyEngine {
         Self { config }
     }
 
+    pub fn from_file(path: &std::path::Path) -> Result<Self, PolicyError> {
+        let contents = std::fs::read_to_string(path)?;
+        Self::from_toml(&contents)
+    }
+
     pub fn from_toml(toml_str: &str) -> Result<Self, PolicyError> {
         let config: PolicyConfig = toml::from_str(toml_str)?;
         Ok(Self::new(config))
     }
 
+    /// Load user policy, then merge project-level overrides if present.
+    pub fn load_with_overrides(
+        user_policy: &std::path::Path,
+        project_policy: Option<&std::path::Path>,
+    ) -> Result<Self, PolicyError> {
+        let mut config = if user_policy.exists() {
+            let text = std::fs::read_to_string(user_policy)?;
+            toml::from_str(&text)?
+        } else {
+            PolicyConfig::default()
+        };
+
+        if let Some(project) = project_policy
+            && project.exists()
+        {
+            let text = std::fs::read_to_string(project)?;
+            let project_config: PolicyConfig = toml::from_str(&text)?;
+            config.merge(project_config);
+        }
+
+        Ok(Self::new(config))
+    }
+
     pub fn evaluate(&self, action: &str) -> PolicyEvaluation {
+        let action = match normalize_action(action) {
+            Ok(a) => a,
+            Err(_) => {
+                return PolicyEvaluation {
+                    decision: PolicyDecision::Deny,
+                    risk: RiskLevel::Critical,
+                    matched_rule: Some("invalid action".to_string()),
+                }
+            }
+        };
         for rule in &self.config.rules {
-            if matches_glob(&rule.action, action) {
+            if matches_glob(&rule.action, &action) {
                 return PolicyEvaluation {
                     decision: rule.decision.clone(),
                     risk: rule.risk.clone(),
@@ -265,5 +360,131 @@ default_risk = "low"
         assert!(!matches_glob("git.*", "git.push.main"));
         assert!(matches_glob("*", "anything"));
         assert!(!matches_glob("git.*", "svn.push"));
+    }
+
+    #[test]
+    fn normalize_strips_dots() {
+        assert_eq!(normalize_action("..git.push..").unwrap(), "git.push");
+    }
+
+    #[test]
+    fn normalize_collapses_dots() {
+        assert_eq!(normalize_action("git...push").unwrap(), "git.push");
+    }
+
+    #[test]
+    fn normalize_lowercases() {
+        assert_eq!(normalize_action("Git.Push").unwrap(), "git.push");
+    }
+
+    #[test]
+    fn normalize_rejects_empty() {
+        assert!(normalize_action("").is_err());
+    }
+
+    #[test]
+    fn normalize_rejects_special_chars() {
+        assert!(normalize_action("git;drop").is_err());
+    }
+
+    #[test]
+    fn normalize_accepts_wildcards() {
+        assert_eq!(normalize_action("git.*").unwrap(), "git.*");
+    }
+
+    #[test]
+    fn evaluate_rejects_invalid_action() {
+        let engine = PolicyEngine::default();
+        let eval = engine.evaluate("");
+        assert_eq!(eval.decision, PolicyDecision::Deny);
+        assert_eq!(eval.risk, RiskLevel::Critical);
+        assert_eq!(eval.matched_rule.as_deref(), Some("invalid action"));
+    }
+
+    #[test]
+    fn merge_prepends_rules() {
+        let mut user_config = PolicyConfig {
+            rules: vec![PolicyRule {
+                action: "deploy.production".to_string(),
+                risk: RiskLevel::Critical,
+                decision: PolicyDecision::RequireApproval,
+            }],
+            ..PolicyConfig::default()
+        };
+        let project_config = PolicyConfig {
+            rules: vec![PolicyRule {
+                action: "deploy.production".to_string(),
+                risk: RiskLevel::Low,
+                decision: PolicyDecision::AutoApprove,
+            }],
+            ..PolicyConfig::default()
+        };
+        user_config.merge(project_config);
+        // Project rule is now first — it should win
+        let engine = PolicyEngine::new(user_config);
+        let eval = engine.evaluate("deploy.production");
+        assert_eq!(eval.decision, PolicyDecision::AutoApprove);
+        assert_eq!(eval.risk, RiskLevel::Low);
+    }
+
+    #[test]
+    fn merge_does_not_override_defaults() {
+        let mut user_config = PolicyConfig {
+            rules: vec![],
+            default_decision: PolicyDecision::Deny,
+            default_risk: RiskLevel::High,
+        };
+        let project_config = PolicyConfig {
+            rules: vec![],
+            default_decision: PolicyDecision::AutoApprove,
+            default_risk: RiskLevel::Low,
+        };
+        user_config.merge(project_config);
+        // User defaults remain unchanged
+        assert_eq!(user_config.default_decision, PolicyDecision::Deny);
+        assert_eq!(user_config.default_risk, RiskLevel::High);
+    }
+
+    #[test]
+    fn load_with_overrides_project_wins() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut user_file = NamedTempFile::new().unwrap();
+        write!(
+            user_file,
+            r#"
+default_decision = "require_approval"
+default_risk = "medium"
+
+[[rules]]
+action = "deploy.staging"
+risk = "medium"
+decision = "auto_approve"
+"#
+        )
+        .unwrap();
+
+        let mut project_file = NamedTempFile::new().unwrap();
+        write!(
+            project_file,
+            r#"
+[[rules]]
+action = "deploy.staging"
+risk = "high"
+decision = "deny"
+"#
+        )
+        .unwrap();
+
+        let engine = PolicyEngine::load_with_overrides(
+            user_file.path(),
+            Some(project_file.path()),
+        )
+        .unwrap();
+
+        let eval = engine.evaluate("deploy.staging");
+        assert_eq!(eval.decision, PolicyDecision::Deny);
+        assert_eq!(eval.risk, RiskLevel::High);
     }
 }

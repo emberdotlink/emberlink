@@ -26,10 +26,10 @@ use core_sync::{
 };
 use core_trust::{derive_score, trust_attested_event, trust_revoked_event};
 use core_types::{
-    AccessGrant, AccessGrantMode, AccessGrantStatus, GrantCapability, AdmissionToken,
-    ContentPublishedEvent, ContentVisibility, EventBody, MessageSentEvent,
-    PresentationAudienceKind, RecipientProfile, SignerBinding, SurvivalMode, SyncProfile,
-    TrustThreshold, Validate, ValidationError,
+    AccessGrant, AttestationBinding, Block, Condition, GrantMode, GrantStatus, ResourceSelector,
+    SignedBlock, Statement, AdmissionToken, ContentPublishedEvent, ContentVisibility, EventBody,
+    MessageSentEvent, PresentationAudienceKind, RecipientProfile, ResourceType, SignerBinding,
+    SurvivalMode, SyncProfile, TrustThreshold, Usage, Validate, ValidationError,
 };
 use core_types::approval::{ApprovalResponse, ApprovalStatus};
 
@@ -77,9 +77,15 @@ pub(crate) fn truncate_id(id: &str) -> &str {
     }
 }
 
-fn parse_capabilities(cap_strs: &[String]) -> Result<Vec<GrantCapability>, ValidationError> {
-    let mut caps = Vec::new();
-    for s in cap_strs {
+/// Parse a list of `--cap <kind>:<arg>` CLI flags into composite-grant
+/// `Statement`s. The syntax is a shorthand for common credential statements;
+/// richer shapes (budgets, non-Credential resource types, conditions) must
+/// be expressed through typed APIs, not this parser.
+///
+/// Stable `sid` format `s<N>` per position so tests can assert on shape.
+fn parse_capabilities(cap_strs: &[String]) -> Result<Vec<Statement>, ValidationError> {
+    let mut stmts = Vec::new();
+    for (i, s) in cap_strs.iter().enumerate() {
         let (kind, arg) = s.split_once(':').ok_or_else(|| {
             ValidationError::new(format!(
                 "invalid capability: {s}. Format: read_credential:<object_id>, \
@@ -87,48 +93,39 @@ fn parse_capabilities(cap_strs: &[String]) -> Result<Vec<GrantCapability>, Valid
                  use_service_binding:<binding_id>"
             ))
         })?;
-        let cap = match kind {
-            "read_credential" => GrantCapability::ReadCredential {
-                object_id: arg.to_string(),
-            },
-            "use_passkey" => GrantCapability::UsePasskey {
-                binding_id: arg.to_string(),
-            },
-            "refresh_disclosure" => GrantCapability::RefreshDisclosure {
-                template_id: arg.to_string(),
-            },
-            "use_service_binding" => GrantCapability::UseServiceBinding {
-                binding_id: arg.to_string(),
-            },
+        let action: &str = match kind {
+            "read_credential" => "credential:read",
+            "use_passkey" => "credential:use_passkey",
+            "refresh_disclosure" => "credential:refresh_disclosure",
+            "use_service_binding" => "credential:use_service_binding",
             _ => {
                 return Err(ValidationError::new(format!(
                     "unknown capability type: {kind}"
                 )));
             }
         };
-        caps.push(cap);
+        stmts.push(Statement {
+            sid: format!("s{}", i + 1),
+            resource_type: ResourceType::Credential,
+            actions: vec![action.to_string()],
+            resource: ResourceSelector::Exact {
+                value: arg.to_string(),
+            },
+            budget: None,
+            usage: Usage::default(),
+            conditions: Vec::<Condition>::new(),
+        });
     }
-    Ok(caps)
+    Ok(stmts)
 }
 
-fn format_capability(cap: &GrantCapability) -> String {
-    match cap {
-        GrantCapability::DiscloseFields {
-            object_id,
-            field_paths,
-        } => format!("disclose_fields:{} [{}]", object_id, field_paths.join(", ")),
-        GrantCapability::ReadCredential { object_id } => {
-            format!("read_credential:{}", object_id)
-        }
-        GrantCapability::UsePasskey { binding_id } => {
-            format!("use_passkey:{}", binding_id)
-        }
-        GrantCapability::RefreshDisclosure { template_id } => {
-            format!("refresh_disclosure:{}", template_id)
-        }
-        GrantCapability::UseServiceBinding { binding_id } => {
-            format!("use_service_binding:{}", binding_id)
-        }
+/// Human-readable selector rendering for `grant show` and `grant list`.
+fn render_resource(r: &ResourceSelector) -> String {
+    match r {
+        ResourceSelector::Exact { value } => value.clone(),
+        ResourceSelector::Glob { pattern } => format!("glob:{pattern}"),
+        ResourceSelector::Regex { pattern } => format!("re:{pattern}"),
+        ResourceSelector::Any => "*".to_string(),
     }
 }
 
@@ -510,12 +507,23 @@ impl DemoApp {
             .map(|root| root.id.clone())
             .ok_or_else(|| ValidationError::new(format!("unknown root: {root_ref}")))?;
 
+        // C-1: guardian_public_key must be the actual Ed25519 pubkey
+        // string, not an opaque label. The authorizer binds signer.public_key
+        // material to the enrolled guardian's stored public_key; if we stored
+        // a label here and signed with FixtureSigner(label), the pubkey
+        // material would not match and every approval would fail. Derive the
+        // real pubkey from the same FixtureSigner label so approve/contest
+        // can produce signatures that match.
         let guardian_key_id = format!("guardian-key-{guardian_id}");
+        let guardian_public_key = {
+            use core_crypto::Signer as _;
+            FixtureSigner::new(&guardian_key_id).public_key().0
+        };
 
         let signer = self.root_signer(&root_id)?;
         self.append_live_event(
             self.allocate_event_id("guardian-enrolled"),
-            guardian_enrolled_event(&root_id, guardian_id, label, &guardian_key_id),
+            guardian_enrolled_event(&root_id, guardian_id, label, &guardian_public_key),
             SignerBinding::root(&root_id, self.root_active_key_id(&root_id)?),
             &signer,
         )?;
@@ -523,7 +531,7 @@ impl DemoApp {
 
         Ok(format!(
             "enrolled guardian\t{}\troot={}\tkey={}\n",
-            guardian_id, root_id, guardian_key_id
+            guardian_id, root_id, guardian_public_key
         ))
     }
 
@@ -592,12 +600,20 @@ impl DemoApp {
             return Err(ValidationError::new("no active recovery request"));
         };
 
-        let guardian_key_id = format!("guardian-key-{guardian_id}");
-        let guardian_signer = AppSigner::Fixture(FixtureSigner::new(&guardian_key_id));
+        // C-1: signer_binding.key_id for guardians is the pubkey material
+        // itself (not an opaque label). Derive it from the same FixtureSigner
+        // used to produce the signature so the authorizer's pubkey-material
+        // binding check passes.
+        let guardian_fixture_label = format!("guardian-key-{guardian_id}");
+        let guardian_signer = AppSigner::Fixture(FixtureSigner::new(&guardian_fixture_label));
+        let guardian_pubkey = {
+            use core_crypto::Signer as _;
+            guardian_signer.public_key().0
+        };
         self.append_live_event(
             self.allocate_event_id("recovery-approved"),
             recovery_approved_event(&request_id, guardian_id),
-            SignerBinding::guardian(guardian_id, guardian_key_id),
+            SignerBinding::guardian(guardian_id, guardian_pubkey),
             &guardian_signer,
         )?;
 
@@ -639,12 +655,17 @@ impl DemoApp {
             return Err(ValidationError::new("no active recovery request"));
         };
 
-        let guardian_key_id = format!("guardian-key-{guardian_id}");
-        let guardian_signer = AppSigner::Fixture(FixtureSigner::new(&guardian_key_id));
+        // C-1: signer_binding.key_id for guardians is the pubkey material.
+        let guardian_fixture_label = format!("guardian-key-{guardian_id}");
+        let guardian_signer = AppSigner::Fixture(FixtureSigner::new(&guardian_fixture_label));
+        let guardian_pubkey = {
+            use core_crypto::Signer as _;
+            guardian_signer.public_key().0
+        };
         self.append_live_event(
             self.allocate_event_id("recovery-contested"),
             recovery_contested_event(&request_id, guardian_id, reason, now_epoch_secs()),
-            SignerBinding::guardian(guardian_id, guardian_key_id),
+            SignerBinding::guardian(guardian_id, guardian_pubkey),
             &guardian_signer,
         )?;
 
@@ -5296,7 +5317,7 @@ impl DemoApp {
         let action = emberlink_app::UiAction::CreateGrantOffer {
             issuing_persona_id: persona_id,
             mode,
-            capabilities,
+            statement_specs: capabilities,
             expires_in_secs,
             relay_hint: relay,
             conditions,
@@ -5377,7 +5398,7 @@ impl DemoApp {
         let action = emberlink_app::UiAction::CreateGrantOffer {
             issuing_persona_id: persona_id,
             mode,
-            capabilities,
+            statement_specs: capabilities,
             expires_in_secs,
             relay_hint: None, // QR offers are offline — no relay
             conditions,
@@ -5724,24 +5745,27 @@ impl DemoApp {
             Ok(None) => return format!("grant not found: {grant_id}\n"),
             Err(e) => return format!("error looking up grant: {e}\n"),
         };
-        if detail.grant.status != AccessGrantStatus::Active {
+        if detail.grant.status != GrantStatus::Active {
             return format!(
                 "grant {} is not active (status: {:?})\n",
                 grant_id, detail.grant.status
             );
         }
 
-        // Build a human-readable scope label from the first ReadCredential cap (if any).
-        let object_id: Option<String> = detail.grant.capabilities.iter().find_map(|cap| {
-            if let GrantCapability::ReadCredential { object_id } = cap {
-                Some(object_id.clone())
-            } else {
-                None
+        // Scope label: first statement carrying a `credential:read` action
+        // against an `Exact` resource. Anything else renders as "(no target)".
+        let object_id: Option<String> = detail.grant.statements().find_map(|(_i, s)| {
+            if !s.actions.iter().any(|a| a == "credential:read") {
+                return None;
+            }
+            match &s.resource {
+                ResourceSelector::Exact { value } => Some(value.clone()),
+                _ => None,
             }
         });
         let scope_label = object_id
             .as_deref()
-            .unwrap_or("(no read_credential capability)");
+            .unwrap_or("(no credential:read statement)");
 
         // 2. Check for local credential deposit.
         let local_payload: Option<Vec<u8>> = match self
@@ -5829,7 +5853,7 @@ impl DemoApp {
     fn attempt_credential_deposit_for_caps(
         &self,
         creation_msg: &str,
-        caps: &[GrantCapability],
+        caps: &[Statement],
         relay_addr: Option<&str>,
     ) -> String {
         // Extract grant_id from "created grant\t<grant-id>\t..."
@@ -5838,17 +5862,21 @@ impl DemoApp {
             None => return String::new(),
         };
 
-        // Find the first ReadCredential capability.
-        let object_id = caps.iter().find_map(|cap| {
-            if let GrantCapability::ReadCredential { object_id } = cap {
-                Some(object_id.clone())
-            } else {
-                None
+        // First statement with a `credential:read` action against an Exact
+        // resource identifies the credential to deposit. Anything else
+        // (glob/regex/any, or non-credential actions) is a no-op here.
+        let object_id = caps.iter().find_map(|s| {
+            if !s.actions.iter().any(|a| a == "credential:read") {
+                return None;
+            }
+            match &s.resource {
+                ResourceSelector::Exact { value } => Some(value.clone()),
+                _ => None,
             }
         });
 
         let Some(object_id) = object_id else {
-            return String::new(); // No ReadCredential cap — nothing to deposit.
+            return String::new(); // No credential:read statement — nothing to deposit.
         };
 
         // Find a namespace that contains this object.
@@ -6025,7 +6053,11 @@ impl DemoApp {
         };
 
         let new_expires_at = now_epoch_secs() + seconds;
-        match self.app_runtime.store.renew_access_grant(grant_id, new_expires_at) {
+        match self
+            .app_runtime
+            .store
+            .renew_access_grant(grant_id, new_expires_at, None)
+        {
             Ok(()) => format!("renewed grant\t{}\texpires_at={}\n", grant_id, new_expires_at),
             Err(err) => format!("Failed to renew grant: {}\n", err),
         }
@@ -6371,18 +6403,30 @@ impl DemoApp {
                 ))
             })?;
 
-        let mode = AccessGrantMode::parse(mode_str)
+        let mode = GrantMode::parse(mode_str)
             .ok_or_else(|| {
                 ValidationError::new(format!(
                     "invalid mode: {mode_str}. Use: one_shot, renewable, standing"
                 ))
             })?;
 
-        let capabilities = parse_capabilities(cap_strs)?;
+        let statements = parse_capabilities(cap_strs)?;
 
         let now = now_epoch_secs();
         let grant_id = self.allocate_subject_id("grant");
         let expires_at = expires_in.map(|s| now + s);
+        // Keep consumed ResourceType/Usage imports alive after shape refactor.
+        let _ = (ResourceType::Credential, Usage::default());
+
+        let block = Block {
+            statements,
+            nbf: None,
+            expires_at,
+            issued_by: persona_id.clone(),
+            issued_at: now,
+            approval: None,
+            note: None,
+        };
 
         let grant = AccessGrant {
             id: grant_id.clone(),
@@ -6391,14 +6435,18 @@ impl DemoApp {
             recipient_kind,
             recipient_id: recipient_id.to_string(),
             recipient_profile,
-            status: AccessGrantStatus::Active,
+            status: GrantStatus::Active,
             mode,
-            capabilities,
+            blocks: vec![SignedBlock {
+                block,
+                // Phase-1 placeholder per design — biscuit-auth chain signing
+                // lands in a follow-up PR. Validate() requires non-empty.
+                pubkey_next: "unsigned-phase1".into(),
+                signature: "unsigned-phase1".into(),
+            }],
+            attestation: AttestationBinding::default(),
             created_at: now,
             updated_at: now,
-            not_before: None,
-            expires_at,
-            renewable_until: None,
             revoked_at: None,
             revoked_reason: None,
             last_used_at: None,
@@ -6433,7 +6481,7 @@ impl DemoApp {
             grant.label = Some(lbl.to_string());
         }
         if let Some(mode_str) = new_mode {
-            grant.mode = AccessGrantMode::parse(mode_str).ok_or_else(|| {
+            grant.mode = GrantMode::parse(mode_str).ok_or_else(|| {
                 ValidationError::new(format!(
                     "invalid mode: {mode_str}. Use: one_shot, renewable, standing"
                 ))
@@ -6459,7 +6507,7 @@ impl DemoApp {
         writeln!(&mut out, "Active grants").unwrap();
         writeln!(
             &mut out,
-            "{:<14} {:<14} {:<16} {:<10} {:<10} CAPS",
+            "{:<14} {:<14} {:<16} {:<10} {:<10} STMTS",
             "GRANT", "PERSONA", "RECIPIENT", "MODE", "PROFILE"
         )
         .unwrap();
@@ -6476,7 +6524,7 @@ impl DemoApp {
                 truncate_id(&g.recipient_id),
                 g.mode.as_str(),
                 g.recipient_profile.as_str(),
-                g.capability_count,
+                g.statement_count,
             )
             .unwrap();
         }
@@ -6508,11 +6556,8 @@ impl DemoApp {
         writeln!(&mut out, "  version:   {}", g.version).unwrap();
         writeln!(&mut out, "  created:   {}", g.created_at).unwrap();
         writeln!(&mut out, "  updated:   {}", g.updated_at).unwrap();
-        if let Some(exp) = g.expires_at {
+        if let Some(exp) = g.effective_expires_at() {
             writeln!(&mut out, "  expires:   {}", exp).unwrap();
-        }
-        if let Some(ru) = g.renewable_until {
-            writeln!(&mut out, "  renewable_until: {}", ru).unwrap();
         }
         if let Some(rev) = g.revoked_at {
             writeln!(&mut out, "  revoked:   {}", rev).unwrap();
@@ -6524,10 +6569,58 @@ impl DemoApp {
             writeln!(&mut out, "  last_used: {}", lu).unwrap();
         }
 
-        if !g.capabilities.is_empty() {
-            writeln!(&mut out, "  capabilities:").unwrap();
-            for cap in &g.capabilities {
-                writeln!(&mut out, "    - {}", format_capability(cap)).unwrap();
+        if !g.blocks.is_empty() {
+            writeln!(
+                &mut out,
+                "  chain:     {} block(s), {} statement(s), resource_types: {}",
+                g.blocks.len(),
+                g.statement_count(),
+                g.resource_types()
+                    .iter()
+                    .map(|rt| rt.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+            .unwrap();
+            for (bi, sb) in g.blocks.iter().enumerate() {
+                writeln!(
+                    &mut out,
+                    "  block {}: issued_by={} issued_at={}{}{}",
+                    bi,
+                    sb.block.issued_by,
+                    sb.block.issued_at,
+                    sb.block
+                        .nbf
+                        .map(|v| format!(" nbf={v}"))
+                        .unwrap_or_default(),
+                    sb.block
+                        .expires_at
+                        .map(|v| format!(" expires_at={v}"))
+                        .unwrap_or_default(),
+                )
+                .unwrap();
+                for stmt in &sb.block.statements {
+                    writeln!(
+                        &mut out,
+                        "    [{}] {} actions=[{}] resource={}",
+                        stmt.sid,
+                        stmt.resource_type.as_str(),
+                        stmt.actions.join(", "),
+                        render_resource(&stmt.resource),
+                    )
+                    .unwrap();
+                    if let Some(b) = &stmt.budget {
+                        writeln!(&mut out, "       budget: {b:?}").unwrap();
+                    }
+                    if !stmt.conditions.is_empty() {
+                        writeln!(
+                            &mut out,
+                            "       conditions: {} condition(s)",
+                            stmt.conditions.len()
+                        )
+                        .unwrap();
+                    }
+                }
             }
         }
 
@@ -6569,7 +6662,7 @@ impl DemoApp {
         }
         writeln!(
             &mut out,
-            "{:<14} {:<14} {:<10} {:<10} {:<10} CAPS",
+            "{:<14} {:<14} {:<10} {:<10} {:<10} STMTS",
             "GRANT", "PERSONA", "STATUS", "MODE", "PROFILE"
         )
         .unwrap();
@@ -6586,7 +6679,7 @@ impl DemoApp {
                 g.status.as_str(),
                 g.mode.as_str(),
                 g.recipient_profile.as_str(),
-                g.capability_count,
+                g.statement_count,
             )
             .unwrap();
         }

@@ -52,3 +52,11 @@ class CredentialValue:
 class UseCredentialResult:
     status: str
     credential: CredentialValue
+
+
+@dataclass
+class GrantRevokedNotification:
+    """Server-initiated notification pushed by the daemon when a grant is revoked."""
+
+    grant_id: str
+    persona_id: str

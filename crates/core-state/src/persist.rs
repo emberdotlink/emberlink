@@ -188,7 +188,8 @@ pub(crate) fn write_file_manifest(
                 &chunk.manifest_id,
                 chunk.ordinal,
                 &chunk.chunk_id,
-                chunk.ciphertext_bytes
+                // rusqlite 0.39 removed u64 ToSql; SQLite integers are signed i64.
+                chunk.ciphertext_bytes as i64
             ],
         )
         .map_err(|err| ValidationError::new(format!("write manifest chunk row: {err}")))?;
@@ -263,7 +264,8 @@ pub(crate) fn write_local_file_manifest(
                 &chunk.manifest_id,
                 chunk.ordinal,
                 &chunk.chunk_id,
-                chunk.ciphertext_bytes
+                // rusqlite 0.39 removed u64 ToSql; SQLite integers are signed i64.
+                chunk.ciphertext_bytes as i64
             ],
         )
         .map_err(|err| ValidationError::new(format!("write local manifest chunk row: {err}")))?;
@@ -328,7 +330,8 @@ pub(crate) fn load_file_manifest(
                 manifest_id: manifest_id.to_string(),
                 chunk_id: row.get(0)?,
                 ordinal: row.get(1)?,
-                ciphertext_bytes: row.get(2)?,
+                // rusqlite 0.39 removed u64 FromSql; read as i64 and cast.
+                ciphertext_bytes: row.get::<_, i64>(2)? as u64,
             })
         })
         .map_err(|err| ValidationError::new(format!("query manifest chunk rows: {err}")))?;
@@ -407,7 +410,8 @@ pub(crate) fn load_local_file_manifest(
                 manifest_id: manifest_id.to_string(),
                 chunk_id: row.get(0)?,
                 ordinal: row.get(1)?,
-                ciphertext_bytes: row.get(2)?,
+                // rusqlite 0.39 removed u64 FromSql; read as i64 and cast.
+                ciphertext_bytes: row.get::<_, i64>(2)? as u64,
             })
         })
         .map_err(|err| ValidationError::new(format!("query local manifest chunk rows: {err}")))?;
@@ -548,7 +552,8 @@ pub(crate) fn write_local_block(
          VALUES (?1, ?2, NULL, NULL)
          ON CONFLICT(chunk_id) DO UPDATE SET
             ciphertext_bytes = excluded.ciphertext_bytes",
-        params![&block.chunk_id, block.ciphertext_bytes],
+        // rusqlite 0.39 removed u64 ToSql; SQLite integers are signed i64.
+        params![&block.chunk_id, block.ciphertext_bytes as i64],
     )
     .map_err(|err| ValidationError::new(format!("write local block: {err}")))?;
     Ok(())
@@ -567,7 +572,8 @@ pub(crate) fn write_encrypted_local_block(
             ciphertext = excluded.ciphertext",
         params![
             &block.chunk.chunk_id,
-            block.chunk.ciphertext_bytes,
+            // rusqlite 0.39 removed u64 ToSql; SQLite integers are signed i64.
+            block.chunk.ciphertext_bytes as i64,
             &block.encrypted.nonce_hex,
             &block.encrypted.ciphertext
         ],
@@ -2201,146 +2207,74 @@ pub(crate) fn delete_service_binding(
     Ok(count > 0)
 }
 
-// --- Access Grant persistence ---
+// --- Access Grant persistence (design — composite grant shape) ---
+//
+// A grant is a signed chain of SignedBlocks. We persist the whole chain as
+// one JSON blob in `blocks_json`. Per-block expiry and per-statement budget
+// live inside that blob; top-level columns (status, mode, last_used_at) are
+// envelope state only. Projections (effective_expires_at, aggregate_usage,
+// resource_types) are computed from blocks on read.
+//
+// Authoritative on-wire format will move to biscuit-auth tokens once
+// core-crypto wires it in; until then blocks_json is the durable store.
 
-pub(crate) fn capabilities_to_json(
-    capabilities: &[core_types::GrantCapability],
-) -> Result<String, ValidationError> {
-    let json_values: Vec<serde_json::Value> = capabilities
-        .iter()
-        .map(|cap| match cap {
-            core_types::GrantCapability::DiscloseFields {
-                object_id,
-                field_paths,
-            } => serde_json::json!({
-                "kind": "disclose_fields",
-                "object_id": object_id,
-                "field_paths": field_paths,
-            }),
-            core_types::GrantCapability::ReadCredential { object_id } => serde_json::json!({
-                "kind": "read_credential",
-                "object_id": object_id,
-            }),
-            core_types::GrantCapability::UsePasskey { binding_id } => serde_json::json!({
-                "kind": "use_passkey",
-                "binding_id": binding_id,
-            }),
-            core_types::GrantCapability::RefreshDisclosure { template_id } => serde_json::json!({
-                "kind": "refresh_disclosure",
-                "template_id": template_id,
-            }),
-            core_types::GrantCapability::UseServiceBinding { binding_id } => serde_json::json!({
-                "kind": "use_service_binding",
-                "binding_id": binding_id,
-            }),
-        })
-        .collect();
-    serde_json::to_string(&json_values)
-        .map_err(|err| ValidationError::new(format!("serialize capabilities: {err}")))
+fn blocks_to_json(blocks: &[core_types::SignedBlock]) -> Result<String, ValidationError> {
+    serde_json::to_string(blocks)
+        .map_err(|err| ValidationError::new(format!("serialize grant blocks: {err}")))
 }
 
-pub(crate) fn capabilities_from_json(
-    json: &str,
-) -> Result<Vec<core_types::GrantCapability>, ValidationError> {
-    let values: Vec<serde_json::Value> = serde_json::from_str(json)
-        .map_err(|err| ValidationError::new(format!("deserialize capabilities: {err}")))?;
-    let mut caps = Vec::new();
-    for val in &values {
-        let kind = val
-            .get("kind")
-            .and_then(|k| k.as_str())
-            .unwrap_or("");
-        match kind {
-            "disclose_fields" => {
-                let object_id = val
-                    .get("object_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let field_paths = val
-                    .get("field_paths")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                caps.push(core_types::GrantCapability::DiscloseFields {
-                    object_id,
-                    field_paths,
-                });
-            }
-            "read_credential" => {
-                let object_id = val
-                    .get("object_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                caps.push(core_types::GrantCapability::ReadCredential { object_id });
-            }
-            "use_passkey" => {
-                let binding_id = val
-                    .get("binding_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                caps.push(core_types::GrantCapability::UsePasskey { binding_id });
-            }
-            "refresh_disclosure" => {
-                let template_id = val
-                    .get("template_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                caps.push(core_types::GrantCapability::RefreshDisclosure { template_id });
-            }
-            "use_service_binding" => {
-                let binding_id = val
-                    .get("binding_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                caps.push(core_types::GrantCapability::UseServiceBinding { binding_id });
-            }
-            _ => {
-                // Unknown capability kinds are preserved but ignored per design
-            }
-        }
-    }
-    Ok(caps)
+fn blocks_from_json(json: &str) -> Result<Vec<core_types::SignedBlock>, ValidationError> {
+    serde_json::from_str(json)
+        .map_err(|err| ValidationError::new(format!("deserialize grant blocks: {err}")))
 }
 
 pub(crate) fn write_access_grant(
     conn: &Connection,
     grant: &core_types::AccessGrant,
 ) -> Result<(), ValidationError> {
-    let caps_json = capabilities_to_json(&grant.capabilities)?;
-    // Only persist "active" or "revoked" — derived statuses aren't stored.
+    let blocks_json = blocks_to_json(&grant.blocks)?;
+    // Only persist terminal-ish stored statuses. Derived `Expired` / `Pending`
+    // are never written; `ExhaustedByBudget` + `Paused` are distinct persisted
+    // terminals / pauses.
     let stored_status = match grant.status {
-        core_types::AccessGrantStatus::Revoked => "revoked",
+        core_types::GrantStatus::Revoked => "revoked",
+        core_types::GrantStatus::ExhaustedByBudget => "exhausted_by_budget",
+        core_types::GrantStatus::Paused => "paused",
         _ => "active",
     };
+    let attestation_json = serde_json::to_string(&grant.attestation)
+        .map_err(|err| ValidationError::new(format!("encode grant attestation: {err}")))?;
+
+    // Envelope-level projections for indexing / listing convenience.
+    let effective_expires_at = grant.effective_expires_at();
+    let resource_types_csv = grant
+        .resource_types()
+        .iter()
+        .map(|rt| rt.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+
     conn.execute(
         "INSERT INTO access_grants (
             grant_id, version, issuing_persona_id, recipient_kind, recipient_id,
-            recipient_profile, status, mode, capabilities_json, label,
-            created_at, updated_at, not_before, expires_at, renewable_until,
-            revoked_at, revoked_reason, last_used_at
+            recipient_profile, status, mode, blocks_json, label,
+            created_at, updated_at, expires_at,
+            revoked_at, revoked_reason, last_used_at,
+            resource_types_csv, attestation_json
         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
         ON CONFLICT(grant_id) DO UPDATE SET
             version = excluded.version,
             status = excluded.status,
             mode = excluded.mode,
-            capabilities_json = excluded.capabilities_json,
+            blocks_json = excluded.blocks_json,
             label = excluded.label,
             updated_at = excluded.updated_at,
-            not_before = excluded.not_before,
             expires_at = excluded.expires_at,
-            renewable_until = excluded.renewable_until,
             revoked_at = excluded.revoked_at,
             revoked_reason = excluded.revoked_reason,
-            last_used_at = excluded.last_used_at",
+            last_used_at = excluded.last_used_at,
+            resource_types_csv = excluded.resource_types_csv,
+            attestation_json = excluded.attestation_json",
         params![
             &grant.id,
             grant.version as i64,
@@ -2350,16 +2284,16 @@ pub(crate) fn write_access_grant(
             grant.recipient_profile.as_str(),
             stored_status,
             grant.mode.as_str(),
-            &caps_json,
+            &blocks_json,
             &grant.label,
             grant.created_at as i64,
             grant.updated_at as i64,
-            grant.not_before.map(|v| v as i64),
-            grant.expires_at.map(|v| v as i64),
-            grant.renewable_until.map(|v| v as i64),
+            effective_expires_at.map(|v| v as i64),
             grant.revoked_at.map(|v| v as i64),
             &grant.revoked_reason,
             grant.last_used_at.map(|v| v as i64),
+            &resource_types_csv,
+            &attestation_json,
         ],
     )
     .map_err(|err| ValidationError::new(format!("write access grant: {err}")))?;
@@ -2372,7 +2306,7 @@ pub(crate) fn write_access_grant_history(
 ) -> Result<(), ValidationError> {
     conn.execute(
         "INSERT INTO access_grant_history (
-            history_id, grant_id, version, action, timestamp, capabilities_snapshot, note
+            history_id, grant_id, version, action, timestamp, blocks_snapshot, note
         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             &entry.history_id,
@@ -2380,7 +2314,7 @@ pub(crate) fn write_access_grant_history(
             entry.version as i64,
             &entry.action,
             entry.timestamp as i64,
-            &entry.capabilities_snapshot,
+            &entry.blocks_snapshot,
             &entry.note,
         ],
     )
@@ -2400,27 +2334,30 @@ fn row_to_access_grant(
     let recipient_profile_str: String = row.get(5)?;
     let stored_status: String = row.get(6)?;
     let mode_str: String = row.get(7)?;
-    let caps_json: String = row.get(8)?;
+    let blocks_json: String = row.get(8)?;
     let label: Option<String> = row.get(9)?;
     let created_at: i64 = row.get(10)?;
     let updated_at: i64 = row.get(11)?;
-    let not_before: Option<i64> = row.get(12)?;
-    let expires_at: Option<i64> = row.get(13)?;
-    let renewable_until: Option<i64> = row.get(14)?;
-    let revoked_at: Option<i64> = row.get(15)?;
-    let revoked_reason: Option<String> = row.get(16)?;
-    let last_used_at: Option<i64> = row.get(17)?;
+    let expires_at: Option<i64> = row.get(12)?;
+    let revoked_at: Option<i64> = row.get(13)?;
+    let revoked_reason: Option<String> = row.get(14)?;
+    let last_used_at: Option<i64> = row.get(15)?;
+    // resource_types_csv (col 16) is a projection for indexing; not used on read
+    let _resource_types_csv: String = row.get(16).unwrap_or_default();
+    let attestation_json: String = row.get(17)?;
 
     let recipient_kind = core_types::PresentationAudienceKind::parse(&recipient_kind_str)
         .unwrap_or(core_types::PresentationAudienceKind::Service);
     let recipient_profile = core_types::RecipientProfile::parse(&recipient_profile_str)
         .unwrap_or(core_types::RecipientProfile::Human);
-    let mode = core_types::AccessGrantMode::parse(&mode_str)
-        .unwrap_or(core_types::AccessGrantMode::Renewable);
-    let capabilities = capabilities_from_json(&caps_json).unwrap_or_default();
-    let nb = not_before.map(|v| v as u64);
+    let mode = core_types::GrantMode::parse(&mode_str).unwrap_or(core_types::GrantMode::OneShot);
+    let blocks = blocks_from_json(&blocks_json).unwrap_or_default();
     let exp = expires_at.map(|v| v as u64);
-    let status = core_types::AccessGrantStatus::derive(&stored_status, nb, exp, now);
+    // Derive nbf from blocks for the status computation.
+    let nb = blocks.iter().filter_map(|sb| sb.block.nbf).max();
+    let status = core_types::GrantStatus::derive(&stored_status, nb, exp, now);
+    let attestation = serde_json::from_str::<core_types::AttestationBinding>(&attestation_json)
+        .unwrap_or_default();
 
     Ok(core_types::AccessGrant {
         id: grant_id,
@@ -2431,12 +2368,10 @@ fn row_to_access_grant(
         recipient_profile,
         status,
         mode,
-        capabilities,
+        blocks,
+        attestation,
         created_at: created_at as u64,
         updated_at: updated_at as u64,
-        not_before: nb,
-        expires_at: exp,
-        renewable_until: renewable_until.map(|v| v as u64),
         revoked_at: revoked_at.map(|v| v as u64),
         revoked_reason,
         last_used_at: last_used_at.map(|v| v as u64),
@@ -2446,9 +2381,10 @@ fn row_to_access_grant(
 
 const ACCESS_GRANT_COLUMNS: &str =
     "grant_id, version, issuing_persona_id, recipient_kind, recipient_id,
-     recipient_profile, status, mode, capabilities_json, label,
-     created_at, updated_at, not_before, expires_at, renewable_until,
-     revoked_at, revoked_reason, last_used_at";
+     recipient_profile, status, mode, blocks_json, label,
+     created_at, updated_at, expires_at,
+     revoked_at, revoked_reason, last_used_at,
+     resource_types_csv, attestation_json";
 
 pub(crate) fn load_access_grant(
     conn: &Connection,
@@ -2551,7 +2487,7 @@ pub(crate) fn load_access_grant_history(
 ) -> Result<Vec<core_types::AccessGrantHistoryEntry>, ValidationError> {
     let mut stmt = conn
         .prepare(
-            "SELECT history_id, grant_id, version, action, timestamp, capabilities_snapshot, note
+            "SELECT history_id, grant_id, version, action, timestamp, blocks_snapshot, note
              FROM access_grant_history WHERE grant_id = ?1 ORDER BY timestamp ASC",
         )
         .map_err(|err| ValidationError::new(format!("prepare grant history query: {err}")))?;
@@ -2564,7 +2500,7 @@ pub(crate) fn load_access_grant_history(
                 version: row.get::<_, i64>(2)? as u32,
                 action: row.get(3)?,
                 timestamp: row.get::<_, i64>(4)? as u64,
-                capabilities_snapshot: row.get(5)?,
+                blocks_snapshot: row.get(5)?,
                 note: row.get(6)?,
             })
         })
@@ -2589,7 +2525,7 @@ pub(crate) fn load_grant_history_timeline(
         match (persona_id, before) {
             (Some(pid), Some(ts)) => (
                 "SELECT h.history_id, h.grant_id, h.version, h.action, h.timestamp,
-                        h.capabilities_snapshot, h.note
+                        h.blocks_snapshot, h.note
                  FROM access_grant_history h
                  JOIN access_grants g ON h.grant_id = g.grant_id
                  WHERE g.issuing_persona_id = ?1 AND h.timestamp < ?2
@@ -2603,7 +2539,7 @@ pub(crate) fn load_grant_history_timeline(
             ),
             (Some(pid), None) => (
                 "SELECT h.history_id, h.grant_id, h.version, h.action, h.timestamp,
-                        h.capabilities_snapshot, h.note
+                        h.blocks_snapshot, h.note
                  FROM access_grant_history h
                  JOIN access_grants g ON h.grant_id = g.grant_id
                  WHERE g.issuing_persona_id = ?1
@@ -2616,7 +2552,7 @@ pub(crate) fn load_grant_history_timeline(
             ),
             (None, Some(ts)) => (
                 "SELECT history_id, grant_id, version, action, timestamp,
-                        capabilities_snapshot, note
+                        blocks_snapshot, note
                  FROM access_grant_history
                  WHERE timestamp < ?1
                  ORDER BY timestamp DESC LIMIT ?2"
@@ -2628,7 +2564,7 @@ pub(crate) fn load_grant_history_timeline(
             ),
             (None, None) => (
                 "SELECT history_id, grant_id, version, action, timestamp,
-                        capabilities_snapshot, note
+                        blocks_snapshot, note
                  FROM access_grant_history
                  ORDER BY timestamp DESC LIMIT ?1"
                     .to_string(),
@@ -2651,7 +2587,7 @@ pub(crate) fn load_grant_history_timeline(
                 version: row.get::<_, i64>(2)? as u32,
                 action: row.get(3)?,
                 timestamp: row.get::<_, i64>(4)? as u64,
-                capabilities_snapshot: row.get(5)?,
+                blocks_snapshot: row.get(5)?,
                 note: row.get(6)?,
             })
         })

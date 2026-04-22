@@ -287,6 +287,10 @@ CREATE INDEX IF NOT EXISTS idx_persona_device_access_device_id ON persona_device
 CREATE INDEX IF NOT EXISTS idx_local_artifacts_owner ON local_presentation_artifacts(owner_kind, owner_id);
 CREATE INDEX IF NOT EXISTS idx_received_artifacts_issuer ON local_received_presentation_artifacts(issuer_persona_id);
 
+-- design — composite grant statements shape.
+-- blocks_json holds the full signed block chain; per-statement budget +
+-- conditions live inside. Envelope columns (status, mode, expires_at) are
+-- derived projections stored for indexing/listing convenience.
 CREATE TABLE IF NOT EXISTS access_grants (
     grant_id TEXT NOT NULL PRIMARY KEY,
     version INTEGER NOT NULL DEFAULT 1,
@@ -296,16 +300,16 @@ CREATE TABLE IF NOT EXISTS access_grants (
     recipient_profile TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'active',
     mode TEXT NOT NULL,
-    capabilities_json TEXT NOT NULL,
+    blocks_json TEXT NOT NULL,
     label TEXT,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
-    not_before INTEGER,
     expires_at INTEGER,
-    renewable_until INTEGER,
     revoked_at INTEGER,
     revoked_reason TEXT,
-    last_used_at INTEGER
+    last_used_at INTEGER,
+    resource_types_csv TEXT NOT NULL DEFAULT '',
+    attestation_json TEXT NOT NULL DEFAULT '{"status":"unattested_local_dev"}'
 );
 
 CREATE INDEX IF NOT EXISTS idx_grants_persona ON access_grants(issuing_persona_id);
@@ -318,7 +322,7 @@ CREATE TABLE IF NOT EXISTS access_grant_history (
     version INTEGER NOT NULL,
     action TEXT NOT NULL,
     timestamp INTEGER NOT NULL,
-    capabilities_snapshot TEXT,
+    blocks_snapshot TEXT,
     note TEXT
 );
 
@@ -531,9 +535,13 @@ pub(crate) fn ensure_runtime_columns(conn: &Connection) -> Result<(), Validation
         "ensure grant_offers conditions_json column",
     )?;
 
-    // Ensure access_grants tables exist for existing databases.
+    // design — composite grant shape. blocks_json holds the full signed
+    // chain; per-statement budget / conditions live inside. Pre-design
+    // databases are dropped: there are no production users yet.
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS access_grants (
+        "DROP TABLE IF EXISTS access_grants;
+        DROP TABLE IF EXISTS access_grant_history;
+        CREATE TABLE IF NOT EXISTS access_grants (
             grant_id TEXT NOT NULL PRIMARY KEY,
             version INTEGER NOT NULL DEFAULT 1,
             issuing_persona_id TEXT NOT NULL,
@@ -542,16 +550,16 @@ pub(crate) fn ensure_runtime_columns(conn: &Connection) -> Result<(), Validation
             recipient_profile TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'active',
             mode TEXT NOT NULL,
-            capabilities_json TEXT NOT NULL,
+            blocks_json TEXT NOT NULL,
             label TEXT,
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL,
-            not_before INTEGER,
             expires_at INTEGER,
-            renewable_until INTEGER,
             revoked_at INTEGER,
             revoked_reason TEXT,
-            last_used_at INTEGER
+            last_used_at INTEGER,
+            resource_types_csv TEXT NOT NULL DEFAULT '',
+            attestation_json TEXT NOT NULL DEFAULT '{\"status\":\"unattested_local_dev\"}'
         );
         CREATE INDEX IF NOT EXISTS idx_grants_persona ON access_grants(issuing_persona_id);
         CREATE INDEX IF NOT EXISTS idx_grants_recipient ON access_grants(recipient_kind, recipient_id);
@@ -562,7 +570,7 @@ pub(crate) fn ensure_runtime_columns(conn: &Connection) -> Result<(), Validation
             version INTEGER NOT NULL,
             action TEXT NOT NULL,
             timestamp INTEGER NOT NULL,
-            capabilities_snapshot TEXT,
+            blocks_snapshot TEXT,
             note TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_grant_history_grant_id ON access_grant_history(grant_id);",

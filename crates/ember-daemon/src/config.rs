@@ -1,5 +1,7 @@
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -12,6 +14,8 @@ pub enum ConfigError {
     Parse(#[from] toml::de::Error),
     #[error("could not determine home directory")]
     NoHomeDir,
+    #[error("validation error: {0}")]
+    Validation(String),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,12 +47,27 @@ struct RawDaemonSection {
     socket_dir: Option<String>,
     data_dir: Option<String>,
     pid_file: Option<String>,
+    policy_file: Option<String>,
     log_level: Option<LogLevel>,
+    dashboard_addr: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawConfig {
     daemon: Option<RawDaemonSection>,
+    keyring: Option<KeyringConfig>,
+}
+
+/// Keyring service/account identifiers written into `config.toml`.
+///
+/// Resolution order in `Vault::open_from_config`:
+/// 1. Config field (if `Some`)
+/// 2. Env var override (`EMBER_KEYRING_SERVICE` / `EMBER_KEYRING_ACCOUNT`) — debug backdoor
+/// 3. Compile-time default (`"ember-daemon"` / `"vault"`)
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyringConfig {
+    pub service: Option<String>,
+    pub account: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,7 +75,13 @@ pub struct DaemonConfig {
     pub socket_dir: PathBuf,
     pub data_dir: PathBuf,
     pub pid_file: PathBuf,
+    pub policy_file: PathBuf,
     pub log_level: LogLevel,
+    /// Address for the dashboard HTTP listener. `None` disables the dashboard (useful for tests).
+    /// Defaults to `127.0.0.1:3141` — loopback only, never 0.0.0.0.
+    pub dashboard_addr: Option<SocketAddr>,
+    /// Keyring service/account override. `None` fields fall back to env var, then compile-time default.
+    pub keyring: KeyringConfig,
 }
 
 fn expand_tilde(path: &str) -> Result<PathBuf, ConfigError> {
@@ -82,7 +107,10 @@ impl Default for DaemonConfig {
             socket_dir: base.join("run"),
             data_dir: base.join("data"),
             pid_file: base.join("run").join("emberd.pid"),
+            policy_file: base.join("policy.toml"),
             log_level: LogLevel::Info,
+            dashboard_addr: Some("127.0.0.1:3141".parse().expect("valid default addr")),
+            keyring: KeyringConfig::default(),
         }
     }
 }
@@ -103,7 +131,9 @@ impl DaemonConfig {
             socket_dir: None,
             data_dir: None,
             pid_file: None,
+            policy_file: None,
             log_level: None,
+            dashboard_addr: None,
         });
 
         let socket_dir = match section.socket_dir {
@@ -118,14 +148,51 @@ impl DaemonConfig {
             Some(ref s) => expand_tilde(s)?,
             None => defaults.pid_file,
         };
+        let policy_file = match section.policy_file {
+            Some(ref s) => expand_tilde(s)?,
+            None => defaults.policy_file,
+        };
         let log_level = section.log_level.unwrap_or(defaults.log_level);
 
-        Ok(DaemonConfig {
+        let dashboard_addr = match section.dashboard_addr {
+            Some(ref s) if s.is_empty() => None,
+            Some(ref s) => Some(SocketAddr::from_str(s).map_err(|e| {
+                ConfigError::Validation(format!("invalid dashboard_addr '{}': {}", s, e))
+            })?),
+            None => defaults.dashboard_addr,
+        };
+
+        let keyring = raw.keyring.unwrap_or_default();
+
+        let cfg = DaemonConfig {
             socket_dir,
             data_dir,
             pid_file,
+            policy_file,
             log_level,
-        })
+            dashboard_addr,
+            keyring,
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.socket_dir.as_os_str().is_empty() {
+            return Err(ConfigError::Validation("socket_dir cannot be empty".to_string()));
+        }
+        if self.data_dir.as_os_str().is_empty() {
+            return Err(ConfigError::Validation("data_dir cannot be empty".to_string()));
+        }
+        if self.pid_file.as_os_str().is_empty() {
+            return Err(ConfigError::Validation("pid_file cannot be empty".to_string()));
+        }
+        if self.socket_dir == self.data_dir {
+            return Err(ConfigError::Validation(
+                "socket_dir and data_dir must be different".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn ensure_dirs(&self) -> Result<(), ConfigError> {
@@ -184,7 +251,10 @@ mod tests {
             socket_dir: base.join("run"),
             data_dir: base.join("data"),
             pid_file: base.join("run").join("emberd.pid"),
+            policy_file: base.join("policy.toml"),
             log_level: LogLevel::Info,
+            dashboard_addr: None,
+            keyring: KeyringConfig::default(),
         };
 
         cfg.ensure_dirs().unwrap();
@@ -249,5 +319,75 @@ mod tests {
         let p = DaemonConfig::default_config_path();
         assert!(p.to_string_lossy().contains(".ember"));
         assert!(p.to_string_lossy().ends_with("config.toml"));
+    }
+
+    #[test]
+    fn validate_default_config_passes() {
+        let cfg = DaemonConfig::default();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_empty_socket_dir_fails() {
+        let cfg = DaemonConfig {
+            socket_dir: PathBuf::from(""),
+            data_dir: PathBuf::from("/tmp/.ember/data"),
+            pid_file: PathBuf::from("/tmp/.ember/run/emberd.pid"),
+            policy_file: PathBuf::from("/tmp/.ember/policy.toml"),
+            log_level: LogLevel::Info,
+            dashboard_addr: None,
+            keyring: KeyringConfig::default(),
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(err, ConfigError::Validation(ref s) if s.contains("socket_dir")));
+    }
+
+    #[test]
+    fn validate_same_dirs_fails() {
+        let cfg = DaemonConfig {
+            socket_dir: PathBuf::from("/tmp/.ember/same"),
+            data_dir: PathBuf::from("/tmp/.ember/same"),
+            pid_file: PathBuf::from("/tmp/.ember/same/emberd.pid"),
+            policy_file: PathBuf::from("/tmp/.ember/policy.toml"),
+            log_level: LogLevel::Info,
+            dashboard_addr: None,
+            keyring: KeyringConfig::default(),
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(err, ConfigError::Validation(ref s) if s.contains("must be different")));
+    }
+
+    #[test]
+    fn keyring_section_loaded_from_toml() {
+        let toml_str = "[daemon]\nlog_level = \"info\"\n\n[keyring]\nservice = \"my-service\"\naccount = \"my-account\"\n";
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+
+        let loaded = DaemonConfig::load(f.path()).unwrap();
+        assert_eq!(loaded.keyring.service.as_deref(), Some("my-service"));
+        assert_eq!(loaded.keyring.account.as_deref(), Some("my-account"));
+    }
+
+    #[test]
+    fn keyring_section_absent_gives_defaults() {
+        let toml_str = "[daemon]\nlog_level = \"info\"\n";
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+
+        let loaded = DaemonConfig::load(f.path()).unwrap();
+        assert_eq!(loaded.keyring, KeyringConfig::default());
+        assert!(loaded.keyring.service.is_none());
+        assert!(loaded.keyring.account.is_none());
+    }
+
+    #[test]
+    fn keyring_partial_section_service_only() {
+        let toml_str = "[daemon]\nlog_level = \"info\"\n\n[keyring]\nservice = \"only-service\"\n";
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+
+        let loaded = DaemonConfig::load(f.path()).unwrap();
+        assert_eq!(loaded.keyring.service.as_deref(), Some("only-service"));
+        assert!(loaded.keyring.account.is_none());
     }
 }

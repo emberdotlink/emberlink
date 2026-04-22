@@ -760,9 +760,9 @@ impl DemoApp {
                         };
                         writeln!(
                             &mut out,
-                            "  → {} | {} caps | {}",
+                            "  → {} | {} stmts | {}",
                             truncate_id(&g.recipient_id),
-                            g.capability_count,
+                            g.statement_count,
                             expires,
                         )
                         .unwrap();
@@ -800,9 +800,9 @@ impl DemoApp {
                         };
                         writeln!(
                             &mut out,
-                            "  ← {} | {} caps | {}",
+                            "  ← {} | {} stmts | {}",
                             truncate_id(issuer_label),
-                            g.capability_count,
+                            g.statement_count,
                             expires,
                         )
                         .unwrap();

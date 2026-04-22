@@ -3,6 +3,14 @@ name = "emberlink-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Ember CLI — the trust layer for AI agents. Manage personas, credentials, grants, sandboxes, and policy."
+repository = "https://github.com/emberdotlink/emberlink"
+homepage = "https://ember.link"
+keywords = ["agent", "trust", "cli", "credentials", "security"]
+categories = ["authentication", "command-line-utilities"]
+# Disable bin auto-discovery so `src/bin/daemon_agent.rs` is treated as a
+# module of the `ember` binary, not a separate binary of its own.
+autobins = false
 
 [[bin]]
 name = "emberlink-cli"
@@ -25,13 +33,24 @@ emberlink-app = { path = "../emberlink-app" }
 core-storage = { path = "../core-storage" }
 core-trust = { path = "../core-trust" }
 core-types = { path = "../core-types" }
+chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 dirs-next = "2"
 ember-daemon = { path = "../ember-daemon" }
-keyring = "3"
+keyring = { version = "3", features = ["apple-native"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 serde_json = "1"
+thiserror = "2"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 tokio = { version = "1", features = ["full"] }
+# `getrandom` used directly for OS entropy (passphrase generation). `rand`'s
+# 0.9/0.10 API reorg moved `sample_iter`/`fill_bytes` behind extension traits;
+# going through `getrandom` avoids that surface entirely.
+getrandom = "0.4"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 webpki-roots = "1.0"
+
+[dev-dependencies]
+tempfile = "3"

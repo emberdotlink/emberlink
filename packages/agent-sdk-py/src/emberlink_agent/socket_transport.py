@@ -84,8 +84,11 @@ class SocketTransport:
             params["ttl_secs"] = ttl_secs
         return self.send("request_grant", params)
 
-    def use_credential(self, grant_id: str) -> Any:
-        return self.send("use_credential", {"grant_id": grant_id})
+    def use_credential(self, persona_id: str, credential_name: str) -> Any:
+        return self.send("use_credential", {"persona_id": persona_id, "credential_name": credential_name})
+
+    def request_access(self, persona_id: str, action: str, resource: str) -> Any:
+        return self.send("request_access", {"persona_id": persona_id, "action": action, "resource": resource})
 
     def __enter__(self) -> SocketTransport:
         self.connect()

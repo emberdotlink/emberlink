@@ -159,4 +159,37 @@ mod tests {
         handle.revoke();
         drop(handle); // double-zeroize is fine
     }
+
+    #[test]
+    fn revoke_zero_fills_underlying_buffer() {
+        // Construct a handle, capture the raw buffer pointer before revoke,
+        // then after revoke verify the bytes at that pointer are all zero.
+        // This guards against a future refactor that marks `revoked=true`
+        // without actually zeroizing the allocation.
+        let data: Vec<u8> = (1..=32u8).collect();
+        let len = data.len();
+        let mut handle = SecretHandle::new(data);
+        let ptr: *const u8 = handle.inner.as_ptr();
+
+        // Sanity: bytes are non-zero before revoke.
+        unsafe {
+            let slice = std::slice::from_raw_parts(ptr, len);
+            assert!(slice.iter().any(|b| *b != 0), "buffer should be non-zero");
+        }
+
+        handle.revoke();
+
+        // After revoke, `zeroize` must have rewritten all bytes to 0.
+        // The Vec's capacity is unchanged, so the pointer is still valid.
+        unsafe {
+            let slice = std::slice::from_raw_parts(ptr, len);
+            assert!(
+                slice.iter().all(|b| *b == 0),
+                "buffer must be zero-filled after revoke, got: {slice:?}"
+            );
+        }
+
+        // Post-condition: expose fails with Revoked.
+        assert!(matches!(handle.expose(), Err(SecretError::Revoked)));
+    }
 }

@@ -10,7 +10,11 @@ use ed25519_dalek::{
     VerifyingKey,
 };
 use hkdf::Hkdf;
-use rand_core::{OsRng, RngCore};
+// `rand_core 0.10` removed `OsRng` and the `getrandom` feature. We use the
+// `getrandom` crate directly for OS entropy — infallible on the platforms we
+// target; `expect` here matches the previous behavior of `OsRng.fill_bytes`
+// (which panicked internally on OS entropy failure).
+use getrandom::fill as os_fill;
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -114,7 +118,7 @@ pub fn generate_local_key_pair_version(
         random_hex_segment(8)
     );
     let mut secret_bytes = [0u8; 32];
-    OsRng.fill_bytes(&mut secret_bytes);
+    os_fill(&mut secret_bytes).expect("OS entropy failure");
     let pair = local_key_pair_from_secret_bytes(key_id, secret_bytes);
     secret_bytes.zeroize();
     pair
@@ -150,7 +154,7 @@ pub fn generate_random_identifier(prefix: &str) -> String {
 /// random bytes.
 pub fn generate_content_key() -> String {
     let mut ikm = [0u8; 32];
-    OsRng.fill_bytes(&mut ikm);
+    os_fill(&mut ikm).expect("OS entropy failure");
     derive_content_key(&ikm, b"emberlink-manifest-content-key")
 }
 
@@ -194,7 +198,7 @@ pub fn encrypt_content(
     let cipher = XChaCha20Poly1305::new_from_slice(&key_bytes)
         .map_err(|err| ValidationError::new(format!("invalid content key: {err}")))?;
     let mut nonce = [0u8; 24];
-    OsRng.fill_bytes(&mut nonce);
+    os_fill(&mut nonce).expect("OS entropy failure");
     let ciphertext = cipher
         .encrypt(
             XNonce::from_slice(&nonce),
@@ -410,7 +414,7 @@ fn local_key_pair_from_secret_bytes(key_id: String, mut secret_bytes: [u8; 32]) 
 
 fn random_hex_segment(byte_len: usize) -> String {
     let mut bytes = vec![0u8; byte_len];
-    OsRng.fill_bytes(&mut bytes);
+    os_fill(&mut bytes).expect("OS entropy failure");
     bytes_to_hex(&bytes)
 }
 

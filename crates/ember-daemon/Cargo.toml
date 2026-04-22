@@ -3,25 +3,43 @@ name = "ember-daemon"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "The trust layer for AI agents — daemon process for credential mediation, policy enforcement, and agent management"
+repository = "https://github.com/emberdotlink/emberlink"
+homepage = "https://ember.link"
+keywords = ["agent", "trust", "daemon", "credentials", "security"]
+categories = ["authentication", "command-line-utilities"]
 
 [dependencies]
+argon2 = "0.5"
 bytes = "1"
 chacha20poly1305 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 core-crypto = { path = "../core-crypto" }
+core-types = { path = "../core-types" }
 dirs-next = "2"
+keyring = { version = "3", features = ["apple-native"] }
 http-body-util = "0.1"
 hyper = { version = "1", features = ["full"] }
+hyper-rustls = { version = "0.27", features = ["http1", "http2", "ring", "webpki-tokio"] }
 hyper-util = { version = "0.1", features = ["full"] }
-rand = "0.8"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
+webpki-roots = "1.0"
+# Use `getrandom` directly for byte-fill ops in vault and dashboard.
+# The `rand` crate is no longer needed since its 0.9/0.10 API reorg moved
+# `RngCore`/`fill_bytes`/`sample_iter` behind extension traits; `getrandom`
+# gives us what we actually use (OS entropy into a buffer) with a stable
+# API surface.
+getrandom = "0.4"
+percent-encoding = "2"
+rusqlite = { version = "0.39", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
-toml = "0.8"
+toml = "0.9"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+emberlink-agent = { path = "../emberlink-agent" }
 tempfile = "3"

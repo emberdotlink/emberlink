@@ -103,7 +103,7 @@ def test_grant_status_not_found(agent: EmberAgent) -> None:
 @skip_no_binary
 def test_use_credential_grant_not_found(agent: EmberAgent) -> None:
     with pytest.raises(EmberAgentError) as exc_info:
-        agent.use_credential(grant_id="nonexistent-grant", credential_id="cred-1")
+        agent.use_credential(grant_id="nonexistent-grant", credential_name="cred-1")
     assert exc_info.value.code == "NOT_FOUND"
 
 

@@ -12,7 +12,9 @@ Some say you live as long as the last person who remembers you. We believe you s
 
 ## What we are building
 
-Emberlink is **programmable trust between humans and machines.**
+Emberlink is **the Grant Warden for AI agents** — and, beneath that, the general pattern of **programmable trust between humans and machines**. The Warden guards the moment of delegation: it keeps the credentials the agent must never see, issues scoped and time-bound *grants* for the work the agent actually needs to do, enforces policy, requires human approval when required, binds authority to a persona, tracks the delegation chain, revokes instantly (including cascades to sub-agents), and emits a signed **Grant Receipt** as durable proof of what was delegated and what the agent did.
+
+Agents should not get credentials. Agents should get grants.
 
 The grant — scoped, time-bound, revocable delegation of authority from one identity to another — is the fundamental primitive. It works the same whether the recipient is an AI agent, a friend, a service, or a flash coalition of strangers.
 
@@ -140,3 +142,50 @@ The grant primitive composes:
 4. We will never hold plaintext user data on our servers.
 5. We will never sell, analyze, or monetize trust relationship metadata.
 6. If we cannot sustain the mission, we hand the protocol to a foundation before we compromise it.
+
+## The Agent Economy
+
+Agents are no longer tools. They are actors — autonomous, persistent, operating on your behalf across services, APIs, and data you care about. They need credentials. They need authorization. They need audit trails.
+
+The current answer is dangerous and binary. Give the agent your API key and hope it doesn't abuse it. Or give it nothing, and it can't do the work. Full access or useless. There is no middle ground.
+
+This is the gap Ember closes.
+
+**The problem with full credentials is not capability — it's accountability.** When an agent holds your AWS key, it holds your AWS key. No scope. No expiry. No record of what it touched. If it goes wrong, you find out after. If it goes very wrong, you find out from your cloud bill.
+
+Ember's position is not a permissions system bolted onto agents. It is the human's trust broker in the agent economy.
+
+The relationship is: human approves, agent executes. Not once, at setup. Continuously, at the boundary of what was authorized. The agent never holds raw credentials — it holds a grant. The grant says what the agent may do, for how long, under what conditions. The grant can be revoked from your phone in three seconds.
+
+**Four principles that are not negotiable:**
+
+1. Agents never hold raw credentials. They hold scoped, time-bound grants that reference living credentials. The credentials rotate. The agent gets the current version only while the grant is active.
+2. Every credential access is auditable. Not "logged somewhere." Logged in an append-only event record that the human can read, export, and verify. The agent cannot lie about what it did.
+3. Humans approve, agents execute. Elevated access requires a human signature. Not a checkbox at setup — a real-time approval from the phone of whoever owns the resource.
+4. Trust is earned, not assumed. A new agent starts narrow: read-only, time-boxed, limited scope. It earns wider access through a track record of behavior. Trust widens with demonstrated reliability, not with a prompt that says "trust me."
+
+**The vision is agents that are as trustworthy as good employees** — not because they are inherently trustworthy, but because the infrastructure makes betrayal impossible and accountability automatic. You don't trust your accountant because you've looked into their soul. You trust them because there are records, limits, consequences, and visibility.
+
+That is what Ember builds for agents. The trust infrastructure that makes the agent economy safe to participate in.
+
+---
+
+## The product
+
+The ember daemon is this philosophy made concrete.
+
+It runs on your device. It holds your keys. It knows your policies. When an agent asks for something, your daemon is the one who answers.
+
+```
+$ ember daemon start
+
+  ember daemon v0.2.0
+  The trust layer for AI agents
+
+  Socket:    ~/.ember/run/daemon.sock
+  Dashboard: http://localhost:3141
+```
+
+Every credential encrypted. Every access scoped and time-bound. Every action logged. Every decision yours.
+
+Not "trust us." Trust yourself.

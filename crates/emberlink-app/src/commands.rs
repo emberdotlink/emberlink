@@ -34,28 +34,29 @@ pub enum UiAction {
     /// `recipient_kind`: "peer" | "service"
     /// `recipient_profile`: "human" | "agent" | "service"
     /// `mode`: "one_shot" | "renewable" | "standing"
-    /// `capabilities`: serialized capability strings (same format as `format_capability`)
+    /// `statement_specs`: shorthand statement specs parsed by
+    /// `runtime::parse_statement_spec` (`read_credential:<id>` etc.).
+    /// `not_before` / `expires_at` are carried onto block 0.
     CreateGrant {
         issuing_persona_id: String,
         recipient_kind: String,
         recipient_id: String,
         recipient_profile: String,
         mode: String,
-        capabilities: Vec<String>,
+        statement_specs: Vec<String>,
         label: Option<String>,
         not_before: Option<u64>,
         expires_at: Option<u64>,
-        renewable_until: Option<u64>,
     },
 
-    /// Edit an existing grant. Only mutable fields: label, capabilities (subset only),
-    /// expires_at, renewable_until, note.
+    /// Edit an existing grant's mutable envelope fields. `statement_specs`,
+    /// if present, replaces the statements inside block 0. `expires_at`
+    /// rewrites block 0's `expires_at`. `note` lands on the history entry.
     EditGrant {
         grant_id: String,
         label: Option<String>,
-        capabilities: Option<Vec<String>>,
+        statement_specs: Option<Vec<String>>,
         expires_at: Option<u64>,
-        renewable_until: Option<u64>,
         note: Option<String>,
     },
 
@@ -88,12 +89,12 @@ pub enum UiAction {
     // --- Grant offers ---
     /// Create a grant offer and return the grant link URL.
     /// `mode`: "one_shot" | "renewable" | "standing"
-    /// `capabilities`: serialized capability strings
+    /// `statement_specs`: shorthand specs parsed by `parse_statement_spec`
     /// `expires_in_secs`: how long the offer is valid (default: 86400 = 24h)
     CreateGrantOffer {
         issuing_persona_id: String,
         mode: String,
-        capabilities: Vec<String>,
+        statement_specs: Vec<String>,
         expires_in_secs: Option<u64>,
         relay_hint: Option<String>,
         conditions: Vec<core_types::grant_conditions::GrantCondition>,

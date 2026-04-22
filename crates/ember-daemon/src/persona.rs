@@ -81,6 +81,11 @@ impl DaemonStore {
         if count == 0 {
             return Err(StoreError::NotFound);
         }
+        // Cascade: revoke all active grants for this persona
+        self.conn().execute(
+            "UPDATE grants SET status = 'revoked' WHERE persona_id = ?1 AND status = 'active'",
+            rusqlite::params![id],
+        )?;
         Ok(())
     }
 }

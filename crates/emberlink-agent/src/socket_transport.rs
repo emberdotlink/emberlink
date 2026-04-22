@@ -23,6 +23,7 @@ struct Request {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)] // retained as a typed shape for test deserialization
 struct Response {
     id: String,
     result: Option<serde_json::Value>,
@@ -33,6 +34,20 @@ struct Response {
 struct ErrorPayload {
     code: i32,
     message: String,
+}
+
+/// A generic envelope we use to distinguish responses (have `id`) from
+/// server-initiated notifications (have `method`, no `id`).
+#[derive(Deserialize)]
+struct AnyMessage {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    method: Option<String>,
+    #[serde(default)]
+    result: Option<serde_json::Value>,
+    #[serde(default)]
+    error: Option<ErrorPayload>,
 }
 
 // ---------------------------------------------------------------------------
@@ -124,36 +139,51 @@ impl SocketTransport {
 
         self.writer.write_all(line.as_bytes())?;
 
-        let mut response_line = String::new();
-        self.reader.read_line(&mut response_line)?;
+        // Read lines until we see a response matching our request id. Lines
+        // that look like server-initiated notifications (have `method`, no
+        // `id`) are silently dropped — the synchronous transport doesn't
+        // dispatch notifications. Callers that need notifications should use
+        // the async client in `async_client.rs` instead.
+        loop {
+            let mut response_line = String::new();
+            self.reader.read_line(&mut response_line)?;
 
-        if response_line.is_empty() {
-            return Err(TransportError::Protocol(
-                "Connection closed before response".to_string(),
-            ));
-        }
+            if response_line.is_empty() {
+                return Err(TransportError::Protocol(
+                    "Connection closed before response".to_string(),
+                ));
+            }
 
-        let resp: Response = serde_json::from_str(response_line.trim_end()).map_err(|e| {
-            TransportError::Protocol(format!("Failed to parse response: {e}"))
-        })?;
+            let trimmed = response_line.trim_end();
+            let msg: AnyMessage = serde_json::from_str(trimmed).map_err(|e| {
+                TransportError::Protocol(format!("Failed to parse message: {e}"))
+            })?;
 
-        if resp.id != id {
-            return Err(TransportError::Protocol(format!(
-                "Response ID mismatch: expected {id}, got {}",
-                resp.id
-            )));
-        }
+            // Notification: no id, has method. Skip and keep reading.
+            if msg.id.is_none() && msg.method.is_some() {
+                continue;
+            }
 
-        if let Some(err) = resp.error {
-            return Err(TransportError::DaemonError {
-                code: err.code,
-                message: err.message,
+            let resp_id = msg.id.unwrap_or_default();
+            if resp_id != id {
+                // A stray response for a different id (shouldn't happen on a
+                // single-threaded sync client, but guard anyway).
+                return Err(TransportError::Protocol(format!(
+                    "Response ID mismatch: expected {id}, got {resp_id}"
+                )));
+            }
+
+            if let Some(err) = msg.error {
+                return Err(TransportError::DaemonError {
+                    code: err.code,
+                    message: err.message,
+                });
+            }
+
+            return msg.result.ok_or_else(|| {
+                TransportError::Protocol("Response has neither result nor error".to_string())
             });
         }
-
-        resp.result.ok_or_else(|| {
-            TransportError::Protocol("Response has neither result nor error".to_string())
-        })
     }
 
     /// Send a ping and return true if the daemon responds with pong.
@@ -188,10 +218,81 @@ impl SocketTransport {
     /// Use a previously granted credential.
     pub fn use_credential(
         &mut self,
-        grant_id: &str,
+        persona_id: &str,
+        credential_name: &str,
     ) -> Result<serde_json::Value, TransportError> {
-        let params = serde_json::json!({ "grant_id": grant_id });
+        let params = serde_json::json!({
+            "persona_id": persona_id,
+            "credential_name": credential_name,
+        });
         self.send("use_credential", params)
+    }
+
+    /// Request access to a resource through the policy engine.
+    pub fn request_access(
+        &mut self,
+        persona_id: &str,
+        action: &str,
+        resource: &str,
+    ) -> Result<serde_json::Value, TransportError> {
+        let params = serde_json::json!({
+            "persona_id": persona_id,
+            "action": action,
+            "resource": resource,
+        });
+        self.send("request_access", params)
+    }
+}
+
+/// Map a [`TransportError`] onto the agent runtime's minimal
+/// [`crate::runtime::DaemonClientError`]. I/O failures surface as
+/// `Unavailable`; protocol and daemon-side errors collapse to `Daemon`
+/// so raw server text never reaches the calling agent.
+fn map_transport_error(e: TransportError) -> crate::runtime::DaemonClientError {
+    tracing::debug!(error = %e, "daemon call failed");
+    match e {
+        TransportError::Io(_) => crate::runtime::DaemonClientError::Unavailable,
+        TransportError::Protocol(_) | TransportError::DaemonError { .. } => {
+            crate::runtime::DaemonClientError::Daemon
+        }
+    }
+}
+
+/// Adapt [`SocketTransport`] to the [`DaemonClient`] trait consumed by the
+/// agent runtime. Keeps the transport's richer error enum internal: the
+/// agent runtime only needs to know "unreachable" vs "daemon said no" to
+/// decide how to respond to its caller without leaking daemon internals.
+impl crate::runtime::DaemonClient for SocketTransport {
+    fn request_access(
+        &mut self,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, crate::runtime::DaemonClientError> {
+        self.send("request_access", params.clone())
+            .map_err(map_transport_error)
+    }
+
+    fn list_grants(
+        &mut self,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, crate::runtime::DaemonClientError> {
+        self.send("list_grants", params.clone())
+            .map_err(map_transport_error)
+    }
+
+    fn grant_status(
+        &mut self,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, crate::runtime::DaemonClientError> {
+        self.send("grant_status", params.clone())
+            .map_err(map_transport_error)
+    }
+
+    fn use_credential(
+        &mut self,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, crate::runtime::DaemonClientError> {
+        self.send("use_credential", params.clone())
+            .map_err(map_transport_error)
     }
 }
 
