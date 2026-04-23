@@ -95,6 +95,23 @@ impl DaemonRuntime {
         );
         log_vault_identity(&self.config, self.config_path.as_deref());
 
+        // Initialise the daemon's long-lived Ed25519 identity key used to
+        // sign Grant Receipts (Stream D, design §Evidence). First-run
+        // generates the key; subsequent runs re-load it. Failure here is
+        // non-fatal — receipt emission will silently no-op if the key
+        // can't be loaded, but the daemon keeps running.
+        match crate::receipt::init_identity(&self.config.data_dir) {
+            Ok(pubkey) => {
+                info!(signer_pubkey = %pubkey, "daemon identity key loaded");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "daemon identity key unavailable — receipts will not be emitted"
+                );
+            }
+        }
+
         let policy = if self.config.policy_file.exists() {
             let engine = PolicyEngine::from_file(&self.config.policy_file)?;
             info!(path = %self.config.policy_file.display(), "loaded policy");
@@ -120,6 +137,10 @@ impl DaemonRuntime {
         let local = tokio::task::LocalSet::new();
 
         // Spawn the grant expiry sweep — runs every 60 seconds.
+        // TTL-based expiry (column `expires_at`) and composite wall-clock
+        // budget expiry (Statement-level `budget.wall_clock_secs`) both
+        // run on the same cadence. The wall-clock sweep also emits
+        // `budget.warning` at 80% elapsed — same pattern as TTL warnings.
         let expiry_store = Rc::clone(&store);
         local.spawn_local(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -129,6 +150,18 @@ impl DaemonRuntime {
                     Ok(0) => {}
                     Ok(n) => tracing::info!(count = n, "expired stale grants"),
                     Err(e) => tracing::warn!(error = %e, "grant expiry sweep failed"),
+                }
+                match expiry_store.expire_grants_by_wall_clock() {
+                    Ok((0, 0)) => {}
+                    Ok((exhausted, warned)) => {
+                        if exhausted > 0 {
+                            tracing::info!(count = exhausted, "exhausted grants by wall-clock budget");
+                        }
+                        if warned > 0 {
+                            tracing::info!(count = warned, "wall-clock 80% warnings emitted");
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "grant wall-clock sweep failed"),
                 }
             }
         });

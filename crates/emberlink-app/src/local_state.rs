@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use core_crypto::LocalKeyPair;
+use core_crypto::grant_chain::PubkeyNextKeyPair;
 use core_types::KeyAlgorithm;
+use zeroize::Zeroize;
 
 /// A signing key held locally for one owner (root, persona, or device).
 pub struct LocalKeyEntry {
@@ -17,6 +19,28 @@ pub struct EphemeralKeyEntry {
     pub expires_at: u64,
 }
 
+/// The `pubkey_next` secret for a grant chain's tail (M-3). Persisted so
+/// that later delegation / attenuation blocks can be signed after a daemon
+/// restart. Drop clears the secret from memory.
+///
+/// Stored as hex — same encoding as `LocalKeyEntry.private_key`, sharing
+/// the same keystore (`local-state.enc` encrypted under the vault master
+/// key). No separate on-disk location; the whole `LocalState` is
+/// encrypted as a single blob.
+#[derive(Debug, Clone, Zeroize)]
+#[zeroize(drop)]
+pub struct GrantChainSecret {
+    pub grant_id: String,
+    pub public_hex: String,
+    pub secret_hex: String,
+}
+
+impl GrantChainSecret {
+    pub fn to_pubkey_next_keypair(&self) -> Option<PubkeyNextKeyPair> {
+        PubkeyNextKeyPair::from_hex(self.public_hex.clone(), self.secret_hex.clone()).ok()
+    }
+}
+
 /// In-memory local state: signing keys plus any lines the app doesn't parse
 /// (peer_identity, linkages, recovery sessions, manifest keys). The passthrough
 /// lines are preserved verbatim so CLI and GUI can share `local-state.enc`
@@ -26,6 +50,9 @@ pub struct LocalState {
     pub keys: HashMap<String, LocalKeyEntry>,
     /// Ephemeral keys for outstanding grant offers, keyed by offer_id.
     pub ephemeral_keys: HashMap<String, EphemeralKeyEntry>,
+    /// Grant-chain `pubkey_next` secrets keyed by grant_id (M-3). See
+    /// `core_crypto::grant_chain::PubkeyNextKeyPair`.
+    pub chain_secrets: HashMap<String, GrantChainSecret>,
     /// Lines that this layer doesn't interpret — preserved on roundtrip.
     pub passthrough_lines: Vec<String>,
 }
@@ -35,8 +62,30 @@ impl LocalState {
         Self {
             keys: HashMap::new(),
             ephemeral_keys: HashMap::new(),
+            chain_secrets: HashMap::new(),
             passthrough_lines: Vec::new(),
         }
+    }
+
+    /// Store the `pubkey_next` secret for a grant chain's tail. See
+    /// `core_crypto::grant_chain::sign_block_zero`.
+    pub fn store_chain_secret(&mut self, grant_id: impl Into<String>, secret: PubkeyNextKeyPair) {
+        let grant_id = grant_id.into();
+        self.chain_secrets.insert(
+            grant_id.clone(),
+            GrantChainSecret {
+                grant_id,
+                public_hex: secret.public_hex.clone(),
+                secret_hex: secret.secret_hex.clone(),
+            },
+        );
+    }
+
+    /// Load the `pubkey_next` secret for extending a grant chain.
+    pub fn load_chain_secret(&self, grant_id: &str) -> Option<PubkeyNextKeyPair> {
+        self.chain_secrets
+            .get(grant_id)
+            .and_then(|s| s.to_pubkey_next_keypair())
     }
 }
 
@@ -75,12 +124,20 @@ pub fn serialize(state: &LocalState) -> String {
         ));
     }
 
+    for (grant_id, entry) in &state.chain_secrets {
+        lines.push(format!(
+            "chain_secret\t{}\t{}\t{}",
+            grant_id, entry.public_hex, entry.secret_hex,
+        ));
+    }
+
     lines.join("\n")
 }
 
 pub fn deserialize(data: &str) -> Result<LocalState, String> {
     let mut keys = HashMap::new();
     let mut ephemeral_keys = HashMap::new();
+    let mut chain_secrets = HashMap::new();
     let mut passthrough_lines = Vec::new();
 
     for line in data.lines() {
@@ -123,6 +180,19 @@ pub fn deserialize(data: &str) -> Result<LocalState, String> {
                 }
                 _ => return Err(format!("malformed ephemeral_key line: {line}")),
             },
+            Some(&"chain_secret") => match parts.as_slice() {
+                ["chain_secret", grant_id, public_hex, secret_hex] => {
+                    chain_secrets.insert(
+                        grant_id.to_string(),
+                        GrantChainSecret {
+                            grant_id: grant_id.to_string(),
+                            public_hex: public_hex.to_string(),
+                            secret_hex: secret_hex.to_string(),
+                        },
+                    );
+                }
+                _ => return Err(format!("malformed chain_secret line: {line}")),
+            },
             _ => {
                 passthrough_lines.push(line.to_string());
             }
@@ -132,6 +202,7 @@ pub fn deserialize(data: &str) -> Result<LocalState, String> {
     Ok(LocalState {
         keys,
         ephemeral_keys,
+        chain_secrets,
         passthrough_lines,
     })
 }

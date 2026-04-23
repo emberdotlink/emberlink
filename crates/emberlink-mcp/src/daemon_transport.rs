@@ -39,6 +39,10 @@ impl DaemonTransport {
             // Observability
             "audit_query" => Some("audit_query"),
             "detect_anomalies" => Some("detect_anomalies"),
+            // Receipts (Stream D)
+            "list_receipts" => Some("list_receipts"),
+            "get_receipt" => Some("get_receipt"),
+            "daemon_identity" => Some("daemon_identity"),
             // Vault
             "vault_list" => Some("vault_list"),
             // Health

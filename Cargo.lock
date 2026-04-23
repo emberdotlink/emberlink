@@ -517,6 +517,7 @@ dependencies = [
  "ed25519-dalek",
  "getrandom 0.2.17",
  "getrandom 0.4.2",
+ "hex",
  "hkdf 0.13.0",
  "libc",
  "sha2 0.11.0",
@@ -657,6 +658,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -888,6 +890,7 @@ dependencies = [
 name = "ember-daemon"
 version = "0.2.0"
 dependencies = [
+ "aho-corasick",
  "argon2",
  "bytes",
  "chacha20poly1305",
@@ -895,18 +898,23 @@ dependencies = [
  "core-crypto",
  "core-types",
  "dirs-next",
+ "ed25519-dalek",
  "emberlink-agent",
  "getrandom 0.4.2",
+ "hex",
  "http-body-util",
  "hyper",
  "hyper-rustls",
  "hyper-util",
  "keyring",
+ "once_cell",
  "percent-encoding",
+ "regex",
  "rusqlite",
  "rustls",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -950,6 +958,7 @@ dependencies = [
  "dirs-next",
  "serde",
  "serde_json",
+ "zeroize",
 ]
 
 [[package]]
@@ -2190,6 +2199,18 @@ dependencies = [
  "getrandom 0.2.17",
  "libredox",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "regex"
+version = "1.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e10754a14b9137dd7b1e3e5b0493cc9171fdd105e0ab477f51b72e7f3ac0e276"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]

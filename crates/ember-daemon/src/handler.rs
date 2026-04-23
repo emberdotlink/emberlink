@@ -304,6 +304,11 @@ pub async fn dispatch_method_with_events(
             // narrowing filter. Cross-persona enumeration would be a local info
             // disclosure. The agent runtime forwards its own persona_id, so the
             // MCP path stays functional; only bare socket callers are refused.
+            //
+            // Response shape per design: each entry also carries a
+            // `statement_count` and a `statements` array with per-Statement
+            // `sid`, `resource_type`, `actions`, `resource`, `budget`, and
+            // `usage`. Clients can render per-Statement meters natively.
             let persona_id = params["persona_id"]
                 .as_str()
                 .ok_or((-32602, "missing 'persona_id'".to_string()))?;
@@ -314,6 +319,24 @@ pub async fn dispatch_method_with_events(
                 .iter()
                 .filter(|g| g.persona_id == persona_id)
                 .map(|g| {
+                    let statements: Vec<Value> = match store.get_access_grant(&g.id) {
+                        Ok(chain) => chain
+                            .statements()
+                            .map(|(bi, s)| {
+                                json!({
+                                    "sid": s.sid,
+                                    "block_index": bi,
+                                    "resource_type": s.resource_type.as_str(),
+                                    "actions": s.actions,
+                                    "resource": s.resource,
+                                    "budget": s.budget,
+                                    "usage": s.usage,
+                                    "conditions": s.conditions,
+                                })
+                            })
+                            .collect(),
+                        Err(_) => Vec::new(),
+                    };
                     json!({
                         "id": g.id,
                         "persona_id": g.persona_id,
@@ -321,6 +344,8 @@ pub async fn dispatch_method_with_events(
                         "scope": g.scope,
                         "expires_at": g.expires_at,
                         "status": g.status,
+                        "statement_count": statements.len(),
+                        "statements": statements,
                     })
                 })
                 .collect();
@@ -589,6 +614,27 @@ pub async fn dispatch_method_with_events(
                     {
                         return Err((-32002, "grant belongs to a different persona".to_string()));
                     }
+                    // Emit per-Statement array for composite callers
+                    // (design). The legacy `budget` + `usage` envelope
+                    // fields stay as first-statement projections.
+                    let statements: Vec<Value> = match store.get_access_grant(id) {
+                        Ok(chain) => chain
+                            .statements()
+                            .map(|(bi, s)| {
+                                json!({
+                                    "sid": s.sid,
+                                    "block_index": bi,
+                                    "resource_type": s.resource_type.as_str(),
+                                    "actions": s.actions,
+                                    "resource": s.resource,
+                                    "budget": s.budget,
+                                    "usage": s.usage,
+                                    "conditions": s.conditions,
+                                })
+                            })
+                            .collect(),
+                        Err(_) => Vec::new(),
+                    };
                     return Ok(json!({
                         "kind": "grant",
                         "id": g.id,
@@ -600,6 +646,8 @@ pub async fn dispatch_method_with_events(
                         "created_at": g.created_at,
                         "budget": g.budget,
                         "usage": g.usage,
+                        "statements": statements,
+                        "statement_count": statements.len(),
                     }));
                 }
                 Err(crate::store::StoreError::NotFound) => {
@@ -915,6 +963,47 @@ pub async fn dispatch_method_with_events(
                 .poll_notifications(persona_id)
                 .map_err(|e| (-32000, e.to_string()))?;
             Ok(Value::Array(notifications))
+        }
+
+        "list_receipts" => {
+            // Optional `persona_id` filter — returns all when omitted.
+            let persona_id = params["persona_id"].as_str();
+            let receipts = store
+                .list_receipts(persona_id)
+                .map_err(|e| (-32000, e.to_string()))?;
+            let list: Vec<Value> = receipts
+                .iter()
+                .map(|r| serde_json::to_value(r).unwrap_or(Value::Null))
+                .collect();
+            Ok(Value::Array(list))
+        }
+
+        "get_receipt" => {
+            let id = params["id"]
+                .as_str()
+                .ok_or((-32602, "missing 'id'".to_string()))?;
+            let receipt = store
+                .get_receipt(id)
+                .map_err(|e| match e {
+                    crate::store::StoreError::NotFound => {
+                        (-32004, format!("receipt {id} not found"))
+                    }
+                    other => (-32000, other.to_string()),
+                })?;
+            Ok(serde_json::to_value(&receipt).unwrap_or(Value::Null))
+        }
+
+        "daemon_identity" => {
+            // Expose the current daemon identity pubkey over the socket for
+            // offline verification tools. Returns `null` when the identity
+            // was not initialised.
+            match crate::receipt::current_identity() {
+                Some(id) => Ok(json!({
+                    "pubkey": id.pubkey_hex(),
+                    "canonical_version": crate::receipt::CANONICAL_VERSION,
+                })),
+                None => Ok(Value::Null),
+            }
         }
 
         _ => Err((-32601, "Method not found".to_string())),
@@ -2095,5 +2184,111 @@ mod tests {
             &json!({"grant_id": grant_id, "persona_id": persona_id}),
         ).await.unwrap_err();
         assert_eq!(err.0, -32005);
+    }
+
+    // --- Grant Receipts (Stream D) socket surface -------------------------
+
+    /// Init a process-singleton identity keyed off a temp dir so the test
+    /// has real receipts to exercise. Called by each receipt test — the
+    /// OnceCell silently no-ops on the second call, which is fine because
+    /// the key file is stable.
+    fn setup_receipt_identity() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = crate::receipt::init_identity(dir.path());
+        dir
+    }
+
+    #[tokio::test]
+    async fn get_receipt_and_list_receipts_round_trip() {
+        let _guard = setup_receipt_identity();
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let persona = dispatch_method(
+            &store, &vault, &policy, &rl, "create_persona",
+            &json!({"name": "rcpt-alpha"}),
+        ).await.unwrap();
+        let persona_id = persona["id"].as_str().unwrap().to_string();
+        let grant = dispatch_method(
+            &store, &vault, &policy, &rl, "create_grant",
+            &json!({"persona_id": persona_id, "credential_name": "rcpt-cred", "scope": "push", "force": true}),
+        ).await.unwrap();
+        let grant_id = grant["id"].as_str().unwrap().to_string();
+        dispatch_method(&store, &vault, &policy, &rl, "revoke_grant", &json!({"id": grant_id})).await.unwrap();
+
+        // list_receipts (no filter) returns our receipt.
+        let list = dispatch_method(&store, &vault, &policy, &rl, "list_receipts", &json!({})).await.unwrap();
+        let arr = list.as_array().expect("array");
+        assert!(!arr.is_empty(), "receipt should be emitted on revoke");
+        let rid = arr[0]["id"].as_str().unwrap().to_string();
+        assert_eq!(arr[0]["grant_id"].as_str().unwrap(), grant_id);
+
+        // get_receipt returns the full signed body.
+        let r = dispatch_method(&store, &vault, &policy, &rl, "get_receipt", &json!({"id": rid})).await.unwrap();
+        assert_eq!(r["id"].as_str().unwrap(), rid);
+        assert_eq!(r["evidence"]["canonical_version"].as_u64().unwrap(), 1);
+        assert_eq!(r["evidence"]["sig"].as_str().unwrap().len(), 128);
+    }
+
+    #[tokio::test]
+    async fn get_receipt_unknown_id_returns_32004() {
+        let _guard = setup_receipt_identity();
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+        let err = dispatch_method(
+            &store, &vault, &policy, &rl, "get_receipt",
+            &json!({"id": "rct-nonexistent"}),
+        ).await.unwrap_err();
+        assert_eq!(err.0, -32004);
+    }
+
+    #[tokio::test]
+    async fn list_receipts_persona_filter_narrows_results() {
+        let _guard = setup_receipt_identity();
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let a = dispatch_method(&store, &vault, &policy, &rl, "create_persona", &json!({"name": "lra"})).await.unwrap();
+        let b = dispatch_method(&store, &vault, &policy, &rl, "create_persona", &json!({"name": "lrb"})).await.unwrap();
+        let aid = a["id"].as_str().unwrap().to_string();
+        let bid = b["id"].as_str().unwrap().to_string();
+        for pid in [&aid, &bid] {
+            let g = dispatch_method(
+                &store, &vault, &policy, &rl, "create_grant",
+                &json!({"persona_id": pid, "credential_name": "c", "scope": "r", "force": true}),
+            ).await.unwrap();
+            let gid = g["id"].as_str().unwrap().to_string();
+            dispatch_method(&store, &vault, &policy, &rl, "revoke_grant", &json!({"id": gid})).await.unwrap();
+        }
+        let all = dispatch_method(&store, &vault, &policy, &rl, "list_receipts", &json!({})).await.unwrap();
+        let just_a = dispatch_method(
+            &store, &vault, &policy, &rl, "list_receipts",
+            &json!({"persona_id": aid}),
+        ).await.unwrap();
+        assert_eq!(all.as_array().unwrap().len(), 2);
+        assert_eq!(just_a.as_array().unwrap().len(), 1);
+        assert_eq!(just_a[0]["summary"]["persona_id"].as_str().unwrap(), aid);
+    }
+
+    #[tokio::test]
+    async fn daemon_identity_method_returns_pubkey_when_initialised() {
+        let _guard = setup_receipt_identity();
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+        let result = dispatch_method(&store, &vault, &policy, &rl, "daemon_identity", &json!({})).await.unwrap();
+        // Either a pubkey object or null (init raced on separate process) — but
+        // since _guard held a tempdir that init_identity used for the OnceCell,
+        // we expect a pubkey here.
+        assert!(result.is_object(), "identity should be initialised in this test");
+        let pubkey = result["pubkey"].as_str().unwrap();
+        assert_eq!(pubkey.len(), 64);
     }
 }

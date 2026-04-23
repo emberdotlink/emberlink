@@ -13,3 +13,4 @@ base45 = "3"
 
 [dev-dependencies]
 proptest = "1"
+sha2 = "0.10"

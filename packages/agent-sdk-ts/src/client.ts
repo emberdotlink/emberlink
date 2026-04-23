@@ -4,6 +4,8 @@ import type {
   AgentConfig,
   AgentResponse,
   AgentNotification,
+  BudgetExhaustedNotification,
+  BudgetWarningNotification,
   GrantRevokedNotification,
   WhoAmIResult,
   GrantInfo,
@@ -39,6 +41,18 @@ export class EmberAgent {
    * Assign this before calling `connect()` to ensure no notifications are missed.
    */
   onGrantRevoked?: (params: GrantRevokedNotification) => void;
+
+  /**
+   * Called when the daemon pushes a `budget.warning` notification (80% or 95% threshold crossed).
+   * Assign this before calling `connect()` to ensure no notifications are missed.
+   */
+  onBudgetWarning?: (params: BudgetWarningNotification) => void;
+
+  /**
+   * Called when the daemon pushes a `budget.exhausted` notification (100% threshold crossed).
+   * Assign this before calling `connect()` to ensure no notifications are missed.
+   */
+  onBudgetExhausted?: (params: BudgetExhaustedNotification) => void;
 
   constructor(config: AgentConfig) {
     this.config = config;
@@ -81,8 +95,16 @@ export class EmberAgent {
             }
           } else {
             const notif = msg as AgentNotification;
-            if (notif.method === 'grant_revoked') {
-              this.onGrantRevoked?.(notif.params as GrantRevokedNotification);
+            try {
+              if (notif.method === 'grant_revoked') {
+                this.onGrantRevoked?.(notif.params as GrantRevokedNotification);
+              } else if (notif.method === 'budget.warning') {
+                this.onBudgetWarning?.(notif.params as BudgetWarningNotification);
+              } else if (notif.method === 'budget.exhausted') {
+                this.onBudgetExhausted?.(notif.params as BudgetExhaustedNotification);
+              }
+            } catch {
+              // Callback exceptions must not crash the line handler.
             }
           }
         });

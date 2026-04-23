@@ -5,6 +5,9 @@
 
 pub mod daemon_transport;
 
+use std::path::PathBuf;
+
+use daemon_transport::{DaemonTransport, DaemonTransportError};
 use emberlink_agent::protocol::methods::{
     GRANT_STATUS, LIST_GRANTS, REQUEST_GRANT, USE_CREDENTIAL, WHOAMI,
 };
@@ -99,6 +102,27 @@ fn tool_definitions() -> serde_json::Value {
                 },
                 "required": ["grant_id", "credential_id"]
             }
+        },
+        {
+            "name": "list_receipts",
+            "description": "List Grant Receipts — signed artifacts emitted when a grant reaches terminal state. Optionally filter by persona.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "persona_id": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "get_receipt",
+            "description": "Fetch a single Grant Receipt by id. Returns the signed JSON body including Evidence (Ed25519 signature + signer pubkey).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" }
+                },
+                "required": ["id"]
+            }
         }
     ])
 }
@@ -106,13 +130,28 @@ fn tool_definitions() -> serde_json::Value {
 // --- MCP server ---
 
 /// MCP server wrapping an AgentRuntime.
+///
+/// Optionally holds a [`DaemonTransport`] for read-only observability
+/// tools (`list_receipts`, `get_receipt`) that bypass the agent runtime
+/// and route directly through the daemon socket. The runtime is still
+/// used for credential-touching tools.
 pub struct McpServer {
     runtime: AgentRuntime,
+    daemon_transport: Option<DaemonTransport>,
 }
 
 impl McpServer {
     pub fn new(runtime: AgentRuntime) -> Self {
-        Self { runtime }
+        Self { runtime, daemon_transport: None }
+    }
+
+    /// Build a server with daemon-transport observability tools wired.
+    /// `list_receipts` and `get_receipt` call through the transport.
+    pub fn with_daemon_socket(runtime: AgentRuntime, socket: PathBuf) -> Self {
+        Self {
+            runtime,
+            daemon_transport: Some(DaemonTransport::new(socket)),
+        }
     }
 
     /// Handle a single JSON-RPC request and return a JSON-RPC response.
@@ -187,6 +226,70 @@ impl McpServer {
         }
     }
 
+    /// Route an observability tool (`list_receipts` / `get_receipt`)
+    /// through the daemon transport. Fails closed with a descriptive
+    /// error when no transport is configured.
+    fn handle_receipt_tool(
+        &self,
+        req: &JsonRpcRequest,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) -> JsonRpcResponse {
+        let transport = match self.daemon_transport.as_ref() {
+            Some(t) => t,
+            None => {
+                return JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: req.id.clone(),
+                    result: Some(serde_json::json!({
+                        "content": [{
+                            "type": "text",
+                            "text": "daemon unreachable — receipts tools require --daemon-socket"
+                        }],
+                        "isError": true
+                    })),
+                    error: None,
+                };
+            }
+        };
+
+        match transport.call_tool(tool_name, arguments) {
+            Ok(result) => {
+                let text = serde_json::to_string_pretty(&result).unwrap_or_default();
+                JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: req.id.clone(),
+                    result: Some(serde_json::json!({
+                        "content": [{ "type": "text", "text": text }]
+                    })),
+                    error: None,
+                }
+            }
+            Err(e) => {
+                let (msg, code) = match e {
+                    DaemonTransportError::Io(io) => {
+                        (format!("daemon unreachable: {io}"), -32000)
+                    }
+                    DaemonTransportError::Protocol(s) => (format!("protocol: {s}"), -32002),
+                    DaemonTransportError::DaemonError(s) => (format!("daemon: {s}"), -32004),
+                    DaemonTransportError::UnknownTool(t) => {
+                        (format!("unknown tool: {t}"), -32602)
+                    }
+                };
+                let _ = code;
+                JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: req.id.clone(),
+                    result: Some(serde_json::json!({
+                        "content": [{ "type": "text", "text": msg }],
+                        "isError": true
+                    })),
+                    error: None,
+                }
+            }
+        }
+    }
+
     fn handle_tools_call(&self, req: &JsonRpcRequest) -> JsonRpcResponse {
         let params = req.params.as_ref();
         let tool_name = params
@@ -197,6 +300,12 @@ impl McpServer {
             .and_then(|p| p.get("arguments"))
             .cloned()
             .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+
+        // Observability tools route directly through the daemon socket
+        // when one is configured — they never touch the agent runtime.
+        if matches!(tool_name, "list_receipts" | "get_receipt") {
+            return self.handle_receipt_tool(req, tool_name, &arguments);
+        }
 
         // Map MCP tool name to agent method
         let agent_method = match tool_name {
@@ -316,7 +425,9 @@ mod tests {
                 "list_grants",
                 "request_grant",
                 "grant_status",
-                "use_credential"
+                "use_credential",
+                "list_receipts",
+                "get_receipt"
             ]
         );
     }
@@ -506,7 +617,7 @@ mod tests {
         let resp = server.process_line(&serde_json::to_string(&list_req).unwrap()).unwrap();
         let list_resp: JsonRpcResponse = serde_json::from_str(&resp).unwrap();
         let tools = list_resp.result.unwrap()["tools"].as_array().unwrap().len();
-        assert_eq!(tools, 5);
+        assert_eq!(tools, 7);
 
         // 4. Call a tool
         let call_req = serde_json::json!({

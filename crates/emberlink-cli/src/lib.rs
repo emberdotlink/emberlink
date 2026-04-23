@@ -34,6 +34,7 @@ use core_state::{
     DeviceStatus, EventStore, IdentityAuthorizer, PersonaStatus, RecoveryRequestStatus,
 };
 use emberlink_app::{AppRuntime, LocalState};
+use emberlink_app::local_state::GrantChainSecret;
 use core_storage::{
     create_relationship, encrypt_block, ledger_delta, manifest_chunk, manifest_device_access,
     manifest_key_recipient, plan_restore, publish_manifest, storage_relationship_created_event,
@@ -114,6 +115,11 @@ pub struct DemoApp {
     personas: Vec<Persona>,
     revoked_personas: Vec<Persona>,
     local_keys: Vec<LocalKeyRecord>,
+    /// M-3: grant-chain `pubkey_next` secrets keyed by grant_id. Stored
+    /// here so the secret persists across daemon / CLI invocations and
+    /// later delegation / attenuation blocks can be signed against the
+    /// block-0 chain tail. See `core_crypto::grant_chain::PubkeyNextKeyPair`.
+    chain_secrets: std::collections::HashMap<String, GrantChainSecret>,
     linkages: Vec<LinkageAssertion>,
     trust_attestations: Vec<TrustAttestation>,
     recovery_policy: core_types::RecoveryPolicy,
@@ -265,6 +271,7 @@ impl DemoApp {
             personas: Vec::new(),
             revoked_personas: Vec::new(),
             local_keys: Vec::new(),
+            chain_secrets: std::collections::HashMap::new(),
             linkages: Vec::new(),
             trust_attestations: Vec::new(),
             recovery_policy: create_policy("root-a", 2, 3600),
@@ -393,6 +400,12 @@ impl DemoApp {
                 record.key_pair.private_key
             ));
         }
+        for (grant_id, entry) in &self.chain_secrets {
+            lines.push(format!(
+                "chain_secret\t{}\t{}\t{}",
+                grant_id, entry.public_hex, entry.secret_hex,
+            ));
+        }
         let plaintext = lines.join("\n");
         let key = resolve_encryption_key()?;
         let encrypted = encrypt_state(plaintext.as_bytes(), &key)?;
@@ -417,6 +430,7 @@ impl DemoApp {
         self.linkages.clear();
         self.recovery_session = None;
         self.local_keys.clear();
+        self.chain_secrets.clear();
 
         for line in contents.lines() {
             if line.trim().is_empty() {
@@ -462,6 +476,16 @@ impl DemoApp {
                 ["manifest_key", manifest_id, content_key] => {
                     self.app_runtime.store
                         .upsert_local_manifest_key(manifest_id, content_key)?;
+                }
+                ["chain_secret", grant_id, public_hex, secret_hex] => {
+                    self.chain_secrets.insert(
+                        (*grant_id).to_string(),
+                        GrantChainSecret {
+                            grant_id: (*grant_id).to_string(),
+                            public_hex: (*public_hex).to_string(),
+                            secret_hex: (*secret_hex).to_string(),
+                        },
+                    );
                 }
                 [
                     "recovery_session",
@@ -560,6 +584,7 @@ impl DemoApp {
         self.personas.clear();
         self.revoked_personas.clear();
         self.local_keys.clear();
+        self.chain_secrets.clear();
         self.linkages.clear();
         self.recovery_session = None;
     }
@@ -663,6 +688,44 @@ impl DemoApp {
             return;
         }
         self.local_keys.push(record);
+    }
+
+    /// M-3: persist the `pubkey_next` secret for a grant chain's tail so
+    /// later delegation / attenuation blocks can be signed. Caller passes
+    /// the secret by value — `PubkeyNextKeyPair` is `Zeroize`, so the
+    /// in-memory copy held by `commands.rs` is wiped once the hex
+    /// strings are copied into the record.
+    pub(crate) fn store_chain_secret(
+        &mut self,
+        grant_id: &str,
+        secret: core_crypto::grant_chain::PubkeyNextKeyPair,
+    ) {
+        self.chain_secrets.insert(
+            grant_id.to_string(),
+            GrantChainSecret {
+                grant_id: grant_id.to_string(),
+                public_hex: secret.public_hex.clone(),
+                secret_hex: secret.secret_hex.clone(),
+            },
+        );
+    }
+
+    /// M-3: load the persisted `pubkey_next` secret for a grant chain's
+    /// tail, for appending a new block.
+    #[allow(dead_code)]
+    pub(crate) fn load_chain_secret(
+        &self,
+        grant_id: &str,
+    ) -> Option<core_crypto::grant_chain::PubkeyNextKeyPair> {
+        self.chain_secrets
+            .get(grant_id)
+            .and_then(|entry| {
+                core_crypto::grant_chain::PubkeyNextKeyPair::from_hex(
+                    entry.public_hex.clone(),
+                    entry.secret_hex.clone(),
+                )
+                .ok()
+            })
     }
 
     fn local_manifest_key(&self, manifest_id: &str) -> Result<Option<String>, ValidationError> {
@@ -802,6 +865,29 @@ impl DemoApp {
             .find_local_key("root", &root.id, &root.active_key.key_id)
             .ok_or_else(|| ValidationError::new(format!("missing local root key: {}", root.id)))?;
         AppSigner::from_key_pair(&record.key_pair).map_err(ValidationError::new)
+    }
+
+    /// Look up the root keypair in the shape expected by
+    /// `core_crypto::grant_chain::sign_block_zero`. Used when minting a
+    /// new grant: block 0 is signed under the issuing persona's root key
+    /// per design §SignedBlock.
+    pub(crate) fn grant_chain_root_key(
+        &self,
+        root_id: &str,
+    ) -> Result<core_crypto::grant_chain::RootKeyPair, ValidationError> {
+        let root = self
+            .resolve_root(root_id)
+            .ok_or_else(|| ValidationError::new(format!("unknown root: {root_id}")))?;
+        let record = self
+            .find_local_key("root", &root.id, &root.active_key.key_id)
+            .ok_or_else(|| {
+                ValidationError::new(format!(
+                    "missing local root key for grant chain signing: {}",
+                    root.id
+                ))
+            })?;
+        core_crypto::grant_chain::root_key_from_local_key_pair(&record.key_pair)
+            .map_err(|e| ValidationError::new(format!("invalid root key for grant chain: {e}")))
     }
 
     fn allocate_subject_id(&self, prefix: &str) -> String {

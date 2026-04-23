@@ -1,4 +1,5 @@
 use chrono::Utc;
+use core_crypto::grant_chain::RootKeyPair;
 use uuid::Uuid;
 
 use crate::store::{DaemonStore, StoreError};
@@ -73,6 +74,56 @@ impl DaemonStore {
         }
     }
 
+    /// Return the persona's Ed25519 root keypair, formatted for
+    /// `core_crypto::grant_chain::sign_block_zero`.
+    ///
+    /// Daemon-issued grants (per design revision) sign block 0 under the
+    /// issuing persona's root Ed25519 key. The daemon stores both halves of
+    /// that key in its own SQLite `personas` table — the same vault it
+    /// already uses for credential material. Exposing this as a narrow
+    /// lookup keeps the signing surface legible without adding a second
+    /// vault or an unlocked in-memory keystore.
+    ///
+    /// Returns `StoreError::NotFound` if the persona does not exist and
+    /// `StoreError::InvalidInput` if the stored key material cannot be
+    /// parsed as Ed25519 (e.g. DB corruption or a future algorithm switch).
+    pub fn persona_root_keypair(&self, persona_id: &str) -> Result<RootKeyPair, StoreError> {
+        let row: Option<(String, String)> = self
+            .conn()
+            .query_row(
+                "SELECT public_key, private_key FROM personas WHERE id = ?1",
+                rusqlite::params![persona_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        let (public_key, private_key) = row.ok_or(StoreError::NotFound)?;
+
+        // Both halves are prefixed per `core_crypto::LocalKeyPair`
+        // (`ed25519:<hex>` and `ed25519-secret:<hex>`). Strip the prefix
+        // and hand raw hex to `RootKeyPair::from_hex`.
+        let public_hex = public_key.strip_prefix("ed25519:").ok_or_else(|| {
+            StoreError::InvalidInput(format!(
+                "persona '{persona_id}' public key missing 'ed25519:' prefix"
+            ))
+        })?;
+        let secret_hex = private_key
+            .strip_prefix("ed25519-secret:")
+            .ok_or_else(|| {
+                StoreError::InvalidInput(format!(
+                    "persona '{persona_id}' private key missing 'ed25519-secret:' prefix"
+                ))
+            })?;
+        RootKeyPair::from_hex(public_hex, secret_hex).map_err(|e| {
+            StoreError::InvalidInput(format!(
+                "persona '{persona_id}' root key invalid: {e}"
+            ))
+        })
+    }
+
     pub fn revoke_persona(&self, id: &str) -> Result<(), StoreError> {
         let count = self.conn().execute(
             "UPDATE personas SET status = 'revoked' WHERE id = ?1",
@@ -137,6 +188,44 @@ mod tests {
         let store = DaemonStore::open_in_memory().unwrap();
         let result = store.revoke_persona("persona-does-not-exist");
         assert!(matches!(result, Err(StoreError::NotFound)));
+    }
+
+    #[test]
+    fn persona_root_keypair_round_trips_signing() {
+        use core_crypto::grant_chain::{sign_block_zero, verify_chain};
+        use core_types::{Block, ResourceSelector, ResourceType, Statement, Usage};
+
+        let store = DaemonStore::open_in_memory().unwrap();
+        let created = store.create_persona("agent-sign").unwrap();
+
+        let rk = store.persona_root_keypair(&created.id).unwrap();
+        let block = Block {
+            statements: vec![Statement {
+                sid: "S0".into(),
+                resource_type: ResourceType::Credential,
+                actions: vec!["read".into()],
+                resource: ResourceSelector::Any,
+                budget: None,
+                usage: Usage::default(),
+                conditions: Vec::new(),
+            }],
+            nbf: None,
+            expires_at: None,
+            issued_by: created.id.clone(),
+            issued_at: 0,
+            approval: None,
+            note: None,
+        };
+        let signed = sign_block_zero(&rk, &block).unwrap();
+        let root_pubkey_bytes = hex::decode(&rk.public_hex).unwrap();
+        verify_chain(std::slice::from_ref(&signed.signed), &root_pubkey_bytes).unwrap();
+    }
+
+    #[test]
+    fn persona_root_keypair_unknown_persona_returns_not_found() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let err = store.persona_root_keypair("persona-nope").unwrap_err();
+        assert!(matches!(err, StoreError::NotFound));
     }
 
     #[test]

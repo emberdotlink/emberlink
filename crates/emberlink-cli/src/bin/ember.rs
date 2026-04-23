@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use ember_daemon::grant::GrantInfo;
-use core_types::Budget;
+use core_types::{Budget, ResourceSelector, ResourceType, Statement, Usage};
 use ember_daemon::approval::ApprovalOutcome;
 use ember_daemon::audit::AuditFilter;
 use ember_daemon::config::DaemonConfig;
@@ -86,6 +86,11 @@ enum Commands {
     Audit {
         #[command(subcommand)]
         action: AuditAction,
+    },
+    /// Inspect Grant Receipts — signed artifacts emitted at terminal grant state
+    Receipt {
+        #[command(subcommand)]
+        action: ReceiptAction,
     },
     /// View or evaluate policy rules
     Policy {
@@ -341,6 +346,40 @@ enum SandboxAction {
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
     },
+    /// Run an agent in a new sandbox with a 3-statement composite grant
+    /// (Credential + Session + Time) in a single approval envelope.
+    Run {
+        /// Sandbox name
+        name: String,
+        /// Container image
+        #[arg(long, default_value = "ubuntu:24.04")]
+        image: String,
+        /// Clone the given git URL into the sandbox's workspace before starting.
+        #[arg(long = "workspace-from")]
+        workspace_from: Option<String>,
+        /// Additional `KEY=VAL` env var (or bare `KEY` to pass-through from host env) to inject.
+        #[arg(long = "env", short = 'e')]
+        env: Vec<String>,
+        /// Credential object ID for the Credential statement (e.g. "obj-github-token").
+        /// Required to mint the 3-statement composite grant; omit to skip grant creation.
+        #[arg(long)]
+        credential_resource: Option<String>,
+        /// Token budget ceiling for the Session statement (LLM tokens).
+        #[arg(long)]
+        budget_tokens: Option<u64>,
+        /// Cost budget ceiling in dollars (e.g. "0.50" → 50 cents) for the Session statement.
+        #[arg(long)]
+        budget_cents: Option<String>,
+        /// Wall-clock seconds ceiling for the Time statement.
+        #[arg(long)]
+        budget_seconds: Option<u64>,
+        /// Grant TTL (e.g. "30m", "2h", "1d"). Default: no expiry.
+        #[arg(long)]
+        ttl: Option<String>,
+        /// Prompt to pass to the agent inside the sandbox.
+        #[arg(long)]
+        prompt: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -373,6 +412,36 @@ enum ApprovalAction {
         /// New narrowed scope
         #[arg(long)]
         scope: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReceiptAction {
+    /// List receipts, most-recent first
+    List {
+        /// Filter by persona id
+        #[arg(long)]
+        persona: Option<String>,
+    },
+    /// Show the full receipt for a given id
+    Show {
+        /// Receipt id (or grant id)
+        id: String,
+    },
+    /// Export a receipt's signed JSON to stdout
+    Export {
+        /// Receipt id
+        id: String,
+    },
+    /// Verify a receipt's Ed25519 signature against the daemon's identity key
+    Verify {
+        /// Receipt id
+        id: String,
+        /// Override the trust anchor — expected daemon pubkey (hex).
+        /// When omitted, reads from the daemon's identity file under
+        /// `<data_dir>/daemon_identity.key`.
+        #[arg(long)]
+        pubkey: Option<String>,
     },
 }
 
@@ -928,6 +997,76 @@ fn build_budget(
     })
 }
 
+/// Build the 3-statement composite grant envelope for `ember sandbox run`.
+///
+/// Statement layout (per SESSION-composite-plan.md §Stream E):
+///   1. Credential — `credential:read` on `<credential_resource>`, no budget.
+///   2. Session    — `llm:generate` on `anthropic/*`, `budget.tokens = budget_tokens`.
+///   3. Time       — `time:wall_clock` on `*`, `budget.wall_clock_secs = budget_seconds`.
+///
+/// When `credential_resource` is `None` the function returns an empty `Vec` so the
+/// caller can skip grant creation for demo invocations that omit the flag.
+/// When any budget flag is absent the corresponding budget axis is simply not set
+/// (TTL-only for that statement).
+pub fn build_composite_grant_statements(
+    credential_resource: Option<&str>,
+    budget_tokens: Option<u64>,
+    budget_cents: Option<u64>,
+    budget_seconds: Option<u64>,
+) -> Vec<Statement> {
+    let Some(cred_resource) = credential_resource else {
+        return vec![];
+    };
+
+    // Statement 1: Credential — credential:read on the named object.
+    let credential_stmt = Statement {
+        sid: "s0-credential".to_string(),
+        resource_type: ResourceType::Credential,
+        actions: vec!["credential:read".to_string()],
+        resource: ResourceSelector::Exact { value: cred_resource.to_string() },
+        budget: None,
+        usage: Usage::default(),
+        conditions: vec![],
+    };
+
+    // Statement 2: Session — llm:generate on anthropic/*, token + cent budget.
+    let session_budget = if budget_tokens.is_some() || budget_cents.is_some() {
+        Some(Budget {
+            tokens: budget_tokens,
+            cents: budget_cents,
+            ..Budget::default()
+        })
+    } else {
+        None
+    };
+    let session_stmt = Statement {
+        sid: "s1-session".to_string(),
+        resource_type: ResourceType::Session,
+        actions: vec!["llm:generate".to_string()],
+        resource: ResourceSelector::Glob { pattern: "anthropic/*".to_string() },
+        budget: session_budget,
+        usage: Usage::default(),
+        conditions: vec![],
+    };
+
+    // Statement 3: Time — time:wall_clock on *, wall_clock_secs budget.
+    let time_budget = budget_seconds.map(|secs| Budget {
+        wall_clock_secs: Some(secs),
+        ..Budget::default()
+    });
+    let time_stmt = Statement {
+        sid: "s2-time".to_string(),
+        resource_type: ResourceType::Time,
+        actions: vec!["time:wall_clock".to_string()],
+        resource: ResourceSelector::Any,
+        budget: time_budget,
+        usage: Usage::default(),
+        conditions: vec![],
+    };
+
+    vec![credential_stmt, session_stmt, time_stmt]
+}
+
 /// Parse a duration string (15s, 5m, 2h, 1d, or bare integer seconds).
 fn parse_duration(s: &str) -> Result<u64, String> {
     let s = s.trim();
@@ -962,6 +1101,108 @@ fn format_duration(secs: u64) -> String {
     } else {
         format!("{}s", secs)
     }
+}
+
+/// Truncate a string to `max` chars, adding an ellipsis if truncated.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+}
+
+/// Resolve a receipt from either a receipt id (`rct-…`) or a grant id.
+/// When the argument is a grant id, looks up the grant's `receipt_id`
+/// and loads that.
+fn resolve_receipt(
+    store: &DaemonStore,
+    id: &str,
+) -> Result<core_types::grant_receipt::GrantReceipt, String> {
+    if let Ok(r) = store.get_receipt(id) {
+        return Ok(r);
+    }
+    match store.get_grant(id) {
+        Ok(g) => {
+            if let Some(rid) = g.receipt_id.as_deref() {
+                store
+                    .get_receipt(rid)
+                    .map_err(|e| format!("grant has receipt_id={rid} but load failed: {e}"))
+            } else {
+                Err(format!(
+                    "no receipt found for id '{id}' (grant exists but has not reached terminal state)"
+                ))
+            }
+        }
+        Err(_) => Err(format!("no receipt or grant found for id '{id}'")),
+    }
+}
+
+/// Pretty-print a receipt to stdout in human-readable form.
+fn print_receipt_summary(r: &core_types::grant_receipt::GrantReceipt) {
+    use core_types::grant_receipt::{RevokeActor, TerminalReason};
+
+    println!("Grant Receipt {}", r.id);
+    println!("  Grant:       {}", r.grant_id);
+    println!("  Persona:     {}", r.summary.persona_id);
+    println!("  Owner:       {}", r.summary.human_owner);
+    println!("  Service:     {}", r.summary.service);
+    println!("  Resource:    {}", r.summary.resource);
+    println!();
+    println!("  Lifecycle:");
+    println!("    Issued at:     epoch {}", r.lifecycle.issued_at);
+    if let Some(lu) = r.lifecycle.last_used_at {
+        println!("    Last used:     epoch {lu}");
+    } else {
+        println!("    Last used:     never");
+    }
+    println!("    Terminated at: epoch {}", r.lifecycle.terminated_at);
+    let reason_str = match &r.lifecycle.terminal_reason {
+        TerminalReason::Expired => "expired (TTL)".to_string(),
+        TerminalReason::Revoked { by, reason } => {
+            let actor = match by {
+                RevokeActor::Operator => "operator",
+                RevokeActor::Agent => "agent",
+                RevokeActor::ParentCascade => "parent cascade",
+            };
+            if reason.is_empty() {
+                format!("revoked by {actor}")
+            } else {
+                format!("revoked by {actor}: {reason}")
+            }
+        }
+        TerminalReason::ExhaustedByBudget { statement_sid, axis } => {
+            format!("exhausted_by_budget on statement {statement_sid} axis={axis:?}")
+        }
+        TerminalReason::ParentCascadeRevoked { parent_grant_id } => {
+            format!("parent_cascade_revoked (parent={parent_grant_id})")
+        }
+    };
+    println!("    Terminal reason: {reason_str}");
+    println!();
+    println!("  Per-Statement usage:");
+    if r.per_statement_usage.is_empty() {
+        println!("    (none)");
+    } else {
+        for (sid, u) in &r.per_statement_usage {
+            println!(
+                "    {sid:<8} tokens={:<8} cents={:<6} requests={:<6} wall_clock={}s",
+                u.tokens, u.cents, u.requests, u.wall_clock_secs
+            );
+        }
+    }
+    println!();
+    println!("  Evidence:");
+    println!("    Signer pubkey: {}", r.evidence.signer_pubkey);
+    println!("    Hash:          {}", r.evidence.hash);
+    println!("    Signature:     {}", r.evidence.sig);
+    println!("    Canonical v{}", r.evidence.canonical_version);
+    println!();
+    println!("  Chain snapshot: {} block(s)", r.approved_chain.len());
+    println!("  Approval chain: {} event(s)", r.approval_chain.len());
+    println!("  Actions observed: {} entry(ies)", r.actions_observed.len());
 }
 
 /// Render budget and usage for a grant.
@@ -1634,6 +1875,184 @@ fn main() {
                         }
                     }
                 }
+                SandboxAction::Run {
+                    name,
+                    image,
+                    workspace_from,
+                    env,
+                    credential_resource,
+                    budget_tokens,
+                    budget_cents: budget_cents_str,
+                    budget_seconds,
+                    ttl,
+                    prompt,
+                } => {
+                    // Parse --budget-cents into integer cents.
+                    let parsed_cents = match budget_cents_str.as_deref() {
+                        Some(s) => match parse_cents(s) {
+                            Ok(c) => Some(c),
+                            Err(e) => {
+                                eprintln!("error: --budget-cents: {e}");
+                                process::exit(1);
+                            }
+                        },
+                        None => None,
+                    };
+
+                    // Build the 3-statement composite envelope.
+                    let statements = build_composite_grant_statements(
+                        credential_resource.as_deref(),
+                        budget_tokens,
+                        parsed_cents,
+                        budget_seconds,
+                    );
+                    let statement_count = statements.len();
+
+                    // Parse TTL.
+                    let ttl_secs = match ttl.as_deref() {
+                        Some(s) => match parse_duration(s) {
+                            Ok(v) => Some(v),
+                            Err(e) => {
+                                eprintln!("error: --ttl: {e}");
+                                process::exit(1);
+                            }
+                        },
+                        None => None,
+                    };
+
+                    // Build sandbox opts.
+                    let extra_env: Vec<(String, String)> = env
+                        .iter()
+                        .filter_map(|kv| {
+                            if let Some((k, v)) = kv.split_once('=') {
+                                Some((k.to_string(), v.to_string()))
+                            } else {
+                                // Bare key — pass-through from host environment.
+                                std::env::var(kv).ok().map(|v| (kv.clone(), v))
+                            }
+                        })
+                        .collect();
+
+                    let opts = SandboxCreateOpts {
+                        name: name.clone(),
+                        image: image.clone(),
+                        privileged: false,
+                        volumes: vec![],
+                        user: None,
+                        network: None,
+                        unsafe_root: false,
+                        workspace_from: workspace_from.clone(),
+                        extra_env: extra_env.clone(),
+                    };
+
+                    let sandbox = match store.create_sandbox_with_opts(&opts, Some(&config.data_dir)) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            process::exit(1);
+                        }
+                    };
+
+                    // Start the container.
+                    let container_id = match store.start_container(
+                        &sandbox.id,
+                        &config.socket_dir,
+                        None,
+                        &extra_env,
+                    ) {
+                        Ok(cid) => cid,
+                        Err(e) => {
+                            eprintln!("warning: sandbox created but container failed: {e}");
+                            "none".to_string()
+                        }
+                    };
+
+                    println!("Started sandbox");
+                    println!("  ID:        {}", sandbox.id);
+                    println!("  Persona:   {}", sandbox.persona_id);
+                    println!("  Container: {container_id}");
+                    if let Some(ws) = &sandbox.workspace_path {
+                        println!("  Workspace: {ws}");
+                    }
+
+                    // Mint the composite grant if a credential resource was supplied.
+                    if statement_count > 0 {
+                        let credential_res = credential_resource.as_deref().unwrap_or("");
+                        match store.create_grant(
+                            &sandbox.persona_id,
+                            credential_res,
+                            "composite",
+                            ttl_secs,
+                        ) {
+                            Ok(grant_info) => {
+                                // Replace the single-statement shim create_grant wrote with
+                                // the canonical 3-statement envelope in blocks_json so the
+                                // dashboard + handler emit per-Statement arrays.
+                                let created_at_epoch =
+                                    chrono::Utc::now().timestamp().max(0) as u64;
+                                let expires_at_epoch = ttl_secs.map(|s| {
+                                    created_at_epoch.saturating_add(s)
+                                });
+                                // Block 0 is signed under the sandbox
+                                // persona's root Ed25519 key — the daemon
+                                // owns that key material so the CLI looks it
+                                // up from the same store it writes through.
+                                let composite_result = store
+                                    .persona_root_keypair(&sandbox.persona_id)
+                                    .and_then(|root| {
+                                        ember_daemon::grant::access_grant_from_statements(
+                                            &grant_info.id,
+                                            &sandbox.persona_id,
+                                            credential_res,
+                                            statements.clone(),
+                                            created_at_epoch,
+                                            expires_at_epoch,
+                                            &root,
+                                        )
+                                    });
+                                match composite_result {
+                                    Ok(composite) => {
+                                        if let Err(e) =
+                                            store.overwrite_grant_blocks(&grant_info.id, &composite)
+                                        {
+                                            eprintln!(
+                                                "warning: grant minted but composite chain overwrite failed: {e}"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "warning: grant minted but composite chain signing failed: {e}"
+                                        );
+                                    }
+                                }
+                                println!("Minted 3-statement composite grant");
+                                println!("  Grant ID:   {}", grant_info.id);
+                                println!("  Statements: {statement_count}");
+                                println!("    [0] credential:read  on {credential_res}");
+                                if let Some(t) = budget_tokens {
+                                    println!("    [1] llm:generate     on anthropic/*  budget={t} tokens");
+                                } else {
+                                    println!("    [1] llm:generate     on anthropic/*  (no token budget)");
+                                }
+                                if let Some(s) = budget_seconds {
+                                    println!("    [2] time:wall_clock  on *             budget={s}s");
+                                } else {
+                                    println!("    [2] time:wall_clock  on *             (no time budget)");
+                                }
+                                println!("  One approval. Three meters. One receipt at the end.");
+                                if let Some(ref p) = prompt {
+                                    println!("  Prompt: {p}");
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("warning: sandbox started but grant creation failed: {e}");
+                            }
+                        }
+                    } else {
+                        println!("  (no --credential-resource supplied — grant not minted)");
+                    }
+                }
             }
         }
 
@@ -1872,6 +2291,118 @@ fn main() {
                         None => {
                             eprintln!("Event {} not found", id);
                             process::exit(1);
+                        }
+                    }
+                }
+            }
+        }
+
+        Commands::Receipt { action } => {
+            let store = open_store(&config);
+            match action {
+                ReceiptAction::List { persona } => {
+                    let receipts = match store.list_receipts(persona.as_deref()) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            process::exit(1);
+                        }
+                    };
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&receipts).unwrap_or_default());
+                    } else if receipts.is_empty() {
+                        println!("No receipts found.");
+                    } else {
+                        let h_receipt = "RECEIPT";
+                        let h_grant = "GRANT";
+                        let h_persona = "PERSONA";
+                        let h_reason = "REASON";
+                        println!(
+                            "{h_receipt:<30} {h_grant:<38} {h_persona:<22} {h_reason}"
+                        );
+                        for r in &receipts {
+                            let reason_short = match &r.lifecycle.terminal_reason {
+                                core_types::grant_receipt::TerminalReason::Expired => "expired".to_string(),
+                                core_types::grant_receipt::TerminalReason::Revoked { .. } => "revoked".to_string(),
+                                core_types::grant_receipt::TerminalReason::ExhaustedByBudget { .. } => "exhausted".to_string(),
+                                core_types::grant_receipt::TerminalReason::ParentCascadeRevoked { .. } => "cascaded".to_string(),
+                            };
+                            let persona_short: String = r.summary.persona_id.chars().take(20).collect();
+                            println!(
+                                "{:<30} {:<38} {:<22} {}",
+                                truncate(&r.id, 28),
+                                truncate(&r.grant_id, 36),
+                                persona_short,
+                                reason_short
+                            );
+                        }
+                    }
+                }
+                ReceiptAction::Show { id } => {
+                    let r = match resolve_receipt(&store, &id) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            process::exit(1);
+                        }
+                    };
+                    if cli.json {
+                        println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
+                    } else {
+                        print_receipt_summary(&r);
+                    }
+                }
+                ReceiptAction::Export { id } => {
+                    let r = match resolve_receipt(&store, &id) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            process::exit(1);
+                        }
+                    };
+                    match serde_json::to_string_pretty(&r) {
+                        Ok(s) => println!("{s}"),
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            process::exit(1);
+                        }
+                    }
+                }
+                ReceiptAction::Verify { id, pubkey } => {
+                    let r = match resolve_receipt(&store, &id) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            process::exit(1);
+                        }
+                    };
+                    let expected_pubkey = match pubkey {
+                        Some(p) => p,
+                        None => {
+                            // Read pubkey from the identity file.
+                            let path = ember_daemon::receipt::identity_key_path(&config.data_dir);
+                            match ember_daemon::receipt::DaemonIdentity::load_or_create(&config.data_dir) {
+                                Ok(id) => id.pubkey_hex(),
+                                Err(e) => {
+                                    eprintln!(
+                                        "error: could not load trust anchor from {}: {e}",
+                                        path.display()
+                                    );
+                                    process::exit(1);
+                                }
+                            }
+                        }
+                    };
+                    match ember_daemon::receipt::verify_receipt(&r, &expected_pubkey) {
+                        Ok(()) => {
+                            println!("Verified: receipt {}", r.id);
+                            println!("  Signer pubkey: {}", expected_pubkey);
+                            println!("  Hash: {}", r.evidence.hash);
+                            println!("  Canonical version: v{}", r.evidence.canonical_version);
+                        }
+                        Err(e) => {
+                            eprintln!("Verification FAILED: {e}");
+                            process::exit(2);
                         }
                     }
                 }
@@ -2253,6 +2784,62 @@ mod tests {
     #[test]
     fn build_budget_from_flags_none_set() {
         assert!(build_budget(None, None, None, None).is_none());
+    }
+
+    #[test]
+    fn build_composite_grant_statements_three_statements() {
+        let stmts = build_composite_grant_statements(
+            Some("obj-github-token"),
+            Some(20_000),
+            Some(50),
+            Some(1800),
+        );
+        assert_eq!(stmts.len(), 3, "expected 3 statements");
+
+        // Statement 0: Credential
+        assert_eq!(stmts[0].sid, "s0-credential");
+        assert_eq!(stmts[0].resource_type, ResourceType::Credential);
+        assert!(stmts[0].actions.contains(&"credential:read".to_string()));
+        assert_eq!(
+            stmts[0].resource,
+            ResourceSelector::Exact { value: "obj-github-token".to_string() }
+        );
+        assert!(stmts[0].budget.is_none(), "credential statement must have no budget");
+
+        // Statement 1: Session
+        assert_eq!(stmts[1].sid, "s1-session");
+        assert_eq!(stmts[1].resource_type, ResourceType::Session);
+        assert!(stmts[1].actions.contains(&"llm:generate".to_string()));
+        assert_eq!(
+            stmts[1].resource,
+            ResourceSelector::Glob { pattern: "anthropic/*".to_string() }
+        );
+        let session_budget = stmts[1].budget.as_ref().expect("session must have a budget");
+        assert_eq!(session_budget.tokens, Some(20_000));
+        assert_eq!(session_budget.cents, Some(50));
+
+        // Statement 2: Time
+        assert_eq!(stmts[2].sid, "s2-time");
+        assert_eq!(stmts[2].resource_type, ResourceType::Time);
+        assert!(stmts[2].actions.contains(&"time:wall_clock".to_string()));
+        assert_eq!(stmts[2].resource, ResourceSelector::Any);
+        let time_budget = stmts[2].budget.as_ref().expect("time must have a budget");
+        assert_eq!(time_budget.wall_clock_secs, Some(1800));
+    }
+
+    #[test]
+    fn build_composite_grant_statements_no_credential_returns_empty() {
+        let stmts = build_composite_grant_statements(None, Some(20_000), Some(50), Some(1800));
+        assert!(stmts.is_empty(), "no credential_resource means no statements");
+    }
+
+    #[test]
+    fn build_composite_grant_statements_no_budgets_still_three_statements() {
+        let stmts =
+            build_composite_grant_statements(Some("obj-github-token"), None, None, None);
+        assert_eq!(stmts.len(), 3);
+        assert!(stmts[1].budget.is_none(), "session budget absent when no token/cent flags");
+        assert!(stmts[2].budget.is_none(), "time budget absent when no seconds flag");
     }
 
     #[test]

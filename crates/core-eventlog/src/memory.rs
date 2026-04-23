@@ -10,6 +10,24 @@ use core_types::{
 use crate::materialize::{apply_event, apply_storage_event};
 use crate::{AllowAllAuthorizer, Authorizer, EventLog, MaterializedState, SyncBatchRecord};
 
+/// .1a M-2: upper bound for caller-supplied `now_epoch_secs` in the
+/// in-memory log. `core-state::EventStore::append_with_authorizer` clamps
+/// to `system_now + 300s` using the real wall clock, but the memory log is
+/// a WASM / test fixture (it compiles to `wasm32-unknown-unknown` where
+/// `SystemTime` is unavailable), so we apply a fixed year-2500 ceiling
+/// instead. This is an imperfect match — a crafted timestamp anywhere in
+/// the range `(real_now, 2500)` still bypasses cooldowns — but it prevents
+/// `u64::MAX` / `i64::MAX` style sentinels and keeps the memory log from
+/// silently inheriting the core-state gap when it is embedded elsewhere.
+/// Production surfaces that need real wall-clock enforcement must run
+/// behind `core-state::EventStore`, not `MemoryEventLog`.
+///
+/// Value: 2500-01-01T00:00:00Z in epoch seconds.
+pub const MEMORY_LOG_NOW_CEILING: u64 = 16_725_225_600;
+fn clamp_now(now_epoch_secs: u64) -> u64 {
+    now_epoch_secs.min(MEMORY_LOG_NOW_CEILING)
+}
+
 /// In-memory event log implementation for WASM and testing.
 ///
 /// All data is held in memory with no persistence layer. Suitable for
@@ -94,11 +112,19 @@ impl EventLog for MemoryEventLog {
         authorizer: &dyn Authorizer,
         now_epoch_secs: u64,
     ) -> Result<(), ValidationError> {
+        // .1a M-2: clamp caller-supplied `now_epoch_secs` to a hard
+        // ceiling so that sentinels like `u64::MAX` cannot bypass cooldowns
+        // or flip expiry checks. The clamp is imperfect (a crafted timestamp
+        // below the ceiling still bypasses cooldowns that end before it), so
+        // production surfaces must use core-state::EventStore's wall-clock
+        // clamp instead.
+        let effective_now = clamp_now(now_epoch_secs);
         event.validate()?;
         if !verifier.verify(&event.signer, &event.signed_bytes(), &event.signature) {
             return Err(ValidationError::new("signature verification failed"));
         }
-        authorizer.authorize(&event, &self.materialized, now_epoch_secs)?;
+        // Internal store append — raw errors for precise callers.
+        authorizer.authorize_raw(&event, &self.materialized, effective_now)?;
         self.append_validated(event)
     }
 
@@ -302,6 +328,9 @@ impl EventLog for MemoryEventLog {
                 body,
             };
 
+            // .1a M-2: append_with_authorizer clamps internally, but we
+            // keep the original value here so downstream callers see the
+            // unclamped input via the trait contract.
             self.append_with_authorizer(envelope, verifier, authorizer, now_epoch_secs)?;
             imported += 1;
         }
@@ -346,6 +375,10 @@ impl EventLog for MemoryEventLog {
         authorizer: &dyn Authorizer,
         now_epoch_secs: u64,
     ) -> Result<usize, ValidationError> {
+        // .1a M-2: clamp here so every authorize call below sees the
+        // same bounded value, even though we inline the authorize call
+        // rather than delegating to `append_with_authorizer`.
+        let effective_now = clamp_now(now_epoch_secs);
         let seen_ids: BTreeSet<&str> = self.event_index.keys().map(|k| k.as_str()).collect();
         let mut imported = Vec::new();
 
@@ -365,7 +398,7 @@ impl EventLog for MemoryEventLog {
             {
                 continue;
             }
-            if let Err(err) = authorizer.authorize(event, &self.materialized, now_epoch_secs) {
+            if let Err(err) = authorizer.authorize_raw(event, &self.materialized, effective_now) {
                 self.materialized = snapshot_materialized;
                 self.storage_manifests = snapshot_manifests;
                 return Err(err);
@@ -660,5 +693,166 @@ mod tests {
             .unwrap();
         assert_eq!(count, 0);
         assert_eq!(target.event_count(), 3);
+    }
+
+    // ── .1a M-2: clamp_now caps caller-supplied now_epoch_secs ──
+
+    #[test]
+    fn clamp_now_allows_reasonable_timestamps() {
+        // 2025-01-01T00:00:00Z ≈ 1_735_689_600.
+        let t = 1_735_689_600_u64;
+        assert_eq!(
+            super::clamp_now(t),
+            t,
+            "reasonable timestamps pass through unchanged"
+        );
+        assert_eq!(super::clamp_now(0), 0);
+        assert_eq!(super::clamp_now(1), 1);
+    }
+
+    #[test]
+    fn clamp_now_caps_u64_max_to_ceiling() {
+        // u64::MAX is well above the year-2500 ceiling — clamp must cap it.
+        let clamped = super::clamp_now(u64::MAX);
+        assert_eq!(clamped, super::MEMORY_LOG_NOW_CEILING);
+        assert!(
+            clamped < u64::MAX,
+            "u64::MAX must be strictly reduced by clamp_now",
+        );
+    }
+
+    #[test]
+    fn clamp_now_at_ceiling_unchanged() {
+        assert_eq!(
+            super::clamp_now(super::MEMORY_LOG_NOW_CEILING),
+            super::MEMORY_LOG_NOW_CEILING,
+        );
+    }
+
+    #[test]
+    fn clamp_now_above_ceiling_capped() {
+        assert_eq!(
+            super::clamp_now(super::MEMORY_LOG_NOW_CEILING + 1),
+            super::MEMORY_LOG_NOW_CEILING,
+        );
+    }
+
+    /// .1a M-2: Build a test key whose stored `public_key` actually equals
+    /// the pubkey the FixtureSigner derives (required by the C-1 pubkey-material
+    /// binding check, which IdentityAuthorizer enforces).
+    fn bound_test_key(key_id: &str) -> PublicKeyMaterial {
+        use core_crypto::Signer as _;
+        let signer = FixtureSigner::new(key_id);
+        PublicKeyMaterial {
+            key_id: key_id.into(),
+            algorithm: KeyAlgorithm::Ed25519,
+            public_key: signer.public_key().0,
+        }
+    }
+
+    #[test]
+    fn append_with_u64_max_clamped_for_authorize() {
+        // Build a grant offer whose `expires_at` sits just above the
+        // MEMORY_LOG_NOW_CEILING. A claim attempted with `now_epoch_secs =
+        // u64::MAX` would be rejected as "expired" if authorize saw the raw
+        // input, but after clamping `now` becomes the ceiling, which is
+        // strictly less than `expires_at` → the claim succeeds. This
+        // demonstrates the clamp is in effect.
+        let mut source = MemoryEventLog::new();
+        // Root.
+        append_typed(
+            &mut source,
+            "evt-root-1",
+            EventBody::RootCreated(RootCreatedEvent {
+                root_id: "root-a".into(),
+                display_name: "Primary".into(),
+                initial_key: bound_test_key("key-root-a"),
+            }),
+            SignerBinding::root("root-a", "key-root-a"),
+        );
+        // Device to satisfy setup_identity-style layout (not required).
+        append_typed(
+            &mut source,
+            "evt-device-1",
+            EventBody::DeviceAdded(DeviceAddedEvent {
+                root_id: "root-a".into(),
+                device_id: "device-a".into(),
+                label: "Laptop".into(),
+                initial_key: bound_test_key("key-device-a"),
+                initial_encryption_key: test_encryption_key("device-a"),
+            }),
+            SignerBinding::root("root-a", "key-root-a"),
+        );
+        // Two personas under the root.
+        append_typed(
+            &mut source,
+            "evt-persona-a",
+            EventBody::PersonaCreated(PersonaCreatedEvent {
+                root_id: "root-a".into(),
+                persona_id: "persona-a".into(),
+                label: "A".into(),
+                disclosure_profile: None,
+                survival_mode: SurvivalMode::Strict,
+                initial_key: bound_test_key("key-persona-a"),
+            }),
+            SignerBinding::root("root-a", "key-root-a"),
+        );
+        append_typed(
+            &mut source,
+            "evt-persona-b",
+            EventBody::PersonaCreated(PersonaCreatedEvent {
+                root_id: "root-a".into(),
+                persona_id: "persona-b".into(),
+                label: "B".into(),
+                disclosure_profile: None,
+                survival_mode: SurvivalMode::Strict,
+                initial_key: bound_test_key("key-persona-b"),
+            }),
+            SignerBinding::root("root-a", "key-root-a"),
+        );
+        // Grant offer with expires_at just above the ceiling.
+        let expires_at = super::MEMORY_LOG_NOW_CEILING + 10;
+        append_typed(
+            &mut source,
+            "evt-offer",
+            EventBody::GrantOfferCreated(core_types::GrantOfferCreatedEvent {
+                offer_id: "offer-m2".into(),
+                issuer_persona_id: "persona-a".into(),
+                ephemeral_public_key_hex: "aa".into(),
+                sealed_payload_hex: "bb".into(),
+                relay_hint: None,
+                expires_at,
+                conditions_json: String::new(),
+            }),
+            SignerBinding::persona("persona-a", "key-persona-a"),
+        );
+        // Now submit a claim signed by persona-b with now_epoch_secs =
+        // u64::MAX. Before the clamp, authorize would see u64::MAX and
+        // reject "grant offer has expired". After the clamp, effective_now
+        // = NOW_CEILING < expires_at → accepted.
+        let claim = EventEnvelope::from_body(
+            "evt-claim-m2",
+            EventBody::GrantOfferClaimed(core_types::GrantOfferClaimedEvent {
+                offer_id: "offer-m2".into(),
+                recipient_persona_id: "persona-b".into(),
+                claim_response_hex: "cc".into(),
+                claimed_at: 1,
+            }),
+            vec![],
+            SignerBinding::persona("persona-b", "key-persona-b"),
+            &FixtureSigner::new("key-persona-b"),
+        )
+        .unwrap();
+        let result = source.append_with_authorizer(
+            claim,
+            &FixtureVerifier,
+            &crate::IdentityAuthorizer,
+            u64::MAX,
+        );
+        assert!(
+            result.is_ok(),
+            "clamped now must not mark the offer as expired: {:?}",
+            result,
+        );
     }
 }

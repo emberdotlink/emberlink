@@ -192,9 +192,9 @@ async fn main() {
         label: Some(label.clone()),
     };
 
-    let runtime = if no_daemon {
+    let (runtime, receipt_transport_socket) = if no_daemon {
         // Legacy behaviour: no daemon link, request_grant fails closed.
-        AgentRuntime::new(config, store)
+        (AgentRuntime::new(config, store), None)
     } else {
         // Default: connect to the daemon socket.  If --daemon-socket is given,
         // use that; otherwise fall back to $HOME/.ember/run/daemon.sock.
@@ -226,10 +226,16 @@ async fn main() {
 
         let transport = DaemonTransport::new(&socket_path);
         let client: Box<dyn DaemonClient> = Box::new(DaemonTransportClient(transport));
-        AgentRuntime::with_daemon(config, store, client)
+        (
+            AgentRuntime::with_daemon(config, store, client),
+            Some(socket_path),
+        )
     };
 
-    let server = McpServer::new(runtime);
+    let server = match receipt_transport_socket {
+        Some(socket) => McpServer::with_daemon_socket(runtime, socket),
+        None => McpServer::new(runtime),
+    };
 
     eprintln!("emberlink-mcp: server ready (label={label})");
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 
 @dataclass
@@ -60,3 +61,33 @@ class GrantRevokedNotification:
 
     grant_id: str
     persona_id: str
+
+
+# Budget axis values matching the Rust BudgetAxis enum wire form.
+BudgetAxis = Literal["tokens", "cents", "requests", "wall_clock_secs"]
+
+
+@dataclass
+class BudgetWarningNotification:
+    """Server-initiated notification pushed when a Statement's budget crosses a warning threshold (80%, 95%)."""
+
+    grant_id: str
+    statement_sid: str
+    axis: str
+    used: float
+    budget: float
+    percent: float
+    threshold_band: Literal["warning"]
+
+
+@dataclass
+class BudgetExhaustedNotification:
+    """Server-initiated notification pushed when a Statement's budget is fully exhausted (100%)."""
+
+    grant_id: str
+    statement_sid: str
+    axis: str
+    used: float
+    budget: float
+    percent: float
+    threshold_band: Literal["exhausted"]

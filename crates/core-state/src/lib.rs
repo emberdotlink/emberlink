@@ -29,6 +29,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use core_crypto::{
     EncryptedContent, LocalKeyPair, Signer as CryptoSigner, Verifier, generate_content_key,
     generate_random_identifier,
+    grant_chain::{self, ChainError},
 };
 use core_eventlog::materialize::{
     apply_event, apply_storage_event, event_affects_materialized_state,
@@ -749,7 +750,10 @@ impl EventStore {
         if !verifier.verify(&event.signer, &event.signed_bytes(), &event.signature) {
             return Err(ValidationError::new("signature verification failed"));
         }
-        authorizer.authorize(&event, &self.materialized, effective_now)?;
+        // Internal store append — use raw errors so callers can pattern
+        // match on precise variants. Public-facing paths (HTTP handlers,
+        // dashboard) call `authorizer.authorize(...)` which sanitizes.
+        authorizer.authorize_raw(&event, &self.materialized, effective_now)?;
 
         apply_event(&mut self.materialized, &event)?;
         apply_storage_event(&mut self.storage_manifests, &event, &self.materialized)?;
@@ -1439,6 +1443,62 @@ impl EventStore {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs()
+    }
+
+    /// M-2: verify an `AccessGrant`'s block chain against its issuing
+    /// persona's root public key. Authorize paths (daemon proxy, approval,
+    /// CLI grant evaluate) MUST call this before enforcing a grant that
+    /// was loaded from storage — the signature chain is the only defence
+    /// against a forged row in the grants table.
+    ///
+    /// Returns:
+    /// - `Ok(())` — chain is internally consistent and block 0 verifies
+    ///   under the persona's active root key.
+    /// - `Err(ChainError::ChainUnsigned { .. })` — grant was issued before
+    ///   the earlier releases signing migration (carries `"unsigned-phase1"`
+    ///   placeholder strings). Callers should either reject outright or
+    ///   log-and-allow with a one-time warning depending on migration
+    ///   stage. Post-earlier releases the daemon's grant-creation paths
+    ///   (`ember-daemon/src/grant.rs`) sign block 0 under the persona's
+    ///   root Ed25519 key, so `ChainUnsigned` only surfaces for legacy
+    ///   rows that survived migration.
+    /// - `Err(ChainError::SignatureMismatch { .. } |
+    ///    ChainError::RootKeyMismatch | ChainError::InvalidEncoding(_) |
+    ///    ChainError::EmptyChain)` — hard reject; do not enforce.
+    ///
+    /// The caller-supplied error mapping policy for the soft-log of
+    /// `ChainUnsigned` lives outside this function so the read path can
+    /// stay `&self`.
+    pub fn verify_access_grant_chain(
+        &self,
+        grant: &AccessGrant,
+    ) -> Result<(), ChainError> {
+        if grant.blocks.is_empty() {
+            return Err(ChainError::EmptyChain);
+        }
+        let persona = self
+            .materialized
+            .personas_current
+            .get(&grant.issuing_persona_id)
+            .ok_or_else(|| {
+                ChainError::InvalidEncoding(format!(
+                    "issuing persona '{}' not found",
+                    grant.issuing_persona_id
+                ))
+            })?;
+        let root = self
+            .materialized
+            .roots_current
+            .get(&persona.root_id)
+            .ok_or_else(|| {
+                ChainError::InvalidEncoding(format!(
+                    "root '{}' not found for persona '{}'",
+                    persona.root_id, grant.issuing_persona_id
+                ))
+            })?;
+        let root_pubkey_bytes =
+            grant_chain::root_pubkey_bytes_from_ed25519_hex(&root.active_key.public_key)?;
+        grant_chain::verify_chain(&grant.blocks, &root_pubkey_bytes)
     }
 
     /// Create a new access grant. Validates the issuing persona exists and is active.

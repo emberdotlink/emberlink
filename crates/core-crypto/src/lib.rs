@@ -1,3 +1,4 @@
+pub mod grant_chain;
 pub mod secret_handle;
 
 use age::Decryptor;

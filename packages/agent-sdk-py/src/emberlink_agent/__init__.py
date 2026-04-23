@@ -2,6 +2,9 @@ from .client import EmberAgent, EmberAgentError
 from .socket_transport import DaemonError, SocketTransport
 from .types import (
     AgentConfig,
+    BudgetAxis,
+    BudgetExhaustedNotification,
+    BudgetWarningNotification,
     CredentialValue,
     GrantInfo,
     GrantRevokedNotification,
@@ -15,6 +18,9 @@ __all__ = [
     "EmberAgent",
     "EmberAgentError",
     "AgentConfig",
+    "BudgetAxis",
+    "BudgetExhaustedNotification",
+    "BudgetWarningNotification",
     "CredentialValue",
     "GrantInfo",
     "GrantRevokedNotification",

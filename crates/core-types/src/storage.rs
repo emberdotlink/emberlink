@@ -1313,6 +1313,105 @@ mod composite_grant_tests {
     }
 
     #[test]
+    fn block_canonical_encode_is_deterministic_and_round_trips() {
+        let block = Block {
+            statements: vec![stmt_credential_github(), stmt_session_tokens(), stmt_payment()],
+            nbf: None,
+            expires_at: Some(1_800),
+            issued_by: "persona_work".into(),
+            issued_at: 42,
+            approval: None,
+            note: Some("hello".into()),
+        };
+
+        let encoded = block.canonical_encode();
+        // Prefix namespaces the canonical encoding version.
+        assert!(
+            encoded.starts_with(b"type=grant-block-v1\n"),
+            "canonical encoding must carry a version prefix"
+        );
+
+        // Stability: repeated encoding produces identical bytes.
+        assert_eq!(block.canonical_encode(), encoded);
+
+        // Round-trip: decode the JSON body back to a Block and re-encode —
+        // bytes must be byte-identical. This catches any non-determinism
+        // sneaking into the transitive serde graph (e.g. a future HashMap).
+        let json_body = &encoded[b"type=grant-block-v1\n".len()..];
+        let decoded: Block = serde_json::from_slice(json_body)
+            .expect("canonical encoding round-trips through serde_json");
+        assert_eq!(decoded.canonical_encode(), encoded);
+        assert_eq!(decoded, block);
+    }
+
+    #[test]
+    fn block_canonical_encode_differs_on_material_change() {
+        let base = Block {
+            statements: vec![stmt_credential_github()],
+            nbf: None,
+            expires_at: None,
+            issued_by: "persona_a".into(),
+            issued_at: 10,
+            approval: None,
+            note: None,
+        };
+        let mut tampered = base.clone();
+        tampered.issued_at = 11;
+        assert_ne!(base.canonical_encode(), tampered.canonical_encode());
+
+        let mut mutated_stmt = base.clone();
+        mutated_stmt.statements[0].sid = "DifferentSid".into();
+        assert_ne!(base.canonical_encode(), mutated_stmt.canonical_encode());
+    }
+
+    #[test]
+    fn block_canonical_encode_golden_bytes_v1() {
+        // Canonical-version-1 stability baseline. A change to this hash value
+        // indicates a serde_json behavior change — verify the new bytes match
+        // the intended canonical format and bump `canonical_version` in the
+        // prefix before updating this expected value. NEVER silently update
+        // this test.
+        //
+        // If this hash changes:
+        // 1. Determine WHY (serde_json upgrade, Block field addition, etc.)
+        // 2. If the change is intentional, bump canonical_version in the
+        //    `type=grant-block-v1` prefix (→ v2) and update this hash.
+        // 3. If the change is unintentional, REVERT the serde_json upgrade
+        //    or field change that caused it.
+        let fixture_block = Block {
+            statements: vec![Statement {
+                sid: "S0".into(),
+                resource_type: ResourceType::Credential,
+                actions: vec!["credential:read".into()],
+                resource: ResourceSelector::Exact { value: "obj-test".into() },
+                budget: None,
+                usage: Usage::default(),
+                conditions: vec![],
+            }],
+            nbf: None,
+            expires_at: Some(1700000000),
+            issued_by: "persona-test".into(),
+            issued_at: 1699999000,
+            approval: None,
+            note: None,
+        };
+        use sha2::Digest as _;
+        let encoded = fixture_block.canonical_encode();
+        let hash = sha2::Sha256::digest(&encoded);
+        let hex = hex::encode(hash);
+
+        // CANONICAL-VERSION-1 BASELINE. If this value changes:
+        // 1. Determine WHY (serde_json upgrade, Block field addition, etc.)
+        // 2. If the change is intentional, bump canonical_version and update this hash
+        // 3. If the change is unintentional, REVERT the serde_json upgrade or field change
+        assert_eq!(
+            hex,
+            "cd399643d1e04ac2901bce8475557fdc111b947ad2655cacb73508e96293bfe5",
+            "Block::canonical_encode produced unexpected bytes — see test comment"
+        );
+    }
+
+    #[test]
     fn grant_status_derive_handles_all_persisted_states() {
         assert_eq!(GrantStatus::derive("revoked", None, None, 100), GrantStatus::Revoked);
         assert_eq!(
@@ -1842,6 +1941,36 @@ impl Validate for VaultCatalog {
 }
 
 // --- CanonicalEncode impls ---
+
+/// Canonical byte encoding of a grant `Block`. These are the exact bytes the
+/// previous block's `pubkey_next` (or the persona root key, for block 0) signs
+/// to produce `SignedBlock.signature`.
+///
+/// The encoding is `"type=grant-block-v1\n"` followed by `serde_json::to_vec`
+/// of the `Block`. `serde_json` serializes struct fields in declaration order
+/// and `BTreeMap`/sorted keys deterministically; `Block` and its transitive
+/// types contain no `HashMap`, so the encoding is canonical. All `Option`
+/// fields use `skip_serializing_if = "Option::is_none"`, so absent fields
+/// never appear as `null` and changing the option from None to Some does not
+/// silently slide bytes around.
+///
+/// The `type=grant-block-v1` prefix namespaces this encoding — if the shape
+/// changes incompatibly, bump to `v2` and verifiers reject mixed-version
+/// chains at the signature layer.
+impl CanonicalEncode for Block {
+    fn canonical_encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(128);
+        out.extend_from_slice(b"type=grant-block-v1\n");
+        // serde_json emits deterministic bytes for this struct — no HashMap
+        // anywhere in the transitive graph. If a future field change ever
+        // introduces one, the `canonical_encode_round_trips` test (below,
+        // under #[cfg(test)]) will catch the non-determinism.
+        let json = serde_json::to_vec(self)
+            .expect("Block serializes to JSON (no HashMap/non-UTF-8 keys in the graph)");
+        out.extend_from_slice(&json);
+        out
+    }
+}
 
 impl CanonicalEncode for StorageRelationship {
     fn canonical_encode(&self) -> Vec<u8> {

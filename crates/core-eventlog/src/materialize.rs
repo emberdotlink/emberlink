@@ -157,24 +157,45 @@ pub fn apply_event(
             device.status = DeviceStatus::Frozen;
         }
         EventBody::DeviceReplaced(body) => {
-            if !state
+            // Defense-in-depth: both devices must belong to the event's root_id.
+            // authorize.rs only checks that the signer holds the root key for body.root_id;
+            // without these ownership checks, a root could mark another root's device as
+            // Replaced by a third root's device. See docs/the security review
+            let replacement = state
                 .devices_current
-                .contains_key(&body.replacement_device_id)
-            {
+                .get(&body.replacement_device_id)
+                .ok_or_else(|| {
+                    ValidationError::new(format!(
+                        "replacement device does not exist: {}",
+                        body.replacement_device_id
+                    ))
+                })?;
+            if replacement.root_id != body.root_id {
                 return Err(ValidationError::new(format!(
-                    "replacement device does not exist: {}",
-                    body.replacement_device_id
+                    "replacement device {} does not belong to root {}",
+                    body.replacement_device_id, body.root_id
                 )));
             }
-            let device = state
+            let replaced = state
                 .devices_current
-                .get_mut(&body.replaced_device_id)
+                .get(&body.replaced_device_id)
                 .ok_or_else(|| {
                     ValidationError::new(format!(
                         "unknown replaced device: {}",
                         body.replaced_device_id
                     ))
                 })?;
+            if replaced.root_id != body.root_id {
+                return Err(ValidationError::new(format!(
+                    "replaced device {} does not belong to root {}",
+                    body.replaced_device_id, body.root_id
+                )));
+            }
+            // All checks passed — now mutate.
+            let device = state
+                .devices_current
+                .get_mut(&body.replaced_device_id)
+                .expect("replaced device existence already verified");
             device.status = DeviceStatus::Replaced;
             device.replacement_device_id = Some(body.replacement_device_id.clone());
         }
@@ -316,6 +337,19 @@ pub fn apply_event(
             guardian.public_key = body.new_guardian_public_key.clone();
         }
         EventBody::RecoveryRequested(body) => {
+            // Defense-in-depth: reject duplicate request_id. Without this, a root can
+            // replay RecoveryRequested with the same request_id to wipe accumulated
+            // guardian approvals, cooldown, and contest state. authorize.rs does not
+            // enforce uniqueness. See docs/the security review
+            if state
+                .recovery_requests_current
+                .contains_key(&body.request_id)
+            {
+                return Err(ValidationError::new(format!(
+                    "recovery request already exists: {}",
+                    body.request_id
+                )));
+            }
             if !state.devices_current.contains_key(&body.target_device_id) {
                 return Err(ValidationError::new(format!(
                     "recovery target device does not exist: {}",
@@ -710,4 +744,284 @@ pub fn apply_storage_event(
         manifests.insert(body.manifest.id.clone(), body.manifest.clone());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Adversarial regression tests for .1b materialize.rs review.
+    //!
+    //! These tests exercise `apply_event` directly against hand-crafted
+    //! `MaterializedState` and `EventEnvelope` values to assert defense-in-depth
+    //! invariants that are *not* enforced by `authorize.rs`. Integration-level
+    //! authorize + materialize tests live in `authorize.rs` and `memory.rs`.
+    use super::*;
+    use core_crypto::FixtureSigner;
+    use core_events::EventEnvelope;
+    use core_types::{
+        DeviceReplacedEvent, EventBody, KeyAlgorithm, PublicKeyMaterial, RecoveryRequestedEvent,
+        SignerBinding,
+    };
+
+    fn make_key(key_id: &str) -> PublicKeyMaterial {
+        PublicKeyMaterial {
+            key_id: key_id.into(),
+            algorithm: KeyAlgorithm::Ed25519,
+            public_key: format!("ed25519:{key_id}"),
+        }
+    }
+
+    fn make_enc_key(key_id: &str) -> PublicKeyMaterial {
+        PublicKeyMaterial {
+            key_id: format!("enc-{key_id}"),
+            algorithm: KeyAlgorithm::AgeX25519,
+            public_key: format!("age1{key_id}fixture"),
+        }
+    }
+
+    fn make_event(event_id: &str, body: EventBody, signer_binding: SignerBinding) -> EventEnvelope {
+        let signer = FixtureSigner::new(signer_binding.key_id.clone());
+        EventEnvelope::from_body(event_id, body, vec![], signer_binding, &signer).unwrap()
+    }
+
+    fn two_root_state_with_three_devices() -> MaterializedState {
+        let mut state = MaterializedState::default();
+        for root in ["root-a", "root-b", "root-c"] {
+            state.roots_current.insert(
+                root.into(),
+                RootRecord {
+                    root_id: root.into(),
+                    display_name: root.into(),
+                    active_key: make_key(&format!("key-{root}")),
+                    status: RootStatus::Active,
+                },
+            );
+        }
+        for (device, root) in [
+            ("device-a", "root-a"),
+            ("device-b", "root-b"),
+            ("device-c", "root-c"),
+        ] {
+            state.devices_current.insert(
+                device.into(),
+                DeviceRecord {
+                    root_id: root.into(),
+                    device_id: device.into(),
+                    label: device.into(),
+                    active_key: make_key(&format!("key-{device}")),
+                    active_encryption_key: make_enc_key(device),
+                    status: DeviceStatus::Active,
+                    replacement_device_id: None,
+                },
+            );
+        }
+        state
+    }
+
+    // ── .1b-: DeviceReplaced must verify both devices belong to the event's root ──
+
+    #[test]
+    fn device_replaced_rejects_cross_root_replaced_device() {
+        let mut state = two_root_state_with_three_devices();
+        // root-a tries to mark root-b's device-b as replaced by its own device-a.
+        let event = make_event(
+            "evt-1",
+            EventBody::DeviceReplaced(DeviceReplacedEvent {
+                root_id: "root-a".into(),
+                replaced_device_id: "device-b".into(), // owned by root-b!
+                replacement_device_id: "device-a".into(),
+            }),
+            SignerBinding::root("root-a", "key-root-a"),
+        );
+        let result = apply_event(&mut state, &event);
+        assert!(result.is_err(), "cross-root replaced_device must be rejected");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("device-b") && err.contains("root-a"),
+            "error should mention ownership mismatch, got: {err}"
+        );
+        // State must be unchanged.
+        assert_eq!(
+            state.devices_current["device-b"].status,
+            DeviceStatus::Active,
+            "device-b must remain Active after rejected replacement"
+        );
+        assert!(
+            state.devices_current["device-b"]
+                .replacement_device_id
+                .is_none(),
+            "device-b must not record a replacement after rejection"
+        );
+    }
+
+    #[test]
+    fn device_replaced_rejects_cross_root_replacement_device() {
+        let mut state = two_root_state_with_three_devices();
+        // root-a says its own device-a is replaced by root-c's device-c.
+        let event = make_event(
+            "evt-1",
+            EventBody::DeviceReplaced(DeviceReplacedEvent {
+                root_id: "root-a".into(),
+                replaced_device_id: "device-a".into(),
+                replacement_device_id: "device-c".into(), // owned by root-c!
+            }),
+            SignerBinding::root("root-a", "key-root-a"),
+        );
+        let result = apply_event(&mut state, &event);
+        assert!(
+            result.is_err(),
+            "cross-root replacement_device must be rejected"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("device-c") && err.contains("root-a"),
+            "error should mention ownership mismatch, got: {err}"
+        );
+        assert_eq!(
+            state.devices_current["device-a"].status,
+            DeviceStatus::Active,
+            "device-a must remain Active after rejected replacement"
+        );
+    }
+
+    #[test]
+    fn device_replaced_same_root_allowed() {
+        let mut state = two_root_state_with_three_devices();
+        // Add a second device under root-a.
+        state.devices_current.insert(
+            "device-a2".into(),
+            DeviceRecord {
+                root_id: "root-a".into(),
+                device_id: "device-a2".into(),
+                label: "Device A2".into(),
+                active_key: make_key("key-device-a2"),
+                active_encryption_key: make_enc_key("device-a2"),
+                status: DeviceStatus::Active,
+                replacement_device_id: None,
+            },
+        );
+        let event = make_event(
+            "evt-1",
+            EventBody::DeviceReplaced(DeviceReplacedEvent {
+                root_id: "root-a".into(),
+                replaced_device_id: "device-a".into(),
+                replacement_device_id: "device-a2".into(),
+            }),
+            SignerBinding::root("root-a", "key-root-a"),
+        );
+        apply_event(&mut state, &event).expect("same-root replacement must succeed");
+        assert_eq!(
+            state.devices_current["device-a"].status,
+            DeviceStatus::Replaced
+        );
+        assert_eq!(
+            state.devices_current["device-a"].replacement_device_id,
+            Some("device-a2".into())
+        );
+    }
+
+    // ── .1b-: RecoveryRequested must reject duplicate request_id ──
+
+    fn state_with_recovery_context() -> MaterializedState {
+        let mut state = two_root_state_with_three_devices();
+        state.recovery_policies_current.insert(
+            "root-a".into(),
+            RecoveryPolicyRecord {
+                root_id: "root-a".into(),
+                guardian_threshold: 2,
+                cooldown_seconds: 3600,
+            },
+        );
+        state.guardians_current.insert(
+            "guardian-1".into(),
+            GuardianRecord {
+                guardian_id: "guardian-1".into(),
+                root_id: "root-a".into(),
+                label: "G1".into(),
+                public_key: "key-g1".into(),
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn recovery_requested_rejects_duplicate_request_id() {
+        let mut state = state_with_recovery_context();
+        let event1 = make_event(
+            "evt-1",
+            EventBody::RecoveryRequested(RecoveryRequestedEvent {
+                request_id: "req-1".into(),
+                root_id: "root-a".into(),
+                target_device_id: "device-a".into(),
+            }),
+            SignerBinding::root("root-a", "key-root-a"),
+        );
+        apply_event(&mut state, &event1).expect("first recovery request should succeed");
+
+        // Simulate gathered approvals + contest state.
+        let req = state
+            .recovery_requests_current
+            .get_mut("req-1")
+            .expect("request should exist");
+        req.approvals.insert("guardian-1".into());
+        req.status = RecoveryRequestStatus::Contested;
+        req.cooldown_until = Some(1000);
+        req.contest_reason = Some("suspicious".into());
+
+        // Replay RecoveryRequested with the same request_id.
+        let event2 = make_event(
+            "evt-2",
+            EventBody::RecoveryRequested(RecoveryRequestedEvent {
+                request_id: "req-1".into(),
+                root_id: "root-a".into(),
+                target_device_id: "device-a".into(),
+            }),
+            SignerBinding::root("root-a", "key-root-a"),
+        );
+        let result = apply_event(&mut state, &event2);
+        assert!(
+            result.is_err(),
+            "duplicate RecoveryRequested must be rejected"
+        );
+        assert!(
+            result.unwrap_err().to_string().contains("already exists"),
+            "error should mention duplicate"
+        );
+
+        // State must preserve the in-flight request — approvals, cooldown, contest reason intact.
+        let preserved = &state.recovery_requests_current["req-1"];
+        assert!(
+            preserved.approvals.contains("guardian-1"),
+            "approvals must not be wiped"
+        );
+        assert_eq!(preserved.status, RecoveryRequestStatus::Contested);
+        assert_eq!(preserved.cooldown_until, Some(1000));
+        assert_eq!(preserved.contest_reason, Some("suspicious".into()));
+    }
+
+    #[test]
+    fn recovery_requested_unique_id_succeeds() {
+        let mut state = state_with_recovery_context();
+        let event1 = make_event(
+            "evt-1",
+            EventBody::RecoveryRequested(RecoveryRequestedEvent {
+                request_id: "req-1".into(),
+                root_id: "root-a".into(),
+                target_device_id: "device-a".into(),
+            }),
+            SignerBinding::root("root-a", "key-root-a"),
+        );
+        apply_event(&mut state, &event1).expect("first request");
+
+        let event2 = make_event(
+            "evt-2",
+            EventBody::RecoveryRequested(RecoveryRequestedEvent {
+                request_id: "req-2".into(),
+                root_id: "root-a".into(),
+                target_device_id: "device-a".into(),
+            }),
+            SignerBinding::root("root-a", "key-root-a"),
+        );
+        apply_event(&mut state, &event2).expect("distinct request_id must succeed");
+        assert_eq!(state.recovery_requests_current.len(), 2);
+    }
 }

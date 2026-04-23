@@ -2,8 +2,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use core_crypto::{
     Ed25519Verifier, Verifier, generate_ephemeral_keypair, generate_local_encryption_key_pair,
-    generate_local_key_pair, generate_random_identifier, seal_grant_payload, LocalKeyPair,
-    LocalKeySigner, PublicKey, Signature, Signer,
+    generate_local_key_pair, generate_random_identifier, grant_chain, seal_grant_payload,
+    LocalKeyPair, LocalKeySigner, PublicKey, Signature, Signer,
 };
 use core_events::EventEnvelope;
 use core_identity::{create_root, device_revoked_event, root_created_event, root_revoked_event};
@@ -519,7 +519,7 @@ impl<S: AppBackend> AppRuntime<S> {
     ) -> Result<serde_json::Value, String> {
         use core_types::{
             AccessGrant, AttestationBinding, Block, GrantMode, GrantStatus,
-            PresentationAudienceKind, RecipientProfile, SignedBlock,
+            PresentationAudienceKind, RecipientProfile,
         };
 
         let recipient_kind = PresentationAudienceKind::parse(recipient_kind)
@@ -545,6 +545,39 @@ impl<S: AppBackend> AppRuntime<S> {
             approval: None,
             note: None,
         };
+
+        // Sign block 0 under the persona's root key (falling back to the
+        // root id's keypair if the persona itself has no local signing key).
+        // Mirrors the lookup pattern used in `do_create_grant_offer`.
+        let persona = self
+            .store
+            .materialized()
+            .personas_current
+            .get(issuing_persona_id)
+            .ok_or_else(|| format!("persona '{issuing_persona_id}' not found"))?
+            .clone();
+        let persona_entry = self
+            .local_state
+            .keys
+            .get(issuing_persona_id)
+            .or_else(|| self.local_state.keys.get(&persona.root_id))
+            .ok_or_else(|| {
+                format!(
+                    "no local signing key for persona '{issuing_persona_id}' or root '{}'",
+                    persona.root_id
+                )
+            })?;
+        let root_kp = grant_chain::root_key_from_local_key_pair(&persona_entry.key_pair)
+            .map_err(|e| format!("grant chain signing key invalid: {e}"))?;
+        let signed = grant_chain::sign_block_zero(&root_kp, &block)
+            .map_err(|e| format!("grant chain signing failed: {e}"))?;
+        // M-3: persist `pubkey_next_secret` in local state so later
+        // delegation / attenuation blocks can be signed after restart.
+        // The secret is the private half of the ephemeral key whose
+        // public half is recorded in `signed.signed.pubkey_next`.
+        self.local_state
+            .store_chain_secret(grant_id.clone(), signed.pubkey_next_secret);
+
         let grant = AccessGrant {
             id: grant_id.clone(),
             version: 1,
@@ -554,14 +587,7 @@ impl<S: AppBackend> AppRuntime<S> {
             recipient_profile,
             status: GrantStatus::Active,
             mode,
-            blocks: vec![SignedBlock {
-                block,
-                // Phase-1 placeholder — biscuit-auth chain signing lands in a
-                // follow-up PR per design. Validate() rejects empty strings,
-                // so we use stable non-empty markers here.
-                pubkey_next: "unsigned-phase1".into(),
-                signature: "unsigned-phase1".into(),
-            }],
+            blocks: vec![signed.signed],
             attestation: AttestationBinding::default(),
             created_at: now,
             updated_at: now,

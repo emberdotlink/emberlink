@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use emberlink_app::UiAction;
 
-use core_crypto::FixtureSigner;
+use core_crypto::{grant_chain, FixtureSigner};
 use core_identity::{
     device_added_event, device_encryption_key_rotated_event, device_frozen_event,
     device_key_rotated_event, device_replaced_event, root_key_rotated_event,
@@ -27,7 +27,7 @@ use core_sync::{
 use core_trust::{derive_score, trust_attested_event, trust_revoked_event};
 use core_types::{
     AccessGrant, AttestationBinding, Block, Condition, GrantMode, GrantStatus, ResourceSelector,
-    SignedBlock, Statement, AdmissionToken, ContentPublishedEvent, ContentVisibility, EventBody,
+    Statement, AdmissionToken, ContentPublishedEvent, ContentVisibility, EventBody,
     MessageSentEvent, PresentationAudienceKind, RecipientProfile, ResourceType, SignerBinding,
     SurvivalMode, SyncProfile, TrustThreshold, Usage, Validate, ValidationError,
 };
@@ -6388,10 +6388,11 @@ impl DemoApp {
         expires_in: Option<u64>,
         cap_strs: &[String],
     ) -> Result<String, ValidationError> {
-        let persona_id = self
+        let persona = self
             .resolve_persona(persona_ref)
-            .map(|p| p.id.clone())
             .ok_or_else(|| ValidationError::new(format!("unknown persona: {persona_ref}")))?;
+        let persona_id = persona.id.clone();
+        let persona_root_id = persona.root_id.clone();
 
         let recipient_kind = PresentationAudienceKind::parse(kind_str)
             .ok_or_else(|| ValidationError::new(format!("invalid kind: {kind_str}. Use: peer, service")))?;
@@ -6428,6 +6429,18 @@ impl DemoApp {
             note: None,
         };
 
+        // Sign block 0 under the persona's root key (design §SignedBlock —
+        // "signed… for block 0, by the persona's root key"). The
+        // `pubkey_next_secret` is persisted (M-3) under `chain_secrets` in
+        // the encrypted local-state blob so later delegation / attenuation
+        // blocks can be signed against this chain tail. See
+        // `core_crypto::grant_chain::PubkeyNextKeyPair`.
+        let root_key_pair = self.grant_chain_root_key(&persona_root_id)?;
+        let signed = grant_chain::sign_block_zero(&root_key_pair, &block).map_err(|e| {
+            ValidationError::new(format!("grant chain signing failed: {e}"))
+        })?;
+        self.store_chain_secret(&grant_id, signed.pubkey_next_secret);
+
         let grant = AccessGrant {
             id: grant_id.clone(),
             version: 1,
@@ -6437,13 +6450,7 @@ impl DemoApp {
             recipient_profile,
             status: GrantStatus::Active,
             mode,
-            blocks: vec![SignedBlock {
-                block,
-                // Phase-1 placeholder per design — biscuit-auth chain signing
-                // lands in a follow-up PR. Validate() requires non-empty.
-                pubkey_next: "unsigned-phase1".into(),
-                signature: "unsigned-phase1".into(),
-            }],
+            blocks: vec![signed.signed],
             attestation: AttestationBinding::default(),
             created_at: now,
             updated_at: now,

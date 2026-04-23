@@ -140,6 +140,17 @@ pub struct CredentialDepositRecord {
     pub revoked_reason: Option<String>,
 }
 
+/// A disclosure artifact record. Populated by the persona layer when a
+/// disclosure is issued; used by authorize.rs for the L-3 revoker == issuer
+/// cross-check (.1a).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisclosureRecord {
+    /// Unique artifact identifier (matches `DisclosureRevokedEvent.artifact_id`).
+    pub artifact_id: String,
+    /// The persona that originally issued this disclosure.
+    pub issuer_persona_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GrantOfferStatus {
     Pending,
@@ -181,6 +192,9 @@ pub struct MaterializedState {
     pub badges_current: BTreeMap<String, BadgeRecord>,
     pub badge_disputes_current: BTreeMap<String, BadgeDisputeRecord>,
     pub credential_deposits_current: BTreeMap<String, CredentialDepositRecord>,
+    /// Disclosure artifacts indexed by `artifact_id`. Populated by the persona
+    /// layer; used by `authorize.rs` for the L-3 revoker-==issuer cross-check.
+    pub disclosures_current: BTreeMap<String, DisclosureRecord>,
     pub root_key_history: BTreeMap<String, Vec<String>>,
     pub device_key_history: BTreeMap<String, Vec<String>>,
     pub device_encryption_key_history: BTreeMap<String, Vec<String>>,

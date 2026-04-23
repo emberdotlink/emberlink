@@ -152,7 +152,20 @@ impl DaemonStore {
                 payload TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 read_at TEXT
-            );",
+            );
+
+            CREATE TABLE IF NOT EXISTS receipts (
+                id TEXT PRIMARY KEY,
+                grant_id TEXT NOT NULL,
+                persona_id TEXT NOT NULL,
+                terminal_reason TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                receipt_json TEXT NOT NULL,
+                signer_pubkey TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_receipts_grant ON receipts(grant_id);
+            CREATE INDEX IF NOT EXISTS idx_receipts_persona ON receipts(persona_id);
+            CREATE INDEX IF NOT EXISTS idx_receipts_created ON receipts(created_at);",
         )?;
 
         // Additive migration: add sandboxes.workspace_path to pre-existing
@@ -168,20 +181,18 @@ impl DaemonStore {
                 .execute("ALTER TABLE sandboxes ADD COLUMN workspace_path TEXT", [])?;
         }
 
-        // Additive migration: design unified Grant primitive on the daemon-local
-        // `grants` table. Budget + Usage are stored as JSON to match
-        // `core_types::AccessGrant`'s representation and keep the schema
-        // stable as new resource axes (compute, time) come online. `paused`
-        // and `receipt_id` remain flat because they are orthogonal to the
-        // budget abstraction (advisory flag + terminal-state backref).
+        // Additive migration: design composite grant. Every daemon grant
+        // carries a canonical `AccessGrant.blocks` chain serialized as JSON
+        // in `blocks_json`. Per-Statement budget + usage live inside the
+        // blocks (not flat on the row). `paused` and `receipt_id` remain
+        // flat because they are orthogonal to the per-Statement abstraction.
         //
-        // Legacy flat columns (budget_tokens, budget_cents, tokens_used,
-        // cents_used, usage_updated_at) from the first #491 ship are
-        // retained as deprecated dead columns — left in the table so
-        // existing dev DBs don't break but never read or written. A later
-        // cleanup PR can DROP them once we're confident no external tooling
-        // reads from them.
+        // The earlier (#491) flat `budget_json` / `usage_json` envelope-level
+        // fields are retained for backward compat on read (old dev DBs) but
+        // every new grant writes through `blocks_json`. A cleanup PR after
+        // Stream A composition lands can DROP the legacy columns.
         for (col, ddl) in [
+            ("blocks_json",    "ALTER TABLE grants ADD COLUMN blocks_json TEXT"),
             ("budget_json",    "ALTER TABLE grants ADD COLUMN budget_json TEXT"),
             ("usage_json",     "ALTER TABLE grants ADD COLUMN usage_json TEXT"),
             ("paused",         "ALTER TABLE grants ADD COLUMN paused INTEGER NOT NULL DEFAULT 0"),
@@ -239,10 +250,11 @@ mod tests {
             "grants",
             "notifications",
             "personas",
+            "receipts",
             "sandboxes",
             "standing_grants",
         ];
-        assert_eq!(tables.len(), 9);
+        assert_eq!(tables.len(), 10);
         for name in &expected {
             assert!(tables.contains(&name.to_string()), "missing table: {name}");
         }

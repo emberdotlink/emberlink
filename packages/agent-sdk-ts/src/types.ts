@@ -69,6 +69,40 @@ export interface GrantRevokedNotification {
   persona_id: string;
 }
 
+/**
+ * Budget axis values — must match the Rust BudgetAxis enum wire form.
+ * Values are lowercase snake_case as serialized on the wire.
+ */
+export type BudgetAxis = 'tokens' | 'cents' | 'requests' | 'wall_clock_secs';
+
+/**
+ * Threshold band that triggered this notification.
+ * "warning" fires at 80% and 95% crossings; "exhausted" fires at 100%.
+ */
+export type ThresholdBand = 'warning' | 'exhausted';
+
+/** Payload pushed by the daemon when a Statement's budget crosses a warning threshold (80%, 95%). */
+export interface BudgetWarningNotification {
+  grant_id: string;
+  statement_sid: string;
+  axis: BudgetAxis;
+  used: number;
+  budget: number;
+  percent: number;
+  threshold_band: 'warning';
+}
+
+/** Payload pushed by the daemon when a Statement's budget is fully exhausted (100%). */
+export interface BudgetExhaustedNotification {
+  grant_id: string;
+  statement_sid: string;
+  axis: BudgetAxis;
+  used: number;
+  budget: number;
+  percent: number;
+  threshold_band: 'exhausted';
+}
+
 /** A JSON-RPC notification (no `id` field) pushed from the daemon. */
 export interface AgentNotification {
   method: string;

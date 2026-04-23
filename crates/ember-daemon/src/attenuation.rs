@@ -16,7 +16,7 @@
 //! name only the violating axis (never the parent's full state) so that a
 //! compromised child cannot use rejections as an oracle for parent state.
 
-use core_types::{Budget, Usage};
+use core_types::{AccessGrant, Budget, ResourceSelector, Usage};
 
 /// Attenuation failure. `reason` names the violating dimension only —
 /// parent values are deliberately elided so the error is not an oracle for a
@@ -312,6 +312,97 @@ pub fn check_expiry_attenuation(
     Ok(())
 }
 
+// ----------------------------------------------------------------------
+// Per-Statement attenuation (design / P69K-A2)
+// ----------------------------------------------------------------------
+
+/// True iff `child` selector is a subset of `parent` selector. `Any` in the
+/// parent subsumes any child; `Exact` must match exactly; `Glob` uses the
+/// same wildcard matcher as the scope path. Regex is not yet supported as a
+/// parent — reject the child to fail closed.
+fn selector_subset(child: &ResourceSelector, parent: &ResourceSelector) -> bool {
+    match (parent, child) {
+        (ResourceSelector::Any, _) => true,
+        (ResourceSelector::Exact { value: p }, ResourceSelector::Exact { value: c }) => {
+            p == c
+        }
+        (ResourceSelector::Glob { pattern: p }, ResourceSelector::Exact { value: c }) => {
+            wildcard_match(p, c)
+        }
+        (ResourceSelector::Glob { pattern: p }, ResourceSelector::Glob { pattern: c }) => {
+            // A glob-in-glob subset is only provable conservatively: treat
+            // the child as a subset iff parent is "*" or parent == child.
+            p == "*" || p == c
+        }
+        _ => false,
+    }
+}
+
+/// True iff `child_actions` is a subset of `parent_actions`. Wildcard `*`
+/// in the parent subsumes everything; otherwise every child action must
+/// appear verbatim in the parent list. (Synonyms like push↔write, handled
+/// by `scope_subset` for legacy scopes, are NOT implied here — Statements
+/// declare their actions explicitly.)
+fn actions_subset(parent_actions: &[String], child_actions: &[String]) -> bool {
+    if parent_actions.iter().any(|a| a == "*") {
+        return true;
+    }
+    child_actions
+        .iter()
+        .all(|ca| parent_actions.iter().any(|pa| pa == ca))
+}
+
+/// Per-Statement attenuation check. For each statement in the child chain,
+/// find a parent statement whose selector and action-set subsume it, and
+/// whose budget leaves enough remaining headroom on every axis the child
+/// bounds.
+///
+/// Semantics (child ≤ parent):
+/// - Every child statement must have AT LEAST ONE matching parent statement
+///   where `actions_subset(parent.actions, child.actions) &&
+///   selector_subset(child.resource, parent.resource)`.
+/// - For the matched parent, run `check_budget_attenuation` across the
+///   parent's `(budget, usage)` and the child's budget.
+///
+/// Returns the first violation. On success, Ok(()).
+pub fn check_statement_attenuation(
+    parent: &AccessGrant,
+    child: &AccessGrant,
+) -> Result<(), DelegationViolation> {
+    for (_ci, cstmt) in child.statements() {
+        // Find a parent statement that subsumes this child statement.
+        let matched = parent.statements().find(|(_, pstmt)| {
+            actions_subset(&pstmt.actions, &cstmt.actions)
+                && selector_subset(&cstmt.resource, &pstmt.resource)
+        });
+
+        let Some((_pi, pstmt)) = matched else {
+            return Err(DelegationViolation::new(format!(
+                "statement[{}] has no parent with matching selector/actions",
+                cstmt.sid
+            )));
+        };
+
+        // resource_type must also match (or parent is Credential-default).
+        if pstmt.resource_type != cstmt.resource_type {
+            return Err(DelegationViolation::new(format!(
+                "statement[{}].resource_type differs from parent",
+                cstmt.sid
+            )));
+        }
+
+        // Budget: child must fit inside parent's remaining allowance.
+        check_budget_attenuation(&pstmt.budget, &pstmt.usage, &cstmt.budget)
+            .map_err(|e| {
+                DelegationViolation::new(format!(
+                    "statement[{}] {}",
+                    cstmt.sid, e.reason
+                ))
+            })?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,5 +635,197 @@ mod tests {
         let err = check_expiry_attenuation(Some(1_700_000_000), Some(1_700_001_000))
             .unwrap_err();
         assert!(err.reason.contains("expiry"));
+    }
+
+    // --- per-Statement attenuation tests ---
+
+    fn make_grant(statements: Vec<core_types::Statement>) -> AccessGrant {
+        use core_types::{
+            AttestationBinding, Block, GrantMode, GrantStatus,
+            PresentationAudienceKind, RecipientProfile, SignedBlock,
+        };
+        AccessGrant {
+            id: "g".into(),
+            version: 1,
+            issuing_persona_id: "p".into(),
+            recipient_kind: PresentationAudienceKind::Service,
+            recipient_id: "r".into(),
+            recipient_profile: RecipientProfile::Agent,
+            status: GrantStatus::Active,
+            mode: GrantMode::OneShot,
+            blocks: vec![SignedBlock {
+                block: Block {
+                    statements,
+                    nbf: None,
+                    expires_at: None,
+                    issued_by: "p".into(),
+                    issued_at: 0,
+                    approval: None,
+                    note: None,
+                },
+                pubkey_next: "x".into(),
+                signature: "x".into(),
+            }],
+            attestation: AttestationBinding::default(),
+            created_at: 0,
+            updated_at: 0,
+            revoked_at: None,
+            revoked_reason: None,
+            last_used_at: None,
+            label: None,
+        }
+    }
+
+    fn stmt(
+        sid: &str,
+        actions: Vec<String>,
+        resource: ResourceSelector,
+        budget: Option<Budget>,
+    ) -> core_types::Statement {
+        use core_types::ResourceType;
+        core_types::Statement {
+            sid: sid.into(),
+            resource_type: ResourceType::Session,
+            actions,
+            resource,
+            budget,
+            usage: Usage::default(),
+            conditions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn per_stmt_attenuation_accepted_when_child_bounds_smaller() {
+        // Parent: llm:generate on any resource, 1000 tokens AND 600s wall-clock.
+        let parent = make_grant(vec![stmt(
+            "P",
+            vec!["llm:generate".into()],
+            ResourceSelector::Any,
+            Some(Budget {
+                tokens: Some(1000),
+                wall_clock_secs: Some(600),
+                ..Default::default()
+            }),
+        )]);
+        // Child: same action/selector, 500 tokens + 300s.
+        let child = make_grant(vec![stmt(
+            "C",
+            vec!["llm:generate".into()],
+            ResourceSelector::Any,
+            Some(Budget {
+                tokens: Some(500),
+                wall_clock_secs: Some(300),
+                ..Default::default()
+            }),
+        )]);
+        assert!(check_statement_attenuation(&parent, &child).is_ok());
+    }
+
+    #[test]
+    fn per_stmt_attenuation_rejects_child_budget_exceeds_parent() {
+        let parent = make_grant(vec![stmt(
+            "P",
+            vec!["llm:generate".into()],
+            ResourceSelector::Any,
+            Some(Budget {
+                tokens: Some(1000),
+                wall_clock_secs: Some(600),
+                ..Default::default()
+            }),
+        )]);
+        // Child asks for 2000 tokens — violates.
+        let child = make_grant(vec![stmt(
+            "C",
+            vec!["llm:generate".into()],
+            ResourceSelector::Any,
+            Some(Budget {
+                tokens: Some(2000),
+                wall_clock_secs: Some(300),
+                ..Default::default()
+            }),
+        )]);
+        let err = check_statement_attenuation(&parent, &child).unwrap_err();
+        assert!(err.reason.contains("tokens"), "reason: {}", err.reason);
+    }
+
+    #[test]
+    fn per_stmt_attenuation_rejects_child_wall_clock_exceeds_parent() {
+        let parent = make_grant(vec![stmt(
+            "P",
+            vec!["llm:generate".into()],
+            ResourceSelector::Any,
+            Some(Budget {
+                tokens: Some(1000),
+                wall_clock_secs: Some(600),
+                ..Default::default()
+            }),
+        )]);
+        // Child within token budget but asks for 900s — exceeds parent's 600.
+        let child = make_grant(vec![stmt(
+            "C",
+            vec!["llm:generate".into()],
+            ResourceSelector::Any,
+            Some(Budget {
+                tokens: Some(500),
+                wall_clock_secs: Some(900),
+                ..Default::default()
+            }),
+        )]);
+        let err = check_statement_attenuation(&parent, &child).unwrap_err();
+        assert!(err.reason.contains("wall_clock"), "reason: {}", err.reason);
+    }
+
+    #[test]
+    fn per_stmt_attenuation_rejects_when_selector_not_subset() {
+        let parent = make_grant(vec![stmt(
+            "P",
+            vec!["llm:generate".into()],
+            ResourceSelector::Exact { value: "model:haiku".into() },
+            None,
+        )]);
+        // Child asks for a different exact resource.
+        let child = make_grant(vec![stmt(
+            "C",
+            vec!["llm:generate".into()],
+            ResourceSelector::Exact { value: "model:opus".into() },
+            None,
+        )]);
+        let err = check_statement_attenuation(&parent, &child).unwrap_err();
+        assert!(err.reason.contains("no parent"), "reason: {}", err.reason);
+    }
+
+    #[test]
+    fn per_stmt_attenuation_rejects_when_action_not_subset() {
+        let parent = make_grant(vec![stmt(
+            "P",
+            vec!["llm:generate".into()],
+            ResourceSelector::Any,
+            None,
+        )]);
+        let child = make_grant(vec![stmt(
+            "C",
+            vec!["llm:finetune".into()],
+            ResourceSelector::Any,
+            None,
+        )]);
+        let err = check_statement_attenuation(&parent, &child).unwrap_err();
+        assert!(err.reason.contains("no parent"), "reason: {}", err.reason);
+    }
+
+    #[test]
+    fn per_stmt_attenuation_wildcard_parent_subsumes_any_child() {
+        let parent = make_grant(vec![stmt(
+            "P",
+            vec!["*".into()],
+            ResourceSelector::Any,
+            None,
+        )]);
+        let child = make_grant(vec![stmt(
+            "C",
+            vec!["llm:generate".into()],
+            ResourceSelector::Exact { value: "x".into() },
+            None,
+        )]);
+        assert!(check_statement_attenuation(&parent, &child).is_ok());
     }
 }

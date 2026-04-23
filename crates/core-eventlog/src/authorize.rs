@@ -1,6 +1,6 @@
 use core_crypto::PublicKey;
 use core_events::EventEnvelope;
-use core_types::{EventBody, KeyRole, SignerBinding, ValidationError};
+use core_types::{EventBody, KeyRole, SignerBinding, SubjectKind, ValidationError};
 
 use crate::{
     DeviceStatus, GrantOfferStatus, MaterializedState, PersonaStatus, RecoveryRequestStatus,
@@ -8,19 +8,38 @@ use crate::{
 };
 
 pub trait Authorizer {
-    fn authorize(
+    /// Raw authorization: returns the precise error variant
+    /// (NotFound / StateViolation / Unauthorized with specific detail).
+    /// Internal callers (store append, materializer, test harness) call
+    /// this directly so they can pattern-match on exact failure modes.
+    fn authorize_raw(
         &self,
         event: &EventEnvelope,
         state: &MaterializedState,
         now_epoch_secs: u64,
     ) -> Result<(), ValidationError>;
+
+    /// Public-facing authorization: state-leaking error variants are
+    /// collapsed to a generic `unauthorized for the requested operation`.
+    /// HTTP handlers, dashboard emitters, and any consumer that returns
+    /// errors to untrusted clients should call this. Default implementation
+    /// sanitizes; implementors only need `authorize_raw`.
+    fn authorize(
+        &self,
+        event: &EventEnvelope,
+        state: &MaterializedState,
+        now_epoch_secs: u64,
+    ) -> Result<(), ValidationError> {
+        self.authorize_raw(event, state, now_epoch_secs)
+            .map_err(sanitize_authorize_error)
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct AllowAllAuthorizer;
 
 impl Authorizer for AllowAllAuthorizer {
-    fn authorize(
+    fn authorize_raw(
         &self,
         _event: &EventEnvelope,
         _state: &MaterializedState,
@@ -33,16 +52,46 @@ impl Authorizer for AllowAllAuthorizer {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct IdentityAuthorizer;
 
-impl Authorizer for IdentityAuthorizer {
-    fn authorize(
+impl IdentityAuthorizer {
+    fn authorize_inner(
         &self,
         event: &EventEnvelope,
         state: &MaterializedState,
         now_epoch_secs: u64,
     ) -> Result<(), ValidationError> {
         let signer_pk = &event.signer;
+        // .1a I-1: audit-clarity cross-check — the signer_binding.signer
+        // subject id should be coherent with the body's declared authority.
+        // Not security-critical (the key material binding is the authority),
+        // but a mismatch means auditors will be misled. Fail-closed so that
+        // malformed audit trails never land.
+        check_signer_subject_coherence(&event.signer_binding, &event.body)?;
         match &event.body {
-            EventBody::RootCreated(_) => Ok(()),
+            // .1a M-4: RootCreated is unconditionally allowed at the
+            // authorize layer — a root is self-asserting and nothing in state
+            // yet binds its authority. Squatting risk: a first-to-sync peer
+            // can pre-emptively assert `root_id = X` with their own pubkey
+            // before the real root's creation event arrives. Recovery posture
+            // is out-of-band: the real operator must pick a fresh root_id and
+            // prove custody through a side channel (signed statement, DNS,
+            // verified human identity). We additionally enforce pubkey-material
+            // uniqueness across roots below so a second RootCreated using the
+            // same pubkey as an existing root is rejected — this limits the
+            // blast radius of key-material collisions but does not prevent the
+            // squatting pattern itself.
+            EventBody::RootCreated(body) => {
+                for existing in state.roots_current.values() {
+                    if existing.root_id != body.root_id
+                        && existing.active_key.public_key == body.initial_key.public_key
+                    {
+                        return Err(ValidationError::unauthorized(format!(
+                            "root initial key material collides with existing root {}",
+                            existing.root_id
+                        )));
+                    }
+                }
+                Ok(())
+            }
             EventBody::RootKeyRotated(body) => {
                 authorize_root_key(&event.signer_binding, signer_pk, &body.root_id, state)
             }
@@ -56,9 +105,15 @@ impl Authorizer for IdentityAuthorizer {
                 authorize_root_key(&event.signer_binding, signer_pk, &body.root_id, state)
             }
             EventBody::DeviceKeyRotated(body) => {
+                // .1a M-5: event body carries root_id; require it to match
+                // the device's stored root_id to prevent audit-trail lies.
+                require_device_owned_by_root(&body.device_id, &body.root_id, state)?;
                 authorize_device_key(&event.signer_binding, signer_pk, &body.device_id, state)
             }
             EventBody::DeviceEncryptionKeyRotated(body) => {
+                // .1a M-5: mirror DeviceKeyRotated — body.root_id must match
+                // the device's stored root_id.
+                require_device_owned_by_root(&body.device_id, &body.root_id, state)?;
                 authorize_device_key(&event.signer_binding, signer_pk, &body.device_id, state)
             }
             EventBody::DeviceRevoked(body) => {
@@ -116,6 +171,17 @@ impl Authorizer for IdentityAuthorizer {
                     &body.attester_persona_id,
                     state,
                 )?;
+                // .1a L-2: when the attestation is not present in local
+                // state (cross-device delivery is legitimate), we accept the
+                // revocation — materialize.rs no-ops on the missing edge.
+                // This leaves a DoS surface for peers spamming revocations
+                // against non-existent edges. The cost of each such event is
+                // bounded by the attacker expending a valid persona signature
+                // (authorize_persona_key already required an active persona),
+                // so the attacker must either be on-graph themselves or hold
+                // a compromised persona key. Rate-limiting / unmatched-revoke
+                // bounding is deferred to the sync/accept layer — this crate
+                // intentionally does not add a logger dependency.
                 if let Some(existing) = state.trust_edges_current.get(&body.attestation_id)
                     && existing.attester != body.attester_persona_id
                 {
@@ -206,13 +272,15 @@ impl Authorizer for IdentityAuthorizer {
                     .ok_or_else(|| {
                         ValidationError::not_found("recovery request", &body.request_id)
                     })?;
-                if let Some(until) = request.cooldown_until
-                    && now_epoch_secs < until
-                {
-                    return Err(ValidationError::state_violation(
-                        "recovery request is in cooldown after contest",
-                    ));
-                }
+                // .1a I-2: cooldown is a "must be at/after" check; uses the
+                // shared check_time_window helper.
+                check_time_window(
+                    now_epoch_secs,
+                    request.cooldown_until,
+                    None,
+                    "recovery request is in cooldown after contest",
+                    "recovery request cannot have a past-dated window",
+                )?;
                 if request.status != RecoveryRequestStatus::Approved {
                     return Err(ValidationError::state_violation(
                         "recovery request must be approved before execution",
@@ -226,8 +294,29 @@ impl Authorizer for IdentityAuthorizer {
             EventBody::EndpointRotated(body) => {
                 authorize_device_key(&event.signer_binding, signer_pk, &body.device_id, state)
             }
-            // Shutdown notices are relay-operator actions; no identity authority required
-            EventBody::RelayShutdownNotice(_) => Ok(()),
+            EventBody::RelayShutdownNotice(body) => {
+                // .1a M-3: shutdown notices are relay-operator actions, but
+                // when the claimed `relay_peer_id` is a known endpoint in local
+                // state we require the signer to be the device backing that
+                // endpoint. If the relay is not yet in endpoints_current we
+                // pass through — the consumer layer (UI, daemon hints) must
+                // still treat unknown-relay notices as untrusted and only act
+                // on notices whose peer is in the trust graph.
+                if let Some(endpoint) = state.endpoints_current.get(&body.relay_peer_id) {
+                    let device = state.devices_current.get(&endpoint.device_id).ok_or_else(
+                        || ValidationError::not_found("device", &endpoint.device_id),
+                    )?;
+                    if device.active_key.key_id != event.signer_binding.key_id
+                        || device.active_key.public_key != signer_pk.0
+                    {
+                        return Err(ValidationError::unauthorized(format!(
+                            "relay shutdown notice signer does not match endpoint device for {}",
+                            body.relay_peer_id
+                        )));
+                    }
+                }
+                Ok(())
+            }
             EventBody::StorageRelationshipCreated(body) => {
                 authorize_root_key(&event.signer_binding, signer_pk, &body.root_id, state)
             }
@@ -249,12 +338,30 @@ impl Authorizer for IdentityAuthorizer {
                 &body.author_persona_id,
                 state,
             ),
-            EventBody::DisclosureRevoked(body) => authorize_persona_key(
-                &event.signer_binding,
-                signer_pk,
-                &body.revoker_persona_id,
-                state,
-            ),
+            EventBody::DisclosureRevoked(body) => {
+                authorize_persona_key(
+                    &event.signer_binding,
+                    signer_pk,
+                    &body.revoker_persona_id,
+                    state,
+                )?;
+                // .1a L-3: defense-in-depth cross-check — the revoker must
+                // be the original disclosure issuer. When the disclosure is in
+                // local state, require `signer == original_issuer`. If the
+                // artifact is not present in `disclosures_current` (cross-device
+                // delivery where the receiver has not yet materialized the
+                // issuance event), we pass through — the issuer-side replay will
+                // catch violations, analogous to the GrantOfferRevoked and
+                // BadgeRevoked pass-through for unknown artifacts.
+                if let Some(disclosure) = state.disclosures_current.get(&body.artifact_id)
+                    && disclosure.issuer_persona_id != body.revoker_persona_id
+                {
+                    return Err(ValidationError::unauthorized(
+                        "only the original issuer can revoke this disclosure",
+                    ));
+                }
+                Ok(())
+            }
             EventBody::GrantOfferCreated(body) => authorize_persona_key(
                 &event.signer_binding,
                 signer_pk,
@@ -278,11 +385,15 @@ impl Authorizer for IdentityAuthorizer {
                             "grant offer is not in Pending status",
                         ));
                     }
-                    if now_epoch_secs >= offer.expires_at {
-                        return Err(ValidationError::state_violation(
-                            "grant offer has expired",
-                        ));
-                    }
+                    // .1a I-2: expiry is a "must be strictly before"
+                    // check; uses the shared check_time_window helper.
+                    check_time_window(
+                        now_epoch_secs,
+                        None,
+                        Some(offer.expires_at),
+                        "grant offer cannot have a future-only earliest window",
+                        "grant offer has expired",
+                    )?;
                 }
                 Ok(())
             }
@@ -364,6 +475,19 @@ impl Authorizer for IdentityAuthorizer {
             EventBody::LegacyOpaque { .. } => Ok(()),
         }
     }
+}
+
+impl Authorizer for IdentityAuthorizer {
+    fn authorize_raw(
+        &self,
+        event: &EventEnvelope,
+        state: &MaterializedState,
+        now_epoch_secs: u64,
+    ) -> Result<(), ValidationError> {
+        self.authorize_inner(event, state, now_epoch_secs)
+    }
+    // `authorize` inherits the trait default, which wraps `authorize_raw`
+    // with `sanitize_authorize_error` for public-facing error surfaces.
 }
 
 fn authorize_root_key(
@@ -536,6 +660,364 @@ fn authorize_persona_key(
     Ok(())
 }
 
+/// .1a L-1: transform an internal authorize error into a public-facing
+/// error message that does not echo subject-existence / freeze / key-mismatch
+/// state to the caller. Internal callers continue to receive the detailed
+/// messages (useful for daemon logs and test assertions), but any surface
+/// that exposes authorize errors to an untrusted peer (e.g., future
+/// relay-discovery responses) should run them through this sanitizer first.
+///
+/// Subject kind + programmatic error kind are preserved so callers can still
+/// distinguish an Unauthorized decision from a StateViolation without
+/// learning whether the subject exists or what its current status is.
+pub fn sanitize_authorize_error(err: ValidationError) -> ValidationError {
+    use core_types::ValidationErrorKind;
+    let kind = err.kind;
+    let generic = match kind {
+        ValidationErrorKind::NotFound
+        | ValidationErrorKind::Unauthorized
+        | ValidationErrorKind::StateViolation => "unauthorized for the requested operation",
+        _ => return err,
+    };
+    ValidationError {
+        kind: ValidationErrorKind::Unauthorized,
+        message: generic.to_string(),
+    }
+}
+
+/// .1a I-2: shared time-window helper for branches that gate on a
+/// caller-supplied `now` against an optional start (`not_before`) and/or
+/// optional end (`not_after`) epoch. Returns the corresponding error
+/// messages when the window is violated.
+///
+/// Semantics:
+/// * `not_before.is_some()` → require `now >= not_before`, else
+///   `before_msg` (StateViolation) — used for cooldown gates.
+/// * `not_after.is_some()`  → require `now < not_after`, else
+///   `after_msg` (StateViolation) — used for expiry gates.
+fn check_time_window(
+    now_epoch_secs: u64,
+    not_before: Option<u64>,
+    not_after: Option<u64>,
+    before_msg: &'static str,
+    after_msg: &'static str,
+) -> Result<(), ValidationError> {
+    if let Some(start) = not_before
+        && now_epoch_secs < start
+    {
+        return Err(ValidationError::state_violation(before_msg));
+    }
+    if let Some(end) = not_after
+        && now_epoch_secs >= end
+    {
+        return Err(ValidationError::state_violation(after_msg));
+    }
+    Ok(())
+}
+
+/// .1a I-1: audit-clarity cross-check — the signer subject referenced in
+/// `signer_binding.signer.subject_id` should be coherent with the authority
+/// that the event body implies. A mismatch is not a security vulnerability
+/// (the signer's pubkey material + body subject together define the
+/// authority), but an incoherent audit trail is confusing for auditors and
+/// hides downstream bugs. We fail-closed so that malformed envelopes never
+/// land in the log.
+///
+/// Coherence rules (non-exhaustive — only the clearly derivable authority
+/// subject is checked; events whose body does not single out one subject
+/// pass through):
+/// * RootCreated / RootKeyRotated / RootRevoked / RecoveryPolicyCreated /
+///   RecoveryRequested / GuardianEnrolled / DeviceAdded / PersonaCreated /
+///   DeviceReplaced / Storage*: signer is a root → `signer.subject_id ==
+///   body.root_id`.
+/// * DeviceKeyRotated / DeviceEncryptionKeyRotated / DeviceRevoked /
+///   DeviceFrozen / RelayHintUpdated / EndpointRotated: signer is a device
+///   → `signer.subject_id == body.device_id`.
+/// * TrustAttested / TrustRevoked / MessageSent / ContentPublished /
+///   DisclosureRevoked / GrantOffer* / BadgeIssued / BadgeRevoked /
+///   BadgeDisputed / CredentialDeposited / CredentialRevoked: signer is a
+///   persona → `signer.subject_id == body.<the relevant persona id>`.
+///
+/// RecoveryApproved / RecoveryContested / RecoveryRejected / RecoveryExecuted
+/// use the request's root_id; we allow any subject kind on those branches
+/// and defer to the body-specific checks. Same for RelayShutdownNotice (the
+/// signer may be any device backing the endpoint).
+fn check_signer_subject_coherence(
+    binding: &SignerBinding,
+    body: &EventBody,
+) -> Result<(), ValidationError> {
+    let mismatch = |expected_kind: SubjectKind, expected_id: &str| {
+        ValidationError::new(format!(
+            "signer subject {}:{} does not match body authority {}:{}",
+            binding.signer.kind.as_str(),
+            binding.signer.subject_id,
+            expected_kind.as_str(),
+            expected_id,
+        ))
+    };
+    match body {
+        EventBody::RootCreated(b) => {
+            if binding.signer.kind != SubjectKind::Root
+                || binding.signer.subject_id != b.root_id
+            {
+                return Err(mismatch(SubjectKind::Root, &b.root_id));
+            }
+        }
+        EventBody::RootKeyRotated(b) => {
+            if binding.signer.kind != SubjectKind::Root
+                || binding.signer.subject_id != b.root_id
+            {
+                return Err(mismatch(SubjectKind::Root, &b.root_id));
+            }
+        }
+        EventBody::RootRevoked(b) => {
+            if binding.signer.kind != SubjectKind::Root
+                || binding.signer.subject_id != b.root_id
+            {
+                return Err(mismatch(SubjectKind::Root, &b.root_id));
+            }
+        }
+        EventBody::DeviceAdded(b) => {
+            if binding.signer.kind != SubjectKind::Root
+                || binding.signer.subject_id != b.root_id
+            {
+                return Err(mismatch(SubjectKind::Root, &b.root_id));
+            }
+        }
+        EventBody::PersonaCreated(b) => {
+            if binding.signer.kind != SubjectKind::Root
+                || binding.signer.subject_id != b.root_id
+            {
+                return Err(mismatch(SubjectKind::Root, &b.root_id));
+            }
+        }
+        EventBody::RecoveryPolicyCreated(b) => {
+            if binding.signer.kind != SubjectKind::Root
+                || binding.signer.subject_id != b.root_id
+            {
+                return Err(mismatch(SubjectKind::Root, &b.root_id));
+            }
+        }
+        EventBody::RecoveryRequested(b) => {
+            if binding.signer.kind != SubjectKind::Root
+                || binding.signer.subject_id != b.root_id
+            {
+                return Err(mismatch(SubjectKind::Root, &b.root_id));
+            }
+        }
+        EventBody::GuardianEnrolled(b) => {
+            if binding.signer.kind != SubjectKind::Root
+                || binding.signer.subject_id != b.root_id
+            {
+                return Err(mismatch(SubjectKind::Root, &b.root_id));
+            }
+        }
+        EventBody::DeviceReplaced(b) => {
+            if binding.signer.kind != SubjectKind::Root
+                || binding.signer.subject_id != b.root_id
+            {
+                return Err(mismatch(SubjectKind::Root, &b.root_id));
+            }
+        }
+        EventBody::StorageRelationshipCreated(b) => {
+            if binding.signer.kind != SubjectKind::Root
+                || binding.signer.subject_id != b.root_id
+            {
+                return Err(mismatch(SubjectKind::Root, &b.root_id));
+            }
+        }
+        EventBody::StorageLedgerUpdated(b) => {
+            if binding.signer.kind != SubjectKind::Root
+                || binding.signer.subject_id != b.root_id
+            {
+                return Err(mismatch(SubjectKind::Root, &b.root_id));
+            }
+        }
+        EventBody::StorageManifestPublished(b) => {
+            if binding.signer.kind != SubjectKind::Root
+                || binding.signer.subject_id != b.root_id
+            {
+                return Err(mismatch(SubjectKind::Root, &b.root_id));
+            }
+        }
+        // Events where the signer is a persona: the binding subject must be
+        // the relevant persona id from the body.
+        EventBody::TrustAttested(b) => {
+            if binding.signer.kind != SubjectKind::Persona
+                || binding.signer.subject_id != b.attester_persona_id
+            {
+                return Err(mismatch(SubjectKind::Persona, &b.attester_persona_id));
+            }
+        }
+        EventBody::TrustRevoked(b) => {
+            if binding.signer.kind != SubjectKind::Persona
+                || binding.signer.subject_id != b.attester_persona_id
+            {
+                return Err(mismatch(SubjectKind::Persona, &b.attester_persona_id));
+            }
+        }
+        EventBody::MessageSent(b) => {
+            if binding.signer.kind != SubjectKind::Persona
+                || binding.signer.subject_id != b.sender_persona_id
+            {
+                return Err(mismatch(SubjectKind::Persona, &b.sender_persona_id));
+            }
+        }
+        EventBody::ContentPublished(b) => {
+            if binding.signer.kind != SubjectKind::Persona
+                || binding.signer.subject_id != b.author_persona_id
+            {
+                return Err(mismatch(SubjectKind::Persona, &b.author_persona_id));
+            }
+        }
+        EventBody::DisclosureRevoked(b) => {
+            if binding.signer.kind != SubjectKind::Persona
+                || binding.signer.subject_id != b.revoker_persona_id
+            {
+                return Err(mismatch(SubjectKind::Persona, &b.revoker_persona_id));
+            }
+        }
+        EventBody::GrantOfferCreated(b) => {
+            if binding.signer.kind != SubjectKind::Persona
+                || binding.signer.subject_id != b.issuer_persona_id
+            {
+                return Err(mismatch(SubjectKind::Persona, &b.issuer_persona_id));
+            }
+        }
+        EventBody::GrantOfferClaimed(b) => {
+            if binding.signer.kind != SubjectKind::Persona
+                || binding.signer.subject_id != b.recipient_persona_id
+            {
+                return Err(mismatch(SubjectKind::Persona, &b.recipient_persona_id));
+            }
+        }
+        EventBody::GrantOfferRevoked(b) => {
+            if binding.signer.kind != SubjectKind::Persona
+                || binding.signer.subject_id != b.issuer_persona_id
+            {
+                return Err(mismatch(SubjectKind::Persona, &b.issuer_persona_id));
+            }
+        }
+        EventBody::BadgeIssued(b) => {
+            if binding.signer.kind != SubjectKind::Persona
+                || binding.signer.subject_id != b.issuer_persona_id
+            {
+                return Err(mismatch(SubjectKind::Persona, &b.issuer_persona_id));
+            }
+        }
+        EventBody::BadgeRevoked(b) => {
+            if binding.signer.kind != SubjectKind::Persona
+                || binding.signer.subject_id != b.revoker_persona_id
+            {
+                return Err(mismatch(SubjectKind::Persona, &b.revoker_persona_id));
+            }
+        }
+        EventBody::BadgeDisputed(b) => {
+            if binding.signer.kind != SubjectKind::Persona
+                || binding.signer.subject_id != b.disputer_persona_id
+            {
+                return Err(mismatch(SubjectKind::Persona, &b.disputer_persona_id));
+            }
+        }
+        EventBody::CredentialDeposited(b) => {
+            if binding.signer.kind != SubjectKind::Persona
+                || binding.signer.subject_id != b.issuer_id
+            {
+                return Err(mismatch(SubjectKind::Persona, &b.issuer_id));
+            }
+        }
+        EventBody::CredentialRevoked(b) => {
+            if binding.signer.kind != SubjectKind::Persona
+                || binding.signer.subject_id != b.revoker_id
+            {
+                return Err(mismatch(SubjectKind::Persona, &b.revoker_id));
+            }
+        }
+        // Device-as-signer events: the binding subject must be the
+        // relevant device id.
+        EventBody::DeviceKeyRotated(b) => {
+            if binding.signer.kind != SubjectKind::Device
+                || binding.signer.subject_id != b.device_id
+            {
+                return Err(mismatch(SubjectKind::Device, &b.device_id));
+            }
+        }
+        EventBody::DeviceEncryptionKeyRotated(b) => {
+            if binding.signer.kind != SubjectKind::Device
+                || binding.signer.subject_id != b.device_id
+            {
+                return Err(mismatch(SubjectKind::Device, &b.device_id));
+            }
+        }
+        EventBody::RelayHintUpdated(b) => {
+            if binding.signer.kind != SubjectKind::Device
+                || binding.signer.subject_id != b.device_id
+            {
+                return Err(mismatch(SubjectKind::Device, &b.device_id));
+            }
+        }
+        EventBody::EndpointRotated(b) => {
+            if binding.signer.kind != SubjectKind::Device
+                || binding.signer.subject_id != b.device_id
+            {
+                return Err(mismatch(SubjectKind::Device, &b.device_id));
+            }
+        }
+        // Device-revoke / freeze / persona-revoke may be signed by either the
+        // root OR the subject device/persona — we accept either and let the
+        // per-branch authorize check enforce the rest.
+        EventBody::DeviceRevoked(b) => {
+            let matches_root = binding.signer.kind == SubjectKind::Root
+                && binding.signer.subject_id == b.root_id;
+            let matches_device = binding.signer.kind == SubjectKind::Device
+                && binding.signer.subject_id == b.device_id;
+            if !matches_root && !matches_device {
+                return Err(mismatch(SubjectKind::Device, &b.device_id));
+            }
+        }
+        EventBody::DeviceFrozen(b) => {
+            let matches_root = binding.signer.kind == SubjectKind::Root
+                && binding.signer.subject_id == b.root_id;
+            let matches_device = binding.signer.kind == SubjectKind::Device
+                && binding.signer.subject_id == b.device_id;
+            if !matches_root && !matches_device {
+                return Err(mismatch(SubjectKind::Device, &b.device_id));
+            }
+        }
+        EventBody::PersonaRevoked(b) => {
+            let matches_root = binding.signer.kind == SubjectKind::Root
+                && binding.signer.subject_id == b.root_id;
+            let matches_persona = binding.signer.kind == SubjectKind::Persona
+                && binding.signer.subject_id == b.persona_id;
+            if !matches_root && !matches_persona {
+                return Err(mismatch(SubjectKind::Persona, &b.persona_id));
+            }
+        }
+        EventBody::PersonaKeyRotated(b) => {
+            if binding.signer.kind != SubjectKind::Persona
+                || binding.signer.subject_id != b.persona_id
+            {
+                return Err(mismatch(SubjectKind::Persona, &b.persona_id));
+            }
+        }
+        // GuardianKeyRotated: root OR guardian may sign; skip subject binding
+        // check — the per-branch authorize is the authority.
+        EventBody::GuardianKeyRotated(_) => {}
+        // Recovery lifecycle events whose subject authority depends on the
+        // request state — skipped here and enforced by the per-branch code.
+        EventBody::RecoveryApproved(_)
+        | EventBody::RecoveryContested(_)
+        | EventBody::RecoveryRejected(_)
+        | EventBody::RecoveryExecuted(_) => {}
+        // RelayShutdownNotice: signer is the relay device — per-branch
+        // enforcement already checks the endpoint binding.
+        EventBody::RelayShutdownNotice(_) => {}
+        // LegacyOpaque carries an arbitrary declared type; skip.
+        EventBody::LegacyOpaque { .. } => {}
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -665,7 +1147,7 @@ mod tests {
             }),
             SignerBinding::root("root-a", "key-root-a"),
         );
-        let result = auth.authorize(&event, &state, 0);
+        let result = auth.authorize_raw(&event, &state, 0);
         assert!(result.is_err(), "cross-root device revoke must fail");
         assert!(
             result.unwrap_err().to_string().contains("belongs to root"),
@@ -757,7 +1239,7 @@ mod tests {
             }),
             SignerBinding::root("root-a", "key-root-a"),
         );
-        let result = auth.authorize(&event, &state, 0);
+        let result = auth.authorize_raw(&event, &state, 0);
         assert!(result.is_err(), "revoked root must not add devices");
         assert!(result.unwrap_err().to_string().contains("revoked"));
     }
@@ -873,7 +1355,7 @@ mod tests {
         let state = state_with_pending_offer(500); // expires_at = 500
         let auth = IdentityAuthorizer;
         let event = make_claim_event("offer-1", "persona-b", "key-persona-b");
-        let result = auth.authorize(&event, &state, 1000); // now = 1000 > 500
+        let result = auth.authorize_raw(&event, &state, 1000); // now = 1000 > 500
         assert!(result.is_err(), "claim on expired offer must fail");
         assert!(
             result.unwrap_err().to_string().contains("expired"),
@@ -891,7 +1373,7 @@ mod tests {
             .status = GrantOfferStatus::Claimed;
         let auth = IdentityAuthorizer;
         let event = make_claim_event("offer-1", "persona-b", "key-persona-b");
-        let result = auth.authorize(&event, &state, 100);
+        let result = auth.authorize_raw(&event, &state, 100);
         assert!(result.is_err(), "claim on already-claimed offer must fail");
         assert!(
             result.unwrap_err().to_string().contains("Pending"),
@@ -949,7 +1431,7 @@ mod tests {
         let auth = IdentityAuthorizer;
         // persona-b tries to revoke an offer issued by persona-a
         let event = make_revoke_offer_event("offer-1", "persona-b", "key-persona-b", "theft");
-        let result = auth.authorize(&event, &state, 100);
+        let result = auth.authorize_raw(&event, &state, 100);
         assert!(result.is_err(), "non-issuer offer revoke must fail");
         assert!(
             result.unwrap_err().to_string().contains("does not match original issuer"),
@@ -1013,7 +1495,7 @@ mod tests {
         let auth = IdentityAuthorizer;
         // persona-b (recipient) tries to revoke a badge issued by persona-a
         let event = make_revoke_badge_event("badge-1", "persona-b", "key-persona-b");
-        let result = auth.authorize(&event, &state, 0);
+        let result = auth.authorize_raw(&event, &state, 0);
         assert!(result.is_err(), "non-issuer badge revoke must fail");
         assert!(
             result.unwrap_err().to_string().contains("does not match original issuer"),
@@ -1151,7 +1633,7 @@ mod tests {
             "forged envelope must be signature-valid for the authorization check to be meaningful",
         );
         let err = auth
-            .authorize(&event, &state, 0)
+            .authorize_raw(&event, &state, 0)
             .expect_err("authorize must reject envelope whose signer pubkey ≠ stored active key");
         assert!(
             err.to_string().contains("public key"),
@@ -1181,7 +1663,7 @@ mod tests {
             &event.signed_bytes(),
             &event.signature,
         ));
-        let err = auth.authorize(&event, &state, 0).expect_err(
+        let err = auth.authorize_raw(&event, &state, 0).expect_err(
             "authorize must reject persona envelope whose signer pubkey ≠ stored active key",
         );
         assert!(
@@ -1216,7 +1698,7 @@ mod tests {
             &event.signed_bytes(),
             &event.signature,
         ));
-        let err = auth.authorize(&event, &state, 0).expect_err(
+        let err = auth.authorize_raw(&event, &state, 0).expect_err(
             "authorize must reject device envelope whose signer pubkey ≠ stored active key",
         );
         assert!(
@@ -1274,7 +1756,7 @@ mod tests {
             &event.signed_bytes(),
             &event.signature,
         ));
-        let err = auth.authorize(&event, &state, 0).expect_err(
+        let err = auth.authorize_raw(&event, &state, 0).expect_err(
             "authorize must reject guardian envelope whose signer pubkey ≠ enrolled guardian key",
         );
         assert!(
@@ -1302,7 +1784,7 @@ mod tests {
             SignerBinding::root("root-a", "key-root-a"),
         );
         let err = auth
-            .authorize(&event, &state, 0)
+            .authorize_raw(&event, &state, 0)
             .expect_err("cross-root device replace must fail");
         assert!(
             err.to_string().contains("belongs to root"),
@@ -1340,7 +1822,7 @@ mod tests {
             SignerBinding::root("root-a", "key-root-a"),
         );
         let err = auth
-            .authorize(&event, &state, 0)
+            .authorize_raw(&event, &state, 0)
             .expect_err("naming cross-root replacement must fail");
         assert!(
             err.to_string().contains("belongs to root"),
@@ -1431,7 +1913,7 @@ mod tests {
             }),
             SignerBinding::persona("persona-a", "key-persona-a"),
         );
-        let err = auth.authorize(&event, &state, 100).expect_err(
+        let err = auth.authorize_raw(&event, &state, 100).expect_err(
             "credential revoke must reject cross-issuer grant_id collision (defense in depth)",
         );
         assert!(
@@ -1440,4 +1922,659 @@ mod tests {
         );
     }
 
+    // ── .1a M-5: DeviceKeyRotated / DeviceEncryptionKeyRotated body.root_id
+    // must match the device's stored root_id (audit-trail consistency). ──
+
+    #[test]
+    fn device_key_rotated_root_id_mismatch_rejected() {
+        // device-a is owned by root-a, but the body claims root_id=root-b.
+        // Signed by device-a's current key (so authorize_device_key would pass)
+        // — we rely on the new require_device_owned_by_root assertion to reject
+        // the mismatched body.root_id.
+        let state = two_root_state();
+        let auth = IdentityAuthorizer;
+        let event = make_event(
+            "evt-device-key-rotate-mismatch",
+            EventBody::DeviceKeyRotated(core_types::DeviceKeyRotatedEvent {
+                root_id: "root-b".into(),
+                device_id: "device-a".into(),
+                previous_key_id: "key-device-a".into(),
+                new_key: make_key("key-device-a-v2"),
+            }),
+            SignerBinding::device("device-a", "key-device-a"),
+        );
+        let err = auth
+            .authorize_raw(&event, &state, 0)
+            .expect_err("DeviceKeyRotated must reject mismatched body.root_id");
+        assert!(
+            err.to_string().contains("belongs to root"),
+            "error should mention ownership mismatch: {err}"
+        );
+    }
+
+    #[test]
+    fn device_encryption_key_rotated_root_id_mismatch_rejected() {
+        let state = two_root_state();
+        let auth = IdentityAuthorizer;
+        let event = make_event(
+            "evt-device-enc-rotate-mismatch",
+            EventBody::DeviceEncryptionKeyRotated(core_types::DeviceEncryptionKeyRotatedEvent {
+                root_id: "root-b".into(),
+                device_id: "device-a".into(),
+                previous_encryption_key_id: "enc-device-a".into(),
+                new_encryption_key: make_enc_key("device-a-v2"),
+            }),
+            SignerBinding::device("device-a", "key-device-a"),
+        );
+        let err = auth.authorize_raw(&event, &state, 0).expect_err(
+            "DeviceEncryptionKeyRotated must reject mismatched body.root_id",
+        );
+        assert!(
+            err.to_string().contains("belongs to root"),
+            "error should mention ownership mismatch: {err}"
+        );
+    }
+
+    #[test]
+    fn device_key_rotated_matching_root_id_allowed() {
+        // Happy path: body.root_id matches device.root_id → accepted.
+        let state = two_root_state();
+        let auth = IdentityAuthorizer;
+        let event = make_event(
+            "evt-device-key-rotate-ok",
+            EventBody::DeviceKeyRotated(core_types::DeviceKeyRotatedEvent {
+                root_id: "root-a".into(),
+                device_id: "device-a".into(),
+                previous_key_id: "key-device-a".into(),
+                new_key: make_key("key-device-a-v2"),
+            }),
+            SignerBinding::device("device-a", "key-device-a"),
+        );
+        assert!(
+            auth.authorize(&event, &state, 0).is_ok(),
+            "matching body.root_id should be accepted",
+        );
+    }
+
+    // ── .1a M-3: RelayShutdownNotice must match the known endpoint device ──
+
+    fn state_with_relay_endpoint() -> MaterializedState {
+        let mut state = two_root_state();
+        state.endpoints_current.insert(
+            "peer-relay".into(),
+            core_types::EndpointDescriptor {
+                peer_id: "peer-relay".into(),
+                device_id: "device-a".into(),
+                transport_hint: "wss://relay.example".into(),
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn relay_shutdown_notice_wrong_device_rejected() {
+        // An endpoint is registered for peer-relay → device-a. But device-b
+        // signs the notice for the same peer. Must be rejected.
+        let state = state_with_relay_endpoint();
+        let auth = IdentityAuthorizer;
+        let event = make_event(
+            "evt-relay-shutdown",
+            EventBody::RelayShutdownNotice(core_types::RelayShutdownNoticeEvent {
+                relay_peer_id: "peer-relay".into(),
+                reason: "attacker".into(),
+                deadline_epoch: 9999,
+            }),
+            SignerBinding::device("device-b", "key-device-b"),
+        );
+        let err = auth.authorize_raw(&event, &state, 0).expect_err(
+            "shutdown notice from non-endpoint device must be rejected",
+        );
+        assert!(
+            err.to_string().contains("endpoint device"),
+            "error should mention endpoint device mismatch: {err}"
+        );
+    }
+
+    #[test]
+    fn relay_shutdown_notice_correct_device_allowed() {
+        // The endpoint device signs → accepted.
+        let state = state_with_relay_endpoint();
+        let auth = IdentityAuthorizer;
+        let event = make_event(
+            "evt-relay-shutdown-ok",
+            EventBody::RelayShutdownNotice(core_types::RelayShutdownNoticeEvent {
+                relay_peer_id: "peer-relay".into(),
+                reason: "maintenance".into(),
+                deadline_epoch: 9999,
+            }),
+            SignerBinding::device("device-a", "key-device-a"),
+        );
+        assert!(
+            auth.authorize(&event, &state, 0).is_ok(),
+            "shutdown notice from correct endpoint device must be accepted",
+        );
+    }
+
+    #[test]
+    fn relay_shutdown_notice_unknown_endpoint_passes_through() {
+        // No endpoint registered for peer-unknown → authorize defers to
+        // consumer layer. This is the documented pass-through.
+        let state = two_root_state();
+        let auth = IdentityAuthorizer;
+        let event = make_event(
+            "evt-relay-shutdown-unknown",
+            EventBody::RelayShutdownNotice(core_types::RelayShutdownNoticeEvent {
+                relay_peer_id: "peer-unknown".into(),
+                reason: "no endpoint on file".into(),
+                deadline_epoch: 9999,
+            }),
+            SignerBinding::device("device-a", "key-device-a"),
+        );
+        assert!(
+            auth.authorize(&event, &state, 0).is_ok(),
+            "shutdown notice for unknown endpoint must pass through",
+        );
+    }
+
+    // ── .1a M-4: RootCreated key-material collision rejected ──
+
+    #[test]
+    fn root_created_with_colliding_pubkey_rejected() {
+        // state has root-a with key-root-a. A second RootCreated for root-c
+        // that reuses root-a's pubkey must be rejected.
+        let state = two_root_state();
+        let auth = IdentityAuthorizer;
+        let existing_pubkey_material = state
+            .roots_current
+            .get("root-a")
+            .unwrap()
+            .active_key
+            .clone();
+        let event = make_event(
+            "evt-collide-root",
+            EventBody::RootCreated(core_types::RootCreatedEvent {
+                root_id: "root-c".into(),
+                display_name: "Colliding".into(),
+                initial_key: core_types::PublicKeyMaterial {
+                    key_id: "key-root-c".into(),
+                    algorithm: core_types::KeyAlgorithm::Ed25519,
+                    // Reuse root-a's public key material.
+                    public_key: existing_pubkey_material.public_key.clone(),
+                },
+            }),
+            SignerBinding::root("root-c", "key-root-c"),
+        );
+        let err = auth.authorize_raw(&event, &state, 0).expect_err(
+            "RootCreated with colliding pubkey material must be rejected",
+        );
+        assert!(
+            err.to_string().contains("collides with existing root"),
+            "error should mention collision: {err}"
+        );
+    }
+
+    #[test]
+    fn root_created_with_fresh_pubkey_allowed() {
+        let state = two_root_state();
+        let auth = IdentityAuthorizer;
+        let event = make_event(
+            "evt-fresh-root",
+            EventBody::RootCreated(core_types::RootCreatedEvent {
+                root_id: "root-c".into(),
+                display_name: "Fresh".into(),
+                initial_key: make_key("key-root-c-fresh"),
+            }),
+            SignerBinding::root("root-c", "key-root-c-fresh"),
+        );
+        assert!(
+            auth.authorize(&event, &state, 0).is_ok(),
+            "RootCreated with fresh pubkey must be accepted",
+        );
+    }
+
+    // ── .1a L-2: TrustRevoked on unknown attestation passes through (documented) ──
+
+    #[test]
+    fn trust_revoked_on_unknown_attestation_passes_through() {
+        // Document the pass-through: a persona revokes an attestation that
+        // does not exist in local state. Accepted — materialize will no-op.
+        // The DoS risk is bounded by the attacker having to sign with an
+        // active persona key.
+        let state = two_root_state();
+        let auth = IdentityAuthorizer;
+        let event = make_event(
+            "evt-trust-revoked-unknown",
+            EventBody::TrustRevoked(core_types::TrustRevokedEvent {
+                attestation_id: "does-not-exist".into(),
+                attester_persona_id: "persona-a".into(),
+            }),
+            SignerBinding::persona("persona-a", "key-persona-a"),
+        );
+        assert!(
+            auth.authorize(&event, &state, 0).is_ok(),
+            "unknown-attestation TrustRevoked must pass through",
+        );
+    }
+
+    // ── .1a L-3: DisclosureRevoked authorize layer (documented pass-through) ──
+
+    #[test]
+    fn disclosure_revoked_authorize_layer_allows_revoker_persona() {
+        // Authorize layer accepts DisclosureRevoked when the signer is an
+        // active persona that matches `body.revoker_persona_id`. Cross-check
+        // against the original issuer is deferred to the disclosure module
+        // because the eventlog does not materialize disclosure artifacts.
+        let state = two_root_state();
+        let auth = IdentityAuthorizer;
+        let event = make_event(
+            "evt-disclosure-revoked",
+            EventBody::DisclosureRevoked(core_types::DisclosureRevokedEvent {
+                revocation_id: "rev-1".into(),
+                artifact_id: "artifact-1".into(),
+                revoker_persona_id: "persona-a".into(),
+                reason: "test".into(),
+            }),
+            SignerBinding::persona("persona-a", "key-persona-a"),
+        );
+        assert!(
+            auth.authorize(&event, &state, 0).is_ok(),
+            "DisclosureRevoked by active persona must be accepted at authorize layer",
+        );
+    }
+
+    #[test]
+    fn disclosure_revoked_by_non_persona_signer_rejected() {
+        // A root-role signer that still names `revoker_persona_id` in the body
+        // must fail the coherence check (I-1) and / or the persona-key check.
+        let state = two_root_state();
+        let auth = IdentityAuthorizer;
+        let event = make_event(
+            "evt-disclosure-revoked-wrong-role",
+            EventBody::DisclosureRevoked(core_types::DisclosureRevokedEvent {
+                revocation_id: "rev-1".into(),
+                artifact_id: "artifact-1".into(),
+                revoker_persona_id: "persona-a".into(),
+                reason: "test".into(),
+            }),
+            SignerBinding::root("root-a", "key-root-a"),
+        );
+        assert!(
+            auth.authorize(&event, &state, 0).is_err(),
+            "DisclosureRevoked signed by wrong role must be rejected",
+        );
+    }
+
+    // ── .1a I-1: signer subject coherence ──
+
+    #[test]
+    fn signer_subject_mismatch_rejected() {
+        // Body says persona-a sent the message, but signer_binding claims the
+        // signer is persona-b. Even if persona-b's key would technically verify
+        // the payload, the coherence check fails first — auditors should not
+        // see "persona-b signed persona-a's message".
+        let state = two_root_state();
+        let auth = IdentityAuthorizer;
+        let event = make_event(
+            "evt-signer-mismatch",
+            EventBody::MessageSent(core_types::MessageSentEvent {
+                message_id: "msg-1".into(),
+                sender_persona_id: "persona-a".into(),
+                recipient_persona_id: "persona-b".into(),
+                ciphertext_hex: "00".into(),
+            }),
+            SignerBinding::persona("persona-b", "key-persona-b"),
+        );
+        let err = auth
+            .authorize(&event, &state, 0)
+            .expect_err("mismatched signer subject must be rejected");
+        assert!(
+            err.to_string().contains("signer subject"),
+            "error should mention signer-subject mismatch: {err}"
+        );
+    }
+
+    #[test]
+    fn signer_wrong_kind_rejected() {
+        // Body is a DeviceKeyRotated (device-as-signer), but signer_binding
+        // is a root. Coherence check must reject.
+        let state = two_root_state();
+        let auth = IdentityAuthorizer;
+        let event = make_event(
+            "evt-signer-wrong-kind",
+            EventBody::DeviceKeyRotated(core_types::DeviceKeyRotatedEvent {
+                root_id: "root-a".into(),
+                device_id: "device-a".into(),
+                previous_key_id: "key-device-a".into(),
+                new_key: make_key("key-device-a-v2"),
+            }),
+            SignerBinding::root("root-a", "key-root-a"),
+        );
+        let err = auth
+            .authorize(&event, &state, 0)
+            .expect_err("wrong signer kind must be rejected");
+        assert!(
+            err.to_string().contains("signer subject"),
+            "error should mention signer-subject mismatch: {err}"
+        );
+    }
+
+    // ── .1a I-2: check_time_window helper semantics ──
+
+    #[test]
+    fn check_time_window_not_before_blocks() {
+        // cooldown semantics: now < not_before → error.
+        let err = check_time_window(
+            50,
+            Some(100),
+            None,
+            "before-window",
+            "after-window",
+        )
+        .expect_err("now < not_before must error");
+        assert!(err.to_string().contains("before-window"));
+    }
+
+    #[test]
+    fn check_time_window_not_before_at_boundary_allows() {
+        // cooldown semantics: now >= not_before → ok.
+        assert!(
+            check_time_window(100, Some(100), None, "x", "y").is_ok(),
+            "now == not_before must succeed",
+        );
+    }
+
+    #[test]
+    fn check_time_window_not_after_blocks() {
+        // expiry semantics: now >= not_after → error.
+        let err = check_time_window(
+            200,
+            None,
+            Some(200),
+            "before-window",
+            "after-window",
+        )
+        .expect_err("now >= not_after must error");
+        assert!(err.to_string().contains("after-window"));
+    }
+
+    #[test]
+    fn check_time_window_strictly_before_not_after_allows() {
+        assert!(
+            check_time_window(199, None, Some(200), "x", "y").is_ok(),
+            "now < not_after must succeed",
+        );
+    }
+
+    // ── .1a L-1: sanitize_authorize_error collapses state-revealing errors ──
+
+    #[test]
+    fn sanitize_collapses_not_found() {
+        let err = ValidationError::not_found("device", "device-a");
+        let sanitized = super::sanitize_authorize_error(err);
+        assert_eq!(
+            sanitized.kind,
+            core_types::ValidationErrorKind::Unauthorized
+        );
+        assert!(!sanitized.message.contains("device-a"));
+        assert!(!sanitized.message.contains("unknown"));
+        assert!(sanitized.message.contains("unauthorized"));
+    }
+
+    #[test]
+    fn sanitize_collapses_state_violation() {
+        let err =
+            ValidationError::state_violation("device device-a is not active");
+        let sanitized = super::sanitize_authorize_error(err);
+        assert_eq!(
+            sanitized.kind,
+            core_types::ValidationErrorKind::Unauthorized
+        );
+        assert!(!sanitized.message.contains("device-a"));
+        assert!(!sanitized.message.contains("not active"));
+    }
+
+    #[test]
+    fn sanitize_collapses_unauthorized_detail() {
+        let err =
+            ValidationError::unauthorized("signer key foo does not match active device key");
+        let sanitized = super::sanitize_authorize_error(err);
+        assert!(!sanitized.message.contains("signer key"));
+        assert_eq!(
+            sanitized.kind,
+            core_types::ValidationErrorKind::Unauthorized
+        );
+    }
+
+    #[test]
+    fn sanitize_preserves_non_authorize_kinds() {
+        // InvalidFormat errors originate from body-level validation and are
+        // not state-revealing; leave them alone.
+        let err = ValidationError::invalid_format("bad hex");
+        let sanitized = super::sanitize_authorize_error(err.clone());
+        assert_eq!(sanitized, err);
+    }
+
+    #[test]
+    fn check_time_window_both_bounds() {
+        // now inside (not_before, not_after) window → ok.
+        assert!(check_time_window(150, Some(100), Some(200), "x", "y").is_ok());
+        // now before not_before → before_msg.
+        assert!(
+            check_time_window(50, Some(100), Some(200), "before", "after")
+                .unwrap_err()
+                .to_string()
+                .contains("before")
+        );
+        // now at or after not_after → after_msg.
+        assert!(
+            check_time_window(200, Some(100), Some(200), "before", "after")
+                .unwrap_err()
+                .to_string()
+                .contains("after")
+        );
+    }
+
+    // ── .1a L-1: authorize sanitizes, authorize_raw returns raw errors ──
+
+    #[test]
+    fn authorize_sanitizes_not_found_to_generic_unauthorized() {
+        // An event signed by a non-existent root causes a NotFound error
+        // internally. The public `authorize` must return a generic Unauthorized
+        // rather than revealing "root X does not exist".
+        let state = two_root_state();
+        let auth = IdentityAuthorizer;
+        let event = make_event(
+            "evt-unknown-root",
+            EventBody::RootRevoked(core_types::RootRevokedEvent {
+                root_id: "root-nonexistent".into(),
+                reason: "test".into(),
+            }),
+            SignerBinding::root("root-nonexistent", "key-root-nonexistent"),
+        );
+        // authorize_raw returns the precise error.
+        let raw_err = auth
+            .authorize_raw(&event, &state, 0)
+            .expect_err("unknown root must fail");
+        assert_eq!(raw_err.kind, core_types::ValidationErrorKind::NotFound);
+        assert!(raw_err.to_string().contains("root"));
+
+        // authorize returns the sanitized generic message.
+        let sanitized_err = auth
+            .authorize(&event, &state, 0)
+            .expect_err("authorize must also reject");
+        assert_eq!(
+            sanitized_err.kind,
+            core_types::ValidationErrorKind::Unauthorized
+        );
+        assert!(sanitized_err.to_string().contains("unauthorized"));
+        assert!(!sanitized_err.to_string().contains("root-nonexistent"));
+    }
+
+    #[test]
+    fn authorize_sanitizes_state_violation_to_generic_unauthorized() {
+        // A revoked root causes a StateViolation error internally. The public
+        // `authorize` must return a generic Unauthorized.
+        let mut state = two_root_state();
+        state.roots_current.get_mut("root-a").unwrap().status = RootStatus::Revoked;
+        let auth = IdentityAuthorizer;
+        let event = make_event(
+            "evt-revoked-root",
+            EventBody::PersonaCreated(core_types::PersonaCreatedEvent {
+                root_id: "root-a".into(),
+                persona_id: "persona-new".into(),
+                label: "New".into(),
+                disclosure_profile: None,
+                survival_mode: SurvivalMode::Strict,
+                initial_key: make_key("key-new"),
+            }),
+            SignerBinding::root("root-a", "key-root-a"),
+        );
+        // Raw error is a StateViolation with "revoked" in the message.
+        let raw_err = auth
+            .authorize_raw(&event, &state, 0)
+            .expect_err("revoked root must fail");
+        assert_eq!(
+            raw_err.kind,
+            core_types::ValidationErrorKind::StateViolation
+        );
+        assert!(raw_err.to_string().contains("revoked"));
+
+        // Public authorize returns a sanitized Unauthorized.
+        let sanitized_err = auth
+            .authorize(&event, &state, 0)
+            .expect_err("authorize must also reject");
+        assert_eq!(
+            sanitized_err.kind,
+            core_types::ValidationErrorKind::Unauthorized
+        );
+        assert!(!sanitized_err.to_string().contains("revoked"));
+    }
+
+    #[test]
+    fn authorize_passes_through_ok() {
+        let state = two_root_state();
+        let auth = IdentityAuthorizer;
+        let event = make_event(
+            "evt-ok-root-revoke",
+            EventBody::RootRevoked(core_types::RootRevokedEvent {
+                root_id: "root-a".into(),
+                reason: "self-revoke".into(),
+            }),
+            SignerBinding::root("root-a", "key-root-a"),
+        );
+        assert!(auth.authorize(&event, &state, 0).is_ok(), "Ok is not affected by sanitizer");
+        assert!(auth.authorize_raw(&event, &state, 0).is_ok(), "authorize_raw also passes Ok");
+    }
+
+    #[test]
+    fn authorize_sanitizes_unauthorized_detail_to_generic() {
+        // A forged pubkey causes Unauthorized (specific message). The public
+        // `authorize` must collapse it to the generic message.
+        let state = two_root_state();
+        let auth = IdentityAuthorizer;
+        let attacker = FixtureSigner::new("attacker-sanitize-test");
+        let event = forged_envelope(
+            "evt-sanitize-test",
+            EventBody::RootRevoked(core_types::RootRevokedEvent {
+                root_id: "root-a".into(),
+                reason: "attack".into(),
+            }),
+            "key-root-a",
+            &attacker,
+            KeyRole::Root,
+        );
+        let raw_err = auth
+            .authorize_raw(&event, &state, 0)
+            .expect_err("forged pubkey must fail");
+        assert_eq!(raw_err.kind, core_types::ValidationErrorKind::Unauthorized);
+        assert!(raw_err.to_string().contains("public key"));
+
+        let sanitized_err = auth
+            .authorize(&event, &state, 0)
+            .expect_err("authorize must also reject");
+        assert_eq!(
+            sanitized_err.kind,
+            core_types::ValidationErrorKind::Unauthorized
+        );
+        assert!(!sanitized_err.to_string().contains("public key"));
+        assert!(sanitized_err.to_string().contains("unauthorized"));
+    }
+
+    // ── .1a L-3: DisclosureRevoked revoker == original issuer cross-check ──
+
+    fn state_with_disclosure(artifact_id: &str, issuer_persona_id: &str) -> MaterializedState {
+        let mut state = two_root_state();
+        state.disclosures_current.insert(
+            artifact_id.into(),
+            crate::DisclosureRecord {
+                artifact_id: artifact_id.into(),
+                issuer_persona_id: issuer_persona_id.into(),
+            },
+        );
+        state
+    }
+
+    fn make_disclosure_revoke_event(
+        artifact_id: &str,
+        revoker: &str,
+        key: &str,
+    ) -> core_events::EventEnvelope {
+        make_event(
+            "evt-disclosure-revoke",
+            EventBody::DisclosureRevoked(core_types::DisclosureRevokedEvent {
+                revocation_id: "rev-1".into(),
+                artifact_id: artifact_id.into(),
+                revoker_persona_id: revoker.into(),
+                reason: "test".into(),
+            }),
+            SignerBinding::persona(revoker, key),
+        )
+    }
+
+    #[test]
+    fn disclosure_revoke_by_original_issuer_allowed() {
+        // persona-a issued the disclosure and revokes it — must be accepted.
+        let state = state_with_disclosure("artifact-1", "persona-a");
+        let auth = IdentityAuthorizer;
+        let event = make_disclosure_revoke_event("artifact-1", "persona-a", "key-persona-a");
+        assert!(
+            auth.authorize(&event, &state, 0).is_ok(),
+            "original issuer may revoke their own disclosure"
+        );
+    }
+
+    #[test]
+    fn disclosure_revoke_by_non_issuer_rejected() {
+        // persona-a issued the disclosure; persona-b tries to revoke it — must fail.
+        let state = state_with_disclosure("artifact-1", "persona-a");
+        let auth = IdentityAuthorizer;
+        let event = make_disclosure_revoke_event("artifact-1", "persona-b", "key-persona-b");
+        let err = auth
+            .authorize_raw(&event, &state, 0)
+            .expect_err("non-issuer disclosure revoke must fail");
+        assert_eq!(err.kind, core_types::ValidationErrorKind::Unauthorized);
+        assert!(
+            err.to_string().contains("only the original issuer"),
+            "error should mention original issuer restriction: {err}"
+        );
+        // Public authorize collapses to generic message.
+        let sanitized = auth
+            .authorize(&event, &state, 0)
+            .expect_err("public authorize must also reject");
+        assert_eq!(sanitized.kind, core_types::ValidationErrorKind::Unauthorized);
+        assert!(!sanitized.to_string().contains("only the original issuer"));
+    }
+
+    #[test]
+    fn disclosure_revoke_unknown_artifact_passes_through() {
+        // Disclosure not in local state → pass through (cross-device delivery;
+        // issuer-side replay catches violations).
+        let state = two_root_state();
+        let auth = IdentityAuthorizer;
+        let event = make_disclosure_revoke_event("artifact-unknown", "persona-a", "key-persona-a");
+        assert!(
+            auth.authorize(&event, &state, 0).is_ok(),
+            "unknown artifact must pass through at authorize layer",
+        );
+    }
 }

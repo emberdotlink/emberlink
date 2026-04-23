@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -9,6 +11,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
+use crate::pricing;
 use crate::store::StoreError;
 use crate::vault::VaultError;
 
@@ -41,6 +44,27 @@ pub struct ProxyConfig {
 pub struct ProxyState {
     pub store: crate::store::DaemonStore,
     pub vault: crate::vault::Vault,
+    /// In-memory debounce set for threshold-crossing audit events. Entries
+    /// are `(grant_id, statement_sid, axis, band)` — adding to this set
+    /// before emission guarantees `budget.warning` is never logged twice
+    /// for the same threshold. The set resets on daemon restart, which is
+    /// acceptable: a restarted daemon re-emitting a warning is a
+    /// defensive duplicate, not a missed alert.
+    ///
+    /// The outer `RefCell` is safe because proxy connections run on a
+    /// `LocalSet` (see `run_proxy`) — the single-threaded runtime gives
+    /// us non-Sync interior mutability for free without a Mutex.
+    threshold_emitted: RefCell<HashSet<(String, String, &'static str, &'static str)>>,
+}
+
+impl ProxyState {
+    pub fn new(store: crate::store::DaemonStore, vault: crate::vault::Vault) -> Self {
+        Self {
+            store,
+            vault,
+            threshold_emitted: RefCell::new(HashSet::new()),
+        }
+    }
 }
 
 pub async fn run_proxy(
@@ -123,6 +147,55 @@ pub async fn handle_request(
         Err(e) => return Err(ProxyError::Store(e)),
     };
 
+    // Per-Statement resolution (design). If the composite chain has no
+    // Statement applicable to the request's (action, resource), deny with
+    // `no_applicable_statement` and NEVER fall back to grant-level
+    // enforcement — that is the entire point of the composite-grant shape.
+    let access_grant = match state.store.get_access_grant(&grant.id) {
+        Ok(g) => g,
+        Err(e) => return Err(ProxyError::Store(e)),
+    };
+    // Clone the resolved Statement so we can meter against it post-flight
+    // without re-resolving (the request body is consumed during forward).
+    let resolved_sid: String;
+    let resolved_stmt: core_types::Statement;
+    if let Some((action, resource)) = request_to_action_resource(req.method(), req.uri()) {
+        match resolve_statement_for_request(&access_grant, &action, &resource) {
+            None => {
+                tracing::warn!(
+                    grant_id = %grant.id,
+                    persona_id = %persona_id,
+                    credential = %credential_name,
+                    action = %action,
+                    resource = %resource,
+                    "no applicable statement for request — denying"
+                );
+                let _ = state.store.log_event(
+                    Some(&persona_id),
+                    "credential.access",
+                    Some(&credential_name),
+                    "denied_no_applicable_statement",
+                    Some(&format!("action={action} resource={resource}")),
+                );
+                return Ok(no_applicable_statement_response());
+            }
+            Some((_i, stmt)) => {
+                resolved_sid = stmt.sid.clone();
+                resolved_stmt = stmt.clone();
+            }
+        }
+    } else {
+        // Unknown HTTP method — already a hard deny in check_scope, but
+        // emit the same signal here so the composite path doesn't silently
+        // bypass on e.g. CONNECT.
+        tracing::warn!(
+            grant_id = %grant.id,
+            method = %req.method(),
+            "unsupported method — denying"
+        );
+        return Ok(no_applicable_statement_response());
+    }
+
     // Enforce grant.scope against request method + URI. Fail closed on any
     // unknown or ambiguous scope format. Do NOT leak the scope string to the
     // client — log it internally and return a generic 403.
@@ -179,6 +252,51 @@ pub async fn handle_request(
         }
     }
 
+    // Collect the incoming body up front so the Stream C pre-flight
+    // budget check has something to estimate against. `body_bytes_in` is
+    // then forwarded unchanged.
+    let (parts, incoming_body) = req.into_parts();
+    let body_bytes_in = incoming_body
+        .collect()
+        .await
+        .map_err(ProxyError::Hyper)?
+        .to_bytes();
+
+    // Pre-flight Stream C budget check. When the resolved Statement has a
+    // `budget.tokens` or `budget.cents` set, estimate the call cost and
+    // 429 if it would exceed the remaining allowance. Statements without
+    // a budget (TTL-only, credential grants) pass through unchanged.
+    match preflight_budget_check(&resolved_stmt, body_bytes_in.as_ref()) {
+        PreflightDecision::Allowed => {}
+        PreflightDecision::Rejected { axis, limit, used } => {
+            tracing::warn!(
+                grant_id = %grant.id,
+                statement_sid = %resolved_sid,
+                axis,
+                limit,
+                used,
+                "budget pre-flight rejection"
+            );
+            let _ = state.store.log_event(
+                Some(&persona_id),
+                "proxy.denied_preflight",
+                Some(&credential_name),
+                "budget_exhausted",
+                Some(&format!(
+                    "grant_id={} sid={resolved_sid} axis={axis} limit={limit} used={used}",
+                    grant.id
+                )),
+            );
+            return Ok(budget_exhausted_response(
+                &grant.id,
+                &resolved_sid,
+                axis,
+                limit,
+                used,
+            ));
+        }
+    }
+
     // Decrypt credential from vault
     let credential_bytes = match state.vault.get(&state.store, &credential_name) {
         Ok(b) => b,
@@ -209,14 +327,6 @@ pub async fn handle_request(
 
     let client: Client<_, Full<Bytes>> =
         Client::builder(TokioExecutor::new()).build(https);
-
-    // Collect the incoming body so we can forward it.
-    let (parts, incoming_body) = req.into_parts();
-    let body_bytes_in = incoming_body
-        .collect()
-        .await
-        .map_err(ProxyError::Hyper)?
-        .to_bytes();
 
     // Build the outgoing request to the target URL.
     let mut outgoing = Request::builder()
@@ -258,6 +368,47 @@ pub async fn handle_request(
         .map_err(ProxyError::Hyper)?
         .to_bytes();
 
+    // Stream C post-flight meter. Resolve the upstream host and parse
+    // the response for token + cent usage. If the target isn't an LLM
+    // provider we have pricing for, `meter_response` returns `None` and
+    // we skip the increment — the request still forwards unchanged.
+    let target_host: String = extract_host_from_url(&target_url).unwrap_or_default();
+    if let Some(delta) = meter_response(&target_host, resp_body.as_ref()) {
+        match state
+            .store
+            .increment_statement_usage(&grant.id, &resolved_sid, delta)
+        {
+            Ok(delta) => {
+                if let Some(budget) = &resolved_stmt.budget {
+                    emit_threshold_crossings(
+                        &state,
+                        &grant.id,
+                        &resolved_sid,
+                        &persona_id,
+                        &credential_name,
+                        budget,
+                        &delta.prior,
+                        &delta.current,
+                    );
+                }
+                // After the increment, check whether the grant is now
+                // budget-terminal across all budget-bearing Statements
+                // and flip status to `exhausted_by_budget` if so.
+                let _ = state
+                    .store
+                    .mark_grant_exhausted_by_budget_if_terminal(&grant.id);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    grant_id = %grant.id,
+                    sid = %resolved_sid,
+                    error = ?e,
+                    "failed to increment statement usage (metering skipped)"
+                );
+            }
+        }
+    }
+
     let mut builder = Response::builder().status(status);
     for (name, value) in &resp_headers {
         builder = builder.header(name, value);
@@ -268,6 +419,16 @@ pub async fn handle_request(
         .unwrap())
 }
 
+/// Extract the host from a URL string (e.g. `https://api.anthropic.com/v1`).
+/// Returns `None` if the URL is malformed.
+fn extract_host_from_url(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://")?.1;
+    let end = after_scheme
+        .find(['/', '?', '#', ':'])
+        .unwrap_or(after_scheme.len());
+    Some(after_scheme[..end].to_ascii_lowercase())
+}
+
 /// Reason a request was rejected by scope enforcement.
 ///
 /// Held as a separate type (rather than `String`) so callers can't
@@ -275,6 +436,351 @@ pub async fn handle_request(
 /// sensitive and should only hit `tracing` + the audit table.
 #[derive(Debug)]
 pub(crate) struct ScopeViolation(pub(crate) String);
+
+/// Map an HTTP (method, URI) pair to the composite-grant (action, resource)
+/// tuple used by `Statement.applicable_to`.
+///
+/// Actions are colon-delimited IAM verbs (`github:read`, `github:push`,
+/// `generic:read`, `generic:write`). Resources are the request URI's path,
+/// potentially prefixed with the host when the provider is host-scoped.
+///
+/// This is the authoritative bridge between the legacy method-tier scope
+/// grammar and the composite-grant selector model. New callers (dashboard
+/// streaming, approval flow, standing-grant matcher) share this mapping so
+/// the selector a request is checked against is identical across paths.
+pub(crate) fn request_to_action_resource(
+    method: &hyper::Method,
+    uri: &hyper::Uri,
+) -> Option<(String, String)> {
+    let tier = method_tier(method)?;
+    let host = uri.host().unwrap_or("");
+    let path = uri.path();
+
+    let (provider, action) = if host.ends_with("github.com") || host == "api.github.com" {
+        (
+            "github",
+            match tier {
+                MethodTier::Read => "read",
+                MethodTier::Write => "push",
+            },
+        )
+    } else {
+        (
+            "generic",
+            match tier {
+                MethodTier::Read => "read",
+                MethodTier::Write => "write",
+            },
+        )
+    };
+
+    // Resource string: for github, strip leading "/repos/" so the path matches
+    // a selector like `emberdotlink/ember-daemon`. For generic, the full path
+    // is the resource.
+    let resource = if provider == "github" {
+        let trimmed = path.strip_prefix('/').unwrap_or(path);
+        trimmed.strip_prefix("repos/").unwrap_or(trimmed).to_string()
+    } else {
+        path.to_string()
+    };
+
+    Some((format!("{provider}:{action}"), resource))
+}
+
+/// Resolve the applicable `Statement` for a request (action, resource) pair
+/// against a composite grant chain.
+///
+/// Walks every `(block_index, statement)` pair in chain order and returns
+/// the first whose `applicable_to` predicate holds. When the chain has zero
+/// applicable statements the caller MUST deny with
+/// `no_applicable_statement_response()` — the authorization primitive never
+/// falls back to grant-level enforcement. See design § "Allow-only" and
+/// SESSION-composite-plan.md §Risks.
+///
+/// Matching is tolerant of legacy bare-action forms:
+/// - `"read"` on a Statement matches request action `"github:read"` and
+///   `"generic:read"` (the colon-delimited form is a superset of the bare
+///   form, used by new composite grants; the bare form is carried forward
+///   by `scope_to_actions_and_selector` in grant.rs for legacy scopes).
+/// - `"*"` on a Statement matches any request action.
+///
+/// Resource matching follows `Statement.resource.covers(resource)`. When a
+/// grant's selector is an `Exact` match on the credential name (the fallback
+/// for credential-type grants where `scope` has no `:target` tail) we also
+/// accept the request iff the Statement's action agrees — effectively
+/// treating credential-fallback selectors as `Any` because the request's
+/// resource is a URI, not a credential name.
+pub fn resolve_statement_for_request<'a>(
+    grant: &'a core_types::AccessGrant,
+    action: &str,
+    resource: &str,
+) -> Option<(usize, &'a core_types::Statement)> {
+    use core_types::ResourceSelector;
+
+    // Bare-action tail: `"github:read"` → `"read"`, `"read"` → `"read"`.
+    let bare_action = action.rsplit(':').next().unwrap_or(action);
+
+    grant.statements().find(|(_, stmt)| {
+        let action_ok = stmt.actions.iter().any(|a| {
+            a == action
+                || a == bare_action
+                || a == "*"
+                || {
+                    // Stmt action may be a bare "read"/"push"/"write" while
+                    // the request is "github:read". Accept when the trailing
+                    // verb matches.
+                    let stmt_bare = a.rsplit(':').next().unwrap_or(a);
+                    stmt_bare == bare_action
+                }
+        });
+        if !action_ok {
+            return false;
+        }
+
+        // Legacy credential-fallback: if the selector is an Exact match
+        // on the credential name, the resource match is effectively
+        // Any (because the request URI will never equal a credential
+        // name). This is a transitional compat branch — once every
+        // call site emits fully-qualified selectors, this collapses to
+        // pure Statement.resource.covers() matching.
+        match &stmt.resource {
+            ResourceSelector::Exact { value } if !value.contains('/') && !value.starts_with('/') => {
+                // Heuristic: a bare ident without path separators looks
+                // like a credential name (e.g. "github-token", "api-key").
+                // Treat as Any for HTTP resource matching.
+                true
+            }
+            other => other.covers(resource),
+        }
+    })
+}
+
+/// Outcome of `preflight_budget_check`. `Allowed` → forward upstream;
+/// `Rejected { axis, limit, used }` → 429 with budget-exhausted body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreflightDecision {
+    Allowed,
+    Rejected { axis: &'static str, limit: u64, used: u64 },
+}
+
+/// Pre-flight budget check for a resolved Statement.
+///
+/// Given the Statement the request resolved to and the request body (used
+/// to estimate tokens via `pricing::estimate_call_tokens`), return
+/// `Allowed` when the projected token usage plus current usage fits under
+/// the Statement's budget, or `Rejected` naming the first exhausted axis.
+///
+/// Cents are NOT estimated pre-flight because we don't know the model
+/// pricing without the response (the `model` field in the request body is
+/// advisory; the upstream can substitute). The post-flight meter handles
+/// cents. Token estimation uses the byte-length / 4 heuristic from
+/// `pricing.rs` which biases conservatively — a request that just fits
+/// will pass preflight and the real post-flight math may nudge usage up
+/// against the budget.
+///
+/// Statements without a `budget` (TTL-only) always pass.
+pub fn preflight_budget_check(stmt: &core_types::Statement, request_body: &[u8]) -> PreflightDecision {
+    let Some(budget) = &stmt.budget else {
+        return PreflightDecision::Allowed;
+    };
+    if let Some(cap) = budget.tokens {
+        let estimated = pricing::estimate_call_tokens(request_body);
+        let projected = stmt.usage.tokens.saturating_add(estimated);
+        if projected > cap {
+            return PreflightDecision::Rejected {
+                axis: "tokens",
+                limit: cap,
+                used: stmt.usage.tokens,
+            };
+        }
+    }
+    // Cents preflight: only block when the existing usage ALREADY exceeds
+    // the cents cap (post-flight cents tick can nudge usage over budget
+    // between calls). We don't estimate cents up front — see doc above.
+    if let Some(cap) = budget.cents
+        && stmt.usage.cents >= cap
+    {
+        return PreflightDecision::Rejected {
+            axis: "cents",
+            limit: cap,
+            used: stmt.usage.cents,
+        };
+    }
+    PreflightDecision::Allowed
+}
+
+/// 429 denial body for a budget-exhausted pre-flight. The body names
+/// `axis`, `limit`, and `used` so the agent can back off intelligently
+/// without probing. Emitting a structured shape matches the `Error`
+/// schema used by Stream D receipts; no secret is leaked because the
+/// agent already knows the grant's budget (they've minted/received it).
+pub(crate) fn budget_exhausted_response(
+    grant_id: &str,
+    statement_sid: &str,
+    axis: &str,
+    limit: u64,
+    used: u64,
+) -> Response<Full<Bytes>> {
+    let body = serde_json::json!({
+        "error": "budget_exhausted",
+        "grant_id": grant_id,
+        "statement_sid": statement_sid,
+        "axis": axis,
+        "limit": limit,
+        "used": used,
+    });
+    let bytes = serde_json::to_vec(&body)
+        .unwrap_or_else(|_| b"{\"error\":\"budget_exhausted\"}".to_vec());
+    Response::builder()
+        .status(StatusCode::TOO_MANY_REQUESTS)
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(bytes)))
+        .unwrap()
+}
+
+/// Compute the (token, cents) usage delta from an upstream LLM response
+/// body. Returns `None` if the body isn't a recognizable JSON LLM
+/// response — the caller should skip metering rather than fail the
+/// request (e.g. GitHub + non-LLM providers return here with `None`).
+///
+/// Provider is resolved from the target host (`api.anthropic.com`,
+/// `api.openai.com`); an unknown host returns `None` even if the body
+/// looks like JSON — we only meter providers we have a pricing table
+/// for.
+pub fn meter_response(
+    target_host: &str,
+    response_body: &[u8],
+) -> Option<core_types::Usage> {
+    let provider = pricing::provider_for_host(target_host)?;
+    let parsed = pricing::parse_usage(provider, response_body)?;
+    let model =
+        pricing::extract_model(provider, response_body).unwrap_or_default();
+    let cents = pricing::cents_for(
+        &model,
+        provider,
+        parsed.input_tokens,
+        parsed.output_tokens,
+    );
+    Some(core_types::Usage {
+        tokens: parsed.input_tokens.saturating_add(parsed.output_tokens),
+        cents,
+        requests: 1,
+        workload_hours: 0,
+        wall_clock_secs: 0,
+        last_updated: 0,
+    })
+}
+
+/// Emit threshold-crossing audit events for a metering update.
+///
+/// Looks at (prior, current, budget) on each axis (tokens, cents) and
+/// emits a `budget.warning` at each band (80%, 95%) the update crossed
+/// — never twice for the same (grant, sid, axis, band) in the lifetime
+/// of the daemon process (debounce set on `ProxyState`). When `current`
+/// meets or exceeds `budget`, emits a `budget.exhausted` audit record
+/// (debounced the same way, band = `"100"`).
+///
+/// The caller is responsible for passing the Statement's current
+/// resolved `budget` — this function does no read-back.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_threshold_crossings(
+    state: &ProxyState,
+    grant_id: &str,
+    statement_sid: &str,
+    persona_id: &str,
+    credential_name: &str,
+    budget: &core_types::Budget,
+    prior: &core_types::Usage,
+    current: &core_types::Usage,
+) {
+    let axes: [(&'static str, Option<u64>, u64, u64); 2] = [
+        ("tokens", budget.tokens, prior.tokens, current.tokens),
+        ("cents", budget.cents, prior.cents, current.cents),
+    ];
+    for (axis, cap, before, after) in axes.iter() {
+        let Some(cap) = cap else { continue };
+        if *cap == 0 {
+            continue;
+        }
+        for &(band_label, band_frac) in &[("80", 0.80f64), ("95", 0.95f64)] {
+            let threshold = (*cap as f64 * band_frac) as u64;
+            if *before < threshold && *after >= threshold {
+                emit_debounced(
+                    state,
+                    grant_id,
+                    statement_sid,
+                    axis,
+                    band_label,
+                    persona_id,
+                    credential_name,
+                    "budget.warning",
+                    &format!(
+                        "axis={axis} used={after} limit={cap} percent={band_label}"
+                    ),
+                );
+            }
+        }
+        if *before < *cap && *after >= *cap {
+            emit_debounced(
+                state,
+                grant_id,
+                statement_sid,
+                axis,
+                "100",
+                persona_id,
+                credential_name,
+                "budget.exhausted",
+                &format!("axis={axis} used={after} limit={cap}"),
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_debounced(
+    state: &ProxyState,
+    grant_id: &str,
+    statement_sid: &str,
+    axis: &'static str,
+    band_label: &'static str,
+    persona_id: &str,
+    credential_name: &str,
+    action: &str,
+    details: &str,
+) {
+    let key = (
+        grant_id.to_string(),
+        statement_sid.to_string(),
+        axis,
+        band_label,
+    );
+    if !state.threshold_emitted.borrow_mut().insert(key) {
+        return;
+    }
+    let _ = state.store.log_event(
+        Some(persona_id),
+        action,
+        Some(credential_name),
+        band_label,
+        Some(details),
+    );
+}
+
+/// 403 denial when zero statements match a request. Never names the
+/// statement set — same rationale as `scope_violation_response` (leaking
+/// the selector shape is a probe vector). The cause is logged + audited.
+pub(crate) fn no_applicable_statement_response() -> Response<Full<Bytes>> {
+    let body = serde_json::json!({
+        "error": "no_applicable_statement",
+    });
+    let bytes = serde_json::to_vec(&body)
+        .unwrap_or_else(|_| b"{\"error\":\"no_applicable_statement\"}".to_vec());
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(bytes)))
+        .unwrap()
+}
 
 /// Check a grant's `scope` string against the request method and URI.
 ///
@@ -652,7 +1158,7 @@ mod tests {
     fn make_state() -> Arc<ProxyState> {
         let store = DaemonStore::open_in_memory().unwrap();
         let vault = Vault::new(test_key());
-        Arc::new(ProxyState { store, vault })
+        Arc::new(ProxyState::new(store, vault))
     }
 
     fn proxy_request_with_headers(
@@ -740,6 +1246,40 @@ mod tests {
             Err(e) => return Err(ProxyError::Store(e)),
         };
 
+        // Mirror the production per-Statement resolution check.
+        let access_grant = match state.store.get_access_grant(&grant.id) {
+            Ok(g) => g,
+            Err(e) => return Err(ProxyError::Store(e)),
+        };
+        let resolved_sid: String;
+        let resolved_stmt: core_types::Statement;
+        if let Some((action, resource)) = request_to_action_resource(req.method(), req.uri()) {
+            match resolve_statement_for_request(&access_grant, &action, &resource) {
+                None => {
+                    tracing::warn!(
+                        grant_id = %grant.id,
+                        action = %action,
+                        resource = %resource,
+                        "no applicable statement for request — denying (test harness)"
+                    );
+                    let _ = state.store.log_event(
+                        Some(&persona_id),
+                        "credential.access",
+                        Some(&credential_name),
+                        "denied_no_applicable_statement",
+                        Some(&format!("action={action} resource={resource}")),
+                    );
+                    return Ok(no_applicable_statement_response());
+                }
+                Some((_i, stmt)) => {
+                    resolved_sid = stmt.sid.clone();
+                    resolved_stmt = stmt.clone();
+                }
+            }
+        } else {
+            return Ok(no_applicable_statement_response());
+        }
+
         // Mirror the production scope check so tests exercise it end-to-end.
         if let Err(violation) = check_scope(&grant.scope, req.method(), req.uri()) {
             tracing::warn!(
@@ -794,6 +1334,47 @@ mod tests {
             }
         }
 
+        // Collect request body up front so preflight can estimate tokens.
+        // A test-mode header `X-Ember-Test-Response-Body` lets a test
+        // inject the upstream response body verbatim so the post-flight
+        // metering path can be exercised without a real upstream socket.
+        let test_response_body_hdr = req
+            .headers()
+            .get("x-ember-test-response-body")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        let (_parts, incoming_body) = req.into_parts();
+        let body_bytes_in = incoming_body
+            .collect()
+            .await
+            .map_err(ProxyError::Hyper)?
+            .to_bytes();
+
+        // Pre-flight Stream C budget check (test parity with production).
+        match preflight_budget_check(&resolved_stmt, body_bytes_in.as_ref()) {
+            PreflightDecision::Allowed => {}
+            PreflightDecision::Rejected { axis, limit, used } => {
+                let _ = state.store.log_event(
+                    Some(&persona_id),
+                    "proxy.denied_preflight",
+                    Some(&credential_name),
+                    "budget_exhausted",
+                    Some(&format!(
+                        "grant_id={} sid={resolved_sid} axis={axis} limit={limit} used={used}",
+                        grant.id
+                    )),
+                );
+                return Ok(budget_exhausted_response(
+                    &grant.id,
+                    &resolved_sid,
+                    axis,
+                    limit,
+                    used,
+                ));
+            }
+        }
+
         let credential_bytes = match state.vault.get(&state.store, &credential_name) {
             Ok(b) => b,
             Err(VaultError::NotFound) => {
@@ -812,21 +1393,64 @@ mod tests {
             None,
         );
 
-        let method = req.method().to_string();
-        let body = serde_json::json!({
-            "proxied": true,
-            "target": target_url,
-            "method": method,
-        });
+        // Synthesize an upstream body. If the test injected
+        // `X-Ember-Test-Response-Body`, use that verbatim so the
+        // post-flight meter has something LLM-shaped to parse;
+        // otherwise return the legacy fixture JSON.
+        let method = _parts.method.to_string();
+        let response_body_bytes: Bytes = match test_response_body_hdr {
+            Some(body) => Bytes::from(body),
+            None => {
+                let body = serde_json::json!({
+                    "proxied": true,
+                    "target": target_url,
+                    "method": method,
+                });
+                Bytes::from(serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec()))
+            }
+        };
 
         let _ = credential_value;
 
-        let body_bytes = serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec());
+        // Post-flight meter (test parity with production).
+        let target_host: String = extract_host_from_url(&target_url).unwrap_or_default();
+        if let Some(delta) = meter_response(&target_host, response_body_bytes.as_ref()) {
+            match state
+                .store
+                .increment_statement_usage(&grant.id, &resolved_sid, delta)
+            {
+                Ok(delta) => {
+                    if let Some(budget) = &resolved_stmt.budget {
+                        emit_threshold_crossings(
+                            &state,
+                            &grant.id,
+                            &resolved_sid,
+                            &persona_id,
+                            &credential_name,
+                            budget,
+                            &delta.prior,
+                            &delta.current,
+                        );
+                    }
+                    let _ = state
+                        .store
+                        .mark_grant_exhausted_by_budget_if_terminal(&grant.id);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        grant_id = %grant.id,
+                        sid = %resolved_sid,
+                        error = ?e,
+                        "test harness: failed to increment statement usage"
+                    );
+                }
+            }
+        }
 
         Ok(Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "application/json")
-            .body(Full::new(Bytes::from(body_bytes)))
+            .body(Full::new(response_body_bytes))
             .unwrap())
     }
 
@@ -992,7 +1616,17 @@ mod tests {
 
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["error"], "scope violation");
+        // Per design a POST to a github endpoint under a read-only
+        // statement has zero applicable statements (the statement's
+        // action is "read", the request's action is "github:push"),
+        // so this denies at the composite layer, not the legacy scope
+        // layer. Either denial shape is acceptable as long as the body
+        // never leaks the selector string.
+        let err = json["error"].as_str().unwrap_or("");
+        assert!(
+            err == "no_applicable_statement" || err == "scope violation",
+            "unexpected error shape: {err}"
+        );
         // The response must NOT leak the scope string.
         let body_str = std::str::from_utf8(&body).unwrap();
         assert!(
@@ -1124,9 +1758,11 @@ mod tests {
             .store
             .query_audit(&crate::audit::AuditFilter::default())
             .unwrap();
-        assert!(entries
-            .iter()
-            .any(|e| e.action == "credential.access" && e.outcome == "denied_scope"));
+        // Either the legacy scope-violation denial or the composite
+        // no-applicable-statement denial satisfies the audit requirement.
+        assert!(entries.iter().any(|e| e.action == "credential.access"
+            && (e.outcome == "denied_scope"
+                || e.outcome == "denied_no_applicable_statement")));
     }
 
     #[tokio::test]
@@ -1303,5 +1939,752 @@ mod tests {
             check_scope("github:push:x/y:feat/*", &hyper::Method::POST, &uri).is_ok(),
             "feat/* should match branch feat/bar delivered as %66eat%2Fbar in path"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Per-Statement resolution tests (design / P69K-A2)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn resolve_statement_picks_first_applicable() {
+        use core_types::{
+            AccessGrant, AttestationBinding, Block, GrantMode, GrantStatus,
+            PresentationAudienceKind, RecipientProfile, ResourceSelector, ResourceType,
+            SignedBlock, Statement, Usage,
+        };
+        let stmt_read = Statement {
+            sid: "S0".into(),
+            resource_type: ResourceType::Credential,
+            actions: vec!["read".into()],
+            resource: ResourceSelector::Glob { pattern: "emberdotlink/*".into() },
+            budget: None,
+            usage: Usage::default(),
+            conditions: Vec::new(),
+        };
+        let stmt_push = Statement {
+            sid: "S1".into(),
+            resource_type: ResourceType::Credential,
+            actions: vec!["push".into()],
+            resource: ResourceSelector::Exact { value: "emberdotlink/widgets".into() },
+            budget: None,
+            usage: Usage::default(),
+            conditions: Vec::new(),
+        };
+        let block = Block {
+            statements: vec![stmt_read, stmt_push],
+            nbf: None,
+            expires_at: None,
+            issued_by: "persona-a".into(),
+            issued_at: 0,
+            approval: None,
+            note: None,
+        };
+        let grant = AccessGrant {
+            id: "grant-x".into(),
+            version: 1,
+            issuing_persona_id: "persona-a".into(),
+            recipient_kind: PresentationAudienceKind::Service,
+            recipient_id: "agent".into(),
+            recipient_profile: RecipientProfile::Agent,
+            status: GrantStatus::Active,
+            mode: GrantMode::OneShot,
+            blocks: vec![SignedBlock {
+                block,
+                pubkey_next: "x".into(),
+                signature: "x".into(),
+            }],
+            attestation: AttestationBinding::default(),
+            created_at: 0,
+            updated_at: 0,
+            revoked_at: None,
+            revoked_reason: None,
+            last_used_at: None,
+            label: None,
+        };
+        // github:read matches stmt_read via glob.
+        let hit = resolve_statement_for_request(&grant, "github:read", "emberdotlink/ember");
+        assert!(hit.is_some(), "github:read should match stmt_read");
+        assert_eq!(hit.unwrap().1.sid, "S0");
+        // github:push on the exact resource matches stmt_push.
+        let hit =
+            resolve_statement_for_request(&grant, "github:push", "emberdotlink/widgets");
+        assert!(hit.is_some(), "github:push on widgets should match stmt_push");
+        assert_eq!(hit.unwrap().1.sid, "S1");
+        // github:push to a different repo matches nothing — read glob is
+        // action=read only and push selector is exact.
+        let hit = resolve_statement_for_request(&grant, "github:push", "emberdotlink/other");
+        assert!(hit.is_none(), "other repo with push must have no match");
+    }
+
+    #[tokio::test]
+    async fn per_statement_denies_unmatched_action() {
+        // A read-scoped grant with a path-style selector. POST under
+        // read action produces no applicable statement → deny.
+        let state = make_state();
+        let persona = state.store.create_persona("per-stmt-1").unwrap();
+        state.vault.add(&state.store, "tok", b"s", None).unwrap();
+        state
+            .store
+            .create_grant(&persona.id, "tok", "generic:read:/api/foo", None)
+            .unwrap();
+
+        let req = proxy_request_with_method_and_uri(
+            "POST",
+            "https://example.com/api/foo",
+            Some(&persona.id),
+            Some("tok"),
+            Some("https://example.com"),
+        );
+        let resp = call(state, req).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "no_applicable_statement");
+    }
+
+    // ------------------------------------------------------------------
+    // Stream C — per-Statement token + cent metering (P69K-C)
+    // ------------------------------------------------------------------
+
+    use core_types::{Budget, ResourceSelector, ResourceType, Statement, Usage};
+
+    /// Build a grant whose composite chain carries caller-supplied
+    /// Statements. Uses `create_grant` to insert the row, then
+    /// `overwrite_grant_blocks` to replace the shim chain with the
+    /// real multi-Statement envelope.
+    fn seed_composite_grant(
+        state: &ProxyState,
+        persona_id: &str,
+        credential_name: &str,
+        statements: Vec<Statement>,
+    ) -> String {
+        // Issue a stub so the row exists with sensible scope. Scope of
+        // `*` means the grant-level `check_scope` is a no-op; the
+        // per-Statement resolution carries the real shape.
+        let grant = state
+            .store
+            .create_grant(persona_id, credential_name, "*", None)
+            .unwrap();
+        let root = state.store.persona_root_keypair(persona_id).unwrap();
+        let ag = crate::grant::access_grant_from_statements(
+            &grant.id,
+            persona_id,
+            credential_name,
+            statements,
+            0,
+            None,
+            &root,
+        )
+        .unwrap();
+        state.store.overwrite_grant_blocks(&grant.id, &ag).unwrap();
+        grant.id
+    }
+
+    /// Credential statement — matches GitHub pushes under github:push.
+    /// Narrower than `*` so resolver chains don't accidentally shadow
+    /// the Session statement on LLM requests.
+    fn stmt_credential(sid: &str) -> Statement {
+        Statement {
+            sid: sid.into(),
+            resource_type: ResourceType::Credential,
+            actions: vec!["github:push".into(), "github:read".into()],
+            resource: ResourceSelector::Any,
+            budget: None,
+            usage: Usage::default(),
+            conditions: Vec::new(),
+        }
+    }
+
+    /// Session statement with a `tokens` budget. Uses `generic:write` so
+    /// it matches Anthropic POSTs (which have action `generic:write`).
+    fn stmt_session(sid: &str, tokens: u64) -> Statement {
+        Statement {
+            sid: sid.into(),
+            resource_type: ResourceType::Session,
+            actions: vec!["generic:write".into(), "generic:read".into()],
+            resource: ResourceSelector::Any,
+            budget: Some(Budget {
+                tokens: Some(tokens),
+                ..Default::default()
+            }),
+            usage: Usage::default(),
+            conditions: Vec::new(),
+        }
+    }
+
+    fn stmt_time(sid: &str, wall_clock_secs: u64) -> Statement {
+        Statement {
+            sid: sid.into(),
+            resource_type: ResourceType::Time,
+            actions: vec!["generic:write".into(), "generic:read".into()],
+            resource: ResourceSelector::Any,
+            budget: Some(Budget {
+                wall_clock_secs: Some(wall_clock_secs),
+                ..Default::default()
+            }),
+            usage: Usage::default(),
+            conditions: Vec::new(),
+        }
+    }
+
+    /// Anthropic-shaped response body with the given token counts.
+    fn anthropic_body(input_tokens: u64, output_tokens: u64) -> String {
+        serde_json::json!({
+            "id": "msg_test",
+            "model": "claude-opus-4-5",
+            "content": [],
+            "usage": {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+            },
+        })
+        .to_string()
+    }
+
+    /// Build a proxy LLM request with an empty-ish JSON request body that
+    /// declares `max_tokens: 1`, so the preflight estimate is near-zero
+    /// and tests can exercise the post-flight meter without tripping
+    /// preflight rejection (the real preflight logic has its own tests).
+    fn proxy_llm_request(
+        persona: &str,
+        credential: &str,
+        target: &str,
+        response_body: &str,
+    ) -> Request<Full<Bytes>> {
+        let req_body = br#"{"max_tokens": 1}"#.to_vec();
+        Request::builder()
+            .method("POST")
+            .uri("https://api.anthropic.com/v1/messages")
+            .header("X-Ember-Persona", persona)
+            .header("X-Ember-Credential", credential)
+            .header("X-Ember-Target", target)
+            .header("X-Ember-Test-Response-Body", response_body)
+            .body(Full::new(Bytes::from(req_body)))
+            .unwrap()
+    }
+
+    /// Call helper that takes a `Full<Bytes>` body — used for tests that
+    /// need a non-empty request body (preflight, metering).
+    async fn call_full(
+        state: Arc<ProxyState>,
+        req: Request<Full<Bytes>>,
+    ) -> Response<Full<Bytes>> {
+        use http_body_util::combinators::UnsyncBoxBody;
+        let (parts, body) = req.into_parts();
+        let mapped = body.map_err(|_| -> hyper::Error {
+            panic!("Full body mapper unused")
+        });
+        let incoming_req = Request::from_parts(parts, mapped);
+        let boxed: Request<UnsyncBoxBody<Bytes, hyper::Error>> =
+            incoming_req.map(UnsyncBoxBody::new);
+        handle_request_boxed(state, boxed).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn proxy_meter_increments_tokens_on_anthropic_response() {
+        let state = make_state();
+        let persona = state.store.create_persona("meter-1").unwrap();
+        state
+            .vault
+            .add(&state.store, "anthropic-key", b"sk-test", None)
+            .unwrap();
+        // 3-statement grant — Credential + Session(20000 tokens) + Time.
+        let grant_id = seed_composite_grant(
+            &state,
+            &persona.id,
+            "anthropic-key",
+            vec![
+                stmt_credential("S0"),
+                stmt_session("S1", 20_000),
+                stmt_time("S2", 1800),
+            ],
+        );
+
+        let body = anthropic_body(1_500, 500);
+        let req = proxy_llm_request(
+            &persona.id,
+            "anthropic-key",
+            "https://api.anthropic.com",
+            &body,
+        );
+        let resp = call_full(Arc::clone(&state), req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Inspect the post-flight usage on the Session statement.
+        let ag = state.store.get_access_grant(&grant_id).unwrap();
+        let session = ag
+            .statements()
+            .find(|(_, s)| s.sid == "S1")
+            .expect("session statement present")
+            .1
+            .clone();
+        assert_eq!(
+            session.usage.tokens, 2_000,
+            "input 1500 + output 500 should sum to 2000 tokens"
+        );
+        // 10% usage → no warning yet.
+        let entries = state
+            .store
+            .query_audit(&crate::audit::AuditFilter::default())
+            .unwrap();
+        assert!(
+            !entries.iter().any(|e| e.action == "budget.warning"),
+            "no warning expected at 10% usage"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_meter_emits_warning_at_80_percent() {
+        let state = make_state();
+        let persona = state.store.create_persona("meter-80").unwrap();
+        state
+            .vault
+            .add(&state.store, "anthropic-key", b"sk-test", None)
+            .unwrap();
+        // Session tokens = 10_000.
+        let _grant_id = seed_composite_grant(
+            &state,
+            &persona.id,
+            "anthropic-key",
+            vec![
+                stmt_credential("S0"),
+                stmt_session("S1", 10_000),
+            ],
+        );
+
+        // First call: 7900 tokens total (input 4000 + output 3900).
+        let body_1 = anthropic_body(4_000, 3_900);
+        let req_1 = proxy_llm_request(
+            &persona.id,
+            "anthropic-key",
+            "https://api.anthropic.com",
+            &body_1,
+        );
+        let resp_1 = call_full(Arc::clone(&state), req_1).await;
+        assert_eq!(resp_1.status(), StatusCode::OK);
+        let entries = state
+            .store
+            .query_audit(&crate::audit::AuditFilter::default())
+            .unwrap();
+        assert!(
+            !entries.iter().any(|e| e.action == "budget.warning"),
+            "no warning expected at 79%"
+        );
+
+        // Second call: 200 more tokens (input 100, output 100) → 8100, crossing 80%.
+        let body_2 = anthropic_body(100, 100);
+        let req_2 = proxy_llm_request(
+            &persona.id,
+            "anthropic-key",
+            "https://api.anthropic.com",
+            &body_2,
+        );
+        let resp_2 = call_full(Arc::clone(&state), req_2).await;
+        assert_eq!(resp_2.status(), StatusCode::OK);
+
+        let entries = state
+            .store
+            .query_audit(&crate::audit::AuditFilter::default())
+            .unwrap();
+        assert!(
+            entries.iter().any(|e| {
+                e.action == "budget.warning"
+                    && e.outcome == "80"
+                    && e.details.as_deref().unwrap_or("").contains("axis=tokens")
+            }),
+            "expected tokens budget.warning at 80% band, entries: {:?}",
+            entries
+                .iter()
+                .map(|e| (e.action.clone(), e.outcome.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_preflight_rejects_over_budget() {
+        let state = make_state();
+        let persona = state.store.create_persona("meter-preflight").unwrap();
+        state
+            .vault
+            .add(&state.store, "anthropic-key", b"sk-test", None)
+            .unwrap();
+        // Budget: 10_000 tokens. Pre-seed usage = 9_500 by doing one
+        // metered call first.
+        let _grant_id = seed_composite_grant(
+            &state,
+            &persona.id,
+            "anthropic-key",
+            vec![
+                stmt_credential("S0"),
+                stmt_session("S1", 10_000),
+            ],
+        );
+        // Warm usage to 9_500 via a prior successful meter.
+        let body_warm = anthropic_body(5_000, 4_500);
+        let req_warm = proxy_llm_request(
+            &persona.id,
+            "anthropic-key",
+            "https://api.anthropic.com",
+            &body_warm,
+        );
+        let resp = call_full(Arc::clone(&state), req_warm).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Now attempt a call whose estimated cost pushes usage past 10k.
+        // Craft a request body large enough that the byte-len/4 heuristic
+        // projects >600 input tokens, plus `max_tokens` = 500 output.
+        let big_prompt: String = "a".repeat(4_000); // 4_000 bytes → ~1_000 tokens input
+        let req_body_json = serde_json::json!({
+            "model": "claude-opus-4-5",
+            "max_tokens": 500,
+            "messages": [{"role": "user", "content": big_prompt}],
+        })
+        .to_string();
+        // Use Full body instead of Empty so preflight has bytes to
+        // estimate against.
+        let response_body = anthropic_body(0, 0);
+        let req_over = Request::builder()
+            .method("POST")
+            .uri("https://api.anthropic.com/v1/messages")
+            .header("X-Ember-Persona", &persona.id)
+            .header("X-Ember-Credential", "anthropic-key")
+            .header("X-Ember-Target", "https://api.anthropic.com")
+            .header("X-Ember-Test-Response-Body", response_body)
+            .body(Full::new(Bytes::from(req_body_json)))
+            .unwrap();
+
+        // Call via the boxed wrapper directly since the `call` helper
+        // uses Empty<Bytes>. Map body errors in the same way.
+        use http_body_util::combinators::UnsyncBoxBody;
+        let (parts, body) = req_over.into_parts();
+        let mapped = body.map_err(|_| -> hyper::Error {
+            panic!("full body error mapper unused in preflight test")
+        });
+        let incoming_req = Request::from_parts(parts, mapped);
+        let boxed: Request<UnsyncBoxBody<Bytes, hyper::Error>> =
+            incoming_req.map(UnsyncBoxBody::new);
+        let resp = handle_request_boxed(Arc::clone(&state), boxed).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "preflight should 429 when projected usage exceeds budget"
+        );
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "budget_exhausted");
+        assert_eq!(json["axis"], "tokens");
+
+        // Usage must be unchanged — 9500, same as before the rejected call.
+        let ag = state.store.get_access_grant(&_grant_id).unwrap();
+        let session = ag
+            .statements()
+            .find(|(_, s)| s.sid == "S1")
+            .unwrap()
+            .1
+            .clone();
+        assert_eq!(
+            session.usage.tokens, 9_500,
+            "preflight reject must not increment usage"
+        );
+
+        let entries = state
+            .store
+            .query_audit(&crate::audit::AuditFilter::default())
+            .unwrap();
+        assert!(
+            entries.iter().any(|e| e.action == "proxy.denied_preflight"),
+            "expected proxy.denied_preflight audit entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_meter_flips_status_on_exhaustion() {
+        // Grant with Session tokens = 2_000 (single budget-bearing
+        // statement). Drive usage past the limit. Since Session is the
+        // only budget-bearing Statement AND it's exhausted, the grant
+        // flips to ExhaustedByBudget under the "all budget-bearing
+        // statements exhausted" rule.
+        let state = make_state();
+        let persona = state.store.create_persona("meter-exhaust").unwrap();
+        state
+            .vault
+            .add(&state.store, "anthropic-key", b"sk-test", None)
+            .unwrap();
+        let grant_id = seed_composite_grant(
+            &state,
+            &persona.id,
+            "anthropic-key",
+            vec![
+                stmt_credential("S0"),
+                stmt_session("S1", 2_000),
+                // Time statement with wall_clock_secs = 3_600, which
+                // still has remaining capacity (usage.wall_clock_secs
+                // stays 0 since we don't tick it in this test). Since
+                // mark_grant_exhausted_by_budget_if_terminal requires
+                // ALL budget-bearing statements exhausted, we do NOT
+                // expect a flip while Time remains active. That
+                // documents the "conservative choice" behavior.
+                stmt_time("S2", 3_600),
+            ],
+        );
+
+        // Drive Session usage past the 2_000 limit.
+        let body = anthropic_body(1_500, 1_500); // 3_000 total
+        let req = proxy_llm_request(
+            &persona.id,
+            "anthropic-key",
+            "https://api.anthropic.com",
+            &body,
+        );
+        let resp = call_full(Arc::clone(&state), req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Session usage exceeds its 2_000 cap.
+        let ag = state.store.get_access_grant(&grant_id).unwrap();
+        let s1 = ag.statements().find(|(_, s)| s.sid == "S1").unwrap().1.clone();
+        assert!(s1.usage.tokens >= 2_000);
+        assert!(
+            !s1.has_budget_remaining(),
+            "S1 should have no budget remaining"
+        );
+        // Since Time statement still has capacity (wall_clock_secs
+        // remains 0), the grant stays Active — the conservative
+        // "all-exhausted" rule documents this.
+        assert_eq!(ag.status.as_str(), "active");
+
+        // Now seed a single-budget-statement grant and verify the flip.
+        let persona2 = state.store.create_persona("meter-exhaust-2").unwrap();
+        state
+            .vault
+            .add(&state.store, "anthropic-key-2", b"sk-test", None)
+            .unwrap();
+        let gid2 = seed_composite_grant(
+            &state,
+            &persona2.id,
+            "anthropic-key-2",
+            vec![
+                stmt_credential("S0"),
+                stmt_session("S1", 2_000),
+            ],
+        );
+        let body2 = anthropic_body(1_500, 1_500);
+        let req2 = proxy_llm_request(
+            &persona2.id,
+            "anthropic-key-2",
+            "https://api.anthropic.com",
+            &body2,
+        );
+        let resp2 = call_full(Arc::clone(&state), req2).await;
+        assert_eq!(resp2.status(), StatusCode::OK);
+
+        let ag2 = state.store.get_access_grant(&gid2).unwrap();
+        assert_eq!(
+            ag2.status.as_str(),
+            "exhausted_by_budget",
+            "single-budget grant must flip when its one budget-bearing statement exhausts"
+        );
+        // Audit must carry grant.exhausted and budget.exhausted events.
+        let entries = state
+            .store
+            .query_audit(&crate::audit::AuditFilter::default())
+            .unwrap();
+        assert!(entries.iter().any(|e| e.action == "grant.exhausted"));
+        assert!(entries.iter().any(|e| e.action == "budget.exhausted"));
+    }
+
+    #[tokio::test]
+    async fn proxy_non_llm_target_skips_token_meters() {
+        // GitHub request — only a Credential statement applicable, no
+        // token/cent meter. Post-flight `meter_response` returns None
+        // for github.com and usage is unchanged.
+        let state = make_state();
+        let persona = state.store.create_persona("gh-meter").unwrap();
+        state
+            .vault
+            .add(&state.store, "gh-token", b"ghp_secret", None)
+            .unwrap();
+        // Single credential statement with allowed POST.
+        let stmt = Statement {
+            sid: "S0".into(),
+            resource_type: ResourceType::Credential,
+            actions: vec!["github:push".into()],
+            resource: ResourceSelector::Any,
+            budget: None,
+            usage: Usage::default(),
+            conditions: Vec::new(),
+        };
+        let grant_id = seed_composite_grant(
+            &state,
+            &persona.id,
+            "gh-token",
+            vec![stmt],
+        );
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://api.github.com/repos/a/b/issues")
+            .header("X-Ember-Persona", &persona.id)
+            .header("X-Ember-Credential", "gh-token")
+            .header("X-Ember-Target", "https://api.github.com")
+            .body(Empty::new())
+            .unwrap();
+        let resp = call(Arc::clone(&state), req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // No metering — usage still default.
+        let ag = state.store.get_access_grant(&grant_id).unwrap();
+        let s0 = ag.statements().find(|(_, s)| s.sid == "S0").unwrap().1.clone();
+        assert_eq!(s0.usage.tokens, 0);
+        assert_eq!(s0.usage.cents, 0);
+        // No warnings/exhausted — statement has no budget.
+        let entries = state
+            .store
+            .query_audit(&crate::audit::AuditFilter::default())
+            .unwrap();
+        assert!(!entries.iter().any(|e| e.action == "budget.warning"));
+        assert!(!entries.iter().any(|e| e.action == "budget.exhausted"));
+    }
+
+    #[test]
+    fn preflight_budget_check_passes_when_under_limit() {
+        let stmt = stmt_session("S1", 10_000);
+        let body = br#"{"max_tokens": 100}"#;
+        assert_eq!(
+            preflight_budget_check(&stmt, body),
+            PreflightDecision::Allowed
+        );
+    }
+
+    #[test]
+    fn preflight_budget_check_rejects_when_projected_exceeds() {
+        let mut stmt = stmt_session("S1", 1_000);
+        stmt.usage.tokens = 900;
+        // Body >= 1_000 bytes implies estimate >= 250 tokens plus 500
+        // default output = 750; 900 + 750 > 1_000 → reject.
+        let big_body = vec![b'a'; 1_000];
+        match preflight_budget_check(&stmt, &big_body) {
+            PreflightDecision::Rejected { axis, limit, used } => {
+                assert_eq!(axis, "tokens");
+                assert_eq!(limit, 1_000);
+                assert_eq!(used, 900);
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preflight_budget_check_no_budget_always_allowed() {
+        let stmt = stmt_credential("S0");
+        let body = b"anything";
+        assert_eq!(
+            preflight_budget_check(&stmt, body),
+            PreflightDecision::Allowed
+        );
+    }
+
+    #[test]
+    fn meter_response_anthropic_extracts_tokens() {
+        let body = br#"{"usage": {"input_tokens": 100, "output_tokens": 200}, "model": "claude-opus-4-5"}"#;
+        let u = meter_response("api.anthropic.com", body).expect("parsed");
+        assert_eq!(u.tokens, 300);
+        // 100 input + 200 output at claude-opus-4-5 (1500 / 7500 cents/M).
+        // in cents: (100 * 1500 / 1_000_000) + (200 * 7500 / 1_000_000) = 0 + 1 = 1.
+        assert_eq!(u.cents, 1);
+    }
+
+    #[test]
+    fn meter_response_github_returns_none() {
+        let body = br#"{"sha": "abc123"}"#;
+        assert!(meter_response("api.github.com", body).is_none());
+    }
+
+    #[test]
+    fn mark_grant_exhausted_stays_active_while_budgets_remain() {
+        // Only one of two budget-bearing statements is exhausted; grant
+        // stays Active.
+        let state = make_state();
+        let persona = state.store.create_persona("flip-test-a").unwrap();
+        let grant_id = seed_composite_grant(
+            &state,
+            &persona.id,
+            "cred",
+            vec![
+                stmt_session("S1", 1_000),
+                stmt_time("S2", 3_600),
+            ],
+        );
+        // Exhaust S1.
+        state
+            .store
+            .increment_statement_usage(
+                &grant_id,
+                "S1",
+                Usage { tokens: 1_500, ..Default::default() },
+            )
+            .unwrap();
+        let flipped = state
+            .store
+            .mark_grant_exhausted_by_budget_if_terminal(&grant_id)
+            .unwrap();
+        assert!(!flipped, "grant should stay active — S2 still has capacity");
+        let ag = state.store.get_access_grant(&grant_id).unwrap();
+        assert_eq!(ag.status.as_str(), "active");
+    }
+
+    #[test]
+    fn threshold_warning_is_debounced_per_band() {
+        // Running the meter twice in a row on the same (grant, sid,
+        // axis, band) must only emit one audit entry.
+        let state = make_state();
+        let persona = state.store.create_persona("dedupe").unwrap();
+        let grant_id = seed_composite_grant(
+            &state,
+            &persona.id,
+            "cred",
+            vec![stmt_session("S1", 10_000)],
+        );
+        // First increment: crosses 80% band (8000/10000).
+        let delta1 = state
+            .store
+            .increment_statement_usage(
+                &grant_id,
+                "S1",
+                Usage { tokens: 8_000, ..Default::default() },
+            )
+            .unwrap();
+        let budget = Budget {
+            tokens: Some(10_000),
+            ..Default::default()
+        };
+        emit_threshold_crossings(
+            &state,
+            &grant_id,
+            "S1",
+            &persona.id,
+            "cred",
+            &budget,
+            &delta1.prior,
+            &delta1.current,
+        );
+        // Second attempt at the same threshold: should be deduped.
+        emit_threshold_crossings(
+            &state,
+            &grant_id,
+            "S1",
+            &persona.id,
+            "cred",
+            &budget,
+            &delta1.prior,
+            &delta1.current,
+        );
+        let entries = state
+            .store
+            .query_audit(&crate::audit::AuditFilter::default())
+            .unwrap();
+        let count = entries
+            .iter()
+            .filter(|e| e.action == "budget.warning" && e.outcome == "80")
+            .count();
+        assert_eq!(count, 1, "warning at 80% must be emitted only once");
     }
 }

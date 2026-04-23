@@ -7,6 +7,8 @@ from typing import Any, Callable, Optional
 
 from .types import (
     AgentConfig,
+    BudgetExhaustedNotification,
+    BudgetWarningNotification,
     CredentialValue,
     GrantInfo,
     GrantRevokedNotification,
@@ -41,6 +43,14 @@ class EmberAgent:
         # Called when the daemon pushes a ``grant_revoked`` notification.
         # Assign before calling ``connect()`` to avoid missing early notifications.
         self.on_grant_revoked: Optional[Callable[[GrantRevokedNotification], None]] = None
+
+        # Called when the daemon pushes a ``budget.warning`` notification (80% or 95% threshold).
+        # Assign before calling ``connect()`` to avoid missing early notifications.
+        self.on_budget_warning: Optional[Callable[[BudgetWarningNotification], None]] = None
+
+        # Called when the daemon pushes a ``budget.exhausted`` notification (100% threshold).
+        # Assign before calling ``connect()`` to avoid missing early notifications.
+        self.on_budget_exhausted: Optional[Callable[[BudgetExhaustedNotification], None]] = None
 
     def connect(self) -> None:
         cmd = [
@@ -78,18 +88,52 @@ class EmberAgent:
                 if slot is not None:
                     slot[1].update(msg)
                     slot[0].set()
-            elif msg.get("method") == "grant_revoked":
-                cb = self.on_grant_revoked
-                if cb is not None:
-                    params = msg.get("params", {})
-                    notif = GrantRevokedNotification(
-                        grant_id=params.get("grant_id", ""),
-                        persona_id=params.get("persona_id", ""),
-                    )
-                    try:
-                        cb(notif)
-                    except Exception:
-                        pass
+            else:
+                method = msg.get("method")
+                params = msg.get("params", {})
+                if method == "grant_revoked":
+                    cb = self.on_grant_revoked
+                    if cb is not None:
+                        notif = GrantRevokedNotification(
+                            grant_id=params.get("grant_id", ""),
+                            persona_id=params.get("persona_id", ""),
+                        )
+                        try:
+                            cb(notif)
+                        except Exception:
+                            pass
+                elif method == "budget.warning":
+                    cb_w = self.on_budget_warning
+                    if cb_w is not None:
+                        notif_w = BudgetWarningNotification(
+                            grant_id=params.get("grant_id", ""),
+                            statement_sid=params.get("statement_sid", ""),
+                            axis=params.get("axis", ""),
+                            used=float(params.get("used", 0)),
+                            budget=float(params.get("budget", 0)),
+                            percent=float(params.get("percent", 0)),
+                            threshold_band="warning",
+                        )
+                        try:
+                            cb_w(notif_w)
+                        except Exception:
+                            pass
+                elif method == "budget.exhausted":
+                    cb_e = self.on_budget_exhausted
+                    if cb_e is not None:
+                        notif_e = BudgetExhaustedNotification(
+                            grant_id=params.get("grant_id", ""),
+                            statement_sid=params.get("statement_sid", ""),
+                            axis=params.get("axis", ""),
+                            used=float(params.get("used", 0)),
+                            budget=float(params.get("budget", 0)),
+                            percent=float(params.get("percent", 0)),
+                            threshold_band="exhausted",
+                        )
+                        try:
+                            cb_e(notif_e)
+                        except Exception:
+                            pass
 
     def close(self) -> None:
         if self._process is not None:

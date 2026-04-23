@@ -127,6 +127,7 @@ pub mod qr_encoding;
 mod recovery;
 pub(crate) mod storage;
 mod trust;
+pub mod grant_receipt;
 
 pub use encoding::{bytes_to_hex, decode_hex_nibble, hex_to_bytes};
 pub use events::*;

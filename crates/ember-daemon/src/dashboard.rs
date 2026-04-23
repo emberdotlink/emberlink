@@ -744,6 +744,44 @@ pub async fn handle_dashboard_request(
             json_response(StatusCode::OK, &body)
         }
 
+        // GET /daemon/identity.json — publish the daemon's long-lived
+        // Ed25519 identity pubkey used to sign Grant Receipts. Always
+        // returns a well-shaped JSON document even if the identity is
+        // not initialised (empty pubkey). Receipt verifiers should
+        // cache this value as their trust anchor.
+        (Method::GET, "/daemon/identity.json") | (Method::GET, "/api/daemon/identity") => {
+            let (pubkey, canonical_version) = match crate::receipt::current_identity() {
+                Some(id) => (id.pubkey_hex(), crate::receipt::CANONICAL_VERSION),
+                None => (String::new(), crate::receipt::CANONICAL_VERSION),
+            };
+            let body = serde_json::json!({
+                "pubkey": pubkey,
+                "algorithm": "ed25519",
+                "canonical_version": canonical_version,
+                "generated_at": chrono::Utc::now().timestamp(),
+            });
+            json_response(StatusCode::OK, &body)
+        }
+
+        // GET /api/receipts — list receipts, most-recent first.
+        (Method::GET, "/api/receipts") => {
+            let persona_filter = req.uri().query().and_then(|q| {
+                q.split('&').find_map(|kv| {
+                    let mut parts = kv.splitn(2, '=');
+                    if parts.next() == Some("persona_id") { parts.next() } else { None }
+                })
+            });
+            let receipts = state
+                .store
+                .list_receipts(persona_filter)
+                .unwrap_or_default();
+            let body: Vec<serde_json::Value> = receipts
+                .iter()
+                .map(|r| serde_json::to_value(r).unwrap_or(serde_json::Value::Null))
+                .collect();
+            json_response(StatusCode::OK, &serde_json::Value::Array(body))
+        }
+
         (Method::GET, "/api/personas") => {
             let personas = state.store.list_personas().unwrap_or_default();
             let body: Vec<serde_json::Value> = personas
@@ -971,11 +1009,14 @@ pub async fn handle_dashboard_request(
         // GET /api/grants — now includes all grants (active + terminal) with budget/usage fields
         (Method::GET, "/api/grants/all") => {
             let grants = state.store.list_all_grants().unwrap_or_default();
-            let body: Vec<serde_json::Value> = grants.iter().map(grant_to_json).collect();
+            let body: Vec<serde_json::Value> = grants
+                .iter()
+                .map(|g| grant_to_json_with_store(g, &state.store))
+                .collect();
             json_response(StatusCode::OK, &serde_json::Value::Array(body))
         }
 
-        // GET /api/grants/{id} — single grant detail with budget/usage
+        // GET /api/grants/{id} — single grant detail with budget/usage + statements
         _ if method == Method::GET
             && path.starts_with("/api/grants/")
             && !path.ends_with("/revoke")
@@ -987,7 +1028,7 @@ pub async fn handle_dashboard_request(
                 error_response(400, "missing grant id")
             } else {
                 match state.store.get_grant(id) {
-                    Ok(g) => json_response(StatusCode::OK, &grant_to_json(&g)),
+                    Ok(g) => json_response(StatusCode::OK, &grant_to_json_with_store(&g, &state.store)),
                     Err(_) => error_response(404, "grant not found"),
                 }
             }
@@ -1062,7 +1103,13 @@ pub async fn handle_dashboard_request(
             }
         }
 
-        // GET /receipts/{id} — Grant Receipt viewer
+        // GET /receipts/{id} — Grant Receipt viewer.
+        //
+        // `id` may be either a receipt id (`rct-…`) or a grant id (back-
+        // compat for dashboard links that point at the grant row). When
+        // the id resolves to a persisted signed receipt we return it
+        // verbatim; otherwise we fall back to the unsigned draft view
+        // of the grant row so active grants remain viewable.
         (Method::GET, p) if p.starts_with("/receipts/") => {
             let id = p.strip_prefix("/receipts/").unwrap_or("");
             let accept = req.headers()
@@ -1078,33 +1125,85 @@ pub async fn handle_dashboard_request(
             let want_json = format_param == Some("json")
                 || (accept.contains("application/json") && !accept.contains("text/html"));
 
-            match state.store.get_grant(id) {
-                Ok(g) => {
+            // Fast path: signed receipt by receipt id.
+            if let Ok(signed) = state.store.get_receipt(id) {
+                if want_json {
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json")
+                        .header(
+                            "content-disposition",
+                            format!("attachment; filename=\"{id}.json\""),
+                        )
+                        .body(Full::new(Bytes::from(
+                            serde_json::to_vec_pretty(&signed).unwrap_or_default(),
+                        )))
+                        .unwrap());
+                }
+                let html = build_signed_receipt_html(&signed);
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/html; charset=utf-8")
+                    .body(Full::new(Bytes::from(html)))
+                    .unwrap());
+            }
+
+            // Next: by grant id — fetch the grant's linked receipt if any.
+            let grant_result = state.store.get_grant(id);
+            if let Ok(g) = grant_result {
+                if let Some(rid) = g.receipt_id.as_deref()
+                    && let Ok(signed) = state.store.get_receipt(rid)
+                {
                     if want_json {
-                        // JSON export
-                        let receipt = build_receipt_json(&g);
-                        Response::builder()
+                        return Ok(Response::builder()
                             .status(StatusCode::OK)
                             .header("content-type", "application/json")
-                            .header("content-disposition", format!("attachment; filename=\"receipt-{id}.json\""))
-                            .body(Full::new(Bytes::from(serde_json::to_vec_pretty(&receipt).unwrap_or_default())))
-                            .unwrap()
-                    } else {
-                        let html = build_receipt_html(&g, &state.csrf_token);
-                        Response::builder()
-                            .status(StatusCode::OK)
-                            .header("content-type", "text/html; charset=utf-8")
-                            .body(Full::new(Bytes::from(html)))
-                            .unwrap()
+                            .header(
+                                "content-disposition",
+                                format!("attachment; filename=\"{rid}.json\""),
+                            )
+                            .body(Full::new(Bytes::from(
+                                serde_json::to_vec_pretty(&signed).unwrap_or_default(),
+                            )))
+                            .unwrap());
                     }
+                    let html = build_signed_receipt_html(&signed);
+                    return Ok(Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/html; charset=utf-8")
+                        .body(Full::new(Bytes::from(html)))
+                        .unwrap());
                 }
-                Err(_) => Response::builder()
+                // Fall back to legacy draft view for grants without a receipt.
+                if want_json {
+                    let receipt = build_receipt_json(&g);
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "application/json")
+                        .header(
+                            "content-disposition",
+                            format!("attachment; filename=\"receipt-{id}.json\""),
+                        )
+                        .body(Full::new(Bytes::from(
+                            serde_json::to_vec_pretty(&receipt).unwrap_or_default(),
+                        )))
+                        .unwrap()
+                } else {
+                    let html = build_receipt_html(&g, &state.csrf_token);
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("content-type", "text/html; charset=utf-8")
+                        .body(Full::new(Bytes::from(html)))
+                        .unwrap()
+                }
+            } else {
+                Response::builder()
                     .status(StatusCode::NOT_FOUND)
                     .header("content-type", "text/html; charset=utf-8")
                     .body(Full::new(Bytes::from(
-                        "<!DOCTYPE html><html><head><title>ember</title></head><body style=\"font-family:monospace;background:#0a0a0f;color:#6b6b7b;display:flex;align-items:center;justify-content:center;height:100vh;margin:0\"><p>Grant not found. <a href=\"/\" style=\"color:#e85d26\">Back to dashboard</a></p></body></html>",
+                        "<!DOCTYPE html><html><head><title>ember</title></head><body style=\"font-family:monospace;background:#0a0a0f;color:#6b6b7b;display:flex;align-items:center;justify-content:center;height:100vh;margin:0\"><p>Receipt not found. <a href=\"/\" style=\"color:#e85d26\">Back to dashboard</a></p></body></html>",
                     )))
-                    .unwrap(),
+                    .unwrap()
             }
         }
 
@@ -1195,6 +1294,75 @@ pub async fn handle_dashboard_request(
 }
 
 /// Serialize a `GrantInfo` to the JSON shape used by dashboard API endpoints.
+///
+/// Post-composite-port (design): also emits a `statements` array with per-
+/// Statement `sid`, `resource_type`, `actions`, `resource`, `budget`, and
+/// `usage`. Dashboard / receipt views can render per-Statement meters from
+/// this field. The legacy envelope-level `budget` + `usage` fields remain
+/// as projections across all statements for backward compat.
+fn grant_to_json_with_store(
+    g: &crate::grant::GrantInfo,
+    store: &crate::store::DaemonStore,
+) -> serde_json::Value {
+    let mut conds = serde_json::Map::new();
+    if let Some(rate) = g.max_uses_per_hour {
+        conds.insert("rate_limit".to_string(), serde_json::json!(format!("{}/hour", rate)));
+    }
+    if let (Some(start), Some(end)) = (g.allowed_hours_start, g.allowed_hours_end) {
+        conds.insert("time_window".to_string(), serde_json::json!(format!("{}:00-{}:00 UTC", start, end)));
+    }
+    if let Some(ref targets) = g.allowed_targets {
+        conds.insert("allowed_targets".to_string(), serde_json::json!(targets));
+    }
+    if let Some(limit) = g.spending_limit_cents {
+        conds.insert("spending_limit".to_string(), serde_json::json!(format!("${}.{:02}/day", limit / 100, limit % 100)));
+    }
+    if let Some(depth) = g.max_delegation_depth {
+        conds.insert("delegation_depth".to_string(), serde_json::json!(depth));
+    }
+    let conditions = if conds.is_empty() { serde_json::Value::Null } else { serde_json::Value::Object(conds) };
+
+    let statements: serde_json::Value = match store.get_access_grant(&g.id) {
+        Ok(chain) => {
+            let arr: Vec<serde_json::Value> = chain
+                .statements()
+                .map(|(block_index, s)| {
+                    serde_json::json!({
+                        "sid": s.sid,
+                        "block_index": block_index,
+                        "resource_type": s.resource_type.as_str(),
+                        "actions": s.actions,
+                        "resource": s.resource,
+                        "budget": s.budget,
+                        "usage": s.usage,
+                        "conditions": s.conditions,
+                    })
+                })
+                .collect();
+            serde_json::Value::Array(arr)
+        }
+        Err(_) => serde_json::Value::Array(Vec::new()),
+    };
+
+    serde_json::json!({
+        "id": g.id,
+        "persona_id": g.persona_id,
+        "credential_name": g.credential_name,
+        "scope": g.scope,
+        "created_at": g.created_at,
+        "expires_at": g.expires_at,
+        "status": g.status,
+        "conditions": conditions,
+        "budget": g.budget,
+        "usage": g.usage,
+        "statements": statements,
+        "paused": g.paused,
+        "receipt_id": g.receipt_id,
+    })
+}
+
+/// Back-compat shim for callers that don't need the `statements` array.
+/// Forwards to `grant_to_json_with_store` but omits the array.
 fn grant_to_json(g: &crate::grant::GrantInfo) -> serde_json::Value {
     let mut conds = serde_json::Map::new();
     if let Some(rate) = g.max_uses_per_hour {
@@ -1227,6 +1395,159 @@ fn grant_to_json(g: &crate::grant::GrantInfo) -> serde_json::Value {
         "paused": g.paused,
         "receipt_id": g.receipt_id,
     })
+}
+
+/// Render a persisted, Ed25519-signed `GrantReceipt` as HTML.
+///
+/// Presents the receipt as a read-only artifact: chain snapshot, per-
+/// Statement usage, approval chain, actions observed, lifecycle, and
+/// evidence block. A download button serves the verbatim signed JSON.
+fn build_signed_receipt_html(r: &core_types::grant_receipt::GrantReceipt) -> String {
+    let json = serde_json::to_string_pretty(r).unwrap_or_default();
+    let escaped = json.replace('<', "&lt;").replace('>', "&gt;");
+    let terminal = &r.lifecycle.terminal_reason;
+    let reason_label = match terminal {
+        core_types::grant_receipt::TerminalReason::Expired => "expired".to_string(),
+        core_types::grant_receipt::TerminalReason::Revoked { by, reason } => {
+            let actor = match by {
+                core_types::grant_receipt::RevokeActor::Operator => "operator",
+                core_types::grant_receipt::RevokeActor::Agent => "agent",
+                core_types::grant_receipt::RevokeActor::ParentCascade => "parent cascade",
+            };
+            if reason.is_empty() {
+                format!("revoked by {actor}")
+            } else {
+                format!("revoked by {actor}: {reason}")
+            }
+        }
+        core_types::grant_receipt::TerminalReason::ExhaustedByBudget {
+            statement_sid,
+            axis,
+        } => format!("exhausted_by_budget on {statement_sid} ({axis:?})"),
+        core_types::grant_receipt::TerminalReason::ParentCascadeRevoked {
+            parent_grant_id,
+        } => format!("parent_cascade_revoked from {parent_grant_id}"),
+    };
+
+    let statements_rows: String = r
+        .per_statement_usage
+        .iter()
+        .map(|(sid, u)| {
+            format!(
+                r#"<tr><td>{sid}</td><td>{} tokens</td><td>{} cents</td><td>{} req</td><td>{} s</td></tr>"#,
+                u.tokens, u.cents, u.requests, u.wall_clock_secs
+            )
+        })
+        .collect();
+    let statements_table = if statements_rows.is_empty() {
+        "<p style=\"color:var(--text-muted);font-size:12px\">No statements recorded.</p>".to_string()
+    } else {
+        format!(
+            r#"<table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr style="color:var(--text-muted);text-align:left"><th>SID</th><th>Tokens</th><th>Cents</th><th>Requests</th><th>Wall-clock</th></tr></thead><tbody>{statements_rows}</tbody></table>"#
+        )
+    };
+
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ember · grant receipt</title>
+<style>
+:root{{--bg-primary:#0a0a0f;--bg-card:#12121a;--bg-hover:#1a1a2a;--accent:#e85d26;--text-primary:#e0e0e8;--text-muted:#6b6b7b;--border:#1e1e2e;--success:#22c55e;--danger:#ef4444}}
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:'JetBrains Mono',ui-monospace,monospace;background:var(--bg-primary);color:var(--text-primary);min-height:100vh;font-size:13px}}
+a{{color:var(--accent);text-decoration:none}}
+#header{{display:flex;align-items:center;justify-content:space-between;padding:14px 24px;border-bottom:1px solid var(--border);background:var(--bg-card)}}
+#header .logo{{font-size:20px;font-weight:700;color:var(--accent)}}
+main{{padding:20px 24px;max-width:960px;margin:0 auto}}
+.card{{background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:20px;margin-bottom:16px}}
+.card-title{{font-size:11px;text-transform:uppercase;letter-spacing:.8px;color:var(--text-muted);margin-bottom:14px}}
+.field{{display:flex;justify-content:space-between;margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid var(--border)}}
+.field:last-child{{border-bottom:none}}
+.field-label{{color:var(--text-muted);font-size:11px}}
+.field-val{{color:var(--text-primary);font-size:12px;text-align:right;word-break:break-all;max-width:65%}}
+.badge{{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600;background:rgba(239,68,68,.15);color:var(--danger)}}
+pre{{background:var(--bg-hover);border:1px solid var(--border);border-radius:6px;padding:14px;overflow-x:auto;font-size:11px;white-space:pre-wrap;word-break:break-all}}
+.btn{{display:inline-flex;align-items:center;padding:6px 14px;border-radius:4px;font-family:inherit;font-size:11px;font-weight:600;cursor:pointer;border:1px solid var(--border);background:rgba(107,107,123,.15);color:var(--text-muted);text-decoration:none}}
+.btn:hover{{opacity:.8}}
+.actions{{display:flex;gap:8px;margin-top:14px}}
+table td,table th{{padding:6px 10px;border-bottom:1px solid var(--border)}}
+</style>
+</head>
+<body>
+<div id="header">
+  <div class="logo">ember</div>
+  <div><a href="/">dashboard</a></div>
+</div>
+<main>
+  <div style="margin-bottom:16px">
+    <span style="font-size:18px;font-weight:700">Grant Receipt</span>
+    <span class="badge" style="margin-left:10px">{reason_label}</span>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Summary</div>
+    <div class="field"><span class="field-label">Receipt ID</span><span class="field-val">{receipt_id}</span></div>
+    <div class="field"><span class="field-label">Grant ID</span><span class="field-val">{grant_id}</span></div>
+    <div class="field"><span class="field-label">Persona</span><span class="field-val">{persona}</span></div>
+    <div class="field"><span class="field-label">Human owner</span><span class="field-val">{owner}</span></div>
+    <div class="field"><span class="field-label">Service</span><span class="field-val">{service}</span></div>
+    <div class="field"><span class="field-label">Resource</span><span class="field-val">{resource}</span></div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Lifecycle</div>
+    <div class="field"><span class="field-label">Issued</span><span class="field-val">epoch {issued}</span></div>
+    <div class="field"><span class="field-label">Last used</span><span class="field-val">{last_used}</span></div>
+    <div class="field"><span class="field-label">Terminated</span><span class="field-val">epoch {terminated}</span></div>
+    <div class="field"><span class="field-label">Terminal reason</span><span class="field-val">{reason_label}</span></div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Per-Statement usage</div>
+    {statements_table}
+  </div>
+
+  <div class="card">
+    <div class="card-title">Evidence (Ed25519)</div>
+    <div class="field"><span class="field-label">Signer pubkey</span><span class="field-val">{signer_pubkey}</span></div>
+    <div class="field"><span class="field-label">Hash</span><span class="field-val">{hash}</span></div>
+    <div class="field"><span class="field-label">Signature</span><span class="field-val">{sig}</span></div>
+    <div class="field"><span class="field-label">Canonical version</span><span class="field-val">v{canonical}</span></div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Raw Signed JSON</div>
+    <pre>{escaped}</pre>
+  </div>
+
+  <div class="actions">
+    <a href="/receipts/{receipt_id}?format=json" class="btn">Download JSON</a>
+    <a href="/daemon/identity.json" class="btn">Trust anchor</a>
+    <a href="/" class="btn">Back</a>
+  </div>
+</main>
+</body>
+</html>"#,
+        reason_label = reason_label,
+        receipt_id = r.id,
+        grant_id = r.grant_id,
+        persona = r.summary.persona_id,
+        owner = r.summary.human_owner,
+        service = r.summary.service,
+        resource = r.summary.resource,
+        issued = r.lifecycle.issued_at,
+        last_used = r.lifecycle.last_used_at.map(|t| format!("epoch {t}")).unwrap_or_else(|| "—".into()),
+        terminated = r.lifecycle.terminated_at,
+        statements_table = statements_table,
+        signer_pubkey = r.evidence.signer_pubkey,
+        hash = r.evidence.hash,
+        sig = r.evidence.sig,
+        canonical = r.evidence.canonical_version,
+        escaped = escaped,
+    )
 }
 
 /// Build the signed-receipt JSON for a grant (for download / display).
@@ -1537,7 +1858,10 @@ mod tests {
 
             (Method::GET, "/api/grants") => {
                 let grants = state.store.list_active_grants().unwrap_or_default();
-                let body: Vec<serde_json::Value> = grants.iter().map(grant_to_json).collect();
+                let body: Vec<serde_json::Value> = grants
+                    .iter()
+                    .map(|g| grant_to_json_with_store(g, &state.store))
+                    .collect();
                 json_response(StatusCode::OK, &serde_json::Value::Array(body))
             }
 
@@ -2372,12 +2696,29 @@ mod tests {
         let state = make_state();
         let persona = state.store.create_persona("agent-gauge").unwrap();
         let grant = state.store.create_grant(&persona.id, "api-key", "read", None).unwrap();
-        // Set budget + usage via direct SQL — uses the design JSON columns.
+        // Set budget + usage via direct SQL. Post-composite-port we must
+        // also patch blocks_json so the composite first-statement carries
+        // the budget; get_grant hydrates from blocks_json.
+        let mut chain = state.store.get_access_grant(&grant.id).unwrap();
+        if let Some(block) = chain.blocks.first_mut()
+            && let Some(stmt) = block.block.statements.first_mut()
+        {
+            stmt.budget = Some(core_types::Budget {
+                tokens: Some(20_000),
+                ..Default::default()
+            });
+            stmt.usage = core_types::Usage {
+                tokens: 5_000,
+                ..Default::default()
+            };
+        }
+        let blocks_json = serde_json::to_string(&chain.blocks).unwrap();
         state.store.conn().execute(
-            "UPDATE grants SET budget_json = ?1, usage_json = ?2 WHERE id = ?3",
+            "UPDATE grants SET budget_json = ?1, usage_json = ?2, blocks_json = ?3 WHERE id = ?4",
             rusqlite::params![
                 r#"{"tokens":20000}"#,
                 r#"{"tokens":5000,"cents":0,"requests":0,"workload_hours":0,"wall_clock_secs":0,"last_updated":0}"#,
+                blocks_json,
                 grant.id,
             ],
         ).unwrap();

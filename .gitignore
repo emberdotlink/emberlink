@@ -9,4 +9,6 @@ memory/
 .headless-metrics.jsonl
 ember-ext/extension/pkg/
 web/node_modules/
+node_modules/
+packages/*/node_modules/
 web/dist/
