@@ -2,11 +2,11 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process;
+use std::rc::Rc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use ember_daemon::grant::GrantInfo;
-use core_types::{Budget, ResourceSelector, ResourceType, Statement, Usage};
+use core_types::{AccessGrant, Budget, ResourceSelector, ResourceType, Statement, Usage};
 use ember_daemon::approval::ApprovalOutcome;
 use ember_daemon::audit::AuditFilter;
 use ember_daemon::config::DaemonConfig;
@@ -15,9 +15,11 @@ use ember_daemon::runtime::{DaemonRuntime, DashboardBind};
 use ember_daemon::sandbox::SandboxCreateOpts;
 use ember_daemon::store::DaemonStore;
 use ember_daemon::vault::{
-    keyring_writes_suppressed, verify_keyring_roundtrip, Vault, DEFAULT_KEYRING_ACCOUNT,
-    DEFAULT_KEYRING_SERVICE,
+    check_production_sentinel, is_cargo_test_binary, keyring_writes_suppressed,
+    verify_keyring_roundtrip, Vault, DEFAULT_KEYRING_ACCOUNT, DEFAULT_KEYRING_SERVICE,
 };
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
 use tracing_subscriber::EnvFilter;
 
 #[path = "daemon_agent.rs"]
@@ -216,9 +218,9 @@ enum GrantAction {
         /// Access scope
         #[arg(long)]
         scope: String,
-        /// Time-to-live in seconds
+        /// Time-to-live (humantime: 5s, 5m, 2h — bare integer also accepted as seconds)
         #[arg(long)]
-        ttl: Option<u64>,
+        ttl: Option<String>,
         /// Max uses per hour (rate limit)
         #[arg(long)]
         rate_limit: Option<u64>,
@@ -237,9 +239,9 @@ enum GrantAction {
         /// Token budget ceiling
         #[arg(long)]
         budget_tokens: Option<u64>,
-        /// Cost budget ceiling in dollars (e.g. "0.50" → 50 cents)
+        /// Cost budget ceiling in USD (e.g. "0.50" → 50 cents stored). Accepts decimal.
         #[arg(long)]
-        budget_cents: Option<String>,
+        budget_usd: Option<String>,
         /// Request count budget ceiling
         #[arg(long)]
         budget_requests: Option<u64>,
@@ -249,21 +251,51 @@ enum GrantAction {
         /// Attestation runtime label (e.g. "claude_code")
         #[arg(long)]
         attestation_runtime: Option<String>,
+        /// Mark the grant as a standing parent () — subsequent
+        /// `ember grant delegate <id>` calls mint child grants without
+        /// re-prompting, subject to `--max-children-per-day`.
+        #[arg(long)]
+        standing: bool,
+        /// Trailing-24h delegation ceiling for a standing parent. Required
+        /// when `--standing` is set; ignored otherwise.
+        #[arg(long)]
+        max_children_per_day: Option<u64>,
+        /// Opaque scope template the orchestrator applies when auto-
+        /// delegating from this standing parent. Advisory — stored on
+        /// the parent, read by the orchestrator.
+        #[arg(long)]
+        auto_delegate_scope_template: Option<String>,
     },
     /// Delegate a grant to a sub-agent with narrowed scope
+    ///
+    /// Child authority is bounded by the parent on every axis (scope,
+    /// budget, expiry) per design § Offline attenuation. Violations
+    /// exit non-zero with a message naming only the failing dimension.
     Delegate {
         /// Parent grant ID
-        #[arg(long)]
+        #[arg(value_name = "PARENT_GRANT_ID")]
         parent: String,
         /// Child persona ID
-        #[arg(long)]
+        #[arg(long = "to", value_name = "CHILD_PERSONA_ID")]
         persona: String,
-        /// Narrowed scope
+        /// Narrowed scope (must be a subset of parent scope)
         #[arg(long)]
         scope: String,
-        /// Time-to-live in seconds
+        /// Time-to-live (e.g. 1h, 30m, 60s; bare integer = seconds)
         #[arg(long)]
-        ttl: Option<u64>,
+        ttl: Option<String>,
+        /// Child token budget (must fit parent's remaining allowance)
+        #[arg(long)]
+        budget_tokens: Option<u64>,
+        /// Child cost budget in USD (e.g. "0.50" → 50 cents stored). Accepts decimal.
+        #[arg(long)]
+        budget_usd: Option<String>,
+        /// Child request-count budget
+        #[arg(long)]
+        budget_requests: Option<u64>,
+        /// Child wall-clock budget in seconds
+        #[arg(long)]
+        budget_seconds: Option<u64>,
     },
     /// List all grants
     List {
@@ -367,9 +399,9 @@ enum SandboxAction {
         /// Token budget ceiling for the Session statement (LLM tokens).
         #[arg(long)]
         budget_tokens: Option<u64>,
-        /// Cost budget ceiling in dollars (e.g. "0.50" → 50 cents) for the Session statement.
+        /// Cost budget ceiling in USD (e.g. "0.50" → 50 cents stored) for the Session statement. Accepts decimal.
         #[arg(long)]
-        budget_cents: Option<String>,
+        budget_usd: Option<String>,
         /// Wall-clock seconds ceiling for the Time statement.
         #[arg(long)]
         budget_seconds: Option<u64>,
@@ -484,6 +516,7 @@ fn print_banner_preamble(config: &DaemonConfig) {
     let version = env!("CARGO_PKG_VERSION");
     let socket = config.socket_dir.join("daemon.sock");
     let db = config.data_dir.join("daemon.db");
+    let log = config.data_dir.join("daemon.log");
     let pid = std::process::id();
 
     eprintln!();
@@ -492,6 +525,7 @@ fn print_banner_preamble(config: &DaemonConfig) {
     eprintln!();
     eprintln!("  Socket:    {}", socket.display());
     eprintln!("  Database:  {}", db.display());
+    eprintln!("  Log:       {}", log.display());
     eprintln!("  PID:       {pid}");
 }
 
@@ -526,6 +560,43 @@ fn effective_config_path(cli_config: Option<&PathBuf>) -> PathBuf {
     cli_config
         .cloned()
         .unwrap_or_else(DaemonConfig::default_config_path)
+}
+
+/// Guard that keeps the non-blocking file-appender thread alive.
+/// Drop it only when the process is about to exit.
+pub struct LogGuard {
+    _worker: tracing_appender::non_blocking::WorkerGuard,
+}
+
+/// Initialize daemon tracing: rolling JSON file appender always; console fmt layer when
+/// `console` is true (foreground). Returns a `LogGuard` the caller must hold for the
+/// lifetime of the process.
+fn configure_tracing(data_dir: &std::path::Path, log_level: &ember_daemon::config::LogLevel, console: bool) -> LogGuard {
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(log_level.as_filter_str()));
+
+    let log_dir = data_dir;
+    let file_appender = tracing_appender::rolling::daily(log_dir, "daemon.log");
+    let (non_blocking, worker_guard) = tracing_appender::non_blocking(file_appender);
+
+    let file_layer = tracing_subscriber::fmt::layer()
+        .json()
+        .with_writer(non_blocking);
+
+    let registry = tracing_subscriber::registry()
+        .with(filter)
+        .with(file_layer);
+
+    if console {
+        let console_layer = tracing_subscriber::fmt::layer();
+        registry.with(console_layer).try_init().ok();
+    } else {
+        registry.try_init().ok();
+    }
+
+    tracing::info!(log_dir = %log_dir.display(), log_prefix = "daemon.log", "daemon logging initialized");
+
+    LogGuard { _worker: worker_guard }
 }
 
 fn load_config(path: Option<&PathBuf>) -> DaemonConfig {
@@ -611,6 +682,19 @@ pub fn record_image_digest(registry_path: &Path, image: &str, digest: &str) {
     }
 }
 
+/// Resolve a keyring service/account value for `ember init`. Pure function so
+/// tests can verify the priority order (flag → env → default) without mutating
+/// process-global environment — env races caused `ember init` to leak to the
+/// production keyring on 2026-04-23.
+fn resolve_init_keyring_value(
+    flag: Option<String>,
+    env_value: Option<String>,
+    default_value: &str,
+) -> String {
+    flag.or(env_value)
+        .unwrap_or_else(|| default_value.to_string())
+}
+
 fn cmd_init(
     config: &DaemonConfig,
     name: Option<String>,
@@ -630,13 +714,20 @@ fn cmd_init(
     }
 
     // Determine the keyring service/account to embed in the config.
-    // --keyring-service / --keyring-account flags override the defaults.
-    let init_keyring_service = keyring_service_override
-        .clone()
-        .unwrap_or_else(|| DEFAULT_KEYRING_SERVICE.to_string());
-    let init_keyring_account = keyring_account_override
-        .clone()
-        .unwrap_or_else(|| DEFAULT_KEYRING_ACCOUNT.to_string());
+    // Matches daemon-runtime `resolve_keyring_service` at vault.rs:249 so
+    // CLI and daemon paths agree. Missing env-var fallback was the
+    // 2026-04-23 leak: qember.sh set the env but `ember init` wrote the
+    // passphrase to the production service anyway.
+    let init_keyring_service = resolve_init_keyring_value(
+        keyring_service_override.clone(),
+        std::env::var("EMBER_KEYRING_SERVICE").ok(),
+        DEFAULT_KEYRING_SERVICE,
+    );
+    let init_keyring_account = resolve_init_keyring_value(
+        keyring_account_override.clone(),
+        std::env::var("EMBER_KEYRING_ACCOUNT").ok(),
+        DEFAULT_KEYRING_ACCOUNT,
+    );
 
     // If the config file doesn't exist yet, write the default template.
     // If it already exists, respect the user's config and skip overwriting —
@@ -702,79 +793,149 @@ decision = \"require_approval\"
         }
     }
 
+    // V0 schema: persona rows are vault-sealed at rest, so the vault must
+    // be ready before we create the root persona. Order:
+    //   1. Write or reuse the salt file.
+    //   2. Resolve or provision the passphrase.
+    //   3. Build the vault from passphrase + salt.
+    //   4. Open the store and attach the vault.
+    //   5. Create the root persona.
+    // Prior flow did 5 first and 1–4 after, which broke under V0 because
+    // create_persona now requires an attached vault.
+    let salt_path = config.data_dir.join("vault.salt");
+    let salt: [u8; 16] = if salt_path.exists() {
+        match fs::read(&salt_path) {
+            Ok(raw) if raw.len() == 16 => {
+                let mut arr = [0u8; 16];
+                arr.copy_from_slice(&raw);
+                arr
+            }
+            Ok(raw) => {
+                eprintln!(
+                    "error: vault.salt has wrong length ({} bytes, expected 16)",
+                    raw.len()
+                );
+                process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("error: failed to read vault salt: {e}");
+                process::exit(1);
+            }
+        }
+    } else {
+        let s = Vault::generate_salt();
+        if let Err(e) = fs::write(&salt_path, s) {
+            eprintln!("warning: failed to write vault salt: {e}");
+        }
+        s
+    };
+
+    let service = init_keyring_service.clone();
+    let account = init_keyring_account.clone();
+
+    // Resolve the passphrase. Priority: env var → keyring (test/mock-gated
+    // fallback) → keyring (production provisioning). The first two branches
+    // never write to the keyring; the production branch generates a random
+    // passphrase and persists it.
+    let (passphrase, vault_status): (String, String) =
+        if let Ok(p) = std::env::var("EMBER_VAULT_PASSPHRASE") {
+            (p, "passphrase source: EMBER_VAULT_PASSPHRASE".to_string())
+        } else if keyring_writes_suppressed() {
+            // Three-axis gate — `bin/ember.rs` isn't covered by the gate
+            // inside `resolve_passphrase` because it calls `keyring::Entry::new`
+            // directly. Keeps `cargo test` from firing real keychain popups
+            // (the 2026-04-22 leak).
+            (
+                "ember-test-fallback-passphrase".to_string(),
+                "keyring write skipped (test/mock gate)".to_string(),
+            )
+        } else {
+            // Belt-and-suspenders production checkpoint. Mirrors the check
+            // inside `Vault::open_from_config` (vault.rs:102-110) so the
+            // CLI init path cannot bypass it by calling `keyring::Entry::new`
+            // directly.
+            if !is_cargo_test_binary() {
+                let home = match dirs_next::home_dir() {
+                    Some(h) => h,
+                    None => {
+                        eprintln!(
+                            "error: refusing to write to production keyring: home directory not \
+                             resolvable (no $HOME)"
+                        );
+                        process::exit(1);
+                    }
+                };
+                if let Err(e) =
+                    check_production_sentinel(&service, DEFAULT_KEYRING_SERVICE, &home)
+                {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            }
+
+            let entry = match keyring::Entry::new(&service, &account) {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("  Vault:    keyring unavailable ({e})");
+                    eprintln!("           Set EMBER_VAULT_PASSPHRASE env var instead");
+                    process::exit(1);
+                }
+            };
+
+            // 32 chars from an alphanumeric alphabet (62 chars) → ~190 bits
+            // of entropy. Rejection-sampled from OS entropy to avoid modulo
+            // bias. Mirrors ember-daemon::vault::generate_passphrase.
+            const ALPHABET: &[u8; 62] =
+                b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+            let mut generated = String::with_capacity(32);
+            let mut scratch = [0u8; 64];
+            while generated.len() < 32 {
+                getrandom::fill(&mut scratch).expect("OS entropy failure");
+                for &b in &scratch {
+                    if generated.len() == 32 {
+                        break;
+                    }
+                    if b < 248 {
+                        generated.push(ALPHABET[(b % 62) as usize] as char);
+                    }
+                }
+            }
+
+            if let Err(e) = entry.set_password(&generated) {
+                eprintln!("  Vault:    keyring unavailable ({e})");
+                eprintln!("           Set EMBER_VAULT_PASSPHRASE env var instead");
+                process::exit(1);
+            }
+
+            let status = match verify_keyring_roundtrip(&service, &account, &generated) {
+                Ok(()) => format!(
+                    "passphrase stored in system keyring (service={service}, account={account})"
+                ),
+                Err(e) => {
+                    eprintln!("  Vault:    keyring write succeeded but read-back failed ({e})");
+                    eprintln!(
+                        "           This usually means the keyring crate is using its in-memory mock backend."
+                    );
+                    eprintln!(
+                        "           Set EMBER_VAULT_PASSPHRASE env var to bypass the keyring."
+                    );
+                    "keyring unavailable (see above)".to_string()
+                }
+            };
+
+            (generated, status)
+        };
+
+    let vault = Rc::new(Vault::from_passphrase(&passphrase, &salt));
     let store = open_store(config);
+    store.set_vault(Rc::clone(&vault));
+
     let root_name = name.as_deref().unwrap_or("root");
     let persona = match store.create_persona(root_name) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("error: failed to create root persona: {e}");
             process::exit(1);
-        }
-    };
-
-    let salt = Vault::generate_salt();
-    let salt_path = config.data_dir.join("vault.salt");
-    if let Err(e) = fs::write(&salt_path, salt) {
-        eprintln!("warning: failed to write vault salt: {e}");
-    }
-
-    let service = init_keyring_service.clone();
-    let account = init_keyring_account.clone();
-    // Three-axis gate. `bin/ember.rs` is not covered by the gate inside
-    // `resolve_passphrase` because it calls `keyring::Entry::new` directly.
-    // Skipping here keeps `cargo test -p emberlink-cli --bin emberlink-cli`
-    // from firing real keychain popups — that was the 2026-04-22 leak.
-    if keyring_writes_suppressed() {
-        println!("Initialized ember");
-        println!("  Config:   {}", config_path.display());
-        println!("  Policy:   {}", policy_path.display());
-        println!("  Vault:    keyring write skipped (test/mock gate)");
-        println!("  Persona:  {}", persona.name);
-        return;
-    }
-    let vault_status = match keyring::Entry::new(&service, &account) {
-        Ok(entry) => {
-            // 32 chars from an alphanumeric alphabet (62 chars) → ~190 bits of entropy.
-            // Rejection-sampled from OS entropy to avoid modulo bias. See the
-            // matching implementation in ember-daemon::vault::generate_passphrase.
-            const ALPHABET: &[u8; 62] =
-                b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-            let mut passphrase = String::with_capacity(32);
-            let mut scratch = [0u8; 64];
-            while passphrase.len() < 32 {
-                getrandom::fill(&mut scratch).expect("OS entropy failure");
-                for &b in &scratch {
-                    if passphrase.len() == 32 {
-                        break;
-                    }
-                    if b < 248 {
-                        passphrase.push(ALPHABET[(b % 62) as usize] as char);
-                    }
-                }
-            }
-            match entry.set_password(&passphrase) {
-                Ok(()) => {
-                    match verify_keyring_roundtrip(&service, &account, &passphrase) {
-                        Ok(()) => format!("passphrase stored in system keyring (service={service}, account={account})"),
-                        Err(e) => {
-                            eprintln!("  Vault:    keyring write succeeded but read-back failed ({e})");
-                            eprintln!("           This usually means the keyring crate is using its in-memory mock backend.");
-                            eprintln!("           Set EMBER_VAULT_PASSPHRASE env var to bypass the keyring.");
-                            "keyring unavailable (see above)".to_string()
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("  Vault:    keyring unavailable ({e})");
-                    eprintln!("           Set EMBER_VAULT_PASSPHRASE env var instead");
-                    "keyring unavailable (see above)".to_string()
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("  Vault:    keyring unavailable ({e})");
-            eprintln!("           Set EMBER_VAULT_PASSPHRASE env var instead");
-            "keyring unavailable (see above)".to_string()
         }
     };
 
@@ -960,9 +1121,9 @@ fn cmd_daemon_reload(config: &DaemonConfig, timeout_secs: u64, cli_config: Optio
     }
 }
 
-/// Parse a decimal dollar string like "0.50" into integer cents (50).
-/// Rejects negative values and non-numeric input.
-fn parse_cents(s: &str) -> Result<u64, String> {
+/// Parse a decimal USD string like "0.50" into integer cents (50).
+/// Input is dollars; output is cents. Rejects negative values and non-numeric input.
+fn parse_usd_to_cents(s: &str) -> Result<u64, String> {
     let trimmed = s.trim();
     if trimmed.starts_with('-') {
         return Err("negative budget not allowed".to_string());
@@ -1073,17 +1234,14 @@ fn parse_duration(s: &str) -> Result<u64, String> {
     if let Some(n) = s.strip_suffix('s') {
         n.parse::<u64>().map_err(|_| format!("invalid duration '{s}'"))
     } else if let Some(n) = s.strip_suffix('m') {
-        n.parse::<u64>()
-            .map(|v| v * 60)
-            .map_err(|_| format!("invalid duration '{s}'"))
+        let v = n.parse::<u64>().map_err(|_| format!("invalid duration '{s}'"))?;
+        v.checked_mul(60).ok_or_else(|| format!("duration overflow '{s}'"))
     } else if let Some(n) = s.strip_suffix('h') {
-        n.parse::<u64>()
-            .map(|v| v * 3600)
-            .map_err(|_| format!("invalid duration '{s}'"))
+        let v = n.parse::<u64>().map_err(|_| format!("invalid duration '{s}'"))?;
+        v.checked_mul(3600).ok_or_else(|| format!("duration overflow '{s}'"))
     } else if let Some(n) = s.strip_suffix('d') {
-        n.parse::<u64>()
-            .map(|v| v * 86400)
-            .map_err(|_| format!("invalid duration '{s}'"))
+        let v = n.parse::<u64>().map_err(|_| format!("invalid duration '{s}'"))?;
+        v.checked_mul(86400).ok_or_else(|| format!("duration overflow '{s}'"))
     } else {
         s.parse::<u64>()
             .map_err(|_| format!("invalid duration '{s}' (expected e.g. 15s, 5m, 2h, 1d, or bare seconds)"))
@@ -1205,92 +1363,132 @@ fn print_receipt_summary(r: &core_types::grant_receipt::GrantReceipt) {
     println!("  Actions observed: {} entry(ies)", r.actions_observed.len());
 }
 
-/// Render budget and usage for a grant.
-fn cmd_grant_budget(info: &GrantInfo) {
+/// Format a budget axis line: `label: <used> / <cap> (<pct>%)`.
+fn fmt_budget_line(label: &str, used: u64, cap: u64) -> String {
+    let pct = (used * 100).checked_div(cap).unwrap_or(0);
+    format!("    {label:<12} {:>9} / {:>9} ({pct}%)", used, cap)
+}
+
+/// Convert a `ResourceSelector` to a compact display string.
+fn resource_selector_display(sel: &ResourceSelector) -> String {
+    match sel {
+        ResourceSelector::Exact { value } => value.clone(),
+        ResourceSelector::Glob { pattern } => pattern.clone(),
+        ResourceSelector::Regex { pattern } => format!("/{pattern}/"),
+        ResourceSelector::Any => "*".to_string(),
+    }
+}
+
+/// Render per-Statement budget and usage for a composite (or legacy) grant.
+///
+/// Pure function over `&AccessGrant` — testable without I/O.
+fn render_grant_budget(grant: &AccessGrant) -> String {
+    use std::fmt::Write as _;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    println!("Grant {}", info.id);
-    println!("  Persona: {}", info.persona_id);
-    println!("  Scope:   {}", info.scope);
-    println!("  Status:  {}", info.status);
-
-    if let Some(ref exp) = info.expires_at {
-        // Try to show remaining TTL
-        if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(exp) {
-            let remaining = parsed.timestamp() - chrono::Utc::now().timestamp();
-            if remaining > 0 {
-                println!("  TTL:     {}m remaining", remaining / 60);
-            } else {
-                println!("  TTL:     expired");
-            }
-        } else {
-            println!("  TTL:     {exp}");
-        }
-    } else {
-        println!("  TTL:     never");
-    }
-
+    let mut out = String::new();
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    if let Some(ref budget) = info.budget {
-        println!("  Budget:");
-        if let Some(bt) = budget.tokens {
-            let used = info.usage.tokens;
-            let pct = (used * 100).checked_div(bt).unwrap_or(0);
-            println!("    tokens:   {:>9} / {:>9} ({}%)", used, bt, pct);
-        }
-        if let Some(bc) = budget.cents {
-            let used = info.usage.cents;
-            let pct = (used * 100).checked_div(bc).unwrap_or(0);
-            println!("    cents:    {:>9} / {:>9} ({}%)", used, bc, pct);
-        }
-        if let Some(br) = budget.requests {
-            let used = info.usage.requests;
-            let pct = (used * 100).checked_div(br).unwrap_or(0);
-            println!("    requests: {:>9} / {:>9} ({}%)", used, br, pct);
-        }
+    let _ = writeln!(out, "Grant {}", grant.id);
+    let _ = writeln!(out, "  Persona: {}", grant.issuing_persona_id);
+    let _ = writeln!(out, "  Status:  {}", grant.effective_status(now_secs).as_str());
 
-        // Compute runway if usage is recent (last_updated within 5 minutes and non-zero)
-        let last_updated = info.usage.last_updated;
-        let age_secs = if last_updated > 0 && now_secs >= last_updated {
-            now_secs - last_updated
-        } else {
-            u64::MAX
-        };
-        let stale = age_secs > 300 || last_updated == 0;
-
-        if !stale {
-            let minutes_elapsed = age_secs as f64 / 60.0;
-            println!("  Runway:");
-            if let Some(bt) = budget.tokens {
-                let used = info.usage.tokens;
-                if used > 0 && bt > used {
-                    let rate = used as f64 / minutes_elapsed;
-                    let remaining_min = (bt - used) as f64 / rate;
-                    println!("    tokens:   ~{}m", remaining_min.round() as u64);
-                } else {
-                    println!("    tokens:   —");
-                }
+    // Effective TTL from the earliest block expiry.
+    match grant.effective_expires_at() {
+        Some(exp_epoch) => {
+            let remaining = exp_epoch as i64 - now_secs as i64;
+            if remaining > 0 {
+                let _ = writeln!(out, "  TTL:     {}m remaining", remaining / 60);
+            } else {
+                let _ = writeln!(out, "  TTL:     expired");
             }
-            if let Some(bc) = budget.cents {
-                let used = info.usage.cents;
-                if used > 0 && bc > used {
-                    let rate = used as f64 / minutes_elapsed;
-                    let remaining_min = (bc - used) as f64 / rate;
-                    println!("    cents:    ~{}m", remaining_min.round() as u64);
-                } else {
-                    println!("    cents:    —");
-                }
-            }
-        } else {
-            println!("  Runway:  —");
         }
-    } else {
-        println!("  Budget:  (none)");
+        None => {
+            let _ = writeln!(out, "  TTL:     never");
+        }
     }
+
+    // Per-Statement budget rows.
+    let statements: Vec<(usize, &Statement)> = grant.statements().collect();
+    let is_composite = statements.len() > 1;
+
+    for (_bi, stmt) in &statements {
+        if is_composite {
+            let _ = writeln!(
+                out,
+                "  Statement {}  {}  {}",
+                stmt.sid,
+                stmt.resource_type.as_str(),
+                resource_selector_display(&stmt.resource),
+            );
+        }
+        let indent = if is_composite { "    " } else { "  " };
+
+        match &stmt.budget {
+            None => {
+                let _ = writeln!(out, "{indent}Budget:  (none)");
+            }
+            Some(b) => {
+                let _ = writeln!(out, "{indent}Budget:");
+                if let Some(cap) = b.tokens {
+                    let _ = writeln!(out, "  {}", fmt_budget_line("tokens:", stmt.usage.tokens, cap));
+                }
+                if let Some(cap) = b.cents {
+                    let _ = writeln!(out, "  {}", fmt_budget_line("cents:", stmt.usage.cents, cap));
+                }
+                if let Some(cap) = b.requests {
+                    let _ = writeln!(out, "  {}", fmt_budget_line("requests:", stmt.usage.requests, cap));
+                }
+                if let Some(cap) = b.wall_clock_secs {
+                    let _ = writeln!(out, "  {}", fmt_budget_line("wall-clock:", stmt.usage.wall_clock_secs, cap));
+                }
+
+                // Runway (rate-based estimate) — only when usage is fresh (<5 min).
+                let last_updated = stmt.usage.last_updated;
+                let age_secs = if last_updated > 0 && now_secs >= last_updated {
+                    now_secs - last_updated
+                } else {
+                    u64::MAX
+                };
+                let stale = age_secs > 300 || last_updated == 0;
+
+                if !stale {
+                    let minutes_elapsed = (age_secs as f64 / 60.0).max(0.001);
+                    let _ = writeln!(out, "{indent}Runway:");
+                    if let Some(cap) = b.tokens {
+                        let used = stmt.usage.tokens;
+                        if used > 0 && cap > used {
+                            let remaining_min = (cap - used) as f64 / (used as f64 / minutes_elapsed);
+                            let _ = writeln!(out, "  {indent}  tokens:      ~{}m", remaining_min.round() as u64);
+                        } else {
+                            let _ = writeln!(out, "  {indent}  tokens:      —");
+                        }
+                    }
+                    if let Some(cap) = b.cents {
+                        let used = stmt.usage.cents;
+                        if used > 0 && cap > used {
+                            let remaining_min = (cap - used) as f64 / (used as f64 / minutes_elapsed);
+                            let _ = writeln!(out, "  {indent}  cents:       ~{}m", remaining_min.round() as u64);
+                        } else {
+                            let _ = writeln!(out, "  {indent}  cents:       —");
+                        }
+                    }
+                } else if !is_composite {
+                    let _ = writeln!(out, "{indent}Runway:  —");
+                }
+            }
+        }
+    }
+
+    out
+}
+
+/// Print budget and usage for a grant to stdout.
+fn cmd_grant_budget(grant: &AccessGrant) {
+    print!("{}", render_grant_budget(grant));
 }
 
 fn main() {
@@ -1310,12 +1508,6 @@ fn main() {
                         process::exit(1);
                     }
                     let log_path = config.data_dir.join("daemon.log");
-                    let log_file = fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&log_path)
-                        .expect("open log file");
-                    let err_file = log_file.try_clone().expect("clone log file");
 
                     let exe = std::env::current_exe().expect("current exe");
                     let mut cmd = std::process::Command::new(exe);
@@ -1323,8 +1515,10 @@ fn main() {
                     if let Some(ref config_path) = cli.config {
                         cmd.arg("--config").arg(config_path);
                     }
-                    cmd.stdout(log_file)
-                        .stderr(err_file)
+                    // Background child writes logs via tracing-appender; no console output.
+                    cmd.env("EMBER_DAEMON_NO_CONSOLE", "1")
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
                         .stdin(std::process::Stdio::null());
 
                     let child = cmd.spawn().expect("spawn daemon");
@@ -1335,15 +1529,17 @@ fn main() {
                     return;
                 }
 
-                tracing_subscriber::fmt()
-                    .with_env_filter(
-                        EnvFilter::try_from_default_env()
-                            .unwrap_or_else(|_| EnvFilter::new(config.log_level.as_filter_str())),
-                    )
-                    .init();
+                if let Err(e) = config.ensure_dirs() {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+                let console = std::env::var("EMBER_DAEMON_NO_CONSOLE").is_err();
+                let _log_guard = configure_tracing(&config.data_dir, &config.log_level, console);
 
                 // Print everything except the dashboard line up-front.
-                print_banner_preamble(&config);
+                if console {
+                    print_banner_preamble(&config);
+                }
 
                 let runtime = match &cli.config {
                     Some(p) => DaemonRuntime::new_with_config_path(config, p.clone()),
@@ -1363,8 +1559,11 @@ fn main() {
                 // It prints the dashboard banner line + footer from the tokio thread,
                 // which is fine because eprintln! is synchronous and we're not in
                 // an async context that cares about thread identity.
-                let notify: Box<dyn FnOnce(DashboardBind)> =
-                    Box::new(|bind| print_banner_dashboard(&bind));
+                let notify: Box<dyn FnOnce(DashboardBind)> = if console {
+                    Box::new(|bind| print_banner_dashboard(&bind))
+                } else {
+                    Box::new(|_bind| {})
+                };
 
                 if let Err(e) = rt.block_on(runtime.run(Some(notify))) {
                     eprintln!("error: {e}");
@@ -1550,23 +1749,51 @@ fn main() {
                     allowed_targets,
                     delegation_depth,
                     budget_tokens,
-                    budget_cents,
+                    budget_usd,
                     budget_requests,
                     budget_seconds,
                     attestation_runtime,
+                    standing,
+                    max_children_per_day,
+                    auto_delegate_scope_template,
                 } => {
-                    let parsed_cents = match budget_cents.as_deref() {
-                        Some(s) => match parse_cents(s) {
+                    // — `--standing` requires `--max-children-per-day`
+                    // and implies a delegation depth, so reject the
+                    // ambiguous combinations up front.
+                    if standing && max_children_per_day.is_none() {
+                        eprintln!(
+                            "error: --standing requires --max-children-per-day"
+                        );
+                        process::exit(1);
+                    }
+                    if standing && delegation_depth.is_none() {
+                        eprintln!(
+                            "error: --standing requires --delegation-depth (the parent must allow delegation)"
+                        );
+                        process::exit(1);
+                    }
+                    let parsed_cents = match budget_usd.as_deref() {
+                        Some(s) => match parse_usd_to_cents(s) {
                             Ok(c) => Some(c),
                             Err(e) => {
-                                eprintln!("error: --budget-cents: {e}");
+                                eprintln!("error: --budget-usd: {e}");
+                                process::exit(1);
+                            }
+                        },
+                        None => None,
+                    };
+                    let ttl_secs = match ttl.as_deref() {
+                        Some(s) => match parse_duration(s) {
+                            Ok(v) => Some(v),
+                            Err(e) => {
+                                eprintln!("error: --ttl: {e}");
                                 process::exit(1);
                             }
                         },
                         None => None,
                     };
                     let budget = build_budget(budget_tokens, parsed_cents, budget_requests, budget_seconds);
-                    match store.create_grant(&persona, &credential, &scope, ttl) {
+                    match store.create_grant(&persona, &credential, &scope, ttl_secs) {
                     Ok(info) => {
                         // Apply conditions via UPDATE if any are set
                         let targets_json = allowed_targets.as_ref().map(|t| {
@@ -1596,6 +1823,23 @@ fn main() {
                                     info.id,
                                 ],
                             );
+                        }
+                        // — flip the `is_standing` flag after the
+                        // base grant row exists so `mark_grant_standing`
+                        // can enforce its preconditions (grant must exist;
+                        // ceiling > 0). Depth was already set by the UPDATE
+                        // above when --delegation-depth was passed, which
+                        // the standing precondition requires.
+                        if standing
+                            && let Some(limit) = max_children_per_day
+                            && let Err(e) = store.mark_grant_standing(
+                                &info.id,
+                                limit,
+                                auto_delegate_scope_template.as_deref(),
+                            )
+                        {
+                            eprintln!("error: failed to mark grant standing: {e}");
+                            process::exit(1);
                         }
                         println!("Created grant");
                         println!("  ID:         {}", info.id);
@@ -1633,6 +1877,15 @@ fn main() {
                                 println!("  Budget:     {}s wall-clock", s);
                             }
                         }
+                        if standing {
+                            println!(
+                                "  Standing:   yes (max {}/day)",
+                                max_children_per_day.unwrap_or(0)
+                            );
+                            if let Some(ref tpl) = auto_delegate_scope_template {
+                                println!("  Auto-scope: {tpl}");
+                            }
+                        }
                     }
                     Err(e) => {
                         eprintln!("error: {e}");
@@ -1645,18 +1898,67 @@ fn main() {
                     persona,
                     scope,
                     ttl,
-                } => match store.delegate_grant(&parent, &persona, &scope, ttl) {
-                    Ok(info) => {
-                        println!("Delegated grant");
-                        println!("  ID:     {}", info.id);
-                        println!("  Parent: {}", parent);
-                        println!("  Scope:  {}", info.scope);
+                    budget_tokens,
+                    budget_usd,
+                    budget_requests,
+                    budget_seconds,
+                } => {
+                    let ttl_secs = match ttl.as_deref() {
+                        Some(s) => match parse_duration(s) {
+                            Ok(n) => Some(n),
+                            Err(e) => {
+                                eprintln!("error: --ttl: {e}");
+                                process::exit(1);
+                            }
+                        },
+                        None => None,
+                    };
+                    let parsed_cents = match budget_usd.as_deref() {
+                        Some(s) => match parse_usd_to_cents(s) {
+                            Ok(c) => Some(c),
+                            Err(e) => {
+                                eprintln!("error: --budget-usd: {e}");
+                                process::exit(1);
+                            }
+                        },
+                        None => None,
+                    };
+                    let child_budget = build_budget(
+                        budget_tokens,
+                        parsed_cents,
+                        budget_requests,
+                        budget_seconds,
+                    );
+                    match store.delegate_grant_full(
+                        &parent,
+                        &persona,
+                        &scope,
+                        ttl_secs,
+                        child_budget,
+                    ) {
+                        Ok(info) => {
+                            if cli.json {
+                                println!(
+                                    "{}",
+                                    serde_json::json!({
+                                        "id": info.id,
+                                        "parent_grant_id": parent,
+                                        "persona_id": info.persona_id,
+                                        "scope": info.scope,
+                                        "expires_at": info.expires_at,
+                                        "budget": info.budget,
+                                    })
+                                );
+                            } else {
+                                println!("{}", info.id);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            process::exit(1);
+                        }
                     }
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        process::exit(1);
-                    }
-                },
+                }
                 GrantAction::List { active } => {
                     let grants = if active {
                         store.list_active_grants()
@@ -1682,14 +1984,9 @@ fn main() {
                             } else {
                                 for g in &list {
                                     let exp = g.expires_at.as_deref().unwrap_or("never");
-                                    let status = if g.status == "revoked" {
-                                        " [revoked]"
-                                    } else {
-                                        ""
-                                    };
                                     println!(
-                                        "{} {} → {} ({}){} expires {}",
-                                        g.id, g.persona_id, g.credential_name, g.scope, status, exp
+                                        "{} {} → {} ({}) expires {} [{}]",
+                                        g.id, g.persona_id, g.credential_name, g.scope, exp, g.status
                                     );
                                 }
                             }
@@ -1714,8 +2011,8 @@ fn main() {
                         process::exit(1);
                     }
                 },
-                GrantAction::Budget { grant_id } => match store.get_grant(&grant_id) {
-                    Ok(info) => cmd_grant_budget(&info),
+                GrantAction::Budget { grant_id } => match store.get_access_grant(&grant_id) {
+                    Ok(grant) => cmd_grant_budget(&grant),
                     Err(e) => {
                         eprintln!("error: {e}");
                         process::exit(1);
@@ -1723,7 +2020,7 @@ fn main() {
                 },
                 GrantAction::Extend { grant_id, tokens, cents, ttl } => {
                     let parsed_cents = match cents.as_deref() {
-                        Some(s) => match parse_cents(s) {
+                        Some(s) => match parse_usd_to_cents(s) {
                             Ok(c) => Some(c),
                             Err(e) => {
                                 eprintln!("error: --cents: {e}");
@@ -1858,16 +2155,32 @@ fn main() {
                         process::exit(1);
                     }
                 },
-                SandboxAction::Stop { id } => match store.stop_sandbox(&id) {
-                    Ok(()) => println!("Stopped sandbox {id}"),
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        process::exit(1);
+                SandboxAction::Stop { id } => {
+                    let resolved = match store.resolve_sandbox_id(&id) {
+                        Ok(uuid) => uuid,
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            process::exit(1);
+                        }
+                    };
+                    match store.stop_sandbox(&resolved) {
+                        Ok(()) => println!("Stopped sandbox {resolved}"),
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            process::exit(1);
+                        }
                     }
-                },
+                }
                 SandboxAction::Exec { id, command } => {
+                    let resolved_id = match store.resolve_sandbox_id(&id) {
+                        Ok(uuid) => uuid,
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            process::exit(1);
+                        }
+                    };
                     let refs: Vec<&str> = command.iter().map(String::as_str).collect();
-                    match store.exec_sandbox(&id, &refs) {
+                    match store.exec_sandbox(&resolved_id, &refs) {
                         Ok(output) => print!("{output}"),
                         Err(e) => {
                             eprintln!("error: {e}");
@@ -1882,17 +2195,17 @@ fn main() {
                     env,
                     credential_resource,
                     budget_tokens,
-                    budget_cents: budget_cents_str,
+                    budget_usd: budget_usd_str,
                     budget_seconds,
                     ttl,
                     prompt,
                 } => {
-                    // Parse --budget-cents into integer cents.
-                    let parsed_cents = match budget_cents_str.as_deref() {
-                        Some(s) => match parse_cents(s) {
+                    // Parse --budget-usd (dollars) into integer cents for storage.
+                    let parsed_cents = match budget_usd_str.as_deref() {
+                        Some(s) => match parse_usd_to_cents(s) {
                             Ok(c) => Some(c),
                             Err(e) => {
-                                eprintln!("error: --budget-cents: {e}");
+                                eprintln!("error: --budget-usd: {e}");
                                 process::exit(1);
                             }
                         },
@@ -1976,81 +2289,204 @@ fn main() {
                     }
 
                     // Mint the composite grant if a credential resource was supplied.
+                    //
+                    // implementation-note-1 — route the composite mint through the policy
+                    // engine so `default_decision = "require_approval"` fires
+                    // here. Three outcomes:
+                    //   - AutoApprove: mint immediately (legacy fast-path)
+                    //   - RequireApproval: submit ONE approval entry that
+                    //     bundles all 3 statements; do NOT exec prompt; exit
+                    //     so the operator can `ember approval approve <id>`
+                    //   - Deny: error and exit non-zero
+                    //
+                    // The policy action name is `credential.access` to match
+                    // the daemon's existing credential-access rule shape.
+                    let mut sandbox_grant_pending = false;
                     if statement_count > 0 {
                         let credential_res = credential_resource.as_deref().unwrap_or("");
-                        match store.create_grant(
-                            &sandbox.persona_id,
-                            credential_res,
-                            "composite",
-                            ttl_secs,
-                        ) {
-                            Ok(grant_info) => {
-                                // Replace the single-statement shim create_grant wrote with
-                                // the canonical 3-statement envelope in blocks_json so the
-                                // dashboard + handler emit per-Statement arrays.
-                                let created_at_epoch =
-                                    chrono::Utc::now().timestamp().max(0) as u64;
-                                let expires_at_epoch = ttl_secs.map(|s| {
-                                    created_at_epoch.saturating_add(s)
-                                });
-                                // Block 0 is signed under the sandbox
-                                // persona's root Ed25519 key — the daemon
-                                // owns that key material so the CLI looks it
-                                // up from the same store it writes through.
-                                let composite_result = store
-                                    .persona_root_keypair(&sandbox.persona_id)
-                                    .and_then(|root| {
-                                        ember_daemon::grant::access_grant_from_statements(
-                                            &grant_info.id,
-                                            &sandbox.persona_id,
-                                            credential_res,
-                                            statements.clone(),
-                                            created_at_epoch,
-                                            expires_at_epoch,
-                                            &root,
-                                        )
-                                    });
-                                match composite_result {
-                                    Ok(composite) => {
-                                        if let Err(e) =
-                                            store.overwrite_grant_blocks(&grant_info.id, &composite)
-                                        {
-                                            eprintln!(
-                                                "warning: grant minted but composite chain overwrite failed: {e}"
-                                            );
+                        let policy_engine = if config.policy_file.exists() {
+                            ember_daemon::policy::PolicyEngine::from_file(&config.policy_file)
+                                .unwrap_or_default()
+                        } else {
+                            ember_daemon::policy::PolicyEngine::default()
+                        };
+                        let policy_action = "credential.access".to_string();
+                        let eval = policy_engine.evaluate(&policy_action);
+                        let risk_str = format!("{:?}", eval.risk).to_lowercase();
+
+                        match eval.decision {
+                            ember_daemon::policy::PolicyDecision::Deny => {
+                                eprintln!(
+                                    "error: policy denied composite grant mint for {credential_res} \
+                                     (rule: {})",
+                                    eval.matched_rule.as_deref().unwrap_or("(default)")
+                                );
+                                process::exit(1);
+                            }
+                            ember_daemon::policy::PolicyDecision::RequireApproval => {
+                                match store.submit_composite_approval(
+                                    &sandbox.persona_id,
+                                    credential_res,
+                                    "composite",
+                                    ttl_secs,
+                                    &policy_action,
+                                    &risk_str,
+                                    statements.clone(),
+                                ) {
+                                    Ok(req) => {
+                                        sandbox_grant_pending = true;
+                                        println!("Approval required for composite grant");
+                                        println!("  Approval ID: {}", req.id);
+                                        println!("  Statements:  {statement_count}");
+                                        println!(
+                                            "    [0] credential:read  on {credential_res}"
+                                        );
+                                        if let Some(t) = budget_tokens {
+                                            println!("    [1] llm:generate     on anthropic/*  budget={t} tokens");
+                                        } else {
+                                            println!("    [1] llm:generate     on anthropic/*  (no token budget)");
                                         }
+                                        if let Some(s) = budget_seconds {
+                                            println!("    [2] time:wall_clock  on *             budget={s}s");
+                                        } else {
+                                            println!("    [2] time:wall_clock  on *             (no time budget)");
+                                        }
+                                        println!();
+                                        println!(
+                                            "  Approve from CLI: ember approval approve {}",
+                                            req.id
+                                        );
+                                        println!(
+                                            "  Or open dashboard: http://localhost:3141/approvals/{}",
+                                            req.id
+                                        );
                                     }
                                     Err(e) => {
                                         eprintln!(
-                                            "warning: grant minted but composite chain signing failed: {e}"
+                                            "warning: sandbox started but submitting approval failed: {e}"
                                         );
                                     }
                                 }
-                                println!("Minted 3-statement composite grant");
-                                println!("  Grant ID:   {}", grant_info.id);
-                                println!("  Statements: {statement_count}");
-                                println!("    [0] credential:read  on {credential_res}");
-                                if let Some(t) = budget_tokens {
-                                    println!("    [1] llm:generate     on anthropic/*  budget={t} tokens");
-                                } else {
-                                    println!("    [1] llm:generate     on anthropic/*  (no token budget)");
-                                }
-                                if let Some(s) = budget_seconds {
-                                    println!("    [2] time:wall_clock  on *             budget={s}s");
-                                } else {
-                                    println!("    [2] time:wall_clock  on *             (no time budget)");
-                                }
-                                println!("  One approval. Three meters. One receipt at the end.");
-                                if let Some(ref p) = prompt {
-                                    println!("  Prompt: {p}");
-                                }
                             }
-                            Err(e) => {
-                                eprintln!("warning: sandbox started but grant creation failed: {e}");
+                            ember_daemon::policy::PolicyDecision::AutoApprove => {
+                                // Seed the parent grant with scope "*" so the
+                                // bipartite-dominance check in
+                                // `overwrite_grant_blocks` accepts the typed
+                                // child statements (Credential / Session /
+                                // Time) below the wildcard parent.
+                                match store.create_grant(
+                                    &sandbox.persona_id,
+                                    credential_res,
+                                    "*",
+                                    ttl_secs,
+                                ) {
+                                    Ok(grant_info) => {
+                                        // Replace the single-statement shim create_grant wrote with
+                                        // the canonical 3-statement envelope in blocks_json so the
+                                        // dashboard + handler emit per-Statement arrays.
+                                        let created_at_epoch =
+                                            chrono::Utc::now().timestamp().max(0) as u64;
+                                        let expires_at_epoch = ttl_secs.map(|s| {
+                                            created_at_epoch.saturating_add(s)
+                                        });
+                                        // Block 0 is signed under the sandbox
+                                        // persona's root Ed25519 key — the daemon
+                                        // owns that key material so the CLI looks it
+                                        // up from the same store it writes through.
+                                        let composite_result = store
+                                            .persona_root_keypair(&sandbox.persona_id)
+                                            .and_then(|root| {
+                                                ember_daemon::grant::access_grant_from_statements(
+                                                    &grant_info.id,
+                                                    &sandbox.persona_id,
+                                                    credential_res,
+                                                    statements.clone(),
+                                                    created_at_epoch,
+                                                    expires_at_epoch,
+                                                    &root,
+                                                )
+                                            });
+                                        match composite_result {
+                                            Ok(composite) => {
+                                                if let Err(e) =
+                                                    store.overwrite_grant_blocks(&grant_info.id, &composite)
+                                                {
+                                                    eprintln!(
+                                                        "warning: grant minted but composite chain overwrite failed: {e}"
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                eprintln!(
+                                                    "warning: grant minted but composite chain signing failed: {e}"
+                                                );
+                                            }
+                                        }
+                                        println!("Minted 3-statement composite grant");
+                                        println!("  Grant ID:   {}", grant_info.id);
+                                        println!("  Statements: {statement_count}");
+                                        println!("    [0] credential:read  on {credential_res}");
+                                        if let Some(t) = budget_tokens {
+                                            println!("    [1] llm:generate     on anthropic/*  budget={t} tokens");
+                                        } else {
+                                            println!("    [1] llm:generate     on anthropic/*  (no token budget)");
+                                        }
+                                        if let Some(s) = budget_seconds {
+                                            println!("    [2] time:wall_clock  on *             budget={s}s");
+                                        } else {
+                                            println!("    [2] time:wall_clock  on *             (no time budget)");
+                                        }
+                                        println!("  One approval. Three meters. One receipt at the end.");
+                                        if let Some(ref p) = prompt {
+                                            println!("  Prompt: {p}");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("warning: sandbox started but grant creation failed: {e}");
+                                    }
+                                }
                             }
                         }
                     } else {
                         println!("  (no --credential-resource supplied — grant not minted)");
+                    }
+
+                    // If a prompt was given and the container started, hand off to
+                    // `docker exec -it <container_id> claude -p "<prompt>"`.  The
+                    // child process inherits stdin/stdout so Claude Code's output
+                    // streams directly to the operator's terminal.
+                    //
+                    // implementation-note-1 — when the composite grant is pending approval,
+                    // skip the agent exec; the operator must approve first
+                    // (then re-run / `ember sandbox exec`) to give the agent
+                    // its credentials.
+                    if sandbox_grant_pending {
+                        if prompt.is_some() {
+                            eprintln!(
+                                "  (skipping agent exec — approve the composite grant first)"
+                            );
+                        }
+                    } else if let Some(ref p) = prompt {
+                        if container_id != "none" {
+                            let exit_status = std::process::Command::new("docker")
+                                .args(["exec", "-it", &container_id, "claude", "-p", p])
+                                .status();
+                            match exit_status {
+                                Ok(s) if s.success() => {}
+                                Ok(s) => {
+                                    eprintln!(
+                                        "warning: claude exited with status {}",
+                                        s.code().unwrap_or(-1)
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!("error: docker exec failed: {e}");
+                                    process::exit(1);
+                                }
+                            }
+                        } else {
+                            eprintln!("warning: container did not start — skipping claude exec");
+                        }
                     }
                 }
             }
@@ -2065,10 +2501,38 @@ fn main() {
                             println!("No pending approvals");
                         } else {
                             for r in &requests {
-                                println!(
-                                    "{} {} → {} ({}) [{}]",
-                                    r.id, r.persona_id, r.credential_name, r.action, r.risk_level
-                                );
+                                // implementation-note-1 — composite envelopes render as
+                                // ONE entry with N statements listed beneath.
+                                if let Some(stmts) = r.composite_statements.as_ref() {
+                                    println!(
+                                        "{} {} → {} ({}) [{}]  composite ({} statements)",
+                                        r.id,
+                                        r.persona_id,
+                                        r.credential_name,
+                                        r.action,
+                                        r.risk_level,
+                                        stmts.len(),
+                                    );
+                                    for (i, s) in stmts.iter().enumerate() {
+                                        let actions = s.actions.join(",");
+                                        let resource = match &s.resource {
+                                            core_types::ResourceSelector::Exact { value } => {
+                                                value.clone()
+                                            }
+                                            core_types::ResourceSelector::Glob { pattern } => {
+                                                pattern.clone()
+                                            }
+                                            core_types::ResourceSelector::Any => "*".to_string(),
+                                            _ => format!("{:?}", s.resource),
+                                        };
+                                        println!("    [{i}] {actions} on {resource}");
+                                    }
+                                } else {
+                                    println!(
+                                        "{} {} → {} ({}) [{}]",
+                                        r.id, r.persona_id, r.credential_name, r.action, r.risk_level
+                                    );
+                                }
                             }
                         }
                     }
@@ -2118,6 +2582,14 @@ fn main() {
                                 println!("  Review: ember grant standing list");
                             } else {
                                 println!("Approved {id}");
+                            }
+                            // implementation-note-1 — surface the grant ID minted by a
+                            // composite-approval resolution so the operator
+                            // (or test harness) can use it directly.
+                            if let Ok(resolved) = store.get_approval(&id)
+                                && let Some(grant_id) = resolved.result_grant_id.as_deref()
+                            {
+                                println!("  Grant ID: {grant_id}");
                             }
                         }
                         Err(e) => {
@@ -2645,6 +3117,7 @@ mod tests {
             log_level: ember_daemon::config::LogLevel::Info,
             dashboard_addr: None,
             keyring: ember_daemon::config::KeyringConfig::default(),
+            stale_approval_threshold_secs: 3600,
         };
 
         // Suppress keyring and passphrase side-effects.
@@ -2658,13 +3131,21 @@ mod tests {
 
         let contents = std::fs::read_to_string(&config_path).unwrap();
         assert!(contents.contains("[keyring]"), "config must contain [keyring] section");
+        // Service/account match the same resolution cmd_init uses — env var
+        // (if set by cargo-test.sh) else compile-time default. Using the
+        // same resolution instead of hardcoding DEFAULT avoids the race where
+        // a concurrent test's env mutation breaks this assertion.
+        let expected_service = std::env::var("EMBER_KEYRING_SERVICE")
+            .unwrap_or_else(|_| DEFAULT_KEYRING_SERVICE.to_string());
+        let expected_account = std::env::var("EMBER_KEYRING_ACCOUNT")
+            .unwrap_or_else(|_| DEFAULT_KEYRING_ACCOUNT.to_string());
         assert!(
-            contents.contains(&format!("service = \"{}\"", DEFAULT_KEYRING_SERVICE)),
-            "config must contain default service name"
+            contents.contains(&format!("service = \"{expected_service}\"")),
+            "config must contain resolved service name; got:\n{contents}"
         );
         assert!(
-            contents.contains(&format!("account = \"{}\"", DEFAULT_KEYRING_ACCOUNT)),
-            "config must contain default account name"
+            contents.contains(&format!("account = \"{expected_account}\"")),
+            "config must contain resolved account name; got:\n{contents}"
         );
     }
 
@@ -2683,6 +3164,7 @@ mod tests {
             log_level: ember_daemon::config::LogLevel::Info,
             dashboard_addr: None,
             keyring: ember_daemon::config::KeyringConfig::default(),
+            stale_approval_threshold_secs: 3600,
         };
 
         unsafe {
@@ -2702,6 +3184,35 @@ mod tests {
         let contents = std::fs::read_to_string(&config_path).unwrap();
         assert!(contents.contains("service = \"custom-service\""), "config must use custom service");
         assert!(contents.contains("account = \"custom-account\""), "config must use custom account");
+    }
+
+    #[test]
+    fn resolve_init_keyring_value_flag_wins_over_env_and_default() {
+        let v = resolve_init_keyring_value(
+            Some("from-flag".to_string()),
+            Some("from-env".to_string()),
+            "from-default",
+        );
+        assert_eq!(v, "from-flag");
+    }
+
+    #[test]
+    fn resolve_init_keyring_value_env_wins_over_default_when_flag_absent() {
+        // Regression guard: 2026-04-23 leak. qember.sh sets
+        // EMBER_KEYRING_SERVICE but not --keyring-service; init previously
+        // wrote the passphrase to the production service anyway.
+        let v = resolve_init_keyring_value(
+            None,
+            Some("from-env".to_string()),
+            "from-default",
+        );
+        assert_eq!(v, "from-env");
+    }
+
+    #[test]
+    fn resolve_init_keyring_value_falls_through_to_default_when_flag_and_env_absent() {
+        let v = resolve_init_keyring_value(None, None, "from-default");
+        assert_eq!(v, "from-default");
     }
 
     #[test]
@@ -2750,17 +3261,17 @@ mod tests {
     }
 
     #[test]
-    fn parse_cents_accepts_decimal() {
-        assert_eq!(parse_cents("0.50").unwrap(), 50);
-        assert_eq!(parse_cents("1.00").unwrap(), 100);
-        assert_eq!(parse_cents("0.01").unwrap(), 1);
-        assert_eq!(parse_cents("10").unwrap(), 1000);
+    fn parse_usd_to_cents_accepts_decimal() {
+        assert_eq!(parse_usd_to_cents("0.50").unwrap(), 50);
+        assert_eq!(parse_usd_to_cents("1.00").unwrap(), 100);
+        assert_eq!(parse_usd_to_cents("0.01").unwrap(), 1);
+        assert_eq!(parse_usd_to_cents("10").unwrap(), 1000);
     }
 
     #[test]
-    fn parse_cents_rejects_negative() {
-        assert!(parse_cents("-1.00").is_err());
-        assert!(parse_cents("-0.01").is_err());
+    fn parse_usd_to_cents_rejects_negative() {
+        assert!(parse_usd_to_cents("-1.00").is_err());
+        assert!(parse_usd_to_cents("-0.01").is_err());
     }
 
     #[test]
@@ -2770,6 +3281,22 @@ mod tests {
         assert_eq!(parse_duration("2h").unwrap(), 7200);
         assert_eq!(parse_duration("1d").unwrap(), 86400);
         assert_eq!(parse_duration("60").unwrap(), 60);
+    }
+
+    #[test]
+    fn parse_duration_rejects_overflow_on_days() {
+        // u64::MAX / 86400 + 1 parses fine as u64 but overflows when multiplied by 86400
+        let overflow_days = u64::MAX / 86400 + 1;
+        let input = format!("{overflow_days}d");
+        assert!(parse_duration(&input).is_err(), "days overflow should return Err");
+        // Same for hours: u64::MAX / 3600 + 1
+        let overflow_hours = u64::MAX / 3600 + 1;
+        let input = format!("{overflow_hours}h");
+        assert!(parse_duration(&input).is_err(), "hours overflow should return Err");
+        // Same for minutes: u64::MAX / 60 + 1
+        let overflow_mins = u64::MAX / 60 + 1;
+        let input = format!("{overflow_mins}m");
+        assert!(parse_duration(&input).is_err(), "minutes overflow should return Err");
     }
 
     #[test]
@@ -2842,81 +3369,432 @@ mod tests {
         assert!(stmts[2].budget.is_none(), "time budget absent when no seconds flag");
     }
 
+    // --- helpers for render_grant_budget tests ---
+
+    fn make_test_statement(sid: &str, rt: ResourceType, resource: &str, budget: Option<Budget>, usage: Usage) -> Statement {
+        Statement {
+            sid: sid.into(),
+            resource_type: rt,
+            actions: vec!["read".to_string()],
+            resource: ResourceSelector::Glob { pattern: resource.to_string() },
+            budget,
+            usage,
+            conditions: vec![],
+        }
+    }
+
+    fn make_test_grant(statements_by_block: Vec<Vec<Statement>>) -> AccessGrant {
+        use core_types::{
+            AttestationBinding, Block, GrantMode, GrantStatus, PresentationAudienceKind,
+            RecipientProfile, SignedBlock,
+        };
+        let blocks: Vec<SignedBlock> = statements_by_block
+            .into_iter()
+            .map(|stmts| SignedBlock {
+                block: Block {
+                    statements: stmts,
+                    nbf: None,
+                    expires_at: None,
+                    issued_by: "persona-test".into(),
+                    issued_at: 0,
+                    approval: None,
+                    note: None,
+                },
+                pubkey_next: "deadbeef".into(),
+                signature: "cafebabe".into(),
+            })
+            .collect();
+        AccessGrant {
+            id: "grant-test".into(),
+            version: 1,
+            issuing_persona_id: "persona-test".into(),
+            recipient_kind: PresentationAudienceKind::Service,
+            recipient_id: "cred".into(),
+            recipient_profile: RecipientProfile::Agent,
+            status: GrantStatus::Active,
+            mode: GrantMode::OneShot,
+            blocks,
+            attestation: AttestationBinding::default(),
+            created_at: 0,
+            updated_at: 0,
+            revoked_at: None,
+            revoked_reason: None,
+            last_used_at: None,
+            label: None,
+        }
+    }
+
     #[test]
     fn grant_budget_renders_populated_grant() {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let now_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let info = ember_daemon::grant::GrantInfo {
-            id: "grant-test123".to_string(),
-            persona_id: "persona-xyz".to_string(),
-            credential_name: "api-key".to_string(),
-            scope: "github:push:owner/repo:feat/*".to_string(),
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            expires_at: Some(chrono::Utc::now().to_rfc3339()),
-            status: "active".to_string(),
-            max_uses_per_hour: None,
-            allowed_hours_start: None,
-            allowed_hours_end: None,
-            allowed_targets: None,
-            parent_grant_id: None,
-            max_delegation_depth: None,
-            spending_limit_cents: None,
-            budget: Some(Budget {
-                tokens: Some(20_000),
-                cents: Some(50),
-                requests: None,
-                wall_clock_secs: None,
-                ..Budget::default()
-            }),
-            usage: Usage {
-                tokens: 14_342,
-                cents: 37,
-                last_updated: now_secs - 60,
-                ..Usage::default()
-            },
-            paused: false,
-            receipt_id: None,
-        };
+        let stmt = make_test_statement(
+            "S0",
+            ResourceType::Session,
+            "llm:generate",
+            Some(Budget { tokens: Some(20_000), cents: Some(50), requests: None, workload_hours: None, wall_clock_secs: None }),
+            Usage { tokens: 14_342, cents: 37, last_updated: 0, ..Usage::default() },
+        );
+        let grant = make_test_grant(vec![vec![stmt]]);
         // Should not panic; budget and usage are populated.
-        cmd_grant_budget(&info);
+        let out = render_grant_budget(&grant);
+        assert!(out.contains("14342"), "missing token usage: {out}");
+        assert!(out.contains("20000"), "missing token cap: {out}");
     }
 
     #[test]
     fn grant_budget_renders_dash_when_usage_stale() {
-        let info = ember_daemon::grant::GrantInfo {
-            id: "grant-stale".to_string(),
-            persona_id: "persona-xyz".to_string(),
-            credential_name: "api-key".to_string(),
-            scope: "read".to_string(),
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            expires_at: None,
-            status: "active".to_string(),
-            max_uses_per_hour: None,
-            allowed_hours_start: None,
-            allowed_hours_end: None,
-            allowed_targets: None,
-            parent_grant_id: None,
-            max_delegation_depth: None,
-            spending_limit_cents: None,
-            budget: Some(Budget {
-                tokens: Some(20_000),
-                cents: None,
-                requests: None,
-                wall_clock_secs: None,
-                ..Budget::default()
-            }),
-            usage: Usage {
-                tokens: 5_000,
-                last_updated: 0, // stale — never updated
-                ..Usage::default()
-            },
-            paused: false,
-            receipt_id: None,
-        };
-        // Should not panic; runway should show dash.
-        cmd_grant_budget(&info);
+        let stmt = make_test_statement(
+            "S0",
+            ResourceType::Session,
+            "llm:generate",
+            Some(Budget { tokens: Some(20_000), cents: None, requests: None, workload_hours: None, wall_clock_secs: None }),
+            Usage { tokens: 5_000, last_updated: 0, ..Usage::default() },
+        );
+        let grant = make_test_grant(vec![vec![stmt]]);
+        // Stale usage — runway should show dash.
+        let out = render_grant_budget(&grant);
+        assert!(out.contains("Runway:  —"), "expected stale runway dash: {out}");
+    }
+
+    #[test]
+    fn render_single_statement_no_budget() {
+        let stmt = make_test_statement("S0", ResourceType::Credential, "credential:*", None, Usage::default());
+        let grant = make_test_grant(vec![vec![stmt]]);
+        let out = render_grant_budget(&grant);
+        assert!(out.contains("Grant grant-test"), "missing header: {out}");
+        assert!(out.contains("Budget:  (none)"), "expected no-budget line: {out}");
+        // Single-statement grants must NOT show per-statement header.
+        assert!(!out.contains("Statement S0"), "should not show stmt header for single: {out}");
+    }
+
+    #[test]
+    fn render_composite_three_statements() {
+        let s0 = make_test_statement("S0", ResourceType::Credential, "credential:*", None, Usage::default());
+        let s1 = make_test_statement(
+            "S1",
+            ResourceType::Session,
+            "llm:generate",
+            Some(Budget { tokens: Some(20_000), cents: Some(100), requests: None, workload_hours: None, wall_clock_secs: None }),
+            Usage { tokens: 12_450, cents: 85, requests: 0, workload_hours: 0, wall_clock_secs: 0, last_updated: 0 },
+        );
+        let s2 = make_test_statement(
+            "S2",
+            ResourceType::Time,
+            "session:*",
+            Some(Budget { tokens: None, cents: None, requests: None, workload_hours: None, wall_clock_secs: Some(1800) }),
+            Usage { tokens: 0, cents: 0, requests: 0, workload_hours: 0, wall_clock_secs: 240, last_updated: 0 },
+        );
+        let grant = make_test_grant(vec![vec![s0, s1, s2]]);
+        let out = render_grant_budget(&grant);
+
+        // Should have per-statement headers.
+        assert!(out.contains("Statement S0"), "missing S0 header: {out}");
+        assert!(out.contains("Statement S1"), "missing S1 header: {out}");
+        assert!(out.contains("Statement S2"), "missing S2 header: {out}");
+
+        // S0 has no budget.
+        assert!(out.contains("Budget:  (none)"), "expected no-budget for S0: {out}");
+
+        // S1 shows token and cent usage.
+        assert!(out.contains("12450"), "missing token usage: {out}");
+        assert!(out.contains("20000"), "missing token cap: {out}");
+        assert!(out.contains("62%"), "wrong token pct: {out}");
+        assert!(out.contains("85%"), "wrong cent pct: {out}");
+
+        // S2 shows wall-clock usage.
+        assert!(out.contains("240"), "missing wall-clock used: {out}");
+        assert!(out.contains("1800"), "missing wall-clock cap: {out}");
+        assert!(out.contains("13%"), "wrong wall-clock pct: {out}");
+    }
+
+    /// Verifies that configure_tracing writes JSON log lines to a rolling file.
+    ///
+    /// Marked `#[ignore]` because it installs a global tracing subscriber, which
+    /// conflicts with other tests in the same process. Run with:
+    ///   cargo test -p emberlink-cli -- --ignored configure_tracing_writes_json_log
+    #[test]
+    #[ignore]
+    fn configure_tracing_writes_json_log() {
+        use ember_daemon::config::LogLevel;
+        use std::io::BufRead;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path();
+
+        let guard = configure_tracing(data_dir, &LogLevel::Info, false);
+        tracing::info!(test_marker = "unit-test-probe", "configure_tracing_writes_json_log probe");
+        // Drop guard to flush the non-blocking writer before reading the file.
+        drop(guard);
+
+        // tracing-appender rolling daily names files <prefix>.<YYYY-MM-DD>
+        let log_file = std::fs::read_dir(data_dir)
+            .unwrap()
+            .flatten()
+            .find(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("daemon.log")
+            })
+            .expect("daemon.log.* should exist after drop");
+
+        let file = std::fs::File::open(log_file.path()).unwrap();
+        let reader = std::io::BufReader::new(file);
+        let found = reader.lines().flatten().any(|line| {
+            // Each line should be a JSON object; look for our test marker.
+            line.contains("unit-test-probe")
+        });
+        assert!(found, "expected test_marker in log file");
+    }
+
+    // --- sandbox run flag-parsing tests ---
+
+    fn parse_sandbox_run(args: &[&str]) -> SandboxAction {
+        use clap::Parser as _;
+        // Build the full CLI args: ["ember", "sandbox", "run", ...args]
+        let full: Vec<&str> = std::iter::once("ember")
+            .chain(std::iter::once("sandbox"))
+            .chain(std::iter::once("run"))
+            .chain(args.iter().copied())
+            .collect();
+        let cli = Cli::try_parse_from(&full).expect("parse failed");
+        match cli.command {
+            Commands::Sandbox { action } => action,
+            _ => panic!("expected Sandbox command"),
+        }
+    }
+
+    #[test]
+    fn sandbox_run_parses_required_name_and_image() {
+        let action = parse_sandbox_run(&["agent-coding", "--image", "ember-claude-code:v1", "--prompt", "hello"]);
+        match action {
+            SandboxAction::Run { name, image, prompt, .. } => {
+                assert_eq!(name, "agent-coding");
+                assert_eq!(image, "ember-claude-code:v1");
+                assert_eq!(prompt.as_deref(), Some("hello"));
+            }
+            _ => panic!("expected SandboxAction::Run"),
+        }
+    }
+
+    #[test]
+    fn sandbox_run_default_image_is_ubuntu() {
+        let action = parse_sandbox_run(&["my-sandbox"]);
+        match action {
+            SandboxAction::Run { image, .. } => {
+                assert_eq!(image, "ubuntu:24.04");
+            }
+            _ => panic!("expected SandboxAction::Run"),
+        }
+    }
+
+    #[test]
+    fn sandbox_run_prompt_is_optional() {
+        let action = parse_sandbox_run(&["my-sandbox", "--image", "alpine:3"]);
+        match action {
+            SandboxAction::Run { prompt, .. } => {
+                assert!(prompt.is_none());
+            }
+            _ => panic!("expected SandboxAction::Run"),
+        }
+    }
+
+    #[test]
+    fn sandbox_run_parses_workspace_from() {
+        let action = parse_sandbox_run(&[
+            "ws-sandbox",
+            "--image", "ember-claude-code:v1",
+            "--workspace-from", "https://github.com/example/repo",
+        ]);
+        match action {
+            SandboxAction::Run { workspace_from, .. } => {
+                assert_eq!(workspace_from.as_deref(), Some("https://github.com/example/repo"));
+            }
+            _ => panic!("expected SandboxAction::Run"),
+        }
+    }
+
+    #[test]
+    fn sandbox_run_parses_env_vars() {
+        let action = parse_sandbox_run(&[
+            "env-sandbox",
+            "--env", "FOO=bar",
+            "--env", "BAZ=qux",
+        ]);
+        match action {
+            SandboxAction::Run { env, .. } => {
+                assert!(env.contains(&"FOO=bar".to_string()));
+                assert!(env.contains(&"BAZ=qux".to_string()));
+            }
+            _ => panic!("expected SandboxAction::Run"),
+        }
+    }
+
+    #[test]
+    fn sandbox_run_parses_ttl() {
+        let action = parse_sandbox_run(&[
+            "ttl-sandbox",
+            "--ttl", "30m",
+        ]);
+        match action {
+            SandboxAction::Run { ttl, .. } => {
+                assert_eq!(ttl.as_deref(), Some("30m"));
+            }
+            _ => panic!("expected SandboxAction::Run"),
+        }
+    }
+
+    fn parse_grant_create(args: &[&str]) -> GrantAction {
+        use clap::Parser as _;
+        let full: Vec<&str> = std::iter::once("ember")
+            .chain(std::iter::once("grant"))
+            .chain(std::iter::once("create"))
+            .chain(args.iter().copied())
+            .collect();
+        let cli = Cli::try_parse_from(&full).expect("parse failed");
+        match cli.command {
+            Commands::Grant { action } => action,
+            _ => panic!("expected Grant command"),
+        }
+    }
+
+    #[test]
+    fn grant_create_ttl_parses_humantime_and_bare_integer() {
+        for (input, expected_secs) in [
+            ("5s", 5u64),
+            ("5m", 300),
+            ("2h", 7200),
+            ("30", 30),
+        ] {
+            let action = parse_grant_create(&[
+                "--persona", "p1",
+                "--credential", "cred-x",
+                "--scope", "read",
+                "--ttl", input,
+            ]);
+            match action {
+                GrantAction::Create { ttl, .. } => {
+                    let s = ttl.as_deref().unwrap_or("");
+                    let parsed = parse_duration(s).expect("should parse");
+                    assert_eq!(parsed, expected_secs, "input={input}");
+                }
+                _ => panic!("expected GrantAction::Create"),
+            }
+        }
+    }
+
+    #[test]
+    fn sandbox_run_parses_budget_tokens_and_usd() {
+        let action = parse_sandbox_run(&[
+            "budget-sandbox",
+            "--budget-tokens", "20000",
+            "--budget-usd", "0.50",
+        ]);
+        match action {
+            SandboxAction::Run { budget_tokens, budget_usd, .. } => {
+                assert_eq!(budget_tokens, Some(20_000u64));
+                assert_eq!(budget_usd.as_deref(), Some("0.50"));
+            }
+            _ => panic!("expected SandboxAction::Run"),
+        }
+    }
+
+    #[test]
+    fn sandbox_run_parses_credential_resource() {
+        let action = parse_sandbox_run(&[
+            "cred-sandbox",
+            "--credential-resource", "obj-github-token",
+        ]);
+        match action {
+            SandboxAction::Run { credential_resource, .. } => {
+                assert_eq!(credential_resource.as_deref(), Some("obj-github-token"));
+            }
+            _ => panic!("expected SandboxAction::Run"),
+        }
+    }
+
+    #[test]
+    fn sandbox_run_full_flags() {
+        let action = parse_sandbox_run(&[
+            "full-sandbox",
+            "--image", "ember-claude-code:v1",
+            "--prompt", "echo hello",
+            "--workspace-from", "https://github.com/example/repo",
+            "--env", "KEY=val",
+            "--ttl", "60s",
+            "--budget-tokens", "5000",
+            "--budget-usd", "0.25",
+            "--budget-seconds", "3600",
+            "--credential-resource", "obj-anthropic-key",
+        ]);
+        match action {
+            SandboxAction::Run {
+                name,
+                image,
+                prompt,
+                workspace_from,
+                env,
+                ttl,
+                budget_tokens,
+                budget_usd,
+                budget_seconds,
+                credential_resource,
+            } => {
+                assert_eq!(name, "full-sandbox");
+                assert_eq!(image, "ember-claude-code:v1");
+                assert_eq!(prompt.as_deref(), Some("echo hello"));
+                assert_eq!(workspace_from.as_deref(), Some("https://github.com/example/repo"));
+                assert!(env.contains(&"KEY=val".to_string()));
+                assert_eq!(ttl.as_deref(), Some("60s"));
+                assert_eq!(budget_tokens, Some(5_000u64));
+                assert_eq!(budget_usd.as_deref(), Some("0.25"));
+                assert_eq!(budget_seconds, Some(3_600u64));
+                assert_eq!(credential_resource.as_deref(), Some("obj-anthropic-key"));
+            }
+            _ => panic!("expected SandboxAction::Run"),
+        }
+    }
+
+    // --- belt-and-suspenders: production checkpoint gate for cmd_init ---
+
+    /// Verify that `check_production_sentinel` blocks production keyring writes
+    /// when the checkpoint file is absent. This is the gate that `cmd_init` calls
+    /// before `keyring::Entry::new` — belt-and-suspenders alongside prior change's
+    /// `resolve_init_keyring_value` fix.
+    #[test]
+    fn production_sentinel_fires_when_file_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No ~/.ember-production in tmp — checkpoint must reject.
+        let result =
+            check_production_sentinel(DEFAULT_KEYRING_SERVICE, DEFAULT_KEYRING_SERVICE, tmp.path());
+        assert!(
+            result.is_err(),
+            "checkpoint should reject production service when opt-in file is absent"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("refusing to open production keychain"),
+            "error message should explain the refusal; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn production_sentinel_passes_when_file_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".ember-production"), b"").unwrap();
+        let result =
+            check_production_sentinel(DEFAULT_KEYRING_SERVICE, DEFAULT_KEYRING_SERVICE, tmp.path());
+        assert!(result.is_ok(), "checkpoint should pass when opt-in file exists");
+    }
+
+    #[test]
+    fn production_sentinel_passes_for_non_production_service() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No checkpoint file, but service is not the production default → should pass.
+        let result =
+            check_production_sentinel("ember-daemon-test", DEFAULT_KEYRING_SERVICE, tmp.path());
+        assert!(
+            result.is_ok(),
+            "checkpoint should pass when service differs from production default"
+        );
     }
 }

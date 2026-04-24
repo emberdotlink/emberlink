@@ -1,4 +1,9 @@
 use crate::encoding::*;
+use crate::size_limits::{
+    MAX_BADGE_PAYLOAD_HEX_BYTES, MAX_CIPHERTEXT_HEX_BYTES, MAX_CONDITIONS_JSON_BYTES,
+    MAX_LABEL_BYTES, MAX_PUBLIC_KEY_HEX_BYTES, MAX_REASON_BYTES, MAX_SEALED_PAYLOAD_HEX_BYTES,
+    MAX_TRANSPORT_HINT_BYTES, validate_optional_size, validate_size,
+};
 use crate::{
     CanonicalEncode, FileManifest, PublicKeyMaterial, RecoveryScope, StorageLedgerEntry,
     StorageRelationship, SurvivalMode, Validate, ValidationError,
@@ -188,13 +193,6 @@ impl SignerBinding {
         }
     }
 
-    pub fn unknown(key_id: impl Into<String>) -> Self {
-        Self {
-            signer: EventSubject::unknown("legacy"),
-            key_id: key_id.into(),
-            role: KeyRole::Unknown,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -700,11 +698,6 @@ pub enum EventBody {
     BadgeDisputed(BadgeDisputedEvent),
     CredentialDeposited(CredentialDepositedEvent),
     CredentialRevoked(CredentialRevokedEvent),
-    LegacyOpaque {
-        declared_type: EventType,
-        subject: EventSubject,
-        canonical_payload: Vec<u8>,
-    },
 }
 
 impl EventBody {
@@ -749,7 +742,6 @@ impl EventBody {
             Self::BadgeDisputed(_) => EventType::BadgeDisputed,
             Self::CredentialDeposited(_) => EventType::CredentialDeposited,
             Self::CredentialRevoked(_) => EventType::CredentialRevoked,
-            Self::LegacyOpaque { declared_type, .. } => *declared_type,
         }
     }
 
@@ -808,7 +800,6 @@ impl EventBody {
             Self::CredentialRevoked(body) => {
                 EventSubject::credential_deposit(body.grant_id.clone())
             }
-            Self::LegacyOpaque { subject, .. } => subject.clone(),
         }
     }
 
@@ -1038,18 +1029,44 @@ impl EventBody {
                     )?)?,
                 },
             )),
-            "trust-attested" => Ok(Self::TrustAttested(TrustAttestedEvent {
-                attestation_id: required_field(&fields, "attestation_id")?,
-                attester_persona_id: required_field(&fields, "attester_persona_id")?,
-                subject_persona_id: required_field(&fields, "subject_persona_id")?,
-                domain: required_field(&fields, "domain")?,
-                score: required_field(&fields, "score")?
+            "trust-attested" => {
+                // development milestone: `f32::from_str` happily accepts
+                // `"NaN"`, `"inf"`, `"-inf"`, and `"-0"` — the exact bit
+                // patterns EVENTS-H2 rejects on the emit path. An
+                // attacker-controlled event stream (relay, backup, peer
+                // sync) could re-inject those values via
+                // `decode_canonical`. Re-apply the same numeric guards
+                // here so the parse path is symmetric with `Validate
+                // for TrustAttestedEvent`.
+                let score = required_field(&fields, "score")?
                     .parse::<f32>()
                     .map_err(|err| {
                         ValidationError::invalid_format(format!("invalid trust score: {err}"))
-                    })?,
-                recipient_bound: optional_non_empty_field(&fields, "recipient_bound"),
-            })),
+                    })?;
+                if score.is_nan() {
+                    return Err(ValidationError::invalid_format(
+                        "trust score must not be NaN",
+                    ));
+                }
+                if score == 0.0 && score.is_sign_negative() {
+                    return Err(ValidationError::invalid_format(
+                        "trust score must not be negative zero",
+                    ));
+                }
+                if !(0.0..=1.0).contains(&score) {
+                    return Err(ValidationError::invalid_format(
+                        "trust score must be in [0.0, 1.0]",
+                    ));
+                }
+                Ok(Self::TrustAttested(TrustAttestedEvent {
+                    attestation_id: required_field(&fields, "attestation_id")?,
+                    attester_persona_id: required_field(&fields, "attester_persona_id")?,
+                    subject_persona_id: required_field(&fields, "subject_persona_id")?,
+                    domain: required_field(&fields, "domain")?,
+                    score,
+                    recipient_bound: optional_non_empty_field(&fields, "recipient_bound"),
+                }))
+            }
             "trust-revoked" => Ok(Self::TrustRevoked(TrustRevokedEvent {
                 attestation_id: required_field(&fields, "attestation_id")?,
                 attester_persona_id: required_field(&fields, "attester_persona_id")?,
@@ -1168,19 +1185,6 @@ impl EventBody {
                         ValidationError::invalid_format("revoked_at must be a valid u64")
                     })?,
             })),
-            "legacy-opaque" => Ok(Self::LegacyOpaque {
-                declared_type: EventType::parse(&required_field(&fields, "declared_type")?)
-                    .ok_or_else(|| {
-                        ValidationError::invalid_format("invalid legacy declared type")
-                    })?,
-                subject: EventSubject::new(
-                    SubjectKind::parse(&required_field(&fields, "subject_kind")?).ok_or_else(
-                        || ValidationError::invalid_format("invalid legacy subject kind"),
-                    )?,
-                    required_field(&fields, "subject_id")?,
-                ),
-                canonical_payload: hex_to_bytes(&required_field(&fields, "payload_hex")?)?,
-            }),
             _ => Err(ValidationError::invalid_format(format!(
                 "unsupported canonical event body type: {record_type}"
             ))),
@@ -1468,6 +1472,7 @@ impl Validate for RootCreatedEvent {
     fn validate(&self) -> Result<(), ValidationError> {
         validate_non_empty(&self.root_id, "root id")?;
         validate_non_empty(&self.display_name, "display name")?;
+        validate_size(&self.display_name, "display name", MAX_LABEL_BYTES)?;
         self.initial_key.validate()
     }
 }
@@ -1489,7 +1494,8 @@ impl Validate for RootKeyRotatedEvent {
 impl Validate for RootRevokedEvent {
     fn validate(&self) -> Result<(), ValidationError> {
         validate_non_empty(&self.root_id, "root id")?;
-        validate_non_empty(&self.reason, "revocation reason")
+        validate_non_empty(&self.reason, "revocation reason")?;
+        validate_size(&self.reason, "revocation reason", MAX_REASON_BYTES)
     }
 }
 
@@ -1498,6 +1504,7 @@ impl Validate for DeviceAddedEvent {
         validate_non_empty(&self.root_id, "root id")?;
         validate_non_empty(&self.device_id, "device id")?;
         validate_non_empty(&self.label, "device label")?;
+        validate_size(&self.label, "device label", MAX_LABEL_BYTES)?;
         self.initial_key.validate()?;
         self.initial_encryption_key.validate()
     }
@@ -1540,7 +1547,8 @@ impl Validate for DeviceRevokedEvent {
     fn validate(&self) -> Result<(), ValidationError> {
         validate_non_empty(&self.root_id, "root id")?;
         validate_non_empty(&self.device_id, "device id")?;
-        validate_non_empty(&self.reason, "revocation reason")
+        validate_non_empty(&self.reason, "revocation reason")?;
+        validate_size(&self.reason, "revocation reason", MAX_REASON_BYTES)
     }
 }
 
@@ -1548,7 +1556,8 @@ impl Validate for DeviceFrozenEvent {
     fn validate(&self) -> Result<(), ValidationError> {
         validate_non_empty(&self.root_id, "root id")?;
         validate_non_empty(&self.device_id, "device id")?;
-        validate_non_empty(&self.reason, "freeze reason")
+        validate_non_empty(&self.reason, "freeze reason")?;
+        validate_size(&self.reason, "freeze reason", MAX_REASON_BYTES)
     }
 }
 
@@ -1571,6 +1580,7 @@ impl Validate for PersonaCreatedEvent {
         validate_non_empty(&self.root_id, "root id")?;
         validate_non_empty(&self.persona_id, "persona id")?;
         validate_non_empty(&self.label, "persona label")?;
+        validate_size(&self.label, "persona label", MAX_LABEL_BYTES)?;
         self.initial_key.validate()
     }
 }
@@ -1594,7 +1604,8 @@ impl Validate for PersonaRevokedEvent {
     fn validate(&self) -> Result<(), ValidationError> {
         validate_non_empty(&self.root_id, "root id")?;
         validate_non_empty(&self.persona_id, "persona id")?;
-        validate_non_empty(&self.reason, "revocation reason")
+        validate_non_empty(&self.reason, "revocation reason")?;
+        validate_size(&self.reason, "revocation reason", MAX_REASON_BYTES)
     }
 }
 
@@ -1615,7 +1626,13 @@ impl Validate for GuardianEnrolledEvent {
         validate_non_empty(&self.root_id, "root id")?;
         validate_non_empty(&self.guardian_id, "guardian id")?;
         validate_non_empty(&self.guardian_label, "guardian label")?;
-        validate_non_empty(&self.guardian_public_key, "guardian public key")
+        validate_size(&self.guardian_label, "guardian label", MAX_LABEL_BYTES)?;
+        validate_non_empty(&self.guardian_public_key, "guardian public key")?;
+        validate_size(
+            &self.guardian_public_key,
+            "guardian public key",
+            MAX_PUBLIC_KEY_HEX_BYTES,
+        )
     }
 }
 
@@ -1624,7 +1641,17 @@ impl Validate for GuardianKeyRotatedEvent {
         validate_non_empty(&self.guardian_id, "guardian id")?;
         validate_non_empty(&self.root_id, "root id")?;
         validate_non_empty(&self.previous_key_id, "previous key id")?;
+        validate_size(
+            &self.previous_key_id,
+            "previous key id",
+            MAX_PUBLIC_KEY_HEX_BYTES,
+        )?;
         validate_non_empty(&self.new_guardian_public_key, "new guardian public key")?;
+        validate_size(
+            &self.new_guardian_public_key,
+            "new guardian public key",
+            MAX_PUBLIC_KEY_HEX_BYTES,
+        )?;
         if self.previous_key_id == self.new_guardian_public_key {
             return Err(ValidationError::state_violation(
                 "rotated guardian key must change key id",
@@ -1653,7 +1680,8 @@ impl Validate for RecoveryContestedEvent {
     fn validate(&self) -> Result<(), ValidationError> {
         validate_non_empty(&self.request_id, "request id")?;
         validate_non_empty(&self.guardian_id, "guardian id")?;
-        validate_non_empty(&self.reason, "contest reason")
+        validate_non_empty(&self.reason, "contest reason")?;
+        validate_size(&self.reason, "contest reason", MAX_REASON_BYTES)
     }
 }
 
@@ -1661,7 +1689,8 @@ impl Validate for RecoveryRejectedEvent {
     fn validate(&self) -> Result<(), ValidationError> {
         validate_non_empty(&self.request_id, "request id")?;
         validate_non_empty(&self.rejected_by, "rejected by")?;
-        validate_non_empty(&self.reason, "rejection reason")
+        validate_non_empty(&self.reason, "rejection reason")?;
+        validate_size(&self.reason, "rejection reason", MAX_REASON_BYTES)
     }
 }
 
@@ -1677,6 +1706,23 @@ impl Validate for TrustAttestedEvent {
         validate_non_empty(&self.attester_persona_id, "attester persona id")?;
         validate_non_empty(&self.subject_persona_id, "subject persona id")?;
         validate_non_empty(&self.domain, "trust domain")?;
+        validate_size(&self.domain, "trust domain", MAX_LABEL_BYTES)?;
+        // EVENTS-H2: reject NaN and negative zero so canonical encoding
+        // `format!("{:.6}", score)` is deterministic. `+0.0 == -0.0` compares
+        // equal but renders as `"0.000000"` vs `"-0.000000"`, which would
+        // produce two distinct signed byte sequences for the same semantic
+        // score. `Range::contains` already excludes NaN, but we check
+        // explicitly so the error message is unambiguous.
+        if self.score.is_nan() {
+            return Err(ValidationError::invalid_format(
+                "trust score must not be NaN",
+            ));
+        }
+        if self.score == 0.0 && self.score.is_sign_negative() {
+            return Err(ValidationError::invalid_format(
+                "trust score must not be negative zero",
+            ));
+        }
         if !(0.0..=1.0).contains(&self.score) {
             return Err(ValidationError::invalid_format(
                 "trust score must be in [0.0, 1.0]",
@@ -1697,7 +1743,8 @@ impl Validate for RelayHintUpdatedEvent {
     fn validate(&self) -> Result<(), ValidationError> {
         validate_non_empty(&self.peer_id, "peer id")?;
         validate_non_empty(&self.device_id, "device id")?;
-        validate_non_empty(&self.transport_hint, "transport hint")
+        validate_non_empty(&self.transport_hint, "transport hint")?;
+        validate_size(&self.transport_hint, "transport hint", MAX_TRANSPORT_HINT_BYTES)
     }
 }
 
@@ -1706,7 +1753,17 @@ impl Validate for EndpointRotatedEvent {
         validate_non_empty(&self.peer_id, "peer id")?;
         validate_non_empty(&self.device_id, "device id")?;
         validate_non_empty(&self.previous_transport_hint, "previous transport hint")?;
+        validate_size(
+            &self.previous_transport_hint,
+            "previous transport hint",
+            MAX_TRANSPORT_HINT_BYTES,
+        )?;
         validate_non_empty(&self.new_transport_hint, "new transport hint")?;
+        validate_size(
+            &self.new_transport_hint,
+            "new transport hint",
+            MAX_TRANSPORT_HINT_BYTES,
+        )?;
         if self.previous_transport_hint == self.new_transport_hint {
             return Err(ValidationError::state_violation(
                 "endpoint rotation must change transport hint",
@@ -1719,7 +1776,8 @@ impl Validate for EndpointRotatedEvent {
 impl Validate for RelayShutdownNoticeEvent {
     fn validate(&self) -> Result<(), ValidationError> {
         validate_non_empty(&self.relay_peer_id, "relay peer id")?;
-        validate_non_empty(&self.reason, "shutdown reason")
+        validate_non_empty(&self.reason, "shutdown reason")?;
+        validate_size(&self.reason, "shutdown reason", MAX_REASON_BYTES)
     }
 }
 
@@ -1729,6 +1787,7 @@ impl Validate for MessageSentEvent {
         validate_non_empty(&self.sender_persona_id, "sender persona id")?;
         validate_non_empty(&self.recipient_persona_id, "recipient persona id")?;
         validate_non_empty(&self.ciphertext_hex, "ciphertext")?;
+        validate_size(&self.ciphertext_hex, "ciphertext", MAX_CIPHERTEXT_HEX_BYTES)?;
         Ok(())
     }
 }
@@ -1738,7 +1797,9 @@ impl Validate for ContentPublishedEvent {
         validate_non_empty(&self.content_id, "content id")?;
         validate_non_empty(&self.author_persona_id, "author persona id")?;
         validate_non_empty(&self.content_type, "content type")?;
+        validate_size(&self.content_type, "content type", MAX_LABEL_BYTES)?;
         validate_non_empty(&self.payload_hex, "payload")?;
+        validate_size(&self.payload_hex, "payload", MAX_CIPHERTEXT_HEX_BYTES)?;
         Ok(())
     }
 }
@@ -1749,6 +1810,7 @@ impl Validate for DisclosureRevokedEvent {
         validate_non_empty(&self.artifact_id, "artifact id")?;
         validate_non_empty(&self.revoker_persona_id, "revoker persona id")?;
         validate_non_empty(&self.reason, "reason")?;
+        validate_size(&self.reason, "reason", MAX_REASON_BYTES)?;
         Ok(())
     }
 }
@@ -1758,7 +1820,22 @@ impl Validate for GrantOfferCreatedEvent {
         validate_non_empty(&self.offer_id, "offer id")?;
         validate_non_empty(&self.issuer_persona_id, "issuer persona id")?;
         validate_non_empty(&self.ephemeral_public_key_hex, "ephemeral public key")?;
+        validate_size(
+            &self.ephemeral_public_key_hex,
+            "ephemeral public key",
+            MAX_PUBLIC_KEY_HEX_BYTES,
+        )?;
         validate_non_empty(&self.sealed_payload_hex, "sealed payload")?;
+        validate_size(
+            &self.sealed_payload_hex,
+            "sealed payload",
+            MAX_SEALED_PAYLOAD_HEX_BYTES,
+        )?;
+        validate_size(
+            &self.conditions_json,
+            "conditions json",
+            MAX_CONDITIONS_JSON_BYTES,
+        )?;
         if self.expires_at == 0 {
             return Err(ValidationError::invalid_format(
                 "grant offer must have a non-zero expiry",
@@ -1775,6 +1852,11 @@ impl Validate for GrantOfferCreatedEvent {
                 "relay_hint must be an https:// or wss:// URL",
             ));
         }
+        validate_optional_size(
+            self.relay_hint.as_deref(),
+            "relay hint",
+            MAX_TRANSPORT_HINT_BYTES,
+        )?;
         Ok(())
     }
 }
@@ -1784,6 +1866,11 @@ impl Validate for GrantOfferClaimedEvent {
         validate_non_empty(&self.offer_id, "offer id")?;
         validate_non_empty(&self.recipient_persona_id, "recipient persona id")?;
         validate_non_empty(&self.claim_response_hex, "claim response")?;
+        validate_size(
+            &self.claim_response_hex,
+            "claim response",
+            MAX_SEALED_PAYLOAD_HEX_BYTES,
+        )?;
         if self.claimed_at == 0 {
             return Err(ValidationError::invalid_format(
                 "claim timestamp must be non-zero",
@@ -1797,14 +1884,21 @@ impl Validate for GrantOfferRevokedEvent {
     fn validate(&self) -> Result<(), ValidationError> {
         validate_non_empty(&self.offer_id, "offer id")?;
         validate_non_empty(&self.issuer_persona_id, "issuer persona id")?;
-        validate_non_empty(&self.reason, "revocation reason")
+        validate_non_empty(&self.reason, "revocation reason")?;
+        validate_size(&self.reason, "revocation reason", MAX_REASON_BYTES)
     }
 }
 
 impl Validate for BadgeEvidence {
     fn validate(&self) -> Result<(), ValidationError> {
         validate_non_empty(&self.evidence_type, "evidence type")?;
-        validate_non_empty(&self.payload_hex, "evidence payload")
+        validate_size(&self.evidence_type, "evidence type", MAX_LABEL_BYTES)?;
+        validate_non_empty(&self.payload_hex, "evidence payload")?;
+        validate_size(
+            &self.payload_hex,
+            "evidence payload",
+            MAX_BADGE_PAYLOAD_HEX_BYTES,
+        )
     }
 }
 
@@ -1814,7 +1908,9 @@ impl Validate for BadgeIssuedEvent {
         validate_non_empty(&self.issuer_persona_id, "issuer persona id")?;
         validate_non_empty(&self.recipient_persona_id, "recipient persona id")?;
         validate_non_empty(&self.badge_type, "badge type")?;
+        validate_size(&self.badge_type, "badge type", MAX_LABEL_BYTES)?;
         validate_non_empty(&self.display_name, "display name")?;
+        validate_size(&self.display_name, "display name", MAX_LABEL_BYTES)?;
         if let Some(ref evidence) = self.evidence {
             evidence.validate()?;
         }
@@ -1831,7 +1927,8 @@ impl Validate for BadgeRevokedEvent {
     fn validate(&self) -> Result<(), ValidationError> {
         validate_non_empty(&self.badge_id, "badge id")?;
         validate_non_empty(&self.revoker_persona_id, "revoker persona id")?;
-        validate_non_empty(&self.reason, "revocation reason")
+        validate_non_empty(&self.reason, "revocation reason")?;
+        validate_size(&self.reason, "revocation reason", MAX_REASON_BYTES)
     }
 }
 
@@ -1840,7 +1937,13 @@ impl Validate for BadgeDisputedEvent {
         validate_non_empty(&self.dispute_id, "dispute id")?;
         validate_non_empty(&self.target_badge_id, "target badge id")?;
         validate_non_empty(&self.disputer_persona_id, "disputer persona id")?;
-        validate_non_empty(&self.reason, "dispute reason")
+        validate_non_empty(&self.reason, "dispute reason")?;
+        validate_size(&self.reason, "dispute reason", MAX_REASON_BYTES)?;
+        validate_optional_size(
+            self.evidence.as_deref(),
+            "dispute evidence",
+            MAX_BADGE_PAYLOAD_HEX_BYTES,
+        )
     }
 }
 
@@ -1871,6 +1974,7 @@ impl Validate for CredentialRevokedEvent {
         validate_non_empty(&self.grant_id, "grant id")?;
         validate_non_empty(&self.revoker_id, "revoker id")?;
         validate_non_empty(&self.reason, "revocation reason")?;
+        validate_size(&self.reason, "revocation reason", MAX_REASON_BYTES)?;
         if self.revoked_at == 0 {
             return Err(ValidationError::invalid_format(
                 "credential revocation revoked_at must be non-zero",
@@ -1944,17 +2048,6 @@ impl Validate for EventBody {
             Self::BadgeDisputed(body) => body.validate(),
             Self::CredentialDeposited(body) => body.validate(),
             Self::CredentialRevoked(body) => body.validate(),
-            Self::LegacyOpaque {
-                subject,
-                canonical_payload,
-                ..
-            } => {
-                subject.validate()?;
-                if canonical_payload.is_empty() {
-                    return Err(ValidationError::empty_field("legacy payload"));
-                }
-                Ok(())
-            }
         }
     }
 }
@@ -2410,19 +2503,6 @@ impl CanonicalEncode for EventBody {
                     ("revoked_at", body.revoked_at.to_string()),
                 ],
             ),
-            Self::LegacyOpaque {
-                declared_type,
-                subject,
-                canonical_payload,
-            } => canonical_record(
-                "legacy-opaque",
-                &[
-                    ("declared_type", declared_type.as_str().to_string()),
-                    ("subject_kind", subject.kind.as_str().to_string()),
-                    ("subject_id", subject.subject_id.clone()),
-                    ("payload_hex", bytes_to_hex(canonical_payload)),
-                ],
-            ),
         }
     }
 }
@@ -2637,3 +2717,306 @@ mod credential_validation_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod size_limit_tests {
+    //! Per-field caps and envelope-level backstop coverage for EVENTS-H1.
+    //! Each oversized-field test mirrors the attack shape from
+    //! `docs/the security review` H-1.
+    use super::*;
+    use crate::size_limits::{
+        MAX_BADGE_PAYLOAD_HEX_BYTES, MAX_CIPHERTEXT_HEX_BYTES, MAX_CONDITIONS_JSON_BYTES,
+        MAX_REASON_BYTES, MAX_SEALED_PAYLOAD_HEX_BYTES, MAX_TRANSPORT_HINT_BYTES,
+    };
+
+    fn assert_size_error(err: &ValidationError) {
+        assert!(
+            err.to_string().contains("exceeds maximum size"),
+            "expected size cap error, got: {err}"
+        );
+    }
+
+    fn valid_message_sent() -> MessageSentEvent {
+        MessageSentEvent {
+            message_id: "msg-001".into(),
+            sender_persona_id: "persona-a".into(),
+            recipient_persona_id: "persona-b".into(),
+            ciphertext_hex: "deadbeef".into(),
+        }
+    }
+
+    #[test]
+    fn message_sent_valid_passes() {
+        assert!(valid_message_sent().validate().is_ok());
+    }
+
+    #[test]
+    fn oversized_ciphertext_hex_rejected() {
+        let mut event = valid_message_sent();
+        event.ciphertext_hex = "a".repeat(MAX_CIPHERTEXT_HEX_BYTES + 1);
+        assert_size_error(&event.validate().unwrap_err());
+    }
+
+    fn valid_grant_offer() -> GrantOfferCreatedEvent {
+        GrantOfferCreatedEvent {
+            offer_id: "offer-001".into(),
+            issuer_persona_id: "persona-issuer".into(),
+            ephemeral_public_key_hex: "deadbeef".into(),
+            sealed_payload_hex: "cafebabe".into(),
+            relay_hint: None,
+            expires_at: 1_800_000_000,
+            conditions_json: String::new(),
+        }
+    }
+
+    #[test]
+    fn grant_offer_valid_passes() {
+        assert!(valid_grant_offer().validate().is_ok());
+    }
+
+    #[test]
+    fn oversized_sealed_payload_rejected() {
+        let mut event = valid_grant_offer();
+        event.sealed_payload_hex = "a".repeat(MAX_SEALED_PAYLOAD_HEX_BYTES + 1);
+        assert_size_error(&event.validate().unwrap_err());
+    }
+
+    #[test]
+    fn oversized_conditions_json_rejected() {
+        let mut event = valid_grant_offer();
+        event.conditions_json = "a".repeat(MAX_CONDITIONS_JSON_BYTES + 1);
+        assert_size_error(&event.validate().unwrap_err());
+    }
+
+    #[test]
+    fn oversized_relay_hint_rejected() {
+        let mut event = valid_grant_offer();
+        let mut hint = String::from("https://");
+        hint.push_str(&"a".repeat(MAX_TRANSPORT_HINT_BYTES + 1));
+        event.relay_hint = Some(hint);
+        assert_size_error(&event.validate().unwrap_err());
+    }
+
+    #[test]
+    fn oversized_persona_revocation_reason_rejected() {
+        let event = PersonaRevokedEvent {
+            root_id: "root-a".into(),
+            persona_id: "persona-a".into(),
+            reason: "x".repeat(MAX_REASON_BYTES + 1),
+        };
+        assert_size_error(&event.validate().unwrap_err());
+    }
+
+    #[test]
+    fn oversized_badge_evidence_payload_rejected() {
+        let evidence = BadgeEvidence {
+            evidence_type: "proof-of-ride".into(),
+            payload_hex: "a".repeat(MAX_BADGE_PAYLOAD_HEX_BYTES + 1),
+        };
+        assert_size_error(&evidence.validate().unwrap_err());
+    }
+
+    #[test]
+    fn oversized_dispute_evidence_rejected() {
+        let event = BadgeDisputedEvent {
+            dispute_id: "dispute-a".into(),
+            target_badge_id: "badge-a".into(),
+            disputer_persona_id: "persona-a".into(),
+            reason: "spurious".into(),
+            evidence: Some("a".repeat(MAX_BADGE_PAYLOAD_HEX_BYTES + 1)),
+        };
+        assert_size_error(&event.validate().unwrap_err());
+    }
+
+    #[test]
+    fn oversized_transport_hint_rejected() {
+        let event = RelayHintUpdatedEvent {
+            peer_id: "peer-a".into(),
+            device_id: "device-a".into(),
+            transport_hint: "a".repeat(MAX_TRANSPORT_HINT_BYTES + 1),
+        };
+        assert_size_error(&event.validate().unwrap_err());
+    }
+
+    #[test]
+    fn oversized_relay_shutdown_reason_rejected() {
+        let event = RelayShutdownNoticeEvent {
+            relay_peer_id: "peer-a".into(),
+            reason: "x".repeat(MAX_REASON_BYTES + 1),
+            deadline_epoch: 1_800_000_000,
+        };
+        assert_size_error(&event.validate().unwrap_err());
+    }
+
+    #[test]
+    fn at_limit_payloads_pass() {
+        // Per-field caps must accept exactly-at-limit values; off-by-one
+        // bugs would silently break legitimate payloads.
+        let mut msg = valid_message_sent();
+        msg.ciphertext_hex = "a".repeat(MAX_CIPHERTEXT_HEX_BYTES);
+        assert!(msg.validate().is_ok());
+
+        let mut offer = valid_grant_offer();
+        offer.sealed_payload_hex = "a".repeat(MAX_SEALED_PAYLOAD_HEX_BYTES);
+        offer.conditions_json = "a".repeat(MAX_CONDITIONS_JSON_BYTES);
+        assert!(offer.validate().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod trust_score_canonical_tests {
+    //! EVENTS-H2: `TrustAttestedEvent.score` canonical encoding must be
+    //! deterministic. `format!("{:.6}", score)` renders `+0.0` as
+    //! `"0.000000"` and `-0.0` as `"-0.000000"`, even though the two
+    //! values compare equal. We close the divergence by rejecting NaN
+    //! and negative-zero at the validation boundary so the existing
+    //! decimal encoding stays stable and existing signatures remain
+    //! verifiable.
+    use super::*;
+
+    fn valid_trust_attested(score: f32) -> TrustAttestedEvent {
+        TrustAttestedEvent {
+            attestation_id: "att-001".into(),
+            attester_persona_id: "persona-attester".into(),
+            subject_persona_id: "persona-subject".into(),
+            domain: "example".into(),
+            score,
+            recipient_bound: None,
+        }
+    }
+
+    #[test]
+    fn test_trust_attested_score_canonical_bit_exactness() {
+        // `+0.0 == -0.0` in IEEE-754 but they render to distinct strings
+        // under `format!("{:.6}", ...)`. Without the EVENTS-H2 guard an
+        // attacker could produce two valid signed attestations for the
+        // same semantic score. The fix: validation rejects negative
+        // zero, so only the positive-zero form can ever reach the
+        // canonical encoder.
+        let pos_zero = valid_trust_attested(0.0f32);
+        let neg_zero = valid_trust_attested(-0.0f32);
+
+        // Sanity: the two scores compare equal but have different bits.
+        assert_eq!(pos_zero.score, neg_zero.score);
+        assert_ne!(pos_zero.score.to_bits(), neg_zero.score.to_bits());
+
+        // The positive-zero form must pass validation.
+        pos_zero
+            .validate()
+            .expect("positive zero score is a valid attestation");
+
+        // The negative-zero form must be rejected at the validation
+        // boundary so it can never be signed.
+        let err = neg_zero
+            .validate()
+            .expect_err("negative zero score must be rejected");
+        assert!(
+            err.to_string().contains("negative zero"),
+            "expected negative-zero rejection, got: {err}"
+        );
+
+        // NaN must also be rejected (explicit check; `Range::contains`
+        // already excludes NaN but the error message would be
+        // misleading without the dedicated guard).
+        let nan_body = valid_trust_attested(f32::NAN);
+        let err = nan_body
+            .validate()
+            .expect_err("NaN score must be rejected");
+        assert!(
+            err.to_string().contains("NaN"),
+            "expected NaN rejection, got: {err}"
+        );
+
+        // Out-of-range values (negative, >1.0, infinity) still rejected.
+        assert!(valid_trust_attested(-0.5f32).validate().is_err());
+        assert!(valid_trust_attested(1.5f32).validate().is_err());
+        assert!(valid_trust_attested(f32::INFINITY).validate().is_err());
+        assert!(valid_trust_attested(f32::NEG_INFINITY).validate().is_err());
+    }
+
+    #[test]
+    fn test_trust_attested_score_canonical_roundtrip_positive_zero() {
+        // With `-0.0` rejected at validation, the canonical-encode /
+        // parse path must roundtrip cleanly for `+0.0`. The bytes
+        // produced before and after a parse-reencode pass must match.
+        let body = EventBody::TrustAttested(valid_trust_attested(0.0f32));
+        let encoded = body.canonical_encode();
+        let reparsed = EventBody::decode_canonical(&encoded)
+            .expect("positive-zero attestation must roundtrip");
+        let reencoded = reparsed.canonical_encode();
+        assert_eq!(
+            encoded, reencoded,
+            "canonical encoding must be idempotent for +0.0 score"
+        );
+    }
+
+    /// Build a canonical `trust-attested` payload with a caller-chosen
+    /// raw `score` string, bypassing the emit-path validation. The
+    /// emit path would refuse these values (EVENTS-H2), but an
+    /// attacker-controlled relay, backup, or peer stream can forge
+    /// the bytes directly. This helper lets us assert that
+    /// `decode_canonical` rejects them (development milestone).
+    fn hostile_trust_attested_payload(score_literal: &str) -> Vec<u8> {
+        format!(
+            "type=trust-attested\n\
+             attestation_id=att-001\n\
+             attester_persona_id=persona-attester\n\
+             subject_persona_id=persona-subject\n\
+             domain=example\n\
+             score={score_literal}\n\
+             recipient_bound=\n"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn decode_canonical_rejects_nan_score() {
+        // `f32::from_str("NaN")` succeeds, so the pre-C43 decode path
+        // would happily produce a `TrustAttestedEvent { score: NaN }`
+        // from attacker bytes.
+        let payload = hostile_trust_attested_payload("NaN");
+        let err = EventBody::decode_canonical(&payload)
+            .expect_err("NaN score must be rejected at decode");
+        assert!(
+            err.to_string().contains("NaN"),
+            "expected NaN rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn decode_canonical_rejects_negative_zero_score() {
+        // `"-0"` parses to the IEEE-754 negative-zero bit pattern, the
+        // exact case EVENTS-H2 closes because `format!("{:.6}", -0.0)`
+        // renders `"-0.000000"` and breaks canonical determinism.
+        let payload = hostile_trust_attested_payload("-0");
+        let err = EventBody::decode_canonical(&payload)
+            .expect_err("negative-zero score must be rejected at decode");
+        assert!(
+            err.to_string().contains("negative zero"),
+            "expected negative-zero rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn decode_canonical_rejects_infinity_score() {
+        // `"inf"` and `"-inf"` both parse as `f32` and fall outside
+        // `[0.0, 1.0]`; decode must reject them even though the raw
+        // string form is valid for `f32::from_str`.
+        let pos_inf = hostile_trust_attested_payload("inf");
+        let err = EventBody::decode_canonical(&pos_inf)
+            .expect_err("positive infinity score must be rejected at decode");
+        assert!(
+            err.to_string().contains("[0.0, 1.0]"),
+            "expected range rejection for +inf, got: {err}"
+        );
+
+        let neg_inf = hostile_trust_attested_payload("-inf");
+        let err = EventBody::decode_canonical(&neg_inf)
+            .expect_err("negative infinity score must be rejected at decode");
+        assert!(
+            err.to_string().contains("[0.0, 1.0]"),
+            "expected range rejection for -inf, got: {err}"
+        );
+    }
+}
+

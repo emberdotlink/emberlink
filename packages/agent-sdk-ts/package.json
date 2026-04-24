@@ -7,7 +7,7 @@
     "url": "https://github.com/emberdotlink/emberlink.git",
     "directory": "packages/agent-sdk-ts"
   },
-  "license": "MIT",
+  "license": "Apache-2.0",
   "version": "0.1.0",
   "type": "module",
   "main": "dist/index.js",

@@ -214,6 +214,9 @@ tbody td{padding:10px 14px;color:var(--text-primary)}
 .approval-card .field{color:var(--text-muted);font-size:11px}
 .approval-card .field-val{color:var(--text-primary);font-size:12px}
 .approval-card .actions{display:flex;gap:8px;margin-top:14px;padding-top:12px;border-top:1px solid var(--border)}
+.composite-statements{margin:6px 0 10px;padding:8px 10px;background:rgba(232,93,38,.05);border-left:2px solid var(--accent);border-radius:4px;font-size:11px}
+.composite-stmt{padding:4px 0;color:var(--text-primary)}
+.composite-stmt-idx{color:var(--text-muted);font-weight:600}
 .timeline{background:var(--bg-card);border:1px solid var(--border);border-radius:8px;overflow:hidden}
 .timeline-item{display:grid;grid-template-columns:180px 140px 160px 140px 80px;gap:12px;align-items:center;padding:10px 14px;border-bottom:1px solid var(--border);transition:background .1s}
 .timeline-item:last-child{border-bottom:none}
@@ -260,8 +263,14 @@ tbody td{padding:10px 14px;color:var(--text-primary)}
 .quick-pick:hover{border-color:var(--accent);color:var(--accent)}
 .modal-actions{display:flex;gap:8px;margin-top:16px}
 .badge.expired_by_budget{background:rgba(239,68,68,.15);color:var(--danger)}
+.badge.exhausted_by_budget{background:rgba(239,68,68,.15);color:var(--danger)}
 .badge.expired{background:rgba(107,107,123,.15);color:var(--text-muted)}
+.badge.paused{background:rgba(234,179,8,.15);color:var(--warning)}
 .badge.parent_cascade_revoked{background:rgba(239,68,68,.1);color:var(--danger)}
+.grant-status-active>td:first-child{border-left:3px solid var(--success)}
+.grant-status-expired>td:first-child{border-left:3px solid var(--warning)}
+.grant-status-revoked>td:first-child{border-left:3px solid var(--danger)}
+.grant-status-exhausted>td:first-child{border-left:3px solid var(--danger)}
 </style>
 </head>
 <body>
@@ -342,7 +351,9 @@ const CSRF_TOKEN = "{{CSRF_TOKEN}}";
 const CSRF_HEADERS = {'X-Ember-CSRF-Token': CSRF_TOKEN};
 function ts(iso){if(!iso)return'—';const d=new Date(iso);return d.toLocaleString(undefined,{month:'short',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'});}
 function trunc(s,n){if(!s)return'—';return s.length>n?s.slice(0,n)+'…':s;}
+function truncPersona(s){if(!s)return'—';const p='persona-';if(s.startsWith(p)){return p+s.slice(p.length,p.length+12);}return trunc(s,20);}
 function badge(cls,text){return`<span class="badge ${cls}">${text}</span>`;}
+function grantStatusClass(s){if(s==='active')return'active';if(s==='expired')return'expired';if(s==='revoked')return'revoked';if(s==='exhausted_by_budget'||s==='expired_by_budget')return'exhausted';return '';}
 
 // Active SSE connections keyed by grant id
 const sseConnections = {};
@@ -526,9 +537,9 @@ async function loadDashboard(){
     if(!grants||grants.length===0){
       gb.innerHTML='<tr><td colspan="8" class="empty">no grants</td></tr>';
     }else{
-      gb.innerHTML=grants.map(g=>`<tr id="grant-row-${g.id}">
+      gb.innerHTML=grants.map(g=>`<tr id="grant-row-${g.id}" class="grant-status-${grantStatusClass(g.status)}">
         <td class="mono">${trunc(g.id,18)}</td>
-        <td class="mono">${trunc(g.persona_id,20)}</td>
+        <td class="mono">${truncPersona(g.persona_id)}</td>
         <td>${g.credential_name||'—'}</td>
         <td>${g.scope||'—'}</td>
         <td class="gauge-cell">${renderBudgetGauge(g)}</td>
@@ -546,10 +557,36 @@ async function loadDashboard(){
     if(!approvals||approvals.length===0){
       ac.innerHTML='<div class="empty">no pending approvals</div>';
     }else{
-      ac.innerHTML=approvals.map(a=>`<div class="approval-card">
-        <div class="row"><span class="field">Persona</span><span class="field-val mono">${trunc(a.persona_id,20)}</span></div>
+      ac.innerHTML=approvals.map(a=>{
+        // implementation-note-1 — composite envelopes (sandbox-run) render as ONE card
+        // with all statements grouped underneath. Single-statement legacy
+        // approvals keep the original per-field row layout.
+        const stmts = Array.isArray(a.composite_statements) ? a.composite_statements : null;
+        const composite_block = stmts ? `
+        <div class="row"><span class="field">Composite</span><span class="field-val">${stmts.length} statements · one approval</span></div>
+        <div class="composite-statements">${stmts.map((s,i)=>{
+          const actions = (s.actions||[]).join(',');
+          let resource = '*';
+          if (s.resource && typeof s.resource === 'object') {
+            if ('Exact' in s.resource) resource = s.resource.Exact.value;
+            else if ('Glob' in s.resource) resource = s.resource.Glob.pattern;
+            else if (s.resource === 'Any' || ('Any' in s.resource)) resource = '*';
+          }
+          let budget = '';
+          if (s.budget) {
+            const parts = [];
+            if (s.budget.tokens != null) parts.push(s.budget.tokens+' tokens');
+            if (s.budget.cents != null) parts.push((s.budget.cents/100).toFixed(2)+' USD');
+            if (s.budget.wall_clock_secs != null) parts.push(s.budget.wall_clock_secs+'s');
+            if (parts.length) budget = ' · '+parts.join(' · ');
+          }
+          return `<div class="composite-stmt"><span class="composite-stmt-idx">[${i}]</span> <span class="mono">${actions}</span> on <span class="mono">${resource}</span>${budget}</div>`;
+        }).join('')}</div>` : `
         <div class="row"><span class="field">Credential</span><span class="field-val">${a.credential_name||'—'}</span></div>
-        <div class="row"><span class="field">Scope</span><span class="field-val">${a.scope||'—'}</span></div>
+        <div class="row"><span class="field">Scope</span><span class="field-val">${a.scope||'—'}</span></div>`;
+        return `<div class="approval-card">
+        <div class="row"><span class="field">Persona</span><span class="field-val mono">${truncPersona(a.persona_id)}</span></div>
+        ${composite_block}
         <div class="row"><span class="field">Action</span><span class="field-val">${a.action||'—'}</span></div>
         <div class="row"><span class="field">Risk</span><span class="field-val">${badge(a.risk_level,a.risk_level)}</span></div>
         <div class="actions">
@@ -558,7 +595,8 @@ async function loadDashboard(){
           <button class="btn btn-warn">Narrow</button>
           <button class="btn btn-danger" onclick="denyRequest('${a.id}')">Deny</button>
         </div>
-      </div>`).join('');
+      </div>`;
+      }).join('');
     }
 
     // Audit timeline
@@ -855,6 +893,11 @@ pub async fn handle_dashboard_request(
                     "status": a.status,
                     "reason": a.reason,
                     "created_at": a.created_at,
+                    // implementation-note-1 — composite envelopes (sandbox-run 3-statement
+                    // bundle) surface as a single approval entry whose
+                    // statements array drives the per-statement card UI.
+                    "composite_statements": a.composite_statements,
+                    "result_grant_id": a.result_grant_id,
                 }))
                 .collect();
             json_response(StatusCode::OK, &serde_json::Value::Array(body))
@@ -878,6 +921,9 @@ pub async fn handle_dashboard_request(
                     "status": a.status,
                     "reason": a.reason,
                     "created_at": a.created_at,
+                    // implementation-note-1 — surface composite statements + minted grant ID.
+                    "composite_statements": a.composite_statements,
+                    "result_grant_id": a.result_grant_id,
                 })),
                 Err(_) => error_response(404, "approval not found"),
             }
@@ -1021,6 +1067,7 @@ pub async fn handle_dashboard_request(
             && path.starts_with("/api/grants/")
             && !path.ends_with("/revoke")
             && !path.ends_with("/pause")
+            && !path.ends_with("/unpause")
             && !path.ends_with("/extend") =>
         {
             let id = path.strip_prefix("/api/grants/").unwrap_or("");
@@ -1034,7 +1081,7 @@ pub async fn handle_dashboard_request(
             }
         }
 
-        // POST /api/grants/{id}/pause  — advisory pause (advisory = doesn't stop proxy)
+        // POST /api/grants/{id}/pause  — hard pause: sets status='paused', proxy rejects
         _ if method == Method::POST
             && path.starts_with("/api/grants/")
             && path.ends_with("/pause") =>
@@ -1047,14 +1094,15 @@ pub async fn handle_dashboard_request(
                     .unwrap()
                     .strip_suffix("/pause")
                     .unwrap();
-                match state.store.set_grant_paused(id, true) {
+                match state.store.pause_grant(id) {
                     Ok(()) => json_response(StatusCode::OK, &serde_json::json!({"paused": true})),
+                    Err(crate::store::StoreError::NotFound) => error_response(404, "grant not found"),
                     Err(e) => error_response(400, &e.to_string()),
                 }
             }
         }
 
-        // POST /api/grants/{id}/unpause
+        // POST /api/grants/{id}/unpause — resumes a paused grant
         _ if method == Method::POST
             && path.starts_with("/api/grants/")
             && path.ends_with("/unpause") =>
@@ -1067,8 +1115,9 @@ pub async fn handle_dashboard_request(
                     .unwrap()
                     .strip_suffix("/unpause")
                     .unwrap();
-                match state.store.set_grant_paused(id, false) {
+                match state.store.resume_grant(id) {
                     Ok(()) => json_response(StatusCode::OK, &serde_json::json!({"paused": false})),
+                    Err(crate::store::StoreError::NotFound) => error_response(404, "grant not found"),
                     Err(e) => error_response(400, &e.to_string()),
                 }
             }
@@ -1099,6 +1148,33 @@ pub async fn handle_dashboard_request(
                 match state.store.extend_grant(id, tokens_delta, cents_delta, ttl_extension_secs) {
                     Ok(g) => json_response(StatusCode::OK, &grant_to_json(&g)),
                     Err(e) => error_response(400, &e.to_string()),
+                }
+            }
+        }
+
+        // GET /grants/{id} — HTML grant-detail page with Pause/Extend buttons.
+        (Method::GET, p) if p.starts_with("/grants/") && !p.contains("/pause") && !p.contains("/unpause") && !p.contains("/extend") && !p.contains("/revoke") => {
+            let id = p.strip_prefix("/grants/").unwrap_or("");
+            if id.is_empty() {
+                error_response(400, "missing grant id")
+            } else {
+                match state.store.get_grant(id) {
+                    Ok(g) => {
+                        let chain = state.store.get_access_grant(&g.id).ok();
+                        let html = build_grant_detail_html(&g, &state.csrf_token, chain.as_ref());
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "text/html; charset=utf-8")
+                            .body(Full::new(Bytes::from(html)))
+                            .unwrap()
+                    }
+                    Err(_) => Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .header("content-type", "text/html; charset=utf-8")
+                        .body(Full::new(Bytes::from(
+                            "<!DOCTYPE html><html><head><title>ember</title></head><body style=\"font-family:monospace;background:#0a0a0f;color:#6b6b7b;display:flex;align-items:center;justify-content:center;height:100vh;margin:0\"><p>Grant not found. <a href=\"/\" style=\"color:#e85d26\">Back to dashboard</a></p></body></html>",
+                        )))
+                        .unwrap(),
                 }
             }
         }
@@ -1189,7 +1265,8 @@ pub async fn handle_dashboard_request(
                         )))
                         .unwrap()
                 } else {
-                    let html = build_receipt_html(&g, &state.csrf_token);
+                    let chain = state.store.get_access_grant(&g.id).ok();
+                    let html = build_receipt_html(&g, &state.csrf_token, chain.as_ref());
                     Response::builder()
                         .status(StatusCode::OK)
                         .header("content-type", "text/html; charset=utf-8")
@@ -1256,8 +1333,7 @@ pub async fn handle_dashboard_request(
             let id = p.strip_prefix("/approvals/").unwrap_or("");
             match state.store.get_approval(id) {
                 Ok(a) => {
-                    // Persona ID: show first 12 chars as prefix to avoid leaking the full UUID.
-                    let persona_prefix: String = a.persona_id.chars().take(20).collect();
+                    let persona_prefix = truncate_persona_id(&a.persona_id);
                     let html = APPROVAL_HTML_TEMPLATE
                         .replace("{{CSRF_TOKEN}}", &state.csrf_token)
                         .replace("{{APPROVAL_ID}}", &a.id)
@@ -1295,11 +1371,11 @@ pub async fn handle_dashboard_request(
 
 /// Serialize a `GrantInfo` to the JSON shape used by dashboard API endpoints.
 ///
-/// Post-composite-port (design): also emits a `statements` array with per-
+/// Post-composite-port (design): emits a `statements` array with per-
 /// Statement `sid`, `resource_type`, `actions`, `resource`, `budget`, and
-/// `usage`. Dashboard / receipt views can render per-Statement meters from
-/// this field. The legacy envelope-level `budget` + `usage` fields remain
-/// as projections across all statements for backward compat.
+/// `usage`. Dashboard / receipt views render per-Statement meters from
+/// this field — there is no envelope-level `budget`/`usage` projection
+/// under the V0 schema.
 fn grant_to_json_with_store(
     g: &crate::grant::GrantInfo,
     store: &crate::store::DaemonStore,
@@ -1353,8 +1429,6 @@ fn grant_to_json_with_store(
         "expires_at": g.expires_at,
         "status": g.status,
         "conditions": conditions,
-        "budget": g.budget,
-        "usage": g.usage,
         "statements": statements,
         "paused": g.paused,
         "receipt_id": g.receipt_id,
@@ -1390,8 +1464,6 @@ fn grant_to_json(g: &crate::grant::GrantInfo) -> serde_json::Value {
         "expires_at": g.expires_at,
         "status": g.status,
         "conditions": conditions,
-        "budget": g.budget,
-        "usage": g.usage,
         "paused": g.paused,
         "receipt_id": g.receipt_id,
     })
@@ -1578,33 +1650,366 @@ fn build_receipt_json(g: &crate::grant::GrantInfo) -> serde_json::Value {
     })
 }
 
-/// Render a full Grant Receipt HTML page with tabbed view (Summary / Evidence).
-fn build_receipt_html(g: &crate::grant::GrantInfo, _csrf_token: &str) -> String {
-    let receipt_json = serde_json::to_string_pretty(&build_receipt_json(g)).unwrap_or_default();
-    let budget_tokens = g.budget.as_ref().and_then(|b| b.tokens);
-    let budget_cents = g.budget.as_ref().and_then(|b| b.cents);
-    let tokens_used = g.usage.tokens;
-    let cents_used = g.usage.cents;
-    let token_pct = budget_tokens.map(|bt| (tokens_used * 100).checked_div(bt).unwrap_or(100u64));
-    let cents_pct = budget_cents.map(|bc| (cents_used * 100).checked_div(bc).unwrap_or(100u64));
+/// Render per-Statement gauge cards for a composite grant chain.
+///
+/// For each statement, renders: SID header, resource_type + actions summary,
+/// and one progress bar per budget axis that has a limit set. Statements with
+/// no budget show an "unbounded" note.
+///
+/// Pure function of the statement slice — testable without a running server.
+pub(crate) fn render_statement_gauges(statements: &[(usize, &core_types::Statement)]) -> String {
+    if statements.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for (block_idx, stmt) in statements {
+        let actions: Vec<&str> = stmt.actions.iter().map(|a| a.as_str()).collect();
+        let actions_str = if actions.is_empty() {
+            "—".to_string()
+        } else {
+            actions.join(", ")
+        };
+        out.push_str(r#"<div style="border:1px solid var(--border);border-radius:6px;padding:14px;margin-bottom:12px">"#);
+        out.push_str(&format!(
+            r#"<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px"><span style="font-size:12px;font-weight:600;color:var(--text-primary)">{sid}</span><span style="font-size:11px;color:var(--text-muted)">block {block_idx} · {rt} · {actions_str}</span></div>"#,
+            sid = stmt.sid,
+            rt = stmt.resource_type.as_str(),
+        ));
+        let has_budget = stmt.budget.as_ref().map(|b| !b.is_none_set()).unwrap_or(false);
+        if !has_budget {
+            out.push_str(r#"<div style="color:var(--text-dim);font-size:12px">unbounded</div>"#);
+        } else if let Some(b) = &stmt.budget {
+            let u = &stmt.usage;
+            if let Some(cap) = b.tokens {
+                let pct = (u.tokens * 100).checked_div(cap).unwrap_or(100).min(100);
+                let color = gauge_color(pct);
+                out.push_str(&format!(
+                    r#"<div class="gauge-label"><span>tokens</span><span>{used} / {cap} ({pct}%)</span></div><div class="gauge-track"><div class="gauge-fill" style="width:{pct}%;background:{color}"></div></div>"#,
+                    used = u.tokens,
+                ));
+            }
+            if let Some(cap) = b.cents {
+                let pct = (u.cents * 100).checked_div(cap).unwrap_or(100).min(100);
+                let color = gauge_color(pct);
+                let used_fmt = format!("${:.2}", u.cents as f64 / 100.0);
+                let cap_fmt = format!("${:.2}", cap as f64 / 100.0);
+                out.push_str(&format!(
+                    r#"<div class="gauge-label"><span>cost</span><span>{used_fmt} / {cap_fmt} ({pct}%)</span></div><div class="gauge-track"><div class="gauge-fill" style="width:{pct}%;background:{color}"></div></div>"#,
+                ));
+            }
+            if let Some(cap) = b.requests {
+                let pct = (u.requests * 100).checked_div(cap).unwrap_or(100).min(100);
+                let color = gauge_color(pct);
+                out.push_str(&format!(
+                    r#"<div class="gauge-label"><span>requests</span><span>{used} / {cap} ({pct}%)</span></div><div class="gauge-track"><div class="gauge-fill" style="width:{pct}%;background:{color}"></div></div>"#,
+                    used = u.requests,
+                ));
+            }
+            if let Some(cap) = b.wall_clock_secs {
+                let pct = (u.wall_clock_secs * 100).checked_div(cap).unwrap_or(100).min(100);
+                let color = gauge_color(pct);
+                out.push_str(&format!(
+                    r#"<div class="gauge-label"><span>wall-clock</span><span>{used}s / {cap}s ({pct}%)</span></div><div class="gauge-track"><div class="gauge-fill" style="width:{pct}%;background:{color}"></div></div>"#,
+                    used = u.wall_clock_secs,
+                ));
+            }
+        }
+        out.push_str("</div>");
+    }
+    out
+}
 
-    let token_gauge = if let (Some(bt), Some(pct)) = (budget_tokens, token_pct) {
-        let color = if pct >= 95 { "var(--danger)" } else if pct >= 80 { "var(--warning)" } else { "var(--success)" };
-        format!(r#"<div class="gauge-label"><span>Tokens</span><span>{} / {} ({pct}%)</span></div>
-<div class="gauge-track"><div class="gauge-fill" style="width:{pct}%;background:{color}"></div></div>"#,
-            tokens_used, bt)
+#[inline]
+fn gauge_color(pct: u64) -> &'static str {
+    if pct >= 95 { "var(--danger)" } else if pct >= 80 { "var(--warning)" } else { "var(--success)" }
+}
+
+/// Render the `/grants/{id}` HTML detail page.
+///
+/// Shows grant metadata, per-Statement budget gauges, and action buttons:
+/// Pause (or Resume if already paused), Extend, Revoke, View Receipt.
+/// Terminal grants show a read-only view with only the receipt link.
+fn build_grant_detail_html(
+    g: &crate::grant::GrantInfo,
+    csrf_token: &str,
+    access_grant: Option<&core_types::AccessGrant>,
+) -> String {
+    let status_class = match g.status.as_str() {
+        "active" => "active",
+        "paused" => "paused",
+        "revoked" | "parent_cascade_revoked" => "revoked",
+        "expired" | "expired_by_budget" | "exhausted_by_budget" => "revoked",
+        _ => "pending",
+    };
+
+    let is_terminal = matches!(
+        g.status.as_str(),
+        "revoked" | "expired" | "expired_by_budget" | "exhausted_by_budget" | "parent_cascade_revoked"
+    );
+
+    let budget_section = if let Some(chain) = access_grant {
+        let stmts: Vec<(usize, &core_types::Statement)> = chain.statements().collect();
+        let gauges = render_statement_gauges(&stmts);
+        if gauges.is_empty() {
+            String::new()
+        } else {
+            format!(r#"<div class="card"><div class="card-title">Statements &amp; Budget</div>{gauges}</div>"#)
+        }
     } else {
         String::new()
     };
 
-    let cents_gauge = if let (Some(bc), Some(pct)) = (budget_cents, cents_pct) {
-        let color = if pct >= 95 { "var(--danger)" } else if pct >= 80 { "var(--warning)" } else { "var(--success)" };
-        let used_fmt = format!("${:.2}", cents_used as f64 / 100.0);
-        let budget_fmt = format!("${:.2}", bc as f64 / 100.0);
-        format!(r#"<div class="gauge-label"><span>Cost</span><span>{used_fmt} / {budget_fmt} ({pct}%)</span></div>
-<div class="gauge-track"><div class="gauge-fill" style="width:{pct}%;background:{color}"></div></div>"#)
+    let paused_badge = if g.paused || g.status == "paused" {
+        r#"<span class="paused-badge">paused</span>"#
     } else {
-        String::new()
+        ""
+    };
+
+    let action_buttons = if is_terminal {
+        format!(
+            r#"<a href="/receipts/{id}" class="btn btn-neutral">View Receipt</a>
+<a href="/" class="btn btn-neutral">Back</a>"#,
+            id = g.id,
+        )
+    } else if g.status == "paused" {
+        format!(
+            r#"<form method="POST" action="/grants/{id}/unpause" style="display:inline">
+  <input type="hidden" name="csrf" value="{csrf}">
+  <button type="submit" class="btn btn-warn" onclick="return confirm('Resume this grant?')">Resume</button>
+</form>
+<button class="btn btn-neutral" onclick="openExtend('{id}')">Extend</button>
+<form method="POST" action="/grants/{id}/revoke" style="display:inline">
+  <input type="hidden" name="csrf" value="{csrf}">
+  <button type="submit" class="btn btn-danger" onclick="return confirm('Revoke this grant? This cannot be undone.')">Revoke</button>
+</form>
+<a href="/" class="btn btn-neutral">Back</a>"#,
+            id = g.id, csrf = csrf_token,
+        )
+    } else {
+        format!(
+            r#"<form method="POST" action="/grants/{id}/pause" style="display:inline">
+  <input type="hidden" name="csrf" value="{csrf}">
+  <button type="submit" class="btn btn-warn" onclick="return confirm('Pause this grant? Proxy requests will be rejected until resumed.')">Pause</button>
+</form>
+<button class="btn btn-neutral" onclick="openExtend('{id}')">Extend</button>
+<form method="POST" action="/grants/{id}/revoke" style="display:inline">
+  <input type="hidden" name="csrf" value="{csrf}">
+  <button type="submit" class="btn btn-danger" onclick="return confirm('Revoke this grant? This cannot be undone.')">Revoke</button>
+</form>
+<a href="/receipts/{id}" class="btn btn-neutral">Receipt</a>
+<a href="/" class="btn btn-neutral">Back</a>"#,
+            id = g.id, csrf = csrf_token,
+        )
+    };
+
+    // The Pause/Resume/Revoke buttons use form POSTs. The server reads the
+    // CSRF token from the `X-Ember-CSRF-Token` header (set via JS on the
+    // dashboard main page). For the detail page, we use a fetch()-based JS
+    // wrapper for CSRF-sensitive actions to keep the header protocol
+    // consistent with the main dashboard. The form `action` attributes are
+    // used as the URL targets; JS intercepts submit events.
+    format!(r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ember · grant {id}</title>
+<style>
+:root{{--bg-primary:#0a0a0f;--bg-card:#12121a;--bg-hover:#1a1a2a;--accent:#e85d26;--text-primary:#e0e0e8;--text-muted:#6b6b7b;--text-dim:#3a3a4a;--border:#1e1e2e;--success:#22c55e;--warning:#eab308;--danger:#ef4444}}
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:'JetBrains Mono',ui-monospace,'Cascadia Code','Fira Code',monospace;background:var(--bg-primary);color:var(--text-primary);min-height:100vh;font-size:13px}}
+a{{color:var(--accent);text-decoration:none}}
+#header{{display:flex;align-items:center;justify-content:space-between;padding:14px 24px;border-bottom:1px solid var(--border);background:var(--bg-card)}}
+#header .logo{{font-size:20px;font-weight:700;color:var(--accent)}}
+#header .nav{{display:flex;gap:16px;align-items:center;color:var(--text-muted);font-size:12px}}
+main{{padding:20px 24px;max-width:900px;margin:0 auto}}
+.card{{background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:20px;margin-bottom:16px}}
+.card-title{{font-size:11px;text-transform:uppercase;letter-spacing:.8px;color:var(--text-muted);margin-bottom:14px}}
+.field{{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px;padding-bottom:10px;border-bottom:1px solid var(--border)}}
+.field:last-child{{border-bottom:none;margin-bottom:0;padding-bottom:0}}
+.field-label{{color:var(--text-muted);font-size:11px}}
+.field-val{{color:var(--text-primary);font-size:12px;text-align:right;word-break:break-all;max-width:65%}}
+.badge{{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600}}
+.badge.active{{background:rgba(34,197,94,.15);color:var(--success)}}
+.badge.paused{{background:rgba(234,179,8,.15);color:var(--warning)}}
+.badge.revoked{{background:rgba(239,68,68,.15);color:var(--danger)}}
+.badge.pending{{background:rgba(234,179,8,.15);color:var(--warning)}}
+.paused-badge{{display:inline-block;padding:2px 7px;border-radius:3px;font-size:10px;font-weight:600;background:rgba(234,179,8,.15);color:var(--warning);border:1px solid rgba(234,179,8,.3);margin-left:8px}}
+.gauge-label{{display:flex;justify-content:space-between;font-size:11px;color:var(--text-muted);margin-bottom:4px;margin-top:10px}}
+.gauge-track{{width:100%;height:6px;background:var(--bg-hover);border-radius:3px;overflow:hidden}}
+.gauge-fill{{height:100%;border-radius:3px;transition:width .3s}}
+.btn{{display:inline-flex;align-items:center;padding:6px 14px;border-radius:4px;font-family:inherit;font-size:11px;font-weight:600;cursor:pointer;border:1px solid transparent;transition:opacity .1s;text-decoration:none}}
+.btn:hover{{opacity:.8}}
+.btn-danger{{background:rgba(239,68,68,.15);color:var(--danger);border-color:rgba(239,68,68,.3)}}
+.btn-warn{{background:rgba(234,179,8,.15);color:var(--warning);border-color:rgba(234,179,8,.3)}}
+.btn-neutral{{background:rgba(107,107,123,.15);color:var(--text-muted);border-color:var(--border)}}
+.btn-success{{background:rgba(34,197,94,.15);color:var(--success);border-color:rgba(34,197,94,.3)}}
+.actions{{display:flex;gap:8px;margin-top:14px;flex-wrap:wrap}}
+.modal-overlay{{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:100;align-items:center;justify-content:center}}
+.modal-overlay.open{{display:flex}}
+.modal{{background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:24px;width:380px;max-width:95vw}}
+.modal-title{{font-size:12px;text-transform:uppercase;letter-spacing:.8px;color:var(--text-muted);margin-bottom:16px}}
+.modal-field{{margin-bottom:12px}}
+.modal-field label{{display:block;font-size:11px;color:var(--text-muted);margin-bottom:4px}}
+.modal-field input{{width:100%;background:var(--bg-hover);border:1px solid var(--border);border-radius:4px;padding:6px 10px;color:var(--text-primary);font-family:inherit;font-size:12px}}
+.modal-field input:focus{{outline:none;border-color:var(--accent)}}
+.quick-picks{{display:flex;gap:6px;margin-top:6px}}
+.quick-pick{{padding:3px 8px;border-radius:3px;font-family:inherit;font-size:10px;font-weight:600;cursor:pointer;border:1px solid var(--border);background:var(--bg-hover);color:var(--text-muted)}}
+.quick-pick:hover{{border-color:var(--accent);color:var(--accent)}}
+.modal-actions{{display:flex;gap:8px;margin-top:16px}}
+</style>
+</head>
+<body>
+<div id="header">
+  <div class="logo">ember</div>
+  <div class="nav"><a href="/">dashboard</a></div>
+</div>
+<main>
+  <div style="margin-bottom:16px;display:flex;align-items:center;gap:10px">
+    <span style="font-size:18px;font-weight:700;color:var(--text-primary)">Grant Detail</span>
+    <span class="badge {status_class}">{status}</span>
+    {paused_badge}
+  </div>
+
+  <div class="card">
+    <div class="card-title">Grant Details</div>
+    <div class="field"><span class="field-label">Grant ID</span><span class="field-val">{id}</span></div>
+    <div class="field"><span class="field-label">Persona</span><span class="field-val">{persona_id}</span></div>
+    <div class="field"><span class="field-label">Credential</span><span class="field-val">{credential_name}</span></div>
+    <div class="field"><span class="field-label">Scope</span><span class="field-val">{scope}</span></div>
+    <div class="field"><span class="field-label">Issued</span><span class="field-val">{created_at}</span></div>
+    <div class="field"><span class="field-label">Expires</span><span class="field-val">{expires_at}</span></div>
+    <div class="field"><span class="field-label">Status</span><span class="field-val"><span class="badge {status_class}">{status}</span></span></div>
+    {parent_row}
+  </div>
+
+  {budget_section}
+
+  <div class="card">
+    <div class="card-title">Actions</div>
+    <div class="actions">{action_buttons}</div>
+  </div>
+</main>
+
+<div class="modal-overlay" id="extend-modal">
+  <div class="modal">
+    <div class="modal-title">Extend Grant</div>
+    <div class="modal-field">
+      <label>Additional Tokens</label>
+      <input type="number" id="extend-tokens" min="0" placeholder="e.g. 10000">
+    </div>
+    <div class="modal-field">
+      <label>Additional Budget (USD)</label>
+      <input type="number" id="extend-cents-usd" min="0" step="0.01" placeholder="e.g. 0.50">
+    </div>
+    <div class="modal-field">
+      <label>TTL Extension</label>
+      <input type="number" id="extend-ttl-secs" min="0" placeholder="seconds">
+      <div class="quick-picks">
+        <button class="quick-pick" onclick="setTTL(900)">15m</button>
+        <button class="quick-pick" onclick="setTTL(3600)">1h</button>
+        <button class="quick-pick" onclick="setTTL(86400)">24h</button>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-success" onclick="submitExtend()">Extend</button>
+      <button class="btn btn-neutral" onclick="closeExtend()">Cancel</button>
+    </div>
+  </div>
+</div>
+<script>
+const CSRF_TOKEN="{csrf_token}";
+const GRANT_ID="{id}";
+const CSRF_HEADERS={{'X-Ember-CSRF-Token':CSRF_TOKEN}};
+function openExtend(){{document.getElementById('extend-modal').classList.add('open');}}
+function closeExtend(){{document.getElementById('extend-modal').classList.remove('open');}}
+function setTTL(s){{document.getElementById('extend-ttl-secs').value=s;}}
+async function submitExtend(){{
+  const tokens=parseInt(document.getElementById('extend-tokens').value)||undefined;
+  const centsUsd=parseFloat(document.getElementById('extend-cents-usd').value);
+  const cents=isNaN(centsUsd)?undefined:Math.round(centsUsd*100);
+  const ttl=parseInt(document.getElementById('extend-ttl-secs').value)||undefined;
+  const body={{}};
+  if(tokens)body.tokens_delta=tokens;
+  if(cents)body.cents_delta=cents;
+  if(ttl)body.ttl_extension_secs=ttl;
+  const resp=await fetch(`/api/grants/${{GRANT_ID}}/extend`,{{method:'POST',headers:{{...CSRF_HEADERS,'content-type':'application/json'}},body:JSON.stringify(body)}});
+  closeExtend();
+  if(!resp.ok){{const e=await resp.json().catch(()=>({{error:'failed'}}));alert('Extend failed: '+(e.error||resp.status));}}
+  else{{window.location.reload();}}
+}}
+document.querySelectorAll('form[action$="/pause"],form[action$="/unpause"],form[action$="/revoke"]').forEach(form=>{{
+  form.addEventListener('submit',async e=>{{
+    e.preventDefault();
+    if(!confirm(form.querySelector('button[type=submit]')?.title||'Confirm?'))return;
+    const resp=await fetch(form.action,{{method:'POST',headers:CSRF_HEADERS}});
+    if(resp.ok){{window.location.href='/';}}
+    else{{const err=await resp.json().catch(()=>({{error:'request failed'}}));alert('Error: '+(err.error||resp.status));}}
+  }});
+}});
+</script>
+</body>
+</html>"#,
+        id = g.id,
+        persona_id = truncate_persona_id(&g.persona_id),
+        credential_name = g.credential_name,
+        scope = g.scope,
+        created_at = g.created_at,
+        expires_at = g.expires_at.as_deref().unwrap_or("never"),
+        status = g.status,
+        status_class = status_class,
+        paused_badge = paused_badge,
+        budget_section = budget_section,
+        action_buttons = action_buttons,
+        csrf_token = csrf_token,
+        parent_row = g.parent_grant_id.as_deref().map(|pid| format!(
+            r#"<div class="field"><span class="field-label">Parent Grant</span><span class="field-val"><a href="/grants/{pid}">{pid}</a></span></div>"#
+        )).unwrap_or_default(),
+    )
+}
+
+fn build_receipt_html(
+    g: &crate::grant::GrantInfo,
+    _csrf_token: &str,
+    access_grant: Option<&core_types::AccessGrant>,
+) -> String {
+    let receipt_json = serde_json::to_string_pretty(&build_receipt_json(g)).unwrap_or_default();
+
+    // Per-Statement gauges (composite path) — preferred when the chain is available.
+    let budget_section = if let Some(chain) = access_grant {
+        let stmts: Vec<(usize, &core_types::Statement)> = chain.statements().collect();
+        let gauges = render_statement_gauges(&stmts);
+        format!(
+            r#"<div class="card"><div class="card-title">Statements &amp; Budget</div>{gauges}</div>"#
+        )
+    } else {
+        // Legacy fallback: single aggregate gauge from GrantInfo scalar columns.
+        let budget_tokens = g.budget.as_ref().and_then(|b| b.tokens);
+        let budget_cents = g.budget.as_ref().and_then(|b| b.cents);
+        let tokens_used = g.usage.tokens;
+        let cents_used = g.usage.cents;
+        let token_pct = budget_tokens.map(|bt| (tokens_used * 100).checked_div(bt).unwrap_or(100u64));
+        let cents_pct = budget_cents.map(|bc| (cents_used * 100).checked_div(bc).unwrap_or(100u64));
+        let token_gauge = if let (Some(bt), Some(pct)) = (budget_tokens, token_pct) {
+            let color = gauge_color(pct);
+            format!(r#"<div class="gauge-label"><span>Tokens</span><span>{tokens_used} / {bt} ({pct}%)</span></div><div class="gauge-track"><div class="gauge-fill" style="width:{pct}%;background:{color}"></div></div>"#)
+        } else {
+            String::new()
+        };
+        let cents_gauge = if let (Some(bc), Some(pct)) = (budget_cents, cents_pct) {
+            let color = gauge_color(pct);
+            let used_fmt = format!("${:.2}", cents_used as f64 / 100.0);
+            let budget_fmt = format!("${:.2}", bc as f64 / 100.0);
+            format!(r#"<div class="gauge-label"><span>Cost</span><span>{used_fmt} / {budget_fmt} ({pct}%)</span></div><div class="gauge-track"><div class="gauge-fill" style="width:{pct}%;background:{color}"></div></div>"#)
+        } else {
+            String::new()
+        };
+        let no_budget_msg = if budget_tokens.is_none() && budget_cents.is_none() {
+            r#"<div style="color:var(--text-dim);font-size:12px;padding:8px 0">No budget set (TTL-only grant)</div>"#
+        } else {
+            ""
+        };
+        format!(r#"<div class="card"><div class="card-title">Budget &amp; Usage</div>{token_gauge}{cents_gauge}{no_budget_msg}</div>"#)
     };
 
     let status_class = match g.status.as_str() {
@@ -1684,12 +2089,7 @@ pre{{background:var(--bg-hover);border:1px solid var(--border);border-radius:6px
       <div class="field"><span class="field-label">Terminal Status</span><span class="field-val"><span class="badge {status_class}">{status}</span></span></div>
     </div>
 
-    <div class="card">
-      <div class="card-title">Budget &amp; Usage</div>
-      {token_gauge}
-      {cents_gauge}
-      {no_budget_msg}
-    </div>
+    {budget_section}
 
     <div class="actions">
       <a href="/receipts/{id}?format=json" class="btn btn-neutral">Download JSON</a>
@@ -1721,18 +2121,12 @@ function showTab(name){{
         status_class = status_class,
         status = g.status,
         id = g.id,
-        persona_id = g.persona_id,
+        persona_id = truncate_persona_id(&g.persona_id),
         credential_name = g.credential_name,
         scope = g.scope,
         created_at = g.created_at,
         expires_at = g.expires_at.as_deref().unwrap_or("—"),
-        token_gauge = token_gauge,
-        cents_gauge = cents_gauge,
-        no_budget_msg = if budget_tokens.is_none() && budget_cents.is_none() {
-            r#"<div style="color:var(--text-dim);font-size:12px;padding:8px 0">No budget set (TTL-only grant)</div>"#
-        } else {
-            ""
-        },
+        budget_section = budget_section,
         receipt_json_escaped = receipt_json.replace('<', "&lt;").replace('>', "&gt;"),
     )
 }
@@ -1753,6 +2147,18 @@ fn error_response(status: u16, msg: &str) -> Response<Full<Bytes>> {
         .header("content-type", "application/json")
         .body(Full::new(Bytes::from(serde_json::to_vec(&body).unwrap())))
         .unwrap()
+}
+
+/// Truncate a persona ID for UI display. Keeps the 12-char UUID prefix after "persona-".
+fn truncate_persona_id(persona_id: &str) -> String {
+    const PREFIX: &str = "persona-";
+    const UUID_CHARS: usize = 12;
+    if let Some(uuid_part) = persona_id.strip_prefix(PREFIX) {
+        let taken: String = uuid_part.chars().take(UUID_CHARS).collect();
+        format!("{PREFIX}{taken}")
+    } else {
+        persona_id.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -1935,11 +2341,36 @@ mod tests {
                 json_response(StatusCode::OK, &body)
             }
 
+            // /grants/{id} — HTML grant-detail page
+            (Method::GET, p) if p.starts_with("/grants/") && !p.contains("/pause") && !p.contains("/unpause") && !p.contains("/extend") && !p.contains("/revoke") => {
+                let id = p.strip_prefix("/grants/").unwrap_or("");
+                if id.is_empty() {
+                    error_response(400, "missing grant id")
+                } else {
+                    match state.store.get_grant(id) {
+                        Ok(g) => {
+                            let chain = state.store.get_access_grant(&g.id).ok();
+                            let html = build_grant_detail_html(&g, &state.csrf_token, chain.as_ref());
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header("content-type", "text/html; charset=utf-8")
+                                .body(Full::new(Bytes::from(html)))
+                                .unwrap()
+                        }
+                        Err(_) => Response::builder()
+                            .status(StatusCode::NOT_FOUND)
+                            .header("content-type", "text/html; charset=utf-8")
+                            .body(Full::new(Bytes::from("not found")))
+                            .unwrap(),
+                    }
+                }
+            }
+
             (Method::GET, p) if p.starts_with("/approvals/") => {
                 let id = p.strip_prefix("/approvals/").unwrap_or("");
                 match state.store.get_approval(id) {
                     Ok(a) => {
-                        let persona_prefix: String = a.persona_id.chars().take(20).collect();
+                        let persona_prefix = truncate_persona_id(&a.persona_id);
                         let html = APPROVAL_HTML_TEMPLATE
                             .replace("{{CSRF_TOKEN}}", &state.csrf_token)
                             .replace("{{APPROVAL_ID}}", &a.id)
@@ -2056,7 +2487,7 @@ mod tests {
                 }
             }
 
-            // 69K.7: pause toggle
+            // 69K.7: hard pause toggle
             _ if method == Method::POST
                 && path.starts_with("/api/grants/")
                 && path.ends_with("/pause") =>
@@ -2069,8 +2500,9 @@ mod tests {
                         .unwrap()
                         .strip_suffix("/pause")
                         .unwrap();
-                    match state.store.set_grant_paused(id, true) {
+                    match state.store.pause_grant(id) {
                         Ok(()) => json_response(StatusCode::OK, &serde_json::json!({"paused": true})),
+                        Err(crate::store::StoreError::NotFound) => error_response(404, "grant not found"),
                         Err(e) => error_response(400, &e.to_string()),
                     }
                 }
@@ -2088,8 +2520,9 @@ mod tests {
                         .unwrap()
                         .strip_suffix("/unpause")
                         .unwrap();
-                    match state.store.set_grant_paused(id, false) {
+                    match state.store.resume_grant(id) {
                         Ok(()) => json_response(StatusCode::OK, &serde_json::json!({"paused": false})),
+                        Err(crate::store::StoreError::NotFound) => error_response(404, "grant not found"),
                         Err(e) => error_response(400, &e.to_string()),
                     }
                 }
@@ -2128,6 +2561,7 @@ mod tests {
                 && path.starts_with("/api/grants/")
                 && !path.ends_with("/revoke")
                 && !path.ends_with("/pause")
+                && !path.ends_with("/unpause")
                 && !path.ends_with("/extend") =>
             {
                 let id = path.strip_prefix("/api/grants/").unwrap_or("");
@@ -2146,7 +2580,8 @@ mod tests {
                 let id = p.strip_prefix("/receipts/").unwrap_or("");
                 match state.store.get_grant(id) {
                     Ok(g) => {
-                        let html = build_receipt_html(&g, &state.csrf_token);
+                        let chain = state.store.get_access_grant(&g.id).ok();
+                        let html = build_receipt_html(&g, &state.csrf_token, chain.as_ref());
                         Response::builder()
                             .status(StatusCode::OK)
                             .header("content-type", "text/html; charset=utf-8")
@@ -2269,7 +2704,8 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["active_grants"], 1);
         assert_eq!(json["pending_approvals"], 1);
-        assert_eq!(json["audit_events"], 1);
+        // create_grant now emits a grant.minted event plus the explicit test.event = 2
+        assert_eq!(json["audit_events"], 2);
         assert_eq!(json["active_agents"], 1);
     }
 
@@ -2655,23 +3091,26 @@ mod tests {
         // Verify initially not paused
         let g0 = state.store.get_grant(&grant.id).unwrap();
         assert!(!g0.paused);
+        assert_eq!(g0.status, "active");
 
-        // Pause via endpoint
+        // Pause via endpoint — hard pause sets status='paused'
         let resp = call_post(Arc::clone(&state), &format!("/api/grants/{}/pause", grant.id)).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["paused"], true);
 
-        // Verify store state changed
+        // Verify store state: status is 'paused' and paused flag is set
         let g1 = state.store.get_grant(&grant.id).unwrap();
         assert!(g1.paused);
+        assert_eq!(g1.status, "paused");
 
-        // Unpause
+        // Unpause — restores status='active'
         let resp2 = call_post(Arc::clone(&state), &format!("/api/grants/{}/unpause", grant.id)).await;
         assert_eq!(resp2.status(), StatusCode::OK);
         let g2 = state.store.get_grant(&grant.id).unwrap();
         assert!(!g2.paused);
+        assert_eq!(g2.status, "active");
     }
 
     #[tokio::test]
@@ -2695,10 +3134,11 @@ mod tests {
     async fn dashboard_renders_budget_gauge_when_grant_has_budget() {
         let state = make_state();
         let persona = state.store.create_persona("agent-gauge").unwrap();
-        let grant = state.store.create_grant(&persona.id, "api-key", "read", None).unwrap();
-        // Set budget + usage via direct SQL. Post-composite-port we must
-        // also patch blocks_json so the composite first-statement carries
-        // the budget; get_grant hydrates from blocks_json.
+        let grant = state.store.create_grant(&persona.id, "api-key", "*:read", None).unwrap();
+        // Set budget + usage on the first-statement of the chain. V0
+        // schema: the envelope-level `budget` / `usage` fields are gone;
+        // consumers read from the `statements` array. Block 0 must be
+        // re-signed after the mutation or `verify_chain` rejects on read.
         let mut chain = state.store.get_access_grant(&grant.id).unwrap();
         if let Some(block) = chain.blocks.first_mut()
             && let Some(stmt) = block.block.statements.first_mut()
@@ -2712,25 +3152,26 @@ mod tests {
                 ..Default::default()
             };
         }
+        if let Some(first) = chain.blocks.first_mut() {
+            let root = state.store.persona_root_keypair(&persona.id).unwrap();
+            let resigned = core_crypto::grant_chain::sign_block_zero(&root, &first.block)
+                .unwrap();
+            *first = resigned.signed;
+        }
         let blocks_json = serde_json::to_string(&chain.blocks).unwrap();
         state.store.conn().execute(
-            "UPDATE grants SET budget_json = ?1, usage_json = ?2, blocks_json = ?3 WHERE id = ?4",
-            rusqlite::params![
-                r#"{"tokens":20000}"#,
-                r#"{"tokens":5000,"cents":0,"requests":0,"workload_hours":0,"wall_clock_secs":0,"last_updated":0}"#,
-                blocks_json,
-                grant.id,
-            ],
+            "UPDATE grants SET blocks_json = ?1 WHERE id = ?2",
+            rusqlite::params![blocks_json, grant.id],
         ).unwrap();
 
-        // Get grant from API — should expose the nested Budget + Usage structs.
+        // Get grant from API — budget + usage live on `statements[0]`.
         let resp = call(Arc::clone(&state), "/api/grants").await;
         let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let arr = json.as_array().unwrap();
         assert_eq!(arr.len(), 1);
-        assert_eq!(arr[0]["budget"]["tokens"], 20000);
-        assert_eq!(arr[0]["usage"]["tokens"], 5000);
+        assert_eq!(arr[0]["statements"][0]["budget"]["tokens"], 20000);
+        assert_eq!(arr[0]["statements"][0]["usage"]["tokens"], 5000);
     }
 
     #[tokio::test]
@@ -2801,5 +3242,274 @@ mod tests {
         let state = make_state();
         let resp = call(state, "/receipts/grant-does-not-exist").await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Pure-function test: render_statement_gauges emits exactly one wrapper
+    /// div per statement, shows the SID, and uses "unbounded" when no budget.
+    #[test]
+    fn render_statement_gauges_emits_one_div_per_statement() {
+        use core_types::{Budget, ResourceSelector, ResourceType, Statement, Usage};
+        use core_types::{Action, StatementId};
+
+        let s0 = Statement {
+            sid: StatementId::from("S0"),
+            resource_type: ResourceType::Credential,
+            actions: vec![Action::from("read")],
+            resource: ResourceSelector::Any,
+            budget: Some(Budget { tokens: Some(10_000), ..Default::default() }),
+            usage: Usage { tokens: 3_000, ..Default::default() },
+            conditions: vec![],
+        };
+        let s1 = Statement {
+            sid: StatementId::from("S1"),
+            resource_type: ResourceType::Session,
+            actions: vec![Action::from("create")],
+            resource: ResourceSelector::Any,
+            budget: Some(Budget { cents: Some(500), ..Default::default() }),
+            usage: Usage { cents: 125, ..Default::default() },
+            conditions: vec![],
+        };
+        let s2 = Statement {
+            sid: StatementId::from("S2"),
+            resource_type: ResourceType::Credential,
+            actions: vec![],
+            resource: ResourceSelector::Any,
+            budget: None,
+            usage: Usage::default(),
+            conditions: vec![],
+        };
+
+        let pairs: Vec<(usize, &Statement)> = vec![(0, &s0), (0, &s1), (0, &s2)];
+        let html = render_statement_gauges(&pairs);
+
+        // Three wrapper divs — use the unique inline style from render_statement_gauges.
+        assert_eq!(html.matches(r#"padding:14px;margin-bottom:12px"#).count(), 3,
+            "should emit one wrapper div per statement");
+
+        // SIDs are present
+        assert!(html.contains("S0"), "html should contain SID S0");
+        assert!(html.contains("S1"), "html should contain SID S1");
+        assert!(html.contains("S2"), "html should contain SID S2");
+
+        // S0 has a token gauge
+        assert!(html.contains("tokens"), "S0 should render tokens gauge");
+
+        // S1 has a cost gauge
+        assert!(html.contains("cost"), "S1 should render cost gauge");
+
+        // S2 is unbounded
+        let s2_start = html.rfind("S2").expect("S2 in output");
+        let s2_section = &html[s2_start..];
+        assert!(s2_section.contains("unbounded"), "S2 with no budget should say unbounded");
+    }
+
+    /// Integration test: /receipts/{id} shows per-Statement gauges for a
+    /// 3-statement composite grant.
+    #[tokio::test]
+    async fn receipt_html_shows_per_statement_gauges_for_composite_grant() {
+        use core_types::{Budget, ResourceSelector, ResourceType, Statement, Usage};
+        use core_types::{Action, StatementId};
+
+        let state = make_state();
+        let persona = state.store.create_persona("p-3stmt").unwrap();
+        // Start with a single-statement grant so we have a valid row.
+        let grant = state.store.create_grant(&persona.id, "api-key", "read", Some(3600)).unwrap();
+
+        // Build a 3-statement composite chain and overwrite blocks_json.
+        let stmts = vec![
+            Statement {
+                sid: StatementId::from("S0"),
+                resource_type: ResourceType::Credential,
+                actions: vec![Action::from("read")],
+                resource: ResourceSelector::Any,
+                budget: Some(Budget { tokens: Some(20_000), ..Default::default() }),
+                usage: Usage { tokens: 5_000, ..Default::default() },
+                conditions: vec![],
+            },
+            Statement {
+                sid: StatementId::from("S1"),
+                resource_type: ResourceType::Session,
+                actions: vec![Action::from("create")],
+                resource: ResourceSelector::Any,
+                budget: Some(Budget { cents: Some(1_000), ..Default::default() }),
+                usage: Usage { cents: 250, ..Default::default() },
+                conditions: vec![],
+            },
+            Statement {
+                sid: StatementId::from("S2"),
+                resource_type: ResourceType::Credential,
+                actions: vec![],
+                resource: ResourceSelector::Any,
+                budget: None,
+                usage: Usage::default(),
+                conditions: vec![],
+            },
+        ];
+        let root = state.store.persona_root_keypair(&persona.id).unwrap();
+        let chain = crate::grant::access_grant_from_statements(
+            &grant.id,
+            &persona.id,
+            "api-key",
+            stmts,
+            0,
+            Some(9_999_999_999),
+            &root,
+        ).unwrap();
+        let blocks_json = serde_json::to_string(&chain.blocks).unwrap();
+        state.store.conn().execute(
+            "UPDATE grants SET blocks_json = ?1 WHERE id = ?2",
+            rusqlite::params![blocks_json, grant.id],
+        ).unwrap();
+
+        let resp = call(Arc::clone(&state), &format!("/receipts/{}", grant.id)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let html = std::str::from_utf8(&body).unwrap();
+
+        // Three statement wrapper divs (one per statement). Each uses the
+        // unique padding:14px;margin-bottom:12px inline style from render_statement_gauges.
+        assert_eq!(
+            html.matches(r#"padding:14px;margin-bottom:12px"#).count(),
+            3,
+            "receipt page should render one gauge block per statement"
+        );
+        assert!(html.contains("S0"), "should show SID S0");
+        assert!(html.contains("S1"), "should show SID S1");
+        assert!(html.contains("S2"), "should show SID S2");
+        assert!(html.contains("unbounded"), "S2 with no budget should render as unbounded");
+        assert!(html.contains("Statements"), "card title should say Statements");
+    }
+
+    // --- /grants/{id} detail page tests ---
+
+    #[tokio::test]
+    async fn grant_detail_page_returns_200_for_active_grant() {
+        let state = make_state();
+        let persona = state.store.create_persona("detail-agent").unwrap();
+        let grant = state.store.create_grant(&persona.id, "api-key", "read", None).unwrap();
+
+        let resp = call(Arc::clone(&state), &format!("/grants/{}", grant.id)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        assert!(ct.contains("text/html"));
+        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(html.contains("Grant Detail"), "page should have Grant Detail title");
+        assert!(html.contains(&grant.id), "page should embed grant id");
+        assert!(html.contains("Pause"), "active grant should show Pause button");
+        assert!(html.contains("Extend"), "active grant should show Extend button");
+        assert!(html.contains("Revoke"), "active grant should show Revoke button");
+    }
+
+    #[tokio::test]
+    async fn grant_detail_page_shows_resume_when_paused() {
+        let state = make_state();
+        let persona = state.store.create_persona("detail-paused").unwrap();
+        let grant = state.store.create_grant(&persona.id, "api-key", "read", None).unwrap();
+        state.store.pause_grant(&grant.id).unwrap();
+
+        let resp = call(Arc::clone(&state), &format!("/grants/{}", grant.id)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(html.contains("Resume"), "paused grant should show Resume button");
+        assert!(!html.contains(">Pause<"), "paused grant should not show Pause button");
+        assert!(html.contains("paused"), "page should indicate paused state");
+    }
+
+    #[tokio::test]
+    async fn grant_detail_page_shows_receipt_link_for_terminal_grant() {
+        let state = make_state();
+        let persona = state.store.create_persona("detail-terminal").unwrap();
+        let grant = state.store.create_grant(&persona.id, "api-key", "read", None).unwrap();
+        state.store.revoke_grant(&grant.id).unwrap();
+
+        let resp = call(Arc::clone(&state), &format!("/grants/{}", grant.id)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(html.contains("View Receipt"), "terminal grant page should have View Receipt link");
+        assert!(!html.contains(">Pause<"), "terminal grant should not show Pause button");
+        assert!(!html.contains(">Revoke<"), "terminal grant should not show Revoke button");
+    }
+
+    #[tokio::test]
+    async fn grant_detail_page_unknown_id_returns_404() {
+        let state = make_state();
+        let resp = call(state, "/grants/grant-does-not-exist").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn pause_hard_sets_status_and_blocks_evaluate() {
+        let state = make_state();
+        let persona = state.store.create_persona("hard-pause-agent").unwrap();
+        let grant = state.store.create_grant(&persona.id, "api-key", "read", None).unwrap();
+
+        let resp = call_post(Arc::clone(&state), &format!("/api/grants/{}/pause", grant.id)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Status must be 'paused', not just the advisory flag.
+        let g = state.store.get_grant(&grant.id).unwrap();
+        assert_eq!(g.status, "paused");
+        assert!(g.paused);
+
+        // evaluate_grant must not return the grant (proxy-blocking).
+        let eval = state.store.evaluate_grant(&persona.id, "api-key");
+        assert!(eval.is_err(), "paused grant must not be returned by evaluate_grant");
+    }
+
+    #[tokio::test]
+    async fn unpause_restores_status_to_active() {
+        let state = make_state();
+        let persona = state.store.create_persona("unpause-agent").unwrap();
+        let grant = state.store.create_grant(&persona.id, "api-key", "read", None).unwrap();
+
+        call_post(Arc::clone(&state), &format!("/api/grants/{}/pause", grant.id)).await;
+        let resp = call_post(Arc::clone(&state), &format!("/api/grants/{}/unpause", grant.id)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let g = state.store.get_grant(&grant.id).unwrap();
+        assert_eq!(g.status, "active");
+        assert!(!g.paused);
+
+        // evaluate_grant should work again.
+        assert!(state.store.evaluate_grant(&persona.id, "api-key").is_ok());
+    }
+
+    #[tokio::test]
+    async fn pause_nonexistent_grant_returns_404() {
+        let state = make_state();
+        let resp = call_post(state, "/api/grants/grant-nope/pause").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn truncate_persona_id_normal() {
+        let full = "persona-368a0fc5-809a-4539-abcd-ef0123456789";
+        let got = truncate_persona_id(full);
+        assert_eq!(got, "persona-368a0fc5-809", "should keep 12 UUID chars after persona- prefix");
+    }
+
+    #[test]
+    fn truncate_persona_id_short_does_not_panic() {
+        let short = "persona-abc";
+        let got = truncate_persona_id(short);
+        assert_eq!(got, "persona-abc", "short UUID portion should not panic or over-reach");
+    }
+
+    #[test]
+    fn truncate_persona_id_missing_prefix_returns_as_is() {
+        let no_prefix = "368a0fc5";
+        let got = truncate_persona_id(no_prefix);
+        assert_eq!(got, "368a0fc5", "missing persona- prefix should return as-is");
+    }
+
+    #[test]
+    fn truncate_persona_id_exact_boundary() {
+        // Exactly 12 UUID chars after "persona-" — returned unchanged (no ellipsis added).
+        let exactly_12 = "persona-368a0fc5-809";
+        let got = truncate_persona_id(exactly_12);
+        assert_eq!(got, "persona-368a0fc5-809", "exactly-12-char UUID portion should be returned as-is");
     }
 }

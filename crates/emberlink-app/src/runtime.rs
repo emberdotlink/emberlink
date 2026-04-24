@@ -724,9 +724,16 @@ impl<S: AppBackend> AppRuntime<S> {
         let sealed_hex =
             seal_grant_payload(&eph.public_key_age, &payload_bytes).map_err(|e| e.to_string())?;
 
-        // Sign the link payload: offer_id|ek_hex|expires_at
-        let link_signing_payload =
-            GrantLink::signing_payload(&offer_id, &eph.public_key_hex, expires_at);
+        // Sign the link payload: offer_id|ek_hex|expires_at|relay_hint_or_empty
+        // (GL-H1: relay_hint is part of the signed bytes so on-path
+        // attackers cannot swap relay endpoints — see security review
+        // docs/the security review).
+        let link_signing_payload = GrantLink::signing_payload(
+            &offer_id,
+            &eph.public_key_hex,
+            expires_at,
+            relay_hint.as_deref(),
+        );
         let signature = signer.sign(&link_signing_payload);
 
         // Create the event
@@ -741,7 +748,14 @@ impl<S: AppBackend> AppRuntime<S> {
                 conditions_json: if conditions.is_empty() {
                     String::new()
                 } else {
-                    serde_json::to_string(conditions).unwrap_or_default()
+                    // GC-H2 sibling: fail-closed on serialize errors. An
+                    // unwrap_or_default() here would write an empty string,
+                    // which the claim path treats as "no conditions" — a
+                    // silent fail-open that permanently strips gating from
+                    // the event log.
+                    serde_json::to_string(conditions).map_err(|e| {
+                        format!("failed to serialize grant conditions: {e}")
+                    })?
                 },
             });
 
@@ -869,18 +883,25 @@ impl<S: AppBackend> AppRuntime<S> {
         }
 
         // --- Step 3: verify issuer signature (BEFORE any identity creation) ---
-        // The issuer signs `offer_id|ek_hex|expires_at`. We verify this signature
-        // to ensure the offer is authentic before creating any local state.
-        // For same-device claims we look up the issuer's public key from the
-        // GrantOfferCreated event in the local store. For cross-device claims,
-        // the signature is still present and structurally valid — we verify it
-        // if the issuer's event is available locally, and require a non-empty
-        // signature regardless.
+        // The issuer signs `offer_id|ek_hex|expires_at|relay_hint_or_empty`. We
+        // verify this signature to ensure the offer is authentic before creating
+        // any local state. For same-device claims we look up the issuer's public
+        // key from the GrantOfferCreated event in the local store. For cross-
+        // device claims, the signature is still present and structurally valid —
+        // we verify it if the issuer's event is available locally, and require a
+        // non-empty signature regardless.
+        //
+        // GL-H1: relay_hint is `None` here because the URL-based claim path
+        // returns early above (the only path that reaches this verification is
+        // the QR / `EL1:` sealed-offer path, and `SealedOffer` does not carry a
+        // relay hint). If a future change re-routes URL claims through this
+        // verification, the `link.relay_hint` from the parsed `GrantLink` must
+        // be threaded in here so the relay binding is checked.
         if issuer_signature.is_empty() {
             return Err("offer has empty issuer signature — cannot authenticate".to_string());
         }
         let signing_payload =
-            GrantLink::signing_payload(&offer_id, &ek_hex, expires_at);
+            GrantLink::signing_payload(&offer_id, &ek_hex, expires_at, None);
 
         // If this runtime created the offer, verify against the stored issuer key.
         // The materialized state tracks GrantOfferCreated events with issuer info.
@@ -998,7 +1019,17 @@ impl<S: AppBackend> AppRuntime<S> {
                 if offer_view.conditions_json.is_empty() {
                     Vec::new()
                 } else {
-                    serde_json::from_str(&offer_view.conditions_json).unwrap_or_default()
+                    serde_json::from_str(&offer_view.conditions_json).map_err(|e| {
+                        let snippet = if offer_view.conditions_json.len() > 120 {
+                            format!("{}… (truncated)", &offer_view.conditions_json[..120])
+                        } else {
+                            offer_view.conditions_json.clone()
+                        };
+                        format!(
+                            "offer '{offer_id}' has unrecognised or malformed \
+                             conditions_json — failing closed (GC-H2): {e}; json={snippet}"
+                        )
+                    })?
                 };
             if !parsed_conditions.is_empty() {
                 // Collect claimant's active badges.
@@ -2496,5 +2527,173 @@ mod tests {
             reason: "test revocation".into(),
         });
         assert!(revoke_result.is_ok(), "issuer should be able to revoke own badge");
+    }
+
+    // -----------------------------------------------------------------------
+    // GC-H2 fail-closed regression tests (development milestone)
+    // -----------------------------------------------------------------------
+
+    /// GC-H2: a GrantOfferCreated event whose conditions_json contains an
+    /// unknown variant must cause claim to fail closed — no GrantClaimed event
+    /// is written and the offer remains Pending.
+    ///
+    /// Setup: inject a GrantOfferCreated event with a hostile conditions_json
+    /// directly into the MemoryEventLog (bypassing normal offer creation).
+    /// MemoryEventLog::append uses AllowAllAuthorizer, so the event is accepted
+    /// even though the signer is a fixture key unrelated to any real identity.
+    /// The FixtureVerifier verifies FixtureSigner signatures, satisfying the
+    /// EventLog::append signature-check invariant.
+    #[test]
+    fn claim_rejects_malformed_conditions_json() {
+        use core_crypto::{FixtureSigner, FixtureVerifier};
+
+        // Real identity so the claim path has a persona + local signing key.
+        let mut rt = memory_runtime();
+        let (init, _) = rt
+            .handle_action(UiAction::Init {
+                name: "Alice".into(),
+                device_label: "Laptop".into(),
+                persona_label: "Default".into(),
+            })
+            .unwrap();
+        let claiming_persona_id = init["persona_id"].as_str().unwrap().to_string();
+
+        // Inject a GrantOfferCreated event with malformed conditions_json.
+        // The issuer_persona_id is deliberately fake — no matching persona in
+        // personas_current, so the issuer-signature check at claim step 3 is
+        // skipped. The conditions_json check (step 5b) fires before any event
+        // write, so this is the only part of the claim that matters here.
+        let offer_id = "offer-gc-h2-test";
+        let ek_hex = "aa".repeat(32); // 64-char hex — valid X25519 length
+        let event = EventEnvelope::from_body(
+            "evt-gc-h2-test",
+            core_types::EventBody::GrantOfferCreated(core_types::GrantOfferCreatedEvent {
+                offer_id: offer_id.into(),
+                issuer_persona_id: "fake-issuer".into(),
+                ephemeral_public_key_hex: ek_hex.clone(),
+                sealed_payload_hex: "deadbeef".into(),
+                relay_hint: None,
+                expires_at: 9_999_999_999,
+                conditions_json: r#"[{"type":"future_variant","value":{}}]"#.into(),
+            }),
+            vec![],
+            SignerBinding::persona("fake-issuer", "fake-key"),
+            &FixtureSigner::new("fake-key"),
+        )
+        .unwrap();
+        rt.store
+            .append(event, &FixtureVerifier)
+            .expect("inject malformed-conditions offer into store");
+
+        // Verify the offer landed in materialized state with the hostile JSON.
+        assert!(
+            rt.store
+                .materialized()
+                .grant_offers_current
+                .get(offer_id)
+                .map(|o| o.conditions_json.contains("future_variant"))
+                .unwrap_or(false),
+            "offer with malformed conditions_json must be in materialized state"
+        );
+
+        // Build a SealedOffer QR referencing our injected offer.
+        // issuer_signature must be non-empty to pass the early empty-sig guard
+        // (claim step 3); any non-empty string is accepted because the fake
+        // issuer persona is absent from personas_current.
+        let sealed = SealedOffer {
+            offer_id: offer_id.into(),
+            ephemeral_public_key_hex: ek_hex,
+            sealed_payload_hex: "deadbeef".into(),
+            expires_at: 9_999_999_999,
+            issuer_signature: "fakesig".into(),
+        };
+        let qr = match encode_sealed_offer(&sealed) {
+            Ok(q) => q,
+            Err(_) => return, // skip if payload too large for QR encoding
+        };
+
+        // Attempt to claim — must return Err with a GC-H2 fail-closed message.
+        let err = rt
+            .handle_action(UiAction::ClaimGrantOffer {
+                link_url: qr,
+                claiming_persona_id: Some(claiming_persona_id),
+                new_user_name: None,
+            })
+            .unwrap_err();
+
+        assert!(
+            err.contains("unrecognised") || err.contains("GC-H2") || err.contains("malformed"),
+            "expected GC-H2 fail-closed error, got: {err}"
+        );
+
+        // No GrantClaimed event was written — offer must still be Pending.
+        let offer_after = rt
+            .store
+            .materialized()
+            .grant_offers_current
+            .get(offer_id)
+            .expect("offer must still exist after failed claim");
+        assert_eq!(
+            offer_after.status,
+            core_eventlog::GrantOfferStatus::Pending,
+            "offer status must remain Pending after fail-closed conditions rejection"
+        );
+        assert!(
+            offer_after.recipient_persona_id.is_none(),
+            "offer must not have a recipient after fail-closed rejection"
+        );
+    }
+
+    /// GC-H2 sibling (runtime.rs:751): when conditions are non-empty, the
+    /// resulting GrantOfferCreated event must store a non-empty conditions_json.
+    ///
+    /// A regression to `.unwrap_or_default()` at the serialize site would
+    /// silently write an empty string, which the claim path treats as
+    /// "no conditions" — permanently stripping gating from the event log.
+    /// This test pins that contract.
+    #[test]
+    fn offer_creation_fails_on_unserializable_conditions() {
+        let mut rt = memory_runtime();
+        let (init, _) = rt
+            .handle_action(UiAction::Init {
+                name: "Alice".into(),
+                device_label: "Laptop".into(),
+                persona_label: "Default".into(),
+            })
+            .unwrap();
+        let persona_id = init["persona_id"].as_str().unwrap().to_string();
+
+        let (offer, _) = rt
+            .handle_action(UiAction::CreateGrantOffer {
+                issuing_persona_id: persona_id,
+                mode: "one_shot".into(),
+                statement_specs: vec!["read_credential:obj-cond-pin".into()],
+                expires_in_secs: Some(86400),
+                relay_hint: None,
+                conditions: vec![
+                    core_types::grant_conditions::GrantCondition::badge("verified-dev"),
+                ],
+            })
+            .unwrap();
+        assert_eq!(offer["status"], "ok");
+        let offer_id = offer["offer_id"].as_str().unwrap().to_string();
+
+        let offer_record = rt
+            .store
+            .materialized()
+            .grant_offers_current
+            .get(&offer_id)
+            .expect("offer must be in materialized state");
+
+        assert!(
+            !offer_record.conditions_json.is_empty(),
+            "conditions_json must not be empty when conditions are non-empty: \
+             a regression to .unwrap_or_default() would silently strip gating"
+        );
+        assert!(
+            offer_record.conditions_json.contains("verified-dev"),
+            "conditions_json must encode the actual condition, got: {}",
+            offer_record.conditions_json
+        );
     }
 }

@@ -1,7 +1,4 @@
-use core_types::ValidationError;
-use rusqlite::Connection;
-
-pub(crate) const SQLITE_MIGRATION_V1: &str = r#"
+pub(crate) const SQLITE_INIT_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS events (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
     event_id TEXT NOT NULL UNIQUE,
@@ -285,6 +282,7 @@ CREATE INDEX IF NOT EXISTS idx_devices_current_root_id ON devices_current(root_i
 CREATE INDEX IF NOT EXISTS idx_personas_current_root_id ON personas_current(root_id);
 CREATE INDEX IF NOT EXISTS idx_persona_device_access_device_id ON persona_device_access(device_id);
 CREATE INDEX IF NOT EXISTS idx_local_artifacts_owner ON local_presentation_artifacts(owner_kind, owner_id);
+CREATE INDEX IF NOT EXISTS idx_local_artifacts_grant ON local_presentation_artifacts(grant_id);
 CREATE INDEX IF NOT EXISTS idx_received_artifacts_issuer ON local_received_presentation_artifacts(issuer_persona_id);
 
 -- design — composite grant statements shape.
@@ -427,323 +425,106 @@ CREATE TABLE IF NOT EXISTS credential_access_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_credential_access_log_grant ON credential_access_log(grant_id);
+CREATE INDEX IF NOT EXISTS idx_credential_access_log_agent ON credential_access_log(agent_id);
 "#;
 
-pub(crate) fn ensure_runtime_columns(conn: &Connection) -> Result<(), ValidationError> {
-    allow_duplicate_column(
-        conn.execute(
-            "ALTER TABLE trust_edges_current ADD COLUMN recipient_bound TEXT",
-            [],
-        ),
-        "ensure trust_edges_current recipient_bound column",
-    )?;
-    allow_duplicate_column(
-        conn.execute(
-            "ALTER TABLE endpoints_current ADD COLUMN device_id TEXT",
-            [],
-        ),
-        "ensure endpoints_current device_id column",
-    )?;
-    allow_duplicate_column(
-        conn.execute(
-            "ALTER TABLE devices_current ADD COLUMN active_encryption_key_id TEXT",
-            [],
-        ),
-        "ensure devices_current active_encryption_key_id column",
-    )?;
-    allow_duplicate_column(
-        conn.execute(
-            "ALTER TABLE devices_current ADD COLUMN active_encryption_public_key TEXT",
-            [],
-        ),
-        "ensure devices_current active_encryption_public_key column",
-    )?;
-    allow_duplicate_column(
-        conn.execute("ALTER TABLE local_blocks ADD COLUMN nonce_hex TEXT", []),
-        "ensure local_blocks nonce_hex column",
-    )?;
-    allow_duplicate_column(
-        conn.execute("ALTER TABLE local_blocks ADD COLUMN ciphertext BLOB", []),
-        "ensure local_blocks ciphertext column",
-    )?;
-    allow_duplicate_column(
-        conn.execute(
-            "ALTER TABLE local_presentation_artifacts ADD COLUMN owner_kind TEXT NOT NULL DEFAULT ''",
-            [],
-        ),
-        "ensure local_presentation_artifacts owner_kind column",
-    )?;
-    allow_duplicate_column(
-        conn.execute(
-            "ALTER TABLE local_presentation_artifacts ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''",
-            [],
-        ),
-        "ensure local_presentation_artifacts owner_id column",
-    )?;
-    allow_duplicate_column(
-        conn.execute(
-            "ALTER TABLE local_presentation_artifacts ADD COLUMN template_id TEXT NOT NULL DEFAULT ''",
-            [],
-        ),
-        "ensure local_presentation_artifacts template_id column",
-    )?;
-    allow_duplicate_column(
-        conn.execute(
-            "ALTER TABLE local_presentation_artifacts ADD COLUMN grant_id TEXT",
-            [],
-        ),
-        "ensure local_presentation_artifacts grant_id column",
-    )?;
-    conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_local_artifacts_grant ON local_presentation_artifacts(grant_id);",
-    )
-    .map_err(|err| ValidationError::new(format!("ensure grant_id index: {err}")))?;
-    allow_duplicate_column(
-        conn.execute(
-            "ALTER TABLE local_received_presentation_artifacts ADD COLUMN issuer_persona_id TEXT",
-            [],
-        ),
-        "ensure local_received_presentation_artifacts issuer_persona_id column",
-    )?;
-    allow_duplicate_column(
-        conn.execute(
-            "ALTER TABLE local_received_presentation_artifacts ADD COLUMN issuer_key_id TEXT",
-            [],
-        ),
-        "ensure local_received_presentation_artifacts issuer_key_id column",
-    )?;
-    allow_duplicate_column(
-        conn.execute(
-            "ALTER TABLE local_received_presentation_artifacts ADD COLUMN issuer_public_key TEXT",
-            [],
-        ),
-        "ensure local_received_presentation_artifacts issuer_public_key column",
-    )?;
-    allow_duplicate_column(
-        conn.execute(
-            "ALTER TABLE local_received_presentation_artifacts ADD COLUMN issuer_signature_hex TEXT",
-            [],
-        ),
-        "ensure local_received_presentation_artifacts issuer_signature_hex column",
-    )?;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+    use std::collections::{HashMap, HashSet};
 
-    allow_duplicate_column(
-        conn.execute(
-            "ALTER TABLE grant_offers ADD COLUMN conditions_json TEXT NOT NULL DEFAULT '[]'",
-            [],
-        ),
-        "ensure grant_offers conditions_json column",
-    )?;
-
-    // design — composite grant shape. blocks_json holds the full signed
-    // chain; per-statement budget / conditions live inside. Pre-design
-    // databases are dropped: there are no production users yet.
-    conn.execute_batch(
-        "DROP TABLE IF EXISTS access_grants;
-        DROP TABLE IF EXISTS access_grant_history;
-        CREATE TABLE IF NOT EXISTS access_grants (
-            grant_id TEXT NOT NULL PRIMARY KEY,
-            version INTEGER NOT NULL DEFAULT 1,
-            issuing_persona_id TEXT NOT NULL,
-            recipient_kind TEXT NOT NULL,
-            recipient_id TEXT NOT NULL,
-            recipient_profile TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'active',
-            mode TEXT NOT NULL,
-            blocks_json TEXT NOT NULL,
-            label TEXT,
-            created_at INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL,
-            expires_at INTEGER,
-            revoked_at INTEGER,
-            revoked_reason TEXT,
-            last_used_at INTEGER,
-            resource_types_csv TEXT NOT NULL DEFAULT '',
-            attestation_json TEXT NOT NULL DEFAULT '{\"status\":\"unattested_local_dev\"}'
+    /// Snapshot of column names required on each table by the pre-collapse
+    /// `ensure_runtime_columns` pass. If the init DDL is truly complete, every
+    /// one of these must be present after running the DDL against a fresh DB.
+    fn required_runtime_columns() -> HashMap<&'static str, Vec<&'static str>> {
+        let mut map = HashMap::new();
+        map.insert("trust_edges_current", vec!["recipient_bound"]);
+        map.insert("endpoints_current", vec!["device_id"]);
+        map.insert(
+            "devices_current",
+            vec!["active_encryption_key_id", "active_encryption_public_key"],
         );
-        CREATE INDEX IF NOT EXISTS idx_grants_persona ON access_grants(issuing_persona_id);
-        CREATE INDEX IF NOT EXISTS idx_grants_recipient ON access_grants(recipient_kind, recipient_id);
-        CREATE INDEX IF NOT EXISTS idx_grants_status ON access_grants(status);
-        CREATE TABLE IF NOT EXISTS access_grant_history (
-            history_id TEXT NOT NULL PRIMARY KEY,
-            grant_id TEXT NOT NULL,
-            version INTEGER NOT NULL,
-            action TEXT NOT NULL,
-            timestamp INTEGER NOT NULL,
-            blocks_snapshot TEXT,
-            note TEXT
+        map.insert("local_blocks", vec!["nonce_hex", "ciphertext"]);
+        map.insert(
+            "local_presentation_artifacts",
+            vec!["owner_kind", "owner_id", "template_id", "grant_id"],
         );
-        CREATE INDEX IF NOT EXISTS idx_grant_history_grant_id ON access_grant_history(grant_id);",
-    )
-    .map_err(|err| ValidationError::new(format!("ensure access_grants tables: {err}")))?;
-
-    // Ensure service_bindings table exists for existing databases.
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS service_bindings (
-            binding_id TEXT NOT NULL PRIMARY KEY,
-            persona_id TEXT NOT NULL,
-            adapter_kind TEXT NOT NULL,
-            service_label TEXT NOT NULL,
-            endpoint TEXT NOT NULL DEFAULT '',
-            external_account_id TEXT NOT NULL,
-            created_at INTEGER NOT NULL
+        map.insert(
+            "local_received_presentation_artifacts",
+            vec![
+                "issuer_persona_id",
+                "issuer_key_id",
+                "issuer_public_key",
+                "issuer_signature_hex",
+            ],
         );
-        CREATE INDEX IF NOT EXISTS idx_service_bindings_persona_id ON service_bindings(persona_id);",
-    )
-    .map_err(|err| ValidationError::new(format!("ensure service_bindings table: {err}")))?;
+        map.insert("grant_offers", vec!["conditions_json"]);
+        map
+    }
 
-    // Ensure badges table exists for existing databases.
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS badges (
-            badge_id TEXT NOT NULL PRIMARY KEY,
-            issuer_persona_id TEXT NOT NULL,
-            recipient_persona_id TEXT NOT NULL,
-            badge_type TEXT NOT NULL,
-            display_name TEXT NOT NULL,
-            evidence_type TEXT,
-            evidence_payload_hex TEXT,
-            issued_at INTEGER NOT NULL,
-            expires_at INTEGER,
-            status TEXT NOT NULL DEFAULT 'active',
-            revoked_reason TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_badges_issuer ON badges(issuer_persona_id);
-        CREATE INDEX IF NOT EXISTS idx_badges_recipient ON badges(recipient_persona_id);
-        CREATE INDEX IF NOT EXISTS idx_badges_badge_type ON badges(badge_type);
-        CREATE INDEX IF NOT EXISTS idx_badges_status ON badges(status);",
-    )
-    .map_err(|err| ValidationError::new(format!("ensure badges table: {err}")))?;
+    fn table_columns(conn: &Connection, table: &str) -> HashSet<String> {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .expect("prepare table_info");
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query table_info");
+        rows.collect::<Result<HashSet<_>, _>>()
+            .expect("collect table_info")
+    }
 
-    // Ensure badge_visibility table exists for existing databases.
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS badge_visibility (
-            badge_id TEXT NOT NULL,
-            persona_id TEXT NOT NULL,
-            visible INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (badge_id, persona_id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_badge_visibility_persona ON badge_visibility(persona_id);",
-    )
-    .map_err(|err| ValidationError::new(format!("ensure badge_visibility table: {err}")))?;
+    #[test]
+    fn fresh_init_ddl_includes_all_runtime_columns() {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        conn.execute_batch(SQLITE_INIT_DDL)
+            .expect("run init ddl");
 
-    // Ensure badge_disputes table exists for existing databases.
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS badge_disputes (
-            dispute_id TEXT NOT NULL PRIMARY KEY,
-            target_badge_id TEXT NOT NULL,
-            disputer_persona_id TEXT NOT NULL,
-            reason TEXT NOT NULL,
-            evidence TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_badge_disputes_target ON badge_disputes(target_badge_id);
-        CREATE INDEX IF NOT EXISTS idx_badge_disputes_disputer ON badge_disputes(disputer_persona_id);",
-    )
-    .map_err(|err| ValidationError::new(format!("ensure badge_disputes table: {err}")))?;
-
-    // Ensure grant_offers table exists for existing databases.
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS grant_offers (
-            offer_id TEXT NOT NULL PRIMARY KEY,
-            issuer_persona_id TEXT NOT NULL,
-            ephemeral_public_key_hex TEXT NOT NULL,
-            sealed_payload_hex TEXT NOT NULL,
-            relay_hint TEXT,
-            expires_at INTEGER NOT NULL,
-            conditions_json TEXT NOT NULL DEFAULT '[]',
-            status TEXT NOT NULL DEFAULT 'pending',
-            recipient_persona_id TEXT,
-            claim_response_hex TEXT,
-            claimed_at INTEGER
-        );
-        CREATE INDEX IF NOT EXISTS idx_grant_offers_issuer ON grant_offers(issuer_persona_id);
-        CREATE INDEX IF NOT EXISTS idx_grant_offers_status ON grant_offers(status);",
-    )
-    .map_err(|err| ValidationError::new(format!("ensure grant_offers table: {err}")))?;
-
-    // Ensure credential_deposits table exists for existing databases.
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS credential_deposits (
-            deposit_id TEXT NOT NULL PRIMARY KEY,
-            grant_id TEXT NOT NULL,
-            credential_id TEXT NOT NULL,
-            issuer_id TEXT NOT NULL,
-            encrypted_blocks_json TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'active',
-            created_at INTEGER NOT NULL,
-            expires_at INTEGER,
-            revoked_at INTEGER,
-            revoked_reason TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_credential_deposits_grant ON credential_deposits(grant_id);",
-    )
-    .map_err(|err| ValidationError::new(format!("ensure credential_deposits table: {err}")))?;
-
-    // Ensure credential_access_log table exists for existing databases.
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS credential_access_log (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            grant_id    TEXT NOT NULL,
-            agent_id    TEXT NOT NULL,
-            accessed_at INTEGER NOT NULL,
-            scope       TEXT NOT NULL,
-            outcome     TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_credential_access_log_grant ON credential_access_log(grant_id);",
-    )
-    .map_err(|err| ValidationError::new(format!("ensure credential_access_log table: {err}")))?;
-
-    // Ensure approval_requests table exists for existing databases.
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS approval_requests (
-            request_id TEXT NOT NULL PRIMARY KEY,
-            requester_id TEXT NOT NULL,
-            requester_label TEXT,
-            requested_scope_json TEXT NOT NULL,
-            requested_duration_secs INTEGER,
-            reason TEXT,
-            status TEXT NOT NULL DEFAULT 'pending',
-            created_at INTEGER NOT NULL,
-            resolved_at INTEGER,
-            resolver_id TEXT,
-            narrowed_scope_json TEXT,
-            denial_reason TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_approval_requests_status ON approval_requests(status);
-        CREATE INDEX IF NOT EXISTS idx_approval_requests_requester ON approval_requests(requester_id);",
-    )
-    .map_err(|err| ValidationError::new(format!("ensure approval_requests table: {err}")))?;
-
-    // Ensure credential_access_log table exists for existing databases.
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS credential_access_log (
-            log_id TEXT NOT NULL PRIMARY KEY,
-            grant_id TEXT NOT NULL,
-            agent_id TEXT NOT NULL,
-            scope TEXT NOT NULL,
-            outcome TEXT NOT NULL,
-            accessed_at INTEGER NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS idx_credential_access_log_grant ON credential_access_log(grant_id);
-        CREATE INDEX IF NOT EXISTS idx_credential_access_log_agent ON credential_access_log(agent_id);",
-    )
-    .map_err(|err| ValidationError::new(format!("ensure credential_access_log table: {err}")))?;
-
-    Ok(())
-}
-
-pub(crate) fn allow_duplicate_column(
-    result: rusqlite::Result<usize>,
-    context: &str,
-) -> Result<(), ValidationError> {
-    match result {
-        Ok(_) => Ok(()),
-        Err(err) => {
-            let message = err.to_string();
-            if message.contains("duplicate column name") {
-                Ok(())
-            } else {
-                Err(ValidationError::new(format!("{context}: {message}")))
+        for (table, expected) in required_runtime_columns() {
+            let columns = table_columns(&conn, table);
+            for col in expected {
+                assert!(
+                    columns.contains(col),
+                    "table {table} missing column {col} after init DDL (present: {columns:?})",
+                );
             }
         }
+
+        // Sanity: init DDL should also create the two indexes the old ensure
+        // pass added out-of-band.
+        let index_names: HashSet<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='index'")
+            .expect("prepare index list")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("query indexes")
+            .collect::<Result<_, _>>()
+            .expect("collect indexes");
+        assert!(
+            index_names.contains("idx_local_artifacts_grant"),
+            "expected idx_local_artifacts_grant in {index_names:?}",
+        );
+        assert!(
+            index_names.contains("idx_credential_access_log_agent"),
+            "expected idx_credential_access_log_agent in {index_names:?}",
+        );
+    }
+
+    #[test]
+    fn fresh_init_ddl_accepts_basic_inserts() {
+        let conn = Connection::open_in_memory().expect("open in-memory db");
+        conn.execute_batch(SQLITE_INIT_DDL)
+            .expect("run init ddl");
+        conn.execute(
+            "INSERT INTO credential_access_log (grant_id, agent_id, accessed_at, scope, outcome)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["g1", "a1", 0_i64, "read", "ok"],
+        )
+        .expect("insert credential_access_log row");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM credential_access_log", [], |r| {
+                r.get(0)
+            })
+            .expect("count credential_access_log rows");
+        assert_eq!(count, 1);
     }
 }

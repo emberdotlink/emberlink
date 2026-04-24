@@ -3,13 +3,69 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use ember_daemon::dashboard::run_dashboard;
-use ember_daemon::policy::PolicyEngine;
+use ember_daemon::policy::{
+    PolicyConfig, PolicyDecision, PolicyEngine, PolicyRule, RiskLevel,
+};
 use ember_daemon::rate_limit::RateLimiter;
 use ember_daemon::socket::SocketListener;
 use ember_daemon::store::DaemonStore;
 use ember_daemon::vault::Vault;
 use tempfile::TempDir;
 use tokio::sync::watch;
+
+/// Permissive policy engine for socket-level integration tests.
+///
+/// development milestone closed the `force: true` socket bypass, so socket tests
+/// can no longer skip the policy engine via the wire. This engine mirrors
+/// the shape of `PolicyEngine::default()` (so `deploy.staging` still
+/// auto-approves etc.) AND adds an auto-approve rule for
+/// `credential.access.*` so existing lifecycle tests can mint grants
+/// without going through the approval loop. It does NOT auto-approve
+/// `*` — that would mask the policy gate entirely.
+fn permissive_test_policy() -> PolicyEngine {
+    PolicyEngine::new(PolicyConfig {
+        rules: vec![
+            PolicyRule {
+                action: "credential.access.*".to_string(),
+                risk: RiskLevel::Low,
+                decision: PolicyDecision::AutoApprove,
+                tier: None,
+            },
+            PolicyRule {
+                action: "credential.access".to_string(),
+                risk: RiskLevel::Low,
+                decision: PolicyDecision::AutoApprove,
+                tier: None,
+            },
+            PolicyRule {
+                action: "git.push.main".to_string(),
+                risk: RiskLevel::Critical,
+                decision: PolicyDecision::Deny,
+                tier: None,
+            },
+            PolicyRule {
+                action: "git.push.*".to_string(),
+                risk: RiskLevel::Medium,
+                decision: PolicyDecision::AutoApprove,
+                tier: None,
+            },
+            PolicyRule {
+                action: "deploy.production".to_string(),
+                risk: RiskLevel::Critical,
+                decision: PolicyDecision::RequireApproval,
+                tier: None,
+            },
+            PolicyRule {
+                action: "deploy.staging".to_string(),
+                risk: RiskLevel::Medium,
+                decision: PolicyDecision::AutoApprove,
+                tier: None,
+            },
+        ],
+        default_decision: PolicyDecision::RequireApproval,
+        default_risk: RiskLevel::Medium,
+    })
+}
 
 /// Spawn the daemon listener on a dedicated single-threaded runtime in its own
 /// OS thread. Returns the socket path and a shutdown sender. This avoids
@@ -31,7 +87,9 @@ fn spawn_listener_thread(tmp: &TempDir) -> (std::path::PathBuf, watch::Sender<bo
         local.block_on(&rt, async move {
             let store = Rc::new(DaemonStore::open_in_memory().unwrap());
             let vault = Rc::new(Vault::new([42u8; 32]));
-            let policy = Rc::new(PolicyEngine::default());
+            // V0 schema: persona-secret writes require an attached vault.
+            store.set_vault(Rc::clone(&vault));
+            let policy = Rc::new(permissive_test_policy());
             let rate_limiter = Rc::new(RefCell::new(RateLimiter::default()));
             let listener = SocketListener::new(
                 path_for_thread,
@@ -83,7 +141,9 @@ async fn full_grant_lifecycle_via_socket() {
         )
         .unwrap();
 
-        // 4. Create grant with TTL
+        // 4. Create grant with TTL — relies on `permissive_test_policy`
+        // auto-approving credential.access.* (force is no longer wire-honored
+        // post development milestone).
         let g = t
             .send(
                 "create_grant",
@@ -92,7 +152,6 @@ async fn full_grant_lifecycle_via_socket() {
                     "credential_name": "test-key",
                     "scope": "read",
                     "ttl_secs": 3600,
-                    "force": true,
                 }),
             )
             .unwrap();
@@ -197,7 +256,8 @@ async fn full_demo_flow() {
             .unwrap();
         assert_eq!(vault_resp["name"], json!("github-token"));
 
-        // 4. Create grant with TTL and rate limit
+        // 4. Create grant with TTL and rate limit — permissive policy
+        // auto-approves; socket API no longer honors `force`.
         let g = t
             .send(
                 "create_grant",
@@ -207,7 +267,6 @@ async fn full_demo_flow() {
                     "scope": "read",
                     "ttl_secs": 3600,
                     "max_uses_per_hour": 10,
-                    "force": true,
                 }),
             )
             .unwrap();
@@ -357,7 +416,7 @@ async fn grant_lifecycle_audits_issuance_and_revoke() {
         )
         .unwrap();
 
-        // Create grant (force=true to bypass policy)
+        // Create grant (policy auto-approves credential.access.*).
         let g = t
             .send(
                 "create_grant",
@@ -366,7 +425,6 @@ async fn grant_lifecycle_audits_issuance_and_revoke() {
                     "credential_name": "audit-key",
                     "scope": "read",
                     "ttl_secs": 3600,
-                    "force": true,
                 }),
             )
             .unwrap();
@@ -453,7 +511,6 @@ async fn revocation_notification_reaches_connected_client() {
                     "persona_id": pid,
                     "credential_name": "revoke-key",
                     "scope": "read",
-                    "force": true,
                 }),
             )
             .unwrap();
@@ -737,6 +794,8 @@ async fn socket_still_works_when_dashboard_port_occupied() {
         local.block_on(&rt, async move {
             let store = Rc::new(DaemonStore::open(&db).unwrap());
             let vault = Rc::new(Vault::new([42u8; 32]));
+            // V0 schema: persona-secret writes require an attached vault.
+            store.set_vault(Rc::clone(&vault));
             let policy = Rc::new(PolicyEngine::default());
             let rate_limiter = Rc::new(RefCell::new(RateLimiter::default()));
 

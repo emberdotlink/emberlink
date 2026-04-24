@@ -8,7 +8,7 @@ use ed25519_dalek::{
     VerifyingKey,
 };
 use getrandom::fill as os_fill;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Errors from the grant-chain signing / verification layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,10 +132,31 @@ impl PubkeyNextKeyPair {
 /// Thin wrapper over the `LocalKeyPair` already in the keystore — this type
 /// keeps the grant-chain API legible without forcing callers to reach into
 /// `core_crypto::LocalKeyPair` directly.
-#[derive(Debug, Clone)]
+///
+/// # Secret hygiene (F-03)
+///
+/// - The secret half is a **private field**. There is no accessor. Signing
+///   goes through `signing_key()` (crate-private) or the public
+///   [`RootKeyPair::from_hex`] constructor; the raw hex never escapes this
+///   module.
+/// - `Debug` is **manually implemented** to redact the secret — a reflexive
+///   `tracing::debug!(?root, ...)` or `format!("{root:?}")` prints
+///   `RootKeyPair { public: <hex>, secret: <redacted> }` and nothing more.
+/// - `Zeroize` + `ZeroizeOnDrop` scrub the secret `String`'s backing bytes
+///   when the value goes out of scope (or on explicit `zeroize()`).
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct RootKeyPair {
-    pub public_hex: String,
-    pub secret_hex: String,
+    public_hex: String,
+    secret_hex: String,
+}
+
+impl std::fmt::Debug for RootKeyPair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RootKeyPair")
+            .field("public", &self.public_hex)
+            .field("secret", &"<redacted>")
+            .finish()
+    }
 }
 
 impl RootKeyPair {
@@ -148,6 +169,19 @@ impl RootKeyPair {
         let _ = decode_secret(&secret_hex)?;
         let _ = decode_pubkey(&public_hex)?;
         Ok(Self { public_hex, secret_hex })
+    }
+
+    /// The public half of the root key, in raw hex (no `ed25519:` prefix).
+    /// Safe to log — public keys are not secret.
+    pub fn public_hex(&self) -> &str {
+        &self.public_hex
+    }
+
+    /// The public half as raw 32 bytes, ready for `verify_chain`'s
+    /// `root_pubkey` argument. Convenience over `hex::decode(kp.public_hex())`
+    /// so callers don't have to depend on the `hex` crate directly.
+    pub fn public_bytes(&self) -> Result<[u8; 32], ChainError> {
+        decode_pubkey(&self.public_hex)
     }
 
     fn signing_key(&self) -> Result<SigningKey, ChainError> {
@@ -365,11 +399,14 @@ fn strip_prefix<'a>(value: &'a str, prefix: &str) -> Result<&'a str, ChainError>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_types::{ResourceSelector, ResourceType, Statement, Usage};
+    use core_types::{KeyAlgorithm, ResourceSelector, ResourceType, Statement, Usage};
 
     fn fresh_root_keypair() -> (RootKeyPair, [u8; 32]) {
-        let mut seed = [0u8; 32];
-        os_fill(&mut seed).unwrap();
+        make_root_keypair(42)
+    }
+
+    fn make_root_keypair(fill: u8) -> (RootKeyPair, [u8; 32]) {
+        let seed = [fill; 32];
         let signing = SigningKey::from_bytes(&seed);
         let pubkey_bytes = signing.verifying_key().to_bytes();
         let pair = RootKeyPair::from_hex(hex::encode(pubkey_bytes), hex::encode(seed)).unwrap();
@@ -464,8 +501,8 @@ mod tests {
 
     #[test]
     fn wrong_root_pubkey_is_distinguished_from_tampering() {
-        let (root_a, _root_a_pubkey) = fresh_root_keypair();
-        let (_root_b, root_b_pubkey) = fresh_root_keypair();
+        let (root_a, _root_a_pubkey) = make_root_keypair(42);
+        let (_root_b, root_b_pubkey) = make_root_keypair(43);
         let block = sample_block("Stmt0", 10);
         let out = sign_block_zero(&root_a, &block).unwrap();
 
@@ -508,12 +545,23 @@ mod tests {
 
     #[test]
     fn round_trip_from_local_key_pair() {
-        let local = crate::generate_local_key_pair("root", "root-a");
+        // Build a deterministic LocalKeyPair from a fixed seed so this test
+        // does not touch OS entropy (library-crates rule: tests must compile
+        // and run identically on host + wasm32-unknown-unknown).
+        let seed = [77u8; 32];
+        let signing = SigningKey::from_bytes(&seed);
+        let pubkey_hex = hex::encode(signing.verifying_key().to_bytes());
+        let local = crate::LocalKeyPair {
+            key_id: "key-root-root-a-v1-fixture".into(),
+            algorithm: KeyAlgorithm::Ed25519,
+            public_key: format!("ed25519:{pubkey_hex}"),
+            private_key: format!("ed25519-secret:{}", hex::encode(seed)),
+        };
         let root_kp = root_key_from_local_key_pair(&local).unwrap();
         let block = sample_block("Stmt0", 42);
         let out = sign_block_zero(&root_kp, &block).unwrap();
 
-        let root_pubkey_bytes = hex::decode(&root_kp.public_hex).unwrap();
+        let root_pubkey_bytes = hex::decode(root_kp.public_hex()).unwrap();
         verify_chain(std::slice::from_ref(&out.signed), &root_pubkey_bytes).unwrap();
     }
 
@@ -550,6 +598,69 @@ mod tests {
         };
         let err = verify_chain(&[out0.signed, unsigned_tail], &root_pubkey_bytes).unwrap_err();
         assert_eq!(err, ChainError::ChainUnsigned { block_index: 1 });
+    }
+
+    /// F-03: `Debug` on `RootKeyPair` must never leak the secret half.
+    /// `format!("{:?}", root)` and `tracing::debug!(?root, ...)` are the
+    /// reflexive shapes that would otherwise ship the secret to logs/sinks.
+    #[test]
+    fn rootkeypair_debug_redacts_secret() {
+        let (root, _) = fresh_root_keypair();
+
+        // Keep a copy of the true secret via a round-trip back out of the
+        // module: reconstruct a RootKeyPair from the same hex we originally
+        // fed `from_hex`. We need the secret string for the anti-leak
+        // assertion.
+        let seed = [99u8; 32];
+        let secret_hex_true = hex::encode(seed);
+        let signing = SigningKey::from_bytes(&seed);
+        let pub_hex_true = hex::encode(signing.verifying_key().to_bytes());
+        let root2 = RootKeyPair::from_hex(pub_hex_true.clone(), secret_hex_true.clone()).unwrap();
+
+        let dbg = format!("{root2:?}");
+        assert!(
+            dbg.contains("<redacted>"),
+            "Debug output must contain redaction marker: {dbg}"
+        );
+        assert!(
+            !dbg.contains(&secret_hex_true),
+            "Debug output MUST NOT contain the secret hex: {dbg}"
+        );
+        // Public half is safe to include and useful for operator triage.
+        assert!(
+            dbg.contains(&pub_hex_true),
+            "Debug output should include the public hex for triage: {dbg}"
+        );
+
+        // Silence unused-warning on `root`: Debug-print it too so this
+        // test exercises the generate/construct path as well.
+        let _ = format!("{root:?}");
+    }
+
+    /// F-03: manual `Zeroize` on `RootKeyPair` scrubs the secret in place.
+    /// `ZeroizeOnDrop` runs the same routine at end-of-scope; we cannot
+    /// observe post-drop memory portably, so test the explicit path — the
+    /// drop behaviour is guaranteed by the derive.
+    #[test]
+    fn rootkeypair_zeroize_clears_secret() {
+        let (mut root, _) = fresh_root_keypair();
+        // Baseline: both halves are non-empty hex strings before zeroize.
+        assert!(!root.secret_hex.is_empty());
+        assert!(!root.public_hex.is_empty());
+
+        root.zeroize();
+
+        // `Zeroize for String` empties the string (length 0), which also
+        // wipes the backing buffer. A zeroed `RootKeyPair` has no hex in
+        // either field — `signing_key()` would fail if called.
+        assert!(
+            root.secret_hex.is_empty(),
+            "zeroize must empty the secret_hex string"
+        );
+        assert!(
+            root.public_hex.is_empty(),
+            "zeroize must empty the public_hex string"
+        );
     }
 
     #[test]

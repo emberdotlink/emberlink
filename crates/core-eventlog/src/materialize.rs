@@ -666,7 +666,6 @@ pub fn apply_event(
                 }
             }
         }
-        EventBody::LegacyOpaque { .. } => {}
     }
 
     Ok(())
@@ -684,7 +683,6 @@ pub fn event_affects_materialized_state(event: &EventEnvelope) -> bool {
             | EventBody::DisclosureRevoked(_)
             | EventBody::RelayShutdownNotice(_)
             | EventBody::StorageManifestPublished(_)
-            | EventBody::LegacyOpaque { .. }
     )
 }
 

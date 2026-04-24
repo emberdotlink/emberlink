@@ -306,8 +306,9 @@ impl DaemonStore {
     /// `network` defaults to bridge (MVS-A default) when `None`; tests pass
     /// `Some("none")` to keep the docker path fast and offline. `extra_env`
     /// is passed through as `-e KEY=VAL` to the container — the daemon also
-    /// injects `EMBER_PERSONA_ID`, `EMBER_DAEMON_SOCKET`, and
-    /// `ANTHROPIC_API_KEY` (pass-through from the daemon env, if set).
+    /// injects `EMBER_PERSONA_ID`, `EMBER_DAEMON_SOCKET`, `EMBER_PROXY_URL`
+    /// (pass-through from the daemon env, if set), and `ANTHROPIC_API_KEY`
+    /// (pass-through from the daemon env, if set).
     pub fn start_container(
         &self,
         sandbox_id: &str,
@@ -335,13 +336,18 @@ impl DaemonStore {
                 })?;
 
         // Compose the env block: caller-provided vars first, then the daemon's
-        // mandatory trio, then the ANTHROPIC_API_KEY pass-through if present.
+        // mandatory trio, then pass-through vars from the daemon env if set.
         let mut env: Vec<(String, String)> = extra_env.to_vec();
         env.push(("EMBER_PERSONA_ID".to_string(), persona_id));
         env.push((
             "EMBER_DAEMON_SOCKET".to_string(),
             "/run/ember/daemon.sock".to_string(),
         ));
+        if let Ok(url) = std::env::var("EMBER_PROXY_URL")
+            && !url.is_empty()
+        {
+            env.push(("EMBER_PROXY_URL".to_string(), url));
+        }
         if let Ok(key) = std::env::var("ANTHROPIC_API_KEY")
             && !key.is_empty()
         {
@@ -413,6 +419,23 @@ impl DaemonStore {
             sandboxes.push(row?);
         }
         Ok(sandboxes)
+    }
+
+    /// Resolve a sandbox name-or-id argument to the canonical UUID.
+    ///
+    /// Accepts either a full sandbox UUID or a human-readable name.  Returns
+    /// `StoreError::NotFound` when no sandbox matches either field.
+    pub fn resolve_sandbox_id(&self, name_or_id: &str) -> Result<String, StoreError> {
+        self.conn()
+            .query_row(
+                "SELECT id FROM sandboxes WHERE id = ?1 OR name = ?1 LIMIT 1",
+                rusqlite::params![name_or_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => StoreError::NotFound,
+                other => StoreError::Sqlite(other),
+            })
     }
 
     pub fn stop_sandbox(&self, id: &str) -> Result<(), StoreError> {
@@ -820,6 +843,27 @@ mod tests {
         assert!(
             !args.iter().any(|a| a.starts_with("ANTHROPIC_API_KEY=")),
             "expected no ANTHROPIC_API_KEY when unset, got {args:?}"
+        );
+    }
+
+    #[test]
+    fn start_container_passes_proxy_url_when_set() {
+        // When EMBER_PROXY_URL is in the env slice it should appear as -e EMBER_PROXY_URL=...
+        let args = args_for(
+            &[("EMBER_PROXY_URL".into(), "http://127.0.0.1:4141".into())],
+            Some("none"),
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-e" && w[1] == "EMBER_PROXY_URL=http://127.0.0.1:4141"),
+            "expected EMBER_PROXY_URL pass-through in {args:?}"
+        );
+
+        // When the env slice does not contain the var it must not leak in.
+        let args = args_for(&[], Some("none"));
+        assert!(
+            !args.iter().any(|a| a.starts_with("EMBER_PROXY_URL=")),
+            "expected no EMBER_PROXY_URL when unset, got {args:?}"
         );
     }
 

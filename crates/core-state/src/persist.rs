@@ -2343,7 +2343,6 @@ fn row_to_access_grant(
     let revoked_reason: Option<String> = row.get(14)?;
     let last_used_at: Option<i64> = row.get(15)?;
     // resource_types_csv (col 16) is a projection for indexing; not used on read
-    let _resource_types_csv: String = row.get(16).unwrap_or_default();
     let attestation_json: String = row.get(17)?;
 
     let recipient_kind = core_types::PresentationAudienceKind::parse(&recipient_kind_str)

@@ -1,6 +1,10 @@
+use std::cell::RefCell;
 use std::path::Path;
+use std::rc::Rc;
 
 use rusqlite::Connection;
+
+use crate::vault::Vault;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -15,6 +19,13 @@ pub enum StoreError {
     /// dimension so the error isn't an oracle for parent state.
     #[error("delegation violation: {reason}")]
     DelegationViolation { reason: String },
+    /// Vault encrypt/decrypt failure — wraps the underlying
+    /// `VaultError::Crypto` message without leaking key material.
+    /// Emitted by persona-secret paths when the attached `Vault`
+    /// cannot seal or open the stored ciphertext (e.g. wrong master
+    /// key, corrupted nonce, Argon2id mismatch).
+    #[error("vault error: {0}")]
+    Vault(String),
 }
 
 impl From<crate::attenuation::DelegationViolation> for StoreError {
@@ -25,21 +36,84 @@ impl From<crate::attenuation::DelegationViolation> for StoreError {
 
 pub struct DaemonStore {
     conn: Connection,
+    /// Optional handle to the daemon `Vault` used to seal/open persona
+    /// root-key material at rest (F-05 / security review cycle 28 W6).
+    ///
+    /// Wired in by `runtime.rs` after the vault is unlocked but before the
+    /// socket listener starts. Absent for in-memory test stores built via
+    /// `open_in_memory()` — tests that need persona signing attach a vault
+    /// via `set_vault` before exercising grant creation.
+    ///
+    /// Interior mutability is required because production callers pre-wrap
+    /// `DaemonStore` in `Rc` before the vault exists (see `runtime.rs` —
+    /// store opens first, then vault), so we cannot thread a mutable
+    /// reference through that chain. The `RefCell` is only touched on
+    /// the single-threaded LocalSet, so runtime borrow panics cannot race.
+    vault: RefCell<Option<Rc<Vault>>>,
 }
 
 impl DaemonStore {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         let conn = Connection::open(path)?;
-        let store = Self { conn };
+        let store = Self {
+            conn,
+            vault: RefCell::new(None),
+        };
         store.migrate()?;
         Ok(store)
     }
 
     pub fn open_in_memory() -> Result<Self, StoreError> {
         let conn = Connection::open_in_memory()?;
-        let store = Self { conn };
+        let store = Self {
+            conn,
+            vault: RefCell::new(None),
+        };
+        store.migrate()?;
+        // V0 schema: every persona secret is vault-sealed, so an
+        // in-memory store always needs a vault for the persona write
+        // path. Attach a deterministic test vault by default — tests
+        // that want to assert "no vault" behavior can call
+        // `open_in_memory_without_vault` instead.
+        #[cfg(test)]
+        {
+            use crate::vault::Vault;
+            store.set_vault(Rc::new(Vault::new([0xABu8; 32])));
+        }
+        Ok(store)
+    }
+
+    /// Test-only helper that builds an in-memory store with no vault
+    /// attached. Used to assert the "vault required" error path on
+    /// persona creation.
+    #[cfg(test)]
+    pub fn open_in_memory_without_vault() -> Result<Self, StoreError> {
+        let conn = Connection::open_in_memory()?;
+        let store = Self {
+            conn,
+            vault: RefCell::new(None),
+        };
         store.migrate()?;
         Ok(store)
+    }
+
+    /// Attach a shared `Vault` handle after construction so persona-secret
+    /// write/read paths can encrypt under the vault master key. Call once
+    /// at startup after `Vault::open_from_config` succeeds and before the
+    /// socket listener accepts traffic.
+    ///
+    /// Idempotent — replacing an already-attached vault is allowed; tests
+    /// swap vaults to assert "wrong key cannot decrypt" invariants.
+    pub fn set_vault(&self, vault: Rc<Vault>) {
+        *self.vault.borrow_mut() = Some(vault);
+    }
+
+    /// Return a clone of the currently attached vault, if any. Persona-secret
+    /// write/read paths require an attached vault after the V0 schema collapse
+    /// — fresh DBs have no plaintext column. Callers handle the `None` case
+    /// by returning a vault-not-attached error.
+    pub(crate) fn vault(&self) -> Option<Rc<Vault>> {
+        self.vault.borrow().clone()
     }
 
     pub fn conn(&self) -> &Connection {
@@ -47,12 +121,16 @@ impl DaemonStore {
     }
 
     fn migrate(&self) -> Result<(), StoreError> {
+        // V0 schema — pre-launch, no users, no rollback. Every column the
+        // daemon needs is in the base CREATE TABLE. Future migrations add
+        // ALTER TABLE blocks below this batch.
         self.conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS personas (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL UNIQUE,
                 public_key TEXT NOT NULL,
-                private_key TEXT NOT NULL,
+                private_key_nonce BLOB,
+                private_key_ciphertext BLOB,
                 created_at TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'active'
             );
@@ -94,6 +172,14 @@ impl DaemonStore {
                 parent_grant_id TEXT,
                 max_delegation_depth INTEGER,
                 spending_limit_cents INTEGER,
+                blocks_json TEXT,
+                budget_json TEXT,
+                usage_json TEXT,
+                paused INTEGER NOT NULL DEFAULT 0,
+                receipt_id TEXT,
+                is_standing INTEGER NOT NULL DEFAULT 0,
+                max_children_per_day INTEGER,
+                auto_delegate_scope_template TEXT,
                 FOREIGN KEY (persona_id) REFERENCES personas(id)
             );
 
@@ -132,6 +218,8 @@ impl DaemonStore {
                 resolved_at TEXT,
                 resolver_note TEXT,
                 created_at TEXT NOT NULL,
+                composite_statements_json TEXT,
+                result_grant_id TEXT,
                 FOREIGN KEY (persona_id) REFERENCES personas(id)
             );
 
@@ -168,52 +256,19 @@ impl DaemonStore {
             CREATE INDEX IF NOT EXISTS idx_receipts_created ON receipts(created_at);",
         )?;
 
-        // Additive migration: add sandboxes.workspace_path to pre-existing
-        // databases. design §Hardening invariants — fresh-clone workspace.
-        let has_workspace_col: bool = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT 1 FROM pragma_table_info('sandboxes') WHERE name = 'workspace_path'")?;
-            stmt.exists([])?
-        };
-        if !has_workspace_col {
-            self.conn
-                .execute("ALTER TABLE sandboxes ADD COLUMN workspace_path TEXT", [])?;
-        }
-
-        // Additive migration: design composite grant. Every daemon grant
-        // carries a canonical `AccessGrant.blocks` chain serialized as JSON
-        // in `blocks_json`. Per-Statement budget + usage live inside the
-        // blocks (not flat on the row). `paused` and `receipt_id` remain
-        // flat because they are orthogonal to the per-Statement abstraction.
-        //
-        // The earlier (#491) flat `budget_json` / `usage_json` envelope-level
-        // fields are retained for backward compat on read (old dev DBs) but
-        // every new grant writes through `blocks_json`. A cleanup PR after
-        // Stream A composition lands can DROP the legacy columns.
-        for (col, ddl) in [
-            ("blocks_json",    "ALTER TABLE grants ADD COLUMN blocks_json TEXT"),
-            ("budget_json",    "ALTER TABLE grants ADD COLUMN budget_json TEXT"),
-            ("usage_json",     "ALTER TABLE grants ADD COLUMN usage_json TEXT"),
-            ("paused",         "ALTER TABLE grants ADD COLUMN paused INTEGER NOT NULL DEFAULT 0"),
-            ("receipt_id",     "ALTER TABLE grants ADD COLUMN receipt_id TEXT"),
-            // Legacy columns — retained so older dev DBs don't fail; not used.
-            ("budget_tokens",  "ALTER TABLE grants ADD COLUMN budget_tokens INTEGER"),
-            ("budget_cents",   "ALTER TABLE grants ADD COLUMN budget_cents INTEGER"),
-            ("tokens_used",    "ALTER TABLE grants ADD COLUMN tokens_used INTEGER NOT NULL DEFAULT 0"),
-            ("cents_used",     "ALTER TABLE grants ADD COLUMN cents_used INTEGER NOT NULL DEFAULT 0"),
-            ("usage_updated_at", "ALTER TABLE grants ADD COLUMN usage_updated_at TEXT"),
-        ] {
-            let has_col: bool = {
-                let mut stmt = self.conn.prepare(
-                    &format!("SELECT 1 FROM pragma_table_info('grants') WHERE name = '{col}'"),
-                )?;
-                stmt.exists([])?
-            };
-            if !has_col {
-                self.conn.execute(ddl, [])?;
-            }
-        }
+        // implementation-note-1 — composite-grant approval columns. Existing v0 DBs
+        // (e.g. the qember.sh demo seed) predate the columns above, so
+        // additively backfill them with idempotent ALTER TABLE calls.
+        // Errors here are swallowed when the column already exists; any
+        // other failure is propagated.
+        let _ = self.conn.execute(
+            "ALTER TABLE approval_requests ADD COLUMN composite_statements_json TEXT",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE approval_requests ADD COLUMN result_grant_id TEXT",
+            [],
+        );
 
         Ok(())
     }

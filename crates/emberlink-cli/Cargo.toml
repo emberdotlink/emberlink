@@ -49,7 +49,9 @@ tokio = { version = "1", features = ["full"] }
 # 0.9/0.10 API reorg moved `sample_iter`/`fill_bytes` behind extension traits;
 # going through `getrandom` avoids that surface entirely.
 getrandom = "0.4"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 webpki-roots = "1.0"
 
 [dev-dependencies]

@@ -1075,6 +1075,21 @@ impl AccessGrant {
         self.blocks.iter().filter_map(|sb| sb.block.nbf).max()
     }
 
+    /// Derive the effective status from both the stored status field and
+    /// the block-level timestamps. A grant stored as `Active` but whose
+    /// `effective_expires_at` has passed is `Expired`; a grant whose
+    /// `effective_nbf` is in the future is `Pending`. Terminal statuses
+    /// (`Revoked`, `ExhaustedByBudget`, `Paused`) are never overridden by
+    /// timestamps — only `Active` can be demoted by TTL or nbf.
+    pub fn effective_status(&self, now_secs: u64) -> GrantStatus {
+        GrantStatus::derive(
+            self.status.as_str(),
+            self.effective_nbf(),
+            self.effective_expires_at(),
+            now_secs,
+        )
+    }
+
     /// Distinct resource_types present across all statements, in first-seen
     /// order. Used by the dashboard to render the persona-chip badges.
     pub fn resource_types(&self) -> Vec<ResourceType> {
@@ -1426,6 +1441,47 @@ mod composite_grant_tests {
         assert_eq!(GrantStatus::derive("active", None, Some(50), 100), GrantStatus::Expired);
         assert_eq!(GrantStatus::derive("active", Some(200), None, 100), GrantStatus::Pending);
         assert_eq!(GrantStatus::derive("active", None, None, 100), GrantStatus::Active);
+    }
+
+    #[test]
+    fn effective_status_returns_expired_when_ttl_passed_despite_stored_active() {
+        let block = Block {
+            statements: vec![stmt_credential_github()],
+            nbf: None,
+            expires_at: Some(50),
+            issued_by: "persona_work".into(),
+            issued_at: 0,
+            approval: None,
+            note: None,
+        };
+        let grant = AccessGrant {
+            id: "grant_ttl_test".into(),
+            version: 1,
+            issuing_persona_id: "persona_work".into(),
+            recipient_kind: PresentationAudienceKind::Service,
+            recipient_id: "agent_claude".into(),
+            recipient_profile: RecipientProfile::Agent,
+            status: GrantStatus::Active,
+            mode: GrantMode::OneShot,
+            blocks: vec![SignedBlock {
+                block,
+                pubkey_next: "deadbeef".into(),
+                signature: "cafebabe".into(),
+            }],
+            attestation: AttestationBinding::default(),
+            created_at: 0,
+            updated_at: 0,
+            revoked_at: None,
+            revoked_reason: None,
+            last_used_at: None,
+            label: None,
+        };
+
+        // Stored status is Active, but the block expired at epoch 50.
+        assert_eq!(grant.status, GrantStatus::Active);
+        assert_eq!(grant.effective_status(100), GrantStatus::Expired);
+        // Still active before expiry.
+        assert_eq!(grant.effective_status(49), GrantStatus::Active);
     }
 }
 

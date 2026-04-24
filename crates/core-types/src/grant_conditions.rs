@@ -6,8 +6,22 @@
 ///
 /// Serialization uses `snake_case` for JSON field names and a `"type"` tag
 /// to distinguish variants.
+///
+/// Empty `All` and `Any` combinators are rejected at deserialization time
+/// (see `GC-H1` in `docs/the security review`):
+/// a serialized `{"type":"all","value":[]}` or `{"type":"any","value":[]}`
+/// is a covert always-pass shape — any wizard or upstream tool that
+/// produced "no badge required" as an empty combinator would silently
+/// disable gating. We fail-closed at the parse boundary so the evaluator
+/// never sees the malformed shape. The evaluator additionally returns
+/// `Unmet` for empty combinators as defence in depth.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+#[serde(
+    tag = "type",
+    content = "value",
+    rename_all = "snake_case",
+    try_from = "GrantConditionRepr"
+)]
 pub enum GrantCondition {
     /// Recipient must hold an active (non-revoked, non-expired) badge of
     /// `badge_type`, and the badge's issuer must meet optional authority
@@ -28,10 +42,77 @@ pub enum GrantCondition {
         #[serde(skip_serializing_if = "Option::is_none")]
         min_authority: Option<f64>,
     },
-    /// All sub-conditions must be satisfied.
+    /// All sub-conditions must be satisfied. Must contain at least one
+    /// sub-condition; an empty `All` is rejected at deserialization.
     All(Vec<GrantCondition>),
-    /// At least one sub-condition must be satisfied.
+    /// At least one sub-condition must be satisfied. Must contain at least
+    /// one sub-condition; an empty `Any` is rejected at deserialization.
     Any(Vec<GrantCondition>),
+}
+
+/// Inner struct for the `BadgeGate` wire variant. Extracted so that
+/// `#[serde(deny_unknown_fields)]` applies: any future protocol field
+/// added to `BadgeGate` that this binary does not recognise will cause
+/// a hard parse error rather than a silent drop (development milestone / MED defence-in-depth).
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BadgeGateRepr {
+    badge_type: String,
+    #[serde(default)]
+    min_convergence: Option<f64>,
+    #[serde(default)]
+    max_distance: Option<u32>,
+    #[serde(default)]
+    min_authority: Option<f64>,
+}
+
+/// Wire-format mirror of [`GrantCondition`] used to validate empty
+/// combinators at deserialization time. Kept private so external code
+/// must construct conditions through the validated entry points.
+#[derive(serde::Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+enum GrantConditionRepr {
+    BadgeGate(BadgeGateRepr),
+    All(Vec<GrantCondition>),
+    Any(Vec<GrantCondition>),
+}
+
+impl TryFrom<GrantConditionRepr> for GrantCondition {
+    type Error = &'static str;
+
+    fn try_from(repr: GrantConditionRepr) -> Result<Self, Self::Error> {
+        match repr {
+            GrantConditionRepr::BadgeGate(BadgeGateRepr {
+                badge_type,
+                min_convergence,
+                max_distance,
+                min_authority,
+            }) => Ok(Self::BadgeGate {
+                badge_type,
+                min_convergence,
+                max_distance,
+                min_authority,
+            }),
+            GrantConditionRepr::All(sub) => {
+                if sub.is_empty() {
+                    return Err(
+                        "empty All combinator is not allowed: an empty All vacuously \
+                         passes and would silently disable gating (GC-H1)",
+                    );
+                }
+                Ok(Self::All(sub))
+            }
+            GrantConditionRepr::Any(sub) => {
+                if sub.is_empty() {
+                    return Err(
+                        "empty Any combinator is not allowed: an empty Any has no \
+                         alternatives and would silently disable gating (GC-H1)",
+                    );
+                }
+                Ok(Self::Any(sub))
+            }
+        }
+    }
 }
 
 impl GrantCondition {
@@ -227,5 +308,158 @@ mod tests {
         let json = serde_json::to_string(&c).unwrap();
         let back: GrantCondition = serde_json::from_str(&json).unwrap();
         assert_eq!(c, back);
+    }
+
+    /// GC-H1: an empty `All` combinator must be rejected at deserialization.
+    /// A serialized `{"type":"all","value":[]}` would otherwise evaluate to
+    /// `Met` (vacuous truth) and silently bypass any gating.
+    #[test]
+    fn deserialize_rejects_empty_all() {
+        let err = serde_json::from_str::<GrantCondition>(r#"{"type":"all","value":[]}"#)
+            .expect_err("empty All must be rejected at deserialize");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("empty All"),
+            "expected empty-All rejection message, got: {msg}"
+        );
+    }
+
+    /// GC-H1: an empty `Any` combinator must be rejected at deserialization.
+    /// A serialized `{"type":"any","value":[]}` would otherwise short-circuit
+    /// to `Met` and silently bypass any gating.
+    #[test]
+    fn deserialize_rejects_empty_any() {
+        let err = serde_json::from_str::<GrantCondition>(r#"{"type":"any","value":[]}"#)
+            .expect_err("empty Any must be rejected at deserialize");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("empty Any"),
+            "expected empty-Any rejection message, got: {msg}"
+        );
+    }
+
+    /// GC-H1: empty combinators nested inside an outer `All` must also be
+    /// rejected — the validator must run recursively, not just at the top.
+    #[test]
+    fn deserialize_rejects_nested_empty_combinator() {
+        let nested_all =
+            r#"{"type":"all","value":[{"type":"all","value":[]}]}"#;
+        let err = serde_json::from_str::<GrantCondition>(nested_all)
+            .expect_err("nested empty All must be rejected");
+        assert!(err.to_string().contains("empty All"));
+
+        let nested_any =
+            r#"{"type":"any","value":[{"type":"any","value":[]}]}"#;
+        let err = serde_json::from_str::<GrantCondition>(nested_any)
+            .expect_err("nested empty Any must be rejected");
+        assert!(err.to_string().contains("empty Any"));
+    }
+
+    /// GC-H2: an unknown variant in a Vec<GrantCondition> must fail
+    /// deserialization, not silently produce an empty Vec. Older nodes
+    /// encountering a future protocol variant must fail-closed.
+    #[test]
+    fn deserialize_rejects_unknown_variant() {
+        // Single unknown top-level condition.
+        let err = serde_json::from_str::<GrantCondition>(
+            r#"{"type":"future_variant","value":{}}"#,
+        )
+        .expect_err("unknown variant must be rejected");
+        assert!(
+            !err.to_string().is_empty(),
+            "expected a non-empty error for unknown variant"
+        );
+
+        // Unknown variant inside a Vec — must not produce an empty Vec.
+        let result =
+            serde_json::from_str::<Vec<GrantCondition>>(r#"[{"type":"future_variant","value":{}}]"#);
+        assert!(
+            result.is_err(),
+            "Vec containing unknown variant must error, not produce empty Vec"
+        );
+    }
+
+    /// GC-H1: non-empty combinators must continue to deserialize cleanly —
+    /// the rejection is scoped to the empty case only.
+    #[test]
+    fn deserialize_accepts_nonempty_combinators() {
+        let json = r#"{"type":"all","value":[{"type":"badge_gate","value":{"badge_type":"verified-dev"}}]}"#;
+        let parsed: GrantCondition =
+            serde_json::from_str(json).expect("non-empty All must deserialize");
+        assert_eq!(
+            parsed,
+            GrantCondition::All(vec![GrantCondition::badge("verified-dev")])
+        );
+
+        let json = r#"{"type":"any","value":[{"type":"badge_gate","value":{"badge_type":"verified-dev"}}]}"#;
+        let parsed: GrantCondition =
+            serde_json::from_str(json).expect("non-empty Any must deserialize");
+        assert_eq!(
+            parsed,
+            GrantCondition::Any(vec![GrantCondition::badge("verified-dev")])
+        );
+    }
+
+    /// development milestone: unknown fields inside a `BadgeGate` value object must be rejected.
+    /// Without `deny_unknown_fields` on `BadgeGateRepr`, a future security-
+    /// critical field (e.g. `expires_after`, `revocation_check_interval`) added
+    /// by a newer protocol version would be silently dropped by older binaries,
+    /// weakening the gate without any signal.
+    #[test]
+    fn test_deserialize_rejects_unknown_badge_gate_field() {
+        // Extra field alongside valid ones — must error.
+        let with_extra = r#"{"type":"badge_gate","value":{"badge_type":"x","unknown_field":42}}"#;
+        assert!(
+            serde_json::from_str::<GrantCondition>(with_extra).is_err(),
+            "unknown field in BadgeGate value must be rejected"
+        );
+
+        // Extra field only, no other fields — also must error.
+        let only_extra =
+            r#"{"type":"badge_gate","value":{"badge_type":"x","future_security_param":true}}"#;
+        assert!(
+            serde_json::from_str::<GrantCondition>(only_extra).is_err(),
+            "future security field in BadgeGate value must be rejected"
+        );
+    }
+
+    /// development milestone: all currently-known optional fields must still deserialize
+    /// cleanly after the `deny_unknown_fields` hardening.
+    #[test]
+    fn test_deserialize_accepts_known_badge_gate_fields() {
+        let full = r#"{
+            "type": "badge_gate",
+            "value": {
+                "badge_type": "verified-dev",
+                "min_convergence": 0.6,
+                "max_distance": 3,
+                "min_authority": 0.8
+            }
+        }"#;
+        let parsed: GrantCondition =
+            serde_json::from_str(full).expect("all known BadgeGate fields must deserialize");
+        assert_eq!(
+            parsed,
+            GrantCondition::BadgeGate {
+                badge_type: "verified-dev".to_string(),
+                min_convergence: Some(0.6),
+                max_distance: Some(3),
+                min_authority: Some(0.8),
+            }
+        );
+    }
+
+    /// Wire-format stability: a fixed JSON string that predates the development milestone
+    /// `BadgeGateRepr` extraction must still deserialize identically.
+    #[test]
+    fn serde_wire_format_stable() {
+        let fixed = r#"{"type":"badge_gate","value":{"badge_type":"verified-dev"}}"#;
+        let parsed: GrantCondition =
+            serde_json::from_str(fixed).expect("pre-change wire format must still deserialize");
+        assert_eq!(parsed, GrantCondition::badge("verified-dev"));
+
+        // Re-serialise and confirm the JSON matches the fixed string.
+        let reserialized = serde_json::to_string(&parsed).unwrap();
+        assert_eq!(reserialized, fixed);
     }
 }

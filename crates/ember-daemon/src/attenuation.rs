@@ -383,13 +383,16 @@ pub fn check_statement_attenuation(
             )));
         };
 
-        // resource_type must also match (or parent is Credential-default).
-        if pstmt.resource_type != cstmt.resource_type {
-            return Err(DelegationViolation::new(format!(
-                "statement[{}].resource_type differs from parent",
-                cstmt.sid
-            )));
-        }
+        // NOTE (P69K-A2-I4): resource_type is intentionally NOT an
+        // attenuation axis. design §Attenuation names six axes —
+        // actions, resource, budget, nbf, expires_at, conditions — and
+        // resource_type is not among them. resource_type is a dispatch
+        // hint used by the authorize walker and proxy routing, not an
+        // authority axis. Requiring an exact match here would reject
+        // legitimate attenuations of fully-permissive parents (e.g. the
+        // `"*"` shim minted by `create_grant` which projects to
+        // ResourceType::Credential) into typed child statements
+        // (Session / Time / Payment).
 
         // Budget: child must fit inside parent's remaining allowance.
         check_budget_attenuation(&pstmt.budget, &pstmt.usage, &cstmt.budget)

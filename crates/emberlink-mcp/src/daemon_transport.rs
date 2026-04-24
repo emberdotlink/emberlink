@@ -43,6 +43,8 @@ impl DaemonTransport {
             "list_receipts" => Some("list_receipts"),
             "get_receipt" => Some("get_receipt"),
             "daemon_identity" => Some("daemon_identity"),
+            // Budget status (P69K-F1)
+            "grant_budget_status" => Some("grant_budget_status"),
             // Vault
             "vault_list" => Some("vault_list"),
             // Health
@@ -51,12 +53,44 @@ impl DaemonTransport {
         }
     }
 
+    /// Extract the host component from a string that may be a URL or a bare
+    /// hostname/path. Returns `None` if the string is clearly not URL-like.
+    ///
+    /// Parsing strategy (no added deps):
+    /// 1. If the string contains `://`, split on `://` and take the authority
+    ///    portion (everything before the first `/` after the scheme).
+    /// 2. Otherwise, take the portion before the first `/` — bare hostnames
+    ///    like `api.github.com` or paths like `api.github.com/repos/...`.
+    /// 3. Strip any `user@` prefix and `:port` suffix.
+    /// 4. Return `None` for empty results or strings that look like simple
+    ///    credential names (no `.` and no `/`).
+    fn extract_host(s: &str) -> Option<String> {
+        let authority = if let Some(after_scheme) = s.split("://").nth(1) {
+            after_scheme.split('/').next().unwrap_or("")
+        } else {
+            s.split('/').next().unwrap_or("")
+        };
+        // Strip user@ prefix and :port suffix.
+        let host_port = authority.split('@').next_back().unwrap_or(authority);
+        let host = host_port.split(':').next().unwrap_or(host_port);
+        // Reject empty or plain words with no structure (looks like a
+        // credential name, not a hostname).
+        if host.is_empty() || (!host.contains('.') && !host.contains(':')) {
+            return None;
+        }
+        Some(host.to_string())
+    }
+
     /// Translate a `request_grant` MCP call into `request_access` daemon
     /// parameters by synthesizing the `action` field from `credential_name`.
     ///
     /// This ensures agent-initiated credential requests route through the
     /// policy engine AND the pre-evaluation rate limiter (see TODO 69.1).
     /// All other fields are forwarded unchanged — no parameter tampering.
+    ///
+    /// Also injects NOTIF-1 banner fields (`tool_name`, `target_host`,
+    /// `target_url`, `agent_framework`) so the approval banner in the
+    /// daemon shows richer context for MCP-originated requests.
     ///
     /// Fails closed: returns `Protocol` error if `credential_name` is
     /// missing rather than silently passing an empty action string.
@@ -84,6 +118,28 @@ impl DaemonTransport {
         };
         if let Some(obj) = augmented.as_object_mut() {
             obj.insert("action".to_string(), serde_json::Value::String(action));
+
+            // NOTIF-1: inject banner fields for the daemon's approval
+            // notification. These are set only when not already present so
+            // callers that supply richer context aren't overwritten.
+            obj.entry("tool_name")
+                .or_insert_with(|| serde_json::Value::String("mcp/request_grant".to_string()));
+            obj.entry("agent_framework")
+                .or_insert_with(|| serde_json::Value::String("mcp".to_string()));
+
+            // Derive target_host from `resource_id` when present. This field
+            // often carries a URL-like path (e.g. "api.github.com/repos/...").
+            // Fall back to `credential_name` if `resource_id` is absent.
+            let url_candidate = arguments
+                .get("resource_id")
+                .and_then(|v| v.as_str())
+                .or(Some(credential_name));
+            if let Some(host) = url_candidate.and_then(Self::extract_host) {
+                obj.entry("target_host")
+                    .or_insert_with(|| serde_json::Value::String(host.clone()));
+                obj.entry("target_url")
+                    .or_insert_with(|| serde_json::Value::String(host));
+            }
         }
         Ok(augmented)
     }
@@ -272,6 +328,17 @@ mod tests {
     }
 
     #[test]
+    fn map_tool_to_method_grant_budget_status_routes_to_daemon() {
+        // `grant_budget_status` is a read-only observability tool that bypasses
+        // the agent runtime and talks directly to the daemon socket — mirrors
+        // the `list_receipts` / `get_receipt` pattern.
+        assert_eq!(
+            DaemonTransport::map_tool_to_method("grant_budget_status"),
+            Some("grant_budget_status")
+        );
+    }
+
+    #[test]
     fn map_tool_to_method_unknown_returns_none() {
         assert_eq!(DaemonTransport::map_tool_to_method("nonexistent"), None);
         assert_eq!(DaemonTransport::map_tool_to_method(""), None);
@@ -300,5 +367,86 @@ mod tests {
     fn error_display_unknown_tool() {
         let e = DaemonTransportError::UnknownTool("foo".to_string());
         assert_eq!(e.to_string(), "unknown tool: foo");
+    }
+
+    // --- NOTIF-1: MCP approval-request banner fields ---
+
+    #[test]
+    fn mcp_approval_request_populates_tool_fields() {
+        // request_grant with a URL-like resource_id should populate
+        // tool_name and target_host in the translated params so the
+        // daemon's approval banner shows richer context.
+        let args = serde_json::json!({
+            "credential_name": "github-token",
+            "resource_id": "api.github.com/repos/emberdotlink/emberlink",
+            "scope": "repo:push",
+            "ttl_secs": 3600
+        });
+        let translated = DaemonTransport::translate_request_grant(&args).unwrap();
+        assert!(
+            translated["tool_name"].as_str().map(|s| s.starts_with("mcp")).unwrap_or(false),
+            "tool_name should start with 'mcp', got: {:?}",
+            translated["tool_name"]
+        );
+        assert!(
+            translated["target_host"].is_string(),
+            "target_host should be present when resource_id contains a hostname"
+        );
+        assert_eq!(
+            translated["target_host"].as_str(),
+            Some("api.github.com"),
+            "target_host should be the authority portion of resource_id"
+        );
+        assert_eq!(translated["agent_framework"], "mcp");
+    }
+
+    #[test]
+    fn mcp_approval_request_no_resource_id_falls_back_to_credential_name() {
+        // When resource_id is absent, the host extraction falls back to
+        // credential_name. A plain name like "github-token" has no dot so
+        // target_host stays None — that's expected and correct.
+        let args = serde_json::json!({
+            "credential_name": "github-token",
+            "scope": "repo:read"
+        });
+        let translated = DaemonTransport::translate_request_grant(&args).unwrap();
+        assert_eq!(translated["tool_name"], "mcp/request_grant");
+        assert_eq!(translated["agent_framework"], "mcp");
+        // Plain credential name has no dot → no host extracted.
+        assert!(
+            translated.get("target_host").is_none()
+                || translated["target_host"].is_null(),
+            "plain credential name should not produce a target_host"
+        );
+    }
+
+    #[test]
+    fn extract_host_url_with_scheme() {
+        assert_eq!(
+            DaemonTransport::extract_host("https://api.github.com/repos/foo"),
+            Some("api.github.com".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_host_bare_path() {
+        assert_eq!(
+            DaemonTransport::extract_host("api.github.com/repos/foo"),
+            Some("api.github.com".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_host_plain_name_returns_none() {
+        assert_eq!(DaemonTransport::extract_host("github-token"), None);
+        assert_eq!(DaemonTransport::extract_host("my_credential"), None);
+    }
+
+    #[test]
+    fn extract_host_strips_port() {
+        assert_eq!(
+            DaemonTransport::extract_host("https://api.example.com:8443/path"),
+            Some("api.example.com".to_string())
+        );
     }
 }

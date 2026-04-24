@@ -11,6 +11,35 @@ use crate::protocol::{
     WhoamiResponse,
 };
 
+/// Extract the host (authority) component from a URL string.
+///
+/// Strips the scheme prefix (`https://`, `http://`, etc.) and discards
+/// the path, query, and fragment, returning only `host[:port]`. Returns
+/// `None` when the URL has no recognizable authority (e.g. bare paths,
+/// empty strings). Used to populate the NOTIF-1 `target_host` banner
+/// field from a caller-supplied `target_url`.
+fn extract_host(url: &str) -> Option<String> {
+    // Strip scheme — find "://" and take everything after it.
+    let after_scheme = if let Some(pos) = url.find("://") {
+        &url[pos + 3..]
+    } else {
+        url
+    };
+    if after_scheme.is_empty() {
+        return None;
+    }
+    // Authority ends at the first '/', '?', or '#'.
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    if authority.is_empty() {
+        None
+    } else {
+        Some(authority.to_owned())
+    }
+}
+
 /// Errors returned by a [`DaemonClient`] when forwarding a request.
 ///
 /// Kept small and structural so the runtime can surface a generic
@@ -297,9 +326,24 @@ impl AgentRuntime {
             "credential_name": credential_name,
             "scope": params.scope,
             "action": action,
+            // NOTIF-1: agent-SDK path always identifies itself so the
+            // notification banner can show the framework badge.
+            "agent_framework": "emberlink-agent",
         });
         if let Some(ttl) = params.duration_secs {
             daemon_params["ttl_secs"] = serde_json::json!(ttl);
+        }
+        if let Some(ref tool) = params.tool_name {
+            daemon_params["tool_name"] = serde_json::json!(tool);
+        }
+        if let Some(ref url) = params.target_url {
+            daemon_params["target_url"] = serde_json::json!(url);
+            // Derive target_host from the URL: strip scheme and take the
+            // authority component (host[:port]). Mirrors the extract_host
+            // logic used in the MCP path.
+            if let Some(host) = extract_host(url) {
+                daemon_params["target_host"] = serde_json::json!(host);
+            }
         }
 
         let result = match daemon.borrow_mut().request_access(&daemon_params) {
@@ -1061,6 +1105,108 @@ mod tests {
         let resp: AgentResponse = serde_json::from_str(&resp_json).unwrap();
         let err = resp.error.unwrap();
         assert_eq!(err.code, "RELAY_ERROR");
+    }
+
+    // --- NOTIF-1: agent-SDK seeding of approval banner fields ---
+
+    /// Verify that every `request_grant` forwarded to the daemon carries
+    /// `agent_framework = "emberlink-agent"`. This is the minimum required
+    /// by NOTIF-1 so the notification banner can show which SDK originated
+    /// the request. Also verifies `tool_name` and `target_host`/`target_url`
+    /// are forwarded when supplied by the caller.
+    #[test]
+    fn agent_approval_request_populates_framework_field() {
+        let captured = captured_cell();
+        let daemon = mock_daemon_with_response(
+            &captured,
+            serde_json::json!({
+                "status": "pending",
+                "approval_id": "appr-notif1",
+            }),
+        );
+        let rt = AgentRuntime::with_daemon(
+            AgentConfig {
+                persona_id: "agent-notif-001".into(),
+                label: None,
+            },
+            Rc::new(EventStore::open_in_memory().unwrap()),
+            daemon,
+        );
+
+        // Include optional NOTIF-1 fields alongside the required ones.
+        let line = r#"{
+            "id": "n1",
+            "method": "request_grant",
+            "params": {
+                "scope": "repo:read",
+                "resource_id": "github-token",
+                "tool_name": "fetch_pr_comments",
+                "target_url": "https://api.github.com/repos/foo/bar/pulls/1"
+            }
+        }"#;
+        let resp_json = process_line(&rt, line);
+        let resp: AgentResponse = serde_json::from_str(&resp_json).unwrap();
+        assert!(resp.error.is_none(), "expected success, got: {:?}", resp.error);
+
+        let sent = first_request_access_call(&captured).expect("daemon must be called");
+
+        // The primary NOTIF-1 assertion: agent_framework must be populated.
+        assert!(
+            sent["agent_framework"].as_str().is_some(),
+            "agent_framework must be set; got: {:?}",
+            sent["agent_framework"]
+        );
+        assert_eq!(sent["agent_framework"], "emberlink-agent");
+
+        // Optional fields forwarded when supplied.
+        assert_eq!(sent["tool_name"], "fetch_pr_comments");
+        assert_eq!(
+            sent["target_url"],
+            "https://api.github.com/repos/foo/bar/pulls/1"
+        );
+        // target_host derived from target_url.
+        assert_eq!(sent["target_host"], "api.github.com");
+    }
+
+    #[test]
+    fn extract_host_strips_scheme_and_path() {
+        assert_eq!(extract_host("https://api.github.com/repos/x/y"), Some("api.github.com".to_string()));
+        assert_eq!(extract_host("http://example.com:8080/path?q=1"), Some("example.com:8080".to_string()));
+        assert_eq!(extract_host("https://example.com"), Some("example.com".to_string()));
+        assert_eq!(extract_host("example.com/path"), Some("example.com".to_string()));
+        assert_eq!(extract_host(""), None);
+        assert_eq!(extract_host("https://"), None);
+    }
+
+    #[test]
+    fn agent_approval_request_framework_set_without_optional_fields() {
+        // agent_framework must be present even when tool_name / target_url
+        // are absent — it is unconditionally seeded by the runtime.
+        let captured = captured_cell();
+        let daemon = mock_daemon_with_response(
+            &captured,
+            serde_json::json!({"status": "pending", "approval_id": "appr-min"}),
+        );
+        let rt = AgentRuntime::with_daemon(
+            AgentConfig {
+                persona_id: "agent-notif-002".into(),
+                label: None,
+            },
+            Rc::new(EventStore::open_in_memory().unwrap()),
+            daemon,
+        );
+        let line =
+            r#"{"id":"n2","method":"request_grant","params":{"scope":"s","resource_id":"c"}}"#;
+        let resp_json = process_line(&rt, line);
+        let resp: AgentResponse = serde_json::from_str(&resp_json).unwrap();
+        assert!(resp.error.is_none());
+
+        let sent = first_request_access_call(&captured).expect("daemon must be called");
+        assert_eq!(sent["agent_framework"], "emberlink-agent");
+        // tool_name and target_url absent → not forwarded.
+        assert!(sent["tool_name"].is_null());
+        assert!(sent["target_url"].is_null());
+        assert!(sent["target_host"].is_null());
     }
 
     // ---------------------------------------------------------------------

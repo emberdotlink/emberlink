@@ -154,16 +154,43 @@ pub struct ParsedUsage {
 /// Parse token usage from an LLM response body. `provider` selects the
 /// parser. Returns `None` if the body doesn't contain a recognizable usage
 /// block — callers should silently skip metering in that case.
+///
+/// Handles both JSON-complete bodies (legacy non-streaming path) and
+/// Anthropic SSE streams. Detection is by-content: bodies whose first
+/// non-whitespace byte is `{` or `[` are treated as JSON; anything else is
+/// attempted as SSE (Anthropic only — OpenAI's streaming shape is not
+/// metered yet). The caller does not need to distinguish — `meter_response`
+/// will get the same `ParsedUsage` back either way.
 pub fn parse_usage(provider: &str, body: &[u8]) -> Option<ParsedUsage> {
-    // Only parse JSON bodies; streaming responses (SSE) are out of scope for
-    // this pass — the daemon forwards them through without parsing.
-    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let usage = value.get("usage")?;
-    match provider {
-        PROVIDER_ANTHROPIC => parse_anthropic_usage(usage),
-        PROVIDER_OPENAI => parse_openai_usage(usage),
-        _ => None,
+    if looks_like_json(body) {
+        let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+        let usage = value.get("usage")?;
+        return match provider {
+            PROVIDER_ANTHROPIC => parse_anthropic_usage(usage),
+            PROVIDER_OPENAI => parse_openai_usage(usage),
+            _ => None,
+        };
     }
+    // : Anthropic SSE streams (text/event-stream). Parse frame-by-frame
+    // and accumulate usage from `message_start` + `message_delta` events.
+    if provider == PROVIDER_ANTHROPIC {
+        return parse_anthropic_sse_usage(body).map(|p| p.usage);
+    }
+    None
+}
+
+/// True when the first non-whitespace byte suggests a JSON document. SSE
+/// streams always start with an `event:` or `data:` line — never `{` — so
+/// this is a robust cheap check.
+fn looks_like_json(body: &[u8]) -> bool {
+    for b in body {
+        match b {
+            b' ' | b'\t' | b'\r' | b'\n' => continue,
+            b'{' | b'[' => return true,
+            _ => return false,
+        }
+    }
+    false
 }
 
 fn parse_anthropic_usage(usage: &serde_json::Value) -> Option<ParsedUsage> {
@@ -197,16 +224,208 @@ fn parse_openai_usage(usage: &serde_json::Value) -> Option<ParsedUsage> {
     })
 }
 
+/// Shape of the Anthropic SSE aggregation — `usage` is the accumulated
+/// token counts, `model` is the `message_start.message.model` if seen
+/// (returned as a convenience so the proxy can skip a second pass for
+/// pricing lookup), and `saw_message_stop` records whether the stream
+/// ended cleanly. The caller — `proxy.rs::run_post_flight_meter` — uses
+/// `saw_message_stop` to tag the audit record `complete` vs `partial`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnthropicSseSummary {
+    pub usage: ParsedUsage,
+    pub model: Option<String>,
+    pub saw_message_stop: bool,
+}
+
+/// Parse an Anthropic Messages-API SSE stream and accumulate usage
+/// tokens. The wire format is documented at
+/// <https://docs.anthropic.com/en/docs/build-with-claude/streaming>.
+///
+/// Behaviour:
+///   * `message_start.message.usage.input_tokens` (plus cache_creation /
+///     cache_read variants) is taken as the authoritative input-token
+///     count — this event fires at most once per stream.
+///   * `message_delta.usage.output_tokens` is cumulative in the real
+///     Anthropic wire format (the final delta carries the total). We
+///     track the **max** value seen so partial streams record what was
+///     produced up to the interruption and full streams match the
+///     non-streaming path exactly.
+///   * `message_stop` marks a clean termination. Its absence (upstream
+///     disconnect, tee size-cap abort, client hang-up) flips the summary
+///     to `saw_message_stop: false` so the meter can distinguish
+///     `complete` from `partial`.
+///
+/// Returns `None` only when no usage field was seen at all (body was
+/// empty or upstream died before `message_start`). In every other case
+/// we emit the partial usage so the audit record captures what the
+/// agent actually consumed.
+pub fn parse_anthropic_sse_usage(body: &[u8]) -> Option<AnthropicSseSummary> {
+    // Parse UTF-8 lossily — SSE is spec'd as UTF-8 but a malformed byte
+    // inside a JSON string would abort the whole parse if we were strict.
+    let text = String::from_utf8_lossy(body);
+
+    // c44 SSE-CRLF: the SSE spec (WHATWG / RFC 8895-ish) permits either LF-LF
+    // or CRLF-CRLF as the frame separator. Anthropic ships LF today, but some
+    // TLS-terminating intermediaries rewrite line endings — a CRLF-framed
+    // response would otherwise collapse into a single unsplit parse unit and
+    // metering would silently degrade to None. Normalize once at entry so the
+    // existing `\n\n` split and `.lines()` scans stay unchanged. The 1 MiB
+    // tee cap on upstream bodies bounds the allocation; the `contains('\r')`
+    // fast-path skips the reallocation entirely for LF-only streams (the
+    // overwhelming common case).
+    let normalized: String;
+    let text: &str = if text.contains('\r') {
+        normalized = text.replace("\r\n", "\n");
+        &normalized
+    } else {
+        text.as_ref()
+    };
+
+    let mut input_tokens: u64 = 0;
+    let mut cache_create: u64 = 0;
+    let mut cache_read: u64 = 0;
+    let mut output_tokens_max: u64 = 0;
+    let mut model: Option<String> = None;
+    let mut saw_message_stop = false;
+    let mut saw_any_usage = false;
+    let mut saw_message_start = false;
+
+    // SSE frames are separated by a blank line. Parse each frame and
+    // extract its `event:` name + `data:` JSON payload. We deliberately
+    // ignore `id:` / `retry:` fields — Anthropic does not use them and
+    // strict ignoring lets us stay robust to future additions.
+    for frame in text.split("\n\n") {
+        let mut event_name: Option<&str> = None;
+        let mut data_lines: Vec<&str> = Vec::new();
+        for line in frame.lines() {
+            // RFC 8895-ish: a line starting with `:` is a comment, skip.
+            if line.starts_with(':') || line.is_empty() {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("event:") {
+                event_name = Some(rest.trim());
+            } else if let Some(rest) = line.strip_prefix("data:") {
+                data_lines.push(rest.trim_start());
+            }
+        }
+        let data = if data_lines.is_empty() {
+            continue;
+        } else if data_lines.len() == 1 {
+            data_lines[0].to_string()
+        } else {
+            // Multi-line `data:` fields are concatenated with `\n` per
+            // the SSE spec — rare in Anthropic's stream but tolerated.
+            data_lines.join("\n")
+        };
+
+        // Parse the data payload as JSON. Skip frames that don't parse —
+        // a malformed frame should not tank the entire accumulator.
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&data) else {
+            continue;
+        };
+
+        // Resolve the event type: prefer the `event:` SSE line, fall
+        // back to the `"type"` JSON field (Anthropic sets both for
+        // message_start / message_delta / message_stop).
+        let event_type = event_name
+            .or_else(|| value.get("type").and_then(|v| v.as_str()))
+            .unwrap_or("");
+
+        match event_type {
+            "message_start" => {
+                saw_message_start = true;
+                if let Some(msg) = value.get("message") {
+                    if let Some(m) = msg.get("model").and_then(|v| v.as_str()) {
+                        model = Some(m.to_string());
+                    }
+                    if let Some(usage) = msg.get("usage") {
+                        saw_any_usage = true;
+                        if let Some(n) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
+                            // Take the max across any repeated message_start
+                            // (defensive; Anthropic fires this exactly once).
+                            input_tokens = input_tokens.max(n);
+                        }
+                        if let Some(n) = usage
+                            .get("cache_creation_input_tokens")
+                            .and_then(|v| v.as_u64())
+                        {
+                            cache_create = cache_create.max(n);
+                        }
+                        if let Some(n) = usage
+                            .get("cache_read_input_tokens")
+                            .and_then(|v| v.as_u64())
+                        {
+                            cache_read = cache_read.max(n);
+                        }
+                        // c44 MSG-START-POISON: deliberately do NOT read
+                        // `output_tokens` from `message_start`. Per Anthropic's
+                        // streaming spec it is always 0 at this point — the
+                        // stream hasn't produced any output yet. Reading it
+                        // here would let a hostile upstream set e.g.
+                        // `output_tokens: u64::MAX` and poison the high-water
+                        // mark for the rest of the stream, since the
+                        // `message_delta` path max-merges. Mirrors the
+                        // input_tokens discipline enforced in the delta arm.
+                    }
+                }
+            }
+            "message_delta" => {
+                if let Some(usage) = value.get("usage") {
+                    saw_any_usage = true;
+                    // Only output_tokens is read from message_delta. Per
+                    // Anthropic's streaming spec, input_tokens / cache_*
+                    // counts are authoritative at message_start and do NOT
+                    // update during the stream. A hostile upstream (MITM,
+                    // rogue relay, compromised endpoint) could otherwise
+                    // inject a single delta with inflated input_tokens to
+                    // exhaust the grant's budget — c44 Phase E HIGH.
+                    if let Some(n) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
+                        output_tokens_max = output_tokens_max.max(n);
+                    }
+                }
+            }
+            "message_stop" => {
+                saw_message_stop = true;
+            }
+            _ => {} // content_block_start / _delta / _stop / ping / error — no usage.
+        }
+    }
+
+    if !saw_any_usage && !saw_message_start {
+        return None;
+    }
+
+    Some(AnthropicSseSummary {
+        usage: ParsedUsage {
+            input_tokens: input_tokens
+                .saturating_add(cache_create)
+                .saturating_add(cache_read),
+            output_tokens: output_tokens_max,
+        },
+        model,
+        saw_message_stop,
+    })
+}
+
 /// Extract the model name from an LLM response body. Optional — used only so
 /// the pricing table sees the actual model the server responded with.
+///
+/// Handles JSON bodies (legacy) and Anthropic SSE streams (): the
+/// SSE path reads `message_start.message.model`.
 pub fn extract_model(provider: &str, body: &[u8]) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
-    match provider {
-        PROVIDER_ANTHROPIC | PROVIDER_OPENAI => {
-            value.get("model").and_then(|v| v.as_str()).map(String::from)
-        }
-        _ => None,
+    if looks_like_json(body) {
+        let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+        return match provider {
+            PROVIDER_ANTHROPIC | PROVIDER_OPENAI => {
+                value.get("model").and_then(|v| v.as_str()).map(String::from)
+            }
+            _ => None,
+        };
     }
+    if provider == PROVIDER_ANTHROPIC {
+        return parse_anthropic_sse_usage(body).and_then(|s| s.model);
+    }
+    None
 }
 
 /// Estimate the worst-case input/output tokens for a pre-flight budget check.
@@ -434,5 +653,200 @@ mod tests {
         // Missing model
         let no_model = br#"{"usage": {"input_tokens": 1, "output_tokens": 2}}"#;
         assert_eq!(extract_model(PROVIDER_ANTHROPIC, no_model), None);
+    }
+
+    // — Anthropic SSE parser unit tests.
+
+    #[test]
+    fn parse_sse_usage_minimal_stream() {
+        let body = "event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"claude-opus-4-5\",\"usage\":{\"input_tokens\":42,\"output_tokens\":0}}}\n\
+\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":18}}\n\
+\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\
+\n";
+        let summary = parse_anthropic_sse_usage(body.as_bytes()).expect("parses");
+        assert_eq!(summary.usage.input_tokens, 42);
+        assert_eq!(summary.usage.output_tokens, 18);
+        assert!(summary.saw_message_stop);
+        assert_eq!(summary.model.as_deref(), Some("claude-opus-4-5"));
+    }
+
+    #[test]
+    fn parse_sse_usage_folds_cache_tokens() {
+        let body = "event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-4-5\",\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":5,\"cache_read_input_tokens\":7,\"output_tokens\":0}}}\n\
+\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":4}}\n\
+\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\
+\n";
+        let summary = parse_anthropic_sse_usage(body.as_bytes()).expect("parses");
+        // 10 + 5 + 7 = 22
+        assert_eq!(summary.usage.input_tokens, 22);
+        assert_eq!(summary.usage.output_tokens, 4);
+    }
+
+    #[test]
+    fn parse_sse_usage_no_message_stop_is_partial() {
+        let body = "event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-4-5\",\"usage\":{\"input_tokens\":3,\"output_tokens\":0}}}\n\
+\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n\
+\n";
+        let summary = parse_anthropic_sse_usage(body.as_bytes()).expect("parses");
+        assert_eq!(summary.usage.output_tokens, 9);
+        assert!(!summary.saw_message_stop);
+    }
+
+    #[test]
+    fn parse_sse_usage_multiple_deltas_takes_max() {
+        // Cumulative output_tokens stream (real Anthropic shape).
+        let body = "event: message_delta\n\
+data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\
+\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":12}}\n\
+\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":30}}\n\
+\n";
+        let summary = parse_anthropic_sse_usage(body.as_bytes()).expect("parses");
+        assert_eq!(summary.usage.output_tokens, 30);
+    }
+
+    #[test]
+    fn parse_sse_usage_skips_malformed_frames() {
+        // One bad frame sandwiched between two good ones.
+        let body = "event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-4-5\",\"usage\":{\"input_tokens\":8,\"output_tokens\":0}}}\n\
+\n\
+event: message_delta\n\
+data: {not valid json\n\
+\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":6}}\n\
+\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\
+\n";
+        let summary = parse_anthropic_sse_usage(body.as_bytes()).expect("parses");
+        assert_eq!(summary.usage.input_tokens, 8);
+        assert_eq!(summary.usage.output_tokens, 6);
+        assert!(summary.saw_message_stop);
+    }
+
+    #[test]
+    fn parse_sse_usage_empty_body_returns_none() {
+        assert_eq!(parse_anthropic_sse_usage(b""), None);
+    }
+
+    /// c44 Phase E HIGH: a hostile upstream that injects `input_tokens` in a
+    /// `message_delta` must NOT inflate billing. Only `message_start` is
+    /// authoritative for input/cache counts.
+    #[test]
+    fn parse_sse_usage_ignores_input_tokens_in_message_delta() {
+        let body = "event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-4-5\",\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\
+\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":9999999,\"cache_creation_input_tokens\":9999999,\"cache_read_input_tokens\":9999999,\"output_tokens\":5}}\n\
+\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\
+\n";
+        let summary = parse_anthropic_sse_usage(body.as_bytes()).expect("parses");
+        assert_eq!(
+            summary.usage.input_tokens, 10,
+            "input_tokens must come from message_start only, not message_delta"
+        );
+        assert_eq!(summary.usage.output_tokens, 5);
+    }
+
+    /// c44 SSE-CRLF: CRLF-framed SSE (some enterprise TLS intermediaries
+    /// rewrite line endings) must parse identically to LF-framed SSE.
+    /// Without entry-point normalization, `text.split("\n\n")` would see
+    /// a single unsplit blob and metering would degrade to None.
+    #[test]
+    fn parse_sse_usage_accepts_crlf_frames() {
+        let lf_body = "event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"model\":\"claude-opus-4-5\",\"usage\":{\"input_tokens\":42,\"output_tokens\":0}}}\n\
+\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":18}}\n\
+\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\
+\n";
+        let crlf_body = lf_body.replace('\n', "\r\n");
+        let lf_summary = parse_anthropic_sse_usage(lf_body.as_bytes()).expect("lf parses");
+        let crlf_summary = parse_anthropic_sse_usage(crlf_body.as_bytes()).expect("crlf parses");
+        assert_eq!(
+            lf_summary, crlf_summary,
+            "CRLF-framed SSE must parse identically to LF-framed"
+        );
+        assert_eq!(crlf_summary.usage.input_tokens, 42);
+        assert_eq!(crlf_summary.usage.output_tokens, 18);
+        assert!(crlf_summary.saw_message_stop);
+        assert_eq!(crlf_summary.model.as_deref(), Some("claude-opus-4-5"));
+    }
+
+    /// c44 MSG-START-POISON: a hostile upstream that sets `output_tokens`
+    /// in `message_start` must NOT raise the output high-water mark. Per
+    /// Anthropic's spec, `message_start.usage.output_tokens` is always 0
+    /// (no output has streamed yet); reading it would let MITM inflate
+    /// billing by setting it to u64::MAX, which would then stick via the
+    /// max-merge in the `message_delta` arm.
+    #[test]
+    fn parse_sse_usage_ignores_output_tokens_in_message_start() {
+        let body = "event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-4-5\",\"usage\":{\"input_tokens\":10,\"output_tokens\":9999999}}}\n\
+\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\
+\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\
+\n";
+        let summary = parse_anthropic_sse_usage(body.as_bytes()).expect("parses");
+        assert_eq!(summary.usage.input_tokens, 10);
+        assert_eq!(
+            summary.usage.output_tokens, 5,
+            "output_tokens must come from message_delta only, not message_start"
+        );
+    }
+
+    #[test]
+    fn parse_usage_routes_sse_to_sse_parser() {
+        // Confirm the top-level `parse_usage` dispatches SSE bodies to
+        // the SSE parser instead of returning None.
+        let body = "event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-opus-4-5\",\"usage\":{\"input_tokens\":50,\"output_tokens\":0}}}\n\
+\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":25}}\n\
+\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\
+\n";
+        let parsed = parse_usage(PROVIDER_ANTHROPIC, body.as_bytes()).expect("parsed");
+        assert_eq!(parsed.input_tokens, 50);
+        assert_eq!(parsed.output_tokens, 25);
+    }
+
+    #[test]
+    fn looks_like_json_matches_only_json_bodies() {
+        assert!(looks_like_json(b"{\"k\":1}"));
+        assert!(looks_like_json(b"  \n\t{"));
+        assert!(looks_like_json(b"[1,2,3]"));
+        assert!(!looks_like_json(b"event: message_start\n"));
+        assert!(!looks_like_json(b"data: {\"k\":1}\n"));
+        assert!(!looks_like_json(b""));
     }
 }

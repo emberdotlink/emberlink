@@ -2,6 +2,11 @@
 
 Get ember running in under 5 minutes.
 
+## Prerequisites
+
+- **Rust 1.75+** — install via [rustup.rs](https://rustup.rs)
+- **Docker** (optional) — required only for `ember sandbox` commands; everything else works without it
+
 ## Install
 
 ```bash
@@ -21,7 +26,7 @@ This creates:
 - Root persona (your identity)
 - Vault encryption key stored in the OS keychain
 
-Output shows each path and the keychain status. Ends with `Run 'ember daemon start' to start the daemon.`
+Output shows each path and the keychain status. Ends with `Run \`ember daemon start\` to start the daemon.`
 
 ## Start the daemon
 
@@ -38,8 +43,9 @@ ember daemon start --background
 The daemon prints on startup:
 - **Socket**: `~/.ember/run/daemon.sock` (agent communication)
 - **Database**: `~/.ember/data/daemon.db`
+- **Log**: `~/.ember/data/daemon.log`
 - **PID**: process ID
-- **Dashboard**: http://localhost:3141 (browser UI; approve/deny/revoke require a CSRF token embedded in the page — curl-style POSTs from other origins are rejected)
+- **Dashboard**: `http://localhost:3141` (browser UI; approve/deny/revoke require a CSRF token embedded in the page — curl-style POSTs from other origins are rejected)
 
 Stop with `Ctrl+C` (foreground) or `ember daemon stop` (both modes).
 
@@ -85,9 +91,17 @@ ember status
 
 Shows active personas, grants, running sandboxes, pending approvals, and recent audit events.
 
+**Success looks like:** `ember status` shows one persona (`coding-agent`), one active grant for `github-token`, and a recent `grant.created` audit event. The grant is time-bound — after the TTL expires, `ember status` shows it gone and `ember audit show` records its closure.
+
 ## Claude Code integration
 
-Route Claude Code's tool calls through the ember daemon as an MCP server. Add to `~/.claude/settings.json`:
+Route Claude Code's tool calls through the ember daemon as an MCP server. First install the MCP binary:
+
+```bash
+cargo install --path crates/emberlink-mcp --bin emberlink-mcp
+```
+
+Then add to `~/.claude/settings.json`:
 
 ```json
 {
@@ -100,12 +114,15 @@ Route Claude Code's tool calls through the ember daemon as an MCP server. Add to
 }
 ```
 
-With the daemon running, Claude Code gets five MCP tools that route through the policy engine:
+With the daemon running, Claude Code gets MCP tools that route through the policy engine:
 - `whoami` — get agent identity
 - `list_grants` — list active grants
 - `request_grant` — request a new grant (may require approval)
 - `grant_status` — check grant status
 - `use_credential` — use a credential via an active grant
+- `list_receipts` — list signed Grant Receipts
+- `get_receipt` — fetch a single Grant Receipt by ID
+- `grant_budget_status` — live budget + runway for a composite grant
 
 Requests that require approval fire a desktop notification and block until you approve from the dashboard or CLI.
 
@@ -145,14 +162,19 @@ ember daemon stop
 
 ## Troubleshooting
 
-**Machine-readable status for scripting** — pass `--json` to get a single JSON object with all status fields:
+### Machine-readable status for scripting
+
+Pass `--json` to get a single JSON object with all status fields:
+
 ```bash
 ember status --json | jq .
 ```
+
 This outputs `version`, `daemon` (running/pid/socket), `personas` count, `grants`, `approvals`, `standing_grants`, and `audit_events`. Useful for CI health checks and monitoring scripts.
 
-**Daemon already running**
-```
+### Daemon already running
+
+```bash
 ember daemon status
 ember daemon stop && ember daemon start
 ```
@@ -170,20 +192,18 @@ ember daemon stop && ember daemon start
 
 ## Auto-start on login
 
-### macOS
+Works on macOS (LaunchAgent) and Linux (systemd user unit):
+
 ```bash
-cp contrib/ember-daemon.plist ~/Library/LaunchAgents/link.ember.daemon.plist
-launchctl load ~/Library/LaunchAgents/link.ember.daemon.plist
+ember daemon install-agent
 ```
 
-### Linux (systemd)
+This writes and loads the service file, sets the correct binary path, and enables auto-restart on login. To remove:
+
 ```bash
-mkdir -p ~/.config/systemd/user
-cp contrib/ember-daemon.service ~/.config/systemd/user/
-systemctl --user enable ember-daemon
-systemctl --user start ember-daemon
+ember daemon uninstall-agent
 ```
 
 ---
 
-**The trust layer for AI agents.** [ember.link](https://ember.link)
+**The Grant Warden for AI agents.** [ember.link](https://ember.link)

@@ -73,6 +73,13 @@ pub struct RequestGrantParams {
     pub duration_secs: Option<u64>,
     /// Human-readable reason for the request.
     pub reason: Option<String>,
+    /// Name of the agent tool or action that triggered this request.
+    /// Maps to the NOTIF-1 `tool_name` banner field.
+    pub tool_name: Option<String>,
+    /// Target URL the tool is acting on (e.g. an API endpoint).
+    /// Maps to the NOTIF-1 `target_url` banner field; `target_host` is
+    /// derived from it in the runtime when present.
+    pub target_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

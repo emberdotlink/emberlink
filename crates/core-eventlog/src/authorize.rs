@@ -472,7 +472,6 @@ impl IdentityAuthorizer {
                 }
                 Ok(())
             }
-            EventBody::LegacyOpaque { .. } => Ok(()),
         }
     }
 }
@@ -1012,8 +1011,6 @@ fn check_signer_subject_coherence(
         // RelayShutdownNotice: signer is the relay device — per-branch
         // enforcement already checks the endpoint binding.
         EventBody::RelayShutdownNotice(_) => {}
-        // LegacyOpaque carries an arbitrary declared type; skip.
-        EventBody::LegacyOpaque { .. } => {}
     }
     Ok(())
 }

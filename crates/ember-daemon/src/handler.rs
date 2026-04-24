@@ -11,6 +11,49 @@ use crate::rate_limit::RateLimiter;
 use crate::store::DaemonStore;
 use crate::vault::Vault;
 
+/// Origin of a dispatched RPC request.
+///
+/// Fix for development milestone (CRITICAL): the `force` flag on `create_grant`
+/// used to be accepted from any wire caller, letting unauthenticated socket
+/// clients mint grants that bypassed the policy engine. We now thread the
+/// dispatch *source* through the handler so that only `Internal` callers
+/// (admin CLI paths, test harness, recovery flows) can request policy
+/// bypass. Socket callers that attempt `force: true` are rejected.
+///
+/// **Type-level barrier (development milestone):** The `Internal` variant
+/// requires a mandatory `reason` string literal so that every in-process
+/// privilege escalation is visible and attributable at the call site.  Code
+/// review can grep for `DispatchSource::Internal` and see exactly *why* each
+/// caller claims the internal trust lane.  Forgetting the `reason` is a
+/// compile error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchSource {
+    /// Request arrived via the unix-domain socket RPC path. Callers on this
+    /// path are NOT authenticated as admins, and MUST NOT be able to
+    /// bypass policy gates. Any `force: true` is rejected.
+    Socket,
+    /// Request was synthesized by an in-process caller that has already
+    /// established admin identity (test harness, internal admin CLI path,
+    /// recovery flows). `force: true` is honored.
+    ///
+    /// `reason` is a mandatory static string that names the trust context
+    /// at the call site (e.g. `"admin CLI"`, `"recovery flow"`,
+    /// `"test harness"`).  It is purely a code-review / audit annotation
+    /// and has no effect on runtime behaviour.
+    Internal { reason: &'static str },
+}
+
+impl DispatchSource {
+    /// Returns `true` when this source carries internal (admin) trust.
+    #[inline]
+    pub fn is_internal(self) -> bool {
+        matches!(self, DispatchSource::Internal { .. })
+    }
+}
+
+/// Test-only dispatcher — unconditionally runs as an `Internal` source so
+/// existing tests can use `force: true` as a setup shortcut. Not reachable
+/// from the socket path.
 pub async fn dispatch_method(
     store: &DaemonStore,
     vault: &Vault,
@@ -19,7 +62,17 @@ pub async fn dispatch_method(
     method: &str,
     params: &Value,
 ) -> Result<Value, (i32, String)> {
-    dispatch_method_with_events(store, vault, policy, rate_limiter, None, method, params).await
+    dispatch_method_with_source(
+        store,
+        vault,
+        policy,
+        rate_limiter,
+        None,
+        DispatchSource::Internal { reason: "test harness" },
+        method,
+        params,
+    )
+    .await
 }
 
 pub struct Banner {
@@ -36,8 +89,6 @@ pub struct Banner {
 /// primary overflow culprit. The dashboard deep-link (`click_url`) is the
 /// canonical control surface for full context.
 pub fn build_banner(persona_name: &str, req: &ApprovalRequestInfo) -> Banner {
-    // Tighten action to 40 chars to leave room for "Ember · <name> wants ".
-    let action_short: String = req.action.chars().take(40).collect();
     let id_prefix: String = req
         .id
         .strip_prefix("approval-")
@@ -46,7 +97,24 @@ pub fn build_banner(persona_name: &str, req: &ApprovalRequestInfo) -> Banner {
         .take(8)
         .collect();
 
-    let title = format!("Ember · {persona_name} wants {action_short}");
+    // Title: prefer tool_name when present; fall back to the action string.
+    // Cap the action at 40 chars to leave room for "Ember · <name> wants ".
+    // Append agent_framework as a parenthesized badge when present.
+    let framework_suffix = req
+        .agent_framework
+        .as_deref()
+        .map(|f| {
+            let f_short: String = f.chars().take(16).collect();
+            format!(" ({f_short})")
+        })
+        .unwrap_or_default();
+    let title = if let Some(ref tool) = req.tool_name {
+        let tool_short: String = tool.chars().take(40).collect();
+        format!("Ember · {persona_name} · {tool_short}{framework_suffix}")
+    } else {
+        let action_short: String = req.action.chars().take(40).collect();
+        format!("Ember · {persona_name} wants {action_short}{framework_suffix}")
+    };
 
     // Subtitle: credential · TTL · risk — decision-relevant, no scope/id.
     let ttl_part = req
@@ -68,7 +136,15 @@ pub fn build_banner(persona_name: &str, req: &ApprovalRequestInfo) -> Banner {
         subtitle_raw
     };
 
-    let body_raw = format!("Click to review · {id_prefix}");
+    // Body: prefer target_host + target_summary when either is present; then
+    // fall back to target_url; otherwise use the click-to-review prompt.
+    let body_raw = match (&req.target_host, &req.target_summary, &req.target_url) {
+        (Some(host), Some(summary), _) => format!("{host}{summary}"),
+        (Some(host), None, _) => host.clone(),
+        (None, Some(summary), _) => summary.clone(),
+        (None, None, Some(url)) => url.clone(),
+        (None, None, None) => format!("Click to review · {id_prefix}"),
+    };
     let body: String = if body_raw.chars().count() > 50 {
         let mut s: String = body_raw.chars().take(47).collect();
         s.push_str("...");
@@ -114,12 +190,43 @@ fn notify_require_approval(store: &DaemonStore, req: &ApprovalRequestInfo) {
 /// Dispatch a method with an optional event broadcast channel. When a handler
 /// triggers a server-initiated event (e.g. `revoke_grant`), the event is
 /// published on the channel for connected socket clients to forward.
+///
+/// This is the **socket entry point** — it always runs as
+/// `DispatchSource::Socket`, which causes any caller-supplied `force: true`
+/// on `create_grant` to be rejected. See `DispatchSource` for context.
 pub async fn dispatch_method_with_events(
     store: &DaemonStore,
     vault: &Vault,
     policy: &PolicyEngine,
     rate_limiter: &RefCell<RateLimiter>,
     events_tx: Option<&broadcast::Sender<GrantEvent>>,
+    method: &str,
+    params: &Value,
+) -> Result<Value, (i32, String)> {
+    dispatch_method_with_source(
+        store,
+        vault,
+        policy,
+        rate_limiter,
+        events_tx,
+        DispatchSource::Socket,
+        method,
+        params,
+    )
+    .await
+}
+
+/// Core dispatcher. Callers MUST set `source` correctly: `Socket` for any
+/// request that arrived from the wire, `Internal` only for in-process
+/// admin/test paths. Mis-attribution here would re-open development milestone.
+#[allow(clippy::too_many_arguments)]
+pub async fn dispatch_method_with_source(
+    store: &DaemonStore,
+    vault: &Vault,
+    policy: &PolicyEngine,
+    rate_limiter: &RefCell<RateLimiter>,
+    events_tx: Option<&broadcast::Sender<GrantEvent>>,
+    source: DispatchSource,
     method: &str,
     params: &Value,
 ) -> Result<Value, (i32, String)> {
@@ -176,8 +283,21 @@ pub async fn dispatch_method_with_events(
             });
             let max_delegation_depth = params["max_delegation_depth"].as_u64().map(|v| v as u32);
 
-            // Evaluate policy unless force=true (human/admin bypass)
-            let force = params["force"].as_bool().unwrap_or(false);
+            // Evaluate policy unless force=true (human/admin bypass).
+            //
+            // development milestone fix: `force` is ONLY honored for in-process
+            // admin/test callers (`DispatchSource::Internal`). Socket
+            // callers that supply `force: true` are rejected loudly so an
+            // attacker can never silently bypass the policy gate.
+            let force_requested = params["force"].as_bool().unwrap_or(false);
+            if force_requested && !source.is_internal() {
+                return Err((
+                    -32602,
+                    "the 'force' parameter is not permitted on the socket API"
+                        .to_string(),
+                ));
+            }
+            let force = force_requested && source.is_internal();
             if !force {
                 let action = format!("credential.access.{}", credential_name);
                 let eval = policy.evaluate(&action);
@@ -277,11 +397,77 @@ pub async fn dispatch_method_with_events(
                 .as_str()
                 .ok_or((-32602, "missing 'scope'".to_string()))?;
             let ttl_secs = params["ttl_secs"].as_u64();
+            // Optional child budget — when present, `delegate_grant_full`
+            // enforces offline attenuation (child ≤ parent − usage on every
+            // axis). When absent we fall back to the no-budget shape so
+            // callers that don't set budgets keep working.
+            let child_budget: Option<core_types::Budget> = if params["budget"].is_object() {
+                Some(serde_json::from_value(params["budget"].clone())
+                    .map_err(|e| (-32602, format!("invalid 'budget': {e}")))?)
+            } else {
+                None
+            };
             let parent_grant = store
                 .get_grant(parent_grant_id)
                 .map_err(|e| (-32000, e.to_string()))?;
+
+            // development milestone — defense-in-depth, NOT a full gate.
+            //
+            // What this check does: socket callers must assert
+            // `caller_persona_id` in params; it must equal the parent
+            // grant's owner. A caller who fails to lie — e.g. a benign
+            // mis-use, a stale client, a local script that grabbed a
+            // stranger's parent_grant_id from a log — is rejected before
+            // any state change.
+            //
+            // What this check does NOT do: it does not prove the caller
+            // IS the claimed persona. `caller_persona_id` is an
+            // attacker-supplied string. An attacker who knows the victim
+            // persona_id (readable via list_personas, audit log,
+            // receipts) can set caller_persona_id == victim and the
+            // check passes. Full principal binding requires SO_PEERCRED
+            // + root-signed RPC or a persona session ticket — tracked
+            // as development milestone (defer follow-up).
+            //
+            // The SO_PEERCRED gate (development milestone, prior change) already
+            // ensures only processes running as the daemon's own uid
+            // can connect, so the remaining attack surface is between
+            // local processes of the same user — real but narrower.
+            //
+            // `Internal` source (admin CLI, test harness, recovery)
+            // bypasses — mirrors development milestone pattern.
+            if !source.is_internal() {
+                let caller_persona_id = params["caller_persona_id"]
+                    .as_str()
+                    .ok_or((
+                        -32602,
+                        "missing 'caller_persona_id': socket callers must \
+                         assert the persona delegating the parent grant"
+                            .to_string(),
+                    ))?;
+                if caller_persona_id != parent_grant.persona_id {
+                    tracing::warn!(
+                        caller_persona_id = %caller_persona_id,
+                        parent_grant_id = %parent_grant_id,
+                        parent_owner_persona_id = %parent_grant.persona_id,
+                        "rejecting delegate_grant: caller does not own parent grant"
+                    );
+                    return Err((
+                        -32002,
+                        "delegate_grant: caller does not own parent grant"
+                            .to_string(),
+                    ));
+                }
+            }
+
             let grant = store
-                .delegate_grant(parent_grant_id, child_persona_id, scope, ttl_secs)
+                .delegate_grant_full(
+                    parent_grant_id,
+                    child_persona_id,
+                    scope,
+                    ttl_secs,
+                    child_budget,
+                )
                 .map_err(|e| (-32000, e.to_string()))?;
             let _ = store.log_event(
                 Some(child_persona_id),
@@ -295,7 +481,13 @@ pub async fn dispatch_method_with_events(
                     "scope": scope,
                 }).to_string()),
             );
-            Ok(json!({"id": grant.id, "scope": grant.scope, "parent": parent_grant_id}))
+            Ok(json!({
+                "id": grant.id,
+                "scope": grant.scope,
+                "parent": parent_grant_id,
+                "expires_at": grant.expires_at,
+                "budget": grant.budget,
+            }))
         }
 
         "list_grants" => {
@@ -555,7 +747,7 @@ pub async fn dispatch_method_with_events(
                 .as_str()
                 .ok_or((-32602, "missing 'risk_level'".to_string()))?;
             let ttl_secs = params["ttl_secs"].as_u64();
-            let req = store
+            let mut req = store
                 .submit_approval(
                     persona_id,
                     credential_name,
@@ -565,6 +757,10 @@ pub async fn dispatch_method_with_events(
                     risk_level,
                 )
                 .map_err(|e| (-32000, e.to_string()))?;
+            req.tool_name = params["tool_name"].as_str().map(str::to_owned);
+            req.target_host = params["target_host"].as_str().map(str::to_owned);
+            req.target_url = params["target_url"].as_str().map(str::to_owned);
+            req.agent_framework = params["agent_framework"].as_str().map(str::to_owned);
             notify_require_approval(store, &req);
             Ok(json!({"id": req.id, "status": req.status}))
         }
@@ -615,8 +811,9 @@ pub async fn dispatch_method_with_events(
                         return Err((-32002, "grant belongs to a different persona".to_string()));
                     }
                     // Emit per-Statement array for composite callers
-                    // (design). The legacy `budget` + `usage` envelope
-                    // fields stay as first-statement projections.
+                    // (design). V0 schema: no envelope-level `budget` /
+                    // `usage` projection — consumers read per-Statement
+                    // fields from the `statements` array.
                     let statements: Vec<Value> = match store.get_access_grant(id) {
                         Ok(chain) => chain
                             .statements()
@@ -644,8 +841,6 @@ pub async fn dispatch_method_with_events(
                         "status": g.status,
                         "expires_at": g.expires_at,
                         "created_at": g.created_at,
-                        "budget": g.budget,
-                        "usage": g.usage,
                         "statements": statements,
                         "statement_count": statements.len(),
                     }));
@@ -777,7 +972,7 @@ pub async fn dispatch_method_with_events(
                     }))
                 }
                 PolicyDecision::RequireApproval => {
-                    let req = store
+                    let mut req = store
                         .submit_approval(
                             persona_id,
                             credential_name,
@@ -787,6 +982,10 @@ pub async fn dispatch_method_with_events(
                             &risk_str,
                         )
                         .map_err(|e| (-32000, e.to_string()))?;
+                    req.tool_name = params["tool_name"].as_str().map(str::to_owned);
+                    req.target_host = params["target_host"].as_str().map(str::to_owned);
+                    req.target_url = params["target_url"].as_str().map(str::to_owned);
+                    req.agent_framework = params["agent_framework"].as_str().map(str::to_owned);
                     notify_require_approval(store, &req);
                     Ok(json!({
                         "status": "pending",
@@ -1006,8 +1205,100 @@ pub async fn dispatch_method_with_events(
             }
         }
 
+        "grant_budget_status" => {
+            // Return per-Statement budget + usage + percent_used so MCP/SDK
+            // clients can render a "runway" view without walking the
+            // composite block chain themselves. This is a thin read-only
+            // projection of `get_access_grant` + lifecycle status; the
+            // proxy remains the sole writer of `usage`.
+            let grant_id = params["grant_id"]
+                .as_str()
+                .ok_or((-32602, "missing 'grant_id'".to_string()))?;
+            let chain = match store.get_access_grant(grant_id) {
+                Ok(c) => c,
+                Err(crate::store::StoreError::NotFound) => {
+                    return Err((-32004, format!("grant {grant_id} not found")));
+                }
+                Err(e) => return Err((-32000, e.to_string())),
+            };
+
+            // Envelope status: fold the stored Grant row's status through
+            // `GrantStatus::derive` so Expired is reported alongside
+            // Active/Revoked on the same snapshot. `expires_at` is stored
+            // as an RFC3339 string — parse it defensively and fall back to
+            // the chain-level status when the string is malformed.
+            let envelope_status = match store.get_grant(grant_id) {
+                Ok(g) => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let expires_epoch = g.expires_at.as_deref().and_then(|s| {
+                        chrono::DateTime::parse_from_rfc3339(s)
+                            .ok()
+                            .map(|dt| dt.timestamp() as u64)
+                    });
+                    core_types::GrantStatus::derive(&g.status, None, expires_epoch, now)
+                        .as_str()
+                        .to_string()
+                }
+                Err(_) => chain.status.as_str().to_string(),
+            };
+
+            let statements: Vec<Value> = chain
+                .statements()
+                .map(|(_bi, s)| build_statement_budget_entry(s))
+                .collect();
+
+            Ok(json!({
+                "grant_id": grant_id,
+                "status": envelope_status,
+                "statements": statements,
+            }))
+        }
+
         _ => Err((-32601, "Method not found".to_string())),
     }
+}
+
+/// Shape a single `Statement` into the budget-status response entry used by
+/// the `grant_budget_status` MCP tool. The `percent_used` map is populated
+/// only for axes that have a ceiling set — TTL-only statements return an
+/// empty map rather than a map full of nulls. `estimated_runway_seconds`
+/// is today always `null` (reserved for a future burn-rate projection once
+/// the metering history is durable).
+fn build_statement_budget_entry(s: &core_types::Statement) -> Value {
+    let mut percent_used = serde_json::Map::new();
+    if let Some(budget) = &s.budget {
+        if let Some(cap) = budget.tokens
+            && cap > 0
+        {
+            let pct = ((s.usage.tokens as u128 * 100) / cap as u128) as u64;
+            percent_used.insert("tokens".to_string(), json!(pct));
+        }
+        if let Some(cap) = budget.cents
+            && cap > 0
+        {
+            let pct = ((s.usage.cents as u128 * 100) / cap as u128) as u64;
+            percent_used.insert("cents".to_string(), json!(pct));
+        }
+        if let Some(cap) = budget.requests
+            && cap > 0
+        {
+            let pct = ((s.usage.requests as u128 * 100) / cap as u128) as u64;
+            percent_used.insert("requests".to_string(), json!(pct));
+        }
+    }
+
+    json!({
+        "sid": s.sid,
+        "resource_type": s.resource_type.as_str(),
+        "budget": s.budget,
+        "usage": s.usage,
+        "percent_used": Value::Object(percent_used),
+        "estimated_runway_seconds": Value::Null,
+        "has_budget_remaining": s.has_budget_remaining(),
+    })
 }
 
 #[cfg(test)]
@@ -1423,13 +1714,16 @@ mod tests {
         let log =
             dispatch_method(&store, &vault, &policy, &rl, "audit_query", &json!({})).await.unwrap();
         let arr = log.as_array().unwrap();
-        // Two rows: credential.access (most recent) and grant.issued.
-        // query_audit orders by timestamp DESC, so arr[0] is the later use.
-        assert_eq!(arr.len(), 2);
+        // Three rows (timestamp DESC): credential.access, grant.issued, grant.minted.
+        // grant.minted is emitted inside create_grant_with_budget before the handler
+        // emits grant.issued, so it is the oldest.
+        assert_eq!(arr.len(), 3);
         assert_eq!(arr[0]["action"], json!("credential.access"));
         assert_eq!(arr[0]["outcome"], json!("allowed"));
         assert_eq!(arr[1]["action"], json!("grant.issued"));
         assert_eq!(arr[1]["outcome"], json!("allowed"));
+        assert_eq!(arr[2]["action"], json!("grant.minted"));
+        assert_eq!(arr[2]["outcome"], json!("minted"));
     }
 
     #[tokio::test]
@@ -1544,6 +1838,81 @@ mod tests {
         assert!(child_grant["id"].as_str().unwrap().starts_with("grant-"));
         assert_eq!(child_grant["scope"], json!("read"));
         assert_eq!(child_grant["parent"], json!(parent_grant_id));
+    }
+
+    /// Exercise the socket-level `delegate_grant` method with an
+    /// explicit child `budget` param. Parent carries a tokens budget,
+    /// child asks for a strict subset — attenuation must accept and the
+    /// response envelope must surface the child budget + expiry.
+    #[tokio::test]
+    async fn delegate_grant_via_socket_accepts_child_budget() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let parent_persona = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "create_persona",
+            &json!({"name": "agent-parent-budget"}),
+        ).await.unwrap();
+        let parent_persona_id = parent_persona["id"].as_str().unwrap();
+
+        let child_persona = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "create_persona",
+            &json!({"name": "agent-child-budget"}),
+        ).await.unwrap();
+        let child_persona_id = child_persona["id"].as_str().unwrap();
+
+        let parent_grant = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "create_grant",
+            &json!({
+                "persona_id": parent_persona_id,
+                "credential_name": "delegate-key",
+                "scope": "github:push:acme/*",
+                "max_delegation_depth": 2,
+                "ttl_secs": 3_600,
+                "force": true,
+            }),
+        ).await.unwrap();
+        let parent_grant_id = parent_grant["id"].as_str().unwrap().to_string();
+
+        // `create_grant` socket path doesn't plumb budget yet, so stamp
+        // the tokens budget directly on the row to set up the scenario.
+        store.conn().execute(
+            "UPDATE grants SET budget_json = ?1 WHERE id = ?2",
+            rusqlite::params![
+                r#"{"tokens":10000}"#,
+                &parent_grant_id,
+            ],
+        ).unwrap();
+
+        let child_grant = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "delegate_grant",
+            &json!({
+                "parent_grant_id": parent_grant_id,
+                "child_persona_id": child_persona_id,
+                "scope": "github:push:acme/widgets",
+                "ttl_secs": 900,
+                "budget": {"tokens": 2000},
+            }),
+        ).await.unwrap();
+
+        assert!(child_grant["id"].as_str().unwrap().starts_with("grant-"));
+        assert_eq!(child_grant["scope"], json!("github:push:acme/widgets"));
+        assert_eq!(child_grant["parent"], json!(parent_grant_id));
+        assert_eq!(
+            child_grant["budget"]["tokens"].as_u64(),
+            Some(2000),
+            "child budget echoed in response"
+        );
+        assert!(
+            child_grant["expires_at"].is_string(),
+            "expires_at present on delegated grant"
+        );
     }
 
     #[tokio::test]
@@ -1768,6 +2137,13 @@ mod tests {
             status: "pending".to_string(),
             reason: None,
             created_at: "2026-04-20T00:00:00Z".to_string(),
+            tool_name: None,
+            target_host: None,
+            target_summary: None,
+            target_url: None,
+            agent_framework: None,
+            composite_statements: None,
+            result_grant_id: None,
         }
     }
 
@@ -1855,6 +2231,122 @@ mod tests {
         );
     }
 
+    // --- NOTIF-1: optional semantic fields ---
+
+    #[test]
+    fn banner_all_semantic_fields_none_uses_default_format() {
+        // All new fields absent → legacy title/body behavior.
+        let req = fake_req("github-token", "read", Some(1800), "high", "deploy.production");
+        let banner = build_banner("demo-agent", &req);
+        assert!(
+            banner.title.contains("wants"),
+            "title should use action-based format when tool_name is None: {:?}",
+            banner.title
+        );
+        assert!(
+            banner.body.contains("Click to review"),
+            "body should use default format when target fields are None: {:?}",
+            banner.body
+        );
+    }
+
+    #[test]
+    fn banner_tool_name_appears_in_title_instead_of_action() {
+        let mut req = fake_req("github-token", "read", Some(1800), "high", "deploy.production");
+        req.tool_name = Some("claude-code".to_string());
+        let banner = build_banner("demo-agent", &req);
+        assert!(
+            banner.title.contains("claude-code"),
+            "title should contain tool_name: {:?}",
+            banner.title
+        );
+        assert!(
+            !banner.title.contains("wants"),
+            "title should NOT use action-based 'wants' format when tool_name is set: {:?}",
+            banner.title
+        );
+    }
+
+    #[test]
+    fn banner_target_fields_appear_in_body() {
+        let mut req = fake_req("github-token", "read", Some(1800), "high", "deploy.production");
+        req.tool_name = Some("claude-code".to_string());
+        req.target_host = Some("api.github.com".to_string());
+        req.target_summary = Some("POST /repos/x/y/pulls".to_string());
+        let banner = build_banner("demo-agent", &req);
+        assert!(
+            banner.body.contains("api.github.com"),
+            "body should contain target_host: {:?}",
+            banner.body
+        );
+        assert!(
+            banner.body.contains("POST /repos"),
+            "body should contain target_summary: {:?}",
+            banner.body
+        );
+        assert!(
+            !banner.body.contains("Click to review"),
+            "body should NOT use fallback format when target fields are set: {:?}",
+            banner.body
+        );
+    }
+
+    #[test]
+    fn banner_target_url_appears_when_set() {
+        let mut req = fake_req("github-token", "read", Some(1800), "high", "deploy.production");
+        req.target_url = Some("api.github.com/repos/x/y".to_string());
+        let banner = build_banner("demo-agent", &req);
+        assert!(
+            banner.body.contains("api.github.com/repos/x/y"),
+            "body should contain target_url: {:?}",
+            banner.body
+        );
+        assert!(
+            !banner.body.contains("Click to review"),
+            "body should NOT use fallback format when target_url is set: {:?}",
+            banner.body
+        );
+    }
+
+    #[test]
+    fn banner_agent_framework_appears_when_set() {
+        let mut req = fake_req("github-token", "read", Some(1800), "high", "deploy.production");
+        req.agent_framework = Some("claude-code".to_string());
+        let banner = build_banner("demo-agent", &req);
+        assert!(
+            banner.title.contains("claude-code"),
+            "title should contain agent_framework: {:?}",
+            banner.title
+        );
+    }
+
+    #[test]
+    fn banner_omits_absent_optional_fields() {
+        let req = fake_req("github-token", "read", Some(1800), "high", "deploy.production");
+        let banner = build_banner("demo-agent", &req);
+        assert!(
+            !banner.title.contains("None"),
+            "title must not contain literal 'None': {:?}",
+            banner.title
+        );
+        assert!(
+            !banner.subtitle.contains("None"),
+            "subtitle must not contain literal 'None': {:?}",
+            banner.subtitle
+        );
+        assert!(
+            !banner.body.contains("None"),
+            "body must not contain literal 'None': {:?}",
+            banner.body
+        );
+        // No stray separators from absent fields
+        assert!(
+            !banner.title.contains("()"),
+            "title must not contain empty parens: {:?}",
+            banner.title
+        );
+    }
+
     #[tokio::test]
     async fn dispatch_method_uses_provided_policy() {
         let store = DaemonStore::open_in_memory().unwrap();
@@ -1865,6 +2357,7 @@ mod tests {
                 action: "test.action".to_string(),
                 risk: RiskLevel::High,
                 decision: PolicyDecision::Deny,
+                tier: None,
             }],
             ..PolicyConfig::default()
         });
@@ -2290,5 +2783,686 @@ mod tests {
         assert!(result.is_object(), "identity should be initialised in this test");
         let pubkey = result["pubkey"].as_str().unwrap();
         assert_eq!(pubkey.len(), 64);
+    }
+
+    // --- grant_budget_status (P69K-F1) -------------------------------------
+
+    /// Helper: seed a 3-statement grant via the low-level composite-grant
+    /// API so we can assert the MCP budget-status projection without
+    /// relying on the proxy to mutate usage.
+    fn seed_budget_grant(
+        store: &DaemonStore,
+        persona_id: &str,
+        credential_name: &str,
+    ) -> String {
+        use core_types::{Budget, ResourceSelector, ResourceType, Statement, Usage};
+        let grant = store
+            .create_grant(persona_id, credential_name, "*", None)
+            .unwrap();
+        let root = store.persona_root_keypair(persona_id).unwrap();
+        let statements = vec![
+            Statement {
+                sid: "S1".into(),
+                resource_type: ResourceType::Session,
+                actions: vec!["generic:write".into()],
+                resource: ResourceSelector::Any,
+                budget: Some(Budget {
+                    tokens: Some(20_000),
+                    cents: Some(100),
+                    ..Default::default()
+                }),
+                usage: Usage::default(),
+                conditions: Vec::new(),
+            },
+            Statement {
+                sid: "S2".into(),
+                resource_type: ResourceType::Payment,
+                actions: vec!["payment:charge".into()],
+                resource: ResourceSelector::Any,
+                budget: Some(Budget {
+                    cents: Some(500),
+                    ..Default::default()
+                }),
+                usage: Usage::default(),
+                conditions: Vec::new(),
+            },
+            Statement {
+                sid: "S3".into(),
+                resource_type: ResourceType::Time,
+                actions: vec!["session:start".into()],
+                resource: ResourceSelector::Any,
+                budget: Some(Budget {
+                    wall_clock_secs: Some(3_600),
+                    ..Default::default()
+                }),
+                usage: Usage::default(),
+                conditions: Vec::new(),
+            },
+        ];
+        let ag = crate::grant::access_grant_from_statements(
+            &grant.id,
+            persona_id,
+            credential_name,
+            statements,
+            0,
+            None,
+            &root,
+        )
+        .unwrap();
+        store.overwrite_grant_blocks(&grant.id, &ag).unwrap();
+        grant.id
+    }
+
+    #[tokio::test]
+    async fn grant_budget_status_returns_per_statement_shape() {
+        // A 3-statement composite grant surfaces three entries in the
+        // response, each carrying sid + resource_type + budget + usage +
+        // percent_used. With a stubbed 50% usage on S1, percent_used
+        // reflects it — the MCP client can render a runway view without
+        // walking the block chain itself.
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+        let persona = store.create_persona("budget-status").unwrap();
+        let grant_id = seed_budget_grant(&store, &persona.id, "cred-a");
+
+        // Drive S1 to 10_000 tokens (50%) and 50 cents (50%).
+        let delta = store
+            .increment_statement_usage(
+                &grant_id,
+                "S1",
+                core_types::Usage {
+                    tokens: 10_000,
+                    cents: 50,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(delta.current.tokens, 10_000);
+
+        let result = dispatch_method(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            "grant_budget_status",
+            &json!({"grant_id": grant_id}),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["grant_id"].as_str().unwrap(), grant_id);
+        assert_eq!(result["status"].as_str().unwrap(), "active");
+        let statements = result["statements"].as_array().unwrap();
+        assert_eq!(statements.len(), 3, "three-statement grant");
+
+        let s1 = &statements[0];
+        assert_eq!(s1["sid"], "S1");
+        assert_eq!(s1["resource_type"], "session");
+        assert_eq!(s1["usage"]["tokens"], 10_000);
+        assert_eq!(s1["percent_used"]["tokens"], 50);
+        assert_eq!(s1["percent_used"]["cents"], 50);
+        // runway is reserved for a future burn-rate projection.
+        assert!(s1["estimated_runway_seconds"].is_null());
+        assert_eq!(s1["has_budget_remaining"], true);
+
+        // S2 has no usage, should be 0% on its set axis.
+        let s2 = &statements[1];
+        assert_eq!(s2["sid"], "S2");
+        assert_eq!(s2["percent_used"]["cents"], 0);
+    }
+
+    #[tokio::test]
+    async fn grant_budget_status_unknown_grant_returns_not_found() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+        let err = dispatch_method(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            "grant_budget_status",
+            &json!({"grant_id": "grant-nonexistent"}),
+        )
+        .await
+        .unwrap_err();
+        // Consistent with `get_receipt` / `grant_status` not-found shape:
+        // -32004 is the daemon's NotFound code for MCP.
+        assert_eq!(err.0, -32004);
+        assert!(err.1.contains("grant-nonexistent"));
+    }
+
+    #[tokio::test]
+    async fn grant_budget_status_missing_grant_id_returns_invalid_params() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+        let err = dispatch_method(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            "grant_budget_status",
+            &json!({}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, -32602);
+        assert!(err.1.contains("grant_id"));
+    }
+
+    #[tokio::test]
+    async fn grant_budget_status_reflects_revoked_status() {
+        // When the grant envelope is revoked, the budget-status projection
+        // surfaces the terminal state to the caller instead of lying that
+        // it's still active.
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+        let persona = store.create_persona("revoked-status").unwrap();
+        let grant_id = seed_budget_grant(&store, &persona.id, "cred-r");
+        store.revoke_grant(&grant_id).unwrap();
+        let result = dispatch_method(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            "grant_budget_status",
+            &json!({"grant_id": grant_id}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["status"].as_str().unwrap(), "revoked");
+    }
+
+    // --- development milestone regression tests ---------------------------------
+    // These tests verify that the `force: true` policy-bypass flag on
+    // `create_grant` is NOT honored when the request arrives via the socket
+    // entry point (`DispatchSource::Socket`). Previously an unauthenticated
+    // socket client could pass `force: true` and skip every policy gate.
+
+    #[tokio::test]
+    async fn create_grant_socket_rejects_force_true() {
+        // A socket client sends `create_grant` with `force: true`. The
+        // handler must reject with -32602 rather than minting the grant.
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let persona = dispatch_method(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            "create_persona",
+            &json!({"name": "c2-victim"}),
+        )
+        .await
+        .unwrap();
+        let persona_id = persona["id"].as_str().unwrap();
+
+        // The default policy's `credential.access.*` rule is
+        // `RequireApproval` — without `force`, a socket caller gets a
+        // pending approval rather than a grant. With `force: true` the
+        // handler MUST reject instead of bypassing policy.
+        let err = dispatch_method_with_source(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            None,
+            DispatchSource::Socket,
+            "create_grant",
+            &json!({
+                "persona_id": persona_id,
+                "credential_name": "prod-stripe-key",
+                "scope": "*",
+                "force": true,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, -32602, "socket force must return -32602, got {err:?}");
+        assert!(
+            err.1.to_lowercase().contains("force"),
+            "error should mention force, got: {}",
+            err.1
+        );
+    }
+
+    #[tokio::test]
+    async fn create_grant_socket_without_force_runs_policy() {
+        // Same request shape minus `force` — must be treated as an ordinary
+        // policy-gated call. With default policy (RequireApproval for
+        // credential.access), the response is a pending_approval envelope,
+        // NOT a freshly minted grant.
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let persona = dispatch_method(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            "create_persona",
+            &json!({"name": "c2-policy"}),
+        )
+        .await
+        .unwrap();
+        let persona_id = persona["id"].as_str().unwrap();
+
+        let result = dispatch_method_with_source(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            None,
+            DispatchSource::Socket,
+            "create_grant",
+            &json!({
+                "persona_id": persona_id,
+                "credential_name": "prod-stripe-key",
+                "scope": "*",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result["status"], json!("pending_approval"),
+            "default policy requires approval for credential.access.*"
+        );
+        assert!(result["approval_id"].is_string());
+        // Crucially: no grant id was issued.
+        assert!(result.get("id").is_none());
+    }
+
+    #[tokio::test]
+    async fn create_grant_socket_with_force_false_is_allowed() {
+        // Explicit `force: false` is indistinguishable from omitting it —
+        // the socket path runs policy either way.
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let persona = dispatch_method(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            "create_persona",
+            &json!({"name": "c2-force-false"}),
+        )
+        .await
+        .unwrap();
+        let persona_id = persona["id"].as_str().unwrap();
+
+        let result = dispatch_method_with_source(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            None,
+            DispatchSource::Socket,
+            "create_grant",
+            &json!({
+                "persona_id": persona_id,
+                "credential_name": "prod-stripe-key",
+                "scope": "*",
+                "force": false,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["status"], json!("pending_approval"));
+    }
+
+    #[tokio::test]
+    async fn create_grant_internal_honors_force() {
+        // Internal callers (test harness / admin CLI path) retain the
+        // ability to skip policy with `force: true`. This keeps the
+        // legitimate bypass path working.
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let persona = dispatch_method(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            "create_persona",
+            &json!({"name": "c2-internal"}),
+        )
+        .await
+        .unwrap();
+        let persona_id = persona["id"].as_str().unwrap();
+
+        let result = dispatch_method_with_source(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            None,
+            DispatchSource::Internal { reason: "test harness — create_grant force bypass" },
+            "create_grant",
+            &json!({
+                "persona_id": persona_id,
+                "credential_name": "prod-stripe-key",
+                "scope": "read",
+                "force": true,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            result["id"].as_str().unwrap_or("").starts_with("grant-"),
+            "internal force should mint a grant, got: {result}"
+        );
+    }
+
+    // --- development milestone regression tests ---------------------------------
+    // A socket caller must assert `caller_persona_id` and it must match the
+    // parent grant's owner (`persona_id`). Otherwise any socket process
+    // could pick any leaked `parent_grant_id` and mint a child grant
+    // pinned to an attacker-controlled persona, forging the audit trail
+    // under the legitimate owner's name.
+
+    /// Helper: create two personas (A, B) and a grant owned by A with
+    /// delegation depth so it can be further attenuated. Returns the
+    /// tuple (a_id, b_id, parent_grant_id). Uses the `Internal` dispatch
+    /// path to set up — the `force: true` on `create_grant` requires it.
+    async fn c3_setup_two_personas_and_grant(
+        store: &DaemonStore,
+        vault: &Vault,
+        policy: &PolicyEngine,
+        rl: &RefCell<RateLimiter>,
+    ) -> (String, String, String) {
+        let persona_a = dispatch_method(
+            store, vault, policy, rl,
+            "create_persona",
+            &json!({"name": "c3-persona-a"}),
+        ).await.unwrap();
+        let a_id = persona_a["id"].as_str().unwrap().to_string();
+
+        let persona_b = dispatch_method(
+            store, vault, policy, rl,
+            "create_persona",
+            &json!({"name": "c3-persona-b"}),
+        ).await.unwrap();
+        let b_id = persona_b["id"].as_str().unwrap().to_string();
+
+        let parent_grant = dispatch_method(
+            store, vault, policy, rl,
+            "create_grant",
+            &json!({
+                "persona_id": a_id,
+                "credential_name": "c3-key",
+                "scope": "*",
+                "max_delegation_depth": 2,
+                "force": true,
+            }),
+        ).await.unwrap();
+        let parent_grant_id = parent_grant["id"].as_str().unwrap().to_string();
+
+        (a_id, b_id, parent_grant_id)
+    }
+
+    #[tokio::test]
+    async fn test_delegate_grant_socket_rejects_non_owner() {
+        // Parent grant is issued to persona A. Persona B tries to delegate
+        // it via the socket path. The handler MUST reject before any state
+        // mutation — no child grant may be minted, no `grant.delegated`
+        // audit row may be written.
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let (_a_id, b_id, parent_grant_id) =
+            c3_setup_two_personas_and_grant(&store, &vault, &policy, &rl).await;
+
+        // Snapshot grant count before the attack to prove nothing was
+        // minted. `list_active_grants` returns every active grant in the
+        // store; we expect the count to be identical after rejection.
+        let before = store.list_active_grants().unwrap().len();
+
+        let err = dispatch_method_with_source(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            None,
+            DispatchSource::Socket,
+            "delegate_grant",
+            &json!({
+                "parent_grant_id": parent_grant_id,
+                "child_persona_id": b_id,
+                "scope": "read",
+                // Attacker asserts they are B, not A. B does not own
+                // `parent_grant_id`.
+                "caller_persona_id": b_id,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, -32002, "expected -32002, got {err:?}");
+        assert!(
+            err.1.to_lowercase().contains("does not own"),
+            "error should say caller does not own parent, got: {}",
+            err.1
+        );
+
+        let after = store.list_active_grants().unwrap().len();
+        assert_eq!(
+            before, after,
+            "no child grant must be minted when socket caller isn't parent owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delegate_grant_socket_accepts_owner() {
+        // Same setup but the socket caller correctly asserts persona A
+        // (the parent owner). Delegation must succeed.
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let (a_id, b_id, parent_grant_id) =
+            c3_setup_two_personas_and_grant(&store, &vault, &policy, &rl).await;
+
+        let result = dispatch_method_with_source(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            None,
+            DispatchSource::Socket,
+            "delegate_grant",
+            &json!({
+                "parent_grant_id": parent_grant_id,
+                "child_persona_id": b_id,
+                "scope": "read",
+                "caller_persona_id": a_id,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result["id"].as_str().unwrap_or("").starts_with("grant-"),
+            "socket owner-delegation must mint a grant, got: {result}"
+        );
+        assert_eq!(result["parent"], json!(parent_grant_id));
+    }
+
+    #[tokio::test]
+    async fn test_delegate_grant_socket_rejects_missing_caller_persona_id() {
+        // Even without a wrong persona id, the socket path must refuse to
+        // proceed if the caller omits `caller_persona_id` — fail-closed.
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let (_a_id, b_id, parent_grant_id) =
+            c3_setup_two_personas_and_grant(&store, &vault, &policy, &rl).await;
+
+        let err = dispatch_method_with_source(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            None,
+            DispatchSource::Socket,
+            "delegate_grant",
+            &json!({
+                "parent_grant_id": parent_grant_id,
+                "child_persona_id": b_id,
+                "scope": "read",
+                // no caller_persona_id
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, -32602, "missing param must return -32602, got {err:?}");
+        assert!(
+            err.1.to_lowercase().contains("caller_persona_id"),
+            "error must name the missing parameter, got: {}",
+            err.1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delegate_grant_internal_bypass() {
+        // Internal callers (admin CLI / test harness) bypass the
+        // ownership gate. Parent is owned by A; an `Internal` dispatch
+        // without any `caller_persona_id` MUST still succeed — mirrors
+        // the C2 `force` bypass semantics for Internal.
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let (_a_id, b_id, parent_grant_id) =
+            c3_setup_two_personas_and_grant(&store, &vault, &policy, &rl).await;
+
+        let result = dispatch_method_with_source(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            None,
+            DispatchSource::Internal { reason: "test harness — delegate_grant ownership bypass" },
+            "delegate_grant",
+            &json!({
+                "parent_grant_id": parent_grant_id,
+                "child_persona_id": b_id,
+                "scope": "read",
+                // Deliberately omit caller_persona_id — Internal bypasses.
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result["id"].as_str().unwrap_or("").starts_with("grant-"),
+            "internal bypass must mint a grant, got: {result}"
+        );
+    }
+
+    fn minimal_req() -> ApprovalRequestInfo {
+        ApprovalRequestInfo {
+            id: "approval-0bc51eff-0000-0000-0000-000000000000".to_string(),
+            persona_id: "persona-abc".to_string(),
+            credential_name: "github-token".to_string(),
+            scope: "repo:read".to_string(),
+            ttl_secs: Some(1800),
+            action: "credential.access.github-token".to_string(),
+            risk_level: "high".to_string(),
+            status: "pending".to_string(),
+            reason: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            tool_name: None,
+            target_host: None,
+            target_summary: None,
+            target_url: None,
+            agent_framework: None,
+            composite_statements: None,
+            result_grant_id: None,
+        }
+    }
+
+    #[test]
+    fn build_banner_includes_tool_and_target_when_present() {
+        let mut req = minimal_req();
+        req.tool_name = Some("claude-code".to_string());
+        req.target_url = Some("api.github.com/repos/emberdotlink/emberlink".to_string());
+
+        let banner = build_banner("claude-code", &req);
+
+        assert!(
+            banner.title.contains("claude-code"),
+            "title should include tool_name, got: {}",
+            banner.title
+        );
+        assert!(
+            banner.body.contains("api.github.com"),
+            "body should include target_url, got: {}",
+            banner.body
+        );
+        assert!(
+            banner.title.chars().count() <= 60,
+            "title must not exceed 60 chars, got {} chars: {}",
+            banner.title.chars().count(),
+            banner.title
+        );
+        assert!(
+            banner.body.chars().count() <= 50,
+            "body must not exceed 50 chars, got {} chars: {}",
+            banner.body.chars().count(),
+            banner.body
+        );
+    }
+
+    #[test]
+    fn build_banner_falls_back_without_new_fields() {
+        let req = minimal_req();
+        let banner = build_banner("demo-agent", &req);
+
+        assert!(
+            banner.title.contains("demo-agent"),
+            "title should include persona name, got: {}",
+            banner.title
+        );
+        assert!(
+            banner.body.contains("Click to review"),
+            "body should fall back to click-to-review prompt, got: {}",
+            banner.body
+        );
+        assert!(
+            banner.title.chars().count() <= 60,
+            "title must not exceed 60 chars, got {} chars: {}",
+            banner.title.chars().count(),
+            banner.title
+        );
+        assert!(
+            banner.body.chars().count() <= 50,
+            "body must not exceed 50 chars, got {} chars: {}",
+            banner.body.chars().count(),
+            banner.body
+        );
     }
 }

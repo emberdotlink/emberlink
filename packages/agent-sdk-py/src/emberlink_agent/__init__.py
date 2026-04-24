@@ -1,5 +1,4 @@
 from .client import EmberAgent, EmberAgentError
-from .socket_transport import DaemonError, SocketTransport
 from .types import (
     AgentConfig,
     BudgetAxis,
@@ -28,6 +27,4 @@ __all__ = [
     "RequestGrantResult",
     "UseCredentialResult",
     "WhoAmIResult",
-    "SocketTransport",
-    "DaemonError",
 ]

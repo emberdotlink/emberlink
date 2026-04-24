@@ -6,7 +6,10 @@
 //!   the matching pending request waiter.
 //! - Lines with `method` and `params` (no `id`) are notifications. The
 //!   `grant_revoked` notification triggers immediate zeroization of the
-//!   matching [`CredentialCache`] entry.
+//!   matching [`CredentialCache`] entry. `budget.warning` and
+//!   `budget.exhausted` notifications fire user-registered callbacks
+//!   (`on_budget_warning` / `on_budget_exhausted`) so long-running agents
+//!   can surface runway state without polling `grant_budget_status`.
 //!
 //! This client is intended for long-running agent processes that hold cached
 //! credentials. For one-shot RPC calls, the synchronous [`SocketTransport`]
@@ -96,6 +99,50 @@ impl From<std::io::Error> for ClientError {
 
 type PendingMap = Arc<Mutex<HashMap<String, oneshot::Sender<Result<serde_json::Value, ClientError>>>>>;
 
+/// Payload pushed by the daemon when a Statement's budget crosses a 80% or
+/// 95% warning threshold. Mirrors the `budget.warning` JSON-RPC notification
+/// shape so TS/Py/Rust SDKs agree on the wire.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BudgetWarningNotification {
+    pub grant_id: String,
+    pub statement_sid: String,
+    pub axis: String,
+    pub used: u64,
+    pub budget: u64,
+    pub percent: u32,
+}
+
+/// Payload pushed by the daemon when a Statement's budget reaches 100%.
+/// Mirrors the `budget.exhausted` JSON-RPC notification shape.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BudgetExhaustedNotification {
+    pub grant_id: String,
+    pub statement_sid: String,
+    pub axis: String,
+    pub used: u64,
+    pub budget: u64,
+}
+
+/// User-supplied callback for `budget.warning` notifications. Boxed as a
+/// trait object so a single reader task can invoke whatever the agent
+/// registers without a generic parameter leaking into the client type.
+pub type BudgetWarningCallback =
+    Arc<dyn Fn(BudgetWarningNotification) + Send + Sync + 'static>;
+/// User-supplied callback for `budget.exhausted` notifications.
+pub type BudgetExhaustedCallback =
+    Arc<dyn Fn(BudgetExhaustedNotification) + Send + Sync + 'static>;
+
+/// Set of push-notification callbacks wired into the reader task. Held in a
+/// `Mutex` so `on_budget_warning` / `on_budget_exhausted` setters can update
+/// them after `connect()` without re-establishing the socket.
+#[derive(Default)]
+struct Callbacks {
+    on_budget_warning: Option<BudgetWarningCallback>,
+    on_budget_exhausted: Option<BudgetExhaustedCallback>,
+}
+
+type CallbacksHandle = Arc<Mutex<Callbacks>>;
+
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// An async socket client that processes server-initiated notifications.
@@ -107,6 +154,7 @@ pub struct AsyncSocketClient {
     writer: Arc<Mutex<OwnedWriteHalf>>,
     pending: PendingMap,
     cache: CredentialCache,
+    callbacks: CallbacksHandle,
     reader_task: tokio::task::JoinHandle<()>,
 }
 
@@ -120,6 +168,8 @@ impl AsyncSocketClient {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let pending_reader = Arc::clone(&pending);
         let cache_reader = cache.clone();
+        let callbacks: CallbacksHandle = Arc::new(Mutex::new(Callbacks::default()));
+        let callbacks_reader = Arc::clone(&callbacks);
 
         let reader_task = tokio::spawn(async move {
             let reader = BufReader::new(read_half);
@@ -127,7 +177,13 @@ impl AsyncSocketClient {
             loop {
                 match lines.next_line().await {
                     Ok(Some(line)) => {
-                        dispatch_line(&line, &pending_reader, &cache_reader).await;
+                        dispatch_line(
+                            &line,
+                            &pending_reader,
+                            &cache_reader,
+                            &callbacks_reader,
+                        )
+                        .await;
                     }
                     Ok(None) => {
                         // EOF: fail any pending waiters.
@@ -154,8 +210,30 @@ impl AsyncSocketClient {
             writer: Arc::new(Mutex::new(write_half)),
             pending,
             cache,
+            callbacks,
             reader_task,
         })
+    }
+
+    /// Register a callback that fires whenever the daemon pushes a
+    /// `budget.warning` notification (80% or 95% band crossed). Replaces
+    /// any previously registered warning callback.
+    pub async fn on_budget_warning<F>(&self, cb: F)
+    where
+        F: Fn(BudgetWarningNotification) + Send + Sync + 'static,
+    {
+        let mut guard = self.callbacks.lock().await;
+        guard.on_budget_warning = Some(Arc::new(cb));
+    }
+
+    /// Register a callback that fires whenever the daemon pushes a
+    /// `budget.exhausted` notification (100% threshold reached).
+    pub async fn on_budget_exhausted<F>(&self, cb: F)
+    where
+        F: Fn(BudgetExhaustedNotification) + Send + Sync + 'static,
+    {
+        let mut guard = self.callbacks.lock().await;
+        guard.on_budget_exhausted = Some(Arc::new(cb));
     }
 
     /// Send a request and await the matching response.
@@ -211,7 +289,12 @@ impl Drop for AsyncSocketClient {
 // Line dispatch
 // ---------------------------------------------------------------------------
 
-async fn dispatch_line(line: &str, pending: &PendingMap, cache: &CredentialCache) {
+async fn dispatch_line(
+    line: &str,
+    pending: &PendingMap,
+    cache: &CredentialCache,
+    callbacks: &CallbacksHandle,
+) {
     // Try response first (has `id`). If that fails, try notification.
     if let Ok(resp) = serde_json::from_str::<IncomingResponse>(line) {
         // Only treat as response if it has result or error; otherwise fall
@@ -235,11 +318,15 @@ async fn dispatch_line(line: &str, pending: &PendingMap, cache: &CredentialCache
     }
 
     if let Ok(notif) = serde_json::from_str::<IncomingNotification>(line) {
-        handle_notification(&notif, cache).await;
+        handle_notification(&notif, cache, callbacks).await;
     }
 }
 
-async fn handle_notification(notif: &IncomingNotification, cache: &CredentialCache) {
+async fn handle_notification(
+    notif: &IncomingNotification,
+    cache: &CredentialCache,
+    callbacks: &CallbacksHandle,
+) {
     match notif.method.as_str() {
         "grant_revoked" => {
             let grant_id = match notif.params.get("grant_id").and_then(|v| v.as_str()) {
@@ -248,6 +335,43 @@ async fn handle_notification(notif: &IncomingNotification, cache: &CredentialCac
             };
             debug!(grant_id, "received grant_revoked; zeroizing cached handle");
             cache.revoke(grant_id);
+        }
+        "budget.warning" => {
+            let parsed: BudgetWarningNotification =
+                match serde_json::from_value(notif.params.clone()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        debug!(error = %e, "malformed budget.warning payload; dropping");
+                        return;
+                    }
+                };
+            // Snapshot the callback Arc under a short lock so the user
+            // callback is free to call back into the client without
+            // deadlocking on `callbacks`.
+            let cb = {
+                let guard = callbacks.lock().await;
+                guard.on_budget_warning.clone()
+            };
+            if let Some(cb) = cb {
+                cb(parsed);
+            }
+        }
+        "budget.exhausted" => {
+            let parsed: BudgetExhaustedNotification =
+                match serde_json::from_value(notif.params.clone()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        debug!(error = %e, "malformed budget.exhausted payload; dropping");
+                        return;
+                    }
+                };
+            let cb = {
+                let guard = callbacks.lock().await;
+                guard.on_budget_exhausted.clone()
+            };
+            if let Some(cb) = cb {
+                cb(parsed);
+            }
         }
         other => {
             debug!(method = %other, "ignoring unknown notification");
@@ -364,7 +488,8 @@ mod tests {
             method: "unknown_method".into(),
             params: serde_json::json!({"grant_id": "grant-safe"}),
         };
-        handle_notification(&notif, &cache).await;
+        let callbacks: CallbacksHandle = Arc::new(Mutex::new(Callbacks::default()));
+        handle_notification(&notif, &cache, &callbacks).await;
         // Unknown notifications must not invalidate cache.
         assert!(cache.is_active("grant-safe"));
     }
@@ -377,7 +502,93 @@ mod tests {
             method: "grant_revoked".into(),
             params: serde_json::json!({}),
         };
-        handle_notification(&notif, &cache).await;
+        let callbacks: CallbacksHandle = Arc::new(Mutex::new(Callbacks::default()));
+        handle_notification(&notif, &cache, &callbacks).await;
         assert!(cache.is_active("grant-a"));
+    }
+
+    #[tokio::test]
+    async fn budget_warning_notification_fires_callback() {
+        // P69K-F1: the async client must surface `budget.warning` pushes
+        // to a user-registered callback. Mirrors the TS SDK
+        // `onBudgetWarning` contract.
+        use std::sync::Mutex as StdMutex;
+
+        let cache = CredentialCache::new();
+        let callbacks: CallbacksHandle = Arc::new(Mutex::new(Callbacks::default()));
+        let received: Arc<StdMutex<Vec<BudgetWarningNotification>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+        let received_cb = Arc::clone(&received);
+        {
+            let mut guard = callbacks.lock().await;
+            guard.on_budget_warning =
+                Some(Arc::new(move |p: BudgetWarningNotification| {
+                    received_cb.lock().unwrap().push(p);
+                }));
+        }
+        let notif = IncomingNotification {
+            method: "budget.warning".into(),
+            params: serde_json::json!({
+                "grant_id": "grant-1",
+                "statement_sid": "S1",
+                "axis": "tokens",
+                "used": 8_000,
+                "budget": 10_000,
+                "percent": 80,
+            }),
+        };
+        handle_notification(&notif, &cache, &callbacks).await;
+        let seen = received.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].grant_id, "grant-1");
+        assert_eq!(seen[0].percent, 80);
+        assert_eq!(seen[0].axis, "tokens");
+    }
+
+    #[tokio::test]
+    async fn budget_exhausted_notification_fires_callback() {
+        use std::sync::Mutex as StdMutex;
+
+        let cache = CredentialCache::new();
+        let callbacks: CallbacksHandle = Arc::new(Mutex::new(Callbacks::default()));
+        let received: Arc<StdMutex<Vec<BudgetExhaustedNotification>>> =
+            Arc::new(StdMutex::new(Vec::new()));
+        let received_cb = Arc::clone(&received);
+        {
+            let mut guard = callbacks.lock().await;
+            guard.on_budget_exhausted =
+                Some(Arc::new(move |p: BudgetExhaustedNotification| {
+                    received_cb.lock().unwrap().push(p);
+                }));
+        }
+        let notif = IncomingNotification {
+            method: "budget.exhausted".into(),
+            params: serde_json::json!({
+                "grant_id": "grant-x",
+                "statement_sid": "S2",
+                "axis": "cents",
+                "used": 100,
+                "budget": 100,
+            }),
+        };
+        handle_notification(&notif, &cache, &callbacks).await;
+        let seen = received.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].grant_id, "grant-x");
+        assert_eq!(seen[0].axis, "cents");
+    }
+
+    #[tokio::test]
+    async fn malformed_budget_notification_is_dropped_silently() {
+        // A junk payload must not panic the reader task or corrupt any
+        // state — the callback simply never fires.
+        let cache = CredentialCache::new();
+        let callbacks: CallbacksHandle = Arc::new(Mutex::new(Callbacks::default()));
+        let notif = IncomingNotification {
+            method: "budget.warning".into(),
+            params: serde_json::json!({"this": "is junk"}),
+        };
+        handle_notification(&notif, &cache, &callbacks).await;
+        // Nothing to assert beyond "did not panic".
     }
 }

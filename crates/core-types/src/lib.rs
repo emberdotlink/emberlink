@@ -125,6 +125,7 @@ pub mod credential_delivery;
 pub mod grant_conditions;
 pub mod qr_encoding;
 mod recovery;
+pub mod size_limits;
 pub(crate) mod storage;
 mod trust;
 pub mod grant_receipt;

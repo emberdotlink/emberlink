@@ -683,12 +683,6 @@ fn is_event_relevant_to_context(event: &EventEnvelope, context: &LightSyncContex
         EventBody::CredentialRevoked(body) => {
             context.persona_ids.contains(&body.revoker_id)
         }
-        EventBody::LegacyOpaque { subject, .. } => {
-            context.root_ids.contains(&subject.subject_id)
-                || context.persona_ids.contains(&subject.subject_id)
-                || context.device_ids.contains(&subject.subject_id)
-                || context.recovery_request_ids.contains(&subject.subject_id)
-        }
     }
 }
 

@@ -7,8 +7,16 @@ memory/
 *.pfx
 .headless-control
 .headless-metrics.jsonl
+.headless-ready-queue.json
+.headless-inflight.json
+.headless-events.jsonl
+.headless-failures.jsonl
+.ember/runtime/
+**/.ember/runtime/
 ember-ext/extension/pkg/
 web/node_modules/
 node_modules/
 packages/*/node_modules/
 web/dist/
+.playwright-cli/
+demo/screenshots/

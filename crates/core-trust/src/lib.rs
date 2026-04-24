@@ -442,6 +442,16 @@ fn evaluate_single_condition(
         }
 
         GrantCondition::All(sub_conditions) => {
+            // GC-H1 defence in depth: deserialization rejects empty `All`,
+            // but if an empty variant is constructed in-process (e.g. by a
+            // future internal builder bug), fail closed instead of silently
+            // returning `Met` via vacuous truth.
+            if sub_conditions.is_empty() {
+                return ConditionResult::Unmet(
+                    "empty All combinator: no sub-conditions specified (fail-closed)"
+                        .to_string(),
+                );
+            }
             for sub in sub_conditions {
                 let result = evaluate_single_condition(sub, input);
                 if !result.is_met() {
@@ -452,8 +462,14 @@ fn evaluate_single_condition(
         }
 
         GrantCondition::Any(sub_conditions) => {
+            // GC-H1 defence in depth: deserialization rejects empty `Any`.
+            // If a malformed variant somehow reaches the evaluator, fail
+            // closed instead of short-circuiting to `Met`.
             if sub_conditions.is_empty() {
-                return ConditionResult::Met;
+                return ConditionResult::Unmet(
+                    "empty Any combinator: no alternatives provided (fail-closed)"
+                        .to_string(),
+                );
             }
             let mut last_reason = String::new();
             for sub in sub_conditions {
@@ -1169,5 +1185,41 @@ mod tests {
         let input = badge_gate_input("issuer", "claimant", &badges, &edges, &counts);
         let result = evaluate_grant_conditions(&conditions, &input);
         assert!(result.is_met());
+    }
+
+    /// GC-H1 defence in depth: deserialization rejects empty `All`/`Any`
+    /// combinators, but the evaluator must also fail closed if a malformed
+    /// variant is constructed in-process (bypassing serde). Previously the
+    /// evaluator returned `Met` on `All(vec![])` (vacuous truth) and
+    /// `Any(vec![])` (early `Met` short-circuit), giving a covert always-pass
+    /// shape if any future caller built one programmatically.
+    #[test]
+    fn empty_all_combinator_evaluates_unmet() {
+        let empty_counts = std::collections::BTreeMap::new();
+        let input = badge_gate_input("issuer", "claimant", &[], &[], &empty_counts);
+        let conditions = vec![core_types::grant_conditions::GrantCondition::All(vec![])];
+        let result = evaluate_grant_conditions(&conditions, &input);
+        assert!(!result.is_met(), "empty All must be Unmet (fail-closed)");
+        if let ConditionResult::Unmet(reason) = result {
+            assert!(
+                reason.contains("empty All"),
+                "expected empty-All reason, got: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_any_combinator_evaluates_unmet() {
+        let empty_counts = std::collections::BTreeMap::new();
+        let input = badge_gate_input("issuer", "claimant", &[], &[], &empty_counts);
+        let conditions = vec![core_types::grant_conditions::GrantCondition::Any(vec![])];
+        let result = evaluate_grant_conditions(&conditions, &input);
+        assert!(!result.is_met(), "empty Any must be Unmet (fail-closed)");
+        if let ConditionResult::Unmet(reason) = result {
+            assert!(
+                reason.contains("empty Any"),
+                "expected empty-Any reason, got: {reason}"
+            );
+        }
     }
 }

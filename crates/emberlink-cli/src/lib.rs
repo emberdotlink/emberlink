@@ -181,10 +181,6 @@ impl DemoApp {
         let mut app = Self::new_unhydrated(data_file, seed_demo, verifier, event_store);
 
         if let Some(path) = app.data_file.clone() {
-            let legacy_snapshot = legacy_snapshot_path(&path);
-            if legacy_snapshot.exists() {
-                let _ = fs::remove_file(&legacy_snapshot);
-            }
             let local_state_exists = path.exists();
             let mut seeded_identities = false;
             if local_state_exists {
@@ -1228,12 +1224,6 @@ impl DemoApp {
                     ValidationError::new(format!("remove sqlite state file: {err}"))
                 })?;
             }
-            let legacy_snapshot = legacy_snapshot_path(data_file);
-            if legacy_snapshot.exists() {
-                fs::remove_file(&legacy_snapshot).map_err(|err| {
-                    ValidationError::new(format!("remove legacy state file: {err}"))
-                })?;
-            }
             self.app_runtime = AppRuntime::new(EventStore::open(&sqlite_file)?, LocalState::default());
         } else {
             self.app_runtime = AppRuntime::new(EventStore::default(), LocalState::default());
@@ -1597,17 +1587,6 @@ fn join_or_none(values: &BTreeSet<String>) -> String {
     } else {
         values.iter().cloned().collect::<Vec<_>>().join(", ")
     }
-}
-
-fn legacy_snapshot_path(local_state_file: &Path) -> PathBuf {
-    let stem = local_state_file
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("local-state");
-    local_state_file
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(format!("{stem}.events.tsv"))
 }
 
 fn short_key(key: &str) -> String {

@@ -162,10 +162,21 @@ pub fn canonical_body_bytes(receipt_with_zero_evidence: &GrantReceipt) -> Vec<u8
 /// look at the caller's Evidence — it zeroes Evidence first so the hash
 /// is stable regardless of what `evidence` currently holds.
 pub fn canonical_hash(receipt: &GrantReceipt) -> String {
+    hex::encode(canonical_hash_receipt(receipt))
+}
+
+/// Raw-bytes variant of [`canonical_hash`] — returns the 32-byte sha256
+/// digest directly. Evidence is zeroed before hashing so the result is
+/// independent of what the caller's `evidence` field currently holds
+/// (including `hash`, `sig`, `signer_pubkey`, and `canonical_version`).
+pub fn canonical_hash_receipt(receipt: &GrantReceipt) -> [u8; 32] {
     let mut cloned = receipt.clone();
     cloned.evidence = Evidence::default();
     let bytes = canonical_body_bytes(&cloned);
-    hex::encode(Sha256::digest(&bytes))
+    let digest = Sha256::digest(&bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
 }
 
 /// Verify an Ed25519 signature against a pubkey (both hex) over the
@@ -317,14 +328,45 @@ fn derive_reason(info: &GrantInfo) -> TerminalReason {
     }
 }
 
-/// Build a signed receipt for a terminal grant and persist it. Returns
-/// the receipt id.
-pub fn emit_receipt(
+/// Assemble a fully-populated [`GrantReceipt`] for a terminal grant from
+/// the daemon's existing stores. Pure logic — does NOT sign the receipt
+/// (evidence stays [`Evidence::default`]) and does NOT persist it.
+///
+/// Fails with:
+///   - [`StoreError::NotFound`] if `grant_id` does not exist;
+///   - [`StoreError::InvalidInput`] if the grant is still active (not in
+///     a terminal status). The terminal set is defined by
+///     [`is_terminal_status`].
+///
+/// `now_epoch_secs` is stamped into `lifecycle.terminated_at` — callers
+/// should pass the same clock they used to drive the terminal transition
+/// (e.g. the sweep timestamp for `expire_stale_grants`).
+pub fn generate_receipt(
     store: &DaemonStore,
-    identity: &DaemonIdentity,
+    grant_id: &str,
+    terminal_reason: TerminalReason,
+    now_epoch_secs: u64,
+) -> Result<GrantReceipt, StoreError> {
+    let info = store.get_grant(grant_id)?;
+    if !is_terminal_status(&info.status) {
+        return Err(StoreError::InvalidInput(format!(
+            "grant {grant_id} is not in a terminal state (status={})",
+            info.status
+        )));
+    }
+    Ok(build_receipt_body(store, &info, terminal_reason, now_epoch_secs))
+}
+
+/// Body-assembly helper shared by [`generate_receipt`] (public, error-returning)
+/// and [`emit_receipt`] (signs + persists after assembly). Infallible — a
+/// missing `access_grant` row degrades to an empty chain, and a missing
+/// persona row degrades to the raw persona_id.
+fn build_receipt_body(
+    store: &DaemonStore,
     info: &GrantInfo,
     reason: TerminalReason,
-) -> Result<String, StoreError> {
+    now_epoch_secs: u64,
+) -> GrantReceipt {
     // 1. Pull the canonical composite chain + scoped audit excerpt.
     let chain = match store.get_access_grant(&info.id) {
         Ok(g) => g.blocks,
@@ -347,7 +389,7 @@ pub fn emit_receipt(
     //    log and filter client-side for entries whose `details` JSON
     //    references this grant_id. Keeps the receipt self-contained and
     //    avoids a schema for grant-id→event mapping.
-    let actions_observed: Vec<ReceiptAuditEntry> = store
+    let raw_audit: Vec<crate::audit::AuditEntry> = store
         .query_audit(&AuditFilter { limit: Some(500), ..Default::default() })
         .unwrap_or_default()
         .into_iter()
@@ -355,34 +397,77 @@ pub fn emit_receipt(
             let details = e.details.as_deref().unwrap_or("");
             details.contains(&info.id) || e.credential.as_deref() == Some(&info.credential_name)
         })
+        .collect();
+
+    let actions_observed: Vec<ReceiptAuditEntry> = raw_audit
+        .iter()
         .map(|e| ReceiptAuditEntry {
             at: parse_rfc3339_epoch(&e.timestamp),
             event: e.action.clone(),
-            action: Some(e.action),
-            resource: e.credential,
-            outcome: e.outcome,
+            action: Some(e.action.clone()),
+            resource: e.credential.clone(),
+            outcome: e.outcome.clone(),
         })
         .collect();
 
-    // 4. Human owner + approval chain (best-effort; Phase 1 persona record
-    //    has no email, so we fall back to the persona display name).
+    // 4. Human owner + approval chain.
+    //
+    // The approval chain is built from audit entries for `grant.issued` events
+    // that reference this grant_id in their `details` JSON. Each issuance event
+    // carries a `source` field that identifies the approval path:
+    //
+    //   "approval"          → HumanDashboard approved
+    //   "approval_narrowed" → HumanDashboard approved with scope narrowing
+    //   "approval_always"   → HumanDashboard approved with standing-grant creation
+    //   "standing_grant"    → StandingGrant auto-approved
+    //   (anything else)     → Policy auto-approved (e.g. "request_access",
+    //                         "request_access_blocking", or direct create_grant
+    //                         call from the CLI/handler path)
+    //
+    // Future refinement: distinguish CLI vs. Dashboard human approvals once the
+    // approval actor is recorded on the approval_requests row.
     let human_owner = store
         .get_persona(&info.persona_id)
         .ok()
         .map(|p| p.name)
         .unwrap_or_else(|| info.persona_id.clone());
 
-    let approval_chain: Vec<ApprovalEvent> = chain
+    let mut approval_chain: Vec<ApprovalEvent> = raw_audit
         .iter()
-        .filter_map(|sb| {
-            sb.block.approval.as_ref().map(|_| ApprovalEvent {
-                at: sb.block.issued_at,
-                actor: ApprovalActor::HumanDashboard,
-                outcome: ApprovalOutcome::Approved,
+        .filter(|e| e.action == "grant.issued")
+        .filter_map(|e| {
+            let details_str = e.details.as_deref().unwrap_or("{}");
+            let details: serde_json::Value =
+                serde_json::from_str(details_str).unwrap_or_default();
+            // Only include entries that explicitly name this grant_id to avoid
+            // pulling in issuance events for other grants that share the same
+            // credential_name.
+            let details_grant_id = details["grant_id"].as_str().unwrap_or("");
+            if !details_grant_id.is_empty() && details_grant_id != info.id {
+                return None;
+            }
+            let source = details["source"].as_str().unwrap_or("");
+            let (actor, outcome) = match source {
+                "approval" => (ApprovalActor::HumanDashboard, ApprovalOutcome::Approved),
+                "approval_narrowed" => {
+                    (ApprovalActor::HumanDashboard, ApprovalOutcome::ApprovedWithNarrowing)
+                }
+                "approval_always" => (ApprovalActor::HumanDashboard, ApprovalOutcome::Approved),
+                "standing_grant" => (ApprovalActor::StandingGrant, ApprovalOutcome::Approved),
+                _ => (ApprovalActor::Policy, ApprovalOutcome::Approved),
+            };
+            Some(ApprovalEvent {
+                at: parse_rfc3339_epoch(&e.timestamp),
+                actor,
+                outcome,
                 reason: None,
             })
         })
         .collect();
+
+    // Approval chain must be ordered by timestamp ascending (most recent last).
+    // The audit query returns DESC; reverse to get ascending order.
+    approval_chain.reverse();
 
     // 5. Lifecycle.
     let issued_at = chain
@@ -394,11 +479,10 @@ pub fn emit_receipt(
     } else {
         None
     };
-    let terminated_at = Utc::now().timestamp().max(0) as u64;
     let lifecycle = Lifecycle {
         issued_at,
         last_used_at,
-        terminated_at,
+        terminated_at: now_epoch_secs,
         terminal_reason: reason,
     };
 
@@ -425,10 +509,11 @@ pub fn emit_receipt(
         })
         .unwrap_or_default();
 
-    // 8. Assemble receipt body (Evidence zeroed for hash stability).
+    // 8. Assemble receipt body (Evidence zeroed for hash stability — caller
+    //    signs and repopulates evidence if needed).
     let receipt_id = format!("rct-{}", Uuid::new_v4());
-    let mut receipt = GrantReceipt {
-        id: receipt_id.clone(),
+    GrantReceipt {
+        id: receipt_id,
         grant_id: info.id.clone(),
         summary,
         approved_chain: chain,
@@ -438,9 +523,21 @@ pub fn emit_receipt(
         lifecycle,
         attestation,
         evidence: Evidence::default(),
-    };
+    }
+}
 
-    // 9. Sign. Canonical hash is over body-minus-Evidence.
+/// Build a signed receipt for a terminal grant and persist it. Returns
+/// the receipt id.
+pub fn emit_receipt(
+    store: &DaemonStore,
+    identity: &DaemonIdentity,
+    info: &GrantInfo,
+    reason: TerminalReason,
+) -> Result<String, StoreError> {
+    let now = Utc::now().timestamp().max(0) as u64;
+    let mut receipt = build_receipt_body(store, info, reason, now);
+
+    // Sign. Canonical hash is over body-minus-Evidence.
     let hash_hex = canonical_hash(&receipt);
     let sig_bytes = identity.sign(hash_hex.as_bytes());
     receipt.evidence = Evidence {
@@ -450,9 +547,8 @@ pub fn emit_receipt(
         canonical_version: CANONICAL_VERSION,
     };
 
-    // 10. Persist.
+    let receipt_id = receipt.id.clone();
     store.store_receipt(&receipt)?;
-
     Ok(receipt_id)
 }
 
@@ -721,8 +817,11 @@ mod tests {
         let identity = ensure_identity();
         let store = DaemonStore::open_in_memory().unwrap();
         let persona = store.create_persona("agent-3stmt").unwrap();
+        // Seed with a fully-permissive "*" scope so the P69K-A2-I4
+        // bipartite dominance check accepts the three-statement
+        // attenuation (credential:use / llm:generate / session:run).
         let grant = store
-            .create_grant(&persona.id, "composite", "llm:generate", None)
+            .create_grant(&persona.id, "composite", "*", None)
             .unwrap();
 
         // Overwrite blocks with a three-statement chain.
@@ -818,6 +917,404 @@ mod tests {
         assert_eq!(canonical_hash(&r), canonical_hash(&r));
         // Must match the stored evidence.hash.
         assert_eq!(canonical_hash(&r), r.evidence.hash);
+    }
+
+    /// Approval chain is populated from audit log when a human approval
+    /// (source = "approval") is recorded before the grant is revoked.
+    #[test]
+    fn emit_receipt_populates_approval_chain_from_audit() {
+        use crate::approval::ApprovalOutcome as StoreApprovalOutcome;
+        use core_types::grant_receipt::{ApprovalActor, ApprovalOutcome};
+
+        let identity = ensure_identity();
+        let store = DaemonStore::open_in_memory().unwrap();
+        let persona = store.create_persona("agent-approval-chain").unwrap();
+
+        // Simulate a human-approval flow: submit approval then resolve it.
+        // resolve_approval creates the grant and logs "grant.issued" with
+        // source = "approval".
+        let req = store
+            .submit_approval(&persona.id, "github-token", "push", None, "credential.access.github-token", "medium")
+            .unwrap();
+        store.resolve_approval(&req.id, &StoreApprovalOutcome::Approved).unwrap();
+
+        // Retrieve the grant that was created by resolve_approval.
+        let grants = store.list_grants().unwrap();
+        assert_eq!(grants.len(), 1, "resolve_approval must have created a grant");
+        let grant = &grants[0];
+
+        store.revoke_grant(&grant.id).unwrap();
+        let rid = store.get_grant(&grant.id).unwrap().receipt_id.unwrap();
+        let r = store.get_receipt(&rid).unwrap();
+
+        assert_eq!(r.approval_chain.len(), 1, "expected exactly one approval event");
+        let ev = &r.approval_chain[0];
+        assert_eq!(ev.actor, ApprovalActor::HumanDashboard);
+        assert_eq!(ev.outcome, ApprovalOutcome::Approved);
+        assert!(ev.at > 0, "approval event must have a non-zero timestamp");
+
+        verify_receipt(&r, &identity.pubkey_hex()).expect("receipt with approval_chain must verify");
+    }
+
+    /// Approval chain entries are ordered ascending by timestamp regardless
+    /// of the audit log's descending query order.
+    #[test]
+    fn emit_receipt_approval_chain_ordered_by_time() {
+        use core_types::grant_receipt::ApprovalActor;
+
+        let identity = ensure_identity();
+        let store = DaemonStore::open_in_memory().unwrap();
+        let persona = store.create_persona("agent-order").unwrap();
+
+        // Directly log three grant.issued events for the same grant_id in
+        // order t1 < t2 < t3 to verify the chain sorts ascending.
+        // We use a fixed grant (created but never touched by the standard
+        // flow) so there is no race with revoke_grant's own log events.
+        let grant = store
+            .create_grant(&persona.id, "tok", "r", None)
+            .unwrap();
+        let grant_id = grant.id.clone();
+
+        // Seed three audit entries with distinct timestamps by using
+        // wall-clock spacing. Each entry must reference the grant_id in
+        // `details` so the filter picks it up.
+        for i in 0u64..3 {
+            let details = serde_json::json!({
+                "grant_id": grant_id,
+                "scope": "r",
+                "source": "approval",
+            }).to_string();
+            store
+                .log_event(Some(&persona.id), "grant.issued", Some("tok"), "allowed", Some(&details))
+                .unwrap();
+            // Brief pause so RFC-3339 timestamps differ (SQLite stores TEXT).
+            std::thread::sleep(std::time::Duration::from_millis(10 + i * 2));
+        }
+
+        store.revoke_grant(&grant_id).unwrap();
+        let rid = store.get_grant(&grant_id).unwrap().receipt_id.unwrap();
+        let r = store.get_receipt(&rid).unwrap();
+
+        // We seeded 3 approval entries; revoke_grant does not add a
+        // grant.issued so the count should be exactly 3.
+        assert_eq!(r.approval_chain.len(), 3, "expected 3 approval events");
+        assert!(r.approval_chain.iter().all(|ev| ev.actor == ApprovalActor::HumanDashboard));
+
+        // Verify ascending order.
+        for w in r.approval_chain.windows(2) {
+            assert!(
+                w[0].at <= w[1].at,
+                "approval chain must be ordered ascending: {} > {}",
+                w[0].at,
+                w[1].at
+            );
+        }
+
+        verify_receipt(&r, &identity.pubkey_hex()).expect("receipt verifies");
+    }
+
+    // ------------------------------------------------------------------
+    // generate_receipt / canonical_hash_receipt — task P69K-D scaffold
+    // ------------------------------------------------------------------
+
+    /// Flip the grant's SQL status directly so generate_receipt can see it.
+    /// Used by tests that want to exercise terminal paths without invoking
+    /// the OnceCell-backed revoke path (which also persists a receipt and
+    /// would muddy the assertion target).
+    fn force_status(store: &DaemonStore, grant_id: &str, status: &str) {
+        store
+            .conn()
+            .execute(
+                "UPDATE grants SET status = ?1 WHERE id = ?2",
+                rusqlite::params![status, grant_id],
+            )
+            .expect("force_status update");
+    }
+
+    #[test]
+    fn generate_receipt_on_expired_grant_has_correct_terminal_reason() {
+        let _identity = ensure_identity();
+        let store = DaemonStore::open_in_memory().unwrap();
+        let persona = store.create_persona("agent-gen-expired").unwrap();
+        let grant = store
+            .create_grant(&persona.id, "cred", "read", None)
+            .unwrap();
+        force_status(&store, &grant.id, "expired");
+
+        let now = 1_700_000_000u64;
+        let receipt =
+            generate_receipt(&store, &grant.id, TerminalReason::Expired, now).unwrap();
+
+        assert_eq!(receipt.grant_id, grant.id);
+        assert_eq!(receipt.lifecycle.terminated_at, now);
+        assert!(matches!(receipt.lifecycle.terminal_reason, TerminalReason::Expired));
+        // Evidence must stay zeroed on the pure-logic path — signing is a
+        // separate concern.
+        assert_eq!(receipt.evidence, Evidence::default());
+    }
+
+    #[test]
+    fn generate_receipt_on_revoked_grant_captures_revoke_actor() {
+        let _identity = ensure_identity();
+        let store = DaemonStore::open_in_memory().unwrap();
+        let persona = store.create_persona("agent-gen-revoked").unwrap();
+        let grant = store
+            .create_grant(&persona.id, "cred", "read", None)
+            .unwrap();
+        force_status(&store, &grant.id, "revoked");
+
+        let reason = TerminalReason::Revoked {
+            by: RevokeActor::Agent,
+            reason: "voluntary release".into(),
+        };
+        let now = 1_700_000_050u64;
+        let receipt =
+            generate_receipt(&store, &grant.id, reason.clone(), now).unwrap();
+
+        match receipt.lifecycle.terminal_reason {
+            TerminalReason::Revoked { by, reason: r } => {
+                assert_eq!(by, RevokeActor::Agent);
+                assert_eq!(r, "voluntary release");
+            }
+            other => panic!("expected Revoked, got {other:?}"),
+        }
+        assert_eq!(receipt.lifecycle.terminated_at, now);
+    }
+
+    #[test]
+    fn generate_receipt_populates_per_statement_usage() {
+        use core_types::{Block, Budget, ResourceSelector, ResourceType, Statement};
+
+        let _identity = ensure_identity();
+        let store = DaemonStore::open_in_memory().unwrap();
+        let persona = store.create_persona("agent-gen-usage").unwrap();
+        // Seed with a fully-permissive "*" scope so the P69K-A2-I4
+        // bipartite dominance check accepts the two-statement
+        // attenuation (credential:use + llm:generate).
+        let grant = store
+            .create_grant(&persona.id, "composite-usage", "*", None)
+            .unwrap();
+
+        // Overwrite the block chain with two statements carrying distinct
+        // per-axis usage tallies.
+        let statements = vec![
+            Statement {
+                sid: "S0".into(),
+                resource_type: ResourceType::Credential,
+                actions: vec!["credential:use".into()],
+                resource: ResourceSelector::Any,
+                budget: None,
+                usage: Usage { requests: 7, ..Default::default() },
+                conditions: vec![],
+            },
+            Statement {
+                sid: "S1".into(),
+                resource_type: ResourceType::Session,
+                actions: vec!["llm:generate".into()],
+                resource: ResourceSelector::Any,
+                budget: Some(Budget { tokens: Some(10_000), ..Default::default() }),
+                usage: Usage { tokens: 4_321, ..Default::default() },
+                conditions: vec![],
+            },
+        ];
+        let now_secs = Utc::now().timestamp().max(0) as u64;
+        let block = Block {
+            statements,
+            nbf: None,
+            expires_at: None,
+            issued_by: persona.id.clone(),
+            issued_at: now_secs,
+            approval: None,
+            note: None,
+        };
+        let root = store.persona_root_keypair(&persona.id).unwrap();
+        let signed = crate::grant::sign_block_zero_with(&root, &block).unwrap();
+        let composed = core_types::AccessGrant {
+            id: grant.id.clone(),
+            version: 1,
+            issuing_persona_id: persona.id.clone(),
+            recipient_kind: core_types::PresentationAudienceKind::Service,
+            recipient_id: "composite-usage".into(),
+            recipient_profile: core_types::RecipientProfile::Agent,
+            status: core_types::GrantStatus::Active,
+            mode: core_types::GrantMode::OneShot,
+            blocks: vec![signed],
+            attestation: AttestationBinding::default(),
+            created_at: now_secs,
+            updated_at: now_secs,
+            revoked_at: None,
+            revoked_reason: None,
+            last_used_at: None,
+            label: None,
+        };
+        store.overwrite_grant_blocks(&grant.id, &composed).unwrap();
+        force_status(&store, &grant.id, "expired");
+
+        let receipt =
+            generate_receipt(&store, &grant.id, TerminalReason::Expired, now_secs).unwrap();
+
+        assert_eq!(receipt.per_statement_usage.len(), 2);
+        let by_sid: std::collections::HashMap<_, _> = receipt
+            .per_statement_usage
+            .iter()
+            .map(|(sid, u)| (sid.clone(), u.clone()))
+            .collect();
+        assert_eq!(by_sid.get("S0").unwrap().requests, 7);
+        assert_eq!(by_sid.get("S1").unwrap().tokens, 4_321);
+    }
+
+    #[test]
+    fn generate_receipt_fails_on_unknown_grant_id() {
+        let _identity = ensure_identity();
+        let store = DaemonStore::open_in_memory().unwrap();
+        let err = generate_receipt(
+            &store,
+            "grant-does-not-exist",
+            TerminalReason::Expired,
+            1_700_000_000,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, StoreError::NotFound),
+            "expected NotFound for unknown grant, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn generate_receipt_fails_on_non_terminal_grant() {
+        let _identity = ensure_identity();
+        let store = DaemonStore::open_in_memory().unwrap();
+        let persona = store.create_persona("agent-gen-active").unwrap();
+        let grant = store
+            .create_grant(&persona.id, "cred", "read", None)
+            .unwrap();
+        // Grant is active; generate_receipt must refuse.
+        let err = generate_receipt(
+            &store,
+            &grant.id,
+            TerminalReason::Expired,
+            1_700_000_000,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, StoreError::InvalidInput(_)),
+            "expected InvalidInput for active grant, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn canonical_hash_receipt_deterministic() {
+        let _identity = ensure_identity();
+        let store = DaemonStore::open_in_memory().unwrap();
+        let persona = store.create_persona("agent-hash-det").unwrap();
+        let grant = store
+            .create_grant(&persona.id, "cred", "read", None)
+            .unwrap();
+        force_status(&store, &grant.id, "expired");
+
+        let now = 1_700_000_123u64;
+        let r1 =
+            generate_receipt(&store, &grant.id, TerminalReason::Expired, now).unwrap();
+        let mut r2 = r1.clone();
+        // Deterministic: identical content → identical hash, even though
+        // generate_receipt mints a fresh uuid for the id on each call.
+        // Force-match the id so the receipts really are identical.
+        r2.id = r1.id.clone();
+
+        let h1 = canonical_hash_receipt(&r1);
+        let h2 = canonical_hash_receipt(&r2);
+        assert_eq!(h1, h2, "canonical_hash_receipt must be deterministic");
+        assert_eq!(h1.len(), 32, "sha256 digest must be 32 bytes");
+
+        // The hex wrapper must agree with the raw-bytes result.
+        assert_eq!(canonical_hash(&r1), hex::encode(h1));
+    }
+
+    #[test]
+    fn canonical_hash_receipt_evidence_fields_excluded() {
+        let _identity = ensure_identity();
+        let store = DaemonStore::open_in_memory().unwrap();
+        let persona = store.create_persona("agent-hash-evex").unwrap();
+        let grant = store
+            .create_grant(&persona.id, "cred", "read", None)
+            .unwrap();
+        force_status(&store, &grant.id, "expired");
+
+        let now = 1_700_000_456u64;
+        let base =
+            generate_receipt(&store, &grant.id, TerminalReason::Expired, now).unwrap();
+        let baseline_hash = canonical_hash_receipt(&base);
+
+        // Mutate ONLY evidence fields. The canonical hash must stay stable.
+        let mut with_hash = base.clone();
+        with_hash.evidence.hash = "ff".repeat(32);
+        assert_eq!(
+            canonical_hash_receipt(&with_hash),
+            baseline_hash,
+            "evidence.hash must not influence canonical hash"
+        );
+
+        let mut with_sig = base.clone();
+        with_sig.evidence.sig = "ab".repeat(64);
+        assert_eq!(
+            canonical_hash_receipt(&with_sig),
+            baseline_hash,
+            "evidence.sig must not influence canonical hash"
+        );
+
+        let mut with_pubkey = base.clone();
+        with_pubkey.evidence.signer_pubkey = "cd".repeat(32);
+        assert_eq!(
+            canonical_hash_receipt(&with_pubkey),
+            baseline_hash,
+            "evidence.signer_pubkey must not influence canonical hash"
+        );
+
+        let mut with_version = base.clone();
+        with_version.evidence.canonical_version = 99;
+        assert_eq!(
+            canonical_hash_receipt(&with_version),
+            baseline_hash,
+            "evidence.canonical_version must not influence canonical hash"
+        );
+
+        // Sanity: mutating a *non-evidence* field DOES change the hash.
+        let mut with_summary = base.clone();
+        with_summary.summary.resource.push_str("-tampered");
+        assert_ne!(
+            canonical_hash_receipt(&with_summary),
+            baseline_hash,
+            "non-evidence mutation must change canonical hash"
+        );
+    }
+
+    /// Legacy grants that have no grant.issued audit entries produce an
+    /// empty approval chain rather than a crash.
+    #[test]
+    fn emit_receipt_approval_chain_empty_when_no_audit_entries() {
+        let identity = ensure_identity();
+        let store = DaemonStore::open_in_memory().unwrap();
+        let persona = store.create_persona("agent-legacy").unwrap();
+
+        // Create and immediately revoke without any approval flow — no
+        // grant.issued event is emitted by create_grant itself.
+        // (create_grant does not call log_event; the caller in handler.rs
+        //  does. In tests that call create_grant directly there is no log.)
+        let grant = store
+            .create_grant(&persona.id, "legacy-cred", "read", None)
+            .unwrap();
+        store.revoke_grant(&grant.id).unwrap();
+
+        let rid = store.get_grant(&grant.id).unwrap().receipt_id.unwrap();
+        let r = store.get_receipt(&rid).unwrap();
+
+        assert!(
+            r.approval_chain.is_empty(),
+            "legacy grants with no audit entries must produce empty approval_chain, got {:?}",
+            r.approval_chain
+        );
+
+        verify_receipt(&r, &identity.pubkey_hex()).expect("receipt verifies even with empty chain");
     }
 }
 

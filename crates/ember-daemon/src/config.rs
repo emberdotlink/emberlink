@@ -50,6 +50,7 @@ struct RawDaemonSection {
     policy_file: Option<String>,
     log_level: Option<LogLevel>,
     dashboard_addr: Option<String>,
+    stale_approval_threshold_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -82,6 +83,9 @@ pub struct DaemonConfig {
     pub dashboard_addr: Option<SocketAddr>,
     /// Keyring service/account override. `None` fields fall back to env var, then compile-time default.
     pub keyring: KeyringConfig,
+    /// Startup sweep: mark `pending` approval_requests older than this many seconds as `timed_out`.
+    /// Default 3600 (1 hour). Set to 0 to disable the sweep.
+    pub stale_approval_threshold_secs: u64,
 }
 
 fn expand_tilde(path: &str) -> Result<PathBuf, ConfigError> {
@@ -111,6 +115,7 @@ impl Default for DaemonConfig {
             log_level: LogLevel::Info,
             dashboard_addr: Some("127.0.0.1:3141".parse().expect("valid default addr")),
             keyring: KeyringConfig::default(),
+            stale_approval_threshold_secs: 3600,
         }
     }
 }
@@ -134,6 +139,7 @@ impl DaemonConfig {
             policy_file: None,
             log_level: None,
             dashboard_addr: None,
+            stale_approval_threshold_secs: None,
         });
 
         let socket_dir = match section.socket_dir {
@@ -163,6 +169,9 @@ impl DaemonConfig {
         };
 
         let keyring = raw.keyring.unwrap_or_default();
+        let stale_approval_threshold_secs = section
+            .stale_approval_threshold_secs
+            .unwrap_or(defaults.stale_approval_threshold_secs);
 
         let cfg = DaemonConfig {
             socket_dir,
@@ -172,6 +181,7 @@ impl DaemonConfig {
             log_level,
             dashboard_addr,
             keyring,
+            stale_approval_threshold_secs,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -255,6 +265,7 @@ mod tests {
             log_level: LogLevel::Info,
             dashboard_addr: None,
             keyring: KeyringConfig::default(),
+            stale_approval_threshold_secs: 3600,
         };
 
         cfg.ensure_dirs().unwrap();
@@ -337,6 +348,7 @@ mod tests {
             log_level: LogLevel::Info,
             dashboard_addr: None,
             keyring: KeyringConfig::default(),
+            stale_approval_threshold_secs: 3600,
         };
         let err = cfg.validate().unwrap_err();
         assert!(matches!(err, ConfigError::Validation(ref s) if s.contains("socket_dir")));
@@ -352,6 +364,7 @@ mod tests {
             log_level: LogLevel::Info,
             dashboard_addr: None,
             keyring: KeyringConfig::default(),
+            stale_approval_threshold_secs: 3600,
         };
         let err = cfg.validate().unwrap_err();
         assert!(matches!(err, ConfigError::Validation(ref s) if s.contains("must be different")));

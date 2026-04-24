@@ -17,9 +17,18 @@ pub struct GrantLink {
     pub ephemeral_public_key_hex: String,
     /// Expiry timestamp (epoch seconds).
     pub expires_at: u64,
-    /// Issuer's signature over `offer_id|ek|exp`, proving link authenticity.
+    /// Issuer's signature over `offer_id|ek|exp|relay_hint_or_empty`,
+    /// proving link authenticity. The empty string fills the relay slot
+    /// when [`Self::relay_hint`] is `None`, so an on-path attacker who
+    /// appends `&relay=...` to a link the issuer rendered without one
+    /// also breaks the signature.
     pub issuer_signature: String,
     /// Optional relay endpoint hint for async pickup.
+    ///
+    /// Bound into [`Self::signing_payload`] so an on-path attacker cannot
+    /// swap the relay endpoint without invalidating the signature
+    /// (security review `docs/the security review`,
+    /// finding H-1).
     pub relay_hint: Option<String>,
 }
 
@@ -154,9 +163,25 @@ impl GrantLink {
 
     /// The canonical payload that the issuer signs to prove link authenticity.
     ///
-    /// Format: `<offer_id>|<ephemeral_public_key_hex>|<expires_at>`
-    pub fn signing_payload(offer_id: &str, ek_hex: &str, expires_at: u64) -> Vec<u8> {
-        format!("{offer_id}|{ek_hex}|{expires_at}").into_bytes()
+    /// Format: `<offer_id>|<ephemeral_public_key_hex>|<expires_at>|<relay_hint_or_empty>`
+    ///
+    /// Field ordering matches the reading order of the rendered URL
+    /// (offer-id in path, then `ek`, `exp`, `sig`, `relay` query params).
+    /// `relay_hint = None` is encoded as an empty trailing field so the
+    /// "no relay" case binds into the signature distinctly from any
+    /// non-empty relay value — an on-path attacker who appends
+    /// `&relay=evil.example.com` to a link the issuer rendered with
+    /// `None` flips the trailing field from `""` to `"evil.example.com"`
+    /// and verification fails (GL-H1, security review
+    /// `docs/the security review`).
+    pub fn signing_payload(
+        offer_id: &str,
+        ek_hex: &str,
+        expires_at: u64,
+        relay_hint: Option<&str>,
+    ) -> Vec<u8> {
+        let relay = relay_hint.unwrap_or("");
+        format!("{offer_id}|{ek_hex}|{expires_at}|{relay}").into_bytes()
     }
 }
 
@@ -260,9 +285,114 @@ mod tests {
 
     #[test]
     fn signing_payload_deterministic() {
-        let p1 = GrantLink::signing_payload("offer-1", "aabb", 12345);
-        let p2 = GrantLink::signing_payload("offer-1", "aabb", 12345);
+        let p1 = GrantLink::signing_payload("offer-1", "aabb", 12345, None);
+        let p2 = GrantLink::signing_payload("offer-1", "aabb", 12345, None);
         assert_eq!(p1, p2);
-        assert_eq!(p1, b"offer-1|aabb|12345");
+        assert_eq!(p1, b"offer-1|aabb|12345|");
+    }
+
+    #[test]
+    fn signing_payload_binds_relay_hint() {
+        // GL-H1: the relay hint must be part of the signed bytes so an
+        // on-path attacker cannot swap relay endpoints without breaking
+        // the signature.
+        let with_relay_a = GrantLink::signing_payload(
+            "offer-1",
+            "aabb",
+            12345,
+            Some("wss://honest.example.com"),
+        );
+        let with_relay_b = GrantLink::signing_payload(
+            "offer-1",
+            "aabb",
+            12345,
+            Some("wss://evil.example.com"),
+        );
+        let without_relay = GrantLink::signing_payload("offer-1", "aabb", 12345, None);
+
+        assert_ne!(with_relay_a, with_relay_b);
+        assert_ne!(with_relay_a, without_relay);
+        assert_ne!(with_relay_b, without_relay);
+        assert_eq!(
+            with_relay_a,
+            b"offer-1|aabb|12345|wss://honest.example.com",
+        );
+        assert_eq!(without_relay, b"offer-1|aabb|12345|");
+    }
+
+    #[test]
+    fn relay_hint_tamper_detected() {
+        // GL-H1: end-to-end demonstration. Build the signing payload an
+        // honest issuer would compute for a link carrying relay_hint_A.
+        // An on-path attacker rewrites the link to advertise relay_hint_B.
+        // The verifier recomputes the signing payload from the parsed
+        // (tampered) link and the bytes no longer match what the issuer
+        // signed — so any signature check against `issuer_signed_bytes`
+        // will reject `attacker_recomputed_bytes`.
+        let mut link = sample_link();
+        link.relay_hint = Some("wss://honest.example.com".to_string());
+
+        let issuer_signed_bytes = GrantLink::signing_payload(
+            &link.offer_id,
+            &link.ephemeral_public_key_hex,
+            link.expires_at,
+            link.relay_hint.as_deref(),
+        );
+
+        // Render, then simulate an on-path swap of the relay query param.
+        let url = link.to_url();
+        let tampered = url.replace(
+            "&relay=wss://honest.example.com",
+            "&relay=wss://evil.example.com",
+        );
+        assert_ne!(url, tampered, "tamper substitution must apply");
+        let parsed_tampered = GrantLink::parse(&tampered).unwrap();
+        assert_eq!(
+            parsed_tampered.relay_hint.as_deref(),
+            Some("wss://evil.example.com"),
+        );
+
+        let attacker_recomputed_bytes = GrantLink::signing_payload(
+            &parsed_tampered.offer_id,
+            &parsed_tampered.ephemeral_public_key_hex,
+            parsed_tampered.expires_at,
+            parsed_tampered.relay_hint.as_deref(),
+        );
+        assert_ne!(
+            issuer_signed_bytes, attacker_recomputed_bytes,
+            "relay swap must change the signing payload so signature \
+             verification fails",
+        );
+    }
+
+    #[test]
+    fn relay_hint_addition_detected() {
+        // GL-H1 corollary: an attacker appending `&relay=...` to a link
+        // the issuer rendered without one must also break the signature.
+        let link = sample_link();
+        assert!(link.relay_hint.is_none());
+
+        let issuer_signed_bytes = GrantLink::signing_payload(
+            &link.offer_id,
+            &link.ephemeral_public_key_hex,
+            link.expires_at,
+            link.relay_hint.as_deref(),
+        );
+
+        let url = link.to_url();
+        let tampered = format!("{url}&relay=wss://evil.example.com");
+        let parsed_tampered = GrantLink::parse(&tampered).unwrap();
+        assert_eq!(
+            parsed_tampered.relay_hint.as_deref(),
+            Some("wss://evil.example.com"),
+        );
+
+        let attacker_recomputed_bytes = GrantLink::signing_payload(
+            &parsed_tampered.offer_id,
+            &parsed_tampered.ephemeral_public_key_hex,
+            parsed_tampered.expires_at,
+            parsed_tampered.relay_hint.as_deref(),
+        );
+        assert_ne!(issuer_signed_bytes, attacker_recomputed_bytes);
     }
 }

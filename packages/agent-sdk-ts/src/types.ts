@@ -51,7 +51,7 @@ export interface GrantStatusResult {
 export interface UseCredentialParams {
   [key: string]: unknown;
   grant_id: string;
-  credential_id: string;
+  credential_name: string;
 }
 
 export interface CredentialResult {

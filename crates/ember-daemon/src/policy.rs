@@ -17,6 +17,27 @@ pub enum PolicyDecision {
     Deny,
 }
 
+/// approval tier (design §Approval UX).
+///
+/// Tiers classify how an action reaches its decision, separate from the
+/// decision itself:
+/// - `Tier0` → silent auto-approve, zero interruption.
+/// - `Tier1` → interactive approval (desktop notification / dashboard).
+/// - `Tier2` → hardware-key approval (YubiKey touch / biometric).
+///
+/// Tier is a projection of `PolicyDecision` by default, but rules may
+/// pin a stricter tier explicitly (e.g. an auto-approve action the
+/// operator still wants routed through hardware). The runtime gate in
+/// the approval handler refuses Tier 2 with a clear "not yet supported"
+/// error until the hardware path ships.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Tier {
+    Tier0,
+    Tier1,
+    Tier2,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyRule {
     /// Pattern to match action names (supports glob: "git.*", "deploy.*", "*")
@@ -25,6 +46,21 @@ pub struct PolicyRule {
     pub risk: RiskLevel,
     /// What to do when this action is requested
     pub decision: PolicyDecision,
+    /// Explicit tier override. When absent, the tier is derived from
+    /// `decision` via [`classify_tier`].
+    #[serde(default)]
+    pub tier: Option<Tier>,
+}
+
+/// Default tier for a given decision (per design): auto-approve is
+/// Tier 0 (silent), require-approval is Tier 1 (interactive), deny is
+/// Tier 2 (hardware-key required to override).
+pub fn classify_tier(decision: &PolicyDecision) -> Tier {
+    match decision {
+        PolicyDecision::AutoApprove => Tier::Tier0,
+        PolicyDecision::RequireApproval => Tier::Tier1,
+        PolicyDecision::Deny => Tier::Tier2,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +109,10 @@ pub struct PolicyEvaluation {
     pub decision: PolicyDecision,
     pub risk: RiskLevel,
     pub matched_rule: Option<String>,
+    /// — approval tier for this evaluation. Derived from the
+    /// rule's explicit `tier` field when present, otherwise projected
+    /// from `decision` via [`classify_tier`].
+    pub tier: Tier,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -179,22 +219,27 @@ impl PolicyEngine {
                     decision: PolicyDecision::Deny,
                     risk: RiskLevel::Critical,
                     matched_rule: Some("invalid action".to_string()),
+                    tier: Tier::Tier2,
                 }
             }
         };
         for rule in &self.config.rules {
             if matches_glob(&rule.action, &action) {
+                let tier = rule.tier.unwrap_or_else(|| classify_tier(&rule.decision));
                 return PolicyEvaluation {
                     decision: rule.decision.clone(),
                     risk: rule.risk.clone(),
                     matched_rule: Some(rule.action.clone()),
+                    tier,
                 };
             }
         }
+        let tier = classify_tier(&self.config.default_decision);
         PolicyEvaluation {
             decision: self.config.default_decision.clone(),
             risk: self.config.default_risk.clone(),
             matched_rule: None,
+            tier,
         }
     }
 }
@@ -206,31 +251,37 @@ impl Default for PolicyEngine {
                 action: "git.push.main".to_string(),
                 risk: RiskLevel::Critical,
                 decision: PolicyDecision::Deny,
+                tier: None,
             },
             PolicyRule {
                 action: "git.push.*".to_string(),
                 risk: RiskLevel::Medium,
                 decision: PolicyDecision::AutoApprove,
+                tier: None,
             },
             PolicyRule {
                 action: "deploy.production".to_string(),
                 risk: RiskLevel::Critical,
                 decision: PolicyDecision::RequireApproval,
+                tier: Some(Tier::Tier2),
             },
             PolicyRule {
                 action: "deploy.staging".to_string(),
                 risk: RiskLevel::Medium,
                 decision: PolicyDecision::AutoApprove,
+                tier: None,
             },
             PolicyRule {
                 action: "credential.access".to_string(),
                 risk: RiskLevel::High,
                 decision: PolicyDecision::RequireApproval,
+                tier: None,
             },
             PolicyRule {
                 action: "*".to_string(),
                 risk: RiskLevel::Medium,
                 decision: PolicyDecision::RequireApproval,
+                tier: None,
             },
         ];
         Self::new(PolicyConfig {
@@ -408,6 +459,7 @@ default_risk = "low"
                 action: "deploy.production".to_string(),
                 risk: RiskLevel::Critical,
                 decision: PolicyDecision::RequireApproval,
+                tier: None,
             }],
             ..PolicyConfig::default()
         };
@@ -416,6 +468,7 @@ default_risk = "low"
                 action: "deploy.production".to_string(),
                 risk: RiskLevel::Low,
                 decision: PolicyDecision::AutoApprove,
+                tier: None,
             }],
             ..PolicyConfig::default()
         };
@@ -486,5 +539,72 @@ decision = "deny"
         let eval = engine.evaluate("deploy.staging");
         assert_eq!(eval.decision, PolicyDecision::Deny);
         assert_eq!(eval.risk, RiskLevel::High);
+    }
+
+    // --- — Tier classification ---
+
+    #[test]
+    fn tier_classification_defaults_from_decision() {
+        // AutoApprove → Tier 0, RequireApproval → Tier 1, Deny → Tier 2.
+        let engine = PolicyEngine::default();
+
+        // `git.push.feat/*` auto-approves → Tier 0.
+        let auto = engine.evaluate("git.push.feat-branch");
+        assert_eq!(auto.decision, PolicyDecision::AutoApprove);
+        assert_eq!(auto.tier, Tier::Tier0);
+
+        // `credential.access` requires approval → Tier 1.
+        let interactive = engine.evaluate("credential.access");
+        assert_eq!(interactive.decision, PolicyDecision::RequireApproval);
+        assert_eq!(interactive.tier, Tier::Tier1);
+
+        // `git.push.main` denies → Tier 2.
+        let denied = engine.evaluate("git.push.main");
+        assert_eq!(denied.decision, PolicyDecision::Deny);
+        assert_eq!(denied.tier, Tier::Tier2);
+    }
+
+    #[test]
+    fn tier_explicit_override_wins() {
+        // A rule can pin a stricter tier than the default classifier would
+        // derive — e.g. an auto-approve action the operator still wants
+        // routed through hardware.
+        let toml_str = r#"
+[[rules]]
+action = "deploy.production"
+risk = "critical"
+decision = "require_approval"
+tier = "tier2"
+"#;
+        let engine = PolicyEngine::from_toml(toml_str).unwrap();
+        let eval = engine.evaluate("deploy.production");
+        assert_eq!(eval.decision, PolicyDecision::RequireApproval);
+        // Classifier default for RequireApproval is Tier1, but the rule
+        // pins Tier2 — the explicit override must win.
+        assert_eq!(eval.tier, Tier::Tier2);
+    }
+
+    #[test]
+    fn tier_unmatched_action_uses_default_decision_tier() {
+        let toml_str = r#"
+default_decision = "auto_approve"
+default_risk = "low"
+"#;
+        let engine = PolicyEngine::from_toml(toml_str).unwrap();
+        let eval = engine.evaluate("any.unmatched.action");
+        assert!(eval.matched_rule.is_none());
+        // Default decision is AutoApprove → Tier 0.
+        assert_eq!(eval.tier, Tier::Tier0);
+    }
+
+    #[test]
+    fn tier_invalid_action_is_tier2() {
+        // Invalid actions are denied at Tier 2 (the strictest gate) so
+        // garbage input can never slip into the Tier 0 silent-approve
+        // path.
+        let engine = PolicyEngine::default();
+        let eval = engine.evaluate("");
+        assert_eq!(eval.decision, PolicyDecision::Deny);
+        assert_eq!(eval.tier, Tier::Tier2);
     }
 }

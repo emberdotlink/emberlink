@@ -84,7 +84,7 @@ describe('emberlink-agent integration', { skip: skipReason }, () => {
 
   test('use_credential for nonexistent grant returns NOT_FOUND error', async () => {
     await assert.rejects(
-      () => agent.useCredential({ grant_id: 'nonexistent-grant', credential_id: 'cred-1' }),
+      () => agent.useCredential({ grant_id: 'nonexistent-grant', credential_name: 'cred-1' }),
       (err: unknown) => {
         assert.ok(err instanceof EmberAgentError);
         assert.equal((err as EmberAgentError).code, 'NOT_FOUND');

@@ -1,7 +1,7 @@
 use core_crypto::{PublicKey, Signature, Signer};
 use core_types::{
-    CanonicalEncode, EventBody, EventRefRelation, EventSubject, EventType, KeyRole, SchemaVersion,
-    SignerBinding, Validate, ValidationError,
+    CanonicalEncode, EventBody, EventRefRelation, EventSubject, EventType, SchemaVersion,
+    SignerBinding, Validate, ValidationError, size_limits::validate_envelope_payload_size,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,58 +86,6 @@ impl EventEnvelope {
         })
     }
 
-    pub fn new<T>(
-        event_id: impl Into<String>,
-        event_type: EventType,
-        body: &T,
-        signer: &impl Signer,
-    ) -> Self
-    where
-        T: CanonicalEncode + Validate,
-    {
-        body.validate()
-            .expect("legacy event bodies must validate before wrapping");
-
-        let event_id = event_id.into();
-        let subject = EventSubject::unknown(event_type.as_str());
-        let signer_public_key = signer.public_key();
-        let signer_binding = SignerBinding {
-            signer: subject.clone(),
-            key_id: signer_public_key.0.clone(),
-            role: KeyRole::Unknown,
-        };
-        let body = EventBody::LegacyOpaque {
-            declared_type: event_type,
-            subject,
-            canonical_payload: body.canonical_encode(),
-        };
-        let payload = body.canonical_encode();
-        let refs = Vec::new();
-        let signed_bytes = canonical_signed_bytes(
-            SchemaVersion::V0_1_0,
-            &event_id,
-            event_type,
-            &body.subject(),
-            &signer_binding,
-            &refs,
-            &payload,
-        );
-        let signature = signer.sign(&signed_bytes);
-
-        Self {
-            schema_version: SchemaVersion::V0_1_0,
-            event_id,
-            event_type,
-            subject: body.subject(),
-            signer_binding,
-            signer: signer_public_key,
-            payload,
-            refs,
-            signature,
-            body,
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn from_stored_parts(
         schema_version: SchemaVersion,
@@ -188,6 +136,11 @@ impl Validate for EventEnvelope {
         if self.payload.is_empty() {
             return Err(ValidationError::new("event payload must not be empty"));
         }
+        // Envelope-level backstop: per-field caps in core-types limit each
+        // attacker-controlled field individually; this gate catches any
+        // shape we missed (or any future field that forgets a per-field
+        // cap). See `core_types::size_limits` for rationale.
+        validate_envelope_payload_size(self.payload.len())?;
         self.subject.validate()?;
         self.signer_binding.validate()?;
         self.body.validate()?;
@@ -285,8 +238,8 @@ fn canonical_signed_bytes(
 mod tests {
     use core_crypto::{FixtureSigner, Verifier};
     use core_types::{
-        DeviceAddedEvent, EventBody, KeyAlgorithm, PersonaCreatedEvent, PublicKeyMaterial,
-        RootCreatedEvent, SurvivalMode,
+        EventBody, KeyAlgorithm, PersonaCreatedEvent, PublicKeyMaterial, RootCreatedEvent,
+        SurvivalMode,
     };
 
     use super::*;
@@ -296,14 +249,6 @@ mod tests {
             key_id: key_id.into(),
             algorithm: KeyAlgorithm::DevEd25519Like,
             public_key: format!("devpub:{key_id}"),
-        }
-    }
-
-    fn test_encryption_key(key_id: &str) -> PublicKeyMaterial {
-        PublicKeyMaterial {
-            key_id: format!("enc-{key_id}"),
-            algorithm: KeyAlgorithm::AgeX25519,
-            public_key: format!("age1{key_id}fixture"),
         }
     }
 
@@ -335,26 +280,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_constructor_keeps_older_call_sites_working() {
-        let signer = FixtureSigner::new("fixture_signer");
-        let envelope = EventEnvelope::new(
-            "evt-legacy",
-            EventType::DeviceAdded,
-            &DeviceAddedEvent {
-                root_id: "root-1".into(),
-                device_id: "device-1".into(),
-                label: "Laptop".into(),
-                initial_key: test_key("key-device-1"),
-                initial_encryption_key: test_encryption_key("key-device-1"),
-            },
-            &signer,
-        );
-
-        assert_eq!(envelope.event_type, EventType::DeviceAdded);
-        assert!(matches!(envelope.body, EventBody::LegacyOpaque { .. }));
-    }
-
-    #[test]
     fn validation_rejects_duplicate_refs() {
         let signer = FixtureSigner::new("fixture-persona-key");
         let envelope = EventEnvelope::from_body(
@@ -374,5 +299,37 @@ mod tests {
         .unwrap();
 
         assert!(envelope.validate().is_err());
+    }
+
+    #[test]
+    fn envelope_payload_size_cap_rejects_oversized_canonical_blob() {
+        // Backstop test for EVENTS-H1: even if every per-field cap is
+        // bypassed, the envelope-level MAX_EVENT_PAYLOAD_BYTES backstop
+        // must reject oversized payloads.
+        use core_types::size_limits::MAX_EVENT_PAYLOAD_BYTES;
+
+        let signer = FixtureSigner::new("fixture-root-key");
+        let body = EventBody::RootCreated(RootCreatedEvent {
+            root_id: "root-1".into(),
+            display_name: "Primary".into(),
+            initial_key: test_key("key-root-1"),
+        });
+        let mut envelope = EventEnvelope::from_body(
+            "evt-bomb",
+            body,
+            vec![],
+            SignerBinding::root("root-1", "key-root-1"),
+            &signer,
+        )
+        .unwrap();
+        // Force-inflate the stored payload bytes past the envelope cap.
+        // Real attackers reach this state via `from_stored_parts` with a
+        // crafted SQLite row; we simulate by direct-mutating the field.
+        envelope.payload = vec![b'a'; MAX_EVENT_PAYLOAD_BYTES + 1];
+        let err = envelope.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("event payload exceeds"),
+            "expected envelope-cap rejection, got: {err}"
+        );
     }
 }

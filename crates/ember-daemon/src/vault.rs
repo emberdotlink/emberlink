@@ -18,6 +18,10 @@ pub enum VaultError {
     NotFound,
     Keyring(String),
     Io(String),
+    /// Daemon was about to open the production keyring service without an
+    /// opt-in checkpoint (`$HOME/.ember-production`). Refuses to proceed so that
+    /// stray dev/QA daemon starts do not fire real keychain prompts.
+    ProductionSentinelMissing(String),
 }
 
 impl std::fmt::Display for VaultError {
@@ -28,6 +32,7 @@ impl std::fmt::Display for VaultError {
             VaultError::NotFound => write!(f, "credential not found"),
             VaultError::Keyring(s) => write!(f, "keyring error: {s}"),
             VaultError::Io(s) => write!(f, "io error: {s}"),
+            VaultError::ProductionSentinelMissing(s) => write!(f, "{s}"),
         }
     }
 }
@@ -87,8 +92,58 @@ impl Vault {
         let salt = vault_salt(config)?;
         let service = resolve_keyring_service(&config.keyring);
         let account = resolve_keyring_account(&config.keyring);
+
+        // Belt-and-suspenders: refuse to open the production keyring service
+        // unless the operator has explicitly opted in with
+        // `$HOME/.ember-production`. Dev/QA daemons that point at a custom
+        // service name (via config or env override) bypass this check. Skipped
+        // entirely under cargo-test binaries — the passphrase branch below is
+        // also gated there, so the real keychain is never touched in tests.
+        if !is_cargo_test_binary() {
+            let home = dirs_next::home_dir().ok_or_else(|| {
+                VaultError::ProductionSentinelMissing(
+                    "refusing to open vault: home directory not resolvable (no $HOME)"
+                        .to_string(),
+                )
+            })?;
+            check_production_sentinel(&service, DEFAULT_KEYRING_SERVICE, &home)?;
+        }
+
         let passphrase = resolve_passphrase(&service, &account)?;
         Ok(Vault::from_passphrase(&passphrase, &salt))
+    }
+
+    /// Seal raw bytes under the vault master key and return
+    /// `(nonce, ciphertext)` suitable for storing side-by-side in two
+    /// BLOB columns. Used by persona-secret at-rest encryption (F-05).
+    ///
+    /// The nonce is a fresh 24-byte XChaCha20 nonce drawn from OS entropy
+    /// per call — never reused across seals.
+    pub fn seal(&self, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), VaultError> {
+        let cipher = XChaCha20Poly1305::new_from_slice(&self.vault_key).unwrap();
+        let mut nonce_bytes = [0u8; 24];
+        getrandom::fill(&mut nonce_bytes).expect("OS entropy failure");
+        let nonce = XNonce::from_slice(&nonce_bytes);
+        let ciphertext = cipher
+            .encrypt(nonce, plaintext)
+            .map_err(|e| VaultError::Crypto(e.to_string()))?;
+        Ok((nonce_bytes.to_vec(), ciphertext))
+    }
+
+    /// Open a `(nonce, ciphertext)` pair produced by `seal`. Returns the
+    /// plaintext bytes on success, `VaultError::Crypto` on AEAD failure.
+    pub fn open(&self, nonce_bytes: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, VaultError> {
+        if nonce_bytes.len() != 24 {
+            return Err(VaultError::Crypto(format!(
+                "invalid nonce length: {}",
+                nonce_bytes.len()
+            )));
+        }
+        let cipher = XChaCha20Poly1305::new_from_slice(&self.vault_key).unwrap();
+        let nonce = XNonce::from_slice(nonce_bytes);
+        cipher
+            .decrypt(nonce, ciphertext)
+            .map_err(|e| VaultError::Crypto(e.to_string()))
     }
 
     pub fn add(
@@ -211,20 +266,48 @@ pub fn resolve_keyring_account(config: &crate::config::KeyringConfig) -> String 
     std::env::var("EMBER_KEYRING_ACCOUNT").unwrap_or_else(|_| DEFAULT_KEYRING_ACCOUNT.to_string())
 }
 
-/// Keyring service name used to identify the ember vault entry in the OS keychain.
+/// Refuse to open the production keyring service unless the operator has
+/// explicitly opted in by creating `<home>/.ember-production`.
 ///
-/// This is the legacy env-var-only helper retained for callers that do not yet have
-/// a `KeyringConfig` (e.g., `ember init` before the config is written).
-/// Override via `EMBER_KEYRING_SERVICE` env var.
-pub fn keyring_service() -> String {
-    std::env::var("EMBER_KEYRING_SERVICE").unwrap_or_else(|_| DEFAULT_KEYRING_SERVICE.to_string())
-}
-
-/// Keyring account name used to identify the ember vault entry in the OS keychain.
+/// Returns `Ok(())` when the daemon may proceed:
+/// - effective service name differs from the production default (any
+///   dev/QA service name opts out automatically), OR
+/// - effective service matches the production default AND the checkpoint
+///   file exists.
 ///
-/// Legacy env-var-only helper. Override via `EMBER_KEYRING_ACCOUNT` env var.
-pub fn keyring_account() -> String {
-    std::env::var("EMBER_KEYRING_ACCOUNT").unwrap_or_else(|_| DEFAULT_KEYRING_ACCOUNT.to_string())
+/// Returns `Err(VaultError::ProductionSentinelMissing)` when the daemon is
+/// pointed at the production service but the checkpoint is absent. The error
+/// message is the documentation: it tells the operator how to opt in (touch
+/// the checkpoint file) or opt out (set `[keyring].service` or
+/// `EMBER_KEYRING_SERVICE`). There is deliberately no `--force` or env
+/// escape hatch; the checkpoint IS the opt-in.
+///
+/// The production service name is taken as a parameter (rather than reading
+/// `DEFAULT_KEYRING_SERVICE` directly) so the check is unit-testable with
+/// synthetic values. Real callers pass `DEFAULT_KEYRING_SERVICE`.
+pub fn check_production_sentinel(
+    effective_service: &str,
+    production_service: &str,
+    home_dir: &std::path::Path,
+) -> Result<(), VaultError> {
+    if effective_service != production_service {
+        // Operator has already opted out by picking a non-default service.
+        return Ok(());
+    }
+    let checkpoint = home_dir.join(".ember-production");
+    if checkpoint.exists() {
+        return Ok(());
+    }
+    let msg = format!(
+        "refusing to open production keychain without opt-in checkpoint\n  \
+         reason: no {checkpoint} file exists\n  \
+         effective keyring service: {effective_service:?} (production default)\n  \
+         to opt in (production users, one-time):   touch ~/.ember-production\n  \
+         to opt out (dev/QA, use isolated vault):  set [keyring].service in config,\n  \
+                                                   or pass EMBER_KEYRING_SERVICE=ember-daemon-test",
+        checkpoint = checkpoint.display(),
+    );
+    Err(VaultError::ProductionSentinelMissing(msg))
 }
 
 /// Log the active keyring identity at INFO level and, if the config uses the production default
@@ -627,5 +710,60 @@ mod tests {
         let default_path = DaemonConfig::default_config_path();
         // No panic regardless of whether the file exists.
         log_vault_identity(&config, Some(&default_path));
+    }
+
+    // --- P69K-security check production-checkpoint tests ---
+    //
+    // The helper is parameterized on home_dir so tests can point at a tempdir
+    // and never touch the real `$HOME`. The real production service string is
+    // also passed in as a parameter so the test doesn't depend on the global
+    // `DEFAULT_KEYRING_SERVICE` constant value.
+
+    #[test]
+    fn sentinel_absent_production_service_refuses() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No checkpoint file created.
+        let result =
+            check_production_sentinel("ember-daemon", "ember-daemon", tmp.path());
+        match result {
+            Err(VaultError::ProductionSentinelMissing(msg)) => {
+                assert!(msg.contains(".ember-production"));
+                assert!(msg.contains("ember-daemon"));
+                assert!(msg.contains("touch ~/.ember-production"));
+            }
+            other => panic!("expected ProductionSentinelMissing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sentinel_absent_custom_service_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No checkpoint; operator has opted out via custom service name.
+        check_production_sentinel("ember-daemon-test", "ember-daemon", tmp.path())
+            .expect("custom service should bypass checkpoint");
+        check_production_sentinel("ember-daemon-qa", "ember-daemon", tmp.path())
+            .expect("qa service should bypass checkpoint");
+    }
+
+    #[test]
+    fn sentinel_present_production_service_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".ember-production"), b"").unwrap();
+        check_production_sentinel("ember-daemon", "ember-daemon", tmp.path())
+            .expect("checkpoint present should allow production service");
+    }
+
+    #[test]
+    fn sentinel_check_uses_correct_filename() {
+        // A near-miss filename must not satisfy the check.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("ember-production"), b"").unwrap();
+        std::fs::write(tmp.path().join(".ember_production"), b"").unwrap();
+        let result =
+            check_production_sentinel("ember-daemon", "ember-daemon", tmp.path());
+        assert!(
+            matches!(result, Err(VaultError::ProductionSentinelMissing(_))),
+            "near-miss filenames must not satisfy checkpoint"
+        );
     }
 }

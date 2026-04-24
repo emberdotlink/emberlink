@@ -95,6 +95,11 @@ impl DaemonRuntime {
         );
         log_vault_identity(&self.config, self.config_path.as_deref());
 
+        // F-05: attach the vault so persona-secret writes can encrypt at
+        // rest. Fresh DBs under the V0 schema have no plaintext column;
+        // every persona row is vault-sealed from inception.
+        store.set_vault(Rc::clone(&vault));
+
         // Initialise the daemon's long-lived Ed25519 identity key used to
         // sign Grant Receipts (Stream D, design §Evidence). First-run
         // generates the key; subsequent runs re-load it. Failure here is
@@ -110,6 +115,16 @@ impl DaemonRuntime {
                     "daemon identity key unavailable — receipts will not be emitted"
                 );
             }
+        }
+
+        // NOTIF-2: sweep approval_requests that were left pending from a prior
+        // session. Rows older than stale_approval_threshold_secs are marked
+        // timed_out. Fires zero notifications — the user already saw the banner
+        // when the request was first submitted.
+        match store.expire_stale_pending_approvals(self.config.stale_approval_threshold_secs) {
+            Ok(0) => {}
+            Ok(n) => info!(count = n, "startup: auto-expired {n} stale pending approvals"),
+            Err(e) => tracing::warn!(error = %e, "startup stale-approval sweep failed"),
         }
 
         let policy = if self.config.policy_file.exists() {
@@ -309,6 +324,40 @@ pub struct DaemonStatus {
     pub pid: u32,
     pub socket: PathBuf,
     pub running: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write as _;
+    use tempfile::TempDir;
+
+    /// Verifies that the rolling file appender creates `daemon.log.*` in the
+    /// data directory and accepts writes. The global tracing subscriber is NOT
+    /// initialised here — we write directly via the `Write` impl so this test
+    /// can run alongside other tests without conflicting with the global state.
+    #[test]
+    fn rolling_appender_creates_log_file_in_data_dir() {
+        let tmp = TempDir::new().unwrap();
+        let data_dir = tmp.path();
+
+        let mut appender = tracing_appender::rolling::daily(data_dir, "daemon.log");
+        writeln!(appender, r#"{{"message":"daemon-log-test-probe","level":"INFO"}}"#).unwrap();
+        // Flush the internal buffer so the write reaches the OS before we read.
+        appender.flush().unwrap();
+
+        // tracing-appender rolling daily names files `<prefix>.<YYYY-MM-DD>`.
+        let log_entry = std::fs::read_dir(data_dir)
+            .unwrap()
+            .flatten()
+            .find(|e| e.file_name().to_string_lossy().starts_with("daemon.log"))
+            .expect("daemon.log.* should exist after write");
+
+        let contents = std::fs::read_to_string(log_entry.path()).unwrap();
+        assert!(
+            contents.contains("daemon-log-test-probe"),
+            "expected probe string in log file, got: {contents:?}"
+        );
+    }
 }
 
 async fn shutdown_signal() {

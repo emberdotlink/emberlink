@@ -123,6 +123,17 @@ fn tool_definitions() -> serde_json::Value {
                 },
                 "required": ["id"]
             }
+        },
+        {
+            "name": "grant_budget_status",
+            "description": "Get per-Statement budget + usage + percent_used for a composite grant. Returns lifecycle status (active/paused/exhausted_by_budget/revoked/expired) plus a per-statement array; SDK clients use this to render a runway view without subscribing to push events.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "grant_id": { "type": "string" }
+                },
+                "required": ["grant_id"]
+            }
         }
     ])
 }
@@ -303,7 +314,10 @@ impl McpServer {
 
         // Observability tools route directly through the daemon socket
         // when one is configured — they never touch the agent runtime.
-        if matches!(tool_name, "list_receipts" | "get_receipt") {
+        if matches!(
+            tool_name,
+            "list_receipts" | "get_receipt" | "grant_budget_status"
+        ) {
             return self.handle_receipt_tool(req, tool_name, &arguments);
         }
 
@@ -427,8 +441,30 @@ mod tests {
                 "grant_status",
                 "use_credential",
                 "list_receipts",
-                "get_receipt"
+                "get_receipt",
+                "grant_budget_status"
             ]
+        );
+    }
+
+    #[test]
+    fn request_grant_schema_requires_resource_id() {
+        let defs = tool_definitions();
+        let tools = defs.as_array().unwrap();
+        let rg = tools.iter().find(|t| t["name"] == "request_grant").unwrap();
+        let required = rg["inputSchema"]["required"].as_array().unwrap();
+        let required_fields: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            required_fields.contains(&"scope"),
+            "required must include scope"
+        );
+        assert!(
+            required_fields.contains(&"duration_secs"),
+            "required must include duration_secs"
+        );
+        assert!(
+            required_fields.contains(&"resource_id"),
+            "required must include resource_id — MCP clients trust the schema; omitting it causes runtime rejection"
         );
     }
 
@@ -617,7 +653,7 @@ mod tests {
         let resp = server.process_line(&serde_json::to_string(&list_req).unwrap()).unwrap();
         let list_resp: JsonRpcResponse = serde_json::from_str(&resp).unwrap();
         let tools = list_resp.result.unwrap()["tools"].as_array().unwrap().len();
-        assert_eq!(tools, 7);
+        assert_eq!(tools, 8);
 
         // 4. Call a tool
         let call_req = serde_json::json!({

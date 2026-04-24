@@ -84,7 +84,7 @@ use persist::{
     load_grant_offers_by_persona, write_access_grant, write_access_grant_history,
 };
 pub use persist::CredentialDepositRow;
-use schema::{SQLITE_MIGRATION_V1, ensure_runtime_columns};
+use schema::SQLITE_INIT_DDL;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersonaDeviceAccessRecord {
@@ -704,9 +704,8 @@ impl EventStore {
         local_block_store: Option<LocalBlockStore>,
         master_key: Option<Zeroizing<String>>,
     ) -> Result<Self, ValidationError> {
-        conn.execute_batch(SQLITE_MIGRATION_V1)
-            .map_err(|err| ValidationError::new(format!("run sqlite migrations: {err}")))?;
-        ensure_runtime_columns(&conn)?;
+        conn.execute_batch(SQLITE_INIT_DDL)
+            .map_err(|err| ValidationError::new(format!("run sqlite init ddl: {err}")))?;
 
         let mut store = Self {
             conn,
