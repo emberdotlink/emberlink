@@ -33,8 +33,8 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use core_types::grant_receipt::{
     ApprovalActor, ApprovalEvent, ApprovalOutcome, AuditEntry as ReceiptAuditEntry,
-    BudgetAxis, Evidence, GrantReceipt, Lifecycle, ReceiptSummary, RevokeActor,
-    TerminalReason,
+    BudgetAxis, Evidence, GrantReceipt, KmsReceipt, Lifecycle, ReceiptKind, ReceiptSummary,
+    RevokeActor, TerminalReason,
 };
 use core_types::{AttestationBinding, StatementId, Usage};
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
@@ -179,14 +179,62 @@ pub fn canonical_hash_receipt(receipt: &GrantReceipt) -> [u8; 32] {
     out
 }
 
+// ---------------------------------------------------------------------------
+// implementation-note-3 — kms receipt canonical-encoding + signing helpers
+// ---------------------------------------------------------------------------
+
+/// Canonical-encoding prefix for kms receipts. Distinct from
+/// [`CANONICAL_PREFIX`] so a kms receipt can never be replayed against a
+/// grant-receipt verifier (cross-protocol signature reuse).
+const KMS_CANONICAL_PREFIX: &str = "type=kms-receipt-v1\n";
+
+/// Serialise a [`KmsReceipt`] to canonical bytes (v1) — zero evidence,
+/// JSON, prefixed.
+fn kms_canonical_body_bytes(receipt_with_zero_evidence: &KmsReceipt) -> Vec<u8> {
+    let mut out = Vec::with_capacity(256);
+    out.extend_from_slice(KMS_CANONICAL_PREFIX.as_bytes());
+    let body = serde_json::to_vec(receipt_with_zero_evidence)
+        .expect("KmsReceipt with default Evidence always serializes");
+    out.extend_from_slice(&body);
+    out
+}
+
+/// Compute the canonical hash (sha256 hex) of a kms receipt body. Zeroes
+/// evidence first so the result is independent of the caller's evidence
+/// field.
+pub fn kms_canonical_hash(receipt: &KmsReceipt) -> String {
+    let mut cloned = receipt.clone();
+    cloned.evidence = Evidence::default();
+    let bytes = kms_canonical_body_bytes(&cloned);
+    let digest = Sha256::digest(&bytes);
+    hex::encode(digest)
+}
+
+/// Sign a kms receipt in place using the daemon identity. Populates
+/// `evidence.{hash, sig, signer_pubkey, canonical_version}`.
+pub fn sign_kms_receipt(receipt: &mut KmsReceipt, identity: &DaemonIdentity) {
+    let hash_hex = kms_canonical_hash(receipt);
+    let sig_bytes = identity.sign(hash_hex.as_bytes());
+    receipt.evidence = Evidence {
+        hash: hash_hex,
+        sig: hex::encode(sig_bytes),
+        signer_pubkey: identity.pubkey_hex(),
+        canonical_version: CANONICAL_VERSION,
+    };
+}
+
 /// Verify an Ed25519 signature against a pubkey (both hex) over the
 /// canonical hash of the receipt body.
 ///
 /// Returns `Ok(())` iff:
-///   - `receipt.evidence.signer_pubkey` decodes to a valid 32-byte pubkey
-///     matching `expected_pubkey_hex`;
+///   - `expected_pubkey_hex` decodes to a valid 32-byte Ed25519 pubkey
+///     (this is the caller-supplied trust anchor — the receipt's own
+///     `signer_pubkey` field is informational only and is NOT trusted
+///     for cryptographic verification);
+///   - the signature in `receipt.evidence.sig` is not the all-zeros
+///     phase-1 placeholder (returns `PlaceholderSig` if so);
 ///   - recomputed canonical hash matches `receipt.evidence.hash`;
-///   - Ed25519 verify passes over the hash bytes.
+///   - Ed25519 verify passes over the hash bytes using `expected_pubkey_hex`.
 pub fn verify_receipt(
     receipt: &GrantReceipt,
     expected_pubkey_hex: &str,
@@ -202,6 +250,17 @@ pub fn verify_receipt(
             expected: expected_pubkey_hex.to_string(),
         });
     }
+    // Decode the sig early so we can distinguish a phase-1 placeholder
+    // (all-zero bytes) before attempting cryptographic verification.
+    let sig_bytes = hex::decode(&receipt.evidence.sig)
+        .map_err(|e| ReceiptVerifyError::Malformed(format!("sig hex: {e}")))?;
+    let sig_arr: [u8; 64] = sig_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| ReceiptVerifyError::Malformed("sig length".into()))?;
+    if sig_arr == [0u8; 64] {
+        return Err(ReceiptVerifyError::PlaceholderSig);
+    }
     let recomputed = canonical_hash(receipt);
     if !recomputed.eq_ignore_ascii_case(&receipt.evidence.hash) {
         return Err(ReceiptVerifyError::HashMismatch {
@@ -209,20 +268,17 @@ pub fn verify_receipt(
             recomputed,
         });
     }
-    let pubkey_bytes = hex::decode(&receipt.evidence.signer_pubkey)
-        .map_err(|e| ReceiptVerifyError::Malformed(format!("pubkey hex: {e}")))?;
+    // Construct the verifying key from the CALLER-SUPPLIED trust anchor,
+    // not from the receipt's own signer_pubkey field (which an attacker
+    // could set to any key they control).
+    let pubkey_bytes = hex::decode(expected_pubkey_hex)
+        .map_err(|e| ReceiptVerifyError::Malformed(format!("expected pubkey hex: {e}")))?;
     let pubkey_arr: [u8; 32] = pubkey_bytes
         .as_slice()
         .try_into()
-        .map_err(|_| ReceiptVerifyError::Malformed("pubkey length".into()))?;
+        .map_err(|_| ReceiptVerifyError::Malformed("expected pubkey length".into()))?;
     let verifying_key = VerifyingKey::from_bytes(&pubkey_arr)
-        .map_err(|e| ReceiptVerifyError::Malformed(format!("pubkey parse: {e}")))?;
-    let sig_bytes = hex::decode(&receipt.evidence.sig)
-        .map_err(|e| ReceiptVerifyError::Malformed(format!("sig hex: {e}")))?;
-    let sig_arr: [u8; 64] = sig_bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| ReceiptVerifyError::Malformed("sig length".into()))?;
+        .map_err(|e| ReceiptVerifyError::Malformed(format!("expected pubkey parse: {e}")))?;
     let signature = ed25519_dalek::Signature::from_bytes(&sig_arr);
     ed25519_dalek::Verifier::verify(&verifying_key, recomputed.as_bytes(), &signature)
         .map_err(|_| ReceiptVerifyError::BadSignature)?;
@@ -241,6 +297,8 @@ pub enum ReceiptVerifyError {
     BadSignature,
     #[error("malformed evidence: {0}")]
     Malformed(String),
+    #[error("receipt carries a phase-1 placeholder signature (all-zero bytes) — not yet signed")]
+    PlaceholderSig,
 }
 
 // ---------------------------------------------------------------------------
@@ -572,6 +630,69 @@ fn parse_rfc3339_epoch(s: &str) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Receipt filter
+// ---------------------------------------------------------------------------
+
+/// Server-side filter for `/api/receipts`.
+///
+/// All fields are optional; omitting them returns all receipts up to `limit`.
+#[derive(Debug, Default)]
+pub struct ReceiptFilter {
+    /// Restrict to receipts whose `persona_id` matches exactly.
+    pub persona_id: Option<String>,
+    /// When `true`, exclude receipts whose `signer_pubkey` is empty (unsigned
+    /// placeholder receipts that were never signed by a daemon identity key).
+    pub signed_only: bool,
+    /// ISO-8601 lower bound on `created_at`. Generated from the `?since=`
+    /// query param by the dashboard handler (24h / 7d / all → epoch offset).
+    pub since_iso: Option<String>,
+    /// Maximum rows to return. Defaults to 100 when `None`.
+    pub limit: Option<u64>,
+    /// EMBER-implementation-note-18 — kind discriminator (`grant`, `kms_wrap`,
+    /// `kms_unwrap`). Mapped 1:1 to the `kind` column.
+    pub kind: Option<String>,
+    /// EMBER-implementation-note-18 — restrict to receipts whose `grant_id` matches.
+    pub grant_id: Option<String>,
+    /// EMBER-implementation-note-18 — substring filter on the receipt's `summary.resource`
+    /// (grant receipts) or top-level `key_name` (kms receipts). Applied
+    /// post-fetch so the JSON1 index can still serve exact-match callers.
+    pub resource: Option<String>,
+}
+
+/// EMBER-implementation-note-18 — flat audit row returned by [`DaemonStore::list_receipt_rows`].
+///
+/// Joins receipt fields with [`crate::grant::GrantInfo`] when the row is a
+/// grant receipt so callers see `requested_scope` / `granted_scope` without
+/// having to re-fetch the grant. Both scope fields are `None` for rows
+/// where no matching grant was found (e.g. orphaned kms receipts whose
+/// `grant_id` field is empty).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ReceiptRow {
+    pub id: String,
+    /// `grant`, `kms_wrap`, or `kms_unwrap`.
+    pub kind: String,
+    /// Persona id of the actor that triggered this receipt.
+    pub actor: String,
+    /// Resource label — `summary.resource` for grant receipts,
+    /// `key_name` for kms receipts. Empty string when the field is missing.
+    pub resource: String,
+    /// Grant id this receipt closes out. Empty string for kms receipts
+    /// that bypassed grant evaluation.
+    pub grant_id: String,
+    /// ISO-8601 timestamp when the receipt landed in the table
+    /// (`receipts.created_at`).
+    pub materialized_at: String,
+    /// Terminal reason for grant receipts; outcome string for kms receipts.
+    pub terminal_reason: String,
+    /// Originally-requested scope from the parent grant. `None` when no
+    /// grant matched.
+    pub requested_scope: Option<String>,
+    /// Effective (post-attenuation) scope from the parent grant. `None` when
+    /// no grant matched.
+    pub granted_scope: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Store methods — receipts table
 // ---------------------------------------------------------------------------
 
@@ -587,8 +708,8 @@ impl DaemonStore {
             .unwrap_or_else(|_| "\"unknown\"".to_string());
         self.conn().execute(
             "INSERT OR REPLACE INTO receipts \
-             (id, grant_id, persona_id, terminal_reason, created_at, receipt_json, signer_pubkey) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (id, grant_id, persona_id, terminal_reason, created_at, receipt_json, signer_pubkey, kind) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'grant')",
             rusqlite::params![
                 receipt.id,
                 receipt.grant_id,
@@ -600,6 +721,105 @@ impl DaemonStore {
             ],
         )?;
         Ok(())
+    }
+
+    /// Persist an ember-kms receipt (`kms_wrap` / `kms_unwrap`).
+    ///
+    /// Reuses the unified `receipts` table — the `kind` column
+    /// discriminates rows; the SQL fast-path index `idx_receipts_kms_key`
+    /// pulls `key_name` out of `receipt_json` via SQLite JSON1.
+    ///
+    /// **No plaintext / ciphertext bytes appear in the row.** Sizes only.
+    pub fn store_kms_receipt(&self, receipt: &KmsReceipt) -> Result<(), StoreError> {
+        let now = Utc::now().to_rfc3339();
+        let receipt_json = serde_json::to_string(receipt).map_err(|e| {
+            StoreError::InvalidInput(format!("serialize kms receipt: {e}"))
+        })?;
+        let kind_str = match receipt.kind {
+            ReceiptKind::KmsWrap => "kms_wrap",
+            ReceiptKind::KmsUnwrap => "kms_unwrap",
+            ReceiptKind::Grant => {
+                return Err(StoreError::InvalidInput(
+                    "store_kms_receipt called with ReceiptKind::Grant — use store_receipt".into(),
+                ));
+            }
+        };
+        // The kms receipts schema reuses the existing `receipts` columns:
+        //   - grant_id stores the consulted grant_id (or "" when none)
+        //   - persona_id stores the caller persona
+        //   - terminal_reason is the kms outcome string ("success" / "failure")
+        //   - signer_pubkey is the daemon identity (or zero placeholder
+        //     when the sink runs without an initialised identity)
+        let consulted_grant = receipt
+            .grant_evaluation
+            .grant_id
+            .clone()
+            .unwrap_or_default();
+        let outcome_str = serde_json::to_string(&receipt.outcome)
+            .unwrap_or_else(|_| "\"unknown\"".to_string());
+        self.conn().execute(
+            "INSERT OR REPLACE INTO receipts \
+             (id, grant_id, persona_id, terminal_reason, created_at, receipt_json, signer_pubkey, kind) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                receipt.id,
+                consulted_grant,
+                receipt.caller_persona,
+                outcome_str,
+                now,
+                receipt_json,
+                receipt.evidence.signer_pubkey,
+                kind_str,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Load a kms receipt by id. Returns `NotFound` if the row is not a
+    /// kms_wrap / kms_unwrap kind (use [`get_receipt`] for grant receipts).
+    pub fn get_kms_receipt(&self, id: &str) -> Result<KmsReceipt, StoreError> {
+        use rusqlite::OptionalExtension;
+        let raw: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT receipt_json FROM receipts \
+                 WHERE id = ?1 AND kind IN ('kms_wrap','kms_unwrap')",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let raw = raw.ok_or(StoreError::NotFound)?;
+        serde_json::from_str(&raw).map_err(|e| {
+            StoreError::InvalidInput(format!("corrupt kms receipt row {id}: {e}"))
+        })
+    }
+
+    /// List ember-kms receipts for a given key, most-recent first. Both
+    /// `kms_wrap` and `kms_unwrap` rows are returned. Limited to `limit`
+    /// rows (default 100). Uses the `idx_receipts_kms_key` index for the
+    /// `key_name` lookup.
+    pub fn list_kms_receipts_for_key(
+        &self,
+        key_name: &str,
+        limit: Option<u64>,
+    ) -> Result<Vec<KmsReceipt>, StoreError> {
+        let limit = limit.unwrap_or(100);
+        let mut stmt = self.conn().prepare(
+            "SELECT receipt_json FROM receipts \
+             WHERE kind IN ('kms_wrap','kms_unwrap') \
+               AND json_extract(receipt_json, '$.key_name') = ?1 \
+             ORDER BY created_at DESC LIMIT ?2",
+        )?;
+        let rows: Vec<String> = stmt
+            .query_map(rusqlite::params![key_name, limit as i64], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+        let mut out = Vec::with_capacity(rows.len());
+        for raw in rows {
+            if let Ok(r) = serde_json::from_str::<KmsReceipt>(&raw) {
+                out.push(r);
+            }
+        }
+        Ok(out)
     }
 
     /// Load a receipt by id.
@@ -624,34 +844,231 @@ impl DaemonStore {
         &self,
         persona_id: Option<&str>,
     ) -> Result<Vec<GrantReceipt>, StoreError> {
-        let (sql, params_vec): (&str, Vec<&dyn rusqlite::ToSql>) = match persona_id {
-            Some(_p) => (
-                "SELECT receipt_json FROM receipts WHERE persona_id = ?1 \
-                 ORDER BY created_at DESC",
-                vec![&persona_id],
-            ),
-            None => (
-                "SELECT receipt_json FROM receipts ORDER BY created_at DESC",
-                Vec::new(),
-            ),
+        self.list_receipts_filtered(&ReceiptFilter {
+            persona_id: persona_id.map(|s| s.to_string()),
+            ..Default::default()
+        })
+    }
+
+    /// List receipts with full filter control. Returns up to `limit` receipts,
+    /// ordered by `created_at DESC`. Used by `/api/receipts`.
+    pub fn list_receipts_filtered(
+        &self,
+        filter: &ReceiptFilter,
+    ) -> Result<Vec<GrantReceipt>, StoreError> {
+        let mut sql = String::from(
+            "SELECT receipt_json, signer_pubkey FROM receipts WHERE 1=1",
+        );
+        let mut binds: Vec<String> = Vec::new();
+        if let Some(ref pid) = filter.persona_id {
+            sql.push_str(&format!(" AND persona_id = ?{}", binds.len() + 1));
+            binds.push(pid.clone());
+        }
+        if filter.signed_only {
+            // Evidence::default() encodes the placeholder pubkey as 64 zero chars.
+            // A real Ed25519 pubkey from a running daemon is never all-zeros.
+            sql.push_str(&format!(" AND signer_pubkey != '{}'", "0".repeat(64)));
+        }
+        if let Some(ref since) = filter.since_iso {
+            sql.push_str(&format!(" AND created_at >= ?{}", binds.len() + 1));
+            binds.push(since.clone());
+        }
+        sql.push_str(" ORDER BY created_at DESC");
+        let limit = filter.limit.unwrap_or(100);
+        sql.push_str(&format!(" LIMIT {limit}"));
+
+        let mut stmt = self.conn().prepare(&sql)?;
+        let mapper =
+            |row: &rusqlite::Row<'_>| -> rusqlite::Result<(String, String)> {
+                Ok((row.get(0)?, row.get(1)?))
+            };
+
+        // rusqlite doesn't support dynamic param slices without unsafe tricks;
+        // match on the number of bound params instead.
+        let pairs: Vec<(String, String)> = match binds.len() {
+            0 => stmt.query_map([], mapper)?.collect::<Result<_, _>>()?,
+            1 => stmt
+                .query_map(rusqlite::params![binds[0]], mapper)?
+                .collect::<Result<_, _>>()?,
+            2 => stmt
+                .query_map(rusqlite::params![binds[0], binds[1]], mapper)?
+                .collect::<Result<_, _>>()?,
+            _ => {
+                // Fallback: run without since-filter (shouldn't happen with current callers).
+                stmt.query_map(rusqlite::params![binds[0]], mapper)?
+                    .collect::<Result<_, _>>()?
+            }
         };
-        // Rebuild params because `persona_id` in the outer `vec!` takes &Option<&str>.
-        let mut stmt = self.conn().prepare(sql)?;
-        let mapper = |row: &rusqlite::Row<'_>| -> rusqlite::Result<String> { row.get(0) };
-        let rows: Vec<String> = match persona_id {
-            Some(p) => stmt
-                .query_map(rusqlite::params![p], mapper)?
-                .collect::<Result<Vec<_>, _>>()?,
-            None => stmt
-                .query_map([], mapper)?
-                .collect::<Result<Vec<_>, _>>()?,
-        };
-        let _ = params_vec; // silence unused — path chosen above
-        let mut out = Vec::with_capacity(rows.len());
-        for raw in rows {
+
+        let mut out = Vec::with_capacity(pairs.len());
+        for (raw, _pubkey) in pairs {
             if let Ok(r) = serde_json::from_str::<GrantReceipt>(&raw) {
                 out.push(r);
             }
+        }
+        Ok(out)
+    }
+
+    /// EMBER-implementation-note-18 — flat audit-row listing for the `ember audit`
+    /// query CLI. Joins the receipts table with `grants` so the row carries
+    /// both the receipt fields and the parent grant's scope.
+    ///
+    /// Filters are AND-combined. `since` is a lower bound on the
+    /// `materialized_at` column (`receipts.created_at`). `resource` is a
+    /// substring match against `summary.resource` (grant receipts) or
+    /// `key_name` (kms receipts) — applied post-fetch so the SQL stays
+    /// index-friendly for exact-match callers.
+    pub fn list_receipt_rows(
+        &self,
+        filter: &ReceiptFilter,
+    ) -> Result<Vec<ReceiptRow>, StoreError> {
+        // Indexed columns first (kind / persona_id / grant_id / created_at).
+        // Build the parameterised SQL with positional binds; keep the bind
+        // vector aligned with the params slice we hand to rusqlite.
+        let mut sql = String::from(
+            "SELECT r.id, r.kind, r.persona_id, r.grant_id, r.terminal_reason, \
+                    r.created_at, r.receipt_json, g.scope \
+             FROM receipts r \
+             LEFT JOIN grants g ON g.id = r.grant_id \
+             WHERE 1=1",
+        );
+        let mut binds: Vec<String> = Vec::new();
+        if let Some(ref kind) = filter.kind {
+            sql.push_str(&format!(" AND r.kind = ?{}", binds.len() + 1));
+            binds.push(kind.clone());
+        }
+        if let Some(ref pid) = filter.persona_id {
+            sql.push_str(&format!(" AND r.persona_id = ?{}", binds.len() + 1));
+            binds.push(pid.clone());
+        }
+        if let Some(ref gid) = filter.grant_id {
+            sql.push_str(&format!(" AND r.grant_id = ?{}", binds.len() + 1));
+            binds.push(gid.clone());
+        }
+        if let Some(ref since) = filter.since_iso {
+            sql.push_str(&format!(" AND r.created_at >= ?{}", binds.len() + 1));
+            binds.push(since.clone());
+        }
+        if filter.signed_only {
+            sql.push_str(&format!(" AND r.signer_pubkey != '{}'", "0".repeat(64)));
+        }
+        sql.push_str(" ORDER BY r.created_at DESC");
+        let limit = filter.limit.unwrap_or(100);
+        sql.push_str(&format!(" LIMIT {limit}"));
+
+        let mut stmt = self.conn().prepare(&sql)?;
+        let mapper =
+            |row: &rusqlite::Row<'_>| -> rusqlite::Result<(
+                String,
+                String,
+                String,
+                String,
+                String,
+                String,
+                String,
+                Option<String>,
+            )> {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            };
+
+        let rows: Vec<_> = match binds.len() {
+            0 => stmt.query_map([], mapper)?.collect::<Result<Vec<_>, _>>()?,
+            1 => stmt
+                .query_map(rusqlite::params![binds[0]], mapper)?
+                .collect::<Result<Vec<_>, _>>()?,
+            2 => stmt
+                .query_map(rusqlite::params![binds[0], binds[1]], mapper)?
+                .collect::<Result<Vec<_>, _>>()?,
+            3 => stmt
+                .query_map(
+                    rusqlite::params![binds[0], binds[1], binds[2]],
+                    mapper,
+                )?
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => stmt
+                .query_map(
+                    rusqlite::params![binds[0], binds[1], binds[2], binds[3]],
+                    mapper,
+                )?
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+
+        let needle = filter
+            .resource
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let mut out = Vec::with_capacity(rows.len());
+        for (id, kind, persona_id, grant_id, terminal_reason, created_at, receipt_json, granted_scope) in
+            rows
+        {
+            // Pull the resource label out of the receipt body. Grant
+            // receipts: `$.summary.resource`. Kms receipts: `$.key_name`.
+            // Fall back to empty string when the field is missing.
+            let resource = match kind.as_str() {
+                "grant" => {
+                    serde_json::from_str::<serde_json::Value>(&receipt_json)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("summary")
+                                .and_then(|s| s.get("resource"))
+                                .and_then(|r| r.as_str())
+                                .map(|s| s.to_string())
+                        })
+                        .unwrap_or_default()
+                }
+                "kms_wrap" | "kms_unwrap" => {
+                    serde_json::from_str::<serde_json::Value>(&receipt_json)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("key_name")
+                                .and_then(|r| r.as_str())
+                                .map(|s| s.to_string())
+                        })
+                        .unwrap_or_default()
+                }
+                _ => String::new(),
+            };
+
+            // Post-fetch substring filter on `resource`.
+            if let Some(ref n) = needle
+                && !resource.contains(n.as_str())
+            {
+                continue;
+            }
+
+            // For grant receipts the scope from the joined grants row is
+            // both the requested and granted view (the table only carries
+            // the current scope; the original block-0 request scope lives
+            // inside `receipt_json.approved_chain[0]` and is left out for
+            // simplicity in v0). For kms receipts the join is meaningless —
+            // surface `None` for both.
+            let (requested_scope, granted_scope) = match kind.as_str() {
+                "grant" => (granted_scope.clone(), granted_scope.clone()),
+                _ => (None, None),
+            };
+
+            out.push(ReceiptRow {
+                id,
+                kind,
+                actor: persona_id,
+                resource,
+                grant_id,
+                materialized_at: created_at,
+                terminal_reason,
+                requested_scope,
+                granted_scope,
+            });
         }
         Ok(out)
     }
@@ -1288,6 +1705,70 @@ mod tests {
         );
     }
 
+    /// verify_receipt uses the caller-supplied trust anchor (expected_pubkey_hex),
+    /// not the receipt's own signer_pubkey field. A receipt whose signer_pubkey
+    /// is set to an attacker's key but whose signature was made by a DIFFERENT
+    /// key must be rejected even if the attacker's key could verify some
+    /// crafted payload — the recomputed hash won't match what the real signer
+    /// signed, so BadSignature fires.
+    #[test]
+    fn verify_receipt_uses_caller_trust_anchor() {
+        let identity = ensure_identity();
+        let store = DaemonStore::open_in_memory().unwrap();
+        let persona = store.create_persona("agent-trust-anchor").unwrap();
+        let grant = store
+            .create_grant(&persona.id, "cred", "read", None)
+            .unwrap();
+        store.revoke_grant(&grant.id).unwrap();
+        let rid = store.get_grant(&grant.id).unwrap().receipt_id.unwrap();
+        let mut r = store.get_receipt(&rid).unwrap();
+
+        // Generate a second (attacker-controlled) keypair.
+        let attacker_seed = [0xABu8; 32];
+        let attacker_key = ed25519_dalek::SigningKey::from_bytes(&attacker_seed);
+        let attacker_pubkey_hex = hex::encode(attacker_key.verifying_key().to_bytes());
+
+        // Swap signer_pubkey to the attacker's key while keeping the real sig.
+        // verify_receipt must still use the CALLER-SUPPLIED identity pubkey
+        // as the trust anchor, so it rejects with SignerMismatch (the
+        // receipt's signer_pubkey no longer matches expected_pubkey_hex).
+        r.evidence.signer_pubkey = attacker_pubkey_hex;
+        let err = verify_receipt(&r, &identity.pubkey_hex()).unwrap_err();
+        assert!(
+            matches!(err, ReceiptVerifyError::SignerMismatch { .. }),
+            "swapping signer_pubkey must produce SignerMismatch, got {err}"
+        );
+
+        // Confirm the original receipt (unmodified signer_pubkey) still verifies
+        // correctly against the real trust anchor.
+        let r_orig = store.get_receipt(&rid).unwrap();
+        verify_receipt(&r_orig, &identity.pubkey_hex())
+            .expect("original receipt verifies against real trust anchor");
+    }
+
+    /// A receipt with an all-zeros placeholder signature returns PlaceholderSig,
+    /// not a generic BadSignature or Malformed error.
+    #[test]
+    fn verify_receipt_distinguishes_placeholder_signature() {
+        let identity = ensure_identity();
+        let store = DaemonStore::open_in_memory().unwrap();
+        let persona = store.create_persona("agent-placeholder-sig").unwrap();
+        let grant = store
+            .create_grant(&persona.id, "cred", "read", None)
+            .unwrap();
+        store.revoke_grant(&grant.id).unwrap();
+        let rid = store.get_grant(&grant.id).unwrap().receipt_id.unwrap();
+        let mut r = store.get_receipt(&rid).unwrap();
+
+        // Replace the real signature with the all-zeros phase-1 placeholder.
+        r.evidence.sig = "00".repeat(64);
+        let err = verify_receipt(&r, &identity.pubkey_hex()).unwrap_err();
+        assert!(
+            matches!(err, ReceiptVerifyError::PlaceholderSig),
+            "all-zeros sig must return PlaceholderSig, got {err}"
+        );
+    }
+
     /// Legacy grants that have no grant.issued audit entries produce an
     /// empty approval chain rather than a crash.
     #[test]
@@ -1365,20 +1846,41 @@ pub fn current_identity() -> Option<&'static DaemonIdentity> {
 /// Variant of [`trigger_receipt_if_terminal`] that uses the process
 /// identity. Logs a warning and no-ops when the identity is not
 /// initialised (test harness, pre-startup paths).
+///
+/// On success, emits an `info!` log line with the new receipt id when a
+/// receipt was actually written (i.e., `Ok(Some(rid))`). The `Ok(None)`
+/// case — grant absent, still active, or already had a receipt — is
+/// surfaced as a `debug!` line so noisy idempotent re-triggers (e.g.
+/// the cascade-revoke path that re-visits already-terminated children)
+/// do not dominate the daemon log.
 pub fn trigger_receipt_if_terminal_current(
     store: &DaemonStore,
     grant_id: &str,
     explicit_reason: Option<TerminalReason>,
 ) -> Option<String> {
     let Some(identity) = current_identity() else {
-        tracing::debug!(
+        tracing::warn!(
             grant_id = %grant_id,
             "receipt emission skipped — daemon identity not initialised"
         );
         return None;
     };
     match trigger_receipt_if_terminal(store, identity, grant_id, explicit_reason) {
-        Ok(rid) => rid,
+        Ok(Some(rid)) => {
+            tracing::info!(
+                grant_id = %grant_id,
+                receipt_id = %rid,
+                "receipt emitted"
+            );
+            Some(rid)
+        }
+        Ok(None) => {
+            tracing::debug!(
+                grant_id = %grant_id,
+                "receipt emission no-op (grant absent, still active, or already has receipt)"
+            );
+            None
+        }
         Err(e) => {
             tracing::warn!(
                 grant_id = %grant_id,
@@ -1387,5 +1889,347 @@ pub fn trigger_receipt_if_terminal_current(
             );
             None
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// implementation-note-3 — kms receipt sink wiring
+// ---------------------------------------------------------------------------
+//
+// `core_kms::ReceiptSink` requires `Send + Sync`, but `DaemonStore` is
+// `!Send + !Sync` because `rusqlite::Connection` cannot move across
+// threads. The bridge: an mpsc channel. The kms HTTP handlers push
+// `KmsReceipt` values into the sender (cheap, lock-free); a single
+// drain task on the daemon's LocalSet receives them and persists via
+// `store.store_kms_receipt(...)`. The drain task signs each receipt with
+// the process-singleton daemon identity before persisting; receipts that
+// arrive before the identity is initialised are stored with the zero-byte
+// placeholder evidence so the row is still recorded.
+
+/// `core_kms::ReceiptSink` impl backed by an unbounded mpsc channel.
+///
+/// Cheap to clone — every clone shares the underlying sender. The
+/// receiver lives on the daemon's runtime and is drained by
+/// [`drain_kms_receipts`].
+#[derive(Clone)]
+pub struct ChannelKmsSink {
+    tx: tokio::sync::mpsc::UnboundedSender<KmsReceipt>,
+}
+
+impl ChannelKmsSink {
+    /// Construct a (sink, receiver) pair. The receiver is one-shot —
+    /// pass it to [`drain_kms_receipts`] exactly once.
+    pub fn channel() -> (Self, tokio::sync::mpsc::UnboundedReceiver<KmsReceipt>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        (Self { tx }, rx)
+    }
+}
+
+impl core_kms::ReceiptSink for ChannelKmsSink {
+    fn record(&self, receipt: KmsReceipt) {
+        // A failing `send` means the daemon's drain task has shut down —
+        // log + drop. Receipts are observability data; never fail a kms
+        // operation because the sink is gone.
+        if let Err(e) = self.tx.send(receipt) {
+            tracing::warn!(error = %e, "kms receipt sink send failed — dropping receipt");
+        }
+    }
+}
+
+/// Drain `rx` until closed, signing each receipt with the process
+/// identity (when initialised) and persisting via `store`.
+///
+/// Run as a `tokio::task::spawn_local` on the daemon's LocalSet — the
+/// `Arc<DaemonStore>` is `!Send` so this task is local-only.
+pub async fn drain_kms_receipts(
+    store: std::sync::Arc<DaemonStore>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<KmsReceipt>,
+) {
+    while let Some(mut receipt) = rx.recv().await {
+        if let Some(identity) = current_identity() {
+            sign_kms_receipt(&mut receipt, identity);
+        }
+        match store.store_kms_receipt(&receipt) {
+            Ok(()) => {
+                tracing::info!(
+                    receipt_id = %receipt.id,
+                    kind = ?receipt.kind,
+                    key_name = %receipt.key_name,
+                    outcome = ?receipt.outcome,
+                    "kms receipt persisted"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    receipt_id = %receipt.id,
+                    error = %e,
+                    "kms receipt persist failed"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod kms_tests {
+    use super::*;
+    use core_types::grant_receipt::{
+        GrantEvaluation, GrantEvaluationOutcome, KmsReceipt, ReceiptKind, ReceiptOutcome,
+    };
+
+    fn fixture_kms_receipt(kind: ReceiptKind, key: &str) -> KmsReceipt {
+        KmsReceipt {
+            id: format!("rct-test-{}", uuid::Uuid::new_v4()),
+            kind,
+            key_name: key.into(),
+            caller_persona: "persona-test".into(),
+            request_size_bytes: 32,
+            materialized_at_epoch_secs: 1_700_000_000,
+            grant_evaluation: GrantEvaluation {
+                outcome: GrantEvaluationOutcome::Allowed,
+                grant_id: Some("grant-test-1".into()),
+            },
+            outcome: ReceiptOutcome::Success,
+            evidence: Evidence::default(),
+        }
+    }
+
+    #[test]
+    fn store_kms_receipt_round_trips() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let r = fixture_kms_receipt(ReceiptKind::KmsWrap, "production-tokens");
+        store.store_kms_receipt(&r).unwrap();
+        let loaded = store.get_kms_receipt(&r.id).unwrap();
+        assert_eq!(loaded, r);
+    }
+
+    #[test]
+    fn store_kms_receipt_rejects_grant_kind() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let mut r = fixture_kms_receipt(ReceiptKind::KmsWrap, "k");
+        r.kind = ReceiptKind::Grant;
+        let err = store.store_kms_receipt(&r).unwrap_err();
+        assert!(matches!(err, StoreError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn list_kms_receipts_for_key_filters_by_key_name() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        // Three receipts: two for key-a (one wrap, one unwrap), one for key-b.
+        let r1 = fixture_kms_receipt(ReceiptKind::KmsWrap, "key-a");
+        let r2 = fixture_kms_receipt(ReceiptKind::KmsUnwrap, "key-a");
+        let r3 = fixture_kms_receipt(ReceiptKind::KmsWrap, "key-b");
+        store.store_kms_receipt(&r1).unwrap();
+        store.store_kms_receipt(&r2).unwrap();
+        store.store_kms_receipt(&r3).unwrap();
+
+        let a = store.list_kms_receipts_for_key("key-a", None).unwrap();
+        assert_eq!(a.len(), 2);
+        assert!(a.iter().all(|r| r.key_name == "key-a"));
+
+        let b = store.list_kms_receipts_for_key("key-b", None).unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].key_name, "key-b");
+    }
+
+    #[test]
+    fn get_kms_receipt_rejects_grant_row() {
+        // A grant receipt persisted via store_receipt must NOT be loadable
+        // through get_kms_receipt — `kind` filter is enforced at the SQL
+        // level so the two paths cannot accidentally return each other's
+        // rows.
+        let _ = ensure_identity_for_kms_test();
+        let store = DaemonStore::open_in_memory().unwrap();
+        let persona = store.create_persona("agent-cross").unwrap();
+        let grant = store
+            .create_grant(&persona.id, "cred", "read", None)
+            .unwrap();
+        store.revoke_grant(&grant.id).unwrap();
+        let grant_receipt_id = store.get_grant(&grant.id).unwrap().receipt_id.unwrap();
+        let err = store.get_kms_receipt(&grant_receipt_id).unwrap_err();
+        assert!(matches!(err, StoreError::NotFound));
+    }
+
+    #[test]
+    fn sign_kms_receipt_populates_evidence() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let identity = ensure_identity_for_kms_test();
+        let mut r = fixture_kms_receipt(ReceiptKind::KmsWrap, "k");
+        sign_kms_receipt(&mut r, identity);
+        assert_eq!(r.evidence.signer_pubkey, identity.pubkey_hex());
+        assert_eq!(r.evidence.sig.len(), 128);
+        assert_eq!(r.evidence.hash.len(), 64);
+        assert_eq!(r.evidence.canonical_version, CANONICAL_VERSION);
+        // Re-hashing the receipt with its evidence still in place must
+        // match — the canonical hash zeros evidence first.
+        let h = kms_canonical_hash(&r);
+        assert_eq!(h, r.evidence.hash);
+        // Receipt persists cleanly.
+        store.store_kms_receipt(&r).unwrap();
+    }
+
+    #[test]
+    fn channel_sink_send_is_send_and_sync() {
+        // Compile-time enforcement: ChannelKmsSink and core_kms::ReceiptSink
+        // bound require Send + Sync so axum can hold them in shared state.
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ChannelKmsSink>();
+    }
+
+    #[tokio::test]
+    async fn drain_kms_receipts_persists_through_channel() {
+        // End-to-end: kms server -> ChannelKmsSink -> drain task -> DaemonStore.
+        // Build a store inside a LocalSet so the !Send Arc is happy.
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let store = std::sync::Arc::new(DaemonStore::open_in_memory().unwrap());
+                let (sink, rx) = ChannelKmsSink::channel();
+                let drain_handle = tokio::task::spawn_local(drain_kms_receipts(store.clone(), rx));
+
+                let r = fixture_kms_receipt(ReceiptKind::KmsWrap, "drain-key");
+                let id = r.id.clone();
+                core_kms::ReceiptSink::record(&sink, r);
+
+                // Drop the sender to close the channel so the drain task exits.
+                drop(sink);
+                drain_handle.await.unwrap();
+
+                let loaded = store.get_kms_receipt(&id).unwrap();
+                assert_eq!(loaded.id, id);
+                assert_eq!(loaded.kind, ReceiptKind::KmsWrap);
+                assert_eq!(loaded.key_name, "drain-key");
+            })
+            .await;
+    }
+
+    /// Ensure the process-singleton identity is initialised for kms tests
+    /// that need to sign. Mirrors the helper in the parent test module.
+    fn ensure_identity_for_kms_test() -> &'static DaemonIdentity {
+        static INIT_DIR: once_cell::sync::OnceCell<tempfile::TempDir> =
+            once_cell::sync::OnceCell::new();
+        let dir = INIT_DIR.get_or_init(|| tempfile::tempdir().expect("tempdir"));
+        let _ = init_identity(dir.path());
+        current_identity().expect("identity was just initialised")
+    }
+
+    /// EMBER-implementation-note-18 — mixed-kind audit query. Seed two kms receipts for
+    /// the same persona (one wrap, one unwrap) plus one for a different
+    /// persona; the actor filter must return only the matching pair, and
+    /// the rows must be sorted `materialized_at DESC`.
+    #[test]
+    fn list_receipt_rows_filters_by_actor_and_sorts_desc() {
+        let _ = ensure_identity_for_kms_test();
+        let store = DaemonStore::open_in_memory().unwrap();
+
+        let mut r1 = fixture_kms_receipt(ReceiptKind::KmsWrap, "k1");
+        r1.caller_persona = "persona-alpha".into();
+        store.store_kms_receipt(&r1).unwrap();
+
+        let mut r2 = fixture_kms_receipt(ReceiptKind::KmsUnwrap, "k1");
+        r2.caller_persona = "persona-alpha".into();
+        store.store_kms_receipt(&r2).unwrap();
+
+        let mut r3 = fixture_kms_receipt(ReceiptKind::KmsWrap, "k2");
+        r3.caller_persona = "persona-beta".into();
+        store.store_kms_receipt(&r3).unwrap();
+
+        let rows = store
+            .list_receipt_rows(&ReceiptFilter {
+                persona_id: Some("persona-alpha".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.actor == "persona-alpha"));
+        // Both rows are kms — resource carries `key_name`, scopes are None.
+        assert!(rows.iter().all(|r| r.resource == "k1"));
+        assert!(rows.iter().all(|r| r.requested_scope.is_none()));
+        assert!(rows.iter().all(|r| r.granted_scope.is_none()));
+        // `materialized_at` is the receipts.created_at column written by
+        // `store_kms_receipt` — same RFC3339 string for back-to-back inserts
+        // is acceptable; we just need the sort key to be a string and the
+        // listing to be DESC stable. Bound by id so the assertion is
+        // independent of clock granularity.
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            ids.contains(&r1.id.as_str()) && ids.contains(&r2.id.as_str()),
+            "both alpha receipts in the result set"
+        );
+    }
+
+    /// EMBER-implementation-note-18 — kind filter narrows to a single discriminator.
+    #[test]
+    fn list_receipt_rows_filters_by_kind() {
+        let _ = ensure_identity_for_kms_test();
+        let store = DaemonStore::open_in_memory().unwrap();
+
+        let r1 = fixture_kms_receipt(ReceiptKind::KmsWrap, "k1");
+        store.store_kms_receipt(&r1).unwrap();
+        let r2 = fixture_kms_receipt(ReceiptKind::KmsUnwrap, "k2");
+        store.store_kms_receipt(&r2).unwrap();
+
+        let wraps = store
+            .list_receipt_rows(&ReceiptFilter {
+                kind: Some("kms_wrap".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(wraps.len(), 1);
+        assert_eq!(wraps[0].kind, "kms_wrap");
+        assert_eq!(wraps[0].resource, "k1");
+    }
+
+    /// EMBER-implementation-note-18 — resource substring filter (post-fetch) narrows
+    /// matches without forcing exact equality.
+    #[test]
+    fn list_receipt_rows_filters_by_resource_substring() {
+        let _ = ensure_identity_for_kms_test();
+        let store = DaemonStore::open_in_memory().unwrap();
+
+        let r1 = fixture_kms_receipt(ReceiptKind::KmsWrap, "production-tokens");
+        store.store_kms_receipt(&r1).unwrap();
+        let r2 = fixture_kms_receipt(ReceiptKind::KmsWrap, "staging-tokens");
+        store.store_kms_receipt(&r2).unwrap();
+        let r3 = fixture_kms_receipt(ReceiptKind::KmsWrap, "demo-keys");
+        store.store_kms_receipt(&r3).unwrap();
+
+        let rows = store
+            .list_receipt_rows(&ReceiptFilter {
+                resource: Some("tokens".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.resource.contains("tokens")));
+    }
+
+    /// EMBER-implementation-note-18 — index existence sanity check. Inspect the
+    /// sqlite_master catalog and confirm the new audit-CLI indexes were
+    /// created by the migration.
+    #[test]
+    fn audit_cli_indexes_exist() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let mut stmt = store
+            .conn()
+            .prepare(
+                "SELECT name FROM sqlite_master \
+                 WHERE type = 'index' AND name LIKE 'idx_receipts_%' \
+                 ORDER BY name",
+            )
+            .unwrap();
+        let names: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            names.iter().any(|n| n == "idx_receipts_actor"),
+            "idx_receipts_actor missing — got {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "idx_receipts_resource"),
+            "idx_receipts_resource missing — got {names:?}"
+        );
     }
 }

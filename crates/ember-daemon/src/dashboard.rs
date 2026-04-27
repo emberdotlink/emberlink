@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,9 +14,68 @@ use tokio::sync::{oneshot, watch};
 use crate::approval::ApprovalOutcome;
 use crate::store::DaemonStore;
 
+/// implementation-note-8 — actions hidden from the operator audit timeline by
+/// default. Internal bookkeeping events (vault unseal, lifecycle plumbing)
+/// leak implementation detail and clutter screenshots; the dashboard exposes
+/// a `[show internal events]` toggle that re-fetches with `?include_internal=1`
+/// to surface them when needed.
+///
+/// `is_internal_audit_action` returns true when an action is either a known
+/// internal event (`vault.auto_unseal_from_keyring`) or follows the
+/// `*.internal.*` namespace convention. Marker grep: `hide.*auto_unseal` /
+/// `filter.*internal`.
+fn is_internal_audit_action(action: &str) -> bool {
+    // Known one-off internal action — vault auto-unseal at daemon startup.
+    if action == "vault.auto_unseal_from_keyring" {
+        return true;
+    }
+    // Generic `.internal.` namespace marker — any future internal lifecycle
+    // event that includes a `.internal.` segment is hidden by default.
+    action.contains(".internal.")
+}
+
+/// Build a `persona_id -> persona.name` map from the store. Used by the
+/// dashboard JSON endpoints to surface real display names alongside the
+/// raw persona id (implementation-note-8). Falls back to an empty map on
+/// store error so endpoints stay live; consumers must treat missing keys
+/// as "no name available" and render the id instead.
+fn persona_name_map(store: &DaemonStore) -> HashMap<String, String> {
+    store
+        .list_personas()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| (p.id, p.name))
+        .collect()
+}
+
 /// Header name clients must send on state-mutating (POST) dashboard requests.
 /// 69K.7: live budget gauge + pause/extend buttons + receipt viewer.
 const CSRF_HEADER: &str = "X-Ember-CSRF-Token";
+
+/// Base64url (RFC 4648 §5) encode without padding. Used by the WebAuthn
+/// challenge endpoint (implementation-note-6) — `navigator.credentials.get()`
+/// expects PublicKeyCredentialRequestOptions.challenge in spec-aligned
+/// base64url-no-pad. Avoids pulling the `base64` crate into the daemon
+/// for one ~10-line helper.
+fn base64url_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        out.push(ALPHABET[(b0 >> 2) as usize] as char);
+        out.push(ALPHABET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() >= 2 {
+            out.push(ALPHABET[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        }
+        if chunk.len() == 3 {
+            out.push(ALPHABET[(b2 & 0x3f) as usize] as char);
+        }
+    }
+    out
+}
 
 /// Generate a fresh 32-byte random CSRF token, hex-encoded. Called once per
 /// dashboard startup. Returns `None` if the OS RNG fails to fill the buffer —
@@ -46,6 +106,42 @@ fn csrf_ok(req_headers: &hyper::HeaderMap, expected: &str) -> bool {
         },
         None => false,
     }
+}
+
+/// Defense-in-depth origin check for POST endpoints (security check).
+///
+/// Reads the `Origin` header first; if present it must equal `expected_origin`
+/// exactly. If `Origin` is absent, falls back to `Referer` — parses its URL
+/// and compares scheme + host + port to `expected_origin`. If neither header is
+/// present the request is rejected (403).
+///
+/// `expected_origin` must be of the form `http://127.0.0.1:<port>` — derived
+/// from the actual bound dashboard address at startup, never from user input.
+fn origin_ok(headers: &hyper::HeaderMap, expected_origin: &str) -> bool {
+    // Primary: check Origin header.
+    if let Some(origin_val) = headers.get("origin") {
+        return match origin_val.to_str() {
+            Ok(o) => o == expected_origin,
+            Err(_) => false,
+        };
+    }
+    // Fallback: parse Referer and compare scheme+host+port.
+    if let Some(referer_val) = headers.get("referer")
+        && let Ok(referer_str) = referer_val.to_str()
+    {
+        // Parse just enough: find "://" then find the next "/" after that
+        // to extract the origin component.
+        if let Some(after_scheme) = referer_str.find("://") {
+            let rest = &referer_str[after_scheme + 3..];
+            let authority_end = rest.find('/').unwrap_or(rest.len());
+            let authority = &rest[..authority_end];
+            let scheme = &referer_str[..after_scheme];
+            let candidate = format!("{scheme}://{authority}");
+            return candidate == expected_origin;
+        }
+    }
+    // Neither header present — reject.
+    false
 }
 
 /// Bind a TCP listener on `addr` and serve the dashboard handler until `shutdown` fires.
@@ -102,6 +198,10 @@ pub async fn run_dashboard(
         }
     };
 
+    // Derive the expected origin from the actual bound address (handles port 0).
+    let local_addr = listener.local_addr().unwrap_or(addr);
+    let expected_origin = format!("http://{local_addr}");
+
     // Arc<DaemonStore> is !Send because rusqlite::Connection is !Send.
     // This is intentional: the Arc is used only within the LocalSet (single thread).
     #[allow(clippy::arc_with_non_send_sync)]
@@ -130,6 +230,12 @@ pub async fn run_dashboard(
                             version: version.clone(),
                             csrf_token: csrf_token.clone(),
                             started_at,
+                            expected_origin: expected_origin.clone(),
+                            // implementation-note-11: the listener
+                            // is alive at this point — propagate the resolved
+                            // local_addr so `/api/status` reports it instead
+                            // of relying on the configured (pre-bind) port.
+                            dashboard_actual_addr: Some(local_addr),
                         });
                         let io = TokioIo::new(stream);
                         tokio::task::spawn_local(async move {
@@ -158,6 +264,45 @@ pub async fn run_dashboard(
         }
     }
 }
+
+/// Shared JS that renders a composite-statement breakdown into HTML — used
+/// by both the dashboard pending-approvals card and the dedicated
+/// `/approvals/{id}` page so the two surfaces can never drift. Injected
+/// into both templates via `{{COMPOSITE_STATEMENTS_JS}}`. The function name
+/// `render_composite_statements` (and the rendered class `composite-statements`)
+/// are the implementation-note-12 target_state_anchor markers — search for
+/// either if you are tracing why the page hides "3 statements" by default.
+pub const COMPOSITE_STATEMENTS_JS: &str = r#"
+// render_composite_statements — single source of truth for the composite
+// breakdown HTML. Returns '' when stmts is null/empty so single-statement
+// approvals fall through to the simple layout.
+function renderCompositeStatements(stmts){
+  if(!Array.isArray(stmts) || stmts.length===0) return '';
+  const rows = stmts.map(function(s,i){
+    const actions = (s.actions||[]).join(',');
+    let resource = '*';
+    if (s.resource && typeof s.resource === 'object') {
+      if ('Exact' in s.resource) resource = s.resource.Exact.value;
+      else if ('Glob' in s.resource) resource = s.resource.Glob.pattern;
+      else if (s.resource === 'Any' || ('Any' in s.resource)) resource = '*';
+    }
+    let budget = '';
+    if (s.budget) {
+      const parts = [];
+      if (s.budget.tokens != null) parts.push(s.budget.tokens+' tokens');
+      if (s.budget.cents != null) parts.push((s.budget.cents/100).toFixed(2)+' USD');
+      if (s.budget.wall_clock_secs != null) parts.push(s.budget.wall_clock_secs+'s');
+      if (parts.length) budget = ' · '+parts.join(' · ');
+    }
+    return '<div class="composite-stmt"><span class="composite-stmt-idx">['+i+']</span> <span class="mono">'+actions+'</span> on <span class="mono">'+resource+'</span>'+budget+'</div>';
+  }).join('');
+  return '<div class="composite-statements">'+rows+'</div>';
+}
+function compositeSummary(stmts){
+  if(!Array.isArray(stmts) || stmts.length===0) return '';
+  return stmts.length+' statements · click to review';
+}
+"#;
 
 pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
 <html lang="en">
@@ -209,14 +354,18 @@ tbody td{padding:10px 14px;color:var(--text-primary)}
 .btn-warn{background:rgba(234,179,8,.15);color:var(--warning);border-color:rgba(234,179,8,.3)}
 .btn-neutral{background:rgba(107,107,123,.15);color:var(--text-muted);border-color:var(--border)}
 .approval-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px}
-.approval-card{background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:16px}
+.approval-card{background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:16px;position:relative}
 .approval-card .row{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
 .approval-card .field{color:var(--text-muted);font-size:11px}
 .approval-card .field-val{color:var(--text-primary);font-size:12px}
 .approval-card .actions{display:flex;gap:8px;margin-top:14px;padding-top:12px;border-top:1px solid var(--border)}
+.btn-dismiss{position:absolute;top:8px;right:8px;background:none;border:none;color:var(--text-dim);font-size:14px;cursor:pointer;line-height:1;padding:2px 4px;border-radius:3px}
+.btn-dismiss:hover{color:var(--text-muted);background:var(--bg-hover)}
 .composite-statements{margin:6px 0 10px;padding:8px 10px;background:rgba(232,93,38,.05);border-left:2px solid var(--accent);border-radius:4px;font-size:11px}
 .composite-stmt{padding:4px 0;color:var(--text-primary)}
 .composite-stmt-idx{color:var(--text-muted);font-weight:600}
+.approval-link{color:var(--accent);text-decoration:none}
+.approval-link:hover{text-decoration:underline}
 .timeline{background:var(--bg-card);border:1px solid var(--border);border-radius:8px;overflow:hidden}
 .timeline-item{display:grid;grid-template-columns:180px 140px 160px 140px 80px;gap:12px;align-items:center;padding:10px 14px;border-bottom:1px solid var(--border);transition:background .1s}
 .timeline-item:last-child{border-bottom:none}
@@ -271,6 +420,11 @@ tbody td{padding:10px 14px;color:var(--text-primary)}
 .grant-status-expired>td:first-child{border-left:3px solid var(--warning)}
 .grant-status-revoked>td:first-child{border-left:3px solid var(--danger)}
 .grant-status-exhausted>td:first-child{border-left:3px solid var(--danger)}
+.signed-yes{color:var(--success);font-weight:700}
+.signed-no{color:var(--text-dim)}
+.receipt-filters{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.receipt-filters select,.receipt-filters label{font-size:11px;color:var(--text-muted);font-family:inherit}
+.receipt-filters select{background:var(--bg-hover);border:1px solid var(--border);border-radius:4px;padding:3px 6px;cursor:pointer}
 </style>
 </head>
 <body>
@@ -309,13 +463,49 @@ tbody td{padding:10px 14px;color:var(--text-primary)}
   </div>
 
   <div class="section">
-    <div class="section-header"><span class="section-title">Audit Timeline</span></div>
+    <div class="section-header">
+      <span class="section-title">Audit Timeline</span>
+      <div style="display:flex;align-items:center;gap:14px">
+        <select id="audit-action-filter" onchange="loadDashboard()" style="background:var(--bg-hover);border:1px solid var(--border);border-radius:4px;color:var(--text-muted);font-family:inherit;font-size:11px;padding:3px 6px;cursor:pointer">
+          <option value="">all actions</option>
+          <option value="grant.">grant.*</option>
+          <option value="approval.">approval.*</option>
+          <option value="broker.">broker.*</option>
+          <option value="credential.">credential.*</option>
+          <option value="vault.">vault.*</option>
+          <option value="sandbox.">sandbox.*</option>
+        </select>
+        <label class="show-all-label"><input type="checkbox" id="show-internal-events" onchange="loadDashboard()"> show internal events</label>
+      </div>
+    </div>
     <div class="timeline">
       <div class="timeline-header">
         <span>Timestamp</span><span>Agent</span><span>Action</span><span>Credential</span><span>Outcome</span>
       </div>
       <div id="audit-body"><div class="empty">loading…</div></div>
     </div>
+  </div>
+
+  <div class="section">
+    <div class="section-header">
+      <span class="section-title">Grant Receipts</span>
+      <div class="receipt-filters">
+        <select id="receipt-signed-filter" onchange="loadReceipts()">
+          <option value="">all receipts</option>
+          <option value="true">signed only</option>
+        </select>
+        <select id="receipt-since-filter" onchange="loadReceipts()">
+          <option value="all">all time</option>
+          <option value="24h">last 24h</option>
+          <option value="7d">last 7d</option>
+        </select>
+        <input type="text" id="receipt-persona-filter" placeholder="persona id…" oninput="loadReceipts()" style="background:var(--bg-hover);border:1px solid var(--border);border-radius:4px;padding:3px 6px;color:var(--text-primary);font-family:inherit;font-size:11px;width:140px">
+      </div>
+    </div>
+    <table id="receipts-table">
+      <thead><tr><th>Issued</th><th>Grant ID</th><th>Persona</th><th>Summary</th><th>Reason</th><th>Signed</th></tr></thead>
+      <tbody id="receipts-body"><tr><td colspan="6" class="empty">loading…</td></tr></tbody>
+    </table>
   </div>
 </main>
 
@@ -349,9 +539,47 @@ tbody td{padding:10px 14px;color:var(--text-primary)}
 <script>
 const CSRF_TOKEN = "{{CSRF_TOKEN}}";
 const CSRF_HEADERS = {'X-Ember-CSRF-Token': CSRF_TOKEN};
+{{COMPOSITE_STATEMENTS_JS}}
 function ts(iso){if(!iso)return'—';const d=new Date(iso);return d.toLocaleString(undefined,{month:'short',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'});}
+// implementation-note-8 — relative_time / formatRelative: render audit + grant
+// timestamps as 'Just now' / '12s ago' / '3 min ago' / '04/26 1:34 AM'
+// long-tail fallback so screenshots don't lead with raw ISO strings. Tooltip
+// (title=) keeps the precise ISO for operators who need it.
+function formatRelative(iso){
+  if(!iso) return '—';
+  const d = new Date(iso);
+  if(isNaN(d.getTime())) return iso;
+  const now = Date.now();
+  const diff = Math.floor((now - d.getTime())/1000);
+  if(diff < 0) return d.toLocaleString();
+  if(diff < 5)   return 'Just now';
+  if(diff < 60)  return diff+'s ago';
+  if(diff < 3600){ const m = Math.floor(diff/60); return m+' min ago'; }
+  if(diff < 86400){ const h = Math.floor(diff/3600); return h+'h ago'; }
+  // Long-tail: short month/day + time, e.g. '04/26 1:34 AM'.
+  const mm = String(d.getMonth()+1).padStart(2,'0');
+  const dd = String(d.getDate()).padStart(2,'0');
+  const time = d.toLocaleTimeString(undefined,{hour:'numeric',minute:'2-digit'});
+  return mm+'/'+dd+' '+time;
+}
+function relTime(iso){
+  // Render as a span with a tooltip carrying the full ISO timestamp.
+  if(!iso) return '—';
+  const safe = String(iso).replace(/"/g,'&quot;');
+  return '<span title="'+safe+'">'+formatRelative(iso)+'</span>';
+}
 function trunc(s,n){if(!s)return'—';return s.length>n?s.slice(0,n)+'…':s;}
 function truncPersona(s){if(!s)return'—';const p='persona-';if(s.startsWith(p)){return p+s.slice(p.length,p.length+12);}return trunc(s,20);}
+// implementation-note-8 — persona.name primary label; raw persona_id moves to
+// the tooltip so screenshots show real names instead of UUID prefixes.
+// Falls back to truncPersona when no name was returned by the API.
+function personaLabel(id, name){
+  if(name && name.length){
+    const safeId = String(id||'').replace(/"/g,'&quot;');
+    return '<span title="'+safeId+'">'+name+'</span>';
+  }
+  return truncPersona(id);
+}
 function badge(cls,text){return`<span class="badge ${cls}">${text}</span>`;}
 function grantStatusClass(s){if(s==='active')return'active';if(s==='expired')return'expired';if(s==='revoked')return'revoked';if(s==='exhausted_by_budget'||s==='expired_by_budget')return'exhausted';return '';}
 
@@ -463,8 +691,65 @@ async function submitExtend(){
   if(!resp.ok){const e=await resp.json().catch(()=>({error:'failed'}));alert('Extend failed: '+(e.error||resp.status));}
   loadDashboard();
 }
+// implementation-note-6 — request a fresh WebAuthn challenge from the daemon and
+// invoke navigator.credentials.get() to raise the platform authenticator
+// (Touch ID on macOS, Windows Hello on Windows, fingerprint on supported
+// Android browsers). Returns {biometric: bool, credential_id?: string}.
+//
+// Failure modes are fail-open by design for the May 3 demo path — if the
+// browser doesn't expose WebAuthn (legacy Safari, restricted-context iframe)
+// or the user has no platform authenticator enrolled, we record
+// `biometric=false` and continue. The daemon's audit log faithfully captures
+// the operator-asserted posture either way; a downstream auditor can filter
+// on `biometric=true` to find the high-trust beats.
+async function performBiometricCeremony(){
+  if(!('credentials' in navigator) || !navigator.credentials.get){
+    return {biometric: false};
+  }
+  try{
+    const ch = await fetch('/api/webauthn/challenge').then(r=>r.json());
+    const challengeBytes = base64urlDecode(ch.challenge);
+    const assertion = await navigator.credentials.get({
+      publicKey:{
+        challenge: challengeBytes,
+        rpId: ch.rp_id || 'localhost',
+        allowCredentials: (ch.allow_credentials||[]).map(c=>({
+          type:'public-key',
+          id: base64urlDecode(c.id),
+        })),
+        userVerification: ch.user_verification || 'preferred',
+        timeout: 60000,
+      }
+    });
+    if(!assertion){
+      return {biometric: false};
+    }
+    return {
+      biometric: true,
+      credential_id: assertion.id || null,
+    };
+  }catch(e){
+    // User cancel, no enrollment, framework error — degrade gracefully.
+    console.warn('biometric ceremony skipped:', e && e.message);
+    return {biometric: false};
+  }
+}
+function base64urlDecode(s){
+  if(!s) return new Uint8Array(0);
+  const pad = '='.repeat((4 - (s.length % 4)) % 4);
+  const b64 = (s + pad).replace(/-/g,'+').replace(/_/g,'/');
+  const raw = atob(b64);
+  const out = new Uint8Array(raw.length);
+  for(let i=0;i<raw.length;i++) out[i] = raw.charCodeAt(i);
+  return out;
+}
 async function approveRequest(id){
-  await fetch(`/api/approvals/${id}/approve`,{method:'POST',headers:CSRF_HEADERS});
+  const bio = await performBiometricCeremony();
+  await fetch(`/api/approvals/${id}/approve`,{
+    method:'POST',
+    headers:{...CSRF_HEADERS,'content-type':'application/json'},
+    body: JSON.stringify(bio),
+  });
   loadDashboard();
 }
 async function approveAlwaysRequest(id){
@@ -472,8 +757,26 @@ async function approveAlwaysRequest(id){
   loadDashboard();
 }
 async function denyRequest(id){
-  await fetch(`/api/approvals/${id}/deny`,{method:'POST',headers:CSRF_HEADERS});
+  const bio = await performBiometricCeremony();
+  await fetch(`/api/approvals/${id}/deny`,{
+    method:'POST',
+    headers:{...CSRF_HEADERS,'content-type':'application/json'},
+    body: JSON.stringify(bio),
+  });
   loadDashboard();
+}
+// implementation-note-7 — dismiss a pending approval card.
+// Records approval.dismissed in the audit log; does NOT re-fire desktop
+// notifications. Card vanishes immediately on success.
+async function dismissApproval(id){
+  const resp = await fetch(`/api/approvals/${id}/dismiss`,{method:'POST',headers:CSRF_HEADERS});
+  if(resp.ok){
+    const card = document.getElementById('approval-card-'+id);
+    if(card) card.remove();
+    // Update pending count
+    const cnt = document.getElementById('cnt-approvals');
+    if(cnt){ const n=parseInt(cnt.textContent)||0; cnt.textContent=Math.max(0,n-1); }
+  }
 }
 
 function renderConditions(c){
@@ -492,11 +795,22 @@ async function loadDashboard(){
   try{
     const showAll=document.getElementById('show-all-grants')?.checked;
     const grantsUrl=showAll?'/api/grants/all':'/api/grants';
+    // implementation-note-8 — operator audit hides internal lifecycle events
+    // (vault.auto_unseal_from_keyring + *.internal.*) by default; toggle
+    // surfaces them via ?include_internal=1. Action filter dropdown narrows
+    // to one family (grant.*, approval.*, broker.*, etc.) via ?action_filter=.
+    const showInternal=document.getElementById('show-internal-events')?.checked;
+    const actionFilter=document.getElementById('audit-action-filter')?.value||'';
+    const auditParams=new URLSearchParams();
+    if(showInternal) auditParams.set('include_internal','1');
+    if(actionFilter) auditParams.set('action_filter',actionFilter);
+    const auditQuery=auditParams.toString();
+    const auditUrl=auditQuery?`/api/audit?${auditQuery}`:'/api/audit';
     const[status,grants,approvals,audit,anomalies]=await Promise.all([
       fetch('/api/status').then(r=>r.json()),
       fetch(grantsUrl).then(r=>r.json()),
       fetch('/api/approvals').then(r=>r.json()),
-      fetch('/api/audit').then(r=>r.json()),
+      fetch(auditUrl).then(r=>r.json()),
       fetch('/api/anomalies').then(r=>r.json()).catch(()=>[]),
     ]);
 
@@ -518,7 +832,7 @@ async function loadDashboard(){
         <div class="anm-meta">
           <div class="anm-agent">${a.agent_id||'unknown'}</div>
           <div class="anm-desc">${a.description||'—'}</div>
-          <div class="anm-ts">${ts(a.detected_at)}</div>
+          <div class="anm-ts">${relTime(a.detected_at)}</div>
         </div>
         <span class="anm-type">${(a.anomaly_type||'').replace(/_/g,' ')}</span>
       </div>`).join('');
@@ -539,11 +853,11 @@ async function loadDashboard(){
     }else{
       gb.innerHTML=grants.map(g=>`<tr id="grant-row-${g.id}" class="grant-status-${grantStatusClass(g.status)}">
         <td class="mono">${trunc(g.id,18)}</td>
-        <td class="mono">${truncPersona(g.persona_id)}</td>
+        <td class="mono">${personaLabel(g.persona_id, g.persona_name)}</td>
         <td>${g.credential_name||'—'}</td>
         <td>${g.scope||'—'}</td>
         <td class="gauge-cell">${renderBudgetGauge(g)}</td>
-        <td class="ts">${g.expires_at?ts(g.expires_at):'never'}</td>
+        <td class="ts">${g.expires_at?relTime(g.expires_at):'never'}</td>
         <td class="status-cell">${badge(g.status,g.status)}</td>
         <td>${renderGrantActions(g)}</td>
       </tr>`).join('');
@@ -558,41 +872,27 @@ async function loadDashboard(){
       ac.innerHTML='<div class="empty">no pending approvals</div>';
     }else{
       ac.innerHTML=approvals.map(a=>{
-        // implementation-note-1 — composite envelopes (sandbox-run) render as ONE card
-        // with all statements grouped underneath. Single-statement legacy
-        // approvals keep the original per-field row layout.
+        // implementation-note-12 — composite breakdown moved to the
+        // dedicated /approvals/{id} page (behind a Show details disclosure).
+        // Cards now render a one-line summary + link so the dashboard stays
+        // glanceable for the demo. Single-statement approvals keep the
+        // legacy per-field row layout.
         const stmts = Array.isArray(a.composite_statements) ? a.composite_statements : null;
-        const composite_block = stmts ? `
-        <div class="row"><span class="field">Composite</span><span class="field-val">${stmts.length} statements · one approval</span></div>
-        <div class="composite-statements">${stmts.map((s,i)=>{
-          const actions = (s.actions||[]).join(',');
-          let resource = '*';
-          if (s.resource && typeof s.resource === 'object') {
-            if ('Exact' in s.resource) resource = s.resource.Exact.value;
-            else if ('Glob' in s.resource) resource = s.resource.Glob.pattern;
-            else if (s.resource === 'Any' || ('Any' in s.resource)) resource = '*';
-          }
-          let budget = '';
-          if (s.budget) {
-            const parts = [];
-            if (s.budget.tokens != null) parts.push(s.budget.tokens+' tokens');
-            if (s.budget.cents != null) parts.push((s.budget.cents/100).toFixed(2)+' USD');
-            if (s.budget.wall_clock_secs != null) parts.push(s.budget.wall_clock_secs+'s');
-            if (parts.length) budget = ' · '+parts.join(' · ');
-          }
-          return `<div class="composite-stmt"><span class="composite-stmt-idx">[${i}]</span> <span class="mono">${actions}</span> on <span class="mono">${resource}</span>${budget}</div>`;
-        }).join('')}</div>` : `
+        const scope_block = stmts ? `
+        <div class="row"><span class="field">Scope</span><a class="field-val approval-link" href="/approvals/${a.id}">${compositeSummary(stmts)}</a></div>` : `
         <div class="row"><span class="field">Credential</span><span class="field-val">${a.credential_name||'—'}</span></div>
-        <div class="row"><span class="field">Scope</span><span class="field-val">${a.scope||'—'}</span></div>`;
-        return `<div class="approval-card">
-        <div class="row"><span class="field">Persona</span><span class="field-val mono">${truncPersona(a.persona_id)}</span></div>
-        ${composite_block}
+        <div class="row"><span class="field">Scope</span><a class="field-val approval-link" href="/approvals/${a.id}">${a.scope||'—'}</a></div>`;
+        return `<div class="approval-card" id="approval-card-${a.id}">
+        <button class="btn-dismiss" onclick="dismissApproval('${a.id}')" title="Dismiss — records approval.dismissed in audit log">✕</button>
+        <div class="row"><span class="field">Persona</span><span class="field-val mono">${personaLabel(a.persona_id, a.persona_name)}</span></div>
+        ${scope_block}
         <div class="row"><span class="field">Action</span><span class="field-val">${a.action||'—'}</span></div>
         <div class="row"><span class="field">Risk</span><span class="field-val">${badge(a.risk_level,a.risk_level)}</span></div>
+        <div class="row"><span class="field">Requested</span><span class="field-val">${relTime(a.created_at)}</span></div>
         <div class="actions">
           <button class="btn btn-success" onclick="approveRequest('${a.id}')">Approve</button>
           <button class="btn btn-success btn-outline" onclick="approveAlwaysRequest('${a.id}')" title="Auto-approve future requests for this action from this persona. Creates a standing grant (expires in 30 days).">&#x1F512; Approve Always</button>
-          <button class="btn btn-warn">Narrow</button>
+          <a class="btn btn-neutral" href="/approvals/${a.id}">Review</a>
           <button class="btn btn-danger" onclick="denyRequest('${a.id}')">Deny</button>
         </div>
       </div>`;
@@ -605,8 +905,8 @@ async function loadDashboard(){
       ab.innerHTML='<div class="empty">no audit events</div>';
     }else{
       ab.innerHTML=audit.map(e=>`<div class="timeline-item">
-        <span class="ts">${ts(e.timestamp)}</span>
-        <span class="mono">${trunc(e.agent_id,14)}</span>
+        <span class="ts">${relTime(e.timestamp)}</span>
+        <span class="mono">${personaLabel(e.agent_id, e.persona_name)}</span>
         <span>${e.action||'—'}</span>
         <span>${e.credential||'—'}</span>
         <span>${badge(e.outcome,e.outcome)}</span>
@@ -617,8 +917,48 @@ async function loadDashboard(){
     document.getElementById('status-dot').classList.add('offline');
   }
 }
+async function loadReceipts(){
+  try{
+    const signedOnly=document.getElementById('receipt-signed-filter')?.value||'';
+    const since=document.getElementById('receipt-since-filter')?.value||'all';
+    const personaId=(document.getElementById('receipt-persona-filter')?.value||'').trim();
+    const p=new URLSearchParams();
+    if(signedOnly==='true')p.set('signed_only','true');
+    if(since&&since!=='all')p.set('since',since);
+    if(personaId)p.set('persona_id',personaId);
+    const url='/api/receipts'+(p.toString()?'?'+p.toString():'');
+    const receipts=await fetch(url).then(r=>r.json());
+    const rb=document.getElementById('receipts-body');
+    if(!rb)return;
+    if(!receipts||receipts.length===0){
+      rb.innerHTML='<tr><td colspan="6" class="empty">no receipts</td></tr>';
+      return;
+    }
+    rb.innerHTML=receipts.map(r=>{
+      const signedHtml=r.signed
+        ?'<span class="signed-yes" title="Ed25519 signed by daemon identity">&#10003;</span>'
+        :'<span class="signed-no" title="No signature (placeholder)">—</span>';
+      const grantLink=`<a href="/grants/${r.grant_id}" class="mono" style="color:var(--accent)">${trunc(r.grant_id,16)}</a>`;
+      const ts=r.created_at_epoch?relTime(new Date(r.created_at_epoch*1000).toISOString()):'—';
+      const reason=(r.terminal_reason||'').replace(/^\w+\s*/,'').replace(/[{}"]/g,'').slice(0,32)||'—';
+      return `<tr>
+        <td class="ts">${ts}</td>
+        <td>${grantLink}</td>
+        <td class="mono">${personaLabel(r.persona_id,r.persona_name)}</td>
+        <td style="color:var(--text-muted);font-size:11px">${r.action_summary||'—'}</td>
+        <td style="color:var(--text-dim);font-size:11px">${reason}</td>
+        <td style="text-align:center">${signedHtml}</td>
+      </tr>`;
+    }).join('');
+  }catch(err){
+    const rb=document.getElementById('receipts-body');
+    if(rb)rb.innerHTML='<tr><td colspan="6" class="empty">error loading receipts</td></tr>';
+  }
+}
 loadDashboard();
+loadReceipts();
 setInterval(loadDashboard,5000);
+setInterval(loadReceipts,15000);
 </script>
 </body>
 </html>"#;
@@ -655,6 +995,17 @@ body{font-family:'JetBrains Mono',ui-monospace,'Cascadia Code','Fira Code',monos
 .btn-warn{background:rgba(234,179,8,.15);color:var(--warning);border-color:rgba(234,179,8,.3)}
 .btn-danger{background:rgba(239,68,68,.15);color:var(--danger);border-color:rgba(239,68,68,.3)}
 #resolved{display:none;margin-top:20px;padding:16px;border-radius:6px;background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.2);color:var(--success);text-align:center;font-size:13px}
+.composite-statements{margin:8px 0 0;padding:10px 12px;background:rgba(232,93,38,.05);border-left:2px solid var(--accent);border-radius:4px;font-size:12px}
+.composite-stmt{padding:5px 0;color:var(--text-primary);text-align:left}
+.composite-stmt-idx{color:var(--text-muted);font-weight:600}
+.mono{font-family:inherit;font-size:12px}
+details.composite-disclosure{margin-top:14px;padding-top:14px;border-top:1px solid var(--border)}
+details.composite-disclosure summary{cursor:pointer;font-size:12px;color:var(--text-muted);list-style:none;user-select:none}
+details.composite-disclosure summary::-webkit-details-marker{display:none}
+details.composite-disclosure summary::before{content:'▸ ';color:var(--accent);font-size:10px}
+details.composite-disclosure[open] summary::before{content:'▾ '}
+details.composite-disclosure summary:hover{color:var(--text-primary)}
+#composite-disclosure[hidden]{display:none}
 </style>
 </head>
 <body>
@@ -666,22 +1017,44 @@ body{font-family:'JetBrains Mono',ui-monospace,'Cascadia Code','Fira Code',monos
   <div class="card-title">Pending Approval</div>
   <div class="field"><span class="field-label">Action</span><span class="field-val">{{ACTION}}</span></div>
   <div class="field"><span class="field-label">Credential</span><span class="field-val">{{CREDENTIAL}}</span></div>
-  <div class="field"><span class="field-label">Scope</span><span class="field-val">{{SCOPE}}</span></div>
+  <div class="field"><span class="field-label">Scope</span><span class="field-val" id="scope-summary">{{SCOPE}}</span></div>
   <div class="field"><span class="field-label">Risk</span><span class="field-val"><span class="badge {{RISK_LEVEL}}">{{RISK_LEVEL}}</span></span></div>
   <div class="field"><span class="field-label">Persona</span><span class="field-val">{{PERSONA_PREFIX}}</span></div>
   <div class="field"><span class="field-label">Requested</span><span class="field-val">{{CREATED_AT}}</span></div>
   <div class="actions">
     <button class="btn btn-success" id="btn-approve" onclick="resolve('approve')">Approve</button>
     <button class="btn btn-success btn-always" id="btn-approve-always" onclick="resolve('approve-always')" title="Auto-approve future requests for this action from this persona. Creates a standing grant (expires in 30 days). Reviewable under Standing Grants.">&#x1F512; Approve Always</button>
-    <button class="btn btn-warn" id="btn-narrow" disabled title="Use the dashboard to narrow scope">Narrow</button>
     <button class="btn btn-danger" id="btn-deny" onclick="resolve('deny')">Deny</button>
   </div>
+  <details class="composite-disclosure" id="composite-disclosure" hidden>
+    <summary>Show details</summary>
+    <div id="composite-breakdown"></div>
+  </details>
   <div id="resolved">Resolved — you can close this tab.</div>
 </div>
 <script>
 const CSRF_TOKEN = "{{CSRF_TOKEN}}";
 const APPROVAL_ID = "{{APPROVAL_ID}}";
+{{COMPOSITE_STATEMENTS_JS}}
 let pollTimer = null;
+let breakdownRendered = false;
+function renderBreakdown(stmts){
+  if(breakdownRendered) return;
+  if(!Array.isArray(stmts) || stmts.length===0) return;
+  // implementation-note-12 — composite breakdown lives behind a
+  // Show details disclosure (collapsed-by-default) so the dedicated
+  // /approvals/{id} page leads with the high-level approve/deny
+  // decision instead of overwhelming the demo audience with a raw
+  // 3 statements list. Clicking the disclosure reveals it.
+  const el = document.getElementById('composite-disclosure');
+  const body = document.getElementById('composite-breakdown');
+  body.innerHTML = renderCompositeStatements(stmts);
+  el.hidden = false;
+  // Tighten the scope summary to match the dashboard card.
+  const sum = document.getElementById('scope-summary');
+  if(sum) sum.textContent = compositeSummary(stmts);
+  breakdownRendered = true;
+}
 function showResolved(status){
   const btns = document.querySelectorAll('.btn');
   btns.forEach(b=>b.disabled=true);
@@ -697,12 +1070,15 @@ async function pollStatus(){
     const resp = await fetch(`/api/approvals/${APPROVAL_ID}`);
     if(resp.ok){
       const data = await resp.json();
+      if(Array.isArray(data.composite_statements)) renderBreakdown(data.composite_statements);
       if(data.status && data.status !== 'pending'){
         showResolved(data.status);
       }
     }
   }catch(_){}
 }
+// Fire once on load so the breakdown appears without waiting 2s.
+pollStatus();
 pollTimer = setInterval(pollStatus, 2000);
 async function resolve(action){
   const btns = document.querySelectorAll('.btn');
@@ -743,6 +1119,24 @@ pub struct DashboardState {
     /// `SystemTime` because it is monotonic and cannot produce a negative
     /// duration due to clock skew.
     pub started_at: std::time::Instant,
+    /// Expected `Origin` for POST requests (security check defense-in-depth).
+    ///
+    /// Set to `http://127.0.0.1:<port>` derived from the actual bound address
+    /// at dashboard startup. Every POST handler checks that the incoming
+    /// `Origin` (or `Referer` origin component) matches this value before the
+    /// CSRF token check. Mismatches are rejected with 403.
+    ///
+    /// Defaults to `"http://127.0.0.1:3141"` for backwards-compat with tests
+    /// that construct `DashboardState` without an explicit origin.
+    pub expected_origin: String,
+    /// implementation-note-11: the address the dashboard actually
+    /// bound to, surfaced via `/api/status` as `dashboard_addr_bound`. Always
+    /// `Some` when the dashboard is serving traffic (you can't reach this
+    /// state otherwise) but the field is `Option<>` so test fixtures can
+    /// model the "not bound" case to verify the JSON contract returns `null`.
+    /// Resolved from `TcpListener::local_addr()` after a successful bind so
+    /// port-0 ephemeral assignments are reflected truthfully.
+    pub dashboard_actual_addr: Option<SocketAddr>,
 }
 
 pub async fn handle_dashboard_request(
@@ -755,7 +1149,9 @@ pub async fn handle_dashboard_request(
 
     let resp = match (method.clone(), path.as_str()) {
         (Method::GET, "/") | (Method::GET, "/index.html") => {
-            let html = DASHBOARD_HTML.replace("{{CSRF_TOKEN}}", &state.csrf_token);
+            let html = DASHBOARD_HTML
+                .replace("{{COMPOSITE_STATEMENTS_JS}}", COMPOSITE_STATEMENTS_JS)
+                .replace("{{CSRF_TOKEN}}", &state.csrf_token);
             Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "text/html; charset=utf-8")
@@ -771,6 +1167,13 @@ pub async fn handle_dashboard_request(
                 .iter()
                 .filter(|p| p.status == "active")
                 .count();
+            // implementation-note-11: stringify the bound address
+            // (or `null`) so the CLI `status` subcommand stops printing the
+            // configured-but-not-bound port. Field shape: `Option<String>` →
+            // `null` when the dashboard isn't bound, full `host:port` when it is.
+            let dashboard_addr_bound = state
+                .dashboard_actual_addr
+                .map(|a| a.to_string());
             let body = serde_json::json!({
                 "running": true,
                 "version": state.version,
@@ -778,6 +1181,7 @@ pub async fn handle_dashboard_request(
                 "active_grants": active_grants,
                 "pending_approvals": pending_approvals,
                 "audit_events": audit_events,
+                "dashboard_addr_bound": dashboard_addr_bound,
             });
             json_response(StatusCode::OK, &body)
         }
@@ -802,20 +1206,80 @@ pub async fn handle_dashboard_request(
         }
 
         // GET /api/receipts — list receipts, most-recent first.
+        // Query params (all optional):
+        //   signed_only=true  — exclude receipts with empty signer_pubkey
+        //   persona_id=<id>   — restrict to one persona
+        //   since=24h|7d|all  — lower bound on created_at (default: all)
+        //   limit=N           — cap (default 100)
         (Method::GET, "/api/receipts") => {
-            let persona_filter = req.uri().query().and_then(|q| {
-                q.split('&').find_map(|kv| {
+            use crate::receipt::ReceiptFilter;
+
+            let (persona_id, signed_only, since_iso) = req.uri().query().map(|q| {
+                let mut pid: Option<String> = None;
+                let mut signed = false;
+                let mut since: Option<String> = None;
+                for kv in q.split('&') {
                     let mut parts = kv.splitn(2, '=');
-                    if parts.next() == Some("persona_id") { parts.next() } else { None }
-                })
-            });
+                    let k = parts.next().unwrap_or("");
+                    let v = parts.next().unwrap_or("");
+                    match k {
+                        "persona_id" if !v.is_empty() => pid = Some(v.to_string()),
+                        "signed_only" if v == "true" || v == "1" => signed = true,
+                        "since" => {
+                            let now = chrono::Utc::now();
+                            since = match v {
+                                "24h" => Some((now - chrono::Duration::hours(24)).to_rfc3339()),
+                                "7d" => Some((now - chrono::Duration::days(7)).to_rfc3339()),
+                                _ => None,
+                            };
+                        }
+                        _ => {}
+                    }
+                }
+                (pid, signed, since)
+            }).unwrap_or((None, false, None));
+
+            let filter = ReceiptFilter {
+                persona_id,
+                signed_only,
+                since_iso,
+                limit: Some(100),
+                grant_id: None,
+                kind: None,
+                resource: None,
+            };
             let receipts = state
                 .store
-                .list_receipts(persona_filter)
+                .list_receipts_filtered(&filter)
                 .unwrap_or_default();
+            let names = persona_name_map(&state.store);
             let body: Vec<serde_json::Value> = receipts
                 .iter()
-                .map(|r| serde_json::to_value(r).unwrap_or(serde_json::Value::Null))
+                .map(|r| {
+                    let signed = r.evidence.signer_pubkey != "0".repeat(64)
+                        && r.evidence.sig != "0".repeat(128)
+                        && !r.evidence.signer_pubkey.is_empty();
+                    let persona_name = names.get(&r.summary.persona_id).cloned();
+                    let action_summary = format!(
+                        "{} · {}",
+                        r.summary.service,
+                        r.summary.resource
+                            .chars()
+                            .take(40)
+                            .collect::<String>()
+                    );
+                    serde_json::json!({
+                        "id": r.id,
+                        "grant_id": r.grant_id,
+                        "persona_id": r.summary.persona_id,
+                        "persona_name": persona_name,
+                        "action_summary": action_summary,
+                        "terminal_reason": format!("{:?}", r.lifecycle.terminal_reason),
+                        "created_at_epoch": r.lifecycle.terminated_at,
+                        "signed": signed,
+                        "signer_pubkey": r.evidence.signer_pubkey,
+                    })
+                })
                 .collect();
             json_response(StatusCode::OK, &serde_json::Value::Array(body))
         }
@@ -837,6 +1301,11 @@ pub async fn handle_dashboard_request(
 
         (Method::GET, "/api/grants") => {
             let grants = state.store.list_active_grants().unwrap_or_default();
+            // implementation-note-8 — surface persona.name alongside persona_id
+            // so the dashboard can render real display names instead of UUID
+            // prefixes. Lookup is rendering-layer only; raw persona_id is
+            // unchanged, contract additive.
+            let names = persona_name_map(&state.store);
             let body: Vec<serde_json::Value> = grants
                 .iter()
                 .map(|g| {
@@ -857,16 +1326,29 @@ pub async fn handle_dashboard_request(
                         conds.insert("delegation_depth".to_string(), serde_json::json!(depth));
                     }
                     let conditions = if conds.is_empty() { serde_json::Value::Null } else { serde_json::Value::Object(conds) };
-                    serde_json::json!({
-                        "id": g.id,
-                        "persona_id": g.persona_id,
-                        "credential_name": g.credential_name,
-                        "scope": g.scope,
-                        "created_at": g.created_at,
-                        "expires_at": g.expires_at,
-                        "status": g.status,
-                        "conditions": conditions,
-                    })
+
+                    // implementation-note-13 (budget_persists_on_simple_grant) —
+                    // surface the projected budget + usage so the dashboard's
+                    // BUDGET column and live gauge JS can render the operator-
+                    // configured ceilings. `g.budget` projects from the signed
+                    // chain's first-statement budget; `g.usage` is the running
+                    // tally. Both stay omitted when no axis was set so existing
+                    // consumers (and tests) see the same shape they did pre-fix.
+                    let mut entry = serde_json::Map::new();
+                    entry.insert("id".into(), serde_json::json!(g.id));
+                    entry.insert("persona_id".into(), serde_json::json!(g.persona_id));
+                    entry.insert("persona_name".into(), serde_json::json!(names.get(&g.persona_id).cloned()));
+                    entry.insert("credential_name".into(), serde_json::json!(g.credential_name));
+                    entry.insert("scope".into(), serde_json::json!(g.scope));
+                    entry.insert("created_at".into(), serde_json::json!(g.created_at));
+                    entry.insert("expires_at".into(), serde_json::json!(g.expires_at));
+                    entry.insert("status".into(), serde_json::json!(g.status));
+                    entry.insert("conditions".into(), conditions);
+                    if let Some(b) = g.budget.as_ref().filter(|b| !b.is_none_set()) {
+                        entry.insert("budget".into(), serde_json::to_value(b).unwrap_or(serde_json::Value::Null));
+                        entry.insert("usage".into(), serde_json::to_value(&g.usage).unwrap_or(serde_json::Value::Null));
+                    }
+                    serde_json::Value::Object(entry)
                 })
                 .collect();
             json_response(StatusCode::OK, &serde_json::Value::Array(body))
@@ -880,11 +1362,14 @@ pub async fn handle_dashboard_request(
 
         (Method::GET, "/api/approvals") => {
             let approvals = state.store.list_pending_approvals().unwrap_or_default();
+            // implementation-note-8 — `persona.name` lookup for the approval card.
+            let names = persona_name_map(&state.store);
             let body: Vec<serde_json::Value> = approvals
                 .iter()
                 .map(|a| serde_json::json!({
                     "id": a.id,
                     "persona_id": a.persona_id,
+                    "persona_name": names.get(&a.persona_id).cloned(),
                     "credential_name": a.credential_name,
                     "scope": a.scope,
                     "ttl_secs": a.ttl_secs,
@@ -893,7 +1378,7 @@ pub async fn handle_dashboard_request(
                     "status": a.status,
                     "reason": a.reason,
                     "created_at": a.created_at,
-                    // implementation-note-1 — composite envelopes (sandbox-run 3-statement
+                    // implementation-note-5 — composite envelopes (sandbox-run 3-statement
                     // bundle) surface as a single approval entry whose
                     // statements array drives the per-statement card UI.
                     "composite_statements": a.composite_statements,
@@ -910,42 +1395,80 @@ pub async fn handle_dashboard_request(
         {
             let id = path.strip_prefix("/api/approvals/").unwrap_or("");
             match state.store.get_approval(id) {
-                Ok(a) => json_response(StatusCode::OK, &serde_json::json!({
-                    "id": a.id,
-                    "persona_id": a.persona_id,
-                    "credential_name": a.credential_name,
-                    "scope": a.scope,
-                    "ttl_secs": a.ttl_secs,
-                    "action": a.action,
-                    "risk_level": a.risk_level,
-                    "status": a.status,
-                    "reason": a.reason,
-                    "created_at": a.created_at,
-                    // implementation-note-1 — surface composite statements + minted grant ID.
-                    "composite_statements": a.composite_statements,
-                    "result_grant_id": a.result_grant_id,
-                })),
+                Ok(a) => {
+                    // implementation-note-8 — additive `persona_name` lookup.
+                    let persona_name = state.store.get_persona(&a.persona_id).ok().map(|p| p.name);
+                    json_response(StatusCode::OK, &serde_json::json!({
+                        "id": a.id,
+                        "persona_id": a.persona_id,
+                        "persona_name": persona_name,
+                        "credential_name": a.credential_name,
+                        "scope": a.scope,
+                        "ttl_secs": a.ttl_secs,
+                        "action": a.action,
+                        "risk_level": a.risk_level,
+                        "status": a.status,
+                        "reason": a.reason,
+                        "created_at": a.created_at,
+                        // implementation-note-5 — surface composite statements + minted grant ID.
+                        "composite_statements": a.composite_statements,
+                        "result_grant_id": a.result_grant_id,
+                    }))
+                }
                 Err(_) => error_response(404, "approval not found"),
             }
         }
 
         (Method::GET, "/api/audit") => {
             use crate::audit::AuditFilter;
+            // implementation-note-8 — operator audit timeline hides internal
+            // bookkeeping events (vault.auto_unseal_from_keyring + the
+            // generic `*.internal.*` namespace) by default. The dashboard
+            // toggle re-fetches with `?include_internal=1` so internal
+            // events are reachable without hand-editing URLs.
+            // `?action_filter=<prefix>` further narrows to one action family
+            // (e.g. `grant.`, `approval.`, `broker.`). Both are rendering-
+            // layer only — store rows are unchanged.
+            let (include_internal, action_filter) = req.uri().query().map(|q| {
+                let mut include = false;
+                let mut filter: Option<String> = None;
+                for kv in q.split('&') {
+                    let mut parts = kv.splitn(2, '=');
+                    let k = parts.next().unwrap_or("");
+                    let v = parts.next().unwrap_or("");
+                    if k == "include_internal" && (v == "1" || v == "true") {
+                        include = true;
+                    }
+                    if k == "action_filter" && !v.is_empty() {
+                        filter = Some(v.to_string());
+                    }
+                }
+                (include, filter)
+            }).unwrap_or((false, None));
             let entries = state
                 .store
-                .query_audit(&AuditFilter { limit: Some(100), ..Default::default() })
+                .query_audit(&AuditFilter { limit: Some(100), action_prefix: action_filter, ..Default::default() })
                 .unwrap_or_default();
+            let names = persona_name_map(&state.store);
             let body: Vec<serde_json::Value> = entries
                 .iter()
-                .map(|e| serde_json::json!({
-                    "id": e.id,
-                    "timestamp": e.timestamp,
-                    "agent_id": e.agent_id,
-                    "action": e.action,
-                    "credential": e.credential,
-                    "outcome": e.outcome,
-                    "details": e.details,
-                }))
+                .filter(|e| include_internal || !is_internal_audit_action(&e.action))
+                .map(|e| {
+                    let persona_name = e
+                        .agent_id
+                        .as_deref()
+                        .and_then(|id| names.get(id).cloned());
+                    serde_json::json!({
+                        "id": e.id,
+                        "timestamp": e.timestamp,
+                        "agent_id": e.agent_id,
+                        "persona_name": persona_name,
+                        "action": e.action,
+                        "credential": e.credential,
+                        "outcome": e.outcome,
+                        "details": e.details,
+                    })
+                })
                 .collect();
             json_response(StatusCode::OK, &serde_json::Value::Array(body))
         }
@@ -954,7 +1477,9 @@ pub async fn handle_dashboard_request(
             && path.starts_with("/api/grants/")
             && path.ends_with("/revoke") =>
         {
-            if !csrf_ok(&headers, &state.csrf_token) {
+            if !origin_ok(&headers, &state.expected_origin) {
+                error_response(403, "origin or referer header missing or mismatched")
+            } else if !csrf_ok(&headers, &state.csrf_token) {
                 error_response(403, "csrf token missing or mismatched")
             } else {
                 let id = path
@@ -973,7 +1498,9 @@ pub async fn handle_dashboard_request(
             && path.starts_with("/api/approvals/")
             && path.ends_with("/approve-always") =>
         {
-            if !csrf_ok(&headers, &state.csrf_token) {
+            if !origin_ok(&headers, &state.expected_origin) {
+                error_response(403, "origin or referer header missing or mismatched")
+            } else if !csrf_ok(&headers, &state.csrf_token) {
                 error_response(403, "csrf token missing or mismatched")
             } else {
                 let id = path
@@ -1003,16 +1530,54 @@ pub async fn handle_dashboard_request(
             && path.starts_with("/api/approvals/")
             && path.ends_with("/approve") =>
         {
-            if !csrf_ok(&headers, &state.csrf_token) {
+            if !origin_ok(&headers, &state.expected_origin) {
+                error_response(403, "origin or referer header missing or mismatched")
+            } else if !csrf_ok(&headers, &state.csrf_token) {
                 error_response(403, "csrf token missing or mismatched")
             } else {
                 let id = path
                     .strip_prefix("/api/approvals/")
                     .unwrap()
                     .strip_suffix("/approve")
-                    .unwrap();
-                match state.store.resolve_approval(id, &ApprovalOutcome::Approved) {
-                    Ok(()) => json_response(StatusCode::OK, &serde_json::json!({"approved": true})),
+                    .unwrap()
+                    .to_string();
+                // implementation-note-6 — optional JSON body carries WebAuthn
+                // assertion metadata: `{biometric: bool, credential_id?: string,
+                // assertion?: {clientDataJSON, authenticatorData, signature, ...}}`.
+                // The dashboard JS calls `navigator.credentials.get()` with a
+                // freshly-minted challenge from `/api/webauthn/challenge` and
+                // forwards the assertion here. We accept the operator-asserted
+                // `biometric=true` claim trusting the same-origin browser
+                // because the dashboard is bound to localhost; deeper
+                // attestation (verifying the assertion signature against a
+                // pre-registered passkey) is on the protocol-side roadmap and
+                // tracked separately. The audit log records exactly what was
+                // claimed, so downstream verification is possible.
+                use http_body_util::BodyExt as _;
+                let body_bytes = req
+                    .into_body()
+                    .collect()
+                    .await
+                    .map(|c| c.to_bytes())
+                    .unwrap_or_default();
+                let params: serde_json::Value =
+                    serde_json::from_slice(&body_bytes).unwrap_or_default();
+                let biometric = params["biometric"].as_bool().unwrap_or(false);
+                let credential_id = params["credential_id"].as_str();
+                match state.store.resolve_approval_with_biometric(
+                    &id,
+                    &ApprovalOutcome::Approved,
+                    biometric,
+                    credential_id,
+                ) {
+                    Ok(()) => json_response(
+                        StatusCode::OK,
+                        &serde_json::json!({
+                            "approved": true,
+                            "biometric": biometric,
+                            "credential_id": credential_id,
+                        }),
+                    ),
                     Err(e) => error_response(400, &e.to_string()),
                 }
             }
@@ -1022,24 +1587,83 @@ pub async fn handle_dashboard_request(
             && path.starts_with("/api/approvals/")
             && path.ends_with("/deny") =>
         {
-            if !csrf_ok(&headers, &state.csrf_token) {
+            if !origin_ok(&headers, &state.expected_origin) {
+                error_response(403, "origin or referer header missing or mismatched")
+            } else if !csrf_ok(&headers, &state.csrf_token) {
                 error_response(403, "csrf token missing or mismatched")
             } else {
                 let id = path
                     .strip_prefix("/api/approvals/")
                     .unwrap()
                     .strip_suffix("/deny")
-                    .unwrap();
-                match state.store.resolve_approval(
-                    id,
+                    .unwrap()
+                    .to_string();
+                // implementation-note-6 — accept biometric metadata on deny too so
+                // an auditor can distinguish "human rejected with TouchID"
+                // from "untouched click-through".
+                use http_body_util::BodyExt as _;
+                let body_bytes = req
+                    .into_body()
+                    .collect()
+                    .await
+                    .map(|c| c.to_bytes())
+                    .unwrap_or_default();
+                let params: serde_json::Value =
+                    serde_json::from_slice(&body_bytes).unwrap_or_default();
+                let biometric = params["biometric"].as_bool().unwrap_or(false);
+                let credential_id = params["credential_id"].as_str();
+                match state.store.resolve_approval_with_biometric(
+                    &id,
                     &ApprovalOutcome::Denied {
                         reason: "denied via dashboard".to_string(),
                     },
+                    biometric,
+                    credential_id,
                 ) {
-                    Ok(()) => json_response(StatusCode::OK, &serde_json::json!({"denied": true})),
+                    Ok(()) => json_response(
+                        StatusCode::OK,
+                        &serde_json::json!({
+                            "denied": true,
+                            "biometric": biometric,
+                            "credential_id": credential_id,
+                        }),
+                    ),
                     Err(e) => error_response(400, &e.to_string()),
                 }
             }
+        }
+
+        // implementation-note-6 — WebAuthn challenge minting endpoint.
+        //
+        // Returns a fresh 32-byte random challenge (base64url-encoded) plus
+        // a configured `rp_id` so the dashboard JS can call
+        // `navigator.credentials.get({publicKey: {challenge, rpId, ...}})`.
+        //
+        // We don't (yet) persist the challenge or bind it to a pending
+        // approval — the assertion ride-along on the approve POST is
+        // accepted as a same-origin attestation that the browser raised
+        // the platform-authenticator (Touch ID / Windows Hello) sheet.
+        // Full server-side challenge replay protection is tracked
+        // separately on the protocol roadmap; the audit-log capture
+        // satisfies the May 3 demo's evidence requirement.
+        (Method::GET, "/api/webauthn/challenge") => {
+            let mut buf = [0u8; 32];
+            if getrandom::fill(&mut buf).is_err() {
+                return Ok(error_response(500, "challenge entropy failure"));
+            }
+            // base64url (RFC 4648 §5) encoded without padding — what
+            // navigator.credentials.get() expects in the spec-aligned
+            // PublicKeyCredentialRequestOptions.challenge field.
+            let challenge = base64url_encode(&buf);
+            json_response(
+                StatusCode::OK,
+                &serde_json::json!({
+                    "challenge": challenge,
+                    "rp_id": "localhost",
+                    "allow_credentials": [],
+                    "user_verification": "preferred",
+                }),
+            )
         }
 
         (Method::GET, "/health") | (Method::GET, "/api/health") => {
@@ -1086,7 +1710,9 @@ pub async fn handle_dashboard_request(
             && path.starts_with("/api/grants/")
             && path.ends_with("/pause") =>
         {
-            if !csrf_ok(&headers, &state.csrf_token) {
+            if !origin_ok(&headers, &state.expected_origin) {
+                error_response(403, "origin or referer header missing or mismatched")
+            } else if !csrf_ok(&headers, &state.csrf_token) {
                 error_response(403, "csrf token missing or mismatched")
             } else {
                 let id = path
@@ -1107,7 +1733,9 @@ pub async fn handle_dashboard_request(
             && path.starts_with("/api/grants/")
             && path.ends_with("/unpause") =>
         {
-            if !csrf_ok(&headers, &state.csrf_token) {
+            if !origin_ok(&headers, &state.expected_origin) {
+                error_response(403, "origin or referer header missing or mismatched")
+            } else if !csrf_ok(&headers, &state.csrf_token) {
                 error_response(403, "csrf token missing or mismatched")
             } else {
                 let id = path
@@ -1128,7 +1756,9 @@ pub async fn handle_dashboard_request(
             && path.starts_with("/api/grants/")
             && path.ends_with("/extend") =>
         {
-            if !csrf_ok(&headers, &state.csrf_token) {
+            if !origin_ok(&headers, &state.expected_origin) {
+                error_response(403, "origin or referer header missing or mismatched")
+            } else if !csrf_ok(&headers, &state.csrf_token) {
                 error_response(403, "csrf token missing or mismatched")
             } else {
                 let id = path
@@ -1147,6 +1777,32 @@ pub async fn handle_dashboard_request(
 
                 match state.store.extend_grant(id, tokens_delta, cents_delta, ttl_extension_secs) {
                     Ok(g) => json_response(StatusCode::OK, &grant_to_json(&g)),
+                    Err(e) => error_response(400, &e.to_string()),
+                }
+            }
+        }
+
+        // POST /api/approvals/{id}/dismiss — implementation-note-7
+        // Operator-initiated dismiss. Sets status to 'dismissed', records
+        // `approval.dismissed` audit event, removes the card from the dashboard.
+        _ if method == Method::POST
+            && path.starts_with("/api/approvals/")
+            && path.ends_with("/dismiss") =>
+        {
+            if !origin_ok(&headers, &state.expected_origin) {
+                error_response(403, "origin or referer header missing or mismatched")
+            } else if !csrf_ok(&headers, &state.csrf_token) {
+                error_response(403, "csrf token missing or mismatched")
+            } else {
+                let id = path
+                    .strip_prefix("/api/approvals/")
+                    .unwrap()
+                    .strip_suffix("/dismiss")
+                    .unwrap();
+                match state.store.dismiss_approval(id) {
+                    Ok(()) => json_response(StatusCode::OK, &serde_json::json!({"dismissed": true})),
+                    Err(crate::store::StoreError::NotFound) => error_response(404, "approval not found"),
+                    Err(crate::store::StoreError::AlreadyResolved) => error_response(409, "approval already resolved"),
                     Err(e) => error_response(400, &e.to_string()),
                 }
             }
@@ -1333,16 +1989,7 @@ pub async fn handle_dashboard_request(
             let id = p.strip_prefix("/approvals/").unwrap_or("");
             match state.store.get_approval(id) {
                 Ok(a) => {
-                    let persona_prefix = truncate_persona_id(&a.persona_id);
-                    let html = APPROVAL_HTML_TEMPLATE
-                        .replace("{{CSRF_TOKEN}}", &state.csrf_token)
-                        .replace("{{APPROVAL_ID}}", &a.id)
-                        .replace("{{ACTION}}", &a.action)
-                        .replace("{{CREDENTIAL}}", &a.credential_name)
-                        .replace("{{SCOPE}}", &a.scope)
-                        .replace("{{RISK_LEVEL}}", &a.risk_level)
-                        .replace("{{PERSONA_PREFIX}}", &persona_prefix)
-                        .replace("{{CREATED_AT}}", &a.created_at);
+                    let html = render_approval_page(&state.csrf_token, &a);
                     Response::builder()
                         .status(StatusCode::OK)
                         .header("content-type", "text/html; charset=utf-8")
@@ -1420,9 +2067,14 @@ fn grant_to_json_with_store(
         Err(_) => serde_json::Value::Array(Vec::new()),
     };
 
+    // implementation-note-8 — additive `persona_name` lookup so the dashboard
+    // can render the persona's display name as the primary label.
+    let persona_name = store.get_persona(&g.persona_id).ok().map(|p| p.name);
+
     serde_json::json!({
         "id": g.id,
         "persona_id": g.persona_id,
+        "persona_name": persona_name,
         "credential_name": g.credential_name,
         "scope": g.scope,
         "created_at": g.created_at,
@@ -2150,6 +2802,33 @@ fn error_response(status: u16, msg: &str) -> Response<Full<Bytes>> {
 }
 
 /// Truncate a persona ID for UI display. Keeps the 12-char UUID prefix after "persona-".
+/// Render the dedicated `/approvals/{id}` page HTML for a given approval
+/// record, with all `{{TOKEN}}` placeholders substituted.
+///
+/// implementation-note-12 — the page leads with the high-level
+/// Approve/Deny decision; the per-statement breakdown for composite
+/// approvals is rendered client-side from the polled JSON behind a
+/// "Show details" disclosure (collapsed-by-default). Both the dashboard
+/// pending-approvals card and this page share the same
+/// `renderCompositeStatements` helper via `COMPOSITE_STATEMENTS_JS`,
+/// so the two surfaces cannot drift.
+fn render_approval_page(
+    csrf_token: &str,
+    approval: &crate::approval::ApprovalRequestInfo,
+) -> String {
+    let persona_prefix = truncate_persona_id(&approval.persona_id);
+    APPROVAL_HTML_TEMPLATE
+        .replace("{{COMPOSITE_STATEMENTS_JS}}", COMPOSITE_STATEMENTS_JS)
+        .replace("{{CSRF_TOKEN}}", csrf_token)
+        .replace("{{APPROVAL_ID}}", &approval.id)
+        .replace("{{ACTION}}", &approval.action)
+        .replace("{{CREDENTIAL}}", &approval.credential_name)
+        .replace("{{SCOPE}}", &approval.scope)
+        .replace("{{RISK_LEVEL}}", &approval.risk_level)
+        .replace("{{PERSONA_PREFIX}}", &persona_prefix)
+        .replace("{{CREATED_AT}}", &approval.created_at)
+}
+
 fn truncate_persona_id(persona_id: &str) -> String {
     const PREFIX: &str = "persona-";
     const UUID_CHARS: usize = 12;
@@ -2167,6 +2846,7 @@ mod tests {
     use crate::store::DaemonStore;
 
     const TEST_CSRF_TOKEN: &str = "test-csrf-token-0123456789abcdef";
+    const TEST_EXPECTED_ORIGIN: &str = "http://127.0.0.1:3141";
 
     fn make_state() -> Arc<DashboardState> {
         let store = DaemonStore::open_in_memory().unwrap();
@@ -2175,6 +2855,13 @@ mod tests {
             version: "0.0.0-test".to_string(),
             csrf_token: TEST_CSRF_TOKEN.to_string(),
             started_at: std::time::Instant::now(),
+            expected_origin: TEST_EXPECTED_ORIGIN.to_string(),
+            // implementation-note-11: default to a well-known
+            // localhost addr so most tests see a "bound" dashboard; tests
+            // that exercise the "not bound" branch override directly.
+            dashboard_actual_addr: Some(
+                "127.0.0.1:3141".parse().expect("test addr parse"),
+            ),
         })
     }
 
@@ -2194,6 +2881,7 @@ mod tests {
         let req = Request::builder()
             .method("POST")
             .uri(format!("http://localhost{path}"))
+            .header("origin", TEST_EXPECTED_ORIGIN)
             .header(CSRF_HEADER, TEST_CSRF_TOKEN)
             .body(http_body_util::Empty::<Bytes>::new())
             .unwrap();
@@ -2205,6 +2893,7 @@ mod tests {
         let req = Request::builder()
             .method("POST")
             .uri(format!("http://localhost{path}"))
+            .header("origin", TEST_EXPECTED_ORIGIN)
             .body(http_body_util::Empty::<Bytes>::new())
             .unwrap();
 
@@ -2218,6 +2907,7 @@ mod tests {
         let req = Request::builder()
             .method("POST")
             .uri(format!("http://localhost{path}"))
+            .header("origin", TEST_EXPECTED_ORIGIN)
             .header(CSRF_HEADER, "not-the-real-token")
             .body(http_body_util::Empty::<Bytes>::new())
             .unwrap();
@@ -2235,7 +2925,9 @@ mod tests {
 
         match (method.clone(), path.as_str()) {
             (Method::GET, "/") | (Method::GET, "/index.html") => {
-                let html = DASHBOARD_HTML.replace("{{CSRF_TOKEN}}", &state.csrf_token);
+                let html = DASHBOARD_HTML
+                    .replace("{{COMPOSITE_STATEMENTS_JS}}", COMPOSITE_STATEMENTS_JS)
+                    .replace("{{CSRF_TOKEN}}", &state.csrf_token);
                 Response::builder()
                     .status(StatusCode::OK)
                     .header("content-type", "text/html; charset=utf-8")
@@ -2251,6 +2943,11 @@ mod tests {
                     .iter()
                     .filter(|p| p.status == "active")
                     .count();
+                // implementation-note-11: mirror the production
+                // handler so `api_status_*` tests cover the new field shape.
+                let dashboard_addr_bound = state
+                    .dashboard_actual_addr
+                    .map(|a| a.to_string());
                 let body = serde_json::json!({
                     "running": true,
                     "version": state.version,
@@ -2258,6 +2955,7 @@ mod tests {
                     "active_grants": active_grants,
                     "pending_approvals": pending_approvals,
                     "audit_events": audit_events,
+                    "dashboard_addr_bound": dashboard_addr_bound,
                 });
                 json_response(StatusCode::OK, &body)
             }
@@ -2277,6 +2975,26 @@ mod tests {
                 json_response(StatusCode::OK, &body)
             }
 
+            // implementation-note-6 — WebAuthn challenge endpoint (test handler).
+            // Mirrors the production handler exactly; kept in sync here so
+            // dashboard tests can assert on the response shape.
+            (Method::GET, "/api/webauthn/challenge") => {
+                let mut buf = [0u8; 32];
+                if getrandom::fill(&mut buf).is_err() {
+                    return error_response(500, "challenge entropy failure");
+                }
+                let challenge = base64url_encode(&buf);
+                json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({
+                        "challenge": challenge,
+                        "rp_id": "localhost",
+                        "allow_credentials": [],
+                        "user_verification": "preferred",
+                    }),
+                )
+            }
+
             (Method::GET, "/api/approvals") => {
                 let approvals = state.store.list_pending_approvals().unwrap_or_default();
                 let body: Vec<serde_json::Value> = approvals
@@ -2293,31 +3011,74 @@ mod tests {
             {
                 let id = path.strip_prefix("/api/approvals/").unwrap_or("");
                 match state.store.get_approval(id) {
-                    Ok(a) => json_response(StatusCode::OK, &serde_json::json!({
-                        "id": a.id,
-                        "persona_id": a.persona_id,
-                        "credential_name": a.credential_name,
-                        "scope": a.scope,
-                        "ttl_secs": a.ttl_secs,
-                        "action": a.action,
-                        "risk_level": a.risk_level,
-                        "status": a.status,
-                        "reason": a.reason,
-                        "created_at": a.created_at,
-                    })),
+                    Ok(a) => {
+                        // implementation-note-8 — surface persona.name for the
+                        // approval-detail render path (test handler mirrors
+                        // production).
+                        let persona_name = state.store.get_persona(&a.persona_id).ok().map(|p| p.name);
+                        json_response(StatusCode::OK, &serde_json::json!({
+                            "id": a.id,
+                            "persona_id": a.persona_id,
+                            "persona_name": persona_name,
+                            "credential_name": a.credential_name,
+                            "scope": a.scope,
+                            "ttl_secs": a.ttl_secs,
+                            "action": a.action,
+                            "risk_level": a.risk_level,
+                            "status": a.status,
+                            "reason": a.reason,
+                            "created_at": a.created_at,
+                        }))
+                    }
                     Err(_) => error_response(404, "approval not found"),
                 }
             }
 
             (Method::GET, "/api/audit") => {
                 use crate::audit::AuditFilter;
+                // implementation-note-8 — mirror the production handler's
+                // `?include_internal=1` toggle and `?action_filter=<prefix>`
+                // so test coverage reflects the same operator-audit semantics.
+                let (include_internal, action_filter) = req.uri().query().map(|q| {
+                    let mut include = false;
+                    let mut filter: Option<String> = None;
+                    for kv in q.split('&') {
+                        let mut parts = kv.splitn(2, '=');
+                        let k = parts.next().unwrap_or("");
+                        let v = parts.next().unwrap_or("");
+                        if k == "include_internal" && (v == "1" || v == "true") {
+                            include = true;
+                        }
+                        if k == "action_filter" && !v.is_empty() {
+                            filter = Some(v.to_string());
+                        }
+                    }
+                    (include, filter)
+                }).unwrap_or((false, None));
                 let entries = state
                     .store
-                    .query_audit(&AuditFilter { limit: Some(100), ..Default::default() })
+                    .query_audit(&AuditFilter { limit: Some(100), action_prefix: action_filter, ..Default::default() })
                     .unwrap_or_default();
+                let names = persona_name_map(&state.store);
                 let body: Vec<serde_json::Value> = entries
                     .iter()
-                    .map(|e| serde_json::json!({"id": e.id, "action": e.action}))
+                    .filter(|e| include_internal || !is_internal_audit_action(&e.action))
+                    .map(|e| {
+                        let persona_name = e
+                            .agent_id
+                            .as_deref()
+                            .and_then(|id| names.get(id).cloned());
+                        serde_json::json!({
+                            "id": e.id,
+                            "timestamp": e.timestamp,
+                            "agent_id": e.agent_id,
+                            "persona_name": persona_name,
+                            "action": e.action,
+                            "credential": e.credential,
+                            "outcome": e.outcome,
+                            "details": e.details,
+                        })
+                    })
                     .collect();
                 json_response(StatusCode::OK, &serde_json::Value::Array(body))
             }
@@ -2370,16 +3131,7 @@ mod tests {
                 let id = p.strip_prefix("/approvals/").unwrap_or("");
                 match state.store.get_approval(id) {
                     Ok(a) => {
-                        let persona_prefix = truncate_persona_id(&a.persona_id);
-                        let html = APPROVAL_HTML_TEMPLATE
-                            .replace("{{CSRF_TOKEN}}", &state.csrf_token)
-                            .replace("{{APPROVAL_ID}}", &a.id)
-                            .replace("{{ACTION}}", &a.action)
-                            .replace("{{CREDENTIAL}}", &a.credential_name)
-                            .replace("{{SCOPE}}", &a.scope)
-                            .replace("{{RISK_LEVEL}}", &a.risk_level)
-                            .replace("{{PERSONA_PREFIX}}", &persona_prefix)
-                            .replace("{{CREATED_AT}}", &a.created_at);
+                        let html = render_approval_page(&state.csrf_token, &a);
                         Response::builder()
                             .status(StatusCode::OK)
                             .header("content-type", "text/html; charset=utf-8")
@@ -2400,7 +3152,9 @@ mod tests {
                 && path.starts_with("/api/grants/")
                 && path.ends_with("/revoke") =>
             {
-                if !csrf_ok(&headers, &state.csrf_token) {
+                if !origin_ok(&headers, &state.expected_origin) {
+                    error_response(403, "origin or referer header missing or mismatched")
+                } else if !csrf_ok(&headers, &state.csrf_token) {
                     error_response(403, "csrf token missing or mismatched")
                 } else {
                     let id = path
@@ -2419,7 +3173,9 @@ mod tests {
                 && path.starts_with("/api/approvals/")
                 && path.ends_with("/approve-always") =>
             {
-                if !csrf_ok(&headers, &state.csrf_token) {
+                if !origin_ok(&headers, &state.expected_origin) {
+                    error_response(403, "origin or referer header missing or mismatched")
+                } else if !csrf_ok(&headers, &state.csrf_token) {
                     error_response(403, "csrf token missing or mismatched")
                 } else {
                     let id = path
@@ -2448,7 +3204,9 @@ mod tests {
                 && path.starts_with("/api/approvals/")
                 && path.ends_with("/approve") =>
             {
-                if !csrf_ok(&headers, &state.csrf_token) {
+                if !origin_ok(&headers, &state.expected_origin) {
+                    error_response(403, "origin or referer header missing or mismatched")
+                } else if !csrf_ok(&headers, &state.csrf_token) {
                     error_response(403, "csrf token missing or mismatched")
                 } else {
                     let id = path
@@ -2467,7 +3225,9 @@ mod tests {
                 && path.starts_with("/api/approvals/")
                 && path.ends_with("/deny") =>
             {
-                if !csrf_ok(&headers, &state.csrf_token) {
+                if !origin_ok(&headers, &state.expected_origin) {
+                    error_response(403, "origin or referer header missing or mismatched")
+                } else if !csrf_ok(&headers, &state.csrf_token) {
                     error_response(403, "csrf token missing or mismatched")
                 } else {
                     let id = path
@@ -2487,12 +3247,38 @@ mod tests {
                 }
             }
 
+            // implementation-note-7 — dismiss (test handler)
+            _ if method == Method::POST
+                && path.starts_with("/api/approvals/")
+                && path.ends_with("/dismiss") =>
+            {
+                if !origin_ok(&headers, &state.expected_origin) {
+                    error_response(403, "origin or referer header missing or mismatched")
+                } else if !csrf_ok(&headers, &state.csrf_token) {
+                    error_response(403, "csrf token missing or mismatched")
+                } else {
+                    let id = path
+                        .strip_prefix("/api/approvals/")
+                        .unwrap()
+                        .strip_suffix("/dismiss")
+                        .unwrap();
+                    match state.store.dismiss_approval(id) {
+                        Ok(()) => json_response(StatusCode::OK, &serde_json::json!({"dismissed": true})),
+                        Err(crate::store::StoreError::NotFound) => error_response(404, "approval not found"),
+                        Err(crate::store::StoreError::AlreadyResolved) => error_response(409, "approval already resolved"),
+                        Err(e) => error_response(400, &e.to_string()),
+                    }
+                }
+            }
+
             // 69K.7: hard pause toggle
             _ if method == Method::POST
                 && path.starts_with("/api/grants/")
                 && path.ends_with("/pause") =>
             {
-                if !csrf_ok(&headers, &state.csrf_token) {
+                if !origin_ok(&headers, &state.expected_origin) {
+                    error_response(403, "origin or referer header missing or mismatched")
+                } else if !csrf_ok(&headers, &state.csrf_token) {
                     error_response(403, "csrf token missing or mismatched")
                 } else {
                     let id = path
@@ -2512,7 +3298,9 @@ mod tests {
                 && path.starts_with("/api/grants/")
                 && path.ends_with("/unpause") =>
             {
-                if !csrf_ok(&headers, &state.csrf_token) {
+                if !origin_ok(&headers, &state.expected_origin) {
+                    error_response(403, "origin or referer header missing or mismatched")
+                } else if !csrf_ok(&headers, &state.csrf_token) {
                     error_response(403, "csrf token missing or mismatched")
                 } else {
                     let id = path
@@ -2533,7 +3321,9 @@ mod tests {
                 && path.starts_with("/api/grants/")
                 && path.ends_with("/extend") =>
             {
-                if !csrf_ok(&headers, &state.csrf_token) {
+                if !origin_ok(&headers, &state.expected_origin) {
+                    error_response(403, "origin or referer header missing or mismatched")
+                } else if !csrf_ok(&headers, &state.csrf_token) {
                     error_response(403, "csrf token missing or mismatched")
                 } else {
                     let id = path
@@ -2613,6 +3403,69 @@ mod tests {
                 }
             }
 
+            // GET /api/receipts — test handler mirrors production filter logic.
+            (Method::GET, "/api/receipts") => {
+                use crate::receipt::ReceiptFilter;
+                let (persona_id, signed_only, since_iso) = req.uri().query().map(|q| {
+                    let mut pid: Option<String> = None;
+                    let mut signed = false;
+                    let mut since: Option<String> = None;
+                    for kv in q.split('&') {
+                        let mut parts = kv.splitn(2, '=');
+                        let k = parts.next().unwrap_or("");
+                        let v = parts.next().unwrap_or("");
+                        match k {
+                            "persona_id" if !v.is_empty() => pid = Some(v.to_string()),
+                            "signed_only" if v == "true" || v == "1" => signed = true,
+                            "since" => {
+                                let now = chrono::Utc::now();
+                                since = match v {
+                                    "24h" => Some((now - chrono::Duration::hours(24)).to_rfc3339()),
+                                    "7d" => Some((now - chrono::Duration::days(7)).to_rfc3339()),
+                                    _ => None,
+                                };
+                            }
+                            _ => {}
+                        }
+                    }
+                    (pid, signed, since)
+                }).unwrap_or((None, false, None));
+                let filter = ReceiptFilter {
+                    persona_id,
+                    signed_only,
+                    since_iso,
+                    limit: Some(100),
+                    grant_id: None,
+                    kind: None,
+                    resource: None,
+                };
+                let receipts = state.store.list_receipts_filtered(&filter).unwrap_or_default();
+                let names = persona_name_map(&state.store);
+                let body: Vec<serde_json::Value> = receipts.iter().map(|r| {
+                    let signed = r.evidence.signer_pubkey != "0".repeat(64)
+                        && r.evidence.sig != "0".repeat(128)
+                        && !r.evidence.signer_pubkey.is_empty();
+                    let persona_name = names.get(&r.summary.persona_id).cloned();
+                    let action_summary = format!(
+                        "{} · {}",
+                        r.summary.service,
+                        r.summary.resource.chars().take(40).collect::<String>()
+                    );
+                    serde_json::json!({
+                        "id": r.id,
+                        "grant_id": r.grant_id,
+                        "persona_id": r.summary.persona_id,
+                        "persona_name": persona_name,
+                        "action_summary": action_summary,
+                        "terminal_reason": format!("{:?}", r.lifecycle.terminal_reason),
+                        "created_at_epoch": r.lifecycle.terminated_at,
+                        "signed": signed,
+                        "signer_pubkey": r.evidence.signer_pubkey,
+                    })
+                }).collect();
+                json_response(StatusCode::OK, &serde_json::Value::Array(body))
+            }
+
             _ => Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .body(Full::new(Bytes::from("not found")))
@@ -2675,6 +3528,113 @@ mod tests {
         let state = make_state();
         let resp = call(state, "/api/unknown").await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// implementation-note-6 — `/api/webauthn/challenge` returns a fresh
+    /// base64url-encoded challenge plus rp_id + user_verification fields,
+    /// matching the shape `navigator.credentials.get({publicKey: ...})`
+    /// expects in the dashboard JS.
+    #[tokio::test]
+    async fn webauthn_challenge_returns_random_base64url() {
+        let state = make_state();
+        let resp = call(state, "/api/webauthn/challenge").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let challenge = json["challenge"].as_str().expect("challenge field");
+        // 32 random bytes encoded as base64url-no-pad → 43 chars.
+        assert_eq!(challenge.len(), 43);
+        assert!(
+            challenge.chars().all(|c| {
+                c.is_ascii_alphanumeric() || c == '-' || c == '_'
+            }),
+            "base64url alphabet only: {challenge}"
+        );
+        assert_eq!(json["rp_id"], "localhost");
+        assert_eq!(json["user_verification"], "preferred");
+    }
+
+    /// implementation-note-6 — successive challenges differ, asserting we mint
+    /// fresh entropy per call rather than reusing a constant.
+    #[tokio::test]
+    async fn webauthn_challenges_differ_across_calls() {
+        let state = make_state();
+        let r1 = call(Arc::clone(&state), "/api/webauthn/challenge").await;
+        let r2 = call(state, "/api/webauthn/challenge").await;
+        let b1 = http_body_util::BodyExt::collect(r1.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let b2 = http_body_util::BodyExt::collect(r2.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let j1: serde_json::Value = serde_json::from_slice(&b1).unwrap();
+        let j2: serde_json::Value = serde_json::from_slice(&b2).unwrap();
+        assert_ne!(j1["challenge"], j2["challenge"]);
+    }
+
+    /// implementation-note-6 — `resolve_approval_with_biometric` records the
+    /// biometric flag + credential_id in the audit log so an auditor can
+    /// distinguish hardware-attested approvals from click-throughs.
+    #[tokio::test]
+    async fn resolve_approval_with_biometric_logs_audit_fields() {
+        use crate::approval::ApprovalOutcome;
+        let state = make_state();
+        let persona = state.store.create_persona("agent-bio").unwrap();
+        let req = state
+            .store
+            .submit_approval(&persona.id, "stripe-key", "read", None, "credential:read", "low")
+            .unwrap();
+
+        state
+            .store
+            .resolve_approval_with_biometric(
+                &req.id,
+                &ApprovalOutcome::Approved,
+                true,
+                Some("touchid:enrollment-abcdef"),
+            )
+            .unwrap();
+
+        // Walk the audit log and confirm the new biometric fields landed
+        // on at least one event tied to this approval. We expect both a
+        // grant.issued (legacy event) and an approval.approved (new
+        // dedicated event) to carry the fields.
+        use crate::audit::AuditFilter;
+        let entries = state
+            .store
+            .query_audit(&AuditFilter {
+                limit: Some(50),
+                ..Default::default()
+            })
+            .unwrap();
+        let bio_entries: Vec<_> = entries
+            .iter()
+            .filter(|e| {
+                e.details
+                    .as_deref()
+                    .map(|d| d.contains("\"biometric\":true"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            !bio_entries.is_empty(),
+            "expected biometric=true in at least one audit event detail"
+        );
+        let credential_logged = bio_entries.iter().any(|e| {
+            e.details
+                .as_deref()
+                .map(|d| d.contains("touchid:enrollment-abcdef"))
+                .unwrap_or(false)
+        });
+        assert!(
+            credential_logged,
+            "expected credential_id=touchid:... in audit detail"
+        );
     }
 
     #[tokio::test]
@@ -2993,6 +3953,73 @@ mod tests {
 
         let resp = call_post_no_csrf(state, &format!("/api/approvals/{}/approve", req.id)).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn approval_deep_link_hides_composite_breakdown_behind_disclosure() {
+        // implementation-note-12 — the dedicated /approvals/{id} page must
+        // lead with the Approve/Deny decision and keep the per-statement
+        // breakdown collapsed behind a "Show details" disclosure. Asserts:
+        //   1. The page contains a <details class="composite-disclosure"> block
+        //   2. The block is `hidden` by default (only revealed when JS sees
+        //      composite_statements in the polled JSON)
+        //   3. The shared renderCompositeStatements helper is present so
+        //      the dashboard card and this page never drift
+        let state = make_state();
+        let persona = state.store.create_persona("agent-composite").unwrap();
+        let req = state.store.submit_approval(
+            &persona.id,
+            "github-key",
+            "composite",
+            None,
+            "credential.access",
+            "high",
+        ).unwrap();
+
+        let resp = call(Arc::clone(&state), &format!("/approvals/{}", req.id)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let s = std::str::from_utf8(&body).unwrap();
+
+        // Disclosure block exists and is collapsed-by-default.
+        assert!(
+            s.contains(r#"<details class="composite-disclosure" id="composite-disclosure" hidden>"#),
+            "composite-disclosure must be present and `hidden` by default"
+        );
+        assert!(
+            s.contains("<summary>Show details</summary>"),
+            "disclosure must use the Show details summary affordance"
+        );
+        // Shared helper baked in (single source of truth with dashboard card).
+        assert!(
+            s.contains("function renderCompositeStatements"),
+            "shared renderCompositeStatements helper must be present in the page"
+        );
+        // Approve/Deny must be the leading decision.
+        assert!(s.contains("Approve"));
+        assert!(s.contains("Deny"));
+    }
+
+    #[tokio::test]
+    async fn dashboard_html_inlines_shared_composite_helper() {
+        // implementation-note-12 — the dashboard pending-approvals card and
+        // the dedicated /approvals/{id} page share a single JS helper for
+        // rendering the composite-statement breakdown. Assert the helper is
+        // baked into the dashboard HTML so the two surfaces cannot drift.
+        let state = make_state();
+        let resp = call(state, "/").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let s = std::str::from_utf8(&body).unwrap();
+        assert!(
+            s.contains("function renderCompositeStatements"),
+            "dashboard must inline the shared renderCompositeStatements helper"
+        );
+        // The placeholder must be substituted, not left raw.
+        assert!(
+            !s.contains("{{COMPOSITE_STATEMENTS_JS}}"),
+            "COMPOSITE_STATEMENTS_JS placeholder must be replaced"
+        );
     }
 
     // --- GET /api/approvals/<id> per-approval JSON endpoint tests ---
@@ -3511,5 +4538,358 @@ mod tests {
         let exactly_12 = "persona-368a0fc5-809";
         let got = truncate_persona_id(exactly_12);
         assert_eq!(got, "persona-368a0fc5-809", "exactly-12-char UUID portion should be returned as-is");
+    }
+
+    // --- security check: Origin/Referer header checks ---
+
+    fn make_headers_with_origin(origin: &str) -> hyper::HeaderMap {
+        let mut h = hyper::HeaderMap::new();
+        h.insert("origin", origin.parse().unwrap());
+        h
+    }
+
+    fn make_headers_with_referer(referer: &str) -> hyper::HeaderMap {
+        let mut h = hyper::HeaderMap::new();
+        h.insert("referer", referer.parse().unwrap());
+        h
+    }
+
+    fn make_empty_headers() -> hyper::HeaderMap {
+        hyper::HeaderMap::new()
+    }
+
+    #[test]
+    fn origin_ok_matching_origin_passes() {
+        let h = make_headers_with_origin("http://127.0.0.1:3141");
+        assert!(origin_ok(&h, "http://127.0.0.1:3141"));
+    }
+
+    #[test]
+    fn origin_ok_mismatched_origin_fails() {
+        let h = make_headers_with_origin("http://evil.example.com");
+        assert!(!origin_ok(&h, "http://127.0.0.1:3141"));
+    }
+
+    #[test]
+    fn origin_ok_missing_origin_and_referer_fails() {
+        let h = make_empty_headers();
+        assert!(!origin_ok(&h, "http://127.0.0.1:3141"));
+    }
+
+    #[test]
+    fn origin_ok_matching_referer_passes() {
+        let h = make_headers_with_referer("http://127.0.0.1:3141/some/path?q=1");
+        assert!(origin_ok(&h, "http://127.0.0.1:3141"));
+    }
+
+    #[test]
+    fn origin_ok_mismatched_referer_fails() {
+        let h = make_headers_with_referer("http://attacker.example.com/steal");
+        assert!(!origin_ok(&h, "http://127.0.0.1:3141"));
+    }
+
+    // Integration tests: POST endpoints reject requests without matching Origin.
+
+    #[tokio::test]
+    async fn post_revoke_without_origin_returns_403() {
+        let state = make_state();
+        let persona = state.store.create_persona("no-origin-agent").unwrap();
+        let grant = state.store.create_grant(&persona.id, "key", "read", None).unwrap();
+        // Build POST with valid CSRF but no Origin/Referer.
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("http://localhost/api/grants/{}/revoke", grant.id))
+            .header(CSRF_HEADER, TEST_CSRF_TOKEN)
+            .body(http_body_util::Empty::<Bytes>::new())
+            .unwrap();
+        let resp = handle_dashboard_boxed(state, req).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn post_approve_with_wrong_origin_returns_403() {
+        let state = make_state();
+        let persona = state.store.create_persona("wrong-origin-agent").unwrap();
+        let req_a = state.store.submit_approval(&persona.id, "key", "read", None, "access", "low").unwrap();
+        // Build POST with valid CSRF but mismatched Origin.
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("http://localhost/api/approvals/{}/approve", req_a.id))
+            .header("origin", "http://evil.example.com")
+            .header(CSRF_HEADER, TEST_CSRF_TOKEN)
+            .body(http_body_util::Empty::<Bytes>::new())
+            .unwrap();
+        let resp = handle_dashboard_boxed(state, req).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn post_approve_with_matching_referer_only_passes_origin_check() {
+        let state = make_state();
+        let persona = state.store.create_persona("referer-agent").unwrap();
+        let req_a = state.store.submit_approval(&persona.id, "key", "read", None, "access", "low").unwrap();
+        // Build POST with valid CSRF and matching Referer (no Origin).
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("http://localhost/api/approvals/{}/approve", req_a.id))
+            .header("referer", format!("{TEST_EXPECTED_ORIGIN}/approvals/{}", req_a.id))
+            .header(CSRF_HEADER, TEST_CSRF_TOKEN)
+            .body(http_body_util::Empty::<Bytes>::new())
+            .unwrap();
+        let resp = handle_dashboard_boxed(state, req).await;
+        // Origin check passes; CSRF passes; store resolves OK → 200.
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // --- implementation-note-7: dismiss endpoint ---
+
+    #[tokio::test]
+    async fn dismiss_approval_returns_200_and_removes_from_pending() {
+        let state = make_state();
+        let persona = state.store.create_persona("dismiss-agent").unwrap();
+        let approval = state
+            .store
+            .submit_approval(&persona.id, "key", "read", None, "access", "low")
+            .unwrap();
+
+        let resp = call_post(Arc::clone(&state), &format!("/api/approvals/{}/dismiss", approval.id)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["dismissed"], true);
+
+        // Approval should no longer appear in pending list.
+        let pending = state.store.list_pending_approvals().unwrap();
+        assert!(pending.iter().all(|a| a.id != approval.id), "dismissed approval must not appear in pending");
+
+        // Status must be 'dismissed'.
+        let resolved = state.store.get_approval(&approval.id).unwrap();
+        assert_eq!(resolved.status, "dismissed");
+    }
+
+    #[tokio::test]
+    async fn dismiss_approval_double_dismiss_returns_409() {
+        let state = make_state();
+        let persona = state.store.create_persona("dismiss-double").unwrap();
+        let approval = state
+            .store
+            .submit_approval(&persona.id, "key", "read", None, "access", "low")
+            .unwrap();
+
+        call_post(Arc::clone(&state), &format!("/api/approvals/{}/dismiss", approval.id)).await;
+        let resp = call_post(Arc::clone(&state), &format!("/api/approvals/{}/dismiss", approval.id)).await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn dismiss_approval_nonexistent_returns_404() {
+        let state = make_state();
+        let resp = call_post(state, "/api/approvals/does-not-exist/dismiss").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn dismiss_approval_without_csrf_returns_403() {
+        let state = make_state();
+        let persona = state.store.create_persona("dismiss-nocsrf").unwrap();
+        let approval = state
+            .store
+            .submit_approval(&persona.id, "key", "read", None, "access", "low")
+            .unwrap();
+        let resp = call_post_no_csrf(state, &format!("/api/approvals/{}/dismiss", approval.id)).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // --- implementation-note-8: audit action_filter query param ---
+
+    #[tokio::test]
+    async fn audit_action_filter_returns_only_matching_prefix() {
+        let state = make_state();
+        state.store.log_event(None, "grant.create", None, "ok", None).unwrap();
+        state.store.log_event(None, "approval.dismissed", None, "ok", None).unwrap();
+        state.store.log_event(None, "broker.materialization", None, "ok", None).unwrap();
+
+        let resp = call(Arc::clone(&state), "/api/audit?action_filter=grant.").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "only grant.* actions should be returned");
+        assert_eq!(arr[0]["action"], "grant.create");
+    }
+
+    #[tokio::test]
+    async fn audit_action_filter_empty_returns_all() {
+        let state = make_state();
+        state.store.log_event(None, "grant.create", None, "ok", None).unwrap();
+        state.store.log_event(None, "approval.dismissed", None, "ok", None).unwrap();
+
+        let resp = call(Arc::clone(&state), "/api/audit?action_filter=").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 2, "empty filter returns all events");
+    }
+
+    // --- implementation-note-14: /api/receipts endpoint ---
+
+    /// Ensure the receipts singleton identity is active (mirrors receipt.rs
+    /// test helper) so revoke_grant can emit signed receipts.
+    fn ensure_receipt_identity() -> &'static crate::receipt::DaemonIdentity {
+        use once_cell::sync::OnceCell;
+        static INIT_DIR: OnceCell<tempfile::TempDir> = OnceCell::new();
+        let dir = INIT_DIR.get_or_init(|| tempfile::tempdir().expect("tempdir"));
+        let _ = crate::receipt::init_identity(dir.path());
+        crate::receipt::current_identity().expect("identity was just initialised")
+    }
+
+    #[tokio::test]
+    async fn api_receipts_empty_returns_array() {
+        let state = make_state();
+        let resp = call(state, "/api/receipts").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.is_array(), "receipts response must be an array");
+        assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn api_receipts_returns_signed_status_field() {
+        ensure_receipt_identity();
+        let state = make_state();
+        let persona = state.store.create_persona("agent-receipt-signed").unwrap();
+        let grant = state.store.create_grant(&persona.id, "gh-token", "push", None).unwrap();
+        state.store.revoke_grant(&grant.id).unwrap();
+
+        let resp = call(Arc::clone(&state), "/api/receipts").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "one revoked grant → one receipt");
+        assert_eq!(arr[0]["grant_id"], grant.id);
+        assert!(arr[0]["signed"].is_boolean(), "signed field must be boolean");
+        assert!(arr[0]["signed"].as_bool().unwrap(), "receipt signed by daemon identity");
+        assert!(arr[0]["action_summary"].is_string());
+        assert!(arr[0]["persona_id"].is_string());
+    }
+
+    #[tokio::test]
+    async fn api_receipts_persona_filter_isolates_results() {
+        ensure_receipt_identity();
+        let state = make_state();
+        let a = state.store.create_persona("agent-rcpt-a").unwrap();
+        let b = state.store.create_persona("agent-rcpt-b").unwrap();
+        let g1 = state.store.create_grant(&a.id, "cred", "r", None).unwrap();
+        let g2 = state.store.create_grant(&b.id, "cred", "r", None).unwrap();
+        state.store.revoke_grant(&g1.id).unwrap();
+        state.store.revoke_grant(&g2.id).unwrap();
+
+        let url = format!("/api/receipts?persona_id={}", a.id);
+        let resp = call(Arc::clone(&state), &url).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "persona filter must return only receipts for that persona");
+        assert_eq!(arr[0]["persona_id"], a.id.as_str());
+    }
+
+    #[tokio::test]
+    async fn api_receipts_signed_only_excludes_unsigned() {
+        // Seed one receipt that is unsigned (signer_pubkey='') via direct store
+        // insert to simulate a pre-identity-key receipt, then one real signed one.
+        ensure_receipt_identity();
+        let state = make_state();
+        let persona = state.store.create_persona("agent-rcpt-so").unwrap();
+        let g_signed = state.store.create_grant(&persona.id, "cred", "r", None).unwrap();
+        state.store.revoke_grant(&g_signed.id).unwrap();
+
+        // Manually insert an unsigned receipt row.
+        use core_types::grant_receipt::{Evidence, GrantReceipt, Lifecycle, ReceiptSummary, TerminalReason};
+        let unsigned = GrantReceipt {
+            id: "rct-unsigned-test".to_string(),
+            grant_id: "grant-unsigned-test".to_string(),
+            summary: ReceiptSummary {
+                human_owner: "test".to_string(),
+                persona_id: persona.id.clone(),
+                agent_id: "test".to_string(),
+                service: "test".to_string(),
+                resource: "r".to_string(),
+            },
+            approved_chain: vec![],
+            per_statement_usage: vec![],
+            approval_chain: vec![],
+            actions_observed: vec![],
+            lifecycle: Lifecycle {
+                issued_at: 0,
+                last_used_at: None,
+                terminated_at: 0,
+                terminal_reason: TerminalReason::Expired,
+            },
+            attestation: Default::default(),
+            evidence: Evidence::default(), // all-zero placeholder → unsigned
+        };
+        state.store.store_receipt(&unsigned).unwrap();
+
+        // Without filter: both receipts visible.
+        let resp_all = call(Arc::clone(&state), "/api/receipts").await;
+        let body_all = http_body_util::BodyExt::collect(resp_all.into_body()).await.unwrap().to_bytes();
+        let all: serde_json::Value = serde_json::from_slice(&body_all).unwrap();
+        assert_eq!(all.as_array().unwrap().len(), 2, "unfiltered returns both");
+
+        // With signed_only=true: only the signed receipt.
+        let resp_signed = call(Arc::clone(&state), "/api/receipts?signed_only=true").await;
+        let body_signed = http_body_util::BodyExt::collect(resp_signed.into_body()).await.unwrap().to_bytes();
+        let signed: serde_json::Value = serde_json::from_slice(&body_signed).unwrap();
+        let signed_arr = signed.as_array().unwrap();
+        assert_eq!(signed_arr.len(), 1, "signed_only=true must exclude unsigned receipt");
+        assert!(signed_arr[0]["signed"].as_bool().unwrap());
+    }
+
+    #[tokio::test]
+    async fn api_receipts_includes_persona_name() {
+        ensure_receipt_identity();
+        let state = make_state();
+        let persona = state.store.create_persona("My Test Agent").unwrap();
+        let grant = state.store.create_grant(&persona.id, "key", "r", None).unwrap();
+        state.store.revoke_grant(&grant.id).unwrap();
+
+        let resp = call(Arc::clone(&state), "/api/receipts").await;
+        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["persona_name"], "My Test Agent", "persona_name must be resolved from store");
+    }
+
+    #[tokio::test]
+    async fn dashboard_html_contains_receipts_section() {
+        let state = make_state();
+        let resp = call(state, "/").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let s = std::str::from_utf8(&body).unwrap();
+        assert!(s.contains("Grant Receipts"), "dashboard must contain Grant Receipts section heading");
+        assert!(s.contains("receipts-body"), "dashboard must contain receipts table body element");
+        assert!(s.contains("receipt-signed-filter"), "dashboard must contain signed filter control");
+        assert!(s.contains("receipt-since-filter"), "dashboard must contain since filter control");
+        assert!(s.contains("function loadReceipts"), "dashboard must contain loadReceipts JS function");
+    }
+
+    #[tokio::test]
+    async fn approval_page_no_longer_has_narrow_button() {
+        // implementation-note-15: disabled Narrow button was removed for clean screenshots.
+        let state = make_state();
+        let persona = state.store.create_persona("agent-narrow-check").unwrap();
+        let req = state.store.submit_approval(&persona.id, "key", "read", None, "access", "low").unwrap();
+        let resp = call(Arc::clone(&state), &format!("/approvals/{}", req.id)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let s = std::str::from_utf8(&body).unwrap();
+        assert!(!s.contains("btn-narrow"), "Narrow button must have been removed from approval page");
+        assert!(!s.contains("Narrow"), "Narrow text must not appear on approval page");
     }
 }

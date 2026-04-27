@@ -10,6 +10,7 @@ pub struct SandboxInfo {
     pub id: String,
     pub name: String,
     pub persona_id: String,
+    pub owner_persona_id: Option<String>,
     pub container_id: Option<String>,
     pub image: String,
     pub status: String,
@@ -40,6 +41,10 @@ pub struct SandboxCreateOpts {
     pub workspace_from: Option<String>,
     /// Additional `KEY=VAL` env vars to pass into the container.
     pub extra_env: Vec<(String, String)>,
+    /// Persona that is creating this sandbox. Stored as `owner_persona_id`
+    /// and required to match on subsequent `exec_sandbox` calls. `None`
+    /// skips the ownership check for backwards-compat with legacy callers.
+    pub owner_persona_id: Option<String>,
 }
 
 /// Host paths that must never appear in a mount source, per design
@@ -284,15 +289,16 @@ impl DaemonStore {
             .map(|p| p.to_string_lossy().to_string());
 
         self.conn().execute(
-            "INSERT INTO sandboxes (id, name, persona_id, container_id, image, status, created_at, workspace_path)
-             VALUES (?1, ?2, ?3, NULL, ?4, 'created', ?5, ?6)",
-            rusqlite::params![id, opts.name, persona.id, opts.image, created_at, workspace_str],
+            "INSERT INTO sandboxes (id, name, persona_id, owner_persona_id, container_id, image, status, created_at, workspace_path)
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, 'created', ?6, ?7)",
+            rusqlite::params![id, opts.name, persona.id, opts.owner_persona_id, opts.image, created_at, workspace_str],
         )?;
 
         Ok(SandboxInfo {
             id,
             name: opts.name.clone(),
             persona_id: persona.id,
+            owner_persona_id: opts.owner_persona_id.clone(),
             container_id: None,
             image: opts.image.clone(),
             status: "created".to_string(),
@@ -399,7 +405,7 @@ impl DaemonStore {
 
     pub fn list_sandboxes(&self) -> Result<Vec<SandboxInfo>, StoreError> {
         let mut stmt = self.conn().prepare(
-            "SELECT id, name, persona_id, container_id, image, status, created_at, workspace_path
+            "SELECT id, name, persona_id, owner_persona_id, container_id, image, status, created_at, workspace_path
              FROM sandboxes ORDER BY created_at",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -407,11 +413,12 @@ impl DaemonStore {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 persona_id: row.get(2)?,
-                container_id: row.get(3)?,
-                image: row.get(4)?,
-                status: row.get(5)?,
-                created_at: row.get(6)?,
-                workspace_path: row.get(7)?,
+                owner_persona_id: row.get(3)?,
+                container_id: row.get(4)?,
+                image: row.get(5)?,
+                status: row.get(6)?,
+                created_at: row.get(7)?,
+                workspace_path: row.get(8)?,
             })
         })?;
         let mut sandboxes = Vec::new();
@@ -428,7 +435,7 @@ impl DaemonStore {
     pub fn resolve_sandbox_id(&self, name_or_id: &str) -> Result<String, StoreError> {
         self.conn()
             .query_row(
-                "SELECT id FROM sandboxes WHERE id = ?1 OR name = ?1 LIMIT 1",
+                "SELECT id FROM sandboxes WHERE id = ?1 OR name = ?1 ORDER BY created_at DESC LIMIT 1",
                 rusqlite::params![name_or_id],
                 |row| row.get(0),
             )
@@ -513,18 +520,217 @@ impl DaemonStore {
         Ok(())
     }
 
-    pub fn exec_sandbox(&self, id: &str, command: &[&str]) -> Result<String, StoreError> {
-        let (container_id, status): (Option<String>, String) = self
+    /// Delete a sandbox: remove the container (`docker rm -f`), wipe the
+    /// fresh-clone workspace if any, drop the sandbox row, and — if the
+    /// auto-created persona has no other references — delete the persona row
+    /// too. Idempotent: returns `Ok(())` when the sandbox is already gone so
+    /// `ember sandbox delete` retries don't fail loudly.
+    ///
+    /// implementation-note-21: addresses the "stale `coding-agent` container blocks
+    /// retry" demo failure. `stop_sandbox` leaves the row + persona behind so
+    /// a second `sandbox create --name coding-agent` hits the
+    /// `personas.name` UNIQUE constraint. `delete_sandbox` is the GC path.
+    pub fn delete_sandbox(&self, id: &str) -> Result<(), StoreError> {
+        // Look up the row. NotFound is the idempotent path — caller already
+        // got what they wanted.
+        let row: Option<(String, String, Option<String>, Option<String>)> = self
             .conn()
             .query_row(
-                "SELECT container_id, status FROM sandboxes WHERE id = ?1",
+                "SELECT name, persona_id, container_id, workspace_path FROM sandboxes WHERE id = ?1",
                 rusqlite::params![id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(StoreError::Sqlite(other)),
+            })?;
+
+        let Some((sandbox_name, persona_id, container_id, workspace_path)) = row else {
+            return Ok(());
+        };
+
+        // Force-remove the container if we recorded one. `docker rm -f` stops
+        // and removes in one shot and is idempotent against an already-gone
+        // container (it errors but we tolerate that).
+        if let Some(ref cid) = container_id {
+            match std::process::Command::new("docker")
+                .args(["rm", "-f", cid.as_str()])
+                .output()
+            {
+                Ok(out) if !out.status.success() => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    tracing::warn!(
+                        cmd = "docker rm -f",
+                        container_id = %cid,
+                        exit = out.status.code().unwrap_or(-1),
+                        stderr = %stderr.trim(),
+                        "subprocess failed (tolerated — sandbox delete is idempotent)"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        cmd = "docker rm -f",
+                        container_id = %cid,
+                        error = %e,
+                        "subprocess spawn failed (tolerated)"
+                    );
+                }
+            }
+        }
+
+        // Belt-and-suspenders: also reap any container whose --name matches
+        // the sandbox name. Covers the implementation-note-21 case where the row
+        // was inserted but `start_container` failed before recording a
+        // container_id, leaving an orphan docker container with the sandbox
+        // name. `docker rm -f <name>` is a no-op when the container is gone.
+        match std::process::Command::new("docker")
+            .args(["rm", "-f", sandbox_name.as_str()])
+            .output()
+        {
+            Ok(out) if !out.status.success() => {
+                // No-such-container is the common case here; downgrade to debug.
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                tracing::debug!(
+                    cmd = "docker rm -f",
+                    name = %sandbox_name,
+                    exit = out.status.code().unwrap_or(-1),
+                    stderr = %stderr.trim(),
+                    "name-based reap returned non-zero (likely no such container — fine)"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    cmd = "docker rm -f",
+                    name = %sandbox_name,
+                    error = %e,
+                    "subprocess spawn failed (tolerated)"
+                );
+            }
+        }
+
+        // Clean up the fresh-clone workspace if any. Container must be gone
+        // first (above) so the bind mount is released.
+        if let Some(ref ws) = workspace_path {
+            let ws_path = PathBuf::from(ws);
+            match std::fs::remove_dir_all(&ws_path) {
+                Ok(()) => tracing::info!(workspace = %ws, "workspace removed"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!(workspace = %ws, error = %e, "workspace remove failed"),
+            }
+        }
+
+        // Drop the sandbox row.
+        self.conn().execute(
+            "DELETE FROM sandboxes WHERE id = ?1",
+            rusqlite::params![id],
+        )?;
+
+        // If the auto-created persona has no other refs, delete it. Refs:
+        //   - other sandbox rows (persona_id or owner_persona_id)
+        //   - grants
+        //   - approval_requests
+        //   - standing_grants
+        //   - notifications
+        //   - receipts
+        //
+        // `personas.name UNIQUE` is the constraint that bites repeat
+        // `sandbox create --name coding-agent` after a failed run, so
+        // dropping the orphaned persona is the actual unblock.
+        let other_refs: i64 = self.conn().query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM sandboxes WHERE persona_id = ?1 OR owner_persona_id = ?1)
+              + (SELECT COUNT(*) FROM grants WHERE persona_id = ?1)
+              + (SELECT COUNT(*) FROM approval_requests WHERE persona_id = ?1)
+              + (SELECT COUNT(*) FROM standing_grants WHERE persona_id = ?1)
+              + (SELECT COUNT(*) FROM notifications WHERE persona_id = ?1)
+              + (SELECT COUNT(*) FROM receipts WHERE persona_id = ?1)",
+            rusqlite::params![persona_id],
+            |row| row.get(0),
+        )?;
+
+        if other_refs == 0 {
+            self.conn().execute(
+                "DELETE FROM personas WHERE id = ?1",
+                rusqlite::params![persona_id],
+            )?;
+            tracing::info!(persona_id = %persona_id, "auto-created persona deleted (no other refs)");
+        } else {
+            tracing::info!(
+                persona_id = %persona_id,
+                refs = other_refs,
+                "persona retained — other rows reference it"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Return the `owner_persona_id` stored for the given sandbox id.
+    /// Returns `None` when the column is NULL (legacy row, no owner recorded).
+    pub fn get_sandbox_owner(&self, sandbox_id: &str) -> Result<Option<String>, StoreError> {
+        self.conn()
+            .query_row(
+                "SELECT owner_persona_id FROM sandboxes WHERE id = ?1",
+                rusqlite::params![sandbox_id],
+                |row| row.get(0),
             )
             .map_err(|e| match e {
                 rusqlite::Error::QueryReturnedNoRows => StoreError::NotFound,
                 other => StoreError::Sqlite(other),
-            })?;
+            })
+    }
+
+    /// Execute a command in a running sandbox container.
+    ///
+    /// `caller_persona_id` must match the sandbox's `owner_persona_id`. When
+    /// the stored `owner_persona_id` is NULL (legacy row predating REVIEW-F9),
+    /// the check is skipped so existing single-user deployments continue to
+    /// work without migration ceremony. New sandboxes created after this fix
+    /// always store an owner and enforce the check.
+    pub fn exec_sandbox(
+        &self,
+        id: &str,
+        command: &[&str],
+        caller_persona_id: &str,
+    ) -> Result<String, StoreError> {
+        let (container_id, status, owner_persona_id): (Option<String>, String, Option<String>) =
+            self
+                .conn()
+                .query_row(
+                    "SELECT container_id, status, owner_persona_id FROM sandboxes WHERE id = ?1",
+                    rusqlite::params![id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => StoreError::NotFound,
+                    other => StoreError::Sqlite(other),
+                })?;
+
+        // Ownership check: when owner_persona_id is set, the caller must match.
+        if let Some(ref owner) = owner_persona_id
+            && owner != caller_persona_id
+        {
+            let details = format!(
+                "attempted_persona={caller_persona_id} sandbox_owner={owner} sandbox_id={id}"
+            );
+            let _ = self.log_event(
+                Some(caller_persona_id),
+                "unauthorized.exec_sandbox",
+                None,
+                "denied",
+                Some(&details),
+            );
+            tracing::warn!(
+                caller_persona_id = %caller_persona_id,
+                sandbox_owner = %owner,
+                sandbox_id = %id,
+                "exec_sandbox: caller persona does not own sandbox"
+            );
+            return Err(StoreError::Unauthorized);
+        }
 
         if status != "running" {
             return Err(StoreError::InvalidInput(format!(
@@ -684,12 +890,201 @@ mod tests {
         assert_eq!(persona.status, "revoked");
     }
 
+    // ---------- implementation-note-21: delete_sandbox ----------
+
+    #[test]
+    fn delete_sandbox_removes_row_and_unreferenced_persona() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let sandbox = store
+            .create_sandbox("coding-agent", "alpine:latest")
+            .unwrap();
+        let persona_id = sandbox.persona_id.clone();
+
+        store.delete_sandbox(&sandbox.id).unwrap();
+
+        // Sandbox row gone.
+        let list = store.list_sandboxes().unwrap();
+        assert!(list.is_empty(), "sandbox row should be deleted");
+
+        // Persona row gone (no other refs).
+        let result = store.get_persona(&persona_id);
+        assert!(
+            matches!(result, Err(StoreError::NotFound)),
+            "persona should be deleted when no other refs exist"
+        );
+    }
+
+    #[test]
+    fn delete_sandbox_unblocks_recreate_with_same_name() {
+        // The whole point of implementation-note-21: after a stale sandbox is
+        // deleted, the demo can re-create a sandbox with the same name
+        // without hitting the `personas.name UNIQUE` constraint.
+        let store = DaemonStore::open_in_memory().unwrap();
+        let first = store
+            .create_sandbox("coding-agent", "alpine:latest")
+            .unwrap();
+        store.delete_sandbox(&first.id).unwrap();
+
+        let second = store
+            .create_sandbox("coding-agent", "alpine:latest")
+            .expect("recreate after delete must succeed");
+        assert_ne!(first.id, second.id);
+        assert_eq!(second.name, "coding-agent");
+    }
+
+    #[test]
+    fn delete_sandbox_is_idempotent_on_missing_id() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        // No sandbox exists; delete must succeed silently.
+        store
+            .delete_sandbox("sandbox-does-not-exist")
+            .expect("delete must be idempotent on missing id");
+    }
+
+    #[test]
+    fn delete_sandbox_keeps_persona_with_other_refs() {
+        // If a grant references the auto-created persona, the persona must
+        // be retained (the foreign-key would orphan it otherwise) — only the
+        // sandbox row itself is deleted.
+        let store = DaemonStore::open_in_memory().unwrap();
+        let sandbox = store
+            .create_sandbox("ref-keeper", "alpine:latest")
+            .unwrap();
+        // Insert a fake grant row referencing the persona.
+        store
+            .conn()
+            .execute(
+                "INSERT INTO grants (id, persona_id, credential_name, scope, created_at, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    "grant-test-keep",
+                    sandbox.persona_id,
+                    "demo-cred",
+                    "*",
+                    Utc::now().to_rfc3339(),
+                    "active",
+                ],
+            )
+            .unwrap();
+
+        store.delete_sandbox(&sandbox.id).unwrap();
+
+        // Sandbox row gone.
+        assert!(store.list_sandboxes().unwrap().is_empty());
+
+        // Persona retained — it has a grant referencing it.
+        let persona = store
+            .get_persona(&sandbox.persona_id)
+            .expect("persona must be retained when other refs exist");
+        assert_eq!(persona.status, "active");
+    }
+
     #[test]
     fn create_duplicate_sandbox_name_returns_error() {
         let store = DaemonStore::open_in_memory().unwrap();
         store.create_sandbox("dup-box", "alpine:latest").unwrap();
         let result = store.create_sandbox("dup-box", "alpine:latest");
         assert!(result.is_err());
+    }
+
+    // ---------- REVIEW-F7: resolve_sandbox_id determinism + UNIQUE(name) ----------
+
+    #[test]
+    fn resolve_sandbox_id_by_name_returns_correct_id() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let sb = store.create_sandbox("resolve-me", "alpine:latest").unwrap();
+        let resolved = store.resolve_sandbox_id("resolve-me").unwrap();
+        assert_eq!(resolved, sb.id);
+    }
+
+    #[test]
+    fn resolve_sandbox_id_by_id_returns_correct_id() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let sb = store.create_sandbox("id-lookup-box", "alpine:latest").unwrap();
+        let resolved = store.resolve_sandbox_id(&sb.id).unwrap();
+        assert_eq!(resolved, sb.id);
+    }
+
+    #[test]
+    fn resolve_sandbox_id_missing_returns_not_found() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let result = store.resolve_sandbox_id("does-not-exist");
+        assert!(matches!(result, Err(StoreError::NotFound)));
+    }
+
+    #[test]
+    fn sandboxes_unique_name_constraint_enforced() {
+        // The UNIQUE index on sandboxes(name) (REVIEW-F7) means inserting a
+        // second sandbox with the same name must fail at the DB layer.
+        let store = DaemonStore::open_in_memory().unwrap();
+        store.create_sandbox("unique-check", "alpine:latest").unwrap();
+        let result = store.create_sandbox("unique-check", "alpine:latest");
+        assert!(
+            result.is_err(),
+            "expected UNIQUE constraint error on duplicate sandbox name"
+        );
+    }
+
+    #[test]
+    fn resolve_sandbox_id_returns_newest_when_unique_index_dropped() {
+        // Simulate an old v0 DB that predates UNIQUE(name) by dropping the
+        // unique index, inserting two rows with the same name, then restoring
+        // the index via the migration-equivalent CREATE UNIQUE INDEX.
+        // The resolver must return the newest row (ORDER BY created_at DESC).
+        let store = DaemonStore::open_in_memory().unwrap();
+
+        // Drop the unique index so we can insert duplicates.
+        store
+            .conn()
+            .execute_batch("DROP INDEX IF EXISTS idx_sandboxes_name;")
+            .unwrap();
+
+        // Also drop the implicit UNIQUE constraint baked into the CREATE TABLE
+        // by recreating the table without it, so both inserts succeed.
+        store
+            .conn()
+            .execute_batch(
+                "CREATE TABLE sandboxes_noconstraint (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    persona_id TEXT NOT NULL,
+                    container_id TEXT,
+                    image TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'created',
+                    created_at TEXT NOT NULL,
+                    stopped_at TEXT,
+                    workspace_path TEXT,
+                    owner_persona_id TEXT
+                );
+                INSERT INTO sandboxes_noconstraint SELECT * FROM sandboxes;
+                DROP TABLE sandboxes;
+                ALTER TABLE sandboxes_noconstraint RENAME TO sandboxes;",
+            )
+            .unwrap();
+
+        // Insert two rows with the same name but different created_at
+        // timestamps so we can assert ORDER BY picks the newer one.
+        let older_id = "sandbox-older-000000000000000000000000000000";
+        let newer_id = "sandbox-newer-000000000000000000000000000000";
+
+        store.conn().execute(
+            "INSERT INTO sandboxes (id, name, persona_id, image, status, created_at)
+             VALUES (?1, 'dup-name', 'p1', 'alpine:latest', 'created', '2024-01-01T00:00:00Z')",
+            rusqlite::params![older_id],
+        ).unwrap();
+
+        store.conn().execute(
+            "INSERT INTO sandboxes (id, name, persona_id, image, status, created_at)
+             VALUES (?1, 'dup-name', 'p2', 'alpine:latest', 'created', '2024-06-01T00:00:00Z')",
+            rusqlite::params![newer_id],
+        ).unwrap();
+
+        // Resolver must return the newest row.
+        let resolved = store.resolve_sandbox_id("dup-name").unwrap();
+        assert_eq!(
+            resolved, newer_id,
+            "resolve_sandbox_id must return the newest sandbox when names collide"
+        );
     }
 
     // ---------- 69J.3: start_container hardening invariants ----------
@@ -1155,7 +1550,7 @@ mod tests {
             .start_container(&sandbox.id, &socket_dir, Some("none"), &[])
             .unwrap();
 
-        let output = store.exec_sandbox(&sandbox.id, &["echo", "hello"]).unwrap();
+        let output = store.exec_sandbox(&sandbox.id, &["echo", "hello"], "any-persona").unwrap();
         assert!(output.contains("hello"));
 
         // Clean up
@@ -1210,5 +1605,119 @@ mod tests {
         // Persona revoked
         let persona = store.get_persona(&sandbox.persona_id).unwrap();
         assert_eq!(persona.status, "revoked");
+    }
+
+    // ---------- REVIEW-F9: exec_sandbox ownership enforcement ----------
+
+    #[test]
+    fn exec_sandbox_rejects_wrong_persona() {
+        let store = DaemonStore::open_in_memory().unwrap();
+
+        // persona-A creates the sandbox
+        let mut o = opts("owned-box");
+        o.owner_persona_id = Some("persona-A".to_string());
+        let sandbox = store.create_sandbox_with_opts(&o, None).unwrap();
+        assert_eq!(sandbox.owner_persona_id.as_deref(), Some("persona-A"));
+
+        // Manually flip status to 'running' so exec gets past the status check.
+        // (We don't spin up docker here — the ownership check fires first.)
+        store
+            .conn()
+            .execute(
+                "UPDATE sandboxes SET status = 'running', container_id = 'fake-cid' WHERE id = ?1",
+                rusqlite::params![sandbox.id],
+            )
+            .unwrap();
+
+        // persona-B's exec attempt must be rejected with Unauthorized.
+        let err = store
+            .exec_sandbox(&sandbox.id, &["echo", "hello"], "persona-B")
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Unauthorized),
+            "expected Unauthorized, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn exec_sandbox_allows_owner_persona() {
+        let store = DaemonStore::open_in_memory().unwrap();
+
+        let mut o = opts("owned-box-owner");
+        o.owner_persona_id = Some("persona-A".to_string());
+        let sandbox = store.create_sandbox_with_opts(&o, None).unwrap();
+
+        store
+            .conn()
+            .execute(
+                "UPDATE sandboxes SET status = 'running', container_id = 'fake-cid' WHERE id = ?1",
+                rusqlite::params![sandbox.id],
+            )
+            .unwrap();
+
+        // persona-A is the owner — exec proceeds past the ownership check.
+        // It will fail later (docker exec on a fake container id), but we get
+        // a docker-level error, not Unauthorized.
+        let result = store.exec_sandbox(&sandbox.id, &["echo", "hi"], "persona-A");
+        assert!(
+            !matches!(result, Err(StoreError::Unauthorized)),
+            "owner should not get Unauthorized: {result:?}"
+        );
+    }
+
+    #[test]
+    fn exec_sandbox_null_owner_skips_check() {
+        let store = DaemonStore::open_in_memory().unwrap();
+
+        // Legacy sandbox: create_sandbox sets owner_persona_id = None.
+        let sandbox = store.create_sandbox("legacy-box", "alpine:latest").unwrap();
+        assert!(sandbox.owner_persona_id.is_none());
+
+        store
+            .conn()
+            .execute(
+                "UPDATE sandboxes SET status = 'running', container_id = 'fake-cid' WHERE id = ?1",
+                rusqlite::params![sandbox.id],
+            )
+            .unwrap();
+
+        // Any caller persona is allowed when owner is NULL.
+        let result = store.exec_sandbox(&sandbox.id, &["echo", "hi"], "any-persona");
+        assert!(
+            !matches!(result, Err(StoreError::Unauthorized)),
+            "null owner should skip check: {result:?}"
+        );
+    }
+
+    #[test]
+    fn exec_sandbox_audit_event_emitted_on_unauthorized() {
+        use crate::audit::AuditFilter;
+
+        let store = DaemonStore::open_in_memory().unwrap();
+
+        let mut o = opts("audit-box");
+        o.owner_persona_id = Some("persona-owner".to_string());
+        let sandbox = store.create_sandbox_with_opts(&o, None).unwrap();
+
+        store
+            .conn()
+            .execute(
+                "UPDATE sandboxes SET status = 'running', container_id = 'fake-cid' WHERE id = ?1",
+                rusqlite::params![sandbox.id],
+            )
+            .unwrap();
+
+        let _ = store.exec_sandbox(&sandbox.id, &["ls"], "persona-intruder");
+
+        let entries = store
+            .query_audit(&AuditFilter {
+                action: Some("unauthorized.exec_sandbox".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(entries.len(), 1, "expected one unauthorized.exec_sandbox audit entry");
+        let e = &entries[0];
+        assert_eq!(e.outcome, "denied");
+        assert_eq!(e.agent_id.as_deref(), Some("persona-intruder"));
     }
 }

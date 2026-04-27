@@ -318,6 +318,7 @@ fn wire_event_to_envelope(w: WireEvent) -> Result<EventEnvelope, ValidationError
                 relation: core_types::EventRefRelation::parse(&r.relation)
                     .ok_or_else(|| ValidationError::new("invalid ref relation"))?,
                 target_event_id: r.target_event_id,
+                seq: 0,
             })
         })
         .collect::<Result<Vec<_>, ValidationError>>()?;
@@ -850,7 +851,7 @@ mod tests {
                 initial_key: test_key("device-a-v1"),
                 initial_encryption_key: test_encryption_key("device-a-v1"),
             }),
-            vec![EventRef::previous("evt-root-created")],
+            vec![EventRef::previous("evt-root-created", 0)],
             SignerBinding::root("root-a", "root-a-v1"),
             &signer,
         )

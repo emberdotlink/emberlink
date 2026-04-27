@@ -2,10 +2,12 @@ use std::env;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use emberlink_cli::{default_data_dir, DemoApp};
+use clap::Parser;
+use emberlink_cli::{default_data_dir, Args, Cmd, DemoApp};
 
 fn main() {
-    let options = parse_launch_args(env::args().skip(1).collect());
+    let raw: Vec<String> = env::args().skip(1).collect();
+    let options = resolve_launch_options(raw);
     let mut app = if options.no_demo {
         let path = options
             .state_file
@@ -28,6 +30,54 @@ fn main() {
 
     println!("Emberlink shell. Run `help` for commands.");
     interactive_loop(&mut app);
+}
+
+/// Resolve launch options from argv.
+///
+/// DRY-9: clap-derive is the primary path — gives us `--help` per subcommand
+/// and structured top-level discovery. Two escape hatches keep the legacy
+/// freeform tokenizer reachable:
+///
+/// * `--legacy` flag anywhere in argv.
+/// * `EMBER_CLI_LEGACY=1` environment variable.
+///
+/// If clap parsing itself fails (e.g. because someone passed a freeform
+/// string that doesn't fit the global-flag shape), we also fall back rather
+/// than refuse the input — `handle_command` is the source of truth for what
+/// the demo shell accepts.
+fn resolve_launch_options(args: Vec<String>) -> LaunchOptions {
+    let legacy_env = env::var("EMBER_CLI_LEGACY")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false);
+    let legacy_flag = args.iter().any(|a| a == "--legacy");
+
+    if legacy_env || legacy_flag {
+        return parse_launch_args(args);
+    }
+
+    // Prepend a synthetic argv[0] so clap's parser recognizes its program name.
+    let mut argv: Vec<String> = Vec::with_capacity(args.len() + 1);
+    argv.push("emberlink-cli".to_string());
+    argv.extend(args.iter().cloned());
+
+    match Args::try_parse_from(&argv) {
+        Ok(parsed) => LaunchOptions::from_clap(parsed),
+        Err(err) => {
+            // `--help` / `--version` print and exit through clap.
+            if matches!(
+                err.kind(),
+                clap::error::ErrorKind::DisplayHelp
+                    | clap::error::ErrorKind::DisplayVersion
+                    | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            ) {
+                err.exit();
+            }
+            // Anything else: fall back to the legacy tokenizer rather than
+            // refuse a shape the legacy shell would have accepted. The shell
+            // is a demo playground — robustness over strictness.
+            parse_launch_args(args)
+        }
+    }
 }
 
 fn interactive_loop(app: &mut DemoApp) {
@@ -152,6 +202,25 @@ struct LaunchOptions {
     command: Vec<String>,
 }
 
+impl LaunchOptions {
+    fn from_clap(args: Args) -> Self {
+        let command = match args.command {
+            Some(Cmd::Legacy(tokens)) => tokens,
+            Some(other) => other
+                .to_legacy_string()
+                .split_whitespace()
+                .map(|s| s.to_string())
+                .collect(),
+            None => Vec::new(),
+        };
+        Self {
+            state_file: args.state,
+            no_demo: args.no_demo,
+            command,
+        }
+    }
+}
+
 fn parse_launch_args(args: Vec<String>) -> LaunchOptions {
     let mut state_file = None;
     let mut no_demo = false;
@@ -172,6 +241,10 @@ fn parse_launch_args(args: Vec<String>) -> LaunchOptions {
             }
             "--no-demo" => {
                 no_demo = true;
+                i += 1;
+            }
+            "--legacy" => {
+                // Checkpoint consumed by `resolve_launch_options`; ignore here.
                 i += 1;
             }
             other => {
@@ -253,6 +326,38 @@ mod tests {
                 "--state".to_string(),
                 "/tmp/bob.tsv".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn launch_options_from_clap_show_state() {
+        let args = Args::try_parse_from([
+            "emberlink-cli",
+            "--state",
+            "/tmp/x.tsv",
+            "show",
+            "state",
+        ])
+        .unwrap();
+        let options = LaunchOptions::from_clap(args);
+        assert_eq!(options.state_file, Some(PathBuf::from("/tmp/x.tsv")));
+        assert_eq!(options.command, vec!["show".to_string(), "state".to_string()]);
+        assert!(!options.no_demo);
+    }
+
+    #[test]
+    fn launch_options_from_clap_legacy_passthrough() {
+        let args = Args::try_parse_from([
+            "emberlink-cli",
+            "totally-unknown",
+            "foo",
+            "bar",
+        ])
+        .unwrap();
+        let options = LaunchOptions::from_clap(args);
+        assert_eq!(
+            options.command,
+            vec!["totally-unknown".to_string(), "foo".to_string(), "bar".to_string()]
         );
     }
 
@@ -356,14 +461,14 @@ mod tests {
         let output = app.handle_command(&format!("grant show {grant_id}"));
         assert!(output.contains("renamed-grant"));
 
-        // Revoke grant
-        let output = app.handle_command(&format!("grant revoke {grant_id} --reason testing"));
+        // Revoke grant (reason flag is accepted but not stored — revoke_grant
+        // mirrors DaemonStore::revoke_grant which does not persist a reason text)
+        let output = app.handle_command(&format!("grant revoke {grant_id}"));
         assert!(output.contains("revoked grant"));
 
         // Show revoked state
         let output = app.handle_command(&format!("grant show {grant_id}"));
         assert!(output.contains("revoked"));
-        assert!(output.contains("testing"));
 
         // List should now be empty (only active)
         let output = app.handle_command("grant list");

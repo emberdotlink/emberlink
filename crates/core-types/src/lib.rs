@@ -123,6 +123,7 @@ mod network;
 pub mod approval;
 pub mod credential_delivery;
 pub mod grant_conditions;
+pub mod policy;
 pub mod qr_encoding;
 mod recovery;
 pub mod size_limits;

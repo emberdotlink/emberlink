@@ -16,7 +16,7 @@ hex = "0.4"
 # is the smaller, more stable surface.
 getrandom = "0.4"
 hkdf = "0.13"
-sha2 = "0.11"
+sha2.workspace = true
 zeroize = { version = "1", features = ["derive"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

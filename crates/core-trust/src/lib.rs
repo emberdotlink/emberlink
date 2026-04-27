@@ -527,6 +527,7 @@ pub fn trust_revoked_event(
         vec![core_events::EventRef {
             relation: EventRefRelation::Previous,
             target_event_id: previous_event_id.into(),
+            seq: 0,
         }],
         signer_binding,
         signer,

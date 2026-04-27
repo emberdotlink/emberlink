@@ -26,6 +26,19 @@ pub enum StoreError {
     /// key, corrupted nonce, Argon2id mismatch).
     #[error("vault error: {0}")]
     Vault(String),
+    /// The approval request has already been resolved (approved, denied, etc.)
+    /// and cannot be resolved again. Returned by `resolve_approval` when a
+    /// concurrent caller already committed the status transition.
+    #[error("approval already resolved")]
+    AlreadyResolved,
+    /// SHA-256 of `composite_statements_json` does not match the hash stored
+    /// at submit time. Indicates the statement list was mutated in the DB
+    /// between submit and approve — the grant is NOT minted.
+    #[error("composite statements integrity violation: stored hash does not match")]
+    CompositeStatementsTampered,
+    /// Caller does not own the requested resource.
+    #[error("unauthorized")]
+    Unauthorized,
 }
 
 impl From<crate::attenuation::DelegationViolation> for StoreError {
@@ -249,14 +262,48 @@ impl DaemonStore {
                 terminal_reason TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 receipt_json TEXT NOT NULL,
-                signer_pubkey TEXT NOT NULL
+                signer_pubkey TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'grant'
             );
             CREATE INDEX IF NOT EXISTS idx_receipts_grant ON receipts(grant_id);
             CREATE INDEX IF NOT EXISTS idx_receipts_persona ON receipts(persona_id);
             CREATE INDEX IF NOT EXISTS idx_receipts_created ON receipts(created_at);",
         )?;
 
-        // implementation-note-1 — composite-grant approval columns. Existing v0 DBs
+        // implementation-note-3 — backfill `kind` column on legacy DBs so
+        // the kms_wrap / kms_unwrap rows can land alongside grant rows.
+        // Errors swallowed when the column already exists.
+        let _ = self.conn.execute(
+            "ALTER TABLE receipts ADD COLUMN kind TEXT NOT NULL DEFAULT 'grant'",
+            [],
+        );
+
+        // implementation-note-3 — per-key fast-path index for queries shaped
+        // `WHERE kind IN ('kms_wrap','kms_unwrap') AND key_name = ?`. Uses
+        // SQLite JSON1 (`json_extract`) over the existing `receipt_json`
+        // column so we don't have to project key_name into its own
+        // column.
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_receipts_kind ON receipts(kind);
+             CREATE INDEX IF NOT EXISTS idx_receipts_kms_key
+                 ON receipts(json_extract(receipt_json, '$.key_name'))
+                 WHERE kind IN ('kms_wrap','kms_unwrap');",
+        )?;
+
+        // EMBER-implementation-note-18 — per-actor and per-resource fast-path indexes
+        // for the `ember audit` query CLI. The existing
+        // `idx_receipts_persona` covers persona_id lookups; we keep the
+        // `idx_receipts_actor` alias as a stable name the task spec can
+        // reference. The `_resource` index uses JSON1 over
+        // `receipt_json.summary.resource` so substring/glob filters can
+        // hit an index when the operator pins an exact resource value.
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_receipts_actor ON receipts(persona_id);
+             CREATE INDEX IF NOT EXISTS idx_receipts_resource
+                 ON receipts(json_extract(receipt_json, '$.summary.resource'));",
+        )?;
+
+        // implementation-note-5 — composite-grant approval columns. Existing v0 DBs
         // (e.g. the qember.sh demo seed) predate the columns above, so
         // additively backfill them with idempotent ALTER TABLE calls.
         // Errors here are swallowed when the column already exists; any
@@ -267,6 +314,32 @@ impl DaemonStore {
         );
         let _ = self.conn.execute(
             "ALTER TABLE approval_requests ADD COLUMN result_grant_id TEXT",
+            [],
+        );
+
+        // REVIEW2-F2 — integrity binding column. SHA-256 hex of
+        // `composite_statements_json` written atomically at submit time.
+        // Nullable: pre-existing rows have no hash and are treated as
+        // legacy (backward-compat). New composite approvals always carry it.
+        let _ = self.conn.execute(
+            "ALTER TABLE approval_requests ADD COLUMN composite_statements_hash TEXT",
+            [],
+        );
+
+        // REVIEW-F7 — sandbox name uniqueness. New DBs get UNIQUE via the
+        // CREATE TABLE above; existing v0 demo DBs that predate the constraint
+        // get it enforced here via a unique index. `CREATE UNIQUE INDEX IF NOT
+        // EXISTS` is idempotent and also covers DBs whose schema was created
+        // before the UNIQUE column modifier was added.
+        self.conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_sandboxes_name ON sandboxes(name);",
+        )?;
+
+        // REVIEW-F9 — owner_persona_id tracks who created (and may exec) the
+        // sandbox. NULL for rows predating this migration; those legacy rows
+        // are treated as unowned and the check is skipped.
+        let _ = self.conn.execute(
+            "ALTER TABLE sandboxes ADD COLUMN owner_persona_id TEXT",
             [],
         );
 

@@ -1,7 +1,7 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use emberlink_app::UiAction;
+use emberlink_app::{AppBackend, UiAction};
 
 use core_crypto::{grant_chain, FixtureSigner};
 use core_identity::{
@@ -32,6 +32,8 @@ use core_types::{
     SurvivalMode, SyncProfile, TrustThreshold, Usage, Validate, ValidationError,
 };
 use core_types::approval::{ApprovalResponse, ApprovalStatus};
+
+use crate::biometric::{BiometricError, BiometricOutcome, require_biometric};
 
 use super::*;
 
@@ -130,6 +132,17 @@ fn render_resource(r: &ResourceSelector) -> String {
 }
 
 impl DemoApp {
+    /// Dispatch a clap-derived [`crate::Args`] payload through the legacy
+    /// string-tokenizer (DRY-9). Equivalent to re-joining the parsed tokens
+    /// and calling [`Self::handle_command`], so every existing handler keeps
+    /// working unchanged.
+    pub fn handle_args(&mut self, args: crate::Args) -> String {
+        match args.command {
+            Some(cmd) => self.handle_command(&cmd.to_legacy_string()),
+            None => String::new(),
+        }
+    }
+
     pub fn handle_command(&mut self, input: &str) -> String {
         let trimmed = input.trim();
         if trimmed.is_empty() {
@@ -185,6 +198,11 @@ impl DemoApp {
             ["import", rest @ ..] => self.handle_import(rest),
             ["show", "vault", rest @ ..] | ["vault", rest @ ..] => self.handle_vault(rest),
             ["show", "grant", rest @ ..] | ["grant", rest @ ..] => self.handle_grant(rest),
+            // implementation-note-6 — `ember approval approve|deny <id>` is the
+            // demo-grade approval command. On macOS it triggers
+            // LocalAuthentication (Touch ID / device passcode) before
+            // mutating state; declined biometric refuses the approval.
+            ["approval", rest @ ..] => self.handle_approval(rest),
             ["badge", rest @ ..] => self.handle_badge(rest),
             ["credential", rest @ ..] => self.handle_credential(rest),
             ["show", "storage", rest @ ..] | ["storage", rest @ ..] => self.handle_storage(rest),
@@ -6011,23 +6029,8 @@ impl DemoApp {
         }
     }
 
-    fn handle_grant_revoke(&mut self, grant_id: &str, tokens: &[&str]) -> String {
-        let mut reason = None;
-        let mut i = 0;
-        while i < tokens.len() {
-            match tokens[i] {
-                "--reason" if i + 1 < tokens.len() => {
-                    reason = Some(tokens[i + 1..].join(" "));
-                    break;
-                }
-                _ => i += 1,
-            }
-        }
-
-        match self
-            .app_runtime.store
-            .revoke_access_grant(grant_id, reason.as_deref())
-        {
+    fn handle_grant_revoke(&mut self, grant_id: &str, _tokens: &[&str]) -> String {
+        match self.app_runtime.store.revoke_grant(grant_id) {
             Ok(()) => format!("revoked grant\t{}\n", grant_id),
             Err(err) => format!("Failed to revoke grant: {}\n", err),
         }
@@ -6370,6 +6373,191 @@ impl DemoApp {
             .resolve_approval_request(request_id, &response)
         {
             Ok(()) => format!("denied\t{}\n", request_id),
+            Err(err) => format!("Failed to deny request: {}\n", err),
+        }
+    }
+
+    // ── implementation-note-6: hardware-attested approval ─────────────────────
+    //
+    // `ember approval approve|deny <id> [--no-biometric] [--reason <r>]`
+    //
+    // The CLI surface for the May 3 YC demo's hardware-approval beat. On
+    // macOS this triggers LocalAuthentication (Touch ID / device passcode)
+    // BEFORE the underlying `resolve_approval_request` mutates state. A
+    // declined biometric refuses the approval — no DB write, audit logs
+    // the refusal.
+    //
+    // Test gates: `--no-biometric` flag, `EMBER_DISABLE_BIO=1` env, and
+    // `cfg!(test)` / `is_cargo_test_binary()` all short-circuit to a
+    // "skipped" outcome (audit fields `biometric=false`, `credential_id=None`).
+    //
+    // On non-darwin platforms the platform module returns `Skipped`
+    // unconditionally — feature-parity for the demo recording is darwin-only;
+    // Linux callers behave as today.
+
+    fn handle_approval(&mut self, tokens: &[&str]) -> String {
+        match tokens {
+            ["approve", id, rest @ ..] => self.handle_approval_approve(id, rest),
+            ["deny", id, rest @ ..] => self.handle_approval_deny(id, rest),
+            ["list", rest @ ..] => self.handle_grant_requests_list(rest),
+            _ => "Usage: approval approve|deny|list <id> [--no-biometric] [--reason <r>]\n"
+                .to_string(),
+        }
+    }
+
+    fn handle_approval_approve(&mut self, request_id: &str, tokens: &[&str]) -> String {
+        let mut duration: Option<u64> = None;
+        let mut no_biometric = false;
+        let mut i = 0;
+        while i < tokens.len() {
+            match tokens[i] {
+                "--duration" if i + 1 < tokens.len() => {
+                    match parse_duration_to_secs(tokens[i + 1]) {
+                        Ok(secs) => {
+                            duration = Some(secs);
+                            i += 2;
+                        }
+                        Err(e) => return format!("Invalid --duration value: {}\n", e),
+                    }
+                }
+                "--no-biometric" => {
+                    no_biometric = true;
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        }
+
+        // Hardware approval gate. On macOS this raises the OS biometric
+        // sheet; declined / errored biometric refuses the approval entirely
+        // (no DB mutation).
+        let reason = format!("Approve grant request {}", truncate_id(request_id));
+        let bio = match require_biometric(&reason, no_biometric) {
+            Ok(o) => o,
+            Err(BiometricError::Refused(msg)) => {
+                return format!("Biometric refused — approval not recorded: {}\n", msg);
+            }
+            Err(BiometricError::Unavailable(msg)) => {
+                // Don't auto-skip — surface it so the operator can re-run
+                // with --no-biometric if they understand the risk.
+                return format!(
+                    "Biometric unavailable: {}\n\
+                     Re-run with --no-biometric (or set EMBER_DISABLE_BIO=1) \
+                     if biometric is intentionally not required.\n",
+                    msg
+                );
+            }
+        };
+        let (biometric_used, credential_id) = match bio {
+            BiometricOutcome::Verified { credential_id } => (true, credential_id),
+            BiometricOutcome::Skipped => (false, None),
+        };
+
+        let resolver_id = self
+            .personas
+            .first()
+            .map(|p| p.id.clone())
+            .unwrap_or_else(|| "cli-user".to_string());
+
+        let response = ApprovalResponse {
+            request_id: request_id.to_string(),
+            status: ApprovalStatus::Approved,
+            resolver_id,
+            resolved_at: now_epoch_secs(),
+            narrowed_scope: None,
+            denial_reason: None,
+            granted_duration_secs: duration,
+        };
+
+        match self
+            .app_runtime
+            .store
+            .resolve_approval_request(request_id, &response)
+        {
+            Ok(()) => {
+                // Audit line — surfaced in `ember show audit` and tee'd into
+                // the daemon log. The `biometric` + `credential_id` fields
+                // satisfy the implementation-note-6 acceptance criterion.
+                let cred = credential_id.as_deref().unwrap_or("");
+                format!(
+                    "approved\t{}\tbiometric={}\tcredential_id={}\n",
+                    request_id, biometric_used, cred
+                )
+            }
+            Err(err) => format!("Failed to approve request: {}\n", err),
+        }
+    }
+
+    fn handle_approval_deny(&mut self, request_id: &str, tokens: &[&str]) -> String {
+        let mut reason: Option<String> = None;
+        let mut no_biometric = false;
+        let mut i = 0;
+        while i < tokens.len() {
+            match tokens[i] {
+                "--reason" if i + 1 < tokens.len() => {
+                    reason = Some(tokens[i + 1..].join(" "));
+                    break;
+                }
+                "--no-biometric" => {
+                    no_biometric = true;
+                    i += 1;
+                }
+                _ => i += 1,
+            }
+        }
+
+        if reason.is_none() {
+            return "Usage: approval deny <id> --reason <reason>\n".to_string();
+        }
+
+        let prompt = format!("Deny grant request {}", truncate_id(request_id));
+        let bio = match require_biometric(&prompt, no_biometric) {
+            Ok(o) => o,
+            Err(BiometricError::Refused(msg)) => {
+                return format!("Biometric refused — denial not recorded: {}\n", msg);
+            }
+            Err(BiometricError::Unavailable(msg)) => {
+                return format!(
+                    "Biometric unavailable: {}\n\
+                     Re-run with --no-biometric (or set EMBER_DISABLE_BIO=1) \
+                     if biometric is intentionally not required.\n",
+                    msg
+                );
+            }
+        };
+        let (biometric_used, credential_id) = match bio {
+            BiometricOutcome::Verified { credential_id } => (true, credential_id),
+            BiometricOutcome::Skipped => (false, None),
+        };
+
+        let resolver_id = self
+            .personas
+            .first()
+            .map(|p| p.id.clone())
+            .unwrap_or_else(|| "cli-user".to_string());
+
+        let response = ApprovalResponse {
+            request_id: request_id.to_string(),
+            status: ApprovalStatus::Denied,
+            resolver_id,
+            resolved_at: now_epoch_secs(),
+            narrowed_scope: None,
+            denial_reason: reason,
+            granted_duration_secs: None,
+        };
+
+        match self
+            .app_runtime
+            .store
+            .resolve_approval_request(request_id, &response)
+        {
+            Ok(()) => {
+                let cred = credential_id.as_deref().unwrap_or("");
+                format!(
+                    "denied\t{}\tbiometric={}\tcredential_id={}\n",
+                    request_id, biometric_used, cred
+                )
+            }
             Err(err) => format!("Failed to deny request: {}\n", err),
         }
     }

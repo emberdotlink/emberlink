@@ -51,12 +51,17 @@ struct RawDaemonSection {
     log_level: Option<LogLevel>,
     dashboard_addr: Option<String>,
     stale_approval_threshold_secs: Option<u64>,
+    /// Bind address for the git-echo credential-injection proxy. `None` (key
+    /// absent) ⇒ default `127.0.0.1:0` (random port). Empty string ⇒ disabled.
+    /// (implementation-note-10)
+    git_proxy_addr: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawConfig {
     daemon: Option<RawDaemonSection>,
     keyring: Option<KeyringConfig>,
+    presence: Option<PresenceConfigSection>,
 }
 
 /// Keyring service/account identifiers written into `config.toml`.
@@ -71,6 +76,22 @@ pub struct KeyringConfig {
     pub account: Option<String>,
 }
 
+/// security check: per-operation user-presence gate config. Optional; all
+/// `None` ⇒ presence module uses defaults (15min idle, no quiet hours).
+///
+/// ```toml
+/// [presence]
+/// idle_timeout_secs = 900       # default 900 (15min)
+/// quiet_hours_start = 22        # 22:00 UTC
+/// quiet_hours_end = 6           #  6:00 UTC (wrap-around supported)
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresenceConfigSection {
+    pub idle_timeout_secs: Option<u64>,
+    pub quiet_hours_start: Option<u8>,
+    pub quiet_hours_end: Option<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonConfig {
     pub socket_dir: PathBuf,
@@ -81,11 +102,18 @@ pub struct DaemonConfig {
     /// Address for the dashboard HTTP listener. `None` disables the dashboard (useful for tests).
     /// Defaults to `127.0.0.1:3141` — loopback only, never 0.0.0.0.
     pub dashboard_addr: Option<SocketAddr>,
+    /// Bind address for the git-echo credential-injection proxy used by
+    /// sandboxed agents (`EMBER_PROXY_URL`). `None` disables the proxy.
+    /// Defaults to `127.0.0.1:0` (loopback, ephemeral port). implementation-note-10.
+    pub git_proxy_addr: Option<SocketAddr>,
     /// Keyring service/account override. `None` fields fall back to env var, then compile-time default.
     pub keyring: KeyringConfig,
     /// Startup sweep: mark `pending` approval_requests older than this many seconds as `timed_out`.
     /// Default 3600 (1 hour). Set to 0 to disable the sweep.
     pub stale_approval_threshold_secs: u64,
+    /// security check per-op user-presence gate. Loaded from `[presence]`
+    /// in config.toml; `None` fields fall back to module defaults.
+    pub presence: PresenceConfigSection,
 }
 
 fn expand_tilde(path: &str) -> Result<PathBuf, ConfigError> {
@@ -114,8 +142,10 @@ impl Default for DaemonConfig {
             policy_file: base.join("policy.toml"),
             log_level: LogLevel::Info,
             dashboard_addr: Some("127.0.0.1:3141".parse().expect("valid default addr")),
+            git_proxy_addr: Some("127.0.0.1:0".parse().expect("valid default addr")),
             keyring: KeyringConfig::default(),
             stale_approval_threshold_secs: 3600,
+            presence: PresenceConfigSection::default(),
         }
     }
 }
@@ -140,6 +170,7 @@ impl DaemonConfig {
             log_level: None,
             dashboard_addr: None,
             stale_approval_threshold_secs: None,
+            git_proxy_addr: None,
         });
 
         let socket_dir = match section.socket_dir {
@@ -168,7 +199,16 @@ impl DaemonConfig {
             None => defaults.dashboard_addr,
         };
 
+        let git_proxy_addr = match section.git_proxy_addr {
+            Some(ref s) if s.is_empty() => None,
+            Some(ref s) => Some(SocketAddr::from_str(s).map_err(|e| {
+                ConfigError::Validation(format!("invalid git_proxy_addr '{}': {}", s, e))
+            })?),
+            None => defaults.git_proxy_addr,
+        };
+
         let keyring = raw.keyring.unwrap_or_default();
+        let presence = raw.presence.unwrap_or_default();
         let stale_approval_threshold_secs = section
             .stale_approval_threshold_secs
             .unwrap_or(defaults.stale_approval_threshold_secs);
@@ -180,8 +220,10 @@ impl DaemonConfig {
             policy_file,
             log_level,
             dashboard_addr,
+            git_proxy_addr,
             keyring,
             stale_approval_threshold_secs,
+            presence,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -264,8 +306,10 @@ mod tests {
             policy_file: base.join("policy.toml"),
             log_level: LogLevel::Info,
             dashboard_addr: None,
+            git_proxy_addr: None,
             keyring: KeyringConfig::default(),
             stale_approval_threshold_secs: 3600,
+            presence: PresenceConfigSection::default(),
         };
 
         cfg.ensure_dirs().unwrap();
@@ -347,8 +391,10 @@ mod tests {
             policy_file: PathBuf::from("/tmp/.ember/policy.toml"),
             log_level: LogLevel::Info,
             dashboard_addr: None,
+            git_proxy_addr: None,
             keyring: KeyringConfig::default(),
             stale_approval_threshold_secs: 3600,
+            presence: PresenceConfigSection::default(),
         };
         let err = cfg.validate().unwrap_err();
         assert!(matches!(err, ConfigError::Validation(ref s) if s.contains("socket_dir")));
@@ -363,8 +409,10 @@ mod tests {
             policy_file: PathBuf::from("/tmp/.ember/policy.toml"),
             log_level: LogLevel::Info,
             dashboard_addr: None,
+            git_proxy_addr: None,
             keyring: KeyringConfig::default(),
             stale_approval_threshold_secs: 3600,
+            presence: PresenceConfigSection::default(),
         };
         let err = cfg.validate().unwrap_err();
         assert!(matches!(err, ConfigError::Validation(ref s) if s.contains("must be different")));
@@ -391,6 +439,30 @@ mod tests {
         assert_eq!(loaded.keyring, KeyringConfig::default());
         assert!(loaded.keyring.service.is_none());
         assert!(loaded.keyring.account.is_none());
+    }
+
+    #[test]
+    fn presence_section_loaded_from_toml() {
+        let toml_str = "[daemon]\nlog_level = \"info\"\n\n[presence]\nidle_timeout_secs = 600\nquiet_hours_start = 22\nquiet_hours_end = 6\n";
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+
+        let loaded = DaemonConfig::load(f.path()).unwrap();
+        assert_eq!(loaded.presence.idle_timeout_secs, Some(600));
+        assert_eq!(loaded.presence.quiet_hours_start, Some(22));
+        assert_eq!(loaded.presence.quiet_hours_end, Some(6));
+    }
+
+    #[test]
+    fn presence_section_absent_gives_defaults() {
+        let toml_str = "[daemon]\nlog_level = \"info\"\n";
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+
+        let loaded = DaemonConfig::load(f.path()).unwrap();
+        assert!(loaded.presence.idle_timeout_secs.is_none());
+        assert!(loaded.presence.quiet_hours_start.is_none());
+        assert!(loaded.presence.quiet_hours_end.is_none());
     }
 
     #[test]

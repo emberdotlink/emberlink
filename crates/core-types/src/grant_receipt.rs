@@ -199,6 +199,90 @@ impl Default for Evidence {
 }
 
 // ---------------------------------------------------------------------------
+// KMS receipts (design — kms_wrap / kms_unwrap)
+// ---------------------------------------------------------------------------
+//
+// Receipts emitted by the ember-kms encrypt / decrypt handlers. Carry NON-
+// SENSITIVE metadata only — never plaintext, ciphertext, key material, or
+// any field derived from them. Sizes are recorded for observability only.
+
+/// Discriminator for receipt kinds. The legacy `GrantReceipt` shape is
+/// `Grant`; the new ember-kms receipts are `KmsWrap` (encrypt) and
+/// `KmsUnwrap` (decrypt). Serde rename produces lowercase-snake JSON
+/// (`"grant"`, `"kms_wrap"`, `"kms_unwrap"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceiptKind {
+    Grant,
+    KmsWrap,
+    KmsUnwrap,
+}
+
+/// Outcome of a receipted operation — `success` or `failure`. Failures
+/// carry no plaintext / ciphertext content; the receipt's purpose is the
+/// audit trail of *that* an operation was attempted, not its payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceiptOutcome {
+    Success,
+    Failure,
+}
+
+/// Result of the grant-scope check that gated a kms operation.
+///
+/// `outcome` is `allowed` when a grant authorised the call (and its id is
+/// recorded in `grant_id`), or `denied` when no grant matched (and
+/// `grant_id` is `None`). Standalone callers that bypass grant evaluation
+/// (e.g. early-bootstrap test paths) emit `denied` with `grant_id: None`
+/// to make the bypass visible in the audit trail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct GrantEvaluation {
+    pub outcome: GrantEvaluationOutcome,
+    /// The grant id consulted, when `outcome == allowed`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub grant_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrantEvaluationOutcome {
+    Allowed,
+    Denied,
+}
+
+/// Receipt body for a single ember-kms encrypt or decrypt call.
+///
+/// **Hard invariant:** this struct must NEVER carry the plaintext or
+/// ciphertext payload, the key material, or any byte-derived field that
+/// could leak the wrapped DEK. Only opaque labels (`key_name`,
+/// `caller_persona`), sizes, and grant-evaluation metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct KmsReceipt {
+    pub id: ReceiptId,
+    /// Discriminator — `kms_wrap` for encrypt, `kms_unwrap` for decrypt.
+    pub kind: ReceiptKind,
+    /// Logical name of the kms key the operation targeted (e.g.
+    /// `"production-tokens"`). Treat as opaque — never deref to material.
+    pub key_name: String,
+    /// Persona id of the caller that invoked the operation. `"unknown"`
+    /// when the caller is not yet identified (early-bootstrap paths).
+    pub caller_persona: String,
+    /// Size of the inbound payload in bytes. **Metadata only — never the
+    /// bytes themselves.** For `kms_wrap` this is the plaintext length;
+    /// for `kms_unwrap` it is the ciphertext length.
+    pub request_size_bytes: u64,
+    /// Unix epoch seconds when the operation completed (success or
+    /// failure). Mirrors the existing `u64` epoch convention used by
+    /// [`Lifecycle`] — chrono is intentionally avoided for wasm parity.
+    pub materialized_at_epoch_secs: u64,
+    pub grant_evaluation: GrantEvaluation,
+    pub outcome: ReceiptOutcome,
+    pub evidence: Evidence,
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -352,6 +436,116 @@ mod tests {
         assert_eq!(
             receipt.evidence.canonical_version, 1,
             "bump canonical_version and update golden test when encoding changes"
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // KMS receipt tests (implementation-note-3)
+    // ----------------------------------------------------------------------
+
+    fn minimal_kms_wrap_receipt() -> KmsReceipt {
+        KmsReceipt {
+            id: "rct_01HXKMSWRAP000000000000001".into(),
+            kind: ReceiptKind::KmsWrap,
+            key_name: "production-tokens".into(),
+            caller_persona: "persona-work".into(),
+            request_size_bytes: 32,
+            materialized_at_epoch_secs: 1_700_000_000,
+            grant_evaluation: GrantEvaluation {
+                outcome: GrantEvaluationOutcome::Allowed,
+                grant_id: Some("grant_01HXKMS00000000000000001".into()),
+            },
+            outcome: ReceiptOutcome::Success,
+            evidence: Evidence::default(),
+        }
+    }
+
+    fn minimal_kms_unwrap_receipt() -> KmsReceipt {
+        KmsReceipt {
+            id: "rct_01HXKMSUNWRAP00000000000001".into(),
+            kind: ReceiptKind::KmsUnwrap,
+            key_name: "production-tokens".into(),
+            caller_persona: "persona-work".into(),
+            request_size_bytes: 64,
+            materialized_at_epoch_secs: 1_700_000_010,
+            grant_evaluation: GrantEvaluation {
+                outcome: GrantEvaluationOutcome::Allowed,
+                grant_id: Some("grant_01HXKMS00000000000000002".into()),
+            },
+            outcome: ReceiptOutcome::Success,
+            evidence: Evidence::default(),
+        }
+    }
+
+    #[test]
+    fn kms_wrap_receipt_json_round_trip() {
+        let receipt = minimal_kms_wrap_receipt();
+        let json = serde_json::to_string(&receipt).expect("serialize kms_wrap");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("parse json");
+        // Discriminator serialises snake_case.
+        assert_eq!(v["kind"], "kms_wrap");
+        assert_eq!(v["key_name"], "production-tokens");
+        assert_eq!(v["caller_persona"], "persona-work");
+        assert_eq!(v["request_size_bytes"], 32);
+        assert_eq!(v["materialized_at_epoch_secs"], 1_700_000_000u64);
+        assert_eq!(v["grant_evaluation"]["outcome"], "allowed");
+        assert_eq!(
+            v["grant_evaluation"]["grant_id"],
+            "grant_01HXKMS00000000000000001"
+        );
+        assert_eq!(v["outcome"], "success");
+        // Round-trip equality.
+        let decoded: KmsReceipt = serde_json::from_str(&json).expect("deserialize kms_wrap");
+        assert_eq!(decoded, receipt);
+    }
+
+    #[test]
+    fn kms_unwrap_receipt_json_round_trip() {
+        let receipt = minimal_kms_unwrap_receipt();
+        let json = serde_json::to_string(&receipt).expect("serialize kms_unwrap");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("parse json");
+        assert_eq!(v["kind"], "kms_unwrap");
+        assert_eq!(v["key_name"], "production-tokens");
+        let decoded: KmsReceipt = serde_json::from_str(&json).expect("deserialize kms_unwrap");
+        assert_eq!(decoded, receipt);
+    }
+
+    /// `KmsReceipt` MUST NOT carry plaintext / ciphertext bytes. Failed
+    /// operations populate `outcome: failure` but reuse the same metadata
+    /// shape — sizes are still recorded (request length is non-sensitive).
+    #[test]
+    fn kms_failure_receipt_has_no_payload_field() {
+        let receipt = KmsReceipt {
+            outcome: ReceiptOutcome::Failure,
+            grant_evaluation: GrantEvaluation {
+                outcome: GrantEvaluationOutcome::Denied,
+                grant_id: None,
+            },
+            ..minimal_kms_wrap_receipt()
+        };
+        let json = serde_json::to_string(&receipt).expect("serialize failure");
+        // Belt-and-braces: the serialised JSON does not contain any field
+        // name that could be a plaintext / ciphertext smuggling channel.
+        assert!(!json.contains("plaintext"), "receipt JSON contains 'plaintext': {json}");
+        assert!(!json.contains("ciphertext"), "receipt JSON contains 'ciphertext': {json}");
+        assert!(!json.contains("\"body\""), "receipt JSON contains '\"body\"': {json}");
+        // Denied evaluations omit `grant_id` from the JSON via skip_serializing_if.
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["outcome"], "failure");
+        assert_eq!(v["grant_evaluation"]["outcome"], "denied");
+        assert!(
+            v["grant_evaluation"].get("grant_id").is_none(),
+            "denied evaluations must not include grant_id"
+        );
+    }
+
+    #[test]
+    fn receipt_kind_serialises_snake_case() {
+        assert_eq!(serde_json::to_string(&ReceiptKind::Grant).unwrap(), "\"grant\"");
+        assert_eq!(serde_json::to_string(&ReceiptKind::KmsWrap).unwrap(), "\"kms_wrap\"");
+        assert_eq!(
+            serde_json::to_string(&ReceiptKind::KmsUnwrap).unwrap(),
+            "\"kms_unwrap\""
         );
     }
 }

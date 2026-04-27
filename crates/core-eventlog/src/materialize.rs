@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use core_events::EventEnvelope;
+use core_events::{EventEnvelope, EventRef};
 use core_trust::derive_public_statements;
 use core_types::{
-    EndpointDescriptor, EventBody, FileManifest, TrustAttestation, Validate, ValidationError,
+    grant_conditions::GrantCondition, EndpointDescriptor, EventBody, EventRefRelation, FileManifest,
+    TrustAttestation, Validate, ValidationError,
 };
 
 use crate::{
@@ -12,6 +13,83 @@ use crate::{
     MaterializedState, PersonaRecord, PersonaStatus, RecoveryPolicyRecord, RecoveryRequestRecord,
     RecoveryRequestStatus, RootRecord, RootStatus,
 };
+
+/// Enforce `prev_event_id` chaining and per-root monotonic sequence.
+///
+/// Finds the `Previous` ref (if present) and:
+/// 1. Asserts `ref.target_event_id == current_head.event_id` (no fork).
+/// 2. Asserts `ref.seq == current_head.seq + 1` (no skip, no replay).
+///
+/// Must be called BEFORE `apply_event` so the check runs against the current
+/// head, not the post-mutation state.
+///
+/// Events with no `Previous` ref (e.g. genesis `RootCreated`) and events
+/// whose `root_id` cannot be determined from the body alone are skipped.
+pub fn check_chain(
+    state: &MaterializedState,
+    event: &EventEnvelope,
+) -> Result<(), ValidationError> {
+    let root_id = match event.body.root_id() {
+        Some(id) => id,
+        None => return Ok(()),
+    };
+
+    let prev_ref: Option<&EventRef> = event
+        .refs
+        .iter()
+        .find(|r| r.relation == EventRefRelation::Previous);
+
+    match (prev_ref, state.root_chain_heads.get(root_id)) {
+        // No previous ref and no known head → genesis event, allow.
+        (None, None) => Ok(()),
+        // No previous ref but a head exists → event is missing a required chain ref.
+        (None, Some((head_event_id, head_seq))) => Err(ValidationError::state_violation(format!(
+            "out-of-order event: missing Previous ref for root {root_id}; \
+             expected prev_event_id={head_event_id} seq={}",
+            head_seq + 1,
+        ))),
+        // Previous ref but no head → references a non-existent predecessor.
+        (Some(r), None) => Err(ValidationError::state_violation(format!(
+            "out-of-order event: Previous ref points to {} but root {} has no chain head",
+            r.target_event_id, root_id,
+        ))),
+        // Previous ref and known head → enforce both checks.
+        (Some(r), Some((head_event_id, head_seq))) => {
+            let expected_seq = head_seq + 1;
+            if r.target_event_id != *head_event_id || r.seq != expected_seq {
+                return Err(ValidationError::state_violation(format!(
+                    "out-of-order event: expected prev_event_id={head_event_id} seq={expected_seq}, \
+                     got prev_event_id={} seq={}",
+                    r.target_event_id, r.seq,
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Update the per-root chain head after an event has been accepted.
+///
+/// Must be called AFTER `apply_event` succeeds. For events with a `Previous`
+/// ref the new `last_seq` is taken from `ref.seq`. For genesis events (no
+/// Previous ref, no existing head) `last_seq` is set to `0`.
+pub fn advance_chain_head(state: &mut MaterializedState, event: &EventEnvelope) {
+    let root_id = match event.body.root_id() {
+        Some(id) => id.to_owned(),
+        None => return,
+    };
+
+    let seq = event
+        .refs
+        .iter()
+        .find(|r| r.relation == EventRefRelation::Previous)
+        .map(|r| r.seq)
+        .unwrap_or(0);
+
+    state
+        .root_chain_heads
+        .insert(root_id, (event.event_id.clone(), seq));
+}
 
 pub fn apply_event(
     state: &mut MaterializedState,
@@ -574,6 +652,28 @@ pub fn apply_event(
         EventBody::DisclosureRevoked(_) => {}
         EventBody::RelayShutdownNotice(_) => {}
         EventBody::GrantOfferCreated(body) => {
+            // security check: validate conditions_json depth before materializing.
+            // The per-field size cap (MAX_CONDITIONS_JSON_BYTES = 8 KiB) is
+            // enforced by GrantOfferCreatedEvent::validate() at event ingress,
+            // which is stricter than the 100 KiB target from SEC-5b.
+            // TODO(SEC-5b): if conditions_json is ever moved to a separate
+            // storage path that bypasses event validation, add an explicit
+            // 100 KiB byte-length check here.
+            if !body.conditions_json.is_empty() {
+                let conditions: Vec<GrantCondition> =
+                    serde_json::from_str(&body.conditions_json).map_err(|e| {
+                        ValidationError::invalid_format(format!(
+                            "grant offer conditions_json is not valid JSON: {e}"
+                        ))
+                    })?;
+                for condition in &conditions {
+                    condition.validate_depth().map_err(|e| {
+                        ValidationError::invalid_format(format!(
+                            "grant offer conditions_json rejected (security check): {e}"
+                        ))
+                    })?;
+                }
+            }
             state.grant_offers_current.insert(
                 body.offer_id.clone(),
                 GrantOfferRecord {
@@ -754,10 +854,10 @@ mod tests {
     //! authorize + materialize tests live in `authorize.rs` and `memory.rs`.
     use super::*;
     use core_crypto::FixtureSigner;
-    use core_events::EventEnvelope;
+    use core_events::{EventEnvelope, EventRef as CrateEventRef};
     use core_types::{
         DeviceReplacedEvent, EventBody, KeyAlgorithm, PublicKeyMaterial, RecoveryRequestedEvent,
-        SignerBinding,
+        RootCreatedEvent, SignerBinding,
     };
 
     fn make_key(key_id: &str) -> PublicKeyMaterial {
@@ -1021,5 +1121,140 @@ mod tests {
         );
         apply_event(&mut state, &event2).expect("distinct request_id must succeed");
         assert_eq!(state.recovery_requests_current.len(), 2);
+    }
+
+    // ── security check: prev_event_id + monotonic sequence chaining ──
+
+    fn make_event_with_refs(
+        event_id: &str,
+        body: EventBody,
+        refs: Vec<CrateEventRef>,
+        signer_binding: SignerBinding,
+    ) -> EventEnvelope {
+        let signer = FixtureSigner::new(signer_binding.key_id.clone());
+        EventEnvelope::from_body(event_id, body, refs, signer_binding, &signer).unwrap()
+    }
+
+    /// Build a MaterializedState with root-a registered and a chain head set.
+    fn state_with_chain_head(head_event_id: &str, head_seq: u64) -> MaterializedState {
+        let mut state = MaterializedState::default();
+        state.roots_current.insert(
+            "root-a".into(),
+            RootRecord {
+                root_id: "root-a".into(),
+                display_name: "Primary".into(),
+                active_key: make_key("key-root-a"),
+                status: RootStatus::Active,
+            },
+        );
+        state
+            .root_chain_heads
+            .insert("root-a".into(), (head_event_id.to_owned(), head_seq));
+        state
+    }
+
+    #[test]
+    fn out_of_order_event_rejected_wrong_seq() {
+        // Adversarial: valid signed event replayed with same prev_event_id but wrong seq.
+        // Chain head: (evt-1, seq=1). New event claims prev=evt-1 seq=5 → should fail.
+        let state = state_with_chain_head("evt-1", 1);
+        let event = make_event_with_refs(
+            "evt-bad",
+            EventBody::DeviceAdded(core_types::DeviceAddedEvent {
+                root_id: "root-a".into(),
+                device_id: "device-x".into(),
+                label: "X".into(),
+                initial_key: make_key("key-device-x"),
+                initial_encryption_key: make_enc_key("device-x"),
+            }),
+            vec![CrateEventRef::previous("evt-1", 5)],
+            SignerBinding::root("root-a", "key-root-a"),
+        );
+        let result = check_chain(&state, &event);
+        assert!(result.is_err(), "wrong seq must be rejected by check_chain");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("out-of-order"),
+            "error must mention out-of-order, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn out_of_order_event_rejected_skip_sequence() {
+        // Skip-sequence: head seq=1, new event claims seq=3 (should be 2).
+        let state = state_with_chain_head("evt-1", 1);
+        let event = make_event_with_refs(
+            "evt-skip",
+            EventBody::DeviceAdded(core_types::DeviceAddedEvent {
+                root_id: "root-a".into(),
+                device_id: "device-skip".into(),
+                label: "Skip".into(),
+                initial_key: make_key("key-device-skip"),
+                initial_encryption_key: make_enc_key("device-skip"),
+            }),
+            vec![CrateEventRef::previous("evt-1", 3)],
+            SignerBinding::root("root-a", "key-root-a"),
+        );
+        let result = check_chain(&state, &event);
+        assert!(result.is_err(), "skip-sequence (1→3) must be rejected");
+    }
+
+    #[test]
+    fn out_of_order_event_rejected_wrong_prev_id() {
+        // Wrong prev_event_id: correct seq but forked chain.
+        // Head: (evt-1, 1). New event claims prev=evt-FORK seq=2.
+        let state = state_with_chain_head("evt-1", 1);
+        let event = make_event_with_refs(
+            "evt-fork",
+            EventBody::DeviceAdded(core_types::DeviceAddedEvent {
+                root_id: "root-a".into(),
+                device_id: "device-fork".into(),
+                label: "Fork".into(),
+                initial_key: make_key("key-device-fork"),
+                initial_encryption_key: make_enc_key("device-fork"),
+            }),
+            vec![CrateEventRef::previous("evt-FORK", 2)],
+            SignerBinding::root("root-a", "key-root-a"),
+        );
+        let result = check_chain(&state, &event);
+        assert!(
+            result.is_err(),
+            "wrong prev_event_id must be rejected even with correct seq"
+        );
+    }
+
+    #[test]
+    fn chain_check_accepts_valid_next_event() {
+        // Happy path: head=(evt-1, seq=1), new event has prev=evt-1 seq=2.
+        let state = state_with_chain_head("evt-1", 1);
+        let event = make_event_with_refs(
+            "evt-2",
+            EventBody::DeviceAdded(core_types::DeviceAddedEvent {
+                root_id: "root-a".into(),
+                device_id: "device-a".into(),
+                label: "A".into(),
+                initial_key: make_key("key-device-a"),
+                initial_encryption_key: make_enc_key("device-a"),
+            }),
+            vec![CrateEventRef::previous("evt-1", 2)],
+            SignerBinding::root("root-a", "key-root-a"),
+        );
+        check_chain(&state, &event).expect("valid next event must pass check_chain");
+    }
+
+    #[test]
+    fn genesis_event_accepted_without_previous_ref() {
+        // First event for a root has no head yet and no Previous ref.
+        let state = MaterializedState::default();
+        let event = make_event(
+            "evt-genesis",
+            EventBody::RootCreated(RootCreatedEvent {
+                root_id: "new-root".into(),
+                display_name: "New Root".into(),
+                initial_key: make_key("key-new-root"),
+            }),
+            SignerBinding::root("new-root", "key-new-root"),
+        );
+        check_chain(&state, &event).expect("genesis event must pass check_chain");
     }
 }

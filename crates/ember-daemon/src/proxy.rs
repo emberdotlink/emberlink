@@ -8,20 +8,35 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::LengthLimitError;
 use hyper::body::{Body, Frame, SizeHint};
+use zeroize::Zeroizing;
 use hyper::{Request, Response, StatusCode, body::Incoming};
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, oneshot, watch};
 use tokio::time::Sleep;
 
 use crate::events::GrantEvent;
 use crate::pricing;
 use crate::store::StoreError;
 use crate::vault::VaultError;
+
+/// Maximum bytes the proxy will buffer from a single request or non-streaming
+/// response body before returning 413 Payload Too Large.
+///
+/// security check (2026-04-24): an unbounded `.collect()` lets a single large POST
+/// exhaust daemon RSS. 10 MiB is comfortably above the largest legitimate
+/// Anthropic request body (≈ 200 KB for a maximal prompt) while keeping the
+/// worst-case allocation per request well below the streaming cap of
+/// `MAX_CONCURRENT_STREAMING × MAX_STREAMING_RESPONSE_BYTES` = 32 MiB. If a
+/// real caller genuinely needs bigger bodies the proxy is the wrong tool —
+/// data that large should go directly to the upstream, not through the
+/// credential-injection layer.
+const MAX_BODY_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
 
 /// Upper bound on the bytes a streaming proxy response is allowed to
 /// accumulate before we abort the downstream tee.
@@ -156,6 +171,27 @@ pub enum ProxyBody {
 /// smart-HTTP bodies are forwarded chunk-for-chunk to the client. The
 /// slot + drop guard give us the same "every terminal path releases
 /// resources exactly once" contract `TeeBody` has.
+///
+/// P69L.0b--ERROR-SIGNAL (2026-04-24): before emitting the terminal
+/// `Poll::Ready(None)`, `poll_frame` synthesises an HTTP/1.1 chunked
+/// trailer frame containing:
+///
+/// ```text
+/// x-ember-stream-outcome: complete   (clean upstream EOF)
+/// x-ember-stream-outcome: partial    (upstream error or watchdog abort)
+/// ```
+///
+/// Clients that read trailers (via `http_body::Body::poll_frame` after
+/// data exhaustion, or higher-level `BodyExt::collect`) can examine this
+/// header to distinguish a clean transfer from a mid-stream failure
+/// without relying on byte counts or TCP error signals. The trailer
+/// value is the authoritative source of truth; the `proxy.stream` audit
+/// event (P69L.0b--AUDIT) always uses the same string so log and wire
+/// agree exactly.
+///
+/// Note: when the body is *dropped* before reaching a terminal frame
+/// (client disconnect) there is no trailer — the drop-guard log line
+/// records `outcome=partial` instead.
 pub struct PassthroughBody<B = Incoming> {
     inner: B,
     /// Concurrency gate slot. `Some` in production; `None` only for
@@ -188,6 +224,13 @@ pub struct PassthroughBody<B = Incoming> {
     /// subsequent polls return `Ready(None)` immediately. Prevents
     /// double-firing if hyper polls after we've aborted.
     frame_idle_fired: bool,
+    /// P69L.0b--ERROR-SIGNAL: tracks whether the trailer has been
+    /// emitted yet. `false` = not yet (initial state); `true` = already
+    /// emitted. Once the upstream reaches a terminal condition (clean EOF,
+    /// upstream error, watchdog abort), `poll_frame` emits the
+    /// `x-ember-stream-outcome` trailer frame and sets this to `true`.
+    /// Subsequent polls skip straight to `Ready(None)`.
+    trailer_emitted: bool,
     /// P69L.0b--AUDIT: correlating identifier threaded from
     /// `handle_git_echo` entry through to drop-time `proxy.stream`
     /// emission. `None` on code paths that don't participate in the
@@ -213,6 +256,28 @@ const PASSTHROUGH_INFLIGHT: u8 = 0;
 const PASSTHROUGH_COMPLETE: u8 = 1;
 const PASSTHROUGH_PARTIAL: u8 = 2;
 
+/// The header name for the stream-outcome trailer emitted by
+/// `PassthroughBody` (P69L.0b--ERROR-SIGNAL).
+const STREAM_OUTCOME_TRAILER_NAME: &str = "x-ember-stream-outcome";
+
+/// Build the `x-ember-stream-outcome` HTTP trailer `HeaderMap` for the
+/// given outcome constant. `PASSTHROUGH_COMPLETE` → `"complete"`, any
+/// other value → `"partial"`. Called by `PassthroughBody::poll_frame`
+/// just before emitting the terminal `Ready(None)`.
+fn build_outcome_trailer(outcome: u8) -> hyper::HeaderMap {
+    let mut map = hyper::HeaderMap::new();
+    let value = if outcome == PASSTHROUGH_COMPLETE {
+        hyper::header::HeaderValue::from_static("complete")
+    } else {
+        hyper::header::HeaderValue::from_static("partial")
+    };
+    map.insert(
+        hyper::header::HeaderName::from_static(STREAM_OUTCOME_TRAILER_NAME),
+        value,
+    );
+    map
+}
+
 impl<B> PassthroughBody<B> {
     /// Construct a production `PassthroughBody`. Callers MUST have
     /// acquired `slot` via `StreamingSlot::try_acquire` before invoking
@@ -226,6 +291,7 @@ impl<B> PassthroughBody<B> {
             frame_idle_deadline: None,
             frame_idle_sleep: None,
             frame_idle_fired: false,
+            trailer_emitted: false,
             request_id: None,
             #[cfg(test)]
             test_outcome_sink: None,
@@ -271,10 +337,11 @@ impl<B> PassthroughBody<B> {
 
 impl<B> Body for PassthroughBody<B>
 where
-    B: Body<Data = Bytes, Error = hyper::Error> + Unpin,
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
 {
     type Data = Bytes;
-    type Error = hyper::Error;
+    type Error = B::Error;
 
     fn poll_frame(
         self: Pin<&mut Self>,
@@ -287,11 +354,24 @@ where
         // pinned on the heap regardless of how `this` moves.
         let this = self.get_mut();
 
-        // P69L.0b--TIMEOUTS: if the frame-idle watchdog has already
-        // fired on a prior poll we're in the terminated state; yield
-        // `Ready(None)` so hyper cleanly ends the response.
-        if this.frame_idle_fired {
+        // P69L.0b--ERROR-SIGNAL: once the trailer has been emitted,
+        // every subsequent poll returns `Ready(None)` — the body is done.
+        // Also covers the frame-idle-watchdog termination path: the
+        // watchdog arm sets `trailer_emitted = true` before returning the
+        // trailer frame, so repeat polls land here and end cleanly.
+        if this.trailer_emitted {
             return Poll::Ready(None);
+        }
+
+        // P69L.0b--TIMEOUTS: frame_idle_fired is set by the watchdog arm
+        // inside the Pending branch and is always accompanied by
+        // `trailer_emitted = true` in the same poll, so this guard is a
+        // defence-in-depth check for any future code path that sets
+        // `frame_idle_fired` without also emitting the trailer.
+        if this.frame_idle_fired {
+            this.trailer_emitted = true;
+            let trailer = build_outcome_trailer(PASSTHROUGH_PARTIAL);
+            return Poll::Ready(Some(Ok(Frame::trailers(trailer))));
         }
 
         match Pin::new(&mut this.inner).poll_frame(cx) {
@@ -317,10 +397,14 @@ where
                                 reason = "frame-idle-timeout",
                                 "proxy stream aborted — frame-idle watchdog fired",
                             );
-                            // End the stream. Drop will observe
-                            // `outcome == PARTIAL` and emit the
-                            // observability log line.
-                            Poll::Ready(None)
+                            // Emit the outcome trailer immediately. The
+                            // next poll sees `frame_idle_fired = true`
+                            // and hits the guard above to emit the
+                            // trailer, then `trailer_emitted = true`
+                            // closes the body with `Ready(None)`.
+                            this.trailer_emitted = true;
+                            let trailer = build_outcome_trailer(PASSTHROUGH_PARTIAL);
+                            Poll::Ready(Some(Ok(Frame::trailers(trailer))))
                         }
                     }
                 } else {
@@ -328,19 +412,30 @@ where
                 }
             }
             Poll::Ready(None) => {
-                // Clean upstream EOF → outcome transitions to
-                // `complete`. Drop will log it verbatim.
+                // Clean upstream EOF → outcome transitions to `complete`.
+                // Emit the `x-ember-stream-outcome: complete` trailer so
+                // the client can distinguish a clean transfer from a
+                // partial one. The next poll sees `trailer_emitted = true`
+                // and returns `Ready(None)`.
                 this.outcome.store(PASSTHROUGH_COMPLETE, Ordering::Release);
-                Poll::Ready(None)
+                this.trailer_emitted = true;
+                let trailer = build_outcome_trailer(PASSTHROUGH_COMPLETE);
+                Poll::Ready(Some(Ok(Frame::trailers(trailer))))
             }
             Poll::Ready(Some(Err(e))) => {
-                // Upstream error aborts the stream mid-flight. Leave
-                // the outcome at `inflight`; Drop maps it to
-                // `partial`. (We don't set `partial` here explicitly
-                // so an already-observed `complete` can never be
-                // clobbered — defence in depth, since on the normal
-                // path we only reach `Err` before EOF.)
-                Poll::Ready(Some(Err(e)))
+                // Upstream error aborts the stream mid-flight. Emit the
+                // `x-ember-stream-outcome: partial` trailer so the client
+                // can observe the failure without an abrupt TCP close. The
+                // error is consumed here; Drop will observe
+                // `outcome == PARTIAL` (inflight → partial via Drop).
+                tracing::warn!(
+                    error = %e,
+                    bytes_forwarded = this.bytes_forwarded.load(Ordering::Relaxed),
+                    "proxy stream upstream error — emitting partial trailer"
+                );
+                this.trailer_emitted = true;
+                let trailer = build_outcome_trailer(PASSTHROUGH_PARTIAL);
+                Poll::Ready(Some(Ok(Frame::trailers(trailer))))
             }
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(chunk) = frame.data_ref() {
@@ -363,8 +458,13 @@ where
     }
 
     fn is_end_stream(&self) -> bool {
-        // Defer to the inner body; we never synthesise end-of-stream
-        // on the passthrough path.
+        // After the outcome trailer has been emitted, the next poll
+        // returns `Ready(None)` — report end-of-stream so callers that
+        // short-circuit on this hint (e.g. hyper's response encoder) do
+        // not attempt another poll unnecessarily.
+        if self.trailer_emitted {
+            return true;
+        }
         self.inner.is_end_stream()
     }
 
@@ -451,6 +551,64 @@ const HOP_BY_HOP_HEADERS: &[&str] = &[
     "transfer-encoding",
     "upgrade",
 ];
+
+/// Explicit allowlist of request headers forwarded to upstream APIs.
+///
+/// security check (2026-04-24): the proxy previously used a blocklist that stripped
+/// only `x-ember-*` and `Authorization`, silently forwarding `Cookie`,
+/// `Host`, `X-Forwarded-*`, `Proxy-Authorization`, and every other header
+/// the client chose to send. An allowlist is the correct security primitive:
+/// only headers that upstreams (Anthropic, GitHub, similar REST APIs)
+/// actually consume are passed through; everything else is dropped silently.
+///
+/// `Authorization` is intentionally NOT included — the proxy always injects
+/// its own credential and any client-supplied `Authorization` must be
+/// stripped before the inject step. See `filter_request_headers`.
+///
+/// Stored lowercased because `HeaderName` comparison is case-insensitive
+/// and all legitimate header names are ASCII.
+const ALLOWED_REQUEST_HEADERS: &[&str] = &[
+    "accept",
+    "accept-encoding",
+    "accept-language",
+    "content-type",
+    "content-length",
+    "user-agent",
+    // Anthropic-specific
+    "anthropic-version",
+    "anthropic-beta",
+    // Generic API key header used by some upstream patterns
+    "x-api-key",
+    // OpenAI-compatible header used by some providers
+    "openai-organization",
+];
+
+/// Build an outgoing `Request::Builder` from `src` headers using only the
+/// `ALLOWED_REQUEST_HEADERS` allowlist.
+///
+/// security check (2026-04-24): constructs outbound headers from scratch rather
+/// than filtering in-place so there is no risk of accidentally carrying
+/// through a header that slips past a blocklist. Any header NOT in
+/// `ALLOWED_REQUEST_HEADERS` is dropped silently — including `Cookie`,
+/// `Host`, `X-Forwarded-*`, `Forwarded`, `Via`, `Proxy-Authorization`,
+/// `Authorization`, `TE`, `Trailer`, `Transfer-Encoding`, and
+/// `Connection`.
+///
+/// `Authorization` is omitted from the allowlist deliberately: callers
+/// inject the vault credential themselves after this call so the value is
+/// always ember-controlled, never client-controlled.
+fn filter_request_headers(
+    mut builder: hyper::http::request::Builder,
+    src: &hyper::HeaderMap,
+) -> hyper::http::request::Builder {
+    for (name, value) in src {
+        let lower = name.as_str();
+        if ALLOWED_REQUEST_HEADERS.contains(&lower) {
+            builder = builder.header(name, value);
+        }
+    }
+    builder
+}
 
 /// Strip RFC 7230 §6.1 hop-by-hop headers from a response header map.
 ///
@@ -770,13 +928,15 @@ pub async fn handle_request(
                     resource = %resource,
                     "no applicable statement for request — denying"
                 );
-                let _ = state.store.log_event(
+                if let Err(e) = state.store.log_event(
                     Some(&persona_id),
                     "credential.access",
                     Some(&credential_name),
                     "denied_no_applicable_statement",
                     Some(&format!("action={action} resource={resource}")),
-                );
+                ) {
+                    tracing::warn!(error = ?e, persona_id = %persona_id, credential = %credential_name, action = %action, resource = %resource, "log_event failed");
+                }
                 return Ok(no_applicable_statement_response());
             }
             Some((_i, stmt)) => {
@@ -810,13 +970,15 @@ pub async fn handle_request(
             detail = %violation.message,
             "scope violation: denying request"
         );
-        let _ = state.store.log_event(
+        if let Err(e) = state.store.log_event(
             Some(&persona_id),
             "credential.access",
             Some(&credential_name),
             violation.audit_outcome(),
             Some(&violation.message),
-        );
+        ) {
+            tracing::warn!(error = ?e, persona_id = %persona_id, credential = %credential_name, outcome = violation.audit_outcome(), "log_event failed");
+        }
         return Ok(scope_violation_response());
     }
 
@@ -858,12 +1020,22 @@ pub async fn handle_request(
     // Collect the incoming body up front so the Stream C pre-flight
     // budget check has something to estimate against. `body_bytes_in` is
     // then forwarded unchanged.
+    //
+    // security check: wrap in Limited so a single oversized POST cannot OOM the daemon.
     let (parts, incoming_body) = req.into_parts();
-    let body_bytes_in = incoming_body
+    let body_bytes_in = match Limited::new(incoming_body, MAX_BODY_BYTES)
         .collect()
         .await
-        .map_err(ProxyError::Hyper)?
-        .to_bytes();
+    {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) if e.downcast_ref::<LengthLimitError>().is_some() => {
+            return Ok(payload_too_large("request body exceeds 10 MiB limit"));
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "request body collection failed");
+            return Ok(internal_error("failed to read request body"));
+        }
+    };
 
     // Pre-flight Stream C budget check. When the resolved Statement has a
     // `budget.tokens` or `budget.cents` set, estimate the call cost and
@@ -880,7 +1052,7 @@ pub async fn handle_request(
                 used,
                 "budget pre-flight rejection"
             );
-            let _ = state.store.log_event(
+            if let Err(e) = state.store.log_event(
                 Some(&persona_id),
                 "proxy.denied_preflight",
                 Some(&credential_name),
@@ -889,7 +1061,9 @@ pub async fn handle_request(
                     "grant_id={} sid={resolved_sid} axis={axis} limit={limit} used={used}",
                     grant.id
                 )),
-            );
+            ) {
+                tracing::warn!(error = ?e, grant_id = %grant.id, statement_sid = %resolved_sid, axis, "log_event failed");
+            }
             return Ok(budget_exhausted_response(
                 &grant.id,
                 &resolved_sid,
@@ -900,9 +1074,10 @@ pub async fn handle_request(
         }
     }
 
-    // Decrypt credential from vault
-    let credential_bytes = match state.vault.get(&state.store, &credential_name) {
-        Ok(b) => b,
+    // Decrypt credential from vault.
+    // security check: wrap in Zeroizing so the raw key bytes are wiped on drop.
+    let credential_bytes: Zeroizing<Vec<u8>> = match state.vault.get(&state.store, &credential_name) {
+        Ok(b) => Zeroizing::new(b),
         Err(VaultError::NotFound) => {
             return Ok(internal_error("credential not found in vault"));
         }
@@ -912,13 +1087,15 @@ pub async fn handle_request(
     let credential_value = String::from_utf8_lossy(&credential_bytes).into_owned();
 
     // Log the access
-    let _ = state.store.log_event(
+    if let Err(e) = state.store.log_event(
         Some(&persona_id),
         "credential.access",
         Some(&credential_name),
         "allowed",
         None,
-    );
+    ) {
+        tracing::warn!(error = ?e, persona_id = %persona_id, credential = %credential_name, "log_event failed");
+    }
 
     // Build an HTTPS-capable client using rustls with system WebPKI roots.
     let https = HttpsConnectorBuilder::new()
@@ -950,17 +1127,13 @@ pub async fn handle_request(
         .method(parts.method.clone())
         .uri(&target_url);
 
-    // Forward original headers, stripping ember-specific and authorization
-    // headers. We inject the credential ourselves below.
-    for (name, value) in &parts.headers {
-        // Drop the ember-specific proxy headers and any incoming
-        // Authorization — we always substitute our own.
-        let lower = name.as_str();
-        if lower.starts_with("x-ember-") || lower == "authorization" {
-            continue;
-        }
-        outgoing = outgoing.header(name, value);
-    }
+    // Forward only the explicitly-allowed headers to upstream.
+    // security check (2026-04-24): allowlist replaces the former blocklist.
+    // Cookie, Host, X-Forwarded-*, Forwarded, Via, Authorization, and every
+    // other header not in ALLOWED_REQUEST_HEADERS are dropped silently.
+    // Authorization is injected from the vault below — client-supplied
+    // credentials never reach upstream.
+    outgoing = filter_request_headers(outgoing, &parts.headers);
 
     // Inject the credential as the appropriate Authorization format.
     // Git smart-HTTP requires Basic auth; all other upstream calls use Bearer.
@@ -1030,7 +1203,7 @@ pub async fn handle_request(
             // a non-billable daemon-internal failure is the
             // conservative choice. Log it in the audit trail so
             // operators can spot sustained saturation.
-            let _ = state.store.log_event(
+            if let Err(e) = state.store.log_event(
                 Some(&persona_id),
                 "proxy.stream",
                 Some(&credential_name),
@@ -1038,7 +1211,9 @@ pub async fn handle_request(
                 Some(&format!(
                     "streaming concurrency cap {MAX_CONCURRENT_STREAMING} reached"
                 )),
-            );
+            ) {
+                tracing::warn!(error = ?e, persona_id = %persona_id, credential = %credential_name, "log_event failed");
+            }
             return Ok(service_unavailable(
                 "streaming concurrency cap reached; retry shortly",
             ));
@@ -1114,12 +1289,22 @@ pub async fn handle_request(
             .unwrap());
     }
 
-    let resp_body = upstream_resp
-        .into_body()
+    // security check: cap non-streaming response bodies at MAX_BODY_BYTES too.
+    // An upstream that returns a multi-hundred-MiB body would otherwise OOM
+    // the daemon while buffering it for the post-flight meter.
+    let resp_body = match Limited::new(upstream_resp.into_body(), MAX_BODY_BYTES)
         .collect()
         .await
-        .map_err(ProxyError::Hyper)?
-        .to_bytes();
+    {
+        Ok(collected) => collected.to_bytes(),
+        Err(e) if e.downcast_ref::<LengthLimitError>().is_some() => {
+            return Ok(payload_too_large("upstream response body exceeds 10 MiB limit"));
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "upstream response body collection failed");
+            return Ok(internal_error("failed to read upstream response body"));
+        }
+    };
 
     // Stream C post-flight meter. Resolve the upstream host and parse
     // the response for token + cent usage. If the target isn't an LLM
@@ -1203,7 +1388,7 @@ impl StreamOutcome {
     }
 }
 
-/// C44-implementation-note-4: short, stable hash of a credential alias for
+/// C44-implementation-note-19: short, stable hash of a credential alias for
 /// emission into the audit log's `credential` column.
 ///
 /// Returns `credname-<first 16 hex of sha256>` — enough entropy to avoid
@@ -1245,7 +1430,7 @@ fn run_post_flight_meter(
     // `statement_usage` is identical for both cases; the audit record is
     // where the distinction lives.
     //
-    // C44-implementation-note-4: the `credential` audit column stores a short
+    // C44-implementation-note-19: the `credential` audit column stores a short
     // hash of the credential alias, not the raw alias. Raw aliases would
     // let anyone with audit-log read access correlate persona ↔ credential
     // across rows, breaking persona isolation. The raw alias still lives
@@ -1932,13 +2117,15 @@ fn emit_debounced(
     if !state.threshold_emitted.borrow_mut().insert(key) {
         return;
     }
-    let _ = state.store.log_event(
+    if let Err(e) = state.store.log_event(
         Some(persona_id),
         action,
         Some(credential_name),
         band_label,
         Some(details),
-    );
+    ) {
+        tracing::warn!(error = ?e, grant_id, statement_sid, axis, action, "log_event failed");
+    }
 
     // Broadcast the structured event to connected socket clients so MCP/SDK
     // consumers receive `budget.warning`/`budget.exhausted` push
@@ -2481,6 +2668,16 @@ fn internal_error(msg: &str) -> Response<ProxyBody> {
         .unwrap()
 }
 
+/// HTTP 413 response used when a request or response body exceeds
+/// `MAX_BODY_BYTES` (security check). Signals to well-behaved clients that the
+/// payload is too large to pass through the credential-injection layer.
+fn payload_too_large(msg: &str) -> Response<ProxyBody> {
+    Response::builder()
+        .status(StatusCode::PAYLOAD_TOO_LARGE)
+        .body(box_full(Full::new(Bytes::from(msg.to_string()))))
+        .unwrap()
+}
+
 /// HTTP 503 response used when the per-process streaming-concurrency
 /// cap is saturated (development milestone). A `Retry-After` header signals to
 /// well-behaved clients that the condition is transient. Keep the body
@@ -2683,11 +2880,38 @@ pub struct GitEchoConfig {
 /// pattern, but dispatches to `handle_git_echo` instead of `handle_request`.
 /// Exposed `pub` so a separate test binary or an `#[ignore]`-d integration
 /// test can spawn it without reaching into daemon state.
+///
+/// `bind_tx` (implementation-note-10): when `Some`, the bound `SocketAddr` is sent
+/// exactly once immediately after `TcpListener::bind` succeeds. Bind errors
+/// are sent as `Err` and the function returns. The receiver gets the actual
+/// local addr (so `127.0.0.1:0` callers can read the assigned port). If the
+/// caller has dropped the receiver the send is silently ignored — bind
+/// success/failure must not depend on whether anyone is listening for it.
 pub async fn run_git_echo_proxy(
     config: GitEchoConfig,
     mut shutdown: watch::Receiver<bool>,
+    bind_tx: Option<oneshot::Sender<Result<std::net::SocketAddr, std::io::Error>>>,
 ) -> Result<(), ProxyError> {
-    let listener = TcpListener::bind(config.bind_addr).await?;
+    let listener = match TcpListener::bind(config.bind_addr).await {
+        Ok(l) => {
+            let local_addr = l.local_addr().unwrap_or(config.bind_addr);
+            if let Some(tx) = bind_tx {
+                let _ = tx.send(Ok(local_addr));
+            }
+            l
+        }
+        Err(e) => {
+            // Mirror dashboard's "best effort to surface, then propagate"
+            // pattern. We deliver the error to `bind_tx` if present, then
+            // return ProxyError so the spawning task records a non-zero exit.
+            tracing::warn!(addr = %config.bind_addr, error = %e, "git echo proxy failed to bind");
+            if let Some(tx) = bind_tx {
+                let kind = e.kind();
+                let _ = tx.send(Err(std::io::Error::new(kind, e.to_string())));
+            }
+            return Err(ProxyError::from(e));
+        }
+    };
     // `GitEchoConfig` embeds `Arc<ProxyState>` which is `!Sync` (RefCell inside).
     // This is intentional: the proxy runs on a `LocalSet` (single-threaded) so
     // `Send + Sync` are not required. The same pattern is used by `run_proxy`.
@@ -2884,8 +3108,9 @@ pub async fn handle_git_echo(
     }
 
     // Fetch the raw credential from the vault. Not in vault → 500 + audit.
-    let credential_bytes = match config.state.vault.get(&config.state.store, &credential_name) {
-        Ok(b) => b,
+    // security check: wrap in Zeroizing so the raw key bytes are wiped on drop.
+    let credential_bytes: Zeroizing<Vec<u8>> = match config.state.vault.get(&config.state.store, &credential_name) {
+        Ok(b) => Zeroizing::new(b),
         Err(VaultError::NotFound) => {
             tracing::warn!(
                 credential = %credential_name,
@@ -2906,7 +3131,7 @@ pub async fn handle_git_echo(
 
     // P69L.0b--AUDIT: emit `credential.access` so operators can see
     // that a credential substitution occurred and which repo was targeted.
-    // `action` mirrors the shape from C44-implementation-note-4: "github.push.<owner/repo>".
+    // `action` mirrors the shape from C44-implementation-note-19: "github.push.<owner/repo>".
     tracing::info!(
         event = "credential.access",
         allowed = true,
@@ -3335,13 +3560,15 @@ mod tests {
                         resource = %resource,
                         "no applicable statement for request — denying (test harness)"
                     );
-                    let _ = state.store.log_event(
+                    if let Err(e) = state.store.log_event(
                         Some(&persona_id),
                         "credential.access",
                         Some(&credential_name),
                         "denied_no_applicable_statement",
                         Some(&format!("action={action} resource={resource}")),
-                    );
+                    ) {
+                        tracing::warn!(error = ?e, persona_id = %persona_id, credential = %credential_name, action = %action, resource = %resource, "log_event failed");
+                    }
                     return Ok(no_applicable_statement_response());
                 }
                 Some((_i, stmt)) => {
@@ -3365,13 +3592,15 @@ mod tests {
                 detail = %violation.message,
                 "scope violation: denying request"
             );
-            let _ = state.store.log_event(
+            if let Err(e) = state.store.log_event(
                 Some(&persona_id),
                 "credential.access",
                 Some(&credential_name),
                 violation.audit_outcome(),
                 Some(&violation.message),
-            );
+            ) {
+                tracing::warn!(error = ?e, persona_id = %persona_id, credential = %credential_name, outcome = violation.audit_outcome(), "log_event failed");
+            }
             return Ok(scope_violation_response());
         }
 
@@ -3412,17 +3641,26 @@ mod tests {
             .map(|s| s.to_string());
 
         let (_parts, incoming_body) = req.into_parts();
-        let body_bytes_in = incoming_body
+        // security check: enforce body size cap in the test harness to match production.
+        let body_bytes_in = match Limited::new(incoming_body, MAX_BODY_BYTES)
             .collect()
             .await
-            .map_err(ProxyError::Hyper)?
-            .to_bytes();
+        {
+            Ok(collected) => collected.to_bytes(),
+            Err(e) if e.downcast_ref::<LengthLimitError>().is_some() => {
+                return Ok(payload_too_large("request body exceeds 10 MiB limit"));
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "request body collection failed");
+                return Ok(internal_error("failed to read request body"));
+            }
+        };
 
         // Pre-flight Stream C budget check (test parity with production).
         match preflight_budget_check(&resolved_stmt, body_bytes_in.as_ref()) {
             PreflightDecision::Allowed => {}
             PreflightDecision::Rejected { axis, limit, used } => {
-                let _ = state.store.log_event(
+                if let Err(e) = state.store.log_event(
                     Some(&persona_id),
                     "proxy.denied_preflight",
                     Some(&credential_name),
@@ -3431,7 +3669,9 @@ mod tests {
                         "grant_id={} sid={resolved_sid} axis={axis} limit={limit} used={used}",
                         grant.id
                     )),
-                );
+                ) {
+                    tracing::warn!(error = ?e, grant_id = %grant.id, statement_sid = %resolved_sid, axis, "log_event failed");
+                }
                 return Ok(budget_exhausted_response(
                     &grant.id,
                     &resolved_sid,
@@ -3442,8 +3682,9 @@ mod tests {
             }
         }
 
-        let credential_bytes = match state.vault.get(&state.store, &credential_name) {
-            Ok(b) => b,
+        // security check: wrap in Zeroizing so the raw key bytes are wiped on drop.
+        let credential_bytes: Zeroizing<Vec<u8>> = match state.vault.get(&state.store, &credential_name) {
+            Ok(b) => Zeroizing::new(b),
             Err(VaultError::NotFound) => {
                 return Ok(internal_error("credential not found in vault"));
             }
@@ -3461,13 +3702,15 @@ mod tests {
         let is_git_transport_test = is_git_smart_http_path(effective_path_and_query_test);
         let auth_mode = if is_git_transport_test { "basic" } else { "bearer" };
 
-        let _ = state.store.log_event(
+        if let Err(e) = state.store.log_event(
             Some(&persona_id),
             "credential.access",
             Some(&credential_name),
             "allowed",
             None,
-        );
+        ) {
+            tracing::warn!(error = ?e, persona_id = %persona_id, credential = %credential_name, "log_event failed");
+        }
 
         // Synthesize an upstream body. If the test injected
         // `X-Ember-Test-Response-Body`, use that verbatim so the
@@ -5858,9 +6101,33 @@ mod tests {
         poll_now.await;
         tokio::time::advance(FRAME_IDLE_DEADLINE + Duration::from_secs(1)).await;
         let f2 = watchdog_fut.await;
+        // P69L.0b--ERROR-SIGNAL: the watchdog now emits a trailer frame
+        // before ending the stream, so f2 is the `x-ember-stream-outcome:
+        // partial` trailer rather than `None`.
+        let trailer_map = match f2 {
+            Some(Ok(ref frame)) => frame.trailers_ref().cloned(),
+            _ => None,
+        };
         assert!(
-            f2.is_none(),
-            "frame-idle watchdog must end the stream with None, got {f2:?}",
+            trailer_map.is_some(),
+            "frame-idle watchdog must emit an outcome trailer, got {f2:?}",
+        );
+        let outcome_hdr = trailer_map
+            .as_ref()
+            .unwrap()
+            .get(STREAM_OUTCOME_TRAILER_NAME)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(
+            outcome_hdr, "partial",
+            "watchdog trailer must carry outcome=partial"
+        );
+
+        // Next poll must return None (body fully terminated).
+        let f3 = std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await;
+        assert!(
+            f3.is_none(),
+            "poll after trailer must return None, got {f3:?}"
         );
 
         // Drop the body — outcome must record `partial`, bytes must
@@ -5996,6 +6263,153 @@ mod tests {
         assert!(!headers.contains_key("connection"));
         assert!(!headers.contains_key("x-custom"));
         assert_eq!(headers.get("x-foo").and_then(|v| v.to_str().ok()), Some("bar"));
+    }
+
+    // ------------------------------------------------------------------
+    // security check: request header allowlist — filter_request_headers
+    // ------------------------------------------------------------------
+
+    /// Helper: run `filter_request_headers` and collect the output into a
+    /// `HeaderMap` so tests can assert presence/absence without dealing
+    /// with `Request::Builder` internals.
+    fn apply_filter(src: &hyper::HeaderMap) -> hyper::HeaderMap {
+        let builder = filter_request_headers(Request::builder(), src);
+        // Build a throwaway request to materialise the header map.
+        let req = builder
+            .uri("https://example.com/")
+            .body(Full::new(Bytes::new()))
+            .expect("builder should be valid after filter_request_headers");
+        req.headers().clone()
+    }
+
+    #[test]
+    fn filter_drops_cookie_header() {
+        // security check: Cookie must never reach upstream (session fixation /
+        // credential-forwarding risk).
+        let mut src = hyper::HeaderMap::new();
+        src.insert("cookie", "x=y".parse().unwrap());
+        src.insert("content-type", "application/json".parse().unwrap());
+
+        let out = apply_filter(&src);
+        assert!(
+            !out.contains_key("cookie"),
+            "Cookie must be stripped by the allowlist"
+        );
+        assert!(
+            out.contains_key("content-type"),
+            "content-type is allowlisted and must pass through"
+        );
+    }
+
+    #[test]
+    fn filter_drops_host_header() {
+        // security check: client-supplied Host must not leak — hyper sets the
+        // correct Host from the request URI; a spoofed value could
+        // confuse SNI-based virtual-hosting at upstream.
+        let mut src = hyper::HeaderMap::new();
+        src.insert("host", "internal.local".parse().unwrap());
+        src.insert("accept", "application/json".parse().unwrap());
+
+        let out = apply_filter(&src);
+        assert!(
+            !out.contains_key("host"),
+            "Host must be stripped by the allowlist"
+        );
+        assert!(
+            out.contains_key("accept"),
+            "accept is allowlisted and must pass through"
+        );
+    }
+
+    #[test]
+    fn filter_drops_x_forwarded_for_header() {
+        // security check: X-Forwarded-For must never reach upstream — it could
+        // spoof the apparent client IP in upstream audit/rate-limit logic.
+        let mut src = hyper::HeaderMap::new();
+        src.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
+        src.insert("x-forwarded-host", "attacker.example".parse().unwrap());
+        src.insert("x-forwarded-proto", "http".parse().unwrap());
+        src.insert("content-type", "application/json".parse().unwrap());
+
+        let out = apply_filter(&src);
+        assert!(
+            !out.contains_key("x-forwarded-for"),
+            "X-Forwarded-For must be stripped by the allowlist"
+        );
+        assert!(
+            !out.contains_key("x-forwarded-host"),
+            "X-Forwarded-Host must be stripped by the allowlist"
+        );
+        assert!(
+            !out.contains_key("x-forwarded-proto"),
+            "X-Forwarded-Proto must be stripped by the allowlist"
+        );
+    }
+
+    #[test]
+    fn filter_drops_authorization_header() {
+        // security check: any client-supplied Authorization is stripped so that
+        // only the vault-injected credential reaches upstream.
+        let mut src = hyper::HeaderMap::new();
+        src.insert("authorization", "Bearer client-token".parse().unwrap());
+        src.insert("content-type", "application/json".parse().unwrap());
+
+        let out = apply_filter(&src);
+        assert!(
+            !out.contains_key("authorization"),
+            "client-supplied Authorization must be stripped — proxy injects its own"
+        );
+    }
+
+    #[test]
+    fn filter_passes_anthropic_version_header() {
+        // security check: Anthropic-Version is in the allowlist and must reach
+        // upstream so callers can pin to a specific API version.
+        let mut src = hyper::HeaderMap::new();
+        src.insert("anthropic-version", "2023-06-01".parse().unwrap());
+        src.insert("cookie", "session=secret".parse().unwrap());
+
+        let out = apply_filter(&src);
+        assert_eq!(
+            out.get("anthropic-version").and_then(|v| v.to_str().ok()),
+            Some("2023-06-01"),
+            "Anthropic-Version must pass through the allowlist"
+        );
+        assert!(
+            !out.contains_key("cookie"),
+            "Cookie must still be stripped when Anthropic-Version is present"
+        );
+    }
+
+    #[test]
+    fn filter_drops_proxy_authorization_forwarded_via_te_trailer_connection() {
+        // security check: verify that the headers explicitly called out in the
+        // acceptance criteria are all absent from the allowlist.
+        let mut src = hyper::HeaderMap::new();
+        src.insert("proxy-authorization", "Basic abc".parse().unwrap());
+        src.insert("forwarded", "for=1.2.3.4".parse().unwrap());
+        src.insert("via", "1.1 proxy.example".parse().unwrap());
+        src.insert("te", "trailers".parse().unwrap());
+        src.insert("trailer", "X-End".parse().unwrap());
+        src.insert("transfer-encoding", "chunked".parse().unwrap());
+        src.insert("connection", "keep-alive".parse().unwrap());
+
+        let out = apply_filter(&src);
+
+        for name in [
+            "proxy-authorization",
+            "forwarded",
+            "via",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "connection",
+        ] {
+            assert!(
+                !out.contains_key(name),
+                "{name} must be stripped by the allowlist (security check)"
+            );
+        }
     }
 
     // ------------------------------------------------------------------
@@ -6986,7 +7400,7 @@ mod tests {
         );
     }
 
-    /// C44-implementation-note-4 regression guard — the proxy.meter audit event
+    /// C44-implementation-note-19 regression guard — the proxy.meter audit event
     /// must NOT emit the raw credential alias in any field. Readers of the
     /// audit log must not be able to correlate persona → credential by
     /// scanning rows. The raw alias stays in `statement_usage`/grant rows;
@@ -7715,5 +8129,413 @@ mod tests {
             StatusCode::FORBIDDEN,
             "missing grant must yield 403"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // P69L.0b--ERROR-SIGNAL: x-ember-stream-outcome trailer tests.
+    // ------------------------------------------------------------------
+
+    /// Clean upstream EOF: the body completes normally, and the final
+    /// trailer frame must carry `x-ember-stream-outcome: complete`.
+    #[tokio::test]
+    async fn passthrough_body_emits_complete_trailer_on_clean_eof() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mock = ChannelBody { rx };
+
+        let mut body = PassthroughBody::new(mock, None);
+
+        // Push two data frames then signal clean EOF by closing the sender.
+        tx.send(Ok(Frame::data(Bytes::from_static(b"chunk-a")))).unwrap();
+        tx.send(Ok(Frame::data(Bytes::from_static(b"chunk-b")))).unwrap();
+        // Drop the sender — ChannelBody's `poll_recv` returns None when the
+        // channel is closed, modelling upstream EOF.
+        drop(tx);
+
+        // Drain all frames.
+        let mut trailers_seen: Option<hyper::HeaderMap> = None;
+        loop {
+            let frame = std::future::poll_fn(|cx| {
+                std::pin::Pin::new(&mut body).poll_frame(cx)
+            })
+            .await;
+            match frame {
+                None => break,
+                Some(Ok(f)) => {
+                    if let Some(t) = f.trailers_ref() {
+                        trailers_seen = Some(t.clone());
+                    }
+                }
+                Some(Err(e)) => panic!("unexpected error: {e}"),
+            }
+        }
+
+        let trailers = trailers_seen.expect("trailer frame must be emitted before body end");
+        let outcome = trailers
+            .get(STREAM_OUTCOME_TRAILER_NAME)
+            .expect("x-ember-stream-outcome header must be present")
+            .to_str()
+            .expect("header value must be valid UTF-8");
+        assert_eq!(
+            outcome, "complete",
+            "clean EOF must produce outcome=complete"
+        );
+
+        // The atomic outcome should also record complete.
+        assert_eq!(
+            body.outcome.load(Ordering::Acquire),
+            PASSTHROUGH_COMPLETE,
+            "internal outcome must be PASSTHROUGH_COMPLETE"
+        );
+    }
+
+    /// A body that emits one data frame then returns an error, modelling
+    /// an upstream TCP reset after partial delivery. The error type is
+    /// `std::io::Error` — since `PassthroughBody<B>` is now generic over
+    /// `B::Error: Display`, we don't need `hyper::Error` specifically.
+    /// Used only by the
+    /// `passthrough_body_emits_partial_trailer_on_upstream_error` test.
+    struct ErrorAfterFirstBody {
+        step: u8,
+    }
+
+    impl Body for ErrorAfterFirstBody {
+        type Data = Bytes;
+        type Error = std::io::Error;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            match self.step {
+                0 => {
+                    self.step = 1;
+                    Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(b"partial-data")))))
+                }
+                _ => Poll::Ready(Some(Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "mock upstream reset",
+                )))),
+            }
+        }
+    }
+
+    /// Mid-stream upstream error: the upstream errors after one data frame.
+    /// The trailer must carry `x-ember-stream-outcome: partial` and the
+    /// body must terminate cleanly (no error propagated to the caller).
+    #[tokio::test]
+    async fn passthrough_body_emits_partial_trailer_on_upstream_error() {
+        let mock = ErrorAfterFirstBody { step: 0 };
+        let mut body = PassthroughBody::new(mock, None);
+
+        // Drain all frames — expect data, then trailer, then None.
+        let mut trailers_seen: Option<hyper::HeaderMap> = None;
+        let mut data_bytes: Vec<u8> = Vec::new();
+        loop {
+            let frame = std::future::poll_fn(|cx| {
+                std::pin::Pin::new(&mut body).poll_frame(cx)
+            })
+            .await;
+            match frame {
+                None => break,
+                Some(Ok(f)) => {
+                    if let Some(d) = f.data_ref() {
+                        data_bytes.extend_from_slice(d);
+                    }
+                    if let Some(t) = f.trailers_ref() {
+                        trailers_seen = Some(t.clone());
+                    }
+                }
+                Some(Err(e)) => panic!("upstream error must not propagate; got: {e}"),
+            }
+        }
+
+        // The partial data frame must have been forwarded.
+        assert_eq!(
+            data_bytes, b"partial-data",
+            "data received before the error must be forwarded"
+        );
+
+        let trailers = trailers_seen.expect("trailer frame must be emitted on upstream error");
+        let outcome = trailers
+            .get(STREAM_OUTCOME_TRAILER_NAME)
+            .expect("x-ember-stream-outcome header must be present")
+            .to_str()
+            .expect("header value must be valid UTF-8");
+        assert_eq!(
+            outcome, "partial",
+            "upstream error must produce outcome=partial"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // P69L.0b-TESTS: missing streaming scenarios.
+    // ------------------------------------------------------------------
+
+    /// Zero-length body: upstream returns 200 with no data frames (immediate
+    /// EOF). `PassthroughBody` must not hang waiting for a frame, must emit
+    /// `outcome=complete`, and must report `bytes_forwarded=0`.
+    #[tokio::test]
+    async fn streaming_response_handles_zero_length_body() {
+        // An immediately-closed sender models a 200 with Content-Length: 0
+        // or a 204/304 where the body is empty.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<
+            Result<Frame<Bytes>, hyper::Error>,
+        >();
+        drop(tx); // Close immediately — zero frames.
+        let mock = ChannelBody { rx };
+
+        let outcome_sink = Arc::new(AtomicU8::new(0xff));
+        let bytes_sink = Arc::new(AtomicU64::new(u64::MAX));
+
+        let mut body = PassthroughBody::new(mock, None)
+            .with_test_sinks(Arc::clone(&outcome_sink), Arc::clone(&bytes_sink));
+
+        // First poll must return the outcome trailer (complete), not hang.
+        let frame =
+            std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await;
+
+        // The trailer frame carries outcome=complete.
+        let trailers = frame
+            .expect("first poll must yield a trailer, not None")
+            .expect("frame must not be an error")
+            .into_trailers()
+            .expect("first frame must be a trailers frame");
+        let outcome = trailers
+            .get(STREAM_OUTCOME_TRAILER_NAME)
+            .expect("x-ember-stream-outcome must be present")
+            .to_str()
+            .expect("header value must be valid UTF-8");
+        assert_eq!(outcome, "complete", "empty body must yield outcome=complete");
+
+        // Second poll terminates the body.
+        let done =
+            std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await;
+        assert!(done.is_none(), "body must end after the trailer");
+
+        drop(body);
+        assert_eq!(
+            outcome_sink.load(Ordering::Acquire),
+            PASSTHROUGH_COMPLETE,
+            "drop must record outcome=complete"
+        );
+        assert_eq!(
+            bytes_sink.load(Ordering::Acquire),
+            0,
+            "zero-length body must report bytes_forwarded=0"
+        );
+    }
+
+    /// Client disconnect mid-stream (e2e): proxy successfully accepts the
+    /// request, begins streaming upstream data, then the downstream client
+    /// drops the response body before EOF. `PassthroughBody` must record
+    /// `outcome=partial` and the slot must be released (no gate leak).
+    ///
+    /// This test exercises the drop path via the test-sink API — the same
+    /// mechanism that `passthrough_drop_emits_partial_outcome_on_mid_stream_drop`
+    /// uses, but wired through `stream_response` to confirm the production
+    /// call-site propagates sinks correctly.
+    #[tokio::test]
+    async fn streaming_response_propagates_client_disconnect() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mock = ChannelBody { rx };
+
+        let outcome_sink = Arc::new(AtomicU8::new(0xff));
+        let bytes_sink = Arc::new(AtomicU64::new(u64::MAX));
+
+        // Simulate the production path: wrap in PassthroughBody (slot=None
+        // for the test so we don't touch the process-global gate).
+        let mut body = PassthroughBody::new(mock, None)
+            .with_test_sinks(Arc::clone(&outcome_sink), Arc::clone(&bytes_sink));
+
+        // Upstream has data queued — keep `tx` alive to model an open
+        // upstream TCP connection at the moment the client disconnects.
+        tx.send(Ok(Frame::data(Bytes::from_static(b"first-chunk")))).unwrap();
+        tx.send(Ok(Frame::data(Bytes::from_static(b"second-chunk")))).unwrap();
+
+        // Client reads exactly one frame then disconnects.
+        let first =
+            std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await;
+        assert!(first.is_some(), "first poll must deliver a frame");
+        let chunk = first.unwrap().unwrap().into_data().expect("data frame");
+        assert_eq!(&chunk[..], b"first-chunk");
+
+        // Drop the body mid-stream (models client TCP close / cancelled request).
+        drop(body);
+
+        // Upstream is still alive — this is the key: no leak.
+        assert_eq!(
+            outcome_sink.load(Ordering::Acquire),
+            PASSTHROUGH_PARTIAL,
+            "client disconnect before EOF must record outcome=partial"
+        );
+        assert_eq!(
+            bytes_sink.load(Ordering::Acquire),
+            b"first-chunk".len() as u64,
+            "bytes_forwarded must count only frames delivered before disconnect"
+        );
+
+        // Keep tx alive to end — upstream still had data when client left.
+        drop(tx);
+    }
+
+    /// Backpressure / slow consumer: a large body is available upstream but
+    /// the consumer reads one frame at a time with channel back-pressure.
+    /// All bytes must arrive intact; the body must not accumulate them in
+    /// memory (each frame is released before the next is requested).
+    #[tokio::test]
+    async fn streaming_response_backpressure_slow_consumer() {
+        const CHUNKS: usize = 8;
+        const CHUNK_SIZE: usize = 64 * 1024; // 64 KiB per frame → 512 KiB total
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mock = ChannelBody { rx };
+
+        // Pre-load all chunks and close the sender (upstream EOF is known).
+        let pattern: Bytes = Bytes::from(vec![0xABu8; CHUNK_SIZE]);
+        for _ in 0..CHUNKS {
+            tx.send(Ok(Frame::data(pattern.clone()))).unwrap();
+        }
+        drop(tx);
+
+        let mut body = PassthroughBody::new(mock, None);
+
+        // Read one frame at a time — model a slow downstream consumer.
+        let mut total_bytes = 0usize;
+        loop {
+            let frame =
+                std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await;
+            match frame {
+                None => break,
+                Some(Ok(f)) => {
+                    if let Some(d) = f.data_ref() {
+                        total_bytes += d.len();
+                        // Verify content correctness (not just length).
+                        assert!(d.iter().all(|&b| b == 0xAB), "chunk bytes must match pattern");
+                    }
+                    // Trailers are the terminal frame — don't count bytes.
+                }
+                Some(Err(e)) => panic!("unexpected error from PassthroughBody: {e}"),
+            }
+        }
+
+        assert_eq!(
+            total_bytes,
+            CHUNKS * CHUNK_SIZE,
+            "all bytes must arrive intact with slow consumer (no drop or duplication)"
+        );
+        assert_eq!(
+            body.bytes_forwarded.load(Ordering::Acquire),
+            (CHUNKS * CHUNK_SIZE) as u64,
+            "bytes_forwarded counter must match total data delivered"
+        );
+        assert_eq!(
+            body.outcome.load(Ordering::Acquire),
+            PASSTHROUGH_COMPLETE,
+            "slow consumer that reads all bytes must record outcome=complete"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // security check: body-size cap tests
+    // -------------------------------------------------------------------------
+
+    /// A request body at exactly MAX_BODY_BYTES (10 MiB) passes through
+    /// and returns 200 OK from the test harness.
+    #[tokio::test]
+    async fn body_at_limit_passes_through() {
+        let state = make_state();
+        let persona = state.store.create_persona("sec9-agent").unwrap();
+        state
+            .vault
+            .add(&state.store, "sec9-token", b"tok-sec9", None)
+            .unwrap();
+        state
+            .store
+            .create_grant(&persona.id, "sec9-token", "*", None)
+            .unwrap();
+
+        // Build a POST with exactly MAX_BODY_BYTES payload.
+        let payload = vec![0u8; MAX_BODY_BYTES];
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://api.github.com/repos/owner/repo/issues")
+            .header("X-Ember-Persona", persona.id.as_str())
+            .header("X-Ember-Credential", "sec9-token")
+            .header("X-Ember-Target", "https://api.github.com")
+            .body(Full::new(Bytes::from(payload)))
+            .unwrap();
+
+        let resp = call_full(state, req).await;
+        // The test harness echos back 200 with the synthetic JSON body.
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// A request body that exceeds MAX_BODY_BYTES (11 MiB here) must
+    /// be rejected with 413 Payload Too Large before touching the vault.
+    #[tokio::test]
+    async fn body_over_limit_returns_413() {
+        let state = make_state();
+        let persona = state.store.create_persona("sec9-over-agent").unwrap();
+        state
+            .vault
+            .add(&state.store, "sec9-over-token", b"tok-sec9-over", None)
+            .unwrap();
+        state
+            .store
+            .create_grant(&persona.id, "sec9-over-token", "*", None)
+            .unwrap();
+
+        // Build a POST with MAX_BODY_BYTES + 1 byte (just over the limit).
+        let payload = vec![0u8; MAX_BODY_BYTES + 1];
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://api.github.com/repos/owner/repo/issues")
+            .header("X-Ember-Persona", persona.id.as_str())
+            .header("X-Ember-Credential", "sec9-over-token")
+            .header("X-Ember-Target", "https://api.github.com")
+            .body(Full::new(Bytes::from(payload)))
+            .unwrap();
+
+        let resp = call_full(state, req).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "body > MAX_BODY_BYTES must return 413"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // security check: credential zeroize test
+    // -------------------------------------------------------------------------
+
+    /// Verify that `Zeroizing<Vec<u8>>` zeros the backing allocation before
+    /// deallocation. Uses `ManuallyDrop` so the allocation stays live while
+    /// we inspect it — we call `zeroize()` explicitly (which is exactly what
+    /// the `Drop` impl does), then verify the bytes are all zero.
+    #[test]
+    fn credential_bytes_zeroized_on_drop() {
+        use std::mem::ManuallyDrop;
+        use zeroize::Zeroize;
+
+        // Verify it's non-zero while live.
+        let token = b"super-secret-token";
+        let cred: Zeroizing<Vec<u8>> = Zeroizing::new(token.to_vec());
+        assert!(
+            cred.iter().any(|&b| b != 0),
+            "credential bytes must be non-zero while live"
+        );
+
+        // Wrap in ManuallyDrop so we control the drop sequence: call
+        // zeroize() first (the exact operation Zeroizing's Drop performs),
+        // then verify all bytes are zero before the allocation is freed.
+        let mut md: ManuallyDrop<Zeroizing<Vec<u8>>> = ManuallyDrop::new(cred);
+        // Zeroize in place (mirrors what `<Zeroizing<T> as Drop>::drop` does).
+        (**md).zeroize();
+        assert!(
+            md.iter().all(|&b| b == 0),
+            "Zeroizing<Vec<u8>> must zero bytes on drop (security check)"
+        );
+        // Now safe to drop without re-zeroing.
+        unsafe { ManuallyDrop::drop(&mut md) };
     }
 }

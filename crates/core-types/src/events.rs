@@ -803,6 +803,34 @@ impl EventBody {
         }
     }
 
+    /// Returns the root_id for events that are directly owned by a root.
+    /// Returns `None` for events whose root ownership can only be determined
+    /// by joining against materialized state (e.g. guardian approvals).
+    pub fn root_id(&self) -> Option<&str> {
+        match self {
+            Self::RootCreated(b) => Some(&b.root_id),
+            Self::RootKeyRotated(b) => Some(&b.root_id),
+            Self::RootRevoked(b) => Some(&b.root_id),
+            Self::DeviceAdded(b) => Some(&b.root_id),
+            Self::DeviceKeyRotated(b) => Some(&b.root_id),
+            Self::DeviceEncryptionKeyRotated(b) => Some(&b.root_id),
+            Self::DeviceRevoked(b) => Some(&b.root_id),
+            Self::DeviceFrozen(b) => Some(&b.root_id),
+            Self::DeviceReplaced(b) => Some(&b.root_id),
+            Self::PersonaCreated(b) => Some(&b.root_id),
+            Self::PersonaKeyRotated(b) => Some(&b.root_id),
+            Self::PersonaRevoked(b) => Some(&b.root_id),
+            Self::RecoveryPolicyCreated(b) => Some(&b.root_id),
+            Self::GuardianEnrolled(b) => Some(&b.root_id),
+            Self::GuardianKeyRotated(b) => Some(&b.root_id),
+            Self::RecoveryRequested(b) => Some(&b.root_id),
+            Self::StorageRelationshipCreated(b) => Some(&b.root_id),
+            Self::StorageLedgerUpdated(b) => Some(&b.root_id),
+            Self::StorageManifestPublished(b) => Some(&b.root_id),
+            _ => None,
+        }
+    }
+
     pub fn decode_canonical(payload: &[u8]) -> Result<Self, ValidationError> {
         let (record_type, fields) = parse_canonical_record(payload)?;
 
@@ -3017,6 +3045,30 @@ mod trust_score_canonical_tests {
             err.to_string().contains("[0.0, 1.0]"),
             "expected range rejection for -inf, got: {err}"
         );
+    }
+
+    #[test]
+    fn decode_canonical_rejects_nan_inf_negzero() {
+        // development milestone consolidated regression: every divergent
+        // float bit pattern that EVENTS-H2 closes on the emit path must
+        // also be rejected on the decode path. `f32::from_str` accepts
+        // all four forms below, so without explicit guards an
+        // attacker-controlled relay/backup/sync stream could re-inject
+        // NaN, ±inf, or -0 into a `TrustAttestedEvent` and break
+        // canonical determinism (which would let two distinct signed
+        // payloads carry the "same" semantic score).
+        //
+        // Decode must `Err` for each of these literal `score` field
+        // values; producing `Ok(TrustAttested(...))` would be a
+        // security regression.
+        for literal in ["NaN", "inf", "-inf", "-0"] {
+            let payload = hostile_trust_attested_payload(literal);
+            let result = EventBody::decode_canonical(&payload);
+            assert!(
+                result.is_err(),
+                "decode_canonical must reject score={literal}, got Ok"
+            );
+        }
     }
 }
 

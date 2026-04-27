@@ -1,6 +1,7 @@
 mod authorize;
 mod event_log;
 pub mod materialize;
+pub use materialize::{advance_chain_head, check_chain};
 mod memory;
 mod types;
 

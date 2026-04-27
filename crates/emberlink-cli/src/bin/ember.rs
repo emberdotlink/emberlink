@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::{self, IsTerminal, Read};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process;
@@ -11,12 +12,13 @@ use ember_daemon::approval::ApprovalOutcome;
 use ember_daemon::audit::AuditFilter;
 use ember_daemon::config::DaemonConfig;
 use ember_daemon::image_registry::ImageRegistry;
-use ember_daemon::runtime::{DaemonRuntime, DashboardBind};
+use ember_daemon::runtime::{DaemonRuntime, DashboardBind, GitProxyBind, StartupBinds};
 use ember_daemon::sandbox::SandboxCreateOpts;
 use ember_daemon::store::DaemonStore;
 use ember_daemon::vault::{
     check_production_sentinel, is_cargo_test_binary, keyring_writes_suppressed,
-    verify_keyring_roundtrip, Vault, DEFAULT_KEYRING_ACCOUNT, DEFAULT_KEYRING_SERVICE,
+    try_auto_unseal_from_keyring, verify_keyring_roundtrip, AutoUnsealOutcome, Vault,
+    DEFAULT_KEYRING_ACCOUNT, DEFAULT_KEYRING_SERVICE,
 };
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
@@ -24,6 +26,24 @@ use tracing_subscriber::EnvFilter;
 
 #[path = "daemon_agent.rs"]
 mod daemon_agent;
+
+/// Render the version string consumed by `ember --version`, `ember -V`, and
+/// `ember version`.
+///
+/// Format: `ember <semver> (<git-sha-or-(no-git)>) built <rfc3339-utc>`.
+///
+/// CLI-VERSION-FLAG: the implementation-note-4 root cause was a
+/// `v0.2.0` binary running against the `v0.2.17` codebase. Embedding the git
+/// SHA + build timestamp at compile time makes "is the running binary
+/// stale?" a five-second `--version` check.
+fn print_version() -> String {
+    format!(
+        "ember {} ({}) built {}",
+        env!("CARGO_PKG_VERSION"),
+        env!("EMBERLINK_GIT_SHA"),
+        env!("EMBERLINK_BUILD_TIMESTAMP"),
+    )
+}
 
 #[derive(Parser)]
 #[command(name = "ember", about = "The trust layer for AI agents")]
@@ -93,6 +113,17 @@ enum Commands {
     Receipt {
         #[command(subcommand)]
         action: ReceiptAction,
+    },
+    /// Manage broker materializations (design / design)
+    ///
+    /// The credential broker mints scoped, time-bounded provider tokens
+    /// (Cloudflare API tokens, Anthropic admin keys, etc.) on demand —
+    /// agents and operator workflows never hold long-lived material. See
+    /// design §5 for the request/response shapes and design for the
+    /// daemon-side broker registry design.
+    Broker {
+        #[command(subcommand)]
+        action: emberlink_cli::broker::BrokerCmd,
     },
     /// View or evaluate policy rules
     Policy {
@@ -180,13 +211,20 @@ enum PersonaAction {
 #[derive(Subcommand)]
 enum VaultAction {
     /// Add a credential to the vault
+    ///
+    /// Default behavior (no --value, no --stdin) prompts interactively with
+    /// echo off — the safest form. Use --stdin for pipes/scripts. Use --value
+    /// only for non-secret values; the value will appear in shell history.
     Add {
         /// Credential name
         #[arg(long)]
         name: String,
-        /// Credential value
+        /// Credential value (visible in shell history — prefer interactive prompt or --stdin for secrets)
+        #[arg(long, conflicts_with = "stdin")]
+        value: Option<String>,
+        /// Read credential value from stdin (no shell history leak; trailing newline trimmed)
         #[arg(long)]
-        value: String,
+        stdin: bool,
         /// Optional metadata
         #[arg(long)]
         metadata: Option<String>,
@@ -203,6 +241,13 @@ enum VaultAction {
         /// Credential name
         name: String,
     },
+    /// Re-lock the vault session (security check).
+    ///
+    /// Equivalent to letting the idle timer expire — but explicit. After
+    /// this runs, the next high-risk op (vault add, vault remove, grant
+    /// create, persona key export) will require fresh user presence
+    /// (Touch ID on macOS).
+    Lock,
 }
 
 #[derive(Subcommand)]
@@ -362,6 +407,10 @@ enum SandboxAction {
         /// Additional `KEY=VAL` env var to pass into the container.
         #[arg(long = "env", short = 'e')]
         env: Vec<String>,
+        /// Owner persona ID recorded for future `exec` authorization.
+        /// Defaults to the `EMBER_PERSONA_ID` environment variable.
+        #[arg(long = "persona")]
+        persona: Option<String>,
     },
     /// List all sandboxes
     List,
@@ -370,10 +419,25 @@ enum SandboxAction {
         /// Sandbox ID
         id: String,
     },
+    /// Delete a sandbox: remove container + DB row + (if no other refs)
+    /// auto-created persona. Idempotent on already-gone state.
+    ///
+    /// implementation-note-21: unblocks `ember sandbox create --name X` retries
+    /// after a previous container start failed and left the persona row +
+    /// stale docker container behind. `ember sandbox delete <id|name>` is
+    /// the GC path; `stop` only halts (sandbox row + persona stay).
+    Delete {
+        /// Sandbox ID or name
+        id: String,
+    },
     /// Execute a command in a sandbox
     Exec {
         /// Sandbox ID
         id: String,
+        /// Calling persona ID. Defaults to the `EMBER_PERSONA_ID` environment variable.
+        /// Must match the sandbox's owner persona.
+        #[arg(long = "persona")]
+        persona: Option<String>,
         /// Command to run
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
@@ -508,10 +572,64 @@ enum AuditAction {
         /// Audit event ID
         id: String,
     },
+    /// Query the receipts table (EMBER-implementation-note-18).
+    ///
+    /// Returns the unified audit view across grant, kms_wrap, and
+    /// kms_unwrap receipts. Filters AND-combine. Use `--json` for raw
+    /// machine-readable rows; default rendering is a fixed-width table.
+    Query {
+        /// Lower bound on `materialized_at`. Accepts ISO-8601
+        /// (`2026-04-01T00:00:00Z`) or relative duration (`24h`, `7d`).
+        #[arg(long)]
+        since: Option<String>,
+        /// Filter by actor (persona id).
+        #[arg(long)]
+        actor: Option<String>,
+        /// Filter by receipt kind (`grant`, `kms_wrap`, `kms_unwrap`).
+        #[arg(long)]
+        kind: Option<String>,
+        /// Filter by grant id.
+        #[arg(long)]
+        grant_id: Option<String>,
+        /// Substring match on the resource label.
+        #[arg(long)]
+        resource: Option<String>,
+        /// Emit raw JSON rows instead of the fixed-width table.
+        #[arg(long)]
+        json: bool,
+        /// Maximum rows to return (default 100).
+        #[arg(long)]
+        limit: Option<u64>,
+    },
+}
+
+/// EMBER-implementation-note-18 — parse a `--since` argument.
+///
+/// Accepts either an ISO-8601 timestamp (e.g. `2026-04-01T00:00:00Z`) or
+/// a relative duration like `24h` / `7d` / `30m` / `45s`. Relative values
+/// are resolved against `now` and converted to ISO-8601 so the daemon
+/// receives a single canonical shape.
+///
+/// Returns `None` for malformed input — callers surface a clean usage
+/// error to the operator instead of guessing.
+pub(crate) fn parse_since(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Try ISO-8601 first — RFC3339 covers the canonical wire shape.
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+        return Some(dt.with_timezone(&chrono::Utc));
+    }
+    // Fall back to relative duration. Reuse the existing `parse_duration`
+    // helper so unit semantics stay consistent across the binary.
+    let secs = parse_duration(trimmed).ok()?;
+    let secs_i64 = i64::try_from(secs).ok()?;
+    chrono::Utc::now().checked_sub_signed(chrono::Duration::seconds(secs_i64))
 }
 
 /// Print the initial banner lines (version, socket, database, PID) immediately on startup.
-/// Call `print_banner_dashboard` once the dashboard bind result is known.
+/// Call `print_banner_startup` once the dashboard + git-proxy bind results are known.
 fn print_banner_preamble(config: &DaemonConfig) {
     let version = env!("CARGO_PKG_VERSION");
     let socket = config.socket_dir.join("daemon.sock");
@@ -529,10 +647,12 @@ fn print_banner_preamble(config: &DaemonConfig) {
     eprintln!("  PID:       {pid}");
 }
 
-/// Print the dashboard line of the banner, followed by the "Ctrl+C to stop" footer.
-/// Called after the dashboard bind result is known (from the DashboardBind callback).
-fn print_banner_dashboard(bind: &DashboardBind) {
-    match bind {
+/// Print the dashboard + git-proxy banner lines, followed by the "Ctrl+C to stop"
+/// footer. Called after both bind results are known (from the StartupBinds callback).
+/// implementation-note-10 extended this from a single dashboard line to the full
+/// startup-binds aggregate.
+fn print_banner_startup(binds: &StartupBinds) {
+    match &binds.dashboard {
         DashboardBind::Bound(addr) => {
             // Display loopback addresses as "localhost" for readability.
             if addr.ip().is_loopback() {
@@ -551,6 +671,23 @@ fn print_banner_dashboard(bind: &DashboardBind) {
             eprintln!("  Dashboard: status unknown (startup timeout)");
         }
     }
+    match &binds.git_proxy {
+        GitProxyBind::Bound(addr) => {
+            // The literal `EMBER_PROXY_URL=…` shape is load-bearing — the
+            // qember.sh demo + ember-git.sh wrapper both grep for it.
+            // Render with the bare host:port so callers can `eval` the line.
+            eprintln!("  EMBER_PROXY_URL=http://{addr}");
+        }
+        GitProxyBind::Failed { addr, error: _ } => {
+            eprintln!("  Git proxy: unavailable (port {} in use)", addr.port());
+        }
+        GitProxyBind::Disabled => {
+            eprintln!("  Git proxy: disabled");
+        }
+        GitProxyBind::Timeout => {
+            eprintln!("  Git proxy: status unknown (startup timeout)");
+        }
+    }
     eprintln!();
     eprintln!("  Ctrl+C to stop");
     eprintln!();
@@ -560,6 +697,46 @@ fn effective_config_path(cli_config: Option<&PathBuf>) -> PathBuf {
     cli_config
         .cloned()
         .unwrap_or_else(DaemonConfig::default_config_path)
+}
+
+/// implementation-note-11: probe `/api/status` on the configured
+/// dashboard address and return the daemon's reported `dashboard_addr_bound`.
+///
+/// `None` means: connect failed, response was malformed, or the daemon
+/// reported `dashboard_addr_bound: null` (bind failed / not configured).
+/// `Some(addr_string)` means: the daemon is serving traffic on that address
+/// — the CLI can render it without lying to the operator.
+///
+/// Implemented as a blocking raw-TCP HTTP/1.1 GET so the CLI can stay free
+/// of an HTTP-client dependency. Local-only request, short timeout, no body
+/// content negotiation. Mirrors the integration-test pattern in
+/// `crates/ember-daemon/tests/integration.rs`.
+fn probe_dashboard_addr_bound(addr: std::net::SocketAddr) -> Option<String> {
+    use std::io::{Read as _, Write as _};
+
+    let mut stream = std::net::TcpStream::connect_timeout(
+        &addr,
+        Duration::from_millis(500),
+    )
+    .ok()?;
+    stream.set_read_timeout(Some(Duration::from_millis(500))).ok()?;
+    stream.set_write_timeout(Some(Duration::from_millis(500))).ok()?;
+
+    let req = b"GET /api/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    stream.write_all(req).ok()?;
+
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).ok()?;
+    let resp = std::str::from_utf8(&buf).ok()?;
+    if !resp.starts_with("HTTP/1.1 200") {
+        return None;
+    }
+    // Body starts after the first blank line (CRLF CRLF).
+    let body = resp.split("\r\n\r\n").nth(1)?;
+    let json: serde_json::Value = serde_json::from_str(body).ok()?;
+    json.get("dashboard_addr_bound")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 /// Guard that keeps the non-blocking file-appender thread alive.
@@ -634,13 +811,47 @@ fn open_store(config: &DaemonConfig) -> DaemonStore {
         process::exit(1);
     }
     let db_path = config.data_dir.join("daemon.db");
-    match DaemonStore::open(&db_path) {
+    let store = match DaemonStore::open(&db_path) {
         Ok(store) => store,
         Err(e) => {
             eprintln!("error: failed to open database: {e}");
             process::exit(1);
         }
+    };
+
+    // implementation-note-20: in-process CLI subcommands (grant/sandbox/persona) talk to
+    // the same SQLite DB the daemon uses, but without going through the
+    // socket — so they need their own attached vault to encrypt/decrypt
+    // persona secrets. Best-effort auto-unseal from keyring: if a passphrase
+    // entry exists, attach it; otherwise fall through silently and let the
+    // call-site's "no vault attached" error surface naturally (callers that
+    // don't touch persona secrets — e.g. `ember audit show` — still work).
+    //
+    // This mirrors the daemon's startup auto-unseal path so CLI and daemon
+    // operate on the same vault key. Required for `qember.sh demo up`'s
+    // `grant create` / `sandbox create` to succeed without a manual unlock.
+    match try_auto_unseal_from_keyring(config) {
+        AutoUnsealOutcome::Unsealed(v) => {
+            store.set_vault(Rc::new(v));
+        }
+        AutoUnsealOutcome::NoKeyringEntry | AutoUnsealOutcome::Error(_) => {
+            // Silent fall-through: not every CLI command needs the vault, and
+            // commands that do will error from the call site with a message
+            // pointing at the missing keyring entry.
+        }
     }
+
+    // Initialise the daemon's Ed25519 process identity so that
+    // `DaemonStore::revoke_grant` (and other terminal-transition paths)
+    // can emit signed Grant Receipts via `trigger_receipt_if_terminal_current`.
+    // Without this, the identity `OnceCell` stays empty and receipt emission
+    // silently no-ops, leaving `ember receipt show <id>` returning "grant
+    // exists but has not reached terminal state".
+    if let Err(e) = ember_daemon::receipt::init_identity(&config.data_dir) {
+        tracing::warn!("could not initialise daemon identity for receipt emission: {e}");
+    }
+
+    store
 }
 
 /// Resolve an image digest via `docker inspect`. Returns None if docker is unavailable or fails.
@@ -839,6 +1050,12 @@ decision = \"require_approval\"
     // passphrase and persists it.
     let (passphrase, vault_status): (String, String) =
         if let Ok(p) = std::env::var("EMBER_VAULT_PASSPHRASE") {
+            // Capture then immediately zeroize from the process environment so
+            // it cannot be read from /proc/<pid>/environ by a second party.
+            // Called during init before any background threads spawn; the
+            // signal/thread race in remove_var is acceptable here.
+            // Safety: single-threaded init path; no other threads are reading env.
+            unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
             (p, "passphrase source: EMBER_VAULT_PASSPHRASE".to_string())
         } else if keyring_writes_suppressed() {
             // Three-axis gate — `bin/ember.rs` isn't covered by the gate
@@ -1156,6 +1373,20 @@ fn build_budget(
         wall_clock_secs,
         ..Budget::default()
     })
+}
+
+/// Return the `docker exec` flags appropriate for the caller's TTY state.
+///
+/// When stdin is a TTY both `-i` (keep stdin open) and `-t` (allocate a
+/// pseudo-TTY) are useful for interactive sessions.  When stdin is **not** a
+/// TTY (CI, pipes, headless agents) passing `-t` causes Docker to fail with
+/// "the input device is not a TTY".  In that case only `-i` is emitted.
+fn docker_exec_flags(is_tty: bool) -> Vec<&'static str> {
+    if is_tty {
+        vec!["-i", "-t"]
+    } else {
+        vec!["-i"]
+    }
 }
 
 /// Build the 3-statement composite grant envelope for `ember sandbox run`.
@@ -1491,7 +1722,45 @@ fn cmd_grant_budget(grant: &AccessGrant) {
     print!("{}", render_grant_budget(grant));
 }
 
+/// Handle `ember sandbox delete <id|name>` — implementation-note-21.
+///
+/// Resolves the argument to a sandbox UUID, then asks the store to delete
+/// the row + container + auto-created persona (when unreferenced).
+/// Idempotent: a missing sandbox prints a friendly note and exits 0 so demo
+/// retries don't fail loudly when the row was already cleaned up.
+fn handle_sandbox_delete(store: &DaemonStore, id_or_name: &str) {
+    let resolved = match store.resolve_sandbox_id(id_or_name) {
+        Ok(uuid) => uuid,
+        Err(ember_daemon::store::StoreError::NotFound) => {
+            println!("sandbox '{id_or_name}' not found (already deleted — ok)");
+            return;
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            process::exit(1);
+        }
+    };
+    match store.delete_sandbox(&resolved) {
+        Ok(()) => println!("Deleted sandbox {resolved}"),
+        Err(e) => {
+            eprintln!("error: {e}");
+            process::exit(1);
+        }
+    }
+}
+
 fn main() {
+    // CLI-VERSION-FLAG: handle `--version` / `-V` before clap parses so the
+    // output format (`ember <semver> (<sha>) built <iso8601>`) is enforced
+    // here rather than fighting clap's built-in renderer. Both forms exit 0
+    // without touching the daemon, vault, or config — `ember --version` must
+    // never block on the keychain unlock prompt.
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    if raw_args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("{}", print_version());
+        return;
+    }
+
     let cli = Cli::parse();
     let config = load_config(cli.config.as_ref());
 
@@ -1559,10 +1828,10 @@ fn main() {
                 // It prints the dashboard banner line + footer from the tokio thread,
                 // which is fine because eprintln! is synchronous and we're not in
                 // an async context that cares about thread identity.
-                let notify: Box<dyn FnOnce(DashboardBind)> = if console {
-                    Box::new(|bind| print_banner_dashboard(&bind))
+                let notify: Box<dyn FnOnce(StartupBinds)> = if console {
+                    Box::new(|binds| print_banner_startup(&binds))
                 } else {
-                    Box::new(|_bind| {})
+                    Box::new(|_binds| {})
                 };
 
                 if let Err(e) = rt.block_on(runtime.run(Some(notify))) {
@@ -1674,18 +1943,61 @@ fn main() {
                 VaultAction::Add {
                     name,
                     value,
+                    stdin,
                     metadata,
-                } => match vault.add(&store, &name, value.as_bytes(), metadata.as_deref()) {
-                    Ok(info) => {
-                        println!("Stored credential");
-                        println!("  ID:   {}", info.id);
-                        println!("  Name: {}", info.name);
+                } => {
+                    let resolved = if stdin {
+                        let mut buf = Vec::new();
+                        if let Err(e) = io::stdin().read_to_end(&mut buf) {
+                            eprintln!("error: failed to read stdin: {e}");
+                            process::exit(1);
+                        }
+                        if buf.last() == Some(&b'\n') {
+                            buf.pop();
+                            if buf.last() == Some(&b'\r') {
+                                buf.pop();
+                            }
+                        }
+                        if buf.is_empty() {
+                            eprintln!("error: --stdin received empty value");
+                            process::exit(1);
+                        }
+                        buf
+                    } else if let Some(v) = value {
+                        v.into_bytes()
+                    } else if io::stdin().is_terminal() {
+                        // Interactive prompt with echo off — default safe path
+                        // when neither --value nor --stdin is given.
+                        match rpassword::prompt_password("Paste credential value: ") {
+                            Ok(s) if s.is_empty() => {
+                                eprintln!("error: empty value");
+                                process::exit(1);
+                            }
+                            Ok(s) => s.into_bytes(),
+                            Err(e) => {
+                                eprintln!("error: failed to read prompt: {e}");
+                                process::exit(1);
+                            }
+                        }
+                    } else {
+                        eprintln!(
+                            "error: stdin is not a TTY; pass --value <V> for inline or pipe \
+                             the value with --stdin"
+                        );
+                        process::exit(2);
+                    };
+                    match vault.add(&store, &name, &resolved, metadata.as_deref()) {
+                        Ok(info) => {
+                            println!("Stored credential");
+                            println!("  ID:   {}", info.id);
+                            println!("  Name: {}", info.name);
+                        }
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            process::exit(1);
+                        }
                     }
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        process::exit(1);
-                    }
-                },
+                }
                 VaultAction::List => match vault.list(&store) {
                     Ok(creds) => {
                         if cli.json {
@@ -1732,6 +2044,18 @@ fn main() {
                         process::exit(1);
                     }
                 },
+                VaultAction::Lock => {
+                    // security check: explicit re-lock. Best-effort —
+                    // both the in-process presence state AND the
+                    // SE-keyring session cache get cleared so the next
+                    // high-risk op MUST re-prompt for biometric.
+                    ember_daemon::presence::lock();
+                    if cli.json {
+                        println!("{{\"locked\": true}}");
+                    } else {
+                        println!("Vault session re-locked. Next high-risk op will prompt for user presence.");
+                    }
+                }
             }
         }
 
@@ -1793,14 +2117,27 @@ fn main() {
                         None => None,
                     };
                     let budget = build_budget(budget_tokens, parsed_cents, budget_requests, budget_seconds);
-                    match store.create_grant(&persona, &credential, &scope, ttl_secs) {
+                    // implementation-note-13 — budget_persists_on_simple_grant.
+                    //
+                    // Pre-fix: this path called `create_grant` (no budget) and
+                    // then UPDATE'd the flat `budget_json` column. But
+                    // `row_to_grant` prefers the composite chain's first-
+                    // statement budget when present, so the chain (which had
+                    // budget=None) shadowed the UPDATE and the budget was
+                    // silently dropped on read — including in `/api/grants`.
+                    //
+                    // Post-fix: route through `create_grant_with_budget` so
+                    // the budget lands in block-zero's statement at mint time.
+                    // The flat `budget_json` column is intentionally NOT
+                    // written here per the function's contract (single source
+                    // of truth = the signed chain).
+                    match store.create_grant_with_budget(&persona, &credential, &scope, ttl_secs, budget.clone()) {
                     Ok(info) => {
-                        // Apply conditions via UPDATE if any are set
+                        // Apply non-budget conditions via UPDATE if any are set.
                         let targets_json = allowed_targets.as_ref().map(|t| {
                             let targets: Vec<&str> = t.split(',').collect();
                             serde_json::to_string(&targets).unwrap_or_default()
                         });
-                        let budget_json = budget.as_ref().map(|b| serde_json::to_string(b).expect("Budget serializes"));
                         let attestation_json = attestation_runtime.as_ref().map(|r| {
                             serde_json::to_string(&serde_json::json!({"status": "unattested_local_dev", "runtime": r})).unwrap_or_default()
                         });
@@ -1808,18 +2145,16 @@ fn main() {
                             || hours_start.is_some()
                             || targets_json.is_some()
                             || delegation_depth.is_some()
-                            || budget_json.is_some()
                             || attestation_json.is_some()
                         {
                             let _ = store.conn().execute(
-                                "UPDATE grants SET max_uses_per_hour=?1, allowed_hours_start=?2, allowed_hours_end=?3, allowed_targets=?4, max_delegation_depth=?5, budget_json=?6 WHERE id=?7",
+                                "UPDATE grants SET max_uses_per_hour=?1, allowed_hours_start=?2, allowed_hours_end=?3, allowed_targets=?4, max_delegation_depth=?5 WHERE id=?6",
                                 rusqlite::params![
                                     rate_limit.map(|v| v as i64),
                                     hours_start.map(|v| v as i64),
                                     hours_end.map(|v| v as i64),
                                     targets_json,
                                     delegation_depth.map(|v| v as i64),
-                                    budget_json,
                                     info.id,
                                 ],
                             );
@@ -2079,6 +2414,7 @@ fn main() {
                     unsafe_root,
                     workspace_from,
                     env,
+                    persona,
                 } => {
                     let extra_env: Vec<(String, String)> = env
                         .iter()
@@ -2086,6 +2422,8 @@ fn main() {
                             kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))
                         })
                         .collect();
+                    let owner_persona_id = persona
+                        .or_else(|| std::env::var("EMBER_PERSONA_ID").ok());
                     let opts = SandboxCreateOpts {
                         name: name.clone(),
                         image: image.clone(),
@@ -2096,6 +2434,7 @@ fn main() {
                         unsafe_root,
                         workspace_from: workspace_from.clone(),
                         extra_env: extra_env.clone(),
+                        owner_persona_id,
                     };
                     let sandbox = match store
                         .create_sandbox_with_opts(&opts, Some(&config.data_dir))
@@ -2171,7 +2510,10 @@ fn main() {
                         }
                     }
                 }
-                SandboxAction::Exec { id, command } => {
+                SandboxAction::Delete { id } => {
+                    handle_sandbox_delete(&store, &id);
+                }
+                SandboxAction::Exec { id, persona, command } => {
                     let resolved_id = match store.resolve_sandbox_id(&id) {
                         Ok(uuid) => uuid,
                         Err(e) => {
@@ -2179,8 +2521,11 @@ fn main() {
                             process::exit(1);
                         }
                     };
+                    let caller_persona = persona
+                        .or_else(|| std::env::var("EMBER_PERSONA_ID").ok())
+                        .unwrap_or_default();
                     let refs: Vec<&str> = command.iter().map(String::as_str).collect();
-                    match store.exec_sandbox(&resolved_id, &refs) {
+                    match store.exec_sandbox(&resolved_id, &refs, &caller_persona) {
                         Ok(output) => print!("{output}"),
                         Err(e) => {
                             eprintln!("error: {e}");
@@ -2246,6 +2591,8 @@ fn main() {
                         })
                         .collect();
 
+                    let run_owner_persona_id =
+                        std::env::var("EMBER_PERSONA_ID").ok();
                     let opts = SandboxCreateOpts {
                         name: name.clone(),
                         image: image.clone(),
@@ -2256,6 +2603,7 @@ fn main() {
                         unsafe_root: false,
                         workspace_from: workspace_from.clone(),
                         extra_env: extra_env.clone(),
+                        owner_persona_id: run_owner_persona_id,
                     };
 
                     let sandbox = match store.create_sandbox_with_opts(&opts, Some(&config.data_dir)) {
@@ -2290,7 +2638,7 @@ fn main() {
 
                     // Mint the composite grant if a credential resource was supplied.
                     //
-                    // implementation-note-1 — route the composite mint through the policy
+                    // implementation-note-5 — route the composite mint through the policy
                     // engine so `default_decision = "require_approval"` fires
                     // here. Three outcomes:
                     //   - AutoApprove: mint immediately (legacy fast-path)
@@ -2456,7 +2804,7 @@ fn main() {
                     // child process inherits stdin/stdout so Claude Code's output
                     // streams directly to the operator's terminal.
                     //
-                    // implementation-note-1 — when the composite grant is pending approval,
+                    // implementation-note-5 — when the composite grant is pending approval,
                     // skip the agent exec; the operator must approve first
                     // (then re-run / `ember sandbox exec`) to give the agent
                     // its credentials.
@@ -2468,8 +2816,14 @@ fn main() {
                         }
                     } else if let Some(ref p) = prompt {
                         if container_id != "none" {
+                            use std::io::IsTerminal as _;
+                            let tty_flags = docker_exec_flags(std::io::stdin().is_terminal());
+                            let mut exec_args = vec!["exec"];
+                            exec_args.extend_from_slice(&tty_flags);
+                            exec_args.push(&container_id);
+                            exec_args.extend_from_slice(&["claude", "-p", p]);
                             let exit_status = std::process::Command::new("docker")
-                                .args(["exec", "-it", &container_id, "claude", "-p", p])
+                                .args(&exec_args)
                                 .status();
                             match exit_status {
                                 Ok(s) if s.success() => {}
@@ -2501,7 +2855,7 @@ fn main() {
                             println!("No pending approvals");
                         } else {
                             for r in &requests {
-                                // implementation-note-1 — composite envelopes render as
+                                // implementation-note-5 — composite envelopes render as
                                 // ONE entry with N statements listed beneath.
                                 if let Some(stmts) = r.composite_statements.as_ref() {
                                     println!(
@@ -2583,7 +2937,7 @@ fn main() {
                             } else {
                                 println!("Approved {id}");
                             }
-                            // implementation-note-1 — surface the grant ID minted by a
+                            // implementation-note-5 — surface the grant ID minted by a
                             // composite-approval resolution so the operator
                             // (or test harness) can use it directly.
                             if let Ok(resolved) = store.get_approval(&id)
@@ -2766,6 +3120,88 @@ fn main() {
                         }
                     }
                 }
+                AuditAction::Query {
+                    since,
+                    actor,
+                    kind,
+                    grant_id,
+                    resource,
+                    json,
+                    limit,
+                } => {
+                    // Validate `--since` up front — surface a clean usage
+                    // error rather than handing a malformed string to the
+                    // store filter.
+                    let since_iso = match since.as_deref() {
+                        None => None,
+                        Some(s) => match parse_since(s) {
+                            Some(dt) => Some(dt.to_rfc3339()),
+                            None => {
+                                eprintln!(
+                                    "error: invalid --since '{s}' \
+                                     (expected ISO-8601 like 2026-04-01T00:00:00Z \
+                                     or relative duration like 24h / 7d)"
+                                );
+                                process::exit(1);
+                            }
+                        },
+                    };
+                    let filter = ember_daemon::receipt::ReceiptFilter {
+                        persona_id: actor,
+                        kind,
+                        grant_id,
+                        resource,
+                        since_iso,
+                        limit,
+                        ..Default::default()
+                    };
+                    let rows = match store.list_receipt_rows(&filter) {
+                        Ok(rows) => rows,
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            process::exit(1);
+                        }
+                    };
+
+                    // `--json` (subcommand-local) and the global `--json`
+                    // flag both opt into raw machine output; either is OK.
+                    if json || cli.json {
+                        match serde_json::to_string_pretty(&rows) {
+                            Ok(s) => println!("{s}"),
+                            Err(e) => {
+                                eprintln!("error: serialize rows: {e}");
+                                process::exit(1);
+                            }
+                        }
+                    } else if rows.is_empty() {
+                        println!("No receipts match the supplied filters.");
+                    } else {
+                        // Fixed-width table. Columns sized for typical
+                        // values; longer fields are truncated by `truncate`.
+                        let h_kind = "KIND";
+                        let h_actor = "ACTOR";
+                        let h_resource = "RESOURCE";
+                        let h_grant = "GRANT";
+                        let h_at = "MATERIALIZED_AT";
+                        let h_reason = "REASON";
+                        println!(
+                            "{h_kind:<10} {h_actor:<22} {h_resource:<28} {h_grant:<22} {h_at:<28} {h_reason}"
+                        );
+                        for r in &rows {
+                            let reason_short: String =
+                                r.terminal_reason.chars().take(40).collect();
+                            println!(
+                                "{:<10} {:<22} {:<28} {:<22} {:<28} {}",
+                                truncate(&r.kind, 10),
+                                truncate(&r.actor, 22),
+                                truncate(&r.resource, 28),
+                                truncate(&r.grant_id, 22),
+                                truncate(&r.materialized_at, 28),
+                                reason_short,
+                            );
+                        }
+                    }
+                }
             }
         }
 
@@ -2881,6 +3317,17 @@ fn main() {
             }
         }
 
+        Commands::Broker { action } => {
+            // Resolve the daemon socket path from the same config that
+            // every other socket-talking subcommand uses.
+            let socket_path = config.socket_dir.join("daemon.sock");
+            let opts = emberlink_cli::broker::GlobalOpts { socket_path };
+            if let Err(e) = emberlink_cli::broker::broker_command(action, opts) {
+                eprintln!("error: {e}");
+                process::exit(e.exit_code());
+            }
+        }
+
         Commands::Policy { action } => {
             let policy = ember_daemon::policy::PolicyEngine::default();
             match action {
@@ -2958,15 +3405,36 @@ fn main() {
                     Ok(status) if status.running => {
                         println!("DAEMON             running (PID {})", status.pid);
                         println!("  Socket:    {}", status.socket.display());
+                        // implementation-note-11: the configured
+                        // address is the *attempted* port. The daemon may
+                        // have failed to bind (port collision) and still
+                        // be running. Probe `/api/status` to read the
+                        // daemon-reported `dashboard_addr_bound` — the only
+                        // honest source of truth — instead of printing the
+                        // configured port unconditionally.
                         match config.dashboard_addr {
-                            Some(addr) if addr.ip().is_loopback() => {
-                                println!("  Dashboard: http://localhost:{}", addr.port());
-                            }
-                            Some(addr) => {
-                                println!("  Dashboard: http://{addr}");
-                            }
+                            Some(addr) => match probe_dashboard_addr_bound(addr) {
+                                Some(bound) => {
+                                    // Render loopback addresses as "localhost"
+                                    // to match the existing banner cosmetic.
+                                    let pretty = bound
+                                        .parse::<std::net::SocketAddr>()
+                                        .ok()
+                                        .filter(|a| a.ip().is_loopback())
+                                        .map(|a| format!("localhost:{}", a.port()))
+                                        .unwrap_or(bound);
+                                    println!("  Dashboard: http://{pretty}/");
+                                }
+                                None => {
+                                    println!(
+                                        "  Dashboard: not running (bind failed or not configured)"
+                                    );
+                                }
+                            },
                             None => {
-                                println!("  Dashboard: disabled");
+                                println!(
+                                    "  Dashboard: not running (bind failed or not configured)"
+                                );
                             }
                         }
                     }
@@ -3040,10 +3508,12 @@ fn main() {
                 let v = serde_json::json!({
                     "name": "ember",
                     "version": env!("CARGO_PKG_VERSION"),
+                    "git_sha": env!("EMBERLINK_GIT_SHA"),
+                    "build_timestamp": env!("EMBERLINK_BUILD_TIMESTAMP"),
                 });
                 println!("{}", serde_json::to_string_pretty(&v).unwrap());
             } else {
-                println!("ember {}", env!("CARGO_PKG_VERSION"));
+                println!("{}", print_version());
             }
         }
     }
@@ -3116,8 +3586,10 @@ mod tests {
             policy_file: tmp.path().join("policy.toml"),
             log_level: ember_daemon::config::LogLevel::Info,
             dashboard_addr: None,
+            git_proxy_addr: None,
             keyring: ember_daemon::config::KeyringConfig::default(),
             stale_approval_threshold_secs: 3600,
+            presence: ember_daemon::config::PresenceConfigSection::default(),
         };
 
         // Suppress keyring and passphrase side-effects.
@@ -3163,8 +3635,10 @@ mod tests {
             policy_file: tmp.path().join("policy.toml"),
             log_level: ember_daemon::config::LogLevel::Info,
             dashboard_addr: None,
+            git_proxy_addr: None,
             keyring: ember_daemon::config::KeyringConfig::default(),
             stale_approval_threshold_secs: 3600,
+            presence: ember_daemon::config::PresenceConfigSection::default(),
         };
 
         unsafe {
@@ -3539,7 +4013,7 @@ mod tests {
 
         let file = std::fs::File::open(log_file.path()).unwrap();
         let reader = std::io::BufReader::new(file);
-        let found = reader.lines().flatten().any(|line| {
+        let found = reader.lines().map_while(Result::ok).any(|line| {
             // Each line should be a JSON object; look for our test marker.
             line.contains("unit-test-probe")
         });
@@ -3641,6 +4115,20 @@ mod tests {
             }
             _ => panic!("expected SandboxAction::Run"),
         }
+    }
+
+    // --- docker_exec_flags unit tests (implementation-note-23) ---
+
+    #[test]
+    fn docker_exec_flags_non_tty_returns_only_i() {
+        let flags = docker_exec_flags(false);
+        assert_eq!(flags, vec!["-i"], "non-TTY: only -i, no -t");
+    }
+
+    #[test]
+    fn docker_exec_flags_tty_returns_i_and_t() {
+        let flags = docker_exec_flags(true);
+        assert_eq!(flags, vec!["-i", "-t"], "TTY: both -i and -t");
     }
 
     fn parse_grant_create(args: &[&str]) -> GrantAction {
@@ -3795,6 +4283,41 @@ mod tests {
         assert!(
             result.is_ok(),
             "checkpoint should pass when service differs from production default"
+        );
+    }
+
+    // --- security check: EMBER_VAULT_PASSPHRASE cleared after first read in cmd_init ---
+
+    #[test]
+    fn cmd_init_removes_vault_passphrase_env_after_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let data_dir = tmp.path().join("data");
+        let run_dir = tmp.path().join("run");
+
+        let config = ember_daemon::config::DaemonConfig {
+            socket_dir: run_dir.clone(),
+            data_dir: data_dir.clone(),
+            pid_file: run_dir.join("emberd.pid"),
+            policy_file: tmp.path().join("policy.toml"),
+            log_level: ember_daemon::config::LogLevel::Info,
+            dashboard_addr: None,
+            git_proxy_addr: None,
+            keyring: ember_daemon::config::KeyringConfig::default(),
+            stale_approval_threshold_secs: 3600,
+            presence: ember_daemon::config::PresenceConfigSection::default(),
+        };
+
+        // SAFETY: test-only, single-threaded, no other threads reading env vars.
+        unsafe {
+            std::env::set_var("EMBER_VAULT_PASSPHRASE", "sec14-cli-passphrase");
+        }
+
+        cmd_init(&config, Some("test".to_string()), Some(&config_path), None, None);
+
+        assert!(
+            std::env::var("EMBER_VAULT_PASSPHRASE").is_err(),
+            "EMBER_VAULT_PASSPHRASE must be absent from the environment after cmd_init"
         );
     }
 }

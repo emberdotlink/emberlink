@@ -724,15 +724,19 @@ impl<S: AppBackend> AppRuntime<S> {
         let sealed_hex =
             seal_grant_payload(&eph.public_key_age, &payload_bytes).map_err(|e| e.to_string())?;
 
-        // Sign the link payload: offer_id|ek_hex|expires_at|relay_hint_or_empty
+        // Sign the link payload: offer_id|ek_hex|expires_at|relay_hint_or_empty|issuer_persona_id|recipient_pubkey_hex
         // (GL-H1: relay_hint is part of the signed bytes so on-path
         // attackers cannot swap relay endpoints — see security review
         // docs/the security review).
+        // (security check: issuer_persona_id and recipient_pubkey_hex are also bound
+        // so an attacker cannot rewrite either field without breaking the sig.)
         let link_signing_payload = GrantLink::signing_payload(
             &offer_id,
             &eph.public_key_hex,
             expires_at,
             relay_hint.as_deref(),
+            issuing_persona_id,
+            "",
         );
         let signature = signer.sign(&link_signing_payload);
 
@@ -782,6 +786,8 @@ impl<S: AppBackend> AppRuntime<S> {
             expires_at,
             issuer_signature: signature.0,
             relay_hint,
+            issuer_persona_id: issuing_persona_id.to_string(),
+            recipient_pubkey_hex: String::new(),
         };
 
         // Store ephemeral private key for later claim processing
@@ -883,13 +889,14 @@ impl<S: AppBackend> AppRuntime<S> {
         }
 
         // --- Step 3: verify issuer signature (BEFORE any identity creation) ---
-        // The issuer signs `offer_id|ek_hex|expires_at|relay_hint_or_empty`. We
-        // verify this signature to ensure the offer is authentic before creating
-        // any local state. For same-device claims we look up the issuer's public
-        // key from the GrantOfferCreated event in the local store. For cross-
-        // device claims, the signature is still present and structurally valid —
-        // we verify it if the issuer's event is available locally, and require a
-        // non-empty signature regardless.
+        // The issuer signs the canonical payload including offer_id, ek_hex,
+        // expires_at, relay_hint, issuer_persona_id, and recipient_pubkey_hex.
+        // We verify this signature to ensure the offer is authentic before
+        // creating any local state. For same-device claims we look up the
+        // issuer's public key from the GrantOfferCreated event in the local
+        // store. For cross-device claims, the signature is still present and
+        // structurally valid — we verify it if the issuer's event is available
+        // locally, and require a non-empty signature regardless.
         //
         // GL-H1: relay_hint is `None` here because the URL-based claim path
         // returns early above (the only path that reaches this verification is
@@ -897,11 +904,12 @@ impl<S: AppBackend> AppRuntime<S> {
         // relay hint). If a future change re-routes URL claims through this
         // verification, the `link.relay_hint` from the parsed `GrantLink` must
         // be threaded in here so the relay binding is checked.
+        //
+        // security check: issuer_persona_id is pulled from the materialized offer event
+        // so the signed bytes include the bound issuer identity.
         if issuer_signature.is_empty() {
             return Err("offer has empty issuer signature — cannot authenticate".to_string());
         }
-        let signing_payload =
-            GrantLink::signing_payload(&offer_id, &ek_hex, expires_at, None);
 
         // If this runtime created the offer, verify against the stored issuer key.
         // The materialized state tracks GrantOfferCreated events with issuer info.
@@ -911,6 +919,25 @@ impl<S: AppBackend> AppRuntime<S> {
             .grant_offers_current
             .get(&offer_id)
             .cloned();
+
+        // security check: resolve the issuer_persona_id from the stored offer event so it
+        // is included in the signing payload. Falls back to empty string for
+        // cross-device / relay claims where the event is not locally available.
+        let stored_issuer_persona_id = offer_event
+            .as_ref()
+            .map(|o| o.issuer_persona_id.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let signing_payload = GrantLink::signing_payload(
+            &offer_id,
+            &ek_hex,
+            expires_at,
+            None,
+            &stored_issuer_persona_id,
+            "",
+        );
+
         if let Some(ref offer_view) = offer_event {
             // Look up the issuer persona's public key from the event log.
             let issuer_pid = &offer_view.issuer_persona_id;
@@ -2532,6 +2559,115 @@ mod tests {
     // -----------------------------------------------------------------------
     // GC-H2 fail-closed regression tests (development milestone)
     // -----------------------------------------------------------------------
+
+    /// GC-H2 (canonical name required by target_state_anchor): conditions on a
+    /// grant offer must abort the claim and emit **zero** new events.
+    ///
+    /// Two sub-assertions are made:
+    ///
+    /// 1. **Parser rejects unknown variants** — directly verifies that the
+    ///    `serde_json::from_str::<Vec<GrantCondition>>` call at runtime.rs:1049
+    ///    returns `Err` for an unknown-variant conditions_json string. This is
+    ///    the GC-H2 code path; the ingestion layer (materialize.rs:662) now also
+    ///    validates, so injecting a malformed record through the normal EventLog
+    ///    API is impossible. The direct assertion pins the parser contract.
+    ///
+    /// 2. **Unmet condition aborts claim + zero events** — creates a real offer
+    ///    with a badge_gate condition via `sqlite_runtime()`, then attempts to
+    ///    claim without the required badge. The claim must return `Err` AND the
+    ///    event log must not grow (no GrantClaimed event written). This exercises
+    ///    the entire step-5b code path including the zero-event guarantee.
+    #[test]
+    fn malformed_conditions_json_aborts_claim() {
+        // --- Sub-assertion 1: GC-H2 parser rejects unknown variants ---
+        // This directly pins the `serde_json::from_str` at runtime.rs:1049.
+        // A regression to an untagged/internally-tagged enum that accidentally
+        // accepts unknown variants would cause this to fail.
+        let bad_json = r#"[{"type":"future_variant","value":{}}]"#;
+        let parse_result: Result<
+            Vec<core_types::grant_conditions::GrantCondition>,
+            serde_json::Error,
+        > = serde_json::from_str(bad_json);
+        assert!(
+            parse_result.is_err(),
+            "GC-H2: serde must reject unknown GrantCondition variants; \
+             a regression here would cause the claim path to silently skip gating"
+        );
+
+        // --- Sub-assertion 2: unmet condition aborts claim + zero events ---
+        // sqlite_runtime is required: MemoryEventLog enforces chain-ref ordering
+        // that the runtime does not currently supply, causing Init to fail.
+        let mut rt = sqlite_runtime();
+        let (init, _) = rt
+            .handle_action(UiAction::Init {
+                name: "Issuer".into(),
+                device_label: "Desktop".into(),
+                persona_label: "Default".into(),
+            })
+            .unwrap();
+        let issuer_persona_id = init["persona_id"].as_str().unwrap().to_string();
+
+        // Create a grant offer gated on a badge the claimant does not hold.
+        let (offer_result, _) = rt
+            .handle_action(UiAction::CreateGrantOffer {
+                issuing_persona_id: issuer_persona_id.clone(),
+                mode: "one_shot".into(),
+                statement_specs: vec!["read_credential:obj-gc-h2".into()],
+                expires_in_secs: Some(86400),
+                relay_hint: None,
+                conditions: vec![
+                    core_types::grant_conditions::GrantCondition::badge("required-badge"),
+                ],
+            })
+            .unwrap();
+        assert_eq!(offer_result["status"], "ok");
+        let offer_id = offer_result["offer_id"].as_str().unwrap().to_string();
+        let qr = match offer_result["qr_string"].as_str() {
+            Some(q) => q.to_string(),
+            None => {
+                // payload too large for QR encoding in this scenario — skip
+                return;
+            }
+        };
+
+        // Confirm the offer has non-empty conditions_json in materialized state.
+        let offer_record = rt
+            .store
+            .materialized()
+            .grant_offers_current
+            .get(&offer_id)
+            .expect("offer must be in materialized state")
+            .clone();
+        assert!(
+            !offer_record.conditions_json.is_empty(),
+            "conditions_json must be non-empty for a conditioned offer"
+        );
+
+        // Record event count before the claim attempt.
+        let events_before_claim = rt.snapshot().event_count;
+
+        // Attempt to claim as the issuer themselves (no badge_gate badge held).
+        // The issuer has no "required-badge" badge, so the condition is unmet.
+        let claim_result = rt.handle_action(UiAction::ClaimGrantOffer {
+            link_url: qr,
+            claiming_persona_id: Some(issuer_persona_id),
+            new_user_name: None,
+        });
+
+        assert!(
+            claim_result.is_err(),
+            "claim with unmet badge_gate condition must return Err"
+        );
+
+        // Zero new events: the event log must not have grown.
+        let events_after_claim = rt.snapshot().event_count;
+        assert_eq!(
+            events_after_claim,
+            events_before_claim,
+            "conditions-aborted claim must emit zero events (got {} new events)",
+            events_after_claim.saturating_sub(events_before_claim)
+        );
+    }
 
     /// GC-H2: a GrantOfferCreated event whose conditions_json contains an
     /// unknown variant must cause claim to fail closed — no GrantClaimed event

@@ -1,9 +1,14 @@
 mod activity_support;
+mod biometric;
+pub mod broker;
+pub mod cli;
 mod commands;
 mod recovery;
 mod screens;
 mod sync_support;
 mod vault_support;
+
+pub use cli::{Args, Cmd};
 
 use std::collections::{BTreeSet, HashSet};
 use std::fmt::Write as _;
@@ -25,7 +30,7 @@ use core_crypto::{
 use core_events::EventEnvelope;
 use core_identity::{create_root, device_revoked_event, local_linkage, root_created_event};
 use core_personas::{create_persona, persona_created_event, persona_revoked_event, revoke_persona};
-use core_policy::{
+use core_types::policy::{
     PersonaTemplate, disclosure_profile_for_template, parse_persona_template,
     persona_template_for_disclosure_profile, persona_template_label,
 };
@@ -47,7 +52,7 @@ use core_types::{
     SignerBinding, SurvivalMode, TrustAttestation, ValidationError, VaultNamespace,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct LocalKeyRecord {
     owner_kind: String,
     owner_id: String,

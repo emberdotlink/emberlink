@@ -16,7 +16,7 @@
 //! name only the violating axis (never the parent's full state) so that a
 //! compromised child cannot use rejections as an oracle for parent state.
 
-use core_types::{AccessGrant, Budget, ResourceSelector, Usage};
+use core_types::{AccessGrant, Budget, ResourceSelector, Statement, Usage};
 
 /// Attenuation failure. `reason` names the violating dimension only —
 /// parent values are deliberately elided so the error is not an oracle for a
@@ -404,6 +404,47 @@ pub fn check_statement_attenuation(
             })?;
     }
     Ok(())
+}
+
+/// Compute the **union bound** of a set of approved statements (REVIEW2-F4).
+///
+/// The union bound is the minimal set `B` of parent statements such that every
+/// approved child statement is dominated by at least one statement in `B` per
+/// [`check_statement_attenuation`]'s rules (selector subsume, action subset,
+/// budget headroom). For heterogeneous statement shapes the minimal bound is
+/// just the input statements themselves: each child statement dominates itself
+/// (matching selectors, identical action sets, and `child ≤ parent_remaining`
+/// holds when usage is reset to zero).
+///
+/// This helper exists so callers minting an operator-approved composite chain
+/// can synthesize a meaningful parent for the bipartite-dominance check that
+/// `overwrite_grant_blocks` runs. Without it, the parent defaults to the
+/// scope-`*` projection from `create_grant`, which dominates everything and
+/// renders the dominance check trivially true. With this bound in place the
+/// check has real teeth: any future attempt to overwrite the chain with a
+/// statement outside the operator-approved set is rejected.
+///
+/// Notes on the returned bound:
+/// - Each parent statement preserves its child's `actions`, `resource`,
+///   `resource_type`, `conditions`, and `budget` verbatim.
+/// - `usage` is reset to `Usage::default()` so the parent's "remaining
+///   allowance" equals its full budget — required for the budget arm of the
+///   dominance check to accept a child whose budget equals the parent's.
+/// - `sid`s are preserved so error messages on a future violation still name
+///   the offending statement intelligibly.
+pub fn compute_statements_union_bound(stmts: &[Statement]) -> Vec<Statement> {
+    stmts
+        .iter()
+        .map(|s| Statement {
+            sid: s.sid.clone(),
+            resource_type: s.resource_type,
+            actions: s.actions.clone(),
+            resource: s.resource.clone(),
+            budget: s.budget.clone(),
+            usage: Usage::default(),
+            conditions: s.conditions.clone(),
+        })
+        .collect()
 }
 
 #[cfg(test)]

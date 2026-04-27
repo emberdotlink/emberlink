@@ -1,3 +1,4 @@
+// See project design notes
 use core_crypto::PublicKey;
 use core_events::EventEnvelope;
 use core_types::{EventBody, KeyRole, SignerBinding, SubjectKind, ValidationError};
@@ -1018,7 +1019,7 @@ fn check_signer_subject_coherence(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_crypto::{FixtureSigner, Signer as _, Verifier as _};
+    use core_crypto::{DOMAIN_EVENT, FixtureSigner, Signer as _, Verifier as _};
     use core_events::EventEnvelope;
     use core_types::{
         DeviceFrozenEvent, DeviceRevokedEvent, EventBody, KeyAlgorithm, PersonaRevokedEvent,
@@ -1585,10 +1586,7 @@ mod tests {
             bytes.extend_from_slice(&payload);
             bytes
         };
-        let signature = {
-            use core_crypto::Signer as _;
-            attacker_signer.sign(&canonical)
-        };
+        let signature = core_crypto::sign_with_context(DOMAIN_EVENT, attacker_signer, &canonical);
         EventEnvelope {
             schema_version: SchemaVersion::V0_1_0,
             event_id: event_id.into(),
@@ -1622,7 +1620,9 @@ mod tests {
         // Sanity: the attacker's signature verifies against their own pubkey —
         // i.e. the signature check alone would not catch this.
         assert!(
-            core_crypto::FixtureVerifier.verify(
+            core_crypto::verify_with_context(
+                DOMAIN_EVENT,
+                &core_crypto::FixtureVerifier,
                 &event.signer,
                 &event.signed_bytes(),
                 &event.signature,
@@ -1655,7 +1655,9 @@ mod tests {
             &attacker,
             KeyRole::Persona,
         );
-        assert!(core_crypto::FixtureVerifier.verify(
+        assert!(core_crypto::verify_with_context(
+            DOMAIN_EVENT,
+            &core_crypto::FixtureVerifier,
             &event.signer,
             &event.signed_bytes(),
             &event.signature,
@@ -1690,7 +1692,9 @@ mod tests {
             &attacker,
             KeyRole::Device,
         );
-        assert!(core_crypto::FixtureVerifier.verify(
+        assert!(core_crypto::verify_with_context(
+            DOMAIN_EVENT,
+            &core_crypto::FixtureVerifier,
             &event.signer,
             &event.signed_bytes(),
             &event.signature,
@@ -1748,7 +1752,9 @@ mod tests {
             &attacker,
             KeyRole::Guardian,
         );
-        assert!(core_crypto::FixtureVerifier.verify(
+        assert!(core_crypto::verify_with_context(
+            DOMAIN_EVENT,
+            &core_crypto::FixtureVerifier,
             &event.signer,
             &event.signed_bytes(),
             &event.signature,

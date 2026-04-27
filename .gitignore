@@ -11,6 +11,8 @@ memory/
 .headless-inflight.json
 .headless-events.jsonl
 .headless-failures.jsonl
+.demo-test-outcomes.jsonl
+.demo-test-blockers.txt
 .ember/runtime/
 **/.ember/runtime/
 ember-ext/extension/pkg/

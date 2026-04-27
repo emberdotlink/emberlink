@@ -39,6 +39,16 @@ pub trait AppBackend: EventLog {
         reason: Option<&str>,
     ) -> Result<(), ValidationError>;
 
+    /// Revoke a grant and emit a Grant Receipt if the daemon identity is
+    /// initialised. Mirrors the `DaemonStore::revoke_grant` path used by the
+    /// dashboard so all surfaces call the same function.
+    ///
+    /// Default implementation delegates to `revoke_access_grant`. Backends
+    /// with richer receipt infrastructure (e.g. `DaemonStore`) should override.
+    fn revoke_grant(&mut self, grant_id: &str) -> Result<(), ValidationError> {
+        self.revoke_access_grant(grant_id, None)
+    }
+
     fn access_grant_detail(
         &self,
         grant_id: &str,

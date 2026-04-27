@@ -1627,6 +1627,7 @@ fn load_all_event_refs(
             relation: EventRefRelation::parse(&relation)
                 .ok_or_else(|| ValidationError::new("unsupported event ref relation in sqlite"))?,
             target_event_id,
+            seq: 0,
         });
     }
 

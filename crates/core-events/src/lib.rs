@@ -1,4 +1,4 @@
-use core_crypto::{PublicKey, Signature, Signer};
+use core_crypto::{PublicKey, Signature, Signer, DOMAIN_EVENT};
 use core_types::{
     CanonicalEncode, EventBody, EventRefRelation, EventSubject, EventType, SchemaVersion,
     SignerBinding, Validate, ValidationError, size_limits::validate_envelope_payload_size,
@@ -8,13 +8,26 @@ use core_types::{
 pub struct EventRef {
     pub relation: EventRefRelation,
     pub target_event_id: String,
+    /// Per-root monotonic sequence number. For `Previous` refs this is the
+    /// sequence number of the event being created (i.e. `head_seq + 1`).
+    /// For non-`Previous` refs the value is `0` (unused / not enforced).
+    pub seq: u64,
 }
 
 impl EventRef {
-    pub fn previous(target_event_id: impl Into<String>) -> Self {
+    pub fn previous(target_event_id: impl Into<String>, seq: u64) -> Self {
         Self {
             relation: EventRefRelation::Previous,
             target_event_id: target_event_id.into(),
+            seq,
+        }
+    }
+
+    pub fn other(relation: EventRefRelation, target_event_id: impl Into<String>) -> Self {
+        Self {
+            relation,
+            target_event_id: target_event_id.into(),
+            seq: 0,
         }
     }
 }
@@ -70,7 +83,7 @@ impl EventEnvelope {
             &refs,
             &payload,
         );
-        let signature = signer.sign(&signed_bytes);
+        let signature = core_crypto::sign_with_context(DOMAIN_EVENT, signer, &signed_bytes);
 
         Ok(Self {
             schema_version: SchemaVersion::V0_1_0,
@@ -227,6 +240,11 @@ fn canonical_signed_bytes(
         out.push_str(".target=");
         out.push_str(&reference.target_event_id);
         out.push('\n');
+        out.push_str("ref.");
+        out.push_str(&index.to_string());
+        out.push_str(".seq=");
+        out.push_str(&reference.seq.to_string());
+        out.push('\n');
     }
     let mut bytes = out.into_bytes();
     bytes.extend_from_slice(b"payload=\n");
@@ -264,14 +282,16 @@ mod tests {
         let envelope = EventEnvelope::from_body(
             "evt-1",
             body,
-            vec![EventRef::previous("evt-0")],
+            vec![EventRef::previous("evt-0", 1)],
             SignerBinding::root("root-1", "key-root-1"),
             &signer,
         )
         .unwrap();
         let verifier = core_crypto::FixtureVerifier;
 
-        assert!(verifier.verify(
+        assert!(core_crypto::verify_with_context(
+            DOMAIN_EVENT,
+            &verifier,
             &envelope.signer,
             &envelope.signed_bytes(),
             &envelope.signature,
@@ -292,7 +312,7 @@ mod tests {
                 survival_mode: SurvivalMode::Strict,
                 initial_key: test_key("key-persona-1"),
             }),
-            vec![EventRef::previous("evt-0"), EventRef::previous("evt-0")],
+            vec![EventRef::previous("evt-0", 1), EventRef::previous("evt-0", 1)],
             SignerBinding::root("root-1", "key-root-1"),
             &signer,
         )

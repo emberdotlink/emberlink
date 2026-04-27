@@ -14,12 +14,14 @@ argon2 = "0.5"
 bytes = "1"
 chacha20poly1305 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
+core-broker = { path = "../core-broker" }
 core-crypto = { path = "../core-crypto" }
+core-kms = { path = "../core-kms" }
 core-types = { path = "../core-types" }
 dirs-next = "2"
 ed25519-dalek = "2.1.1"
 hex = "0.4"
-sha2 = "0.10"
+sha2.workspace = true
 keyring = { version = "3", features = ["apple-native"] }
 libc = "0.2"
 http-body-util = "0.1"
@@ -36,16 +38,27 @@ webpki-roots = "1.0"
 getrandom = "0.4"
 percent-encoding = "2"
 rusqlite = { version = "0.39", features = ["bundled"] }
+secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
-toml = "0.9"
+toml.workspace = true
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 aho-corasick = "1"
 once_cell = "1"
 regex = "1"
+zeroize = { version = "1", features = ["derive"] }
+
+# security check: macOS user-presence gate. The `keyring` crate (already a dep above)
+# does not expose `kSecAttrAccessControl`, so we drop down to
+# `security-framework` directly on macOS to wrap the vault MEK with
+# `kSecAccessControlUserPresence` (Touch ID / device passcode).
+# Pinned to v3 (same major already present transitively via keyring's
+# `apple-native` feature) to avoid a duplicate compile of v2.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3.7"
 
 [dev-dependencies]
 emberlink-agent = { path = "../emberlink-agent" }

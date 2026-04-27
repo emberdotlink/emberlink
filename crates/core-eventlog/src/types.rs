@@ -199,6 +199,10 @@ pub struct MaterializedState {
     pub device_key_history: BTreeMap<String, Vec<String>>,
     pub device_encryption_key_history: BTreeMap<String, Vec<String>>,
     pub persona_key_history: BTreeMap<String, Vec<String>>,
+    /// Per-root chain head: maps root_id → (last_event_id, last_seq).
+    /// `last_seq` is the sequence number of the most recently accepted event
+    /// for that root. Used to enforce monotonic `prev_event_id` chaining.
+    pub root_chain_heads: BTreeMap<String, (String, u64)>,
 }
 
 impl MaterializedState {

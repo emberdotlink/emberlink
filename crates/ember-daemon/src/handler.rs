@@ -7,6 +7,7 @@ use crate::approval::ApprovalRequestInfo;
 use crate::audit::AuditFilter;
 use crate::events::GrantEvent;
 use crate::policy::{PolicyDecision, PolicyEngine};
+use crate::presence::{self, GateOutcome, HighRiskOp};
 use crate::rate_limit::RateLimiter;
 use crate::store::DaemonStore;
 use crate::vault::Vault;
@@ -216,6 +217,22 @@ pub async fn dispatch_method_with_events(
     .await
 }
 
+/// security check marker: the per-op `require_user_presence` gate is
+/// applied to high-risk operations dispatched here (`vault_add`,
+/// `vault_remove`, `create_grant`). Read-class operations bump the
+/// session's `last_activity` via `presence::record_activity()` so they
+/// don't spam the user with biometric prompts but also keep the session
+/// "warm" — the lock fires on idle silence, not on dashboard polling.
+fn check_user_presence_gate(
+    op: HighRiskOp,
+    override_quiet_hours: bool,
+) -> Result<(), (i32, String)> {
+    match presence::require_user_presence(op, override_quiet_hours) {
+        GateOutcome::Allowed => Ok(()),
+        GateOutcome::Locked { reason } => Err((-32030, reason)),
+    }
+}
+
 /// Core dispatcher. Callers MUST set `source` correctly: `Socket` for any
 /// request that arrived from the wire, `Internal` only for in-process
 /// admin/test paths. Mis-attribution here would re-open development milestone.
@@ -298,6 +315,19 @@ pub async fn dispatch_method_with_source(
                 ));
             }
             let force = force_requested && source.is_internal();
+
+            // security check: per-op user-presence gate. Applied BEFORE
+            // policy evaluation so a locked session is rejected with a
+            // re-auth message instead of being silently routed into the
+            // approval queue. Internal callers + force-allowed callers
+            // bypass (test harness, admin CLI, recovery flow). Quiet
+            // hours apply (grant create is NOT emergency-eligible).
+            if !source.is_internal() && !force {
+                let override_qh =
+                    params["override_quiet_hours"].as_bool().unwrap_or(false);
+                check_user_presence_gate(HighRiskOp::GrantCreate, override_qh)?;
+            }
+
             if !force {
                 let action = format!("credential.access.{}", credential_name);
                 let eval = policy.evaluate(&action);
@@ -599,6 +629,10 @@ pub async fn dispatch_method_with_source(
         }
 
         "use_credential" => {
+            // security check: read-class — bump session activity so an
+            // active agent keeps the vault unlocked, but do NOT prompt
+            // for biometric (would spam the user every credential read).
+            presence::record_activity();
             // Two calling conventions:
             //   1. `{persona_id, credential_name}` — classic vault lookup.
             //   2. `{grant_id, persona_id?}` — agent runtime flow. Looks up
@@ -681,6 +715,14 @@ pub async fn dispatch_method_with_source(
         }
 
         "vault_add" => {
+            // security check: per-op user-presence gate. Internal callers
+            // (admin CLI / test harness) bypass — same trust model as
+            // development milestone force-flag handling.
+            if !source.is_internal() {
+                let override_qh =
+                    params["override_quiet_hours"].as_bool().unwrap_or(false);
+                check_user_presence_gate(HighRiskOp::VaultAdd, override_qh)?;
+            }
             let name = params["name"]
                 .as_str()
                 .ok_or((-32602, "missing 'name'".to_string()))?;
@@ -694,7 +736,51 @@ pub async fn dispatch_method_with_source(
             Ok(json!({"id": info.id, "name": info.name}))
         }
 
+        "vault_remove" => {
+            // security check: high-risk write — gated. Emergency-eligible
+            // (vault_remove revokes access; we'd rather let the user shut
+            // down a leaked credential mid-quiet-hours than block them).
+            if !source.is_internal() {
+                let override_qh =
+                    params["override_quiet_hours"].as_bool().unwrap_or(false);
+                check_user_presence_gate(HighRiskOp::VaultRemove, override_qh)?;
+            }
+            let name = params["name"]
+                .as_str()
+                .ok_or((-32602, "missing 'name'".to_string()))?;
+            vault
+                .remove(store, name)
+                .map_err(|e| (-32000, e.to_string()))?;
+            Ok(json!({"removed": true, "name": name}))
+        }
+
+        "vault_lock" => {
+            // security check: explicit re-lock. Always allowed (the user
+            // is reducing privilege, not escalating). Internal/socket
+            // both honored — `ember vault lock` may dispatch this.
+            presence::lock();
+            Ok(json!({"locked": true}))
+        }
+
+        "vault_status" => {
+            // security check: lightweight diagnostic — read-class, never
+            // prompts. Used by dashboards to show "session unlocked: 3m
+            // idle" without forcing a biometric every refresh.
+            presence::record_activity();
+            let (unlocked, idle_secs) = presence::snapshot();
+            let cfg = presence::current_config();
+            Ok(json!({
+                "unlocked": unlocked,
+                "idle_secs": idle_secs,
+                "idle_timeout_secs": cfg.idle_timeout.as_secs(),
+                "quiet_hours_start": cfg.quiet_hours_start,
+                "quiet_hours_end": cfg.quiet_hours_end,
+            }))
+        }
+
         "vault_list" => {
+            // Read-class: bump activity, never prompt.
+            presence::record_activity();
             let creds = vault.list(store).map_err(|e| (-32000, e.to_string()))?;
             let list: Vec<Value> = creds
                 .iter()
@@ -728,6 +814,36 @@ pub async fn dispatch_method_with_source(
                 })
                 .collect();
             Ok(json!(list))
+        }
+
+        // EMBER-implementation-note-18 — receipts-table audit view consumed by
+        // `ember audit query`. Filters are AND-combined; `resource` is a
+        // post-fetch substring match against the receipt body.
+        "audit_receipts" => {
+            let actor = params["actor"].as_str().map(String::from);
+            let kind = params["kind"].as_str().map(String::from);
+            let grant_id = params["grant_id"].as_str().map(String::from);
+            let resource = params["resource"].as_str().map(String::from);
+            let since_iso = params["since"].as_str().map(String::from);
+            let limit = params["limit"].as_u64();
+            let filter = crate::receipt::ReceiptFilter {
+                persona_id: actor,
+                kind,
+                grant_id,
+                resource,
+                since_iso,
+                limit,
+                ..Default::default()
+            };
+            let rows = store
+                .list_receipt_rows(&filter)
+                .map_err(|e| (-32000, e.to_string()))?;
+            // Serialize through serde so callers see the full ReceiptRow
+            // shape (id, kind, actor, resource, grant_id, materialized_at,
+            // terminal_reason, requested_scope, granted_scope).
+            let value = serde_json::to_value(&rows)
+                .map_err(|e| (-32000, format!("serialize receipt rows: {e}")))?;
+            Ok(value)
         }
 
         "submit_approval" => {
@@ -1257,6 +1373,21 @@ pub async fn dispatch_method_with_source(
             }))
         }
 
+        // implementation-note-9 (design Phase 2): broker socket RPC arms.
+        //
+        // These are intentionally additive — the registry, materialization
+        // tracking, Receipt-event emission, and provider-routing logic live
+        // in `crate::broker_handler`. Adding them here is the minimum
+        // dispatch surface so concurrent worktrees touching unrelated
+        // arms don't conflict on a structural refactor of this fn.
+        //
+        // Marker (implementation-note-9): RPC method name "BrokerIssue" lives
+        // alongside its sibling routes as the literal `broker_issue`. See
+        // `broker_handler.rs` for handler bodies + tests.
+        "broker_issue" => crate::broker_handler::handle_broker_issue(store, params).await,
+        "broker_revoke" => crate::broker_handler::handle_broker_revoke(store, params).await,
+        "broker_list" => crate::broker_handler::handle_broker_list(params).await,
+
         _ => Err((-32601, "Method not found".to_string())),
     }
 }
@@ -1724,6 +1855,65 @@ mod tests {
         assert_eq!(arr[1]["outcome"], json!("allowed"));
         assert_eq!(arr[2]["action"], json!("grant.minted"));
         assert_eq!(arr[2]["outcome"], json!("minted"));
+    }
+
+    /// EMBER-implementation-note-18 — round-trip: seed two kms receipts for the same
+    /// persona, dispatch `audit_receipts` with `actor` set, verify both
+    /// rows return with the expected shape.
+    #[tokio::test]
+    async fn audit_receipts_round_trips_kms_rows() {
+        use core_types::grant_receipt::{
+            GrantEvaluation, GrantEvaluationOutcome, KmsReceipt, ReceiptKind,
+            ReceiptOutcome,
+        };
+
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        for (kind, key, persona) in [
+            (ReceiptKind::KmsWrap, "k1", "persona-audit"),
+            (ReceiptKind::KmsUnwrap, "k1", "persona-audit"),
+            (ReceiptKind::KmsWrap, "k2", "persona-other"),
+        ] {
+            let r = KmsReceipt {
+                id: format!("rct-{}", uuid::Uuid::new_v4()),
+                kind,
+                key_name: key.into(),
+                caller_persona: persona.into(),
+                request_size_bytes: 8,
+                materialized_at_epoch_secs: 1_700_000_000,
+                grant_evaluation: GrantEvaluation {
+                    outcome: GrantEvaluationOutcome::Allowed,
+                    grant_id: None,
+                },
+                outcome: ReceiptOutcome::Success,
+                evidence: core_types::grant_receipt::Evidence::default(),
+            };
+            store.store_kms_receipt(&r).unwrap();
+        }
+
+        let result = dispatch_method(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            "audit_receipts",
+            &json!({"actor": "persona-audit"}),
+        )
+        .await
+        .unwrap();
+        let arr = result.as_array().expect("array of rows");
+        assert_eq!(arr.len(), 2);
+        for row in arr {
+            assert_eq!(row["actor"], json!("persona-audit"));
+            assert!(
+                row["kind"] == json!("kms_wrap") || row["kind"] == json!("kms_unwrap"),
+                "kind must be kms_*; got {row:?}"
+            );
+            assert_eq!(row["resource"], json!("k1"));
+        }
     }
 
     #[tokio::test]
@@ -3464,5 +3654,108 @@ mod tests {
             banner.body.chars().count(),
             banner.body
         );
+    }
+
+    // --- security check: per-op user-presence wiring ---
+    //
+    // These tests prove the new methods (`vault_remove`, `vault_lock`,
+    // `vault_status`) dispatch correctly. The gate's lock/allow state
+    // machine has its own coverage in `crate::presence::tests`. Because
+    // cargo-test binaries set `dev_mode_enabled() = true`, the gate
+    // returns `Allowed` for every call here, exercising the wire shape
+    // without forcing live keychain access.
+
+    #[tokio::test]
+    async fn vault_remove_round_trip() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+        dispatch_method(
+            &store, &vault, &policy, &rl,
+            "vault_add",
+            &json!({"name": "to-be-removed", "value": "secret"}),
+        ).await.unwrap();
+        let result = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "vault_remove",
+            &json!({"name": "to-be-removed"}),
+        ).await.unwrap();
+        assert_eq!(result["removed"], json!(true));
+        assert_eq!(result["name"], json!("to-be-removed"));
+    }
+
+    #[tokio::test]
+    async fn vault_remove_missing_name_returns_invalid_params() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+        let err = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "vault_remove",
+            &json!({}),
+        ).await.unwrap_err();
+        assert_eq!(err.0, -32602);
+    }
+
+    #[tokio::test]
+    async fn vault_lock_returns_locked_true() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+        let result = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "vault_lock",
+            &json!(null),
+        ).await.unwrap();
+        assert_eq!(result["locked"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn vault_status_exposes_session_shape() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+        let result = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "vault_status",
+            &json!(null),
+        ).await.unwrap();
+        // Shape contract: dashboard relies on these field names.
+        assert!(result["unlocked"].is_boolean());
+        assert!(result["idle_timeout_secs"].is_u64());
+        // quiet_hours_* may be null, which is .is_null() (or .is_number() if set).
+        assert!(result.get("quiet_hours_start").is_some());
+        assert!(result.get("quiet_hours_end").is_some());
+    }
+
+    #[tokio::test]
+    async fn vault_remove_via_socket_source_runs_under_dev_mode_gate() {
+        // Even via Socket dispatch (where the gate WOULD run), the
+        // cargo-test binary detection short-circuits the gate to Allowed
+        // — so the call still succeeds and we can prove the wiring is
+        // wired through dispatch_method_with_source, not just the
+        // Internal-only convenience entry point.
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+        // Seed via Internal so add doesn't trip its own gate path.
+        dispatch_method(
+            &store, &vault, &policy, &rl,
+            "vault_add",
+            &json!({"name": "seed", "value": "v"}),
+        ).await.unwrap();
+        // Now exercise via Socket source.
+        let result = dispatch_method_with_source(
+            &store, &vault, &policy, &rl, None,
+            DispatchSource::Socket,
+            "vault_remove",
+            &json!({"name": "seed"}),
+        ).await.unwrap();
+        assert_eq!(result["removed"], json!(true));
     }
 }

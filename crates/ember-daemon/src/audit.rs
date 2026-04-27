@@ -20,6 +20,10 @@ pub struct AuditFilter {
     pub agent_id: Option<String>,
     pub action: Option<String>,
     pub limit: Option<usize>,
+    /// implementation-note-8 — filter to actions that start with this prefix,
+    /// e.g. `"grant."` shows only grant-family events. Rendering-layer only;
+    /// applied after the SQL fetch so the limit still governs the fetch window.
+    pub action_prefix: Option<String>,
 }
 
 impl DaemonStore {
@@ -77,7 +81,7 @@ impl DaemonStore {
             })
         };
 
-        let entries = match (&filter.agent_id, &filter.action) {
+        let mut entries = match (&filter.agent_id, &filter.action) {
             (Some(aid), Some(act)) => stmt
                 .query_map(params![aid, act], map_row)?
                 .collect::<Result<Vec<_>, _>>()?,
@@ -91,6 +95,16 @@ impl DaemonStore {
                 .query_map([], map_row)?
                 .collect::<Result<Vec<_>, _>>()?,
         };
+
+        // implementation-note-8 — action_prefix filter applied post-fetch so
+        // the SQL limit governs the fetch window; the prefix narrows what
+        // the dashboard displays. Empty/whitespace prefix is a no-op.
+        if let Some(ref prefix) = filter.action_prefix {
+            let p = prefix.trim();
+            if !p.is_empty() {
+                entries.retain(|e| e.action.starts_with(p));
+            }
+        }
 
         Ok(entries)
     }
@@ -202,5 +216,38 @@ mod tests {
         let entries = store.query_audit(&AuditFilter::default()).unwrap();
         assert!(entries.is_empty());
         assert_eq!(store.audit_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn action_prefix_filter_returns_only_matching() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        store.log_event(None, "grant.create", None, "ok", None).unwrap();
+        store.log_event(None, "grant.revoke", None, "ok", None).unwrap();
+        store.log_event(None, "approval.dismissed", None, "ok", None).unwrap();
+        store.log_event(None, "broker.materialization", None, "ok", None).unwrap();
+
+        let entries = store
+            .query_audit(&AuditFilter {
+                action_prefix: Some("grant.".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(entries.len(), 2, "only grant.* actions should be returned");
+        assert!(entries.iter().all(|e| e.action.starts_with("grant.")));
+    }
+
+    #[test]
+    fn action_prefix_filter_empty_string_is_noop() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        store.log_event(None, "grant.create", None, "ok", None).unwrap();
+        store.log_event(None, "approval.dismissed", None, "ok", None).unwrap();
+
+        let entries = store
+            .query_audit(&AuditFilter {
+                action_prefix: Some("".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(entries.len(), 2, "empty prefix is a no-op — all events returned");
     }
 }

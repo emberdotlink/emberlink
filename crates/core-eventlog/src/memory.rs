@@ -1,13 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use core_crypto::Verifier;
+use core_crypto::{Verifier, DOMAIN_EVENT};
 use core_events::{EventEnvelope, EventRef};
 use core_types::{
     EventBody, EventRefRelation, EventSubject, EventType, FileManifest, KeyRole, PeerCursor,
     SchemaVersion, SignerBinding, SubjectKind, Validate, ValidationError,
 };
 
-use crate::materialize::{apply_event, apply_storage_event};
+use crate::materialize::{advance_chain_head, apply_event, apply_storage_event, check_chain};
 use crate::{AllowAllAuthorizer, Authorizer, EventLog, MaterializedState, SyncBatchRecord};
 
 /// .1a M-2: upper bound for caller-supplied `now_epoch_secs` in the
@@ -69,7 +69,9 @@ impl MemoryEventLog {
     }
 
     fn append_validated(&mut self, event: EventEnvelope) -> Result<(), ValidationError> {
+        check_chain(&self.materialized, &event)?;
         apply_event(&mut self.materialized, &event)?;
+        advance_chain_head(&mut self.materialized, &event);
         apply_storage_event(&mut self.storage_manifests, &event, &self.materialized)?;
 
         let idx = self.events.len();
@@ -120,7 +122,13 @@ impl EventLog for MemoryEventLog {
         // clamp instead.
         let effective_now = clamp_now(now_epoch_secs);
         event.validate()?;
-        if !verifier.verify(&event.signer, &event.signed_bytes(), &event.signature) {
+        if !core_crypto::verify_with_context(
+            DOMAIN_EVENT,
+            verifier,
+            &event.signer,
+            &event.signed_bytes(),
+            &event.signature,
+        ) {
             return Err(ValidationError::new("signature verification failed"));
         }
         // Internal store append — raw errors for precise callers.
@@ -135,6 +143,7 @@ impl EventLog for MemoryEventLog {
 
         for event in &events {
             apply_event(&mut self.materialized, event)?;
+            advance_chain_head(&mut self.materialized, event);
             apply_storage_event(&mut self.storage_manifests, event, &self.materialized)?;
         }
 
@@ -213,7 +222,7 @@ impl EventLog for MemoryEventLog {
             let refs_str = event
                 .refs
                 .iter()
-                .map(|r| format!("{}:{}", r.relation.as_str(), r.target_event_id))
+                .map(|r| format!("{}:{}:{}", r.relation.as_str(), r.target_event_id, r.seq))
                 .collect::<Vec<_>>()
                 .join(",");
             let payload_hex = core_types::bytes_to_hex(&event.payload);
@@ -298,16 +307,26 @@ impl EventLog for MemoryEventLog {
                 refs_str
                     .split(',')
                     .map(|r| {
-                        let parts: Vec<&str> = r.splitn(2, ':').collect();
-                        if parts.len() != 2 {
+                        let parts: Vec<&str> = r.splitn(3, ':').collect();
+                        if parts.len() < 2 {
                             return Err(ValidationError::new(format!("invalid ref: {r}")));
                         }
                         let relation = EventRefRelation::parse(parts[0]).ok_or_else(|| {
                             ValidationError::new(format!("unknown ref relation: {}", parts[0]))
                         })?;
+                        let seq: u64 = if parts.len() == 3 {
+                            parts[2].parse().map_err(|_| {
+                                ValidationError::new(format!(
+                                    "invalid ref seq in: {r}"
+                                ))
+                            })?
+                        } else {
+                            0
+                        };
                         Ok(EventRef {
                             relation,
                             target_event_id: parts[1].to_string(),
+                            seq,
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?
@@ -388,7 +407,13 @@ impl EventLog for MemoryEventLog {
 
         for event in events {
             event.validate()?;
-            if !verifier.verify(&event.signer, &event.signed_bytes(), &event.signature) {
+            if !core_crypto::verify_with_context(
+                DOMAIN_EVENT,
+                verifier,
+                &event.signer,
+                &event.signed_bytes(),
+                &event.signature,
+            ) {
                 self.materialized = snapshot_materialized;
                 self.storage_manifests = snapshot_manifests;
                 return Err(ValidationError::new("signature verification failed"));
@@ -403,11 +428,17 @@ impl EventLog for MemoryEventLog {
                 self.storage_manifests = snapshot_manifests;
                 return Err(err);
             }
+            if let Err(err) = check_chain(&self.materialized, event) {
+                self.materialized = snapshot_materialized;
+                self.storage_manifests = snapshot_manifests;
+                return Err(err);
+            }
             if let Err(err) = apply_event(&mut self.materialized, event) {
                 self.materialized = snapshot_materialized;
                 self.storage_manifests = snapshot_manifests;
                 return Err(err);
             }
+            advance_chain_head(&mut self.materialized, event);
             if let Err(err) =
                 apply_storage_event(&mut self.storage_manifests, event, &self.materialized)
             {
@@ -471,20 +502,29 @@ mod tests {
         }
     }
 
-    fn append_typed(
+    fn append_typed_with_refs(
         log: &mut MemoryEventLog,
         event_id: &str,
         body: EventBody,
         signer_binding: SignerBinding,
+        refs: Vec<core_events::EventRef>,
     ) {
         let signer = FixtureSigner::new(signer_binding.key_id.clone());
         let event =
-            EventEnvelope::from_body(event_id, body, Vec::new(), signer_binding, &signer).unwrap();
+            EventEnvelope::from_body(event_id, body, refs, signer_binding, &signer).unwrap();
         log.append(event, &FixtureVerifier).unwrap();
     }
 
+    /// Returns the (prev_event_id, next_seq) for a given root, or None if no head yet.
+    fn chain_next(log: &MemoryEventLog, root_id: &str) -> Option<(String, u64)> {
+        log.materialized()
+            .root_chain_heads
+            .get(root_id)
+            .map(|(id, seq)| (id.clone(), seq + 1))
+    }
+
     fn setup_identity(log: &mut MemoryEventLog) -> (String, String, String) {
-        append_typed(
+        append_typed_with_refs(
             log,
             "evt-root-1",
             EventBody::RootCreated(RootCreatedEvent {
@@ -493,9 +533,11 @@ mod tests {
                 initial_key: test_key("key-root-a"),
             }),
             SignerBinding::root("root-a", "key-root-a"),
+            Vec::new(),
         );
 
-        append_typed(
+        let (prev_id, next_seq) = chain_next(log, "root-a").unwrap();
+        append_typed_with_refs(
             log,
             "evt-device-1",
             EventBody::DeviceAdded(DeviceAddedEvent {
@@ -506,9 +548,11 @@ mod tests {
                 initial_encryption_key: test_encryption_key("device-a"),
             }),
             SignerBinding::root("root-a", "key-root-a"),
+            vec![core_events::EventRef::previous(prev_id, next_seq)],
         );
 
-        append_typed(
+        let (prev_id, next_seq) = chain_next(log, "root-a").unwrap();
+        append_typed_with_refs(
             log,
             "evt-persona-1",
             EventBody::PersonaCreated(PersonaCreatedEvent {
@@ -520,6 +564,7 @@ mod tests {
                 initial_key: test_key("key-persona-a"),
             }),
             SignerBinding::root("root-a", "key-root-a"),
+            vec![core_events::EventRef::previous(prev_id, next_seq)],
         );
 
         (
@@ -760,7 +805,7 @@ mod tests {
         // demonstrates the clamp is in effect.
         let mut source = MemoryEventLog::new();
         // Root.
-        append_typed(
+        append_typed_with_refs(
             &mut source,
             "evt-root-1",
             EventBody::RootCreated(RootCreatedEvent {
@@ -769,9 +814,11 @@ mod tests {
                 initial_key: bound_test_key("key-root-a"),
             }),
             SignerBinding::root("root-a", "key-root-a"),
+            Vec::new(),
         );
         // Device to satisfy setup_identity-style layout (not required).
-        append_typed(
+        let (prev_id, next_seq) = chain_next(&source, "root-a").unwrap();
+        append_typed_with_refs(
             &mut source,
             "evt-device-1",
             EventBody::DeviceAdded(DeviceAddedEvent {
@@ -782,9 +829,11 @@ mod tests {
                 initial_encryption_key: test_encryption_key("device-a"),
             }),
             SignerBinding::root("root-a", "key-root-a"),
+            vec![core_events::EventRef::previous(prev_id, next_seq)],
         );
         // Two personas under the root.
-        append_typed(
+        let (prev_id, next_seq) = chain_next(&source, "root-a").unwrap();
+        append_typed_with_refs(
             &mut source,
             "evt-persona-a",
             EventBody::PersonaCreated(PersonaCreatedEvent {
@@ -796,8 +845,10 @@ mod tests {
                 initial_key: bound_test_key("key-persona-a"),
             }),
             SignerBinding::root("root-a", "key-root-a"),
+            vec![core_events::EventRef::previous(prev_id, next_seq)],
         );
-        append_typed(
+        let (prev_id, next_seq) = chain_next(&source, "root-a").unwrap();
+        append_typed_with_refs(
             &mut source,
             "evt-persona-b",
             EventBody::PersonaCreated(PersonaCreatedEvent {
@@ -809,10 +860,12 @@ mod tests {
                 initial_key: bound_test_key("key-persona-b"),
             }),
             SignerBinding::root("root-a", "key-root-a"),
+            vec![core_events::EventRef::previous(prev_id, next_seq)],
         );
         // Grant offer with expires_at just above the ceiling.
+        // GrantOfferCreated is persona-signed — root_id() returns None → chain check skipped.
         let expires_at = super::MEMORY_LOG_NOW_CEILING + 10;
-        append_typed(
+        append_typed_with_refs(
             &mut source,
             "evt-offer",
             EventBody::GrantOfferCreated(core_types::GrantOfferCreatedEvent {
@@ -825,6 +878,7 @@ mod tests {
                 conditions_json: String::new(),
             }),
             SignerBinding::persona("persona-a", "key-persona-a"),
+            Vec::new(),
         );
         // Now submit a claim signed by persona-b with now_epoch_secs =
         // u64::MAX. Before the clamp, authorize would see u64::MAX and

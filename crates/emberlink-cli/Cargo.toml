@@ -25,7 +25,6 @@ core-crypto = { path = "../core-crypto" }
 core-events = { path = "../core-events" }
 core-identity = { path = "../core-identity" }
 core-personas = { path = "../core-personas" }
-core-policy = { path = "../core-policy" }
 core-recovery = { path = "../core-recovery" }
 core-sync = { path = "../core-sync" }
 core-state = { path = "../core-state" }
@@ -45,6 +44,10 @@ serde_json = "1"
 thiserror = "2"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 tokio = { version = "1", features = ["full"] }
+# rpassword: cross-platform no-echo TTY read for `ember vault add` interactive
+# prompt. Tiny crate (~few hundred LOC, libc/winapi only). Used over manual
+# tcsetattr because Windows support is otherwise non-trivial.
+rpassword = "7"
 # `getrandom` used directly for OS entropy (passphrase generation). `rand`'s
 # 0.9/0.10 API reorg moved `sample_iter`/`fill_bytes` behind extension traits;
 # going through `getrandom` avoids that surface entirely.
@@ -56,3 +59,7 @@ webpki-roots = "1.0"
 
 [dev-dependencies]
 tempfile = "3"
+# `core-broker` provides `MockBroker`/`BrokerProvider` so the broker CLI
+# integration tests can install a registry on the in-test daemon without
+# depending on real provider plumbing.
+core-broker = { path = "../core-broker" }

@@ -357,7 +357,7 @@ fn row_to_grant(row: &rusqlite::Row<'_>) -> rusqlite::Result<GrantInfo> {
     // Terminal states persisted in the column (revoked, expired, exhausted_by_budget,
     // expired_by_budget, parent_cascade_revoked) are kept as-is.  For non-terminal
     // stored states (active, paused) we additionally derive time-based expiry from
-    // `expires_at`, reusing `GrantStatus::derive` (see prior change / implementation-note-2).
+    // `expires_at`, reusing `GrantStatus::derive` (see prior change / implementation-note-16).
     let effective_status = if matches!(
         status.as_str(),
         "revoked" | "expired" | "exhausted_by_budget" | "expired_by_budget" | "parent_cascade_revoked"
@@ -466,7 +466,7 @@ pub fn access_grant_from_statements(
 /// derived from the store rather than threaded in from the outside.
 /// Existing callers of [`access_grant_from_statements`] continue to
 /// compile unchanged; migrate them to this form incrementally
-/// (TODO P69K-C28-implementation-note-3 caller migration).
+/// (TODO P69K-C28-implementation-note-17 caller migration).
 ///
 /// Returns the same value as calling `access_grant_from_statements` with
 /// the result of `store.persona_root_keypair(persona_id)`.
@@ -536,6 +536,32 @@ impl DaemonStore {
         scope: &str,
         ttl_secs: Option<u64>,
         budget: Option<Budget>,
+    ) -> Result<GrantInfo, StoreError> {
+        self.create_grant_with_budget_inner(persona_id, credential_name, scope, ttl_secs, budget, true)
+    }
+
+    /// Like [`create_grant_with_budget`] but suppresses the `grant.minted`
+    /// audit event.  Used by the composite-approval path so that
+    /// `mint_composite_chain_for_grant` can emit a single `grant.minted`
+    /// event AFTER the composite shape is finalised (REVIEW2-F8).
+    pub(crate) fn create_grant_suppress_minted_event(
+        &self,
+        persona_id: &str,
+        credential_name: &str,
+        scope: &str,
+        ttl_secs: Option<u64>,
+    ) -> Result<GrantInfo, StoreError> {
+        self.create_grant_with_budget_inner(persona_id, credential_name, scope, ttl_secs, None, false)
+    }
+
+    fn create_grant_with_budget_inner(
+        &self,
+        persona_id: &str,
+        credential_name: &str,
+        scope: &str,
+        ttl_secs: Option<u64>,
+        budget: Option<Budget>,
+        emit_minted_event: bool,
     ) -> Result<GrantInfo, StoreError> {
         // Verify persona exists and is active.
         let persona_status: Option<String> = self
@@ -619,21 +645,28 @@ impl DaemonStore {
         )?;
 
         let _ = access_grant; // chain persisted via blocks_json above
-        let _ = self.log_event(
-            Some(persona_id),
-            "grant.minted",
-            Some(credential_name),
-            "minted",
-            Some(
-                &serde_json::json!({
-                    "grant_id": id,
-                    "statement_count": 1,
-                    "ttl_secs": ttl_secs,
-                    "creation_mode": "single",
-                })
-                .to_string(),
-            ),
-        );
+
+        // REVIEW2-F8: for composite grants this event is suppressed here and
+        // re-emitted by `mint_composite_chain_for_grant` after the multi-
+        // statement shape is finalised so the audit log shows the accurate
+        // statement_count.
+        if emit_minted_event {
+            let _ = self.log_event(
+                Some(persona_id),
+                "grant.minted",
+                Some(credential_name),
+                "minted",
+                Some(
+                    &serde_json::json!({
+                        "grant_id": id,
+                        "statement_count": 1,
+                        "ttl_secs": ttl_secs,
+                        "creation_mode": "single",
+                    })
+                    .to_string(),
+                ),
+            );
+        }
         Ok(GrantInfo {
             id,
             persona_id: persona_id.to_string(),
@@ -909,6 +942,49 @@ impl DaemonStore {
         id: &str,
         grant: &AccessGrant,
     ) -> Result<(), StoreError> {
+        self.overwrite_grant_blocks_inner(id, grant, None)
+    }
+
+    /// REVIEW2-F4: overwrite a grant's `blocks_json`, running the
+    /// bipartite-dominance check against an explicit `parent_bound`
+    /// rather than the row's currently-stored chain.
+    ///
+    /// Used by [`mint_composite_chain_for_grant`](crate::approval) so the
+    /// dominance gate is rooted in the operator-approved statement set
+    /// (the union bound) instead of the scope-`*` projection that
+    /// `create_grant` wrote upstream — without this, the dominance check
+    /// is trivially true because `*` dominates everything, hollowing out
+    /// the composite-grant security claim.
+    ///
+    /// `parent_bound` must:
+    /// - have block-0 `issued_by` matching the row's persona_id (else
+    ///   the same envelope guard `overwrite_grant_blocks` enforces fires);
+    /// - carry statements that bound the new `grant`'s authority (every
+    ///   statement in `grant` must be dominated by at least one statement
+    ///   in `parent_bound`).
+    ///
+    /// All other guards (envelope consistency, size caps, full-chain
+    /// crypto verify) run identically to the loaded-parent path.
+    pub fn overwrite_grant_blocks_with_parent_bound(
+        &self,
+        id: &str,
+        grant: &AccessGrant,
+        parent_bound: &AccessGrant,
+    ) -> Result<(), StoreError> {
+        self.overwrite_grant_blocks_inner(id, grant, Some(parent_bound))
+    }
+
+    /// Shared implementation for `overwrite_grant_blocks` and
+    /// `overwrite_grant_blocks_with_parent_bound`. When `parent_override`
+    /// is `Some`, the bipartite-dominance check uses it directly; when
+    /// `None`, the parent is hydrated from the row's stored chain via
+    /// [`Self::load_parent_access_grant_for_overwrite`].
+    fn overwrite_grant_blocks_inner(
+        &self,
+        id: &str,
+        grant: &AccessGrant,
+        parent_override: Option<&AccessGrant>,
+    ) -> Result<(), StoreError> {
         // Adversarial review L2: caller must pass matching id / grant.id.
         // Only one caller today (CLI sandbox run) does it correctly; guard
         // so a future caller can't accidentally cross-write a grant's
@@ -965,8 +1041,32 @@ impl DaemonStore {
         // Check runs BEFORE the (expensive) crypto verify so the cheap
         // violation fails fast — but AFTER envelope checks so we know the
         // row exists and block-0 is self-consistent.
-        let parent = self.load_parent_access_grant_for_overwrite(id, &row_persona_id)?;
-        check_statement_attenuation(&parent, grant).map_err(|e| {
+        //
+        // REVIEW2-F4: When `parent_override` is `Some`, the dominance gate
+        // is rooted in the caller-supplied bound (e.g. the operator-approved
+        // statement set for composite minting) rather than the scope-`*`
+        // projection that `create_grant` wrote upstream. Same envelope guard
+        // applies to the override: its block-0 issued_by must match the row.
+        let loaded_parent;
+        let parent: &AccessGrant = match parent_override {
+            Some(p) => {
+                if let Some(first) = p.blocks.first()
+                    && first.block.issued_by != row_persona_id
+                {
+                    return Err(StoreError::InvalidInput(format!(
+                        "overwrite_grant_blocks: parent_bound block-0 issued_by={} \
+                         does not match row persona_id={row_persona_id}",
+                        first.block.issued_by
+                    )));
+                }
+                p
+            }
+            None => {
+                loaded_parent = self.load_parent_access_grant_for_overwrite(id, &row_persona_id)?;
+                &loaded_parent
+            }
+        };
+        check_statement_attenuation(parent, grant).map_err(|e| {
             StoreError::InvalidInput(format!("attenuation violation: {}", e.reason))
         })?;
 
@@ -1365,14 +1465,22 @@ impl DaemonStore {
             return Err(StoreError::NotFound);
         }
         // Emit Grant Receipt for the operator-initiated revocation.
-        let _ = crate::receipt::trigger_receipt_if_terminal_current(
+        if crate::receipt::trigger_receipt_if_terminal_current(
             self,
             id,
             Some(core_types::grant_receipt::TerminalReason::Revoked {
                 by: core_types::grant_receipt::RevokeActor::Operator,
                 reason: String::new(),
             }),
-        );
+        )
+        .is_none()
+        {
+            tracing::warn!(
+                grant_id = %id,
+                terminal_reason = "revoked",
+                "receipt did not emit for revoked grant — see prior log line"
+            );
+        }
         // Cascade to child delegated grants
         self.cascade_revoke_children(id, id)?;
         Ok(())
@@ -1398,13 +1506,22 @@ impl DaemonStore {
             // Emit a receipt for the cascade-revoked child. The receipt's
             // TerminalReason distinguishes cascade from direct revoke even
             // though both share the same `revoked` SQL status today.
-            let _ = crate::receipt::trigger_receipt_if_terminal_current(
+            if crate::receipt::trigger_receipt_if_terminal_current(
                 self,
                 &child_id,
                 Some(core_types::grant_receipt::TerminalReason::ParentCascadeRevoked {
                     parent_grant_id: root_revoked_id.to_string(),
                 }),
-            );
+            )
+            .is_none()
+            {
+                tracing::warn!(
+                    grant_id = %child_id,
+                    parent_grant_id = %root_revoked_id,
+                    terminal_reason = "parent_cascade_revoked",
+                    "receipt did not emit for cascade-revoked child — see prior log line"
+                );
+            }
             self.cascade_revoke_children(&child_id, root_revoked_id)?;
         }
         Ok(())
@@ -1432,11 +1549,19 @@ impl DaemonStore {
             rusqlite::params![now],
         )?;
         for gid in &expiring {
-            let _ = crate::receipt::trigger_receipt_if_terminal_current(
+            if crate::receipt::trigger_receipt_if_terminal_current(
                 self,
                 gid,
                 Some(core_types::grant_receipt::TerminalReason::Expired),
-            );
+            )
+            .is_none()
+            {
+                tracing::warn!(
+                    grant_id = %gid,
+                    terminal_reason = "expired",
+                    "receipt did not emit for TTL-expired grant — see prior log line"
+                );
+            }
         }
         Ok(count)
     }
@@ -1499,14 +1624,22 @@ impl DaemonStore {
                     )),
                 );
                 // Emit a signed Grant Receipt for the terminal state.
-                let _ = crate::receipt::trigger_receipt_if_terminal_current(
+                if crate::receipt::trigger_receipt_if_terminal_current(
                     self,
                     &info.id,
                     Some(core_types::grant_receipt::TerminalReason::ExhaustedByBudget {
                         statement_sid: "S0".into(),
                         axis: core_types::grant_receipt::BudgetAxis::WallClockSecs,
                     }),
-                );
+                )
+                .is_none()
+                {
+                    tracing::warn!(
+                        grant_id = %info.id,
+                        terminal_reason = "exhausted_by_budget",
+                        "receipt did not emit for budget-exhausted grant — see prior log line"
+                    );
+                }
                 exhausted += 1;
                 continue;
             }
@@ -2695,7 +2828,7 @@ mod tests {
     }
 
     /// `access_grant_from_statements_for_persona` returns the same `AccessGrant`
-    /// as the explicit-root form when both use the same persona (P69K-C28-implementation-note-3).
+    /// as the explicit-root form when both use the same persona (P69K-C28-implementation-note-17).
     #[test]
     fn access_grant_from_statements_for_persona_matches_explicit_root() {
         let store = setup();

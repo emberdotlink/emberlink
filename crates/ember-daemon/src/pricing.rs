@@ -840,6 +840,54 @@ data: {\"type\":\"message_stop\"}\n\
         assert_eq!(parsed.output_tokens, 25);
     }
 
+    /// c44 MSG-START-POISON regression: `message_start.usage.output_tokens`
+    /// set to `u64::MAX` by a hostile upstream must NOT raise the running
+    /// high-water mark. The delta arm max-merges, so a poisoned message_start
+    /// would otherwise lock `output_tokens_max` at `u64::MAX` for every
+    /// subsequent delta. The fix is to never read `output_tokens` from
+    /// `message_start` at all — it is always 0 per Anthropic's spec.
+    #[test]
+    fn message_start_output_tokens_clamped_to_zero() {
+        // Stream with a hostile message_start carrying u64::MAX output_tokens,
+        // followed by a normal delta (output = 7) and a stop.
+        let body = format!(
+            "event: message_start\n\
+data: {{\"type\":\"message_start\",\"message\":{{\"model\":\"claude-opus-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":{}}}}}}}\n\
+\n\
+event: message_delta\n\
+data: {{\"type\":\"message_delta\",\"usage\":{{\"output_tokens\":7}}}}\n\
+\n\
+event: message_stop\n\
+data: {{\"type\":\"message_stop\"}}\n\
+\n",
+            u64::MAX
+        );
+        let summary = parse_anthropic_sse_usage(body.as_bytes()).expect("parses");
+        assert_eq!(summary.usage.input_tokens, 10);
+        assert_eq!(
+            summary.usage.output_tokens, 7,
+            "output_tokens high-water mark must be 7 (from message_delta), \
+             not u64::MAX (from poisoned message_start)"
+        );
+        assert!(summary.saw_message_stop);
+
+        // Edge case: no delta at all — output stays at 0.
+        let body_no_delta = format!(
+            "event: message_start\n\
+data: {{\"type\":\"message_start\",\"message\":{{\"model\":\"claude-opus-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":{}}}}}}}\n\
+\n\
+event: message_stop\n\
+data: {{\"type\":\"message_stop\"}}\n\
+\n",
+            u64::MAX
+        );
+        let summary2 = parse_anthropic_sse_usage(body_no_delta.as_bytes()).expect("parses");
+        assert_eq!(
+            summary2.usage.output_tokens, 0,
+            "output_tokens must stay 0 when only a poisoned message_start is present"
+        );
+    }
+
     #[test]
     fn looks_like_json_matches_only_json_bodies() {
         assert!(looks_like_json(b"{\"k\":1}"));

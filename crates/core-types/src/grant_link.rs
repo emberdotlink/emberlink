@@ -6,8 +6,8 @@ use crate::ValidationError;
 /// needs to claim a grant without any out-of-band coordination.
 ///
 /// Two URL formats are supported:
-/// - Native: `emberlink://claim/<offer-id>?ek=...&exp=...&sig=...`
-/// - Web:    `https://ember.link/#/claim/<offer-id>?ek=...&exp=...&sig=...`
+/// - Native: `emberlink://claim/<offer-id>?ek=...&exp=...&sig=...&issuer=...&rpk=...`
+/// - Web:    `https://ember.link/#/claim/<offer-id>?ek=...&exp=...&sig=...&issuer=...&rpk=...`
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrantLink {
     /// Unique offer identifier. Format: `offer-{random}`.
@@ -17,11 +17,9 @@ pub struct GrantLink {
     pub ephemeral_public_key_hex: String,
     /// Expiry timestamp (epoch seconds).
     pub expires_at: u64,
-    /// Issuer's signature over `offer_id|ek|exp|relay_hint_or_empty`,
-    /// proving link authenticity. The empty string fills the relay slot
-    /// when [`Self::relay_hint`] is `None`, so an on-path attacker who
-    /// appends `&relay=...` to a link the issuer rendered without one
-    /// also breaks the signature.
+    /// Issuer's signature over the canonical signing payload (security check),
+    /// proving link authenticity and binding both issuer identity and
+    /// recipient public key into the signed bytes.
     pub issuer_signature: String,
     /// Optional relay endpoint hint for async pickup.
     ///
@@ -30,16 +28,34 @@ pub struct GrantLink {
     /// (security review `docs/the security review`,
     /// finding H-1).
     pub relay_hint: Option<String>,
+    /// Issuer persona ID bound into the signed payload (security check).
+    ///
+    /// Prevents an attacker from reusing a valid link while substituting a
+    /// different issuer identity — the verifier rejects any mismatch between
+    /// the persona recorded in the offer event and this signed field.
+    pub issuer_persona_id: String,
+    /// Hex-encoded recipient public key bound into the signed payload (security check).
+    ///
+    /// Empty string for open (undirected) offers. When set, the verifier
+    /// rejects any rewrite of this field that was not signed by the issuer,
+    /// preventing an attacker from redirecting a directed offer to a key
+    /// they control.
+    pub recipient_pubkey_hex: String,
 }
 
 impl GrantLink {
     /// Render as a native deep link.
     ///
-    /// Format: `emberlink://claim/<offer-id>?ek=<hex>&exp=<epoch>&sig=<hex>[&relay=<url>]`
+    /// Format: `emberlink://claim/<offer-id>?ek=<hex>&exp=<epoch>&sig=<hex>&issuer=<id>&rpk=<hex>[&relay=<url>]`
     pub fn to_url(&self) -> String {
         let mut url = format!(
-            "emberlink://claim/{}?ek={}&exp={}&sig={}",
-            self.offer_id, self.ephemeral_public_key_hex, self.expires_at, self.issuer_signature,
+            "emberlink://claim/{}?ek={}&exp={}&sig={}&issuer={}&rpk={}",
+            self.offer_id,
+            self.ephemeral_public_key_hex,
+            self.expires_at,
+            self.issuer_signature,
+            self.issuer_persona_id,
+            self.recipient_pubkey_hex,
         );
         if let Some(relay) = &self.relay_hint {
             url.push_str(&format!("&relay={relay}"));
@@ -71,8 +87,13 @@ impl GrantLink {
             None => String::new(),
         };
         format!(
-            "https://ember.link/{relay_query}#/claim/{}?ek={}&exp={}&sig={}",
-            self.offer_id, self.ephemeral_public_key_hex, self.expires_at, self.issuer_signature,
+            "https://ember.link/{relay_query}#/claim/{}?ek={}&exp={}&sig={}&issuer={}&rpk={}",
+            self.offer_id,
+            self.ephemeral_public_key_hex,
+            self.expires_at,
+            self.issuer_signature,
+            self.issuer_persona_id,
+            self.recipient_pubkey_hex,
         )
     }
 
@@ -126,6 +147,8 @@ impl GrantLink {
         let mut exp = None;
         let mut sig = None;
         let mut relay = pre_fragment_relay;
+        let mut issuer = None;
+        let mut rpk = None;
 
         for pair in query.split('&') {
             if let Some((key, value)) = pair.split_once('=') {
@@ -134,6 +157,8 @@ impl GrantLink {
                     "exp" => exp = Some(value.to_string()),
                     "sig" => sig = Some(value.to_string()),
                     "relay" => relay = Some(value.to_string()),
+                    "issuer" => issuer = Some(value.to_string()),
+                    "rpk" => rpk = Some(value.to_string()),
                     _ => {} // ignore unknown params for forward compat
                 }
             }
@@ -151,6 +176,11 @@ impl GrantLink {
         let issuer_signature = sig.ok_or_else(|| {
             ValidationError::invalid_format("grant link missing sig parameter")
         })?;
+        let issuer_persona_id = issuer.ok_or_else(|| {
+            ValidationError::invalid_format("grant link missing issuer parameter")
+        })?;
+        // rpk is optional — empty string for open (undirected) offers
+        let recipient_pubkey_hex = rpk.unwrap_or_default();
 
         Ok(GrantLink {
             offer_id: offer_id.to_string(),
@@ -158,30 +188,33 @@ impl GrantLink {
             expires_at,
             issuer_signature,
             relay_hint: relay,
+            issuer_persona_id,
+            recipient_pubkey_hex,
         })
     }
 
     /// The canonical payload that the issuer signs to prove link authenticity.
     ///
-    /// Format: `<offer_id>|<ephemeral_public_key_hex>|<expires_at>|<relay_hint_or_empty>`
+    /// Format: `<offer_id>|<ephemeral_public_key_hex>|<expires_at>|<relay_hint_or_empty>|<issuer_persona_id>|<recipient_pubkey_hex_or_empty>`
     ///
-    /// Field ordering matches the reading order of the rendered URL
-    /// (offer-id in path, then `ek`, `exp`, `sig`, `relay` query params).
-    /// `relay_hint = None` is encoded as an empty trailing field so the
-    /// "no relay" case binds into the signature distinctly from any
-    /// non-empty relay value — an on-path attacker who appends
-    /// `&relay=evil.example.com` to a link the issuer rendered with
-    /// `None` flips the trailing field from `""` to `"evil.example.com"`
-    /// and verification fails (GL-H1, security review
-    /// `docs/the security review`).
+    /// Field ordering matches the reading order of the rendered URL.
+    /// `relay_hint = None` is encoded as an empty field (GL-H1).
+    /// `recipient_pubkey_hex` is empty for open (undirected) offers.
+    ///
+    /// security check: both `issuer_persona_id` and `recipient_pubkey_hex` are bound
+    /// into the signed bytes so an attacker cannot rewrite either field on
+    /// the wire without breaking the signature.
     pub fn signing_payload(
         offer_id: &str,
         ek_hex: &str,
         expires_at: u64,
         relay_hint: Option<&str>,
+        issuer_persona_id: &str,
+        recipient_pubkey_hex: &str,
     ) -> Vec<u8> {
         let relay = relay_hint.unwrap_or("");
-        format!("{offer_id}|{ek_hex}|{expires_at}|{relay}").into_bytes()
+        format!("{offer_id}|{ek_hex}|{expires_at}|{relay}|{issuer_persona_id}|{recipient_pubkey_hex}")
+            .into_bytes()
     }
 }
 
@@ -196,6 +229,8 @@ mod tests {
             expires_at: 1700000000,
             issuer_signature: "sig0011".to_string(),
             relay_hint: None,
+            issuer_persona_id: "persona-issuer".to_string(),
+            recipient_pubkey_hex: String::new(),
         }
     }
 
@@ -285,10 +320,10 @@ mod tests {
 
     #[test]
     fn signing_payload_deterministic() {
-        let p1 = GrantLink::signing_payload("offer-1", "aabb", 12345, None);
-        let p2 = GrantLink::signing_payload("offer-1", "aabb", 12345, None);
+        let p1 = GrantLink::signing_payload("offer-1", "aabb", 12345, None, "persona-x", "");
+        let p2 = GrantLink::signing_payload("offer-1", "aabb", 12345, None, "persona-x", "");
         assert_eq!(p1, p2);
-        assert_eq!(p1, b"offer-1|aabb|12345|");
+        assert_eq!(p1, b"offer-1|aabb|12345||persona-x|");
     }
 
     #[test]
@@ -301,23 +336,28 @@ mod tests {
             "aabb",
             12345,
             Some("wss://honest.example.com"),
+            "persona-x",
+            "",
         );
         let with_relay_b = GrantLink::signing_payload(
             "offer-1",
             "aabb",
             12345,
             Some("wss://evil.example.com"),
+            "persona-x",
+            "",
         );
-        let without_relay = GrantLink::signing_payload("offer-1", "aabb", 12345, None);
+        let without_relay =
+            GrantLink::signing_payload("offer-1", "aabb", 12345, None, "persona-x", "");
 
         assert_ne!(with_relay_a, with_relay_b);
         assert_ne!(with_relay_a, without_relay);
         assert_ne!(with_relay_b, without_relay);
         assert_eq!(
             with_relay_a,
-            b"offer-1|aabb|12345|wss://honest.example.com",
+            b"offer-1|aabb|12345|wss://honest.example.com|persona-x|",
         );
-        assert_eq!(without_relay, b"offer-1|aabb|12345|");
+        assert_eq!(without_relay, b"offer-1|aabb|12345||persona-x|");
     }
 
     #[test]
@@ -337,6 +377,8 @@ mod tests {
             &link.ephemeral_public_key_hex,
             link.expires_at,
             link.relay_hint.as_deref(),
+            &link.issuer_persona_id,
+            &link.recipient_pubkey_hex,
         );
 
         // Render, then simulate an on-path swap of the relay query param.
@@ -357,6 +399,8 @@ mod tests {
             &parsed_tampered.ephemeral_public_key_hex,
             parsed_tampered.expires_at,
             parsed_tampered.relay_hint.as_deref(),
+            &parsed_tampered.issuer_persona_id,
+            &parsed_tampered.recipient_pubkey_hex,
         );
         assert_ne!(
             issuer_signed_bytes, attacker_recomputed_bytes,
@@ -377,6 +421,8 @@ mod tests {
             &link.ephemeral_public_key_hex,
             link.expires_at,
             link.relay_hint.as_deref(),
+            &link.issuer_persona_id,
+            &link.recipient_pubkey_hex,
         );
 
         let url = link.to_url();
@@ -392,7 +438,91 @@ mod tests {
             &parsed_tampered.ephemeral_public_key_hex,
             parsed_tampered.expires_at,
             parsed_tampered.relay_hint.as_deref(),
+            &parsed_tampered.issuer_persona_id,
+            &parsed_tampered.recipient_pubkey_hex,
         );
         assert_ne!(issuer_signed_bytes, attacker_recomputed_bytes);
+    }
+
+    // ── security check: ephemeral_public_key_hex and issuer_persona_id tamper detection ──
+
+    #[test]
+    fn ephemeral_key_rewrite_changes_signing_payload() {
+        // security check: the ephemeral public key is bound into the signed bytes.
+        // An attacker who rewrites `ek` on the wire causes the verifier to
+        // recompute a different payload — signature check rejects the link.
+        let link = sample_link();
+        let honest_payload = GrantLink::signing_payload(
+            &link.offer_id,
+            &link.ephemeral_public_key_hex,
+            link.expires_at,
+            link.relay_hint.as_deref(),
+            &link.issuer_persona_id,
+            &link.recipient_pubkey_hex,
+        );
+
+        // Attacker rewrites ek in the rendered URL.
+        let url = link.to_url();
+        let tampered = url.replace(
+            &format!("ek={}", link.ephemeral_public_key_hex),
+            "ek=attackerpubkey0011",
+        );
+        assert_ne!(url, tampered, "tamper substitution must apply");
+        let parsed_tampered = GrantLink::parse(&tampered).unwrap();
+        assert_eq!(parsed_tampered.ephemeral_public_key_hex, "attackerpubkey0011");
+
+        let attacker_payload = GrantLink::signing_payload(
+            &parsed_tampered.offer_id,
+            &parsed_tampered.ephemeral_public_key_hex,
+            parsed_tampered.expires_at,
+            parsed_tampered.relay_hint.as_deref(),
+            &parsed_tampered.issuer_persona_id,
+            &parsed_tampered.recipient_pubkey_hex,
+        );
+        assert_ne!(
+            honest_payload, attacker_payload,
+            "ephemeral key rewrite must change the signing payload so \
+             signature verification fails (security check)",
+        );
+    }
+
+    #[test]
+    fn issuer_persona_id_rewrite_changes_signing_payload() {
+        // security check: the issuer persona id is bound into the signed bytes.
+        // An attacker who rewrites `issuer` on the wire causes the verifier to
+        // recompute a different payload — signature check rejects the link.
+        let link = sample_link();
+        let honest_payload = GrantLink::signing_payload(
+            &link.offer_id,
+            &link.ephemeral_public_key_hex,
+            link.expires_at,
+            link.relay_hint.as_deref(),
+            &link.issuer_persona_id,
+            &link.recipient_pubkey_hex,
+        );
+
+        // Attacker rewrites the issuer param in the rendered URL.
+        let url = link.to_url();
+        let tampered = url.replace(
+            &format!("issuer={}", link.issuer_persona_id),
+            "issuer=persona-attacker",
+        );
+        assert_ne!(url, tampered, "tamper substitution must apply");
+        let parsed_tampered = GrantLink::parse(&tampered).unwrap();
+        assert_eq!(parsed_tampered.issuer_persona_id, "persona-attacker");
+
+        let attacker_payload = GrantLink::signing_payload(
+            &parsed_tampered.offer_id,
+            &parsed_tampered.ephemeral_public_key_hex,
+            parsed_tampered.expires_at,
+            parsed_tampered.relay_hint.as_deref(),
+            &parsed_tampered.issuer_persona_id,
+            &parsed_tampered.recipient_pubkey_hex,
+        );
+        assert_ne!(
+            honest_payload, attacker_payload,
+            "issuer persona id rewrite must change the signing payload so \
+             signature verification fails (security check)",
+        );
     }
 }

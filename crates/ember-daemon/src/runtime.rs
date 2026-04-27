@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Mutex;
 
 use thiserror::Error;
 use tokio::signal;
@@ -15,7 +16,7 @@ use crate::policy::{PolicyEngine, PolicyError};
 use crate::rate_limit::RateLimiter;
 use crate::socket::{SocketError, SocketListener};
 use crate::store::DaemonStore;
-use crate::vault::{Vault, log_vault_identity};
+use crate::vault::{AutoUnsealOutcome, Vault, log_vault_identity, try_auto_unseal_from_keyring};
 
 #[derive(Debug, Error)]
 pub enum DaemonError {
@@ -37,6 +38,22 @@ pub enum DaemonError {
     Signal(std::io::Error),
 }
 
+/// Internal status of the vault auto-unseal step at daemon startup. Used to
+/// label the audit event so operators can tell apart "keyring already had a
+/// passphrase" from "first-run provisioning" from "fallback after error".
+#[derive(Debug, Clone, Copy)]
+enum VaultUnsealStatus {
+    /// Keyring lookup succeeded — vault unsealed from stored passphrase.
+    FromKeyring,
+    /// No keyring entry yet — fell through to `Vault::open_from_config`,
+    /// which auto-provisions a fresh passphrase. Expected on a brand-new
+    /// install where the daemon comes up before `ember init`.
+    Provisioned,
+    /// Auto-unseal helper returned an error; fell back to `open_from_config`
+    /// to keep the daemon running. Operator should investigate keyring state.
+    Fallback,
+}
+
 /// The outcome of a dashboard TCP bind attempt. Sent to `run()`'s `start_notify`
 /// callback after the bind (or timeout) so the CLI can print the correct banner line.
 #[derive(Debug, Clone)]
@@ -51,6 +68,32 @@ pub enum DashboardBind {
     Timeout,
 }
 
+/// implementation-note-10: outcome of the git-echo credential-injection proxy bind.
+/// Mirrors `DashboardBind` semantics. Sent to `run()`'s `start_notify`
+/// callback so the CLI can print `EMBER_PROXY_URL=…` for qember.sh +
+/// ember-git.sh consumers.
+#[derive(Debug, Clone)]
+pub enum GitProxyBind {
+    /// Proxy bound successfully. Contains the address it is listening on.
+    Bound(SocketAddr),
+    /// Proxy failed to bind. Contains the attempted address and the OS error message.
+    Failed { addr: SocketAddr, error: String },
+    /// No proxy configured (`git_proxy_addr` is `None` in `DaemonConfig`).
+    Disabled,
+    /// The bind task did not respond within the startup timeout.
+    Timeout,
+}
+
+/// Aggregate bind report passed to `run()`'s `start_notify` callback. Carries
+/// every listener that may have raced to bind during startup so the CLI can
+/// render a consolidated banner. New listeners get a new field here rather
+/// than a parallel callback. implementation-note-10.
+#[derive(Debug, Clone)]
+pub struct StartupBinds {
+    pub dashboard: DashboardBind,
+    pub git_proxy: GitProxyBind,
+}
+
 /// The daemon runtime — owns config, PID file, and socket listener.
 pub struct DaemonRuntime {
     config: DaemonConfig,
@@ -58,47 +101,144 @@ pub struct DaemonRuntime {
     /// Path the config was loaded from — used for the vault identity warning in `run()`.
     /// `None` when config came from defaults (no file on disk).
     config_path: Option<std::path::PathBuf>,
+    /// implementation-note-11: actual address the dashboard
+    /// listener bound to (`Some(addr)`) or absent when the dashboard is
+    /// disabled / failed to bind / timed out (`None`). Populated from inside
+    /// `run()` after the bind result arrives. `Mutex` (not `RefCell`)
+    /// because `DaemonRuntime` is held across await points in `run()` and
+    /// the test harness reads it from a different thread than the one
+    /// driving the daemon.
+    pub dashboard_actual_addr: Mutex<Option<SocketAddr>>,
 }
 
 impl DaemonRuntime {
     pub fn new(config: DaemonConfig) -> Self {
         let pid_file = PidFile::new(config.pid_file.clone());
-        Self { config, pid_file, config_path: None }
+        Self {
+            config,
+            pid_file,
+            config_path: None,
+            dashboard_actual_addr: Mutex::new(None),
+        }
     }
 
     /// Like `new`, but records the path the config was loaded from.
     /// Used to emit the production-keyring-with-custom-config warning at startup.
     pub fn new_with_config_path(config: DaemonConfig, config_path: std::path::PathBuf) -> Self {
         let pid_file = PidFile::new(config.pid_file.clone());
-        Self { config, pid_file, config_path: Some(config_path) }
+        Self {
+            config,
+            pid_file,
+            config_path: Some(config_path),
+            dashboard_actual_addr: Mutex::new(None),
+        }
     }
 
     /// Start the daemon: write PID, open store, bind socket, run until shutdown signal.
     ///
-    /// `start_notify` is called exactly once, as soon as the dashboard bind result is
-    /// known (or the 2-second startup timeout expires), with the `DashboardBind` outcome.
-    /// Pass `None` to skip the notification (e.g., in background mode or tests).
-    pub async fn run(&self, start_notify: Option<Box<dyn FnOnce(DashboardBind)>>) -> Result<(), DaemonError> {
+    /// `start_notify` is called exactly once, as soon as every startup listener's
+    /// bind result is known (or the 2-second startup timeout expires), with a
+    /// `StartupBinds` aggregate. Pass `None` to skip the notification (e.g., in
+    /// background mode or tests).
+    pub async fn run(&self, start_notify: Option<Box<dyn FnOnce(StartupBinds)>>) -> Result<(), DaemonError> {
         self.config.ensure_dirs()?;
         self.pid_file.write()?;
 
         let socket_path = self.config.socket_dir.join("daemon.sock");
         info!(pid = std::process::id(), socket = %socket_path.display(), "ember daemon starting");
+        // CLI-VERSION-FLAG: log the binary's compile-time version + git SHA +
+        // build timestamp at INFO so a stale binary running against a newer
+        // codebase (the implementation-note-4 root cause) is
+        // identifiable in seconds via `tail daemon.log`. Also surfaces the
+        // `(no-git)` fallback if the build script ran without a working repo.
+        info!(
+            version = env!("CARGO_PKG_VERSION"),
+            git_sha = env!("EMBERLINK_GIT_SHA"),
+            build_timestamp = env!("EMBERLINK_BUILD_TIMESTAMP"),
+            "ember daemon binary version"
+        );
+
+        // security check: load the per-op user-presence config from
+        // [presence] in config.toml into the process-global gate. Done
+        // BEFORE the vault unlock so the very first `mark_unlocked` call
+        // applies the right idle-timeout window.
+        {
+            use std::time::Duration;
+            let cfg = crate::presence::PresenceConfig {
+                idle_timeout: self
+                    .config
+                    .presence
+                    .idle_timeout_secs
+                    .map(Duration::from_secs)
+                    .unwrap_or(crate::presence::DEFAULT_IDLE_TIMEOUT),
+                quiet_hours_start: self.config.presence.quiet_hours_start,
+                quiet_hours_end: self.config.presence.quiet_hours_end,
+            };
+            crate::presence::configure(cfg);
+        }
 
         // Open the store and vault. DaemonStore holds a rusqlite Connection which
         // is !Send + !Sync, so we wrap in Rc and run everything on a LocalSet.
         let db_path = self.config.data_dir.join("daemon.db");
         let store = Rc::new(DaemonStore::open(&db_path)?);
-        let vault = Rc::new(
-            Vault::open_from_config(&self.config)
-                .map_err(|e| DaemonError::Vault(e.to_string()))?,
-        );
+
+        // implementation-note-20: auto-unseal the vault from the system keyring. The
+        // helper's contract: it succeeds only if a keyring entry already
+        // exists (or `EMBER_VAULT_PASSPHRASE` is set) — never auto-provisions
+        // on daemon start so a wiped keyring can't silently mint a fresh
+        // vault key. Falls back to `Vault::open_from_config` which DOES
+        // auto-provision; that path stays for first-run ergonomics
+        // (a daemon started before `ember init` will still come up).
+        //
+        // Audit event for the success path is emitted below once the store
+        // has the vault attached, so `audit show` reflects what happened.
+        let (vault, vault_status) = match try_auto_unseal_from_keyring(&self.config) {
+            AutoUnsealOutcome::Unsealed(v) => (Rc::new(v), VaultUnsealStatus::FromKeyring),
+            AutoUnsealOutcome::NoKeyringEntry => {
+                tracing::info!(
+                    "vault: no keyring entry yet — falling back to open_from_config (will provision on first call)"
+                );
+                let v = Vault::open_from_config(&self.config)
+                    .map_err(|e| DaemonError::Vault(e.to_string()))?;
+                (Rc::new(v), VaultUnsealStatus::Provisioned)
+            }
+            AutoUnsealOutcome::Error(e) => {
+                // Non-fatal: log and try the regular open path so the daemon
+                // still starts. The operator can fix keyring state without a
+                // daemon outage.
+                tracing::warn!(error = %e, "vault: auto-unseal from keyring failed; falling back");
+                let v = Vault::open_from_config(&self.config)
+                    .map_err(|e| DaemonError::Vault(e.to_string()))?;
+                (Rc::new(v), VaultUnsealStatus::Fallback)
+            }
+        };
         log_vault_identity(&self.config, self.config_path.as_deref());
 
         // F-05: attach the vault so persona-secret writes can encrypt at
         // rest. Fresh DBs under the V0 schema have no plaintext column;
         // every persona row is vault-sealed from inception.
         store.set_vault(Rc::clone(&vault));
+
+        // implementation-note-20: emit an audit event for the auto-unseal so operators
+        // running `audit show` see exactly when (and how) the vault came
+        // online. Failures here are non-fatal — the audit log is for
+        // observability, not correctness.
+        let outcome_str = match vault_status {
+            VaultUnsealStatus::FromKeyring => "auto_unseal_from_keyring",
+            VaultUnsealStatus::Provisioned => "provisioned_on_first_run",
+            VaultUnsealStatus::Fallback => "auto_unseal_failed_fallback_to_open",
+        };
+        if let Err(e) = store.log_event(
+            None,
+            "vault.auto_unseal_from_keyring",
+            None,
+            outcome_str,
+            None,
+        ) {
+            tracing::warn!(error = %e, "vault: failed to log auto-unseal audit event");
+        } else {
+            tracing::info!(outcome = outcome_str, "vault: attached to store");
+        }
 
         // Initialise the daemon's long-lived Ed25519 identity key used to
         // sign Grant Receipts (Stream D, design §Evidence). First-run
@@ -115,6 +255,33 @@ impl DaemonRuntime {
                     "daemon identity key unavailable — receipts will not be emitted"
                 );
             }
+        }
+
+        // implementation-note-9 (design Phase 2): install the credential
+        // broker registry. Today the only registered provider is the
+        // `MockBroker` (so `ember broker {issue,revoke,list}` round-trips
+        // a deterministic canary credential end-to-end). The Anthropic
+        // and Cloudflare implementations register themselves here once
+        // their downstream tasks land. Calling `install_registry`
+        // multiple times is a no-op after the first call (`OnceCell`).
+        {
+            use core_broker::{BrokerProvider, MockBroker};
+            let mut registry = crate::broker_handler::BrokerRegistry::new();
+            // Register one MockBroker per supported provider so the
+            // daemon answers `broker_issue` for every well-known
+            // provider until real impls land.
+            for provider in [
+                BrokerProvider::Cloudflare,
+                BrokerProvider::Anthropic,
+                BrokerProvider::Github,
+                BrokerProvider::AwsSts,
+                BrokerProvider::Gcp,
+                BrokerProvider::Tailscale,
+            ] {
+                registry.register(Box::new(MockBroker::new(provider)));
+            }
+            crate::broker_handler::install_registry(registry);
+            info!("broker registry installed (mock providers; real impls land per BROKER-* tasks)");
         }
 
         // NOTIF-2: sweep approval_requests that were left pending from a prior
@@ -143,7 +310,7 @@ impl DaemonRuntime {
             socket_path,
             shutdown_rx,
             store.clone(),
-            vault,
+            Rc::clone(&vault),
             Rc::clone(&policy),
             Rc::clone(&rate_limiter),
         );
@@ -181,6 +348,26 @@ impl DaemonRuntime {
             }
         });
 
+        // implementation-note-7 — background sweep marks pending
+        // approvals older than `stale_approval_threshold_secs` as `timed_out`.
+        // Runs every 60 seconds. Complements the startup sweep (line ~261) which
+        // only catches requests left pending from prior sessions. This sweep
+        // handles requests that arrive and time out within a running session.
+        // Auto-swept rows fire zero desktop notifications (operator is not present).
+        let stale_store = Rc::clone(&store);
+        let stale_threshold = self.config.stale_approval_threshold_secs;
+        local.spawn_local(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                match stale_store.expire_stale_pending_approvals(stale_threshold) {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(count = n, threshold_secs = stale_threshold, "background: auto-expired stale pending approvals"),
+                    Err(e) => tracing::warn!(error = %e, "background stale-approval sweep failed"),
+                }
+            }
+        });
+
         // Spawn the dashboard HTTP listener if configured. The bind result is captured via
         // a oneshot channel and driven to completion inside `local.run_until(bind_rx)` below,
         // before the main accept loop starts. This ensures the LocalSet is polled so the
@@ -206,37 +393,172 @@ impl DaemonRuntime {
                 None
             };
 
-        // Drive the LocalSet until the dashboard bind result arrives (or times out).
-        // This polls spawned tasks so run_dashboard actually executes its TcpListener::bind.
-        let dashboard_bind: DashboardBind = if let Some((attempted_addr, bind_rx)) = dashboard_bind_info {
-            let result = local
-                .run_until(tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    bind_rx,
-                ))
-                .await;
-            match result {
-                Ok(Ok(Ok(addr))) => DashboardBind::Bound(addr),
-                Ok(Ok(Err(e))) => DashboardBind::Failed {
-                    addr: attempted_addr,
-                    error: e.to_string(),
-                },
-                Ok(Err(_)) => {
-                    // Sender dropped without sending — should not happen.
-                    tracing::warn!("dashboard bind channel closed before result was sent");
-                    DashboardBind::Timeout
-                }
-                Err(_) => {
-                    tracing::warn!("dashboard bind timed out after 2s");
-                    DashboardBind::Timeout
-                }
+        // implementation-note-10: spawn the git-echo credential-injection proxy if
+        // configured. Bind result is captured via a oneshot channel and
+        // driven below alongside the dashboard's. Each proxy task gets its
+        // own DaemonStore (rusqlite Connection is !Send) and a clone of the
+        // vault key — both reference the same on-disk DB and the same
+        // master key the main daemon uses for grant resolution.
+        let git_proxy_bind_info: Option<(SocketAddr, oneshot::Receiver<Result<SocketAddr, std::io::Error>>)> =
+            if let Some(proxy_addr) = self.config.git_proxy_addr {
+                let proxy_db_path = self.config.data_dir.join("daemon.db");
+                let proxy_shutdown = shutdown_tx.subscribe();
+                let (bind_tx, bind_rx) = oneshot::channel::<Result<SocketAddr, std::io::Error>>();
+                let proxy_vault: Vault = (*vault).clone();
+                // implementation-note-10 marker: spawn_local run_git_echo_proxy via this LocalSet.
+                local.spawn_local(async move {
+                    let store = match crate::store::DaemonStore::open(&proxy_db_path) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "git proxy: failed to open store; proxy disabled");
+                            // Best-effort: deliver a synthesized I/O error to
+                            // the bind channel so the CLI banner can show
+                            // "unavailable" instead of timing out.
+                            let _ = bind_tx.send(Err(std::io::Error::other(
+                                format!("git proxy store open: {e}"),
+                            )));
+                            return;
+                        }
+                    };
+                    // ProxyState wraps a rusqlite Connection which is !Send + !Sync;
+                    // the Arc is used only within this LocalSet (single-threaded runtime),
+                    // mirroring run_proxy / run_git_echo_proxy themselves.
+                    #[allow(clippy::arc_with_non_send_sync)]
+                    let state = std::sync::Arc::new(crate::proxy::ProxyState::new(store, proxy_vault));
+                    let cfg = crate::proxy::GitEchoConfig {
+                        bind_addr: proxy_addr,
+                        upstream_host: "github.com".to_string(),
+                        state,
+                        upstream_scheme: crate::proxy::Scheme::Https,
+                    };
+                    if let Err(e) = crate::proxy::run_git_echo_proxy(
+                        cfg,
+                        proxy_shutdown,
+                        Some(bind_tx),
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %e, "git proxy exited with error");
+                    }
+                });
+                Some((proxy_addr, bind_rx))
+            } else {
+                None
+            };
+
+        // Drive the LocalSet until both startup bind results arrive (or time out).
+        // This polls spawned tasks so run_dashboard / run_git_echo_proxy actually
+        // execute their TcpListener::bind. Both bind futures share a single
+        // 2-second deadline — if either races past the deadline the CLI banner
+        // shows `Timeout` for that listener but the daemon keeps running.
+        let dashboard_attempt = dashboard_bind_info.as_ref().map(|(a, _)| *a);
+        let proxy_attempt = git_proxy_bind_info.as_ref().map(|(a, _)| *a);
+        let dashboard_rx = dashboard_bind_info.map(|(_, rx)| rx);
+        let proxy_rx = git_proxy_bind_info.map(|(_, rx)| rx);
+
+        let (dashboard_outcome, proxy_outcome) = local
+            .run_until(async {
+                let dashboard_fut = async {
+                    match dashboard_rx {
+                        None => None,
+                        Some(rx) => Some(
+                            tokio::time::timeout(std::time::Duration::from_secs(2), rx).await,
+                        ),
+                    }
+                };
+                let proxy_fut = async {
+                    match proxy_rx {
+                        None => None,
+                        Some(rx) => Some(
+                            tokio::time::timeout(std::time::Duration::from_secs(2), rx).await,
+                        ),
+                    }
+                };
+                tokio::join!(dashboard_fut, proxy_fut)
+            })
+            .await;
+
+        let dashboard_bind: DashboardBind = match (dashboard_attempt, dashboard_outcome) {
+            (None, _) => DashboardBind::Disabled,
+            (Some(_), Some(Ok(Ok(Ok(bound))))) => DashboardBind::Bound(bound),
+            (Some(addr), Some(Ok(Ok(Err(e))))) => DashboardBind::Failed {
+                addr,
+                error: e.to_string(),
+            },
+            (Some(_), Some(Ok(Err(_)))) => {
+                tracing::warn!("dashboard bind channel closed before result was sent");
+                DashboardBind::Timeout
             }
-        } else {
-            DashboardBind::Disabled
+            (Some(_), Some(Err(_))) => {
+                tracing::warn!("dashboard bind timed out after 2s");
+                DashboardBind::Timeout
+            }
+            (Some(_), None) => DashboardBind::Disabled,
         };
 
+        let git_proxy_bind: GitProxyBind = match (proxy_attempt, proxy_outcome) {
+            (None, _) => GitProxyBind::Disabled,
+            (Some(_), Some(Ok(Ok(Ok(bound))))) => {
+                // Side-effects only on the success path: log + publish to env
+                // + drop a sidecar file under data_dir so background-mode
+                // launchers (qember.sh demo up) can pick the URL up after
+                // forking the daemon and exiting the parent.
+                let proxy_url = format!("http://{}", bound);
+                info!(proxy_url = %proxy_url, "git proxy listening");
+                // EMBER_PROXY_URL is set so sandbox.rs (which reads from env)
+                // automatically forwards it into spawned containers.
+                // SAFETY: the daemon runtime is single-threaded at this point
+                // (tokio current-thread + LocalSet; we have not entered the
+                // accept loop), so a race-free env mutation is acceptable.
+                unsafe {
+                    std::env::set_var("EMBER_PROXY_URL", &proxy_url);
+                }
+                let url_path = self.config.data_dir.join("proxy.url");
+                if let Err(e) = std::fs::write(&url_path, &proxy_url) {
+                    tracing::warn!(
+                        path = %url_path.display(),
+                        error = %e,
+                        "git proxy: failed to write proxy.url sidecar"
+                    );
+                }
+                GitProxyBind::Bound(bound)
+            }
+            (Some(addr), Some(Ok(Ok(Err(e))))) => GitProxyBind::Failed {
+                addr,
+                error: e.to_string(),
+            },
+            (Some(_), Some(Ok(Err(_)))) => {
+                tracing::warn!("git proxy bind channel closed before result was sent");
+                GitProxyBind::Timeout
+            }
+            (Some(_), Some(Err(_))) => {
+                tracing::warn!("git proxy bind timed out after 2s");
+                GitProxyBind::Timeout
+            }
+            (Some(_), None) => GitProxyBind::Disabled,
+        };
+
+        // implementation-note-11: persist the resolved bind
+        // address on the runtime so out-of-band readers (tests, future
+        // introspection helpers) see the same truth as `/api/status`. Only
+        // the `Bound` variant maps to `Some`; `Failed`/`Disabled`/`Timeout`
+        // all map to `None` so callers can distinguish "bound" from
+        // "configured" without re-deriving from the bind report.
+        let actual_dashboard_addr = match &dashboard_bind {
+            DashboardBind::Bound(addr) => Some(*addr),
+            DashboardBind::Failed { .. }
+            | DashboardBind::Disabled
+            | DashboardBind::Timeout => None,
+        };
+        if let Ok(mut slot) = self.dashboard_actual_addr.lock() {
+            *slot = actual_dashboard_addr;
+        }
+
         if let Some(notify) = start_notify {
-            notify(dashboard_bind);
+            notify(StartupBinds {
+                dashboard: dashboard_bind,
+                git_proxy: git_proxy_bind,
+            });
         }
 
         // Spawn a SIGHUP handler that reloads policy on signal.

@@ -2,13 +2,21 @@
 // Each block is verified with the preceding block's `pubkey_next`, preserving
 // the chain attenuation invariant without another token encoding.
 
+use crate::DOMAIN_GRANT_CHAIN;
 use core_types::{Block, CanonicalEncode, SignedBlock};
 use ed25519_dalek::{
-    Signature as DalekSignature, Signer as DalekSigner, SigningKey, Verifier as DalekVerifier,
-    VerifyingKey,
+    Signature as DalekSignature, Signer as DalekSigner, SigningKey, VerifyingKey,
 };
 use getrandom::fill as os_fill;
 use zeroize::{Zeroize, ZeroizeOnDrop};
+
+fn chain_msg(payload: &[u8]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(DOMAIN_GRANT_CHAIN.len() + 2 + payload.len());
+    msg.extend_from_slice(DOMAIN_GRANT_CHAIN);
+    msg.extend_from_slice(b"||");
+    msg.extend_from_slice(payload);
+    msg
+}
 
 /// Errors from the grant-chain signing / verification layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,7 +220,7 @@ pub fn sign_block_zero(
     let root_signing = root_key.signing_key()?;
     let pubkey_next = PubkeyNextKeyPair::generate();
     let payload = block.canonical_encode();
-    let signature = root_signing.sign(&payload);
+    let signature = root_signing.sign(&chain_msg(&payload));
     Ok(SignedBlockOutput {
         signed: SignedBlock {
             block: block.clone(),
@@ -236,7 +244,7 @@ pub fn sign_appended_block(
     let prev_signing = prev_pubkey_next.signing_key()?;
     let pubkey_next = PubkeyNextKeyPair::generate();
     let payload = block.canonical_encode();
-    let signature = prev_signing.sign(&payload);
+    let signature = prev_signing.sign(&chain_msg(&payload));
     Ok(SignedBlockOutput {
         signed: SignedBlock {
             block: block.clone(),
@@ -326,7 +334,7 @@ fn verify_one(
 
     let payload = sb.block.canonical_encode();
     signer_pubkey
-        .verify(&payload, &signature)
+        .verify_strict(&chain_msg(&payload), &signature)
         .map_err(|_| ChainError::SignatureMismatch { block_index })
 }
 
@@ -660,6 +668,39 @@ mod tests {
         assert!(
             root.public_hex.is_empty(),
             "zeroize must empty the public_hex string"
+        );
+    }
+
+    /// security check regression: `verify_chain` uses `verify_strict` in `verify_one`,
+    /// which rejects any block whose signature R component is a torsion point.
+    ///
+    /// Without `verify_strict`, an attacker could substitute a valid block
+    /// signature with a malleable variant (same S, R replaced by R + torsion
+    /// point) and the chain would accept both — breaking the uniqueness
+    /// invariant required for secure grant revocation and audit log integrity.
+    #[test]
+    fn verify_chain_rejects_torsion_r_in_signature() {
+        let (root, root_pubkey_bytes) = fresh_root_keypair();
+        let block = sample_block("Stmt0", 10);
+        let mut out = sign_block_zero(&root, &block).unwrap();
+
+        // Replace the signature R component with a known Ed25519 torsion point.
+        // Source: ed25519-dalek EIGHT_TORSION[1] — order-8 point, RFC 8032 §5.1.
+        let torsion_r_bytes: [u8; 32] = [
+            0xc7, 0x17, 0x6a, 0x70, 0x3d, 0x4d, 0xd8, 0x4f,
+            0xba, 0x3c, 0x0b, 0x76, 0x0d, 0x10, 0x67, 0x0f,
+            0x2a, 0x20, 0x53, 0xfa, 0x2c, 0x39, 0xcc, 0xc6,
+            0x4e, 0xc7, 0xfd, 0x77, 0x92, 0xac, 0x03, 0x7a,
+        ];
+        let mut sig_bytes = hex::decode(&out.signed.signature).unwrap();
+        sig_bytes[..32].copy_from_slice(&torsion_r_bytes);
+        out.signed.signature = hex::encode(&sig_bytes);
+
+        let err = verify_chain(&[out.signed], &root_pubkey_bytes).unwrap_err();
+        assert_eq!(
+            err,
+            ChainError::RootKeyMismatch,
+            "torsion-R signature must be rejected at block 0"
         );
     }
 

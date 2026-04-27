@@ -1,5 +1,6 @@
 use uuid::Uuid;
 
+use crate::proxy::host_matches_domain;
 use crate::store::{DaemonStore, StoreError};
 
 /// Per-Statement standing grant match (design). Returned when an active
@@ -21,6 +22,43 @@ pub struct StandingGrantInfo {
     pub action_pattern: String,
     pub scope: String,
     pub expires_at: Option<String>,
+}
+
+/// Check `resource` against a grant's `allowed_targets` field.
+///
+/// - `None`  → no restriction; allowed.
+/// - `Some("")` (empty after trimming all entries) → deny-all; not allowed.
+/// - `Some("a.com,b.com")` → `resource` must match at least one entry.
+///
+/// Entry matching mirrors the proxy's FINDING-1-fixed logic: an entry
+/// without a `*.` prefix requires an exact host match; `*.domain` matches
+/// `domain` itself or any subdomain. If `resource` looks like a URL, the
+/// host component is extracted first; otherwise the raw string is compared.
+fn resource_matches_allowed_targets(allowed_targets: Option<&str>, resource: &str) -> bool {
+    let Some(targets) = allowed_targets else {
+        return true; // no restriction
+    };
+    let entries: Vec<&str> = targets.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    if entries.is_empty() {
+        return false; // empty list is deny-all
+    }
+    // Try to extract the host from a URL; fall back to the raw resource string.
+    let candidate: String = if resource.contains("://") {
+        resource
+            .parse::<hyper::Uri>()
+            .ok()
+            .and_then(|u| u.host().map(|h| h.to_owned()))
+            .unwrap_or_else(|| resource.to_owned())
+    } else {
+        resource.to_owned()
+    };
+    entries.iter().any(|pattern| {
+        if let Some(domain) = pattern.strip_prefix("*.") {
+            host_matches_domain(&candidate, domain)
+        } else {
+            candidate.as_str() == *pattern
+        }
+    })
 }
 
 impl DaemonStore {
@@ -102,6 +140,11 @@ impl DaemonStore {
         let grants = self.list_active_grants()?;
         for g in grants {
             if g.persona_id != persona_id {
+                continue;
+            }
+            // security check: enforce allowed_targets at the standing-grant level.
+            // Empty list is deny-all, not wildcard.
+            if !resource_matches_allowed_targets(g.allowed_targets.as_deref(), resource) {
                 continue;
             }
             let ag = match self.get_access_grant(&g.id) {
@@ -281,5 +324,126 @@ mod tests {
             .match_standing_statement("other-persona", "github:read", "emberdotlink/widgets")
             .unwrap();
         assert!(miss.is_none(), "must not match a different persona");
+    }
+
+    // --- security check: allowed_targets enforcement tests -------------------------
+
+    #[test]
+    fn resource_matches_allowed_targets_none_is_unrestricted() {
+        // None = no restriction; any resource is allowed.
+        assert!(resource_matches_allowed_targets(None, "any.host.example.com"));
+        assert!(resource_matches_allowed_targets(None, ""));
+    }
+
+    #[test]
+    fn resource_matches_allowed_targets_empty_is_deny_all() {
+        // Empty string → deny-all, not wildcard.
+        assert!(!resource_matches_allowed_targets(Some(""), "api.github.com"));
+        assert!(!resource_matches_allowed_targets(Some("  "), "api.github.com"));
+        assert!(!resource_matches_allowed_targets(Some(" , , "), "api.github.com"));
+    }
+
+    #[test]
+    fn resource_matches_allowed_targets_exact_match() {
+        assert!(resource_matches_allowed_targets(Some("api.github.com"), "api.github.com"));
+        assert!(!resource_matches_allowed_targets(Some("api.github.com"), "evil.example.com"));
+    }
+
+    #[test]
+    fn resource_matches_allowed_targets_wildcard_subdomain() {
+        assert!(resource_matches_allowed_targets(Some("*.github.com"), "api.github.com"));
+        assert!(resource_matches_allowed_targets(Some("*.github.com"), "uploads.api.github.com"));
+        assert!(resource_matches_allowed_targets(Some("*.github.com"), "github.com"));
+        assert!(!resource_matches_allowed_targets(Some("*.github.com"), "evil.example.com"));
+    }
+
+    #[test]
+    fn resource_matches_allowed_targets_url_host_extraction() {
+        // When the resource is a full URL, extract the host for matching.
+        assert!(resource_matches_allowed_targets(
+            Some("api.github.com"),
+            "https://api.github.com/repos/foo/bar"
+        ));
+        assert!(!resource_matches_allowed_targets(
+            Some("api.github.com"),
+            "https://evil.example.com/steal"
+        ));
+    }
+
+    #[test]
+    fn resource_matches_allowed_targets_multi_entry() {
+        let targets = "api.github.com,anthropic.com";
+        assert!(resource_matches_allowed_targets(Some(targets), "api.github.com"));
+        assert!(resource_matches_allowed_targets(Some(targets), "anthropic.com"));
+        assert!(!resource_matches_allowed_targets(Some(targets), "evil.example.com"));
+    }
+
+    #[test]
+    fn match_standing_statement_empty_allowed_targets_is_deny_all() {
+        let store = setup();
+        let pid = persona_id(&store);
+        let grant = store
+            .create_grant(&pid, "gh-token", "github:read:emberdotlink/widgets", None)
+            .unwrap();
+
+        // Set allowed_targets to empty string — must be deny-all.
+        store
+            .conn()
+            .execute(
+                "UPDATE grants SET allowed_targets = '' WHERE id = ?1",
+                rusqlite::params![grant.id],
+            )
+            .unwrap();
+
+        let result = store
+            .match_standing_statement(&pid, "github:read", "emberdotlink/widgets")
+            .unwrap();
+        assert!(result.is_none(), "empty allowed_targets must be deny-all");
+    }
+
+    #[test]
+    fn match_standing_statement_non_matching_allowed_targets_denied() {
+        let store = setup();
+        let pid = persona_id(&store);
+        let grant = store
+            .create_grant(&pid, "gh-token", "github:read:emberdotlink/widgets", None)
+            .unwrap();
+
+        // Restrict to a target that doesn't match the resource.
+        store
+            .conn()
+            .execute(
+                "UPDATE grants SET allowed_targets = 'api.other.com' WHERE id = ?1",
+                rusqlite::params![grant.id],
+            )
+            .unwrap();
+
+        let result = store
+            .match_standing_statement(&pid, "github:read", "emberdotlink/widgets")
+            .unwrap();
+        assert!(result.is_none(), "non-matching allowed_targets must deny");
+    }
+
+    #[test]
+    fn match_standing_statement_matching_allowed_targets_permitted() {
+        let store = setup();
+        let pid = persona_id(&store);
+        let grant = store
+            .create_grant(&pid, "gh-token", "github:read:emberdotlink/widgets", None)
+            .unwrap();
+
+        // Restrict to the resource used in the call — should still match.
+        store
+            .conn()
+            .execute(
+                "UPDATE grants SET allowed_targets = 'emberdotlink/widgets' WHERE id = ?1",
+                rusqlite::params![grant.id],
+            )
+            .unwrap();
+
+        let result = store
+            .match_standing_statement(&pid, "github:read", "emberdotlink/widgets")
+            .unwrap();
+        assert!(result.is_some(), "matching allowed_targets must permit");
     }
 }

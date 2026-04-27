@@ -1,3 +1,25 @@
+//! Vault MEK + sealed-credentials store.
+//!
+//! ## security check (Tier 1): start-of-session unlock
+//!
+//! `Vault::open_from_config` reads the MEK passphrase via the SE-backed
+//! `vault_macos` shim on macOS — first read prompts for Touch ID. See
+//! `vault_macos.rs` for the shim contract.
+//!
+//! ## security check (Tier 2): per-op user presence + idle re-lock
+//!
+//! After Tier 1 unlocks the vault, the daemon stays "session-permissive"
+//! for read-class operations (vault_get, vault_list, status) but
+//! per-operation `require_user_presence` gates fire on high-risk write
+//! ops (vault_add, vault_remove, grant create, persona key export). The
+//! gate state machine lives in `crate::presence` (not here, because the
+//! gate is dispatch-level, not vault-level). The daemon supervisor calls
+//! `presence::mark_unlocked()` after a successful Tier 1 unlock so
+//! subsequent high-risk ops don't double-prompt within the idle window.
+//!
+//! See `project design notes` (cross-ref) and the
+//! security check task brief for the full layer-cake design.
+
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
 use rusqlite::{OptionalExtension, params};
 use tracing::{info, warn};
@@ -52,6 +74,7 @@ pub struct CredentialInfo {
     pub metadata: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct Vault {
     vault_key: [u8; 32],
 }
@@ -110,6 +133,11 @@ impl Vault {
         }
 
         let passphrase = resolve_passphrase(&service, &account)?;
+        // security check: a successful unlock (Tier 1, possibly via the
+        // macOS user-presence prompt) flips the in-process session state
+        // to Unlocked so per-op `require_user_presence` gates don't
+        // double-prompt within the idle window.
+        crate::presence::mark_unlocked();
         Ok(Vault::from_passphrase(&passphrase, &salt))
     }
 
@@ -237,6 +265,146 @@ impl Vault {
             return Err(VaultError::NotFound);
         }
         Ok(())
+    }
+}
+
+/// Outcome of `try_auto_unseal_from_keyring` — the daemon/CLI startup helper
+/// that opens the vault from a keyring-stored passphrase. Designed as an enum
+/// (rather than `Result<Option<Vault>, _>`) so callers can branch on the
+/// "no keyring entry yet" case without flattening it into the error path.
+pub enum AutoUnsealOutcome {
+    /// Keyring lookup succeeded and the vault is unsealed. Attach to the store.
+    Unsealed(Vault),
+    /// Keyring had no entry for the configured service/account. Treat as
+    /// non-fatal: the daemon should still start so the operator can run
+    /// `ember init` (or equivalent) to provision one.
+    NoKeyringEntry,
+    /// Keyring lookup itself failed (platform error, checkpoint missing, etc.).
+    /// Caller may surface as a startup warning but should keep running.
+    Error(VaultError),
+}
+
+/// Best-effort vault auto-unseal from the system keyring.
+///
+/// This is the documented startup path for both the daemon (`runtime.rs`)
+/// and the in-process CLI subcommands (`bin/ember.rs::open_store`) that
+/// touch personas without going through the socket. Wraps
+/// `Vault::open_from_config` and reshapes its return so a missing keyring
+/// entry is `NoKeyringEntry` rather than an opaque error.
+///
+/// Why a separate helper:
+/// - `Vault::open_from_config` auto-generates a passphrase on first call
+///   when none exists, which is correct for `ember init` but wrong for
+///   "auto-unseal on every daemon start" — we don't want a daemon restart
+///   to silently mint a fresh vault key after the keyring was wiped.
+///   `try_auto_unseal_from_keyring` only succeeds if the keyring already
+///   has an entry (or `EMBER_VAULT_PASSPHRASE` is set, or we're in a test
+///   harness with the mock gate enabled).
+/// - Centralising the auto-unseal contract here means the daemon and the
+///   CLI direct-store paths have one shared trust boundary instead of
+///   each re-implementing keyring lookup.
+///
+/// Always-attempted: there is no relay/hosted/first-party mode flag in
+/// `DaemonConfig` today (implementation-note-20 task instructions explicitly note this).
+/// If one is added later, gate auto-unseal on first-party mode here.
+pub fn try_auto_unseal_from_keyring(config: &DaemonConfig) -> AutoUnsealOutcome {
+    let service = resolve_keyring_service(&config.keyring);
+    let account = resolve_keyring_account(&config.keyring);
+
+    // Production checkpoint — same belt-and-suspenders as `open_from_config`.
+    // Skip in cargo-test binaries (the passphrase branch below is also gated
+    // there, so the real keychain is never touched in tests).
+    if !is_cargo_test_binary() {
+        let home = match dirs_next::home_dir() {
+            Some(h) => h,
+            None => {
+                return AutoUnsealOutcome::Error(VaultError::ProductionSentinelMissing(
+                    "refusing to open vault: home directory not resolvable (no $HOME)"
+                        .to_string(),
+                ));
+            }
+        };
+        if let Err(e) = check_production_sentinel(&service, DEFAULT_KEYRING_SERVICE, &home) {
+            return AutoUnsealOutcome::Error(e);
+        }
+    }
+
+    // Salt resolution can fail on IO. Treat as a hard error — we cannot
+    // derive the vault key without the salt.
+    let salt = match vault_salt(config) {
+        Ok(s) => s,
+        Err(e) => return AutoUnsealOutcome::Error(e),
+    };
+
+    // Resolve the passphrase WITHOUT auto-generating one. Distinguishes
+    // "keyring miss" (NoKeyringEntry) from "platform error" (Error).
+    match resolve_passphrase_no_provision(&service, &account) {
+        Ok(Some(passphrase)) => {
+            // security check: same Tier-1 → Tier-2 hand-off as
+            // `open_from_config` — flip the gate to Unlocked so per-op
+            // `require_user_presence` checks succeed within the idle
+            // window without re-prompting.
+            crate::presence::mark_unlocked();
+            AutoUnsealOutcome::Unsealed(Vault::from_passphrase(&passphrase, &salt))
+        }
+        Ok(None) => AutoUnsealOutcome::NoKeyringEntry,
+        Err(e) => AutoUnsealOutcome::Error(e),
+    }
+}
+
+/// Like `resolve_passphrase` but never provisions a new keyring entry.
+/// Returns `Ok(None)` when the keyring has no entry — the signal callers
+/// use to distinguish "needs init" from "failed".
+///
+/// Test/mock gate is preserved: under `cfg!(test)` / `EMBER_VAULT_MOCK` /
+/// cargo test binary, returns the deterministic test passphrase so the
+/// real keychain is never touched.
+fn resolve_passphrase_no_provision(
+    service: &str,
+    account: &str,
+) -> Result<Option<String>, VaultError> {
+    // 1. Environment variable — capture then immediately zeroize from the
+    // process environment so it cannot be read from /proc/<pid>/environ
+    // by a second party after this point. Done before any background threads
+    // are running (called during daemon startup), so the signal/thread race
+    // in remove_var is acceptable.
+    // Safety: single-threaded startup path; no other threads are reading env.
+    if let Ok(p) = std::env::var("EMBER_VAULT_PASSPHRASE") {
+        unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
+        return Ok(Some(p));
+    }
+
+    // 2. Test gate — same three-axis check as `resolve_passphrase`.
+    if cfg!(test) || std::env::var("EMBER_VAULT_MOCK").is_ok() || is_cargo_test_binary() {
+        // In test mode, only return a passphrase if the test has explicitly
+        // signaled "keyring entry exists" via `EMBER_VAULT_TEST_KEYRING_PRESENT=1`.
+        // Otherwise return None so tests can exercise the NoKeyringEntry path.
+        if std::env::var("EMBER_VAULT_TEST_KEYRING_PRESENT").is_ok() {
+            return Ok(Some(format!("test-passphrase-{service}-{account}")));
+        }
+        return Ok(None);
+    }
+
+    // 3. macOS user-presence gate (security check). When the effective service is the
+    //    production default, route the read through `vault_macos` so the
+    //    Keychain entry's `kSecAttrAccessControl` triggers the LocalAuthentication
+    //    prompt (Touch ID / device passcode). The `keyring` crate cannot do
+    //    this. Dev/QA service names (e.g. `ember-daemon-qa`) skip this branch
+    //    and fall through to the regular `keyring::Entry` path so qember.sh
+    //    demo flows don't fire a biometric prompt.
+    #[cfg(target_os = "macos")]
+    if crate::vault_macos::apply_user_presence(service, DEFAULT_KEYRING_SERVICE) {
+        return crate::vault_macos::get_password_user_presence(service, account)
+            .map_err(VaultError::Keyring);
+    }
+
+    // 4. System keyring lookup — read-only, no provisioning.
+    let entry = keyring::Entry::new(service, account)
+        .map_err(|e| VaultError::Keyring(format!("init: {e}")))?;
+    match entry.get_password() {
+        Ok(p) => Ok(Some(p)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(VaultError::Keyring(format!("read: {e}"))),
     }
 }
 
@@ -394,8 +562,14 @@ pub fn verify_keyring_roundtrip(service: &str, account: &str, expected: &str) ->
 }
 
 fn resolve_passphrase(service: &str, account: &str) -> Result<String, VaultError> {
-    // 1. Environment variable
+    // 1. Environment variable — capture then immediately zeroize from the
+    // process environment so it cannot be read from /proc/<pid>/environ
+    // by a second party after this point. Done before any background threads
+    // are running (called during daemon startup), so the signal/thread race
+    // in remove_var is acceptable.
+    // Safety: single-threaded startup path; no other threads are reading env.
     if let Ok(p) = std::env::var("EMBER_VAULT_PASSPHRASE") {
+        unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
         return Ok(p);
     }
 
@@ -416,14 +590,40 @@ fn resolve_passphrase(service: &str, account: &str) -> Result<String, VaultError
         return Ok(format!("test-passphrase-{service}-{account}"));
     }
 
-    // 2. System keyring
+    // 2. macOS user-presence gate (security check). For the production keychain service
+    //    the vault MEK passphrase entry is wrapped with kSecAttrAccessControl
+    //    requiring user presence (Touch ID / device passcode); the `keyring`
+    //    crate cannot set that attribute. Read first; if absent, generate +
+    //    store via the SE-wrapped writer so the very first daemon start lays
+    //    down a SAC-protected entry. Dev/QA services (e.g. `ember-daemon-qa`)
+    //    fall through to the keyring path below — biometric on every QA
+    //    iteration would break `qember.sh demo up`.
+    #[cfg(target_os = "macos")]
+    if crate::vault_macos::apply_user_presence(service, DEFAULT_KEYRING_SERVICE) {
+        match crate::vault_macos::get_password_user_presence(service, account)
+            .map_err(VaultError::Keyring)?
+        {
+            Some(p) => return Ok(p),
+            None => {
+                let p = generate_passphrase();
+                crate::vault_macos::set_password_user_presence(service, account, &p)
+                    .map_err(VaultError::Keyring)?;
+                info!(
+                    "generated and stored vault passphrase in macOS Keychain with kSecAttrAccessControl=USER_PRESENCE"
+                );
+                return Ok(p);
+            }
+        }
+    }
+
+    // 3. System keyring (non-macOS, or macOS dev/QA service name).
     let entry = keyring::Entry::new(service, account)
         .map_err(|e| VaultError::Keyring(format!("init: {e}")))?;
 
     match entry.get_password() {
         Ok(p) => Ok(p),
         Err(keyring::Error::NoEntry) => {
-            // 3. Generate and store a random passphrase, then verify cross-handle read-back
+            // 4. Generate and store a random passphrase, then verify cross-handle read-back
             let p = generate_passphrase();
             entry
                 .set_password(&p)
@@ -449,6 +649,12 @@ fn vault_salt(config: &DaemonConfig) -> Result<[u8; 16], VaultError> {
         let salt = Vault::generate_salt();
         std::fs::write(&salt_path, salt)
             .map_err(|e| VaultError::Io(format!("salt write: {e}")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&salt_path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| VaultError::Io(format!("salt chmod: {e}")))?;
+        }
         Ok(salt)
     }
 }
@@ -585,6 +791,12 @@ mod tests {
         vault1
             .add(&store, "round-trip-key", b"secret-value", None)
             .unwrap();
+
+        // Re-set the env var: open_from_config removes it after first read
+        // (security check). The second vault must be derived from the same passphrase
+        // to decrypt what vault1 wrote.
+        // SAFETY: test-only, single-threaded, no other threads reading env vars.
+        unsafe { std::env::set_var("EMBER_VAULT_PASSPHRASE", "test-roundtrip-passphrase") };
 
         // Second vault from same config: must decrypt successfully.
         let vault2 = Vault::open_from_config(&config).expect("open vault 2");
@@ -765,5 +977,121 @@ mod tests {
             matches!(result, Err(VaultError::ProductionSentinelMissing(_))),
             "near-miss filenames must not satisfy checkpoint"
         );
+    }
+
+    // --- security check: EMBER_VAULT_PASSPHRASE cleared after first read ---
+
+    #[test]
+    fn env_var_removed_after_open_from_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: test-only, single-threaded, no other threads reading env vars.
+        unsafe { std::env::set_var("EMBER_VAULT_PASSPHRASE", "sec14-test-passphrase") };
+
+        let mut config = DaemonConfig::default();
+        config.data_dir = tmp.path().to_path_buf();
+
+        let _vault = Vault::open_from_config(&config).expect("open vault");
+
+        assert!(
+            std::env::var("EMBER_VAULT_PASSPHRASE").is_err(),
+            "EMBER_VAULT_PASSPHRASE must be absent from the environment after open_from_config"
+        );
+    }
+
+    #[test]
+    fn env_var_removed_after_resolve_passphrase_no_provision() {
+        // SAFETY: test-only, single-threaded, no other threads reading env vars.
+        unsafe { std::env::set_var("EMBER_VAULT_PASSPHRASE", "sec14-no-provision") };
+
+        let result = resolve_passphrase_no_provision("svc", "acct");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Some("sec14-no-provision".to_string()));
+
+        assert!(
+            std::env::var("EMBER_VAULT_PASSPHRASE").is_err(),
+            "EMBER_VAULT_PASSPHRASE must be absent after resolve_passphrase_no_provision"
+        );
+    }
+
+    // --- security check: macOS user-presence gate routing ---
+    //
+    // The shim itself (`vault_macos`) carries unit tests for the
+    // `apply_user_presence` predicate and the SE-safety guard. These tests
+    // assert the routing INSIDE `resolve_passphrase` selects the right
+    // backend per service name, without touching the real Keychain.
+    //
+    // The "first call prompts, subsequent calls cached" property requires a
+    // live Keychain and is exercised by the gated integration test in
+    // `tests/sec7_user_presence.rs` (env-flag opt-in).
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sec7_macos_apply_user_presence_only_for_production_default() {
+        // Production default: gate ON. Anything else: gate OFF (qember demo
+        // flow uses `ember-daemon-qa` and MUST NOT prompt).
+        assert!(crate::vault_macos::apply_user_presence(
+            DEFAULT_KEYRING_SERVICE,
+            DEFAULT_KEYRING_SERVICE
+        ));
+        assert!(!crate::vault_macos::apply_user_presence(
+            "ember-daemon-qa",
+            DEFAULT_KEYRING_SERVICE
+        ));
+        assert!(!crate::vault_macos::apply_user_presence(
+            "ember-daemon-test",
+            DEFAULT_KEYRING_SERVICE
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sec7_qa_service_name_skips_user_presence() {
+        // Pure predicate check — proves the QA service name documented in
+        // qember.sh ("ember-daemon-qa") routes around the SE-backed shim,
+        // so qember demo flows don't fire a biometric prompt every iteration.
+        // Avoids env-var manipulation (which races with parallel tests) by
+        // exercising the routing decision directly.
+        assert!(
+            !crate::vault_macos::apply_user_presence(
+                "ember-daemon-qa",
+                DEFAULT_KEYRING_SERVICE
+            ),
+            "qember.sh QA service must NOT trigger the user-presence gate \
+             (would break demo flows)"
+        );
+    }
+
+    // --- security check: salt file permissions ---
+
+    #[cfg(unix)]
+    #[test]
+    fn salt_file_created_with_0o600_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: test-only, single-threaded.
+        unsafe { std::env::set_var("EMBER_VAULT_PASSPHRASE", "sec17-perms-test") };
+
+        let mut config = DaemonConfig::default();
+        config.data_dir = tmp.path().to_path_buf();
+
+        // vault_salt is called internally by open_from_config; this triggers the
+        // salt-file creation path.
+        let _vault = Vault::open_from_config(&config).expect("open vault for sec17");
+
+        let salt_path = tmp.path().join("vault.salt");
+        let mode = std::fs::metadata(&salt_path)
+            .expect("salt file must exist")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "vault.salt must be 0o600, got {:#o}",
+            mode & 0o777
+        );
+
+        // SAFETY: test-only.
+        unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
     }
 }

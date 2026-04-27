@@ -2,13 +2,14 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
+use ember_daemon::approval::ApprovalOutcome;
 use ember_daemon::dashboard::run_dashboard;
 use ember_daemon::policy::{
     PolicyConfig, PolicyDecision, PolicyEngine, PolicyRule, RiskLevel,
 };
 use ember_daemon::rate_limit::RateLimiter;
 use ember_daemon::socket::SocketListener;
-use ember_daemon::store::DaemonStore;
+use ember_daemon::store::{DaemonStore, StoreError};
 use ember_daemon::vault::Vault;
 use tempfile::TempDir;
 use tokio::sync::watch;
@@ -723,11 +724,11 @@ async fn dashboard_csrf_protects_post_endpoints() {
         &resp_str[..resp_str.len().min(120)]
     );
 
-    // 4. POST with correct header -> passes CSRF, but fails store lookup (400).
+    // 4. POST with correct CSRF header AND matching Origin -> passes both checks,
+    //    but fails store lookup (400, proving both guards allowed the request through).
     let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
     let req = format!(
-        "POST /api/approvals/fake-id/approve HTTP/1.1\r\nHost: localhost\r\nX-Ember-CSRF-Token: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        token
+        "POST /api/approvals/fake-id/approve HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://{addr}\r\nX-Ember-CSRF-Token: {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
     );
     s.write_all(req.as_bytes()).await.unwrap();
     let mut resp = Vec::new();
@@ -735,7 +736,7 @@ async fn dashboard_csrf_protects_post_endpoints() {
     let resp_str = std::str::from_utf8(&resp).unwrap();
     assert!(
         resp_str.starts_with("HTTP/1.1 400"),
-        "expected 400 (store error, CSRF passed), got: {}",
+        "expected 400 (store error, CSRF+origin passed), got: {}",
         &resp_str[..resp_str.len().min(120)]
     );
 
@@ -906,4 +907,300 @@ async fn dashboard_bind_failure_surfaced_via_channel() {
     // Clean up: drop the blocker and signal shutdown (dashboard already exited but be tidy).
     drop(blocker);
     let _ = shutdown_tx.send(true);
+}
+
+// ---------------------------------------------------------------------------
+// implementation-note-20 — auto-unseal vault from keyring on daemon startup.
+//
+// The bug: `qember.sh demo up` finished, then `grant create` failed with
+// "persona '<id>' secret is vault-sealed but no vault is attached" because
+// the in-process call path opened the SQLite store directly and never
+// attached a vault. Fix: a documented `try_auto_unseal_from_keyring` helper
+// that the daemon (`runtime.rs`) and the CLI direct-DB paths
+// (`bin/ember.rs::open_store`) both call.
+//
+// These tests exercise the helper + the runtime audit event end-to-end.
+// They share a single mutex so env-variable manipulation does not race
+// across the parallel test runner — `EMBER_VAULT_PASSPHRASE` and
+// `EMBER_VAULT_TEST_KEYRING_PRESENT` are process-global, so two tests
+// flipping them simultaneously would interfere.
+// ---------------------------------------------------------------------------
+
+/// Serialize all implementation-note-20 tests that mutate process-global env vars
+/// (`EMBER_VAULT_PASSPHRASE`, `EMBER_VAULT_TEST_KEYRING_PRESENT`). Without
+/// this, the parallel cargo test runner can interleave env writes between
+/// tests and cause spurious `Unsealed` / `NoKeyringEntry` flips.
+fn demo_ux_8_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+#[test]
+fn auto_unseal_returns_no_keyring_entry_when_none_configured() {
+    use ember_daemon::config::DaemonConfig;
+    use ember_daemon::vault::{try_auto_unseal_from_keyring, AutoUnsealOutcome};
+
+    let _guard = demo_ux_8_env_lock();
+
+    // Failure-mode acceptance criterion: keyring entry absent → helper returns
+    // NoKeyringEntry, daemon can still start (caller falls back to
+    // provisioning path).
+    // SAFETY: tests holding `_guard` are serialized for env-var access.
+    unsafe {
+        std::env::remove_var("EMBER_VAULT_TEST_KEYRING_PRESENT");
+        std::env::remove_var("EMBER_VAULT_PASSPHRASE");
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let config = DaemonConfig {
+        data_dir: tmp.path().to_path_buf(),
+        ..Default::default()
+    };
+
+    match try_auto_unseal_from_keyring(&config) {
+        AutoUnsealOutcome::NoKeyringEntry => {}
+        AutoUnsealOutcome::Unsealed(_) => {
+            panic!("expected NoKeyringEntry, got Unsealed (test gate misconfigured?)")
+        }
+        AutoUnsealOutcome::Error(e) => {
+            panic!("expected NoKeyringEntry, got Error: {e}")
+        }
+    }
+}
+
+#[test]
+fn auto_unseal_returns_unsealed_when_keyring_entry_present() {
+    use ember_daemon::config::DaemonConfig;
+    use ember_daemon::store::DaemonStore;
+    use ember_daemon::vault::{try_auto_unseal_from_keyring, AutoUnsealOutcome};
+    use std::rc::Rc;
+
+    let _guard = demo_ux_8_env_lock();
+
+    // Happy path: the test-keyring-present gate signals "as if the keyring
+    // had a passphrase". Auto-unseal should succeed, the returned vault
+    // should attach to the store, and `create_persona` should succeed —
+    // which is the contract that `qember.sh demo up` + `grant create` needs.
+    // SAFETY: tests holding `_guard` are serialized for env-var access.
+    unsafe {
+        std::env::set_var("EMBER_VAULT_TEST_KEYRING_PRESENT", "1");
+        std::env::remove_var("EMBER_VAULT_PASSPHRASE");
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let config = DaemonConfig {
+        data_dir: tmp.path().to_path_buf(),
+        ..Default::default()
+    };
+
+    let outcome = try_auto_unseal_from_keyring(&config);
+
+    // Re-clear so other tests see a clean slate even if this one panics later.
+    unsafe {
+        std::env::remove_var("EMBER_VAULT_TEST_KEYRING_PRESENT");
+    }
+
+    let vault = match outcome {
+        AutoUnsealOutcome::Unsealed(v) => v,
+        AutoUnsealOutcome::NoKeyringEntry => {
+            panic!("expected Unsealed; got NoKeyringEntry — test gate not honoring EMBER_VAULT_TEST_KEYRING_PRESENT")
+        }
+        AutoUnsealOutcome::Error(e) => panic!("expected Unsealed; got Error: {e}"),
+    };
+
+    // Round-trip: attach to store, create a persona, retrieve its keypair.
+    // This is the precise call sequence that `grant create` triggers and the
+    // path that was failing in implementation-note-20. If this works end-to-end, the
+    // demo-blocking bug is fixed.
+    let store = DaemonStore::open_in_memory().unwrap();
+    store.set_vault(Rc::new(vault));
+    let persona = store.create_persona("demo-ux-8-root").unwrap();
+    let _kp = store
+        .persona_root_keypair(&persona.id)
+        .expect("persona_root_keypair must succeed when vault is attached");
+}
+
+#[test]
+fn daemon_run_logs_vault_auto_unseal_audit_event() {
+    use ember_daemon::audit::AuditFilter;
+    use ember_daemon::config::DaemonConfig;
+    use ember_daemon::runtime::DaemonRuntime;
+    use ember_daemon::store::DaemonStore;
+
+    let _guard = demo_ux_8_env_lock();
+
+    // Drive `DaemonRuntime::run()` long enough for it to attach the vault and
+    // emit the `vault.auto_unseal_from_keyring` audit event, then drop the
+    // runtime task to shut it down. We don't go through the full socket loop
+    // here — the audit row is written before the listener accepts.
+    //
+    // Test gate: signal "keyring entry exists" so the helper returns Unsealed
+    // and the audit event is labeled `auto_unseal_from_keyring`.
+    // SAFETY: tests holding `_guard` are serialized for env-var access.
+    unsafe {
+        std::env::set_var("EMBER_VAULT_TEST_KEYRING_PRESENT", "1");
+        std::env::remove_var("EMBER_VAULT_PASSPHRASE");
+    }
+
+    let tmp = TempDir::new().unwrap();
+    let socket_dir = tmp.path().join("run");
+    std::fs::create_dir_all(&socket_dir).unwrap();
+    let config = DaemonConfig {
+        data_dir: tmp.path().to_path_buf(),
+        pid_file: socket_dir.join("emberd.pid"),
+        policy_file: tmp.path().join("policy.toml"),
+        socket_dir,
+        // Disable dashboard so the runtime startup is purely about vault attach.
+        dashboard_addr: None,
+        ..Default::default()
+    };
+
+    let runtime = DaemonRuntime::new(config.clone());
+    let db_path = config.data_dir.join("daemon.db");
+
+    // Run the runtime on a single-threaded tokio runtime in this thread,
+    // racing against a 1.5-second timer so the test always terminates.
+    // The audit-event write happens within the first few hundred ms of
+    // `run()` — well before any external traffic could arrive.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&rt, async move {
+        tokio::select! {
+            res = runtime.run(None) => { let _ = res; }
+            _ = tokio::time::sleep(Duration::from_millis(1500)) => {}
+        }
+    });
+
+    // Drop env gate before any panic-on-assertion.
+    unsafe {
+        std::env::remove_var("EMBER_VAULT_TEST_KEYRING_PRESENT");
+    }
+
+    let store = DaemonStore::open(&db_path).unwrap();
+    let entries = store
+        .query_audit(&AuditFilter {
+            action: Some("vault.auto_unseal_from_keyring".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+
+    assert!(
+        !entries.is_empty(),
+        "expected at least one vault.auto_unseal_from_keyring audit row, found 0 — \
+         the daemon startup path must emit this audit event so `audit show` reflects \
+         when (and how) the vault came online"
+    );
+    assert_eq!(entries[0].action, "vault.auto_unseal_from_keyring");
+    assert_eq!(
+        entries[0].outcome, "auto_unseal_from_keyring",
+        "outcome should label the success branch when keyring entry is present"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// security check — BEGIN IMMEDIATE serializes concurrent authorize+materialize pairs
+// ---------------------------------------------------------------------------
+
+/// Ten concurrent callers each open their own DaemonStore connection to the
+/// same on-disk SQLite file and simultaneously call resolve_approval(Approved)
+/// for the same pending request.
+///
+/// The BEGIN IMMEDIATE transaction inside resolve_approval acquires a write
+/// lock before the status re-read, so the authorize (status == 'pending'
+/// check) and the materialize (grant mint + UPDATE) run atomically. Exactly
+/// one caller wins; the other nine see status != 'pending' and return
+/// AlreadyResolved.
+#[test]
+fn ten_concurrent_approve_calls_mint_exactly_one_grant() {
+    use std::sync::{Arc, Barrier};
+
+    const THREAD_COUNT: usize = 10;
+    const VAULT_KEY: [u8; 32] = [0xCCu8; 32];
+
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("sec19.db");
+
+    // Bootstrap: one store creates the persona and the pending approval.
+    let request_id = {
+        let store = DaemonStore::open(&db_path).unwrap();
+        store.set_vault(Rc::new(Vault::new(VAULT_KEY)));
+        store.create_persona("sec19-agent").unwrap();
+        let pid = store.list_personas().unwrap().into_iter().next().unwrap().id;
+        let req = store
+            .submit_approval(&pid, "sec19-key", "read", None, "credential.access", "high")
+            .unwrap();
+        req.id
+    };
+
+    // All threads synchronize on this barrier to maximize dispatch overlap.
+    let barrier = Arc::new(Barrier::new(THREAD_COUNT));
+
+    let handles: Vec<_> = (0..THREAD_COUNT)
+        .map(|_| {
+            let db_path = db_path.clone();
+            let req_id = request_id.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let store = DaemonStore::open(&db_path).unwrap();
+                store.set_vault(Rc::new(Vault::new(VAULT_KEY)));
+                barrier.wait();
+                store.resolve_approval(&req_id, &ApprovalOutcome::Approved)
+            })
+        })
+        .collect();
+
+    let results: Vec<_> = handles
+        .into_iter()
+        .map(|h| h.join().expect("thread panicked"))
+        .collect();
+
+    let ok_count = results.iter().filter(|r| r.is_ok()).count();
+    let already_resolved_count = results
+        .iter()
+        .filter(|r| matches!(r, Err(StoreError::AlreadyResolved)))
+        .count();
+
+    // All results must be either Ok or AlreadyResolved — no unexpected errors.
+    for r in &results {
+        match r {
+            Ok(()) | Err(StoreError::AlreadyResolved) => {}
+            Err(e) => panic!("unexpected error from resolve_approval: {e}"),
+        }
+    }
+
+    assert_eq!(
+        ok_count, 1,
+        "BEGIN IMMEDIATE must allow exactly one approve to succeed; got {ok_count}"
+    );
+    assert_eq!(
+        already_resolved_count,
+        THREAD_COUNT - 1,
+        "the other {} callers must return AlreadyResolved; got {already_resolved_count}",
+        THREAD_COUNT - 1
+    );
+
+    // Verify exactly one grant was minted across all concurrent attempts.
+    let verify_store = DaemonStore::open(&db_path).unwrap();
+    verify_store.set_vault(Rc::new(Vault::new(VAULT_KEY)));
+    let grants = verify_store.list_grants().unwrap();
+    assert_eq!(
+        grants.len(),
+        1,
+        "exactly one grant must be minted; got {}",
+        grants.len()
+    );
+    assert_eq!(grants[0].credential_name, "sec19-key");
+
+    let resolved = verify_store.get_approval(&request_id).unwrap();
+    assert_eq!(resolved.status, "approved");
+    assert!(
+        resolved.result_grant_id.is_some(),
+        "winning approval must record the minted grant_id"
+    );
 }

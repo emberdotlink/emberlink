@@ -27,8 +27,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use core_crypto::{
-    EncryptedContent, LocalKeyPair, Signer as CryptoSigner, Verifier, generate_content_key,
-    generate_random_identifier,
+    DOMAIN_EVENT, EncryptedContent, LocalKeyPair, Signer as CryptoSigner, Verifier,
+    generate_content_key, generate_random_identifier,
     grant_chain::{self, ChainError},
 };
 use core_eventlog::materialize::{
@@ -746,7 +746,13 @@ impl EventStore {
         let effective_now = now_epoch_secs.min(system_now + MAX_CLOCK_SKEW_SECS);
 
         event.validate()?;
-        if !verifier.verify(&event.signer, &event.signed_bytes(), &event.signature) {
+        if !core_crypto::verify_with_context(
+            DOMAIN_EVENT,
+            verifier,
+            &event.signer,
+            &event.signed_bytes(),
+            &event.signature,
+        ) {
             return Err(ValidationError::new("signature verification failed"));
         }
         // Internal store append — use raw errors so callers can pattern
@@ -992,16 +998,24 @@ impl EventStore {
                 refs_str
                     .split(',')
                     .map(|r| {
-                        let parts: Vec<&str> = r.splitn(2, ':').collect();
-                        if parts.len() != 2 {
+                        let parts: Vec<&str> = r.splitn(3, ':').collect();
+                        if parts.len() < 2 {
                             return Err(ValidationError::new(format!("invalid ref: {r}")));
                         }
                         let relation = EventRefRelation::parse(parts[0]).ok_or_else(|| {
                             ValidationError::new(format!("unknown ref relation: {}", parts[0]))
                         })?;
+                        let seq: u64 = if parts.len() == 3 {
+                            parts[2].parse().map_err(|_| {
+                                ValidationError::new(format!("invalid ref seq in: {r}"))
+                            })?
+                        } else {
+                            0
+                        };
                         Ok(EventRef {
                             relation,
                             target_event_id: parts[1].to_string(),
+                            seq,
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?
@@ -1139,7 +1153,13 @@ impl EventStore {
 
         for event in events {
             event.validate()?;
-            if !verifier.verify(&event.signer, &event.signed_bytes(), &event.signature) {
+            if !core_crypto::verify_with_context(
+                DOMAIN_EVENT,
+                verifier,
+                &event.signer,
+                &event.signed_bytes(),
+                &event.signature,
+            ) {
                 self.rebuild()?;
                 return Err(ValidationError::new("signature verification failed"));
             }
@@ -4717,7 +4737,7 @@ mod tests {
                 request_id: "recovery-1".into(),
                 guardian_id: "guardian-alex".into(),
             }),
-            vec![EventRef::previous("evt-recovery-request-1")],
+            vec![EventRef::previous("evt-recovery-request-1", 0)],
             SignerBinding::guardian("guardian-alex", alex_pub.clone()),
             &FixtureSigner::new("guardian-key-alex"),
         )
@@ -4732,7 +4752,7 @@ mod tests {
                 request_id: "recovery-1".into(),
                 guardian_id: "guardian-riley".into(),
             }),
-            vec![EventRef::previous("evt-recovery-approval-1")],
+            vec![EventRef::previous("evt-recovery-approval-1", 0)],
             SignerBinding::guardian("guardian-riley", riley_pub.clone()),
             &FixtureSigner::new("guardian-key-riley"),
         )
@@ -7769,7 +7789,7 @@ mod tests {
                 request_id: "recovery-1".into(),
                 guardian_id: "guardian-alex".into(),
             }),
-            vec![EventRef::previous("evt-recovery-request-1")],
+            vec![EventRef::previous("evt-recovery-request-1", 0)],
             SignerBinding::device("device-a", "key-device-a-v1"),
             &FixtureSigner::new("key-device-a-v1"),
         )
@@ -8005,7 +8025,7 @@ mod tests {
                 request_id: "recovery-1".into(),
                 guardian_id: "guardian-alex".into(),
             }),
-            vec![EventRef::previous("evt-recovery-request-1")],
+            vec![EventRef::previous("evt-recovery-request-1", 0)],
             SignerBinding::guardian("guardian-alex", alex_pub.clone()),
             &FixtureSigner::new("guardian-key-alex"),
         )
@@ -8022,7 +8042,7 @@ mod tests {
                 reason: "improper approval".into(),
                 contested_at_epoch: 1000,
             }),
-            vec![EventRef::previous("evt-recovery-approval-1")],
+            vec![EventRef::previous("evt-recovery-approval-1", 0)],
             SignerBinding::guardian("guardian-riley", riley_pub.clone()),
             &FixtureSigner::new("guardian-key-riley"),
         )
@@ -8047,7 +8067,7 @@ mod tests {
                 request_id: "recovery-1".into(),
                 executed_scope: RecoveryScope::FreezeDevice,
             }),
-            vec![EventRef::previous("evt-recovery-contest-1")],
+            vec![EventRef::previous("evt-recovery-contest-1", 0)],
             SignerBinding::root("root-a", "key-root-a-v1"),
             &FixtureSigner::new("key-root-a-v1"),
         )
@@ -8064,7 +8084,7 @@ mod tests {
                 rejected_by: "root-a".into(),
                 reason: "contest upheld".into(),
             }),
-            vec![EventRef::previous("evt-recovery-contest-1")],
+            vec![EventRef::previous("evt-recovery-contest-1", 0)],
             SignerBinding::root("root-a", "key-root-a-v1"),
             &FixtureSigner::new("key-root-a-v1"),
         )
@@ -8157,7 +8177,7 @@ mod tests {
                 request_id: "recovery-x".into(),
                 guardian_id: "guardian-b".into(),
             }),
-            vec![EventRef::previous("evt-request-1")],
+            vec![EventRef::previous("evt-request-1", 0)],
             SignerBinding::guardian("guardian-b", fixture_guardian_pubkey("guardian-key-b")),
             &FixtureSigner::new("guardian-key-b"),
         )
@@ -8175,7 +8195,7 @@ mod tests {
                 reason: "suspicious".into(),
                 contested_at_epoch: 1000,
             }),
-            vec![EventRef::previous("evt-approval-1")],
+            vec![EventRef::previous("evt-approval-1", 0)],
             SignerBinding::guardian("guardian-c", fixture_guardian_pubkey("guardian-key-c")),
             &FixtureSigner::new("guardian-key-c"),
         )
@@ -8192,7 +8212,7 @@ mod tests {
                 request_id: "recovery-x".into(),
                 executed_scope: RecoveryScope::FreezeDevice,
             }),
-            vec![EventRef::previous("evt-contest-1")],
+            vec![EventRef::previous("evt-contest-1", 0)],
             SignerBinding::root("root-x", "key-root-x-v1"),
             &FixtureSigner::new("key-root-x-v1"),
         )

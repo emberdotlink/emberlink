@@ -1,3 +1,34 @@
+/// Maximum allowed nesting depth for `GrantCondition` combinators.
+///
+/// An attacker-supplied `conditions_json` with thousands of nested `All`
+/// or `Any` layers would cause a stack overflow in any recursive evaluator.
+/// Conditions are validated against this limit before evaluation (security check).
+pub const MAX_CONDITION_DEPTH: u32 = 10;
+
+/// Errors specific to grant-condition validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantConditionError {
+    /// The condition tree exceeds [`MAX_CONDITION_DEPTH`] levels of nesting.
+    ConditionsTooDeep {
+        /// The depth at which the limit was exceeded.
+        depth: u32,
+    },
+}
+
+impl std::fmt::Display for GrantConditionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ConditionsTooDeep { depth } => write!(
+                f,
+                "grant condition tree exceeds maximum nesting depth of {MAX_CONDITION_DEPTH} \
+                 (reached depth {depth})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GrantConditionError {}
+
 /// Conditions that a grant offer recipient must satisfy before claiming.
 ///
 /// Conditions are evaluated at claim time against the claimant's badge
@@ -194,6 +225,30 @@ impl GrantCondition {
             Err(format!(
                 "unknown condition format: '{s}'. Expected 'badge:<type>[,min-convergence=<f>][,max-distance=<n>][,min-authority=<f>]'"
             ))
+        }
+    }
+
+    /// Validate that the condition tree does not exceed [`MAX_CONDITION_DEPTH`].
+    ///
+    /// Call this before evaluating any condition tree received from an untrusted
+    /// source. Returns `Err(GrantConditionError::ConditionsTooDeep)` if any
+    /// branch exceeds the depth limit. Starts the counter at 0 (the root node).
+    pub fn validate_depth(&self) -> Result<(), GrantConditionError> {
+        self.check_depth_inner(0)
+    }
+
+    fn check_depth_inner(&self, depth: u32) -> Result<(), GrantConditionError> {
+        if depth > MAX_CONDITION_DEPTH {
+            return Err(GrantConditionError::ConditionsTooDeep { depth });
+        }
+        match self {
+            Self::BadgeGate { .. } => Ok(()),
+            Self::All(subs) | Self::Any(subs) => {
+                for sub in subs {
+                    sub.check_depth_inner(depth + 1)?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -446,6 +501,50 @@ mod tests {
                 max_distance: Some(3),
                 min_authority: Some(0.8),
             }
+        );
+    }
+
+    /// security check: a flat leaf condition at depth 0 must pass depth validation.
+    #[test]
+    fn depth_check_leaf_ok() {
+        let c = GrantCondition::badge("verified-dev");
+        assert!(c.validate_depth().is_ok());
+    }
+
+    /// security check: a condition tree exactly at MAX_CONDITION_DEPTH (10) must pass.
+    #[test]
+    fn depth_check_at_limit_ok() {
+        // Build a 10-deep nested All: All([All([...All([badge])])])
+        // The outermost All is depth 0; the innermost badge is depth 10.
+        let mut c = GrantCondition::badge("x");
+        for _ in 0..MAX_CONDITION_DEPTH {
+            c = GrantCondition::All(vec![c]);
+        }
+        assert!(
+            c.validate_depth().is_ok(),
+            "condition tree at MAX_CONDITION_DEPTH must be accepted"
+        );
+    }
+
+    /// security check: a condition tree one level past MAX_CONDITION_DEPTH (11) must
+    /// be rejected with `ConditionsTooDeep`.
+    #[test]
+    fn depth_check_exceeds_limit_error() {
+        // Build an 11-deep nested All — one level beyond the cap.
+        let mut c = GrantCondition::badge("x");
+        for _ in 0..=MAX_CONDITION_DEPTH {
+            c = GrantCondition::All(vec![c]);
+        }
+        let err = c
+            .validate_depth()
+            .expect_err("11-deep condition tree must be rejected");
+        assert!(
+            matches!(err, GrantConditionError::ConditionsTooDeep { .. }),
+            "expected ConditionsTooDeep, got: {err:?}"
+        );
+        assert!(
+            err.to_string().contains("maximum nesting depth"),
+            "error message must mention the depth cap, got: {err}"
         );
     }
 
