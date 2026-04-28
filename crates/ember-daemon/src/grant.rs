@@ -269,6 +269,15 @@ fn classify_resource_type(credential_name: &str, scope: &str) -> ResourceType {
 /// bare-action forms like `read`/`write`/`push`/`*`. The mapping is
 /// best-effort and preserves the scope string verbatim as the selector
 /// pattern so existing proxy enforcement continues to match.
+///
+/// 4-segment scopes (`<provider>:<action>:<target>:<subtarget>`) emit a
+/// structured [`ResourceSelector::GlobWithSubtarget`]: `primary_glob` is
+/// the third segment (the resource — `owner/repo`) and `subtarget_glob` is
+/// the fourth (a branch-path glob like `feat/*`). This routes the per-
+/// Statement resolver to a primary match plus a secondary subtarget check,
+/// so a primary-match-but-subtarget-miss denies with
+/// `denied_subtarget_scope` instead of the catch-all
+/// `denied_no_applicable_statement` (P69E.5c).
 fn scope_to_actions_and_selector(
     scope: &str,
     credential_name: &str,
@@ -282,6 +291,18 @@ fn scope_to_actions_and_selector(
     };
     let selector = if scope == "*" {
         ResourceSelector::Any
+    } else if parts.len() == 4 && !parts.iter().any(|p| p.is_empty()) {
+        // P69E.5c: 4-segment scope routes to the structured subtarget shape.
+        // primary = parts[2] (the resource — `owner/repo`).
+        // subtarget = parts[3] (the branch glob — `feat/*` etc.).
+        // We deliberately do NOT splat the 4th segment into the primary
+        // glob: doing so produces a colon-joined pattern
+        // (`owner/repo:feat/*`) that the request resource (a path string)
+        // can never match, which is the bug this fix closes.
+        ResourceSelector::GlobWithSubtarget {
+            primary_glob: parts[2].to_string(),
+            subtarget_glob: parts[3].to_string(),
+        }
     } else if scope.contains('*') {
         ResourceSelector::Glob { pattern: scope.into() }
     } else if parts.len() >= 3 {
@@ -357,7 +378,7 @@ fn row_to_grant(row: &rusqlite::Row<'_>) -> rusqlite::Result<GrantInfo> {
     // Terminal states persisted in the column (revoked, expired, exhausted_by_budget,
     // expired_by_budget, parent_cascade_revoked) are kept as-is.  For non-terminal
     // stored states (active, paused) we additionally derive time-based expiry from
-    // `expires_at`, reusing `GrantStatus::derive` (see prior change / implementation-note-16).
+    // `expires_at`, reusing `GrantStatus::derive` (see prior change / implementation-note-26).
     let effective_status = if matches!(
         status.as_str(),
         "revoked" | "expired" | "exhausted_by_budget" | "expired_by_budget" | "parent_cascade_revoked"
@@ -466,7 +487,7 @@ pub fn access_grant_from_statements(
 /// derived from the store rather than threaded in from the outside.
 /// Existing callers of [`access_grant_from_statements`] continue to
 /// compile unchanged; migrate them to this form incrementally
-/// (TODO P69K-C28-implementation-note-17 caller migration).
+/// (TODO P69K-C28-implementation-note-27 caller migration).
 ///
 /// Returns the same value as calling `access_grant_from_statements` with
 /// the result of `store.persona_root_keypair(persona_id)`.
@@ -2828,7 +2849,7 @@ mod tests {
     }
 
     /// `access_grant_from_statements_for_persona` returns the same `AccessGrant`
-    /// as the explicit-root form when both use the same persona (P69K-C28-implementation-note-17).
+    /// as the explicit-root form when both use the same persona (P69K-C28-implementation-note-27).
     #[test]
     fn access_grant_from_statements_for_persona_matches_explicit_root() {
         let store = setup();

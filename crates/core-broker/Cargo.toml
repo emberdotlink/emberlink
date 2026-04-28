@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Broker trait, request/response types, and MockBroker for the Emberlink credential broker (design)."
+publish = false
 
 [dependencies]
 secrecy = "0.10"

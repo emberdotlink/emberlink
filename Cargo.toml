@@ -20,7 +20,9 @@ members = [
     "crates/core-sync",
     "crates/core-storage",
     "crates/core-mcp",
+    "crates/ember-broker",
     "crates/ember-daemon",
+    "crates/ember-tools",
 ]
 resolver = "2"
 

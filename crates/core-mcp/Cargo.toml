@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Shared JSON-RPC 2.0 types and stdio transport for MCP servers."
+publish = false
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

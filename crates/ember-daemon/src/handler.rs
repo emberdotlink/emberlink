@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
@@ -11,6 +12,191 @@ use crate::presence::{self, GateOutcome, HighRiskOp};
 use crate::rate_limit::RateLimiter;
 use crate::store::DaemonStore;
 use crate::vault::Vault;
+
+// development milestone: peer-credential-derived principal binding for
+// `delegate_grant`. Mirrors the socket layer's `PeerIdentity` shape so
+// `handler.rs` does not have to depend on socket-layer cfg gates. The
+// fields are public because this is a kernel-derived identity carried
+// by trusted code (the socket layer); there is no validation surface
+// for callers to violate.
+//
+// `pid` is `Option<i32>` because BSD's `LOCAL_PEERCRED` does not always
+// surface PID. On macOS in particular, when `pid` is `None`, the only
+// safe behavior is to fail-closed — `peercred_principal()` returns
+// `HandlerError::PrincipalUnavailable` rather than minting a delegation
+// authorized by an unknown principal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerCred {
+    pub uid: u32,
+    pub pid: Option<i32>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl From<crate::socket::PeerIdentity> for PeerCred {
+    fn from(p: crate::socket::PeerIdentity) -> Self {
+        PeerCred { uid: p.uid, pid: p.pid }
+    }
+}
+
+/// Errors returned by the principal-binding layer.
+///
+/// These are converted to JSON-RPC error tuples by the dispatch layer:
+///   `PrincipalUnavailable` -> `-32401`, "principal binding unavailable"
+///   `PrincipalMismatch    -> `-32401`, "principal mismatch"
+///
+/// `-32401` is reused from the JSON-RPC convention (Unauthorized) — same
+/// code used elsewhere in the daemon for authorization rejections that
+/// are NOT policy denials (`-32003`) or generic param errors (`-32602`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandlerError {
+    /// The peer-credential structure did not contain enough information
+    /// to derive a principal. On macOS this happens whenever
+    /// `LOCAL_PEERCRED` did not return a PID. We fail-closed rather than
+    /// fall back to UID-only binding (which would let any same-UID
+    /// process claim any persona).
+    PrincipalUnavailable,
+    /// The kernel-derived principal does not match the persona the
+    /// caller asserted in their request params. The caller is lying
+    /// about which persona they are.
+    PrincipalMismatch,
+    /// The peer's PID is not enrolled in the daemon's PID->persona
+    /// registry. The caller has not yet established an identity in
+    /// this daemon (no `create_persona` call from this PID, or the
+    /// enrollment expired/was cleared).
+    PrincipalNotEnrolled,
+}
+
+impl HandlerError {
+    pub fn to_jsonrpc(&self) -> (i32, String) {
+        match self {
+            HandlerError::PrincipalUnavailable => (
+                -32401,
+                "delegate_grant: principal binding unavailable on this \
+                 platform (peer PID was not surfaced by the kernel)"
+                    .to_string(),
+            ),
+            HandlerError::PrincipalMismatch => (
+                -32401,
+                "delegate_grant: caller's kernel-derived principal does \
+                 not match the asserted caller_persona_id"
+                    .to_string(),
+            ),
+            HandlerError::PrincipalNotEnrolled => (
+                -32401,
+                "delegate_grant: caller PID is not enrolled with any \
+                 persona — call create_persona on this connection first"
+                    .to_string(),
+            ),
+        }
+    }
+}
+
+/// Per-connection request context carrying kernel-derived identity.
+///
+/// Phase 1 of development milestone — see the proposal at
+/// `project documentation`. The `peer` field
+/// is populated by the socket layer at connection accept time; the
+/// `principal` field is the persona id resolved from `peer.pid` via
+/// `peercred_principal()`. For `Internal` callers, both are `None`.
+///
+/// The struct deliberately mirrors what we expect to extend to
+/// session-ticket-based binding (Alternative B) so the handler call
+/// site does not change between phases — only the population of
+/// `principal` does.
+#[derive(Debug, Clone)]
+pub struct RequestContext {
+    pub source: DispatchSource,
+    pub peer: Option<PeerCred>,
+    /// Pre-resolved persona id, when the dispatch layer has already
+    /// looked it up (e.g. for tests that want to inject a principal
+    /// directly without going through the PID registry).
+    pub principal: Option<String>,
+}
+
+impl RequestContext {
+    /// Build an `Internal` context — bypasses peercred binding entirely.
+    pub fn internal(reason: &'static str) -> Self {
+        Self {
+            source: DispatchSource::Internal { reason },
+            peer: None,
+            principal: None,
+        }
+    }
+
+    /// Build a `Socket` context with a peer credential. The principal
+    /// will be lazily resolved by handlers that require it.
+    pub fn socket(peer: Option<PeerCred>) -> Self {
+        Self {
+            source: DispatchSource::Socket,
+            peer,
+            principal: None,
+        }
+    }
+
+    /// Build a `Socket` context with a pre-resolved principal. Used by
+    /// tests that want to assert handler behavior without populating
+    /// the global PID registry.
+    pub fn socket_with_principal(peer: Option<PeerCred>, principal: String) -> Self {
+        Self {
+            source: DispatchSource::Socket,
+            peer,
+            principal: Some(principal),
+        }
+    }
+}
+
+// PID -> Persona enrollment registry. Populated when a Socket caller
+// calls `create_persona` and inspected when the same caller (same PID)
+// invokes `delegate_grant`.
+//
+// Why thread-local: the daemon is single-threaded LocalSet at runtime,
+// so production correctness only needs a single map. We use a
+// thread-local rather than a global static so that cargo's parallel
+// test runner gets fresh registries per test thread — otherwise a
+// `create_persona` enrollment from one test could leak into another
+// test's `delegate_grant` lookup and produce a flaky principal-mismatch
+// result. This is a pragmatic phase-1 fit; phase 2 (session ticket)
+// will move enrollment into a more structured per-connection store.
+std::thread_local! {
+    static PID_PERSONA_REGISTRY: RefCell<HashMap<i32, String>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Enroll a (pid, persona_id) pair in the per-thread registry.
+///
+/// Called from the `create_persona` handler when the dispatch source is
+/// `Socket` and the peer credential surfaced a PID.  Subsequent
+/// `delegate_grant` calls from the same PID will resolve to this
+/// persona id.
+pub fn enroll_pid_persona(pid: i32, persona_id: &str) {
+    PID_PERSONA_REGISTRY.with(|reg| {
+        reg.borrow_mut().insert(pid, persona_id.to_string());
+    });
+}
+
+/// Test-only helper: drop all enrollments. Cargo's per-test isolation
+/// relies on a fresh registry, so individual tests that enroll PIDs
+/// should call this in setup (or rely on thread-local isolation).
+#[cfg(test)]
+pub fn clear_pid_persona_registry() {
+    PID_PERSONA_REGISTRY.with(|reg| reg.borrow_mut().clear());
+}
+
+/// Resolve the calling persona for a peer credential.
+///
+/// On Linux the registry is keyed by PID, populated at `create_persona`
+/// dispatch time. On macOS where `peer.pid` may be `None`, we fail-closed
+/// with `PrincipalUnavailable` rather than fall back to UID-only binding
+/// (which would let any same-UID process claim any persona).
+pub fn peercred_principal(peer: &PeerCred) -> Result<String, HandlerError> {
+    let pid = peer.pid.ok_or(HandlerError::PrincipalUnavailable)?;
+    PID_PERSONA_REGISTRY.with(|reg| {
+        reg.borrow()
+            .get(&pid)
+            .cloned()
+            .ok_or(HandlerError::PrincipalNotEnrolled)
+    })
+}
 
 /// Origin of a dispatched RPC request.
 ///
@@ -195,6 +381,11 @@ fn notify_require_approval(store: &DaemonStore, req: &ApprovalRequestInfo) {
 /// This is the **socket entry point** — it always runs as
 /// `DispatchSource::Socket`, which causes any caller-supplied `force: true`
 /// on `create_grant` to be rejected. See `DispatchSource` for context.
+///
+/// Backward-compat entry point: no peer credential, so principal binding
+/// (development milestone) cannot apply — `delegate_grant` falls back to the
+/// param-asserted ownership check. Production callers should use
+/// `dispatch_method_with_peer` instead.
 pub async fn dispatch_method_with_events(
     store: &DaemonStore,
     vault: &Vault,
@@ -204,13 +395,69 @@ pub async fn dispatch_method_with_events(
     method: &str,
     params: &Value,
 ) -> Result<Value, (i32, String)> {
-    dispatch_method_with_source(
+    dispatch_method_with_context(
         store,
         vault,
         policy,
         rate_limiter,
         events_tx,
-        DispatchSource::Socket,
+        RequestContext::socket(None),
+        method,
+        params,
+    )
+    .await
+}
+
+/// Socket entry point with a peer credential — the production path.
+///
+/// The socket layer captures `SO_PEERCRED` / `LOCAL_PEERCRED` at accept
+/// time and forwards the resulting `PeerIdentity` here. The handler
+/// uses it to bind `delegate_grant` to a kernel-derived principal
+/// instead of trusting an attacker-controlled `caller_persona_id` param.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub async fn dispatch_method_with_peer(
+    store: &DaemonStore,
+    vault: &Vault,
+    policy: &PolicyEngine,
+    rate_limiter: &RefCell<RateLimiter>,
+    events_tx: Option<&broadcast::Sender<GrantEvent>>,
+    peer: Option<crate::socket::PeerIdentity>,
+    method: &str,
+    params: &Value,
+) -> Result<Value, (i32, String)> {
+    let peer_cred: Option<PeerCred> = peer.map(Into::into);
+    dispatch_method_with_context(
+        store,
+        vault,
+        policy,
+        rate_limiter,
+        events_tx,
+        RequestContext::socket(peer_cred),
+        method,
+        params,
+    )
+    .await
+}
+
+/// Non-Linux/macOS fallback — never has a real PeerIdentity.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub async fn dispatch_method_with_peer(
+    store: &DaemonStore,
+    vault: &Vault,
+    policy: &PolicyEngine,
+    rate_limiter: &RefCell<RateLimiter>,
+    events_tx: Option<&broadcast::Sender<GrantEvent>>,
+    _peer: Option<()>,
+    method: &str,
+    params: &Value,
+) -> Result<Value, (i32, String)> {
+    dispatch_method_with_context(
+        store,
+        vault,
+        policy,
+        rate_limiter,
+        events_tx,
+        RequestContext::socket(None),
         method,
         params,
     )
@@ -233,9 +480,10 @@ fn check_user_presence_gate(
     }
 }
 
-/// Core dispatcher. Callers MUST set `source` correctly: `Socket` for any
-/// request that arrived from the wire, `Internal` only for in-process
-/// admin/test paths. Mis-attribution here would re-open development milestone.
+/// Backward-compatible shim: builds a `RequestContext` from a bare
+/// `DispatchSource` and delegates to `dispatch_method_with_context`. Used
+/// by tests that pre-date development milestone and by `Internal` callers
+/// that have no peer credential to assert.
 #[allow(clippy::too_many_arguments)]
 pub async fn dispatch_method_with_source(
     store: &DaemonStore,
@@ -247,6 +495,37 @@ pub async fn dispatch_method_with_source(
     method: &str,
     params: &Value,
 ) -> Result<Value, (i32, String)> {
+    let ctx = RequestContext {
+        source,
+        peer: None,
+        principal: None,
+    };
+    dispatch_method_with_context(
+        store, vault, policy, rate_limiter, events_tx, ctx, method, params,
+    )
+    .await
+}
+
+/// Core dispatcher. Callers MUST set `ctx.source` correctly: `Socket` for
+/// any request that arrived from the wire, `Internal` only for in-process
+/// admin/test paths. Mis-attribution here would re-open development milestone.
+///
+/// `ctx.peer` carries the kernel-derived peer credential when available
+/// (Linux + macOS sockets only). `delegate_grant` consults it via
+/// `peercred_principal()` to bind requests to a real principal instead
+/// of trusting an attacker-controlled param. See development milestone.
+#[allow(clippy::too_many_arguments)]
+pub async fn dispatch_method_with_context(
+    store: &DaemonStore,
+    vault: &Vault,
+    policy: &PolicyEngine,
+    rate_limiter: &RefCell<RateLimiter>,
+    events_tx: Option<&broadcast::Sender<GrantEvent>>,
+    ctx: RequestContext,
+    method: &str,
+    params: &Value,
+) -> Result<Value, (i32, String)> {
+    let source = ctx.source;
     match method {
         "ping" => Ok(json!({"pong": true})),
 
@@ -257,6 +536,17 @@ pub async fn dispatch_method_with_source(
             let info = store
                 .create_persona(name)
                 .map_err(|e| (-32000, e.to_string()))?;
+            // development milestone: enroll the (peer_pid, persona_id) so
+            // subsequent `delegate_grant` calls from this PID resolve
+            // back to the persona that just claimed it.  Only applies to
+            // Socket callers; Internal callers don't have a real peer
+            // identity and shouldn't pollute the registry.
+            if !source.is_internal()
+                && let Some(peer) = &ctx.peer
+                && let Some(pid) = peer.pid
+            {
+                enroll_pid_persona(pid, &info.id);
+            }
             Ok(json!({"id": info.id, "name": info.name, "public_key": info.public_key}))
         }
 
@@ -441,52 +731,114 @@ pub async fn dispatch_method_with_source(
                 .get_grant(parent_grant_id)
                 .map_err(|e| (-32000, e.to_string()))?;
 
-            // development milestone — defense-in-depth, NOT a full gate.
+            // development milestone — full principal binding.
             //
-            // What this check does: socket callers must assert
-            // `caller_persona_id` in params; it must equal the parent
-            // grant's owner. A caller who fails to lie — e.g. a benign
-            // mis-use, a stale client, a local script that grabbed a
-            // stranger's parent_grant_id from a log — is rejected before
-            // any state change.
+            // The defense-in-depth check from development milestone (prior change) was
+            // a useful loud-fail for benign mis-use but did not prove the
+            // caller WAS the claimed persona — `caller_persona_id` was
+            // attacker-controlled. Full principal binding closes that gap
+            // by deriving the caller's persona from the kernel-supplied
+            // peer credential (`SO_PEERCRED` / `LOCAL_PEERCRED`) on the
+            // Unix socket and rejecting any request whose params claim a
+            // different persona.
             //
-            // What this check does NOT do: it does not prove the caller
-            // IS the claimed persona. `caller_persona_id` is an
-            // attacker-supplied string. An attacker who knows the victim
-            // persona_id (readable via list_personas, audit log,
-            // receipts) can set caller_persona_id == victim and the
-            // check passes. Full principal binding requires SO_PEERCRED
-            // + root-signed RPC or a persona session ticket — tracked
-            // as development milestone (defer follow-up).
-            //
-            // The SO_PEERCRED gate (development milestone, prior change) already
-            // ensures only processes running as the daemon's own uid
-            // can connect, so the remaining attack surface is between
-            // local processes of the same user — real but narrower.
+            // Resolution order for the calling principal:
+            //   1. `ctx.principal` — pre-resolved by tests or future
+            //      session-ticket binding (Phase 2).
+            //   2. `peercred_principal(&ctx.peer)` — looks up the peer's
+            //      PID in the daemon's enrollment registry. Populated by
+            //      `create_persona` calls from the same PID. On macOS
+            //      where pid is `None`, fail-closed with
+            //      `PrincipalUnavailable`.
+            //   3. Legacy fallback: when no peer credential is available
+            //      (e.g. older callers using `dispatch_method_with_events`
+            //      without a peer), fall back to the param-asserted
+            //      ownership check from prior change.
             //
             // `Internal` source (admin CLI, test harness, recovery)
             // bypasses — mirrors development milestone pattern.
             if !source.is_internal() {
-                let caller_persona_id = params["caller_persona_id"]
-                    .as_str()
-                    .ok_or((
-                        -32602,
-                        "missing 'caller_persona_id': socket callers must \
-                         assert the persona delegating the parent grant"
-                            .to_string(),
-                    ))?;
-                if caller_persona_id != parent_grant.persona_id {
-                    tracing::warn!(
-                        caller_persona_id = %caller_persona_id,
-                        parent_grant_id = %parent_grant_id,
-                        parent_owner_persona_id = %parent_grant.persona_id,
-                        "rejecting delegate_grant: caller does not own parent grant"
-                    );
-                    return Err((
-                        -32002,
-                        "delegate_grant: caller does not own parent grant"
-                            .to_string(),
-                    ));
+                // First try kernel-derived principal binding.
+                let kernel_principal: Option<String> = match (&ctx.principal, &ctx.peer) {
+                    (Some(p), _) => Some(p.clone()),
+                    (None, Some(peer)) => match peercred_principal(peer) {
+                        Ok(p) => Some(p),
+                        Err(e) => {
+                            tracing::warn!(
+                                error = ?e,
+                                pid = ?peer.pid,
+                                uid = peer.uid,
+                                parent_grant_id = %parent_grant_id,
+                                "rejecting delegate_grant: principal binding failed"
+                            );
+                            return Err(e.to_jsonrpc());
+                        }
+                    },
+                    (None, None) => None,
+                };
+
+                match kernel_principal {
+                    Some(principal) => {
+                        // Optional `caller_persona_id` in params, when
+                        // present, must match the kernel-derived principal.
+                        // Attacker-supplied mismatch is rejected.
+                        if let Some(asserted) = params["caller_persona_id"].as_str()
+                            && asserted != principal
+                        {
+                            tracing::warn!(
+                                asserted_persona_id = %asserted,
+                                kernel_persona_id = %principal,
+                                parent_grant_id = %parent_grant_id,
+                                "rejecting delegate_grant: params.caller_persona_id \
+                                 does not match kernel-derived principal"
+                            );
+                            return Err(HandlerError::PrincipalMismatch.to_jsonrpc());
+                        }
+                        // Kernel-derived principal must own the parent grant.
+                        if principal != parent_grant.persona_id {
+                            tracing::warn!(
+                                kernel_persona_id = %principal,
+                                parent_grant_id = %parent_grant_id,
+                                parent_owner_persona_id = %parent_grant.persona_id,
+                                "rejecting delegate_grant: kernel-derived principal \
+                                 does not own parent grant"
+                            );
+                            return Err((
+                                -32002,
+                                "delegate_grant: caller does not own parent grant"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                    None => {
+                        // Legacy fallback: no peer credential available
+                        // (older socket entry points, missing kernel
+                        // surface). Fall back to the param-asserted check
+                        // — strictly weaker than principal binding but
+                        // preserves backward compat for callers that
+                        // haven't been migrated.
+                        let caller_persona_id = params["caller_persona_id"]
+                            .as_str()
+                            .ok_or((
+                                -32602,
+                                "missing 'caller_persona_id': socket callers must \
+                                 assert the persona delegating the parent grant"
+                                    .to_string(),
+                            ))?;
+                        if caller_persona_id != parent_grant.persona_id {
+                            tracing::warn!(
+                                caller_persona_id = %caller_persona_id,
+                                parent_grant_id = %parent_grant_id,
+                                parent_owner_persona_id = %parent_grant.persona_id,
+                                "rejecting delegate_grant: caller does not own parent grant"
+                            );
+                            return Err((
+                                -32002,
+                                "delegate_grant: caller does not own parent grant"
+                                    .to_string(),
+                            ));
+                        }
+                    }
                 }
             }
 
@@ -789,6 +1141,24 @@ pub async fn dispatch_method_with_source(
             Ok(json!(list))
         }
 
+        "vault_get" => {
+            // Read-class: bump activity, never prompt. Returns the
+            // plaintext credential value to the caller. Never log the
+            // value — only the lookup name (security invariant —
+            // see `feedback_never_print_vault_secrets` and the
+            // 2026-04-27 CF token leak post-mortem).
+            presence::record_activity();
+            let name = params["name"]
+                .as_str()
+                .ok_or((-32602, "missing 'name'".to_string()))?;
+            let value = vault
+                .get(store, name)
+                .map_err(|e| (-32000, e.to_string()))?;
+            tracing::info!(name = %name, "vault_get: credential fetched");
+            let text = String::from_utf8_lossy(&value).into_owned();
+            Ok(json!({"value": text}))
+        }
+
         "audit_query" => {
             let agent_id = params["agent_id"].as_str().map(String::from);
             let limit = params["limit"].as_u64().map(|l| l as usize);
@@ -816,34 +1186,27 @@ pub async fn dispatch_method_with_source(
             Ok(json!(list))
         }
 
-        // EMBER-implementation-note-18 — receipts-table audit view consumed by
-        // `ember audit query`. Filters are AND-combined; `resource` is a
-        // post-fetch substring match against the receipt body.
-        "audit_receipts" => {
-            let actor = params["actor"].as_str().map(String::from);
-            let kind = params["kind"].as_str().map(String::from);
-            let grant_id = params["grant_id"].as_str().map(String::from);
-            let resource = params["resource"].as_str().map(String::from);
-            let since_iso = params["since"].as_str().map(String::from);
-            let limit = params["limit"].as_u64();
+        // EMBER-implementation-note-28: unified receipt query — supports the full
+        // `ReceiptFilter` shape (actor/kind/grant_id/since/resource/limit).
+        // The `ember audit query` CLI path calls this via JSON-RPC socket.
+        "receipt_query" => {
             let filter = crate::receipt::ReceiptFilter {
-                persona_id: actor,
-                kind,
-                grant_id,
-                resource,
-                since_iso,
-                limit,
+                persona_id: params["actor"].as_str().map(String::from),
+                kind: params["kind"].as_str().map(String::from),
+                grant_id: params["grant_id"].as_str().map(String::from),
+                resource: params["resource"].as_str().map(String::from),
+                since_iso: params["since"].as_str().map(String::from),
+                limit: params["limit"].as_u64(),
                 ..Default::default()
             };
             let rows = store
-                .list_receipt_rows(&filter)
+                .query_receipts(&filter)
                 .map_err(|e| (-32000, e.to_string()))?;
-            // Serialize through serde so callers see the full ReceiptRow
-            // shape (id, kind, actor, resource, grant_id, materialized_at,
-            // terminal_reason, requested_scope, granted_scope).
-            let value = serde_json::to_value(&rows)
-                .map_err(|e| (-32000, format!("serialize receipt rows: {e}")))?;
-            Ok(value)
+            let list: Vec<Value> = rows
+                .iter()
+                .map(|r| serde_json::to_value(r).unwrap_or(Value::Null))
+                .collect();
+            Ok(Value::Array(list))
         }
 
         "submit_approval" => {
@@ -1373,7 +1736,7 @@ pub async fn dispatch_method_with_source(
             }))
         }
 
-        // implementation-note-9 (design Phase 2): broker socket RPC arms.
+        // implementation-note-17 (design Phase 2): broker socket RPC arms.
         //
         // These are intentionally additive — the registry, materialization
         // tracking, Receipt-event emission, and provider-routing logic live
@@ -1381,12 +1744,18 @@ pub async fn dispatch_method_with_source(
         // dispatch surface so concurrent worktrees touching unrelated
         // arms don't conflict on a structural refactor of this fn.
         //
-        // Marker (implementation-note-9): RPC method name "BrokerIssue" lives
+        // Marker (implementation-note-17): RPC method name "BrokerIssue" lives
         // alongside its sibling routes as the literal `broker_issue`. See
         // `broker_handler.rs` for handler bodies + tests.
         "broker_issue" => crate::broker_handler::handle_broker_issue(store, params).await,
         "broker_revoke" => crate::broker_handler::handle_broker_revoke(store, params).await,
         "broker_list" => crate::broker_handler::handle_broker_list(params).await,
+        // implementation-note-3: agent processes hold an
+        // opaque `SecretRef`; the trust boundary (ember-proxy /
+        // ember-tools) calls `broker_resolve` to materialise the
+        // plaintext credential. Stub today; full impl in
+        // implementation-note-18.
+        "broker_resolve" => crate::broker_handler::handle_broker_resolve(store, params).await,
 
         _ => Err((-32601, "Method not found".to_string())),
     }
@@ -1855,65 +2224,6 @@ mod tests {
         assert_eq!(arr[1]["outcome"], json!("allowed"));
         assert_eq!(arr[2]["action"], json!("grant.minted"));
         assert_eq!(arr[2]["outcome"], json!("minted"));
-    }
-
-    /// EMBER-implementation-note-18 — round-trip: seed two kms receipts for the same
-    /// persona, dispatch `audit_receipts` with `actor` set, verify both
-    /// rows return with the expected shape.
-    #[tokio::test]
-    async fn audit_receipts_round_trips_kms_rows() {
-        use core_types::grant_receipt::{
-            GrantEvaluation, GrantEvaluationOutcome, KmsReceipt, ReceiptKind,
-            ReceiptOutcome,
-        };
-
-        let store = DaemonStore::open_in_memory().unwrap();
-        let vault = test_vault();
-        let policy = test_policy();
-        let rl = test_rate_limiter();
-
-        for (kind, key, persona) in [
-            (ReceiptKind::KmsWrap, "k1", "persona-audit"),
-            (ReceiptKind::KmsUnwrap, "k1", "persona-audit"),
-            (ReceiptKind::KmsWrap, "k2", "persona-other"),
-        ] {
-            let r = KmsReceipt {
-                id: format!("rct-{}", uuid::Uuid::new_v4()),
-                kind,
-                key_name: key.into(),
-                caller_persona: persona.into(),
-                request_size_bytes: 8,
-                materialized_at_epoch_secs: 1_700_000_000,
-                grant_evaluation: GrantEvaluation {
-                    outcome: GrantEvaluationOutcome::Allowed,
-                    grant_id: None,
-                },
-                outcome: ReceiptOutcome::Success,
-                evidence: core_types::grant_receipt::Evidence::default(),
-            };
-            store.store_kms_receipt(&r).unwrap();
-        }
-
-        let result = dispatch_method(
-            &store,
-            &vault,
-            &policy,
-            &rl,
-            "audit_receipts",
-            &json!({"actor": "persona-audit"}),
-        )
-        .await
-        .unwrap();
-        let arr = result.as_array().expect("array of rows");
-        assert_eq!(arr.len(), 2);
-        for row in arr {
-            assert_eq!(row["actor"], json!("persona-audit"));
-            assert!(
-                row["kind"] == json!("kms_wrap") || row["kind"] == json!("kms_unwrap"),
-                "kind must be kms_*; got {row:?}"
-            );
-            assert_eq!(row["resource"], json!("k1"));
-        }
     }
 
     #[tokio::test]
@@ -3573,6 +3883,280 @@ mod tests {
         );
     }
 
+    // --- development milestone regression tests ----------------------------
+    //
+    // Full principal binding via `SO_PEERCRED` / `LOCAL_PEERCRED` derived
+    // peer credential. The new layer:
+    //   1. Enrolls (peer.pid -> persona_id) in `create_persona` from a
+    //      Socket caller carrying a real PeerCred.
+    //   2. On `delegate_grant`, derives the kernel principal from the
+    //      peer's PID and rejects any params.caller_persona_id that
+    //      doesn't match the kernel principal (`PrincipalMismatch`).
+    //   3. On macOS where pid is None, fails closed with
+    //      `PrincipalUnavailable` rather than silently allowing.
+    //
+    // These tests exercise the handler dispatch surface directly with
+    // synthetic `RequestContext` so we don't need a real Unix socket
+    // pair or a second OS user — both impossible in CI.
+
+    #[tokio::test]
+    async fn forged_caller_persona_id_in_delegate_params_rejected() {
+        // The threat model that motivated development milestone: an
+        // attacker process running under the daemon's UID enumerates
+        // personas, learns the victim's persona_id, and asserts it as
+        // `caller_persona_id`.  Under development milestone alone the request
+        // would succeed.  Under development milestone the kernel-derived
+        // principal does not match, so the handler MUST reject with
+        // `PrincipalMismatch`.
+        clear_pid_persona_registry();
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let (a_id, b_id, parent_grant_id) =
+            c3_setup_two_personas_and_grant(&store, &vault, &policy, &rl).await;
+
+        // Attacker connection: the kernel says the peer is persona B
+        // (the attacker's enrolled identity).  Attacker forges params
+        // claiming to be A (the parent grant's owner).  The mismatch
+        // between asserted A and kernel-derived B must trip the gate
+        // BEFORE we even reach the ownership check.
+        let attacker_pid: i32 = 70_001;
+        enroll_pid_persona(attacker_pid, &b_id);
+
+        let ctx = RequestContext {
+            source: DispatchSource::Socket,
+            peer: Some(PeerCred { uid: 1000, pid: Some(attacker_pid) }),
+            principal: None,
+        };
+
+        let before = store.list_active_grants().unwrap().len();
+
+        let err = dispatch_method_with_context(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            None,
+            ctx,
+            "delegate_grant",
+            &json!({
+                "parent_grant_id": parent_grant_id,
+                "child_persona_id": b_id,
+                "scope": "read",
+                // Attacker forges A as caller — but the kernel knows
+                // they are running under PID enrolled to B.
+                "caller_persona_id": a_id,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, -32401, "expected -32401 PrincipalMismatch, got {err:?}");
+        assert!(
+            err.1.to_lowercase().contains("principal")
+                || err.1.to_lowercase().contains("mismatch"),
+            "error should reference principal mismatch, got: {}",
+            err.1
+        );
+
+        let after = store.list_active_grants().unwrap().len();
+        assert_eq!(
+            before, after,
+            "no child grant must be minted when params forge a different caller"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn linux_peercred_resolves_persona_via_pid_lookup() {
+        // Happy path on Linux: a Socket caller creates a persona and the
+        // daemon enrolls (peer.pid -> persona_id).  A subsequent
+        // `delegate_grant` from the same PID is bound to that persona
+        // without the caller having to assert `caller_persona_id`.
+        clear_pid_persona_registry();
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        // Use a synthetic PID — never reused by a real process during
+        // the test because the registry is thread-local and reset.
+        let caller_pid: i32 = 80_002;
+        let peer = PeerCred { uid: 1000, pid: Some(caller_pid) };
+
+        // Step 1: create_persona via Socket with the peer credential.
+        // Handler enrolls the (pid -> persona_id) pair.
+        let create_ctx = RequestContext {
+            source: DispatchSource::Socket,
+            peer: Some(peer),
+            principal: None,
+        };
+        let persona = dispatch_method_with_context(
+            &store, &vault, &policy, &rl, None, create_ctx,
+            "create_persona",
+            &json!({"name": "c3full-linux-caller"}),
+        )
+        .await
+        .unwrap();
+        let caller_persona_id = persona["id"].as_str().unwrap().to_string();
+
+        // Verify the enrollment landed.
+        let resolved = peercred_principal(&peer)
+            .expect("PID must resolve to enrolled persona on Linux");
+        assert_eq!(
+            resolved, caller_persona_id,
+            "peercred_principal must return the enrolled persona id"
+        );
+
+        // Step 2: build a parent grant owned by the enrolled persona
+        // via Internal (force=true requires Internal).  Then delegate
+        // via Socket from the same PID — must succeed without any
+        // caller_persona_id forgery.
+        let parent_grant = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "create_grant",
+            &json!({
+                "persona_id": caller_persona_id,
+                "credential_name": "c3full-linux-key",
+                "scope": "*",
+                "max_delegation_depth": 2,
+                "force": true,
+            }),
+        )
+        .await
+        .unwrap();
+        let parent_grant_id = parent_grant["id"].as_str().unwrap().to_string();
+
+        // child persona for the delegation target.
+        let child = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "create_persona",
+            &json!({"name": "c3full-linux-child"}),
+        )
+        .await
+        .unwrap();
+        let child_id = child["id"].as_str().unwrap().to_string();
+
+        let delegate_ctx = RequestContext {
+            source: DispatchSource::Socket,
+            peer: Some(peer),
+            principal: None,
+        };
+        let result = dispatch_method_with_context(
+            &store, &vault, &policy, &rl, None, delegate_ctx,
+            "delegate_grant",
+            &json!({
+                "parent_grant_id": parent_grant_id,
+                "child_persona_id": child_id,
+                "scope": "read",
+                // Caller may also assert caller_persona_id; if so, it
+                // must match the kernel principal.  Here we assert the
+                // correct value to exercise the matching branch.
+                "caller_persona_id": caller_persona_id,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            result["id"].as_str().unwrap_or("").starts_with("grant-"),
+            "Linux peercred-resolved owner must mint a grant, got: {result}"
+        );
+        assert_eq!(result["parent"], json!(parent_grant_id));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn macos_peercred_pid_none_fails_closed() {
+        // macOS LOCAL_PEERCRED does not always surface the peer PID.
+        // When pid is `None` we cannot derive a principal — the only
+        // safe move is to fail-closed with `PrincipalUnavailable`.
+        // Falling back to UID-only binding would let any same-UID
+        // process claim any persona, defeating the gate.
+        clear_pid_persona_registry();
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let (a_id, b_id, parent_grant_id) =
+            c3_setup_two_personas_and_grant(&store, &vault, &policy, &rl).await;
+        // Suppress unused warning when the kernel-principal path runs
+        // before the ownership check would have been hit.
+        let _ = a_id;
+
+        // Peer credential with no PID — the macOS edge case.
+        let ctx = RequestContext {
+            source: DispatchSource::Socket,
+            peer: Some(PeerCred { uid: 1000, pid: None }),
+            principal: None,
+        };
+
+        let before = store.list_active_grants().unwrap().len();
+
+        let err = dispatch_method_with_context(
+            &store, &vault, &policy, &rl, None, ctx,
+            "delegate_grant",
+            &json!({
+                "parent_grant_id": parent_grant_id,
+                "child_persona_id": b_id,
+                "scope": "read",
+                // Even with a "correct" caller_persona_id assertion,
+                // the daemon must still reject — pid=None means the
+                // principal is unverifiable, so we cannot trust ANY
+                // attacker-supplied caller_persona_id.
+                "caller_persona_id": b_id,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, -32401, "expected -32401 PrincipalUnavailable, got {err:?}");
+        assert!(
+            err.1.to_lowercase().contains("unavailable")
+                || err.1.to_lowercase().contains("principal"),
+            "error should mention principal unavailable, got: {}",
+            err.1
+        );
+
+        let after = store.list_active_grants().unwrap().len();
+        assert_eq!(
+            before, after,
+            "no child grant must be minted on macOS when pid is None"
+        );
+    }
+
+    #[test]
+    fn peercred_principal_returns_unavailable_when_pid_is_none() {
+        // Direct unit test of the peercred_principal helper — no
+        // dispatch overhead.  This is the single-source-of-truth for
+        // the macOS fail-closed semantics.
+        let peer = PeerCred { uid: 1000, pid: None };
+        match peercred_principal(&peer) {
+            Err(HandlerError::PrincipalUnavailable) => {}
+            other => panic!(
+                "expected PrincipalUnavailable for pid=None, got: {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn peercred_principal_returns_not_enrolled_for_unknown_pid() {
+        // Direct unit test: a PID with no enrollment yields
+        // `PrincipalNotEnrolled` — the caller has not yet established
+        // an identity in this daemon.
+        clear_pid_persona_registry();
+        let peer = PeerCred { uid: 1000, pid: Some(99_999) };
+        match peercred_principal(&peer) {
+            Err(HandlerError::PrincipalNotEnrolled) => {}
+            other => panic!(
+                "expected PrincipalNotEnrolled for un-enrolled PID, got: {other:?}"
+            ),
+        }
+    }
+
     fn minimal_req() -> ApprovalRequestInfo {
         ApprovalRequestInfo {
             id: "approval-0bc51eff-0000-0000-0000-000000000000".to_string(),
@@ -3733,6 +4317,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vault_get_round_trip_returns_plaintext_value() {
+        // implementation-note-29: pulumi-render.sh + similar headless
+        // integrations call `ember vault get` -> daemon RPC `vault_get`.
+        // This proves the RPC arm is wired and returns the decrypted
+        // value under the canonical {"value": ...} shape.
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+        dispatch_method(
+            &store, &vault, &policy, &rl,
+            "vault_add",
+            &json!({"name": "rpc-fetch-target", "value": "passphrase-42"}),
+        ).await.unwrap();
+        let result = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "vault_get",
+            &json!({"name": "rpc-fetch-target"}),
+        ).await.unwrap();
+        assert_eq!(result["value"], json!("passphrase-42"));
+    }
+
+    #[tokio::test]
+    async fn vault_get_missing_name_returns_invalid_params() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+        let err = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "vault_get",
+            &json!({}),
+        ).await.unwrap_err();
+        assert_eq!(err.0, -32602);
+    }
+
+    #[tokio::test]
+    async fn vault_get_unknown_name_returns_application_error() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+        let err = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "vault_get",
+            &json!({"name": "no-such-credential"}),
+        ).await.unwrap_err();
+        // Generic application error code (-32000) — vault.get returns
+        // VaultError::NotFound, mapped uniformly with other vault errors.
+        assert_eq!(err.0, -32000);
+    }
+
+    #[tokio::test]
     async fn vault_remove_via_socket_source_runs_under_dev_mode_gate() {
         // Even via Socket dispatch (where the gate WOULD run), the
         // cargo-test binary detection short-circuits the gate to Allowed
@@ -3757,5 +4394,99 @@ mod tests {
             &json!({"name": "seed"}),
         ).await.unwrap();
         assert_eq!(result["removed"], json!(true));
+    }
+
+    /// EMBER-implementation-note-28 integration test: emit synthetic kms_wrap receipts
+    /// for two actors, then verify `receipt_query` filters by actor and kind.
+    #[tokio::test]
+    async fn receipt_query_filters_by_actor_and_kind() {
+        use core_types::grant_receipt::{
+            Evidence, GrantEvaluation, GrantEvaluationOutcome, KmsReceipt,
+            ReceiptKind, ReceiptOutcome,
+        };
+        use crate::receipt::ReceiptFilter;
+
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        // Create two personas.
+        let actor_a = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "create_persona", &json!({"name": "audit-actor-a"}),
+        ).await.unwrap();
+        let actor_a_id = actor_a["id"].as_str().unwrap().to_string();
+
+        let actor_b = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "create_persona", &json!({"name": "audit-actor-b"}),
+        ).await.unwrap();
+        let actor_b_id = actor_b["id"].as_str().unwrap().to_string();
+
+        let eval_denied = GrantEvaluation {
+            outcome: GrantEvaluationOutcome::Denied,
+            grant_id: None,
+        };
+
+        // Insert a synthetic kms_wrap receipt for actor_a.
+        let kms_a = KmsReceipt {
+            id: "kms-wrap-audit-a".to_string(),
+            kind: ReceiptKind::KmsWrap,
+            key_name: "test-key".to_string(),
+            caller_persona: actor_a_id.clone(),
+            request_size_bytes: 32,
+            materialized_at_epoch_secs: 0,
+            grant_evaluation: eval_denied.clone(),
+            outcome: ReceiptOutcome::Success,
+            evidence: Evidence::default(),
+        };
+        store.store_kms_receipt(&kms_a).unwrap();
+
+        // Insert a synthetic kms_wrap receipt for actor_b.
+        let kms_b = KmsReceipt {
+            id: "kms-wrap-audit-b".to_string(),
+            kind: ReceiptKind::KmsWrap,
+            key_name: "test-key".to_string(),
+            caller_persona: actor_b_id.clone(),
+            request_size_bytes: 32,
+            materialized_at_epoch_secs: 0,
+            grant_evaluation: eval_denied,
+            outcome: ReceiptOutcome::Success,
+            evidence: Evidence::default(),
+        };
+        store.store_kms_receipt(&kms_b).unwrap();
+
+        // receipt_query with no filter returns both.
+        let all = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "receipt_query", &json!({}),
+        ).await.unwrap();
+        assert_eq!(all.as_array().unwrap().len(), 2, "no filter → both rows");
+
+        // receipt_query filtered to actor_a returns exactly one row.
+        let actor_a_rows = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "receipt_query", &json!({"actor": actor_a_id}),
+        ).await.unwrap();
+        let arr = actor_a_rows.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "actor filter → one row for actor_a");
+        assert_eq!(arr[0]["actor"].as_str().unwrap(), actor_a_id.as_str());
+
+        // receipt_query filtered to kind=kms_wrap returns both (no actor filter).
+        let kms_rows = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "receipt_query", &json!({"kind": "kms_wrap"}),
+        ).await.unwrap();
+        assert_eq!(kms_rows.as_array().unwrap().len(), 2, "kind=kms_wrap → both rows");
+
+        // Validate via store directly (acceptance: per-actor indexes confirmed).
+        let direct = store.query_receipts(&ReceiptFilter {
+            persona_id: Some(actor_b_id.clone()),
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(direct.len(), 1);
+        assert_eq!(direct[0].actor, actor_b_id);
+        assert_eq!(direct[0].kind, "kms_wrap");
     }
 }

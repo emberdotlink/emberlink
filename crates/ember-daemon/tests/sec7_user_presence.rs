@@ -48,7 +48,7 @@ fn sec7_set_then_get_round_trips_under_user_presence() {
     let account = format!("sec7-live-{}", uuid::Uuid::new_v4());
     let passphrase = "sec7-roundtrip-passphrase";
 
-    // First write — attaches kSecAttrAccessControl=USER_PRESENCE.
+    // First write — attaches kSecAttrAccessControl=BiometryAny|Or|DevicePasscode.
     vault_macos::set_password_user_presence(PROD_SERVICE, &account, passphrase)
         .expect("set_password_user_presence");
 

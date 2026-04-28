@@ -4,13 +4,17 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use emberlink_relay::{
-    Command, RelayConfig, RelayState, ShutdownNotice, StoredOffer,
-    admit_submission_payload, handle_claim_offer, handle_deposit_offer,
+    AdmittedRequest, Command, RelayConfig, RelayState, ShutdownNotice, StoredOffer,
+    admission, admit_submission_payload, handle_claim_offer, handle_deposit_offer,
     handle_fetch_and_claim_offer, handle_fetch_grant_requests, handle_fetch_offer,
     handle_request_grant, handle_respond_grant_request, now_epoch_secs, offer_admission_ok,
     parse_command, run_health_server, run_ws_listener,
     tls::{self, RelayStream, TlsMode},
 };
+
+fn test_admitted(persona: &str, scope: &str) -> AdmittedRequest {
+    admission::gate(None, Some(persona), Some(scope)).expect("test gate admits")
+}
 use core_crypto::{FixtureSigner, Signer as CryptoSigner};
 use core_sync::wrap_for_relay;
 use core_types::{AdmissionToken, RelayMode, TrustThreshold};
@@ -600,7 +604,8 @@ fn offer_deposit_fetch_claim_lifecycle() {
     let s = Arc::clone(&state);
     let oid = offer_id.clone();
     let buf = with_loopback(move |stream| {
-        handle_fetch_offer(stream, &s, &oid);
+        let admitted = test_admitted("anon", &oid);
+        handle_fetch_offer(stream, &s, &oid, &admitted);
     });
     let resp = read_response(&buf);
     let expected_hex = hex::encode(&payload);
@@ -622,7 +627,8 @@ fn offer_deposit_fetch_claim_lifecycle() {
     let s = Arc::clone(&state);
     let oid = offer_id.clone();
     let buf = with_loopback(move |stream| {
-        handle_fetch_offer(stream, &s, &oid);
+        let admitted = test_admitted("anon", &oid);
+        handle_fetch_offer(stream, &s, &oid, &admitted);
     });
     assert_eq!(read_response(&buf), "CLAIMED");
 
@@ -639,7 +645,8 @@ fn offer_deposit_fetch_claim_lifecycle() {
 fn fetch_unknown_offer_returns_not_found() {
     let state = Arc::new(Mutex::new(RelayState::default()));
     let buf = with_loopback(move |stream| {
-        handle_fetch_offer(stream, &state, "offer-does-not-exist");
+        let admitted = test_admitted("anon", "offer-does-not-exist");
+        handle_fetch_offer(stream, &state, "offer-does-not-exist", &admitted);
     });
     assert_eq!(read_response(&buf), "NOT-FOUND");
 }
@@ -700,7 +707,8 @@ fn expired_offers_are_purged_on_next_operation() {
     // Fetching the stale offer triggers purge; it is gone.
     let s = Arc::clone(&state);
     let buf = with_loopback(move |stream| {
-        handle_fetch_offer(stream, &s, "offer-stale");
+        let admitted = test_admitted("anon", "offer-stale");
+        handle_fetch_offer(stream, &s, "offer-stale", &admitted);
     });
     assert_eq!(read_response(&buf), "NOT-FOUND");
     assert!(!state.lock().unwrap().offers.contains_key("offer-stale"));

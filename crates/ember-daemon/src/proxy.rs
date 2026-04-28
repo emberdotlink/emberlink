@@ -918,8 +918,13 @@ pub async fn handle_request(
     let resolved_sid: String;
     let resolved_stmt: core_types::Statement;
     if let Some((action, resource)) = request_to_action_resource(req.method(), &effective_uri) {
-        match resolve_statement_for_request(&access_grant, &action, &resource) {
-            None => {
+        match resolve_statement_for_request_with_uri(
+            &access_grant,
+            &action,
+            &resource,
+            &effective_uri,
+        ) {
+            ResolveOutcome::NoApplicable => {
                 tracing::warn!(
                     grant_id = %grant.id,
                     persona_id = %persona_id,
@@ -939,7 +944,33 @@ pub async fn handle_request(
                 }
                 return Ok(no_applicable_statement_response());
             }
-            Some((_i, stmt)) => {
+            ResolveOutcome::SubtargetMiss { subtarget_glob } => {
+                // P69E.5c: primary matched but subtarget glob did not.
+                // Distinct audit outcome so operators can tell branch-scope
+                // denials apart from generic no-applicable-statement.
+                tracing::warn!(
+                    grant_id = %grant.id,
+                    persona_id = %persona_id,
+                    credential = %credential_name,
+                    action = %action,
+                    resource = %resource,
+                    subtarget = %subtarget_glob,
+                    "subtarget scope mismatch — denying"
+                );
+                if let Err(e) = state.store.log_event(
+                    Some(&persona_id),
+                    "credential.access",
+                    Some(&credential_name),
+                    "denied_subtarget_scope",
+                    Some(&format!(
+                        "action={action} resource={resource} subtarget_glob={subtarget_glob}"
+                    )),
+                ) {
+                    tracing::warn!(error = ?e, persona_id = %persona_id, credential = %credential_name, action = %action, resource = %resource, "log_event failed");
+                }
+                return Ok(scope_violation_response());
+            }
+            ResolveOutcome::Match { index: _, stmt } => {
                 resolved_sid = stmt.sid.clone();
                 resolved_stmt = stmt.clone();
             }
@@ -1084,7 +1115,8 @@ pub async fn handle_request(
         Err(e) => return Err(ProxyError::Vault(e)),
     };
 
-    let credential_value = String::from_utf8_lossy(&credential_bytes).into_owned();
+    let credential_value: Zeroizing<String> =
+        Zeroizing::new(String::from_utf8_lossy(&credential_bytes).into_owned());
 
     // Log the access
     if let Err(e) = state.store.log_event(
@@ -1148,7 +1180,7 @@ pub async fn handle_request(
         );
         build_github_basic_auth(&credential_value)
     } else {
-        format!("Bearer {credential_value}")
+        format!("Bearer {}", &*credential_value)
     };
 
     let outgoing_req = outgoing
@@ -1233,19 +1265,18 @@ pub async fn handle_request(
         let meter_credential = credential_name.clone();
         let meter_host = target_host.clone();
         let meter_cb = TeeMeterCallback::new(
-            move |accumulated: &[u8], tee_outcome: StreamOutcome| {
-                // If the body is Anthropic SSE, the wire format itself
-                // tells us whether the final `message_stop` arrived — so
-                // even when the TCP stream ended cleanly we treat a
-                // missing terminal event as `Partial` (upstream-side
-                // truncation). Non-SSE bodies keep the tee-level
-                // outcome unchanged: clean EOF == Complete, cap/error ==
-                // Partial.
+            move |summary: pricing::UsageSummary, tee_outcome: StreamOutcome| {
+                // development milestone: the SSE wire format itself tells
+                // us whether `message_stop` arrived. With incremental
+                // parsing the flag is already on `UsageSummary`, so we
+                // can downgrade Complete → Partial without a second
+                // pass over the bytes (which we no longer keep). The
+                // downgrade only applies to Anthropic streams; non-SSE
+                // bodies keep the tee-level outcome unchanged.
                 let outcome = if tee_outcome == StreamOutcome::Complete
                     && pricing::provider_for_host(&meter_host)
                         == Some(pricing::PROVIDER_ANTHROPIC)
-                    && let Some(summary) =
-                        pricing::parse_anthropic_sse_usage(accumulated)
+                    && summary.saw_any_usage
                     && !summary.saw_message_stop
                 {
                     StreamOutcome::Partial
@@ -1253,7 +1284,7 @@ pub async fn handle_request(
                     tee_outcome
                 };
 
-                run_post_flight_meter(
+                run_post_flight_meter_from_summary(
                     &meter_state,
                     &meter_grant_id,
                     &meter_sid,
@@ -1261,7 +1292,7 @@ pub async fn handle_request(
                     &meter_persona,
                     &meter_credential,
                     &meter_host,
-                    accumulated,
+                    &summary,
                     outcome,
                 );
             },
@@ -1388,7 +1419,7 @@ impl StreamOutcome {
     }
 }
 
-/// C44-implementation-note-19: short, stable hash of a credential alias for
+/// C44-implementation-note-30: short, stable hash of a credential alias for
 /// emission into the audit log's `credential` column.
 ///
 /// Returns `credname-<first 16 hex of sha256>` — enough entropy to avoid
@@ -1430,7 +1461,7 @@ fn run_post_flight_meter(
     // `statement_usage` is identical for both cases; the audit record is
     // where the distinction lives.
     //
-    // C44-implementation-note-19: the `credential` audit column stores a short
+    // C44-implementation-note-30: the `credential` audit column stores a short
     // hash of the credential alias, not the raw alias. Raw aliases would
     // let anyone with audit-log read access correlate persona ↔ credential
     // across rows, breaking persona isolation. The raw alias still lives
@@ -1496,18 +1527,130 @@ fn run_post_flight_meter(
     }
 }
 
-type TeeMeterFn = dyn FnOnce(&[u8], StreamOutcome);
+/// Variant of `run_post_flight_meter` that consumes a structured
+/// `UsageSummary` produced by the incremental SSE parser.
+///
+/// development milestone: with the streaming parser, `TeeBody` no longer
+/// holds the raw response bytes. The meter must work from the parsed
+/// summary directly. The non-streaming JSON path still uses the
+/// byte-slice `run_post_flight_meter` because its body genuinely is
+/// available as a single `Bytes`.
+#[allow(clippy::too_many_arguments)]
+fn run_post_flight_meter_from_summary(
+    state: &ProxyState,
+    grant_id: &str,
+    statement_sid: &str,
+    resolved_stmt: &core_types::Statement,
+    persona_id: &str,
+    credential_name: &str,
+    target_host: &str,
+    summary: &pricing::UsageSummary,
+    outcome: StreamOutcome,
+) {
+    let Some(delta) = usage_from_summary(target_host, summary) else {
+        return;
+    };
+    // The audit + increment paths below mirror `run_post_flight_meter`
+    // verbatim — keep in sync if either evolves.
+    let credential_hash = hash_credential_name_for_audit(credential_name);
+    match state.store.log_event(
+        Some(persona_id),
+        "proxy.meter",
+        Some(&credential_hash),
+        outcome.audit_tag(),
+        Some(&format!(
+            "grant_id={grant_id} sid={statement_sid} tokens={} cents={}",
+            delta.tokens, delta.cents
+        )),
+    ) {
+        Ok(_) => {}
+        Err(e) => tracing::warn!(
+            error = ?e,
+            grant_id = %grant_id,
+            sid = %statement_sid,
+            "proxy.meter audit log_event failed"
+        ),
+    }
+    match state
+        .store
+        .increment_statement_usage(grant_id, statement_sid, delta)
+    {
+        Ok(delta) => {
+            if let Some(budget) = &resolved_stmt.budget {
+                emit_threshold_crossings(
+                    state,
+                    grant_id,
+                    statement_sid,
+                    persona_id,
+                    credential_name,
+                    budget,
+                    &delta.prior,
+                    &delta.current,
+                );
+            }
+            let _ = state
+                .store
+                .mark_grant_exhausted_by_budget_if_terminal(grant_id);
+        }
+        Err(e) => {
+            tracing::warn!(
+                grant_id = %grant_id,
+                sid = %statement_sid,
+                error = ?e,
+                "failed to increment statement usage (metering skipped)"
+            );
+        }
+    }
+}
+
+/// Compute a `core_types::Usage` delta from an incremental `UsageSummary`.
+/// Returns `None` for non-LLM hosts or when the summary saw no usage at
+/// all — matches the byte-slice `meter_response` semantics so the audit
+/// trail and budget machinery behave identically across the two paths.
+pub fn usage_from_summary(
+    target_host: &str,
+    summary: &pricing::UsageSummary,
+) -> Option<core_types::Usage> {
+    let provider = pricing::provider_for_host(target_host)?;
+    if !summary.saw_any_usage {
+        return None;
+    }
+    let folded = summary.folded_usage();
+    let model = summary.model.clone().unwrap_or_default();
+    let cents = pricing::cents_for(
+        &model,
+        provider,
+        folded.input_tokens,
+        folded.output_tokens,
+    );
+    Some(core_types::Usage {
+        tokens: folded.input_tokens.saturating_add(folded.output_tokens),
+        cents,
+        requests: 1,
+        workload_hours: 0,
+        wall_clock_secs: 0,
+        last_updated: 0,
+    })
+}
+
+type TeeMeterFn = dyn FnOnce(pricing::UsageSummary, StreamOutcome);
 
 /// Callback invoked by `TeeBody` when the upstream stream ends (cleanly or
-/// via the size cap). Carries the accumulated body bytes so the post-flight
-/// meter can run against the full response even though we never buffered
-/// it into a single `Bytes` for the client leg.
+/// via the size cap).
+///
+/// development milestone: the callback used to receive the full byte buffer
+/// `(&[u8], StreamOutcome)`. That forced `TeeBody` to accumulate every
+/// upstream byte up to a 1 MiB cap — N concurrent stalled streams was
+/// `N * 1 MiB` of pinned RSS. The signature now takes a structured
+/// `UsageSummary` produced by the incremental SSE parser, so per-stream
+/// memory is bounded at `SSE_PARTIAL_FRAME_CAP_BYTES` (8 KiB) regardless
+/// of stream length.
 struct TeeMeterCallback {
     inner: Option<Box<TeeMeterFn>>,
 }
 
 impl TeeMeterCallback {
-    fn new<F: FnOnce(&[u8], StreamOutcome) + 'static>(f: F) -> Self {
+    fn new<F: FnOnce(pricing::UsageSummary, StreamOutcome) + 'static>(f: F) -> Self {
         Self {
             inner: Some(Box::new(f)),
         }
@@ -1516,26 +1659,39 @@ impl TeeMeterCallback {
     /// Consume the callback and run the meter exactly once. Subsequent
     /// calls are no-ops — defends against `poll_frame` returning
     /// `Ready(None)` after a cap-abort already fired the meter.
-    fn fire(&mut self, body: &[u8], outcome: StreamOutcome) {
+    fn fire(&mut self, summary: pricing::UsageSummary, outcome: StreamOutcome) {
         if let Some(f) = self.inner.take() {
-            f(body, outcome);
+            f(summary, outcome);
         }
     }
 }
 
 /// Streaming response body that (a) forwards each upstream frame to the
-/// client as it arrives and (b) accumulates the raw bytes so post-flight
-/// metering can run against the full response. Size cap mirrors
-/// `MAX_STREAMING_RESPONSE_BYTES` — when the accumulator grows past the
-/// cap the stream is ended early and the meter fires against whatever was
-/// collected up to that point (so an abusive upstream still has partial
-/// usage accounted).
+/// client as it arrives and (b) feeds an incremental SSE parser so
+/// post-flight metering runs against a structured `UsageSummary` rather
+/// than a raw byte buffer.
+///
+/// development milestone: this struct used to hold a `Vec<u8> accumulator`
+/// capped at `MAX_STREAMING_RESPONSE_BYTES` (1 MiB). N concurrent stalled
+/// streams pinned `N * 1 MiB` of RSS and the meter could only see usage
+/// after the full body had been buffered. The accumulator is gone — only
+/// the parser's internal partial-frame buffer (≤ 8 KiB) lives alongside
+/// the body. Total bytes streamed are still tracked against `cap_bytes`
+/// for DoS protection (an abusive upstream that streams gigabytes of
+/// junk still trips the cap), but the cap is on a counter, not a buffer.
 ///
 /// Generic over the underlying body type so tests can feed a channel-backed
 /// mock without needing a real `hyper::body::Incoming`.
 pub struct TeeBody<B> {
     inner: B,
-    accumulator: Vec<u8>,
+    /// Incremental SSE parser. Owns a bounded partial-frame buffer
+    /// (`SSE_PARTIAL_FRAME_CAP_BYTES` = 8 KiB) and the running
+    /// `UsageSummary`. Replaces the old raw-byte accumulator.
+    parser: pricing::AnthropicSseStreamParser,
+    /// Total upstream bytes seen — cap protects the daemon against an
+    /// abusive upstream that streams unbounded junk. Counter only; the
+    /// bytes themselves are not retained.
+    bytes_seen: usize,
     cap_bytes: usize,
     meter: TeeMeterCallback,
     /// `true` once the stream has emitted its terminal frame (success,
@@ -1572,13 +1728,21 @@ impl<B> TeeBody<B> {
     ) -> Self {
         Self {
             inner,
-            accumulator: Vec::new(),
+            parser: pricing::AnthropicSseStreamParser::new(),
+            bytes_seen: 0,
             cap_bytes,
             meter,
             terminated: false,
             cap_exceeded: false,
             _slot: slot,
         }
+    }
+
+    /// Test-only accessor for the parser's bounded partial-frame buffer
+    /// size — used to assert the per-stream memory invariant.
+    #[cfg(test)]
+    fn buffered_bytes(&self) -> usize {
+        self.parser.buffered_bytes()
     }
 }
 
@@ -1600,11 +1764,12 @@ where
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => {
                 // Clean upstream EOF. The body-level outcome is `Complete`;
-                // if the body shape (SSE) lacks a terminal marker, the
-                // meter callback will downgrade to `Partial` after parsing.
+                // if the body shape (SSE) lacks a terminal `message_stop`,
+                // the meter callback downgrades to `Partial` based on the
+                // structured `UsageSummary` (no second pass over bytes).
                 self.terminated = true;
-                let bytes = std::mem::take(&mut self.accumulator);
-                self.meter.fire(&bytes, StreamOutcome::Complete);
+                let summary = self.parser.take_summary();
+                self.meter.fire(summary, StreamOutcome::Complete);
                 Poll::Ready(None)
             }
             Poll::Ready(Some(Err(e))) => {
@@ -1612,28 +1777,32 @@ where
                 // cannot have seen the terminal frame. Still run the
                 // meter so usage up to the error is recorded.
                 self.terminated = true;
-                let bytes = std::mem::take(&mut self.accumulator);
-                self.meter.fire(&bytes, StreamOutcome::Partial);
+                let summary = self.parser.take_summary();
+                self.meter.fire(summary, StreamOutcome::Partial);
                 Poll::Ready(Some(Err(e)))
             }
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(chunk) = frame.data_ref() {
-                    let new_len = self.accumulator.len().saturating_add(chunk.len());
-                    if new_len > self.cap_bytes {
+                    let new_total = self.bytes_seen.saturating_add(chunk.len());
+                    if new_total > self.cap_bytes {
                         tracing::warn!(
                             cap = self.cap_bytes,
-                            observed = new_len,
+                            observed = new_total,
                             "proxy streaming response exceeded size cap — aborting"
                         );
                         self.terminated = true;
                         self.cap_exceeded = true;
-                        let bytes = std::mem::take(&mut self.accumulator);
+                        let summary = self.parser.take_summary();
                         // Cap abort is always partial — we deliberately
                         // cut the stream short to protect daemon memory.
-                        self.meter.fire(&bytes, StreamOutcome::Partial);
+                        self.meter.fire(summary, StreamOutcome::Partial);
                         return Poll::Ready(None);
                     }
-                    self.accumulator.extend_from_slice(chunk);
+                    self.bytes_seen = new_total;
+                    // Feed the parser incrementally — bounded partial-frame
+                    // buffer absorbs cross-chunk frame splits while the
+                    // running summary stays current.
+                    self.parser.feed(chunk);
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
@@ -1901,6 +2070,107 @@ pub fn resolve_statement_for_request<'a>(
             other => other.covers(resource),
         }
     })
+}
+
+/// Outcome of subtarget-aware per-Statement resolution.
+///
+/// `Match` is the success path: the resolver found an applicable statement
+/// and (if the statement carried a `GlobWithSubtarget`) the subtarget glob
+/// matched the request's branch. `SubtargetMiss` means primary matched but
+/// the request's branch failed the subtarget glob — caller should deny
+/// with `denied_subtarget_scope`. `NoApplicable` is the catch-all "no
+/// statement applies" case → `denied_no_applicable_statement`.
+#[derive(Debug)]
+pub(crate) enum ResolveOutcome<'a> {
+    Match {
+        // P69E.5c: kept for parity with `resolve_statement_for_request`'s
+        // `(usize, &Statement)` shape; callers that meter against the
+        // resolved statement may want the chain index.
+        #[allow(dead_code)]
+        index: usize,
+        stmt: &'a core_types::Statement,
+    },
+    SubtargetMiss {
+        subtarget_glob: String,
+    },
+    NoApplicable,
+}
+
+/// Subtarget-aware variant of [`resolve_statement_for_request`] (P69E.5c).
+///
+/// Walks the chain in order. For each statement that passes
+/// `applicable_to(action, resource)`:
+/// - if it has no subtarget → return `Match`.
+/// - if it has a subtarget AND a request branch was extractable from the
+///   URI AND that branch matches the subtarget glob → return `Match`.
+/// - if it has a subtarget but the URI carries no branch OR the branch
+///   does not match the glob → record `SubtargetMiss` and keep walking,
+///   so a less-restrictive later statement can still match.
+///
+/// Returning `SubtargetMiss` only when no later statement matched routes
+/// the caller to emit `denied_subtarget_scope`, distinguishing this from
+/// the generic `denied_no_applicable_statement`.
+pub(crate) fn resolve_statement_for_request_with_uri<'a>(
+    grant: &'a core_types::AccessGrant,
+    action: &str,
+    resource: &str,
+    uri: &hyper::Uri,
+) -> ResolveOutcome<'a> {
+    use core_types::ResourceSelector;
+
+    let mut subtarget_miss: Option<String> = None;
+
+    for (idx, stmt) in grant.statements() {
+        let action_ok = stmt.actions.iter().any(|a| a == action || a == "*");
+        if !action_ok {
+            continue;
+        }
+
+        // Credential-fallback: an Exact bare-ident selector means "credential
+        // surface only" — request URI never equals a credential name, so
+        // we treat the selector as Any once the action agrees.
+        let primary_ok = match &stmt.resource {
+            ResourceSelector::Exact { value }
+                if !value.contains('/') && !value.starts_with('/') =>
+            {
+                true
+            }
+            other => other.covers(resource),
+        };
+        if !primary_ok {
+            continue;
+        }
+
+        // Primary matched. Check subtarget if the selector carries one.
+        if let Some(sub_glob) = stmt.resource.subtarget_glob() {
+            // Branch extraction is currently github-only. For non-github
+            // providers we fail closed on the subtarget axis and record
+            // the miss, mirroring `subtarget_matches`.
+            let branch = extract_github_branch(uri);
+            let subtarget_ok = match branch {
+                Some(b) => glob_match_branch(sub_glob, &b),
+                None => false,
+            };
+            if subtarget_ok {
+                return ResolveOutcome::Match { index: idx, stmt };
+            } else {
+                // Record the first subtarget-miss reason so the caller
+                // can route to `denied_subtarget_scope` if no later
+                // statement covers the request.
+                if subtarget_miss.is_none() {
+                    subtarget_miss = Some(sub_glob.to_string());
+                }
+                continue;
+            }
+        }
+
+        return ResolveOutcome::Match { index: idx, stmt };
+    }
+
+    match subtarget_miss {
+        Some(sg) => ResolveOutcome::SubtargetMiss { subtarget_glob: sg },
+        None => ResolveOutcome::NoApplicable,
+    }
 }
 
 /// Outcome of `preflight_budget_check`. `Allowed` → forward upstream;
@@ -2507,10 +2777,13 @@ enum GlobTok<'a> {
 ///   matches `release/v2`, `release/v2/hotfix`, and `release/`.
 /// * Everything else matches literally; comparisons are case-sensitive.
 ///
-/// Implementation: tokenise the pattern into runs of literal characters,
-/// single-`*` wildcards, and double-`**` wildcards, then run a standard
-/// backtracking matcher. Pattern length in practice is tiny (branch globs)
-/// so the worst-case complexity is acceptable.
+/// Implementation (security check): tokenise the pattern, then run an iterative
+/// reachability-based matcher (DP over `(token_idx, byte_pos)` states).
+/// The previous recursive backtracking implementation could blow up
+/// exponentially on adversarial patterns like `**/a/**/b/**/c/**/d/**/e`
+/// (multiple non-adjacent `**` segments) — a single attacker-supplied URI
+/// could pin the daemon's single-threaded `LocalSet` for seconds. The DP
+/// version is O(|toks| * |s|) worst-case and bounded.
 fn glob_match_branch(pattern: &str, s: &str) -> bool {
     // Tokenise.
     let bytes = pattern.as_bytes();
@@ -2535,8 +2808,8 @@ fn glob_match_branch(pattern: &str, s: &str) -> bool {
     }
 
     // Collapse adjacent stars so that `***` or `* *` reductions don't cause
-    // exponential blowup in the recursive matcher. `**` absorbs any adjacent
-    // `*`; two adjacent `*`s collapse to one (neither can cross `/`).
+    // redundant work in the matcher. `**` absorbs any adjacent `*`; two
+    // adjacent `*`s collapse to one (neither can cross `/`).
     let mut collapsed: Vec<GlobTok<'_>> = Vec::with_capacity(toks.len());
     for t in toks {
         match (collapsed.last(), &t) {
@@ -2555,37 +2828,102 @@ fn glob_match_branch(pattern: &str, s: &str) -> bool {
         }
     }
 
-    glob_match_recurse(&collapsed, s)
+    glob_match_iter(&collapsed, s)
 }
 
-fn glob_match_recurse(toks: &[GlobTok<'_>], s: &str) -> bool {
-    if toks.is_empty() {
-        return s.is_empty();
-    }
-    match &toks[0] {
-        GlobTok::Literal(lit) => s
-            .strip_prefix(*lit)
-            .is_some_and(|rest| glob_match_recurse(&toks[1..], rest)),
-        GlobTok::Star => {
-            // Match any prefix of s that does not contain '/'.
-            let limit = s.find('/').unwrap_or(s.len());
-            for split in 0..=limit {
-                if s.is_char_boundary(split) && glob_match_recurse(&toks[1..], &s[split..]) {
-                    return true;
+/// Iterative reachability-based glob matcher. Replaces the prior recursive
+/// backtracking impl which had exponential worst-case behaviour on
+/// non-adjacent `**` patterns (security check / CPU DoS).
+///
+/// State = `(tok_idx, byte_pos)`. We compute reachable states as a 2D grid
+/// `reach[tok_idx][byte_pos]`. Transitions:
+///
+/// * `Literal(lit)`: `(i, p) → (i+1, p+lit.len())` iff `s[p..]` starts with
+///   `lit`.
+/// * `Star`: stay at the same token while consuming a non-`/` char
+///   (`(i, p) → (i, p+ch_len)` if `s[p]` ∉ `/`), and skip the token without
+///   consuming (`(i, p) → (i+1, p)`).
+/// * `DoubleStar`: stay at the same token while consuming any char
+///   (`(i, p) → (i, p+ch_len)`), and skip without consuming
+///   (`(i, p) → (i+1, p)`).
+///
+/// Match iff `(toks.len(), s.len())` is reachable. Each state visited at
+/// most once → O(|toks| * |s|) time.
+fn glob_match_iter(toks: &[GlobTok<'_>], s: &str) -> bool {
+    let n_tok = toks.len();
+    let n_str = s.len();
+
+    // reach[i][p] = state (i, p) reachable.
+    let mut reach = vec![vec![false; n_str + 1]; n_tok + 1];
+    reach[0][0] = true;
+
+    // Precompute char boundaries: for each byte p where p..p+ch_len is a
+    // valid UTF-8 char, store the next boundary. Otherwise None.
+    let bytes = s.as_bytes();
+
+    for i in 0..=n_tok {
+        for p in 0..=n_str {
+            if !reach[i][p] {
+                continue;
+            }
+            if i == n_tok {
+                // No more tokens; nothing to expand.
+                continue;
+            }
+            match &toks[i] {
+                GlobTok::Literal(lit) => {
+                    let lit_b = lit.as_bytes();
+                    if p + lit_b.len() <= n_str && &bytes[p..p + lit_b.len()] == lit_b {
+                        reach[i + 1][p + lit_b.len()] = true;
+                    }
+                }
+                GlobTok::Star => {
+                    // Skip without consuming.
+                    reach[i + 1][p] = true;
+                    // Consume one char if it's not '/' and we're at a char
+                    // boundary. (s.is_char_boundary(p) is true for any p
+                    // where reach[i][p] is set, by induction.)
+                    if p < n_str && bytes[p] != b'/' {
+                        // Find next char boundary.
+                        let next = next_char_boundary(s, p);
+                        reach[i][next] = true;
+                    }
+                }
+                GlobTok::DoubleStar => {
+                    // Skip without consuming.
+                    reach[i + 1][p] = true;
+                    // Consume one char (any).
+                    if p < n_str {
+                        let next = next_char_boundary(s, p);
+                        reach[i][next] = true;
+                    }
                 }
             }
-            false
-        }
-        GlobTok::DoubleStar => {
-            // Match any prefix of s, including those that contain '/'.
-            for split in 0..=s.len() {
-                if s.is_char_boundary(split) && glob_match_recurse(&toks[1..], &s[split..]) {
-                    return true;
-                }
-            }
-            false
         }
     }
+
+    reach[n_tok][n_str]
+}
+
+/// Given a byte index `p` that is a char boundary in `s` and `p < s.len()`,
+/// return the next char boundary. UTF-8 chars are 1-4 bytes.
+fn next_char_boundary(s: &str, p: usize) -> usize {
+    let bytes = s.as_bytes();
+    let b0 = bytes[p];
+    let len = if b0 < 0x80 {
+        1
+    } else if b0 < 0xC0 {
+        // Invalid lead byte (continuation); treat as 1 to make progress.
+        // Should not occur for valid UTF-8 strings.
+        1
+    } else if b0 < 0xE0 {
+        2
+    } else if b0 < 0xF0 {
+        3
+    } else {
+        4
+    };
+    (p + len).min(s.len())
 }
 
 /// Tiny glob matcher supporting `*` as "any run of characters". No `?`, no
@@ -2881,7 +3219,7 @@ pub struct GitEchoConfig {
 /// Exposed `pub` so a separate test binary or an `#[ignore]`-d integration
 /// test can spawn it without reaching into daemon state.
 ///
-/// `bind_tx` (implementation-note-10): when `Some`, the bound `SocketAddr` is sent
+/// `bind_tx` (implementation-note-19): when `Some`, the bound `SocketAddr` is sent
 /// exactly once immediately after `TcpListener::bind` succeeds. Bind errors
 /// are sent as `Err` and the function returns. The receiver gets the actual
 /// local addr (so `127.0.0.1:0` callers can read the assigned port). If the
@@ -2904,12 +3242,18 @@ pub async fn run_git_echo_proxy(
             // Mirror dashboard's "best effort to surface, then propagate"
             // pattern. We deliver the error to `bind_tx` if present, then
             // return ProxyError so the spawning task records a non-zero exit.
-            tracing::warn!(addr = %config.bind_addr, error = %e, "git echo proxy failed to bind");
+            //
+            // P69E.8b: annotate `AddrInUse` failures with `lsof -i :<port>` +
+            // daemon-stop hints so operators have an actionable path forward
+            // instead of an opaque "Address already in use" log line.
+            let annotated =
+                crate::socket::annotate_bind_error(e, &config.bind_addr.to_string());
+            tracing::warn!(addr = %config.bind_addr, error = %annotated, "git echo proxy failed to bind");
             if let Some(tx) = bind_tx {
-                let kind = e.kind();
-                let _ = tx.send(Err(std::io::Error::new(kind, e.to_string())));
+                let kind = annotated.kind();
+                let _ = tx.send(Err(std::io::Error::new(kind, annotated.to_string())));
             }
-            return Err(ProxyError::from(e));
+            return Err(ProxyError::from(annotated));
         }
     };
     // `GitEchoConfig` embeds `Arc<ProxyState>` which is `!Sync` (RefCell inside).
@@ -3127,11 +3471,12 @@ pub async fn handle_git_echo(
         }
         Err(e) => return Err(ProxyError::Vault(e)),
     };
-    let credential_value = String::from_utf8_lossy(&credential_bytes).into_owned();
+    let credential_value: Zeroizing<String> =
+        Zeroizing::new(String::from_utf8_lossy(&credential_bytes).into_owned());
 
     // P69L.0b--AUDIT: emit `credential.access` so operators can see
     // that a credential substitution occurred and which repo was targeted.
-    // `action` mirrors the shape from C44-implementation-note-19: "github.push.<owner/repo>".
+    // `action` mirrors the shape from C44-implementation-note-30: "github.push.<owner/repo>".
     tracing::info!(
         event = "credential.access",
         allowed = true,
@@ -3552,8 +3897,13 @@ mod tests {
         let resolved_sid: String;
         let resolved_stmt: core_types::Statement;
         if let Some((action, resource)) = request_to_action_resource(req.method(), &effective_uri) {
-            match resolve_statement_for_request(&access_grant, &action, &resource) {
-                None => {
+            match resolve_statement_for_request_with_uri(
+                &access_grant,
+                &action,
+                &resource,
+                &effective_uri,
+            ) {
+                ResolveOutcome::NoApplicable => {
                     tracing::warn!(
                         grant_id = %grant.id,
                         action = %action,
@@ -3571,7 +3921,28 @@ mod tests {
                     }
                     return Ok(no_applicable_statement_response());
                 }
-                Some((_i, stmt)) => {
+                ResolveOutcome::SubtargetMiss { subtarget_glob } => {
+                    tracing::warn!(
+                        grant_id = %grant.id,
+                        action = %action,
+                        resource = %resource,
+                        subtarget = %subtarget_glob,
+                        "subtarget scope mismatch — denying (test harness)"
+                    );
+                    if let Err(e) = state.store.log_event(
+                        Some(&persona_id),
+                        "credential.access",
+                        Some(&credential_name),
+                        "denied_subtarget_scope",
+                        Some(&format!(
+                            "action={action} resource={resource} subtarget_glob={subtarget_glob}"
+                        )),
+                    ) {
+                        tracing::warn!(error = ?e, persona_id = %persona_id, credential = %credential_name, action = %action, resource = %resource, "log_event failed");
+                    }
+                    return Ok(scope_violation_response());
+                }
+                ResolveOutcome::Match { index: _, stmt } => {
                     resolved_sid = stmt.sid.clone();
                     resolved_stmt = stmt.clone();
                 }
@@ -3691,7 +4062,8 @@ mod tests {
             Err(e) => return Err(ProxyError::Vault(e)),
         };
 
-        let credential_value = String::from_utf8_lossy(&credential_bytes).into_owned();
+        let credential_value: Zeroizing<String> =
+            Zeroizing::new(String::from_utf8_lossy(&credential_bytes).into_owned());
 
         // P69L.0a (test harness): mirror the production git-transport
         // detection so the test wrapper routes the same way.
@@ -4450,6 +4822,48 @@ mod tests {
         assert!(!glob_match_branch("release-*", "release-1/rc1"));
     }
 
+    /// security check: regression for catastrophic-backtracking glob patterns.
+    ///
+    /// The previous recursive matcher had exponential worst-case behaviour
+    /// when multiple non-adjacent `**` segments interacted with a
+    /// non-matching tail — each `**` independently tries every split, so
+    /// five `**` segments on a 50-char input could explode into ~50^5
+    /// recursive calls and pin the daemon's single-threaded `LocalSet` for
+    /// seconds. With the iterative (DP) matcher this is bounded by
+    /// |toks| * |s| ~= 11 * 50 = 550 state expansions, completing in
+    /// microseconds.
+    ///
+    /// Threshold: <100ms, with generous slack for CI noise. Locally a
+    /// successful match completes in ~50µs.
+    #[test]
+    fn glob_match_branch_no_catastrophic_backtracking() {
+        let pattern = "**/a/**/b/**/c/**/d/**/e";
+        // 50 chars, no slashes, no terminal 'e' — guaranteed mismatch.
+        let input = "x".repeat(50);
+
+        let start = std::time::Instant::now();
+        let matched = glob_match_branch(pattern, &input);
+        let elapsed = start.elapsed();
+
+        assert!(!matched, "pattern {pattern} must not match {input}");
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "glob_match_branch took {elapsed:?} on adversarial input \
+             (must be <100ms — backtracking regression)"
+        );
+
+        // Also verify a positive match on the same family of patterns
+        // still works correctly (semantics preserved). The leading `**`
+        // can match zero characters, but the literals `/a/`, `/b/` etc.
+        // still need to appear in order.
+        assert!(glob_match_branch(
+            "**/a/**/b/**/c",
+            "x/a/y/b/z/c"
+        ));
+        assert!(glob_match_branch("a/**/b/**/c", "a/x/b/y/c"));
+        assert!(!glob_match_branch("**/a/**/b/**/c", "a/b/c/extra"));
+    }
+
     #[test]
     fn subtarget_violation_carries_subtarget_audit_outcome() {
         // The ScopeViolation returned by a subtarget mismatch reports the
@@ -4477,6 +4891,137 @@ mod tests {
         let generic = check_scope("read", &hyper::Method::POST, &generic_uri).unwrap_err();
         assert_eq!(generic.kind, ScopeViolationKind::General);
         assert_eq!(generic.audit_outcome(), "denied_scope");
+    }
+
+    // ------------------------------------------------------------------
+    // P69E.5c — Composite selector subtarget routing
+    // ------------------------------------------------------------------
+    //
+    // A 4-segment legacy scope (`github:push:owner/repo:feat/*`) used to
+    // build a flat `ResourceSelector::Glob { pattern: "owner/repo:feat/*" }`,
+    // which a request resource like `owner/repo` could never match — the
+    // resolver always returned `NoApplicable` and the deny path emitted
+    // `denied_no_applicable_statement` instead of the more-specific
+    // `denied_subtarget_scope`. The fix: emit a structured
+    // `GlobWithSubtarget` and route the resolver to verify the subtarget
+    // glob against the request URI's branch.
+
+    fn grant_with_subtarget_scope(scope: &str) -> core_types::AccessGrant {
+        use core_types::{
+            AccessGrant, AttestationBinding, Block, GrantMode, GrantStatus,
+            PresentationAudienceKind, RecipientProfile, ResourceSelector, ResourceType,
+            SignedBlock, Statement, Usage,
+        };
+        // Mirror what `scope_to_actions_and_selector` produces for the
+        // 4-segment shape — a single statement with `GlobWithSubtarget`.
+        let parts: Vec<&str> = scope.split(':').collect();
+        assert_eq!(parts.len(), 4, "test fixture requires 4-segment scope");
+        let stmt = Statement {
+            sid: "S0".into(),
+            resource_type: ResourceType::Credential,
+            actions: vec![format!("{}:{}", parts[0], parts[1])],
+            resource: ResourceSelector::GlobWithSubtarget {
+                primary_glob: parts[2].into(),
+                subtarget_glob: parts[3].into(),
+            },
+            budget: None,
+            usage: Usage::default(),
+            conditions: Vec::new(),
+        };
+        let block = Block {
+            statements: vec![stmt],
+            nbf: None,
+            expires_at: None,
+            issued_by: "persona-sub".into(),
+            issued_at: 0,
+            approval: None,
+            note: None,
+        };
+        AccessGrant {
+            id: "grant-sub".into(),
+            version: 1,
+            issuing_persona_id: "persona-sub".into(),
+            recipient_kind: PresentationAudienceKind::Service,
+            recipient_id: "agent".into(),
+            recipient_profile: RecipientProfile::Agent,
+            status: GrantStatus::Active,
+            mode: GrantMode::OneShot,
+            blocks: vec![SignedBlock {
+                block,
+                pubkey_next: "x".into(),
+                signature: "x".into(),
+            }],
+            attestation: AttestationBinding::default(),
+            created_at: 0,
+            updated_at: 0,
+            revoked_at: None,
+            revoked_reason: None,
+            last_used_at: None,
+            label: None,
+        }
+    }
+
+    #[test]
+    fn subtarget_present_in_scope_routes_to_subtarget_match() {
+        // Scope `github:push:owner/repo:feat/*` against a request that
+        // targets `owner/repo` on branch `feat/foo`. The primary glob
+        // `owner/repo` matches the resource AND `feat/*` matches the
+        // branch — resolver should return `Match`, not `SubtargetMiss`
+        // and not `NoApplicable`.
+        let grant = grant_with_subtarget_scope("github:push:owner/repo:feat/*");
+        let uri: hyper::Uri =
+            "https://api.github.com/repos/owner/repo/branches/feat/foo"
+                .parse()
+                .unwrap();
+        let outcome = resolve_statement_for_request_with_uri(
+            &grant,
+            "github:push",
+            "owner/repo",
+            &uri,
+        );
+        match outcome {
+            ResolveOutcome::Match { stmt, .. } => {
+                assert_eq!(stmt.sid, "S0");
+            }
+            other => panic!(
+                "expected Match for primary+subtarget hit, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn subtarget_miss_returns_denied_subtarget_scope_not_no_applicable_statement() {
+        // Same scope, but the request branch `main` does NOT satisfy
+        // `feat/*`. Pre-fix the resolver returned `NoApplicable` because
+        // the flat glob could not match the colon-joined pattern at all;
+        // post-fix the resolver routes through the structured
+        // `GlobWithSubtarget` and reports `SubtargetMiss` so the deny
+        // path can emit `denied_subtarget_scope`.
+        let grant = grant_with_subtarget_scope("github:push:owner/repo:feat/*");
+        let uri: hyper::Uri =
+            "https://api.github.com/repos/owner/repo/branches/main"
+                .parse()
+                .unwrap();
+        let outcome = resolve_statement_for_request_with_uri(
+            &grant,
+            "github:push",
+            "owner/repo",
+            &uri,
+        );
+        match outcome {
+            ResolveOutcome::SubtargetMiss { subtarget_glob } => {
+                assert_eq!(subtarget_glob, "feat/*");
+            }
+            ResolveOutcome::NoApplicable => panic!(
+                "regression: subtarget mismatch fell through to NoApplicable; \
+                 the audit log would emit denied_no_applicable_statement \
+                 instead of denied_subtarget_scope"
+            ),
+            ResolveOutcome::Match { .. } => {
+                panic!("subtarget did not match branch — should not be Match");
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -6714,8 +7259,8 @@ mod tests {
     /// produced. Asserts:
     ///   1. Each chunk body equals what was sent (in order).
     ///   2. The arrival ordering matches send ordering (no buffering).
-    ///   3. The meter callback fires exactly once with the full
-    ///      concatenated body.
+    ///   3. The meter callback fires exactly once with a populated
+    ///      `UsageSummary` that reflects the streamed frames.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tee_body_forwards_chunks_as_they_arrive() {
         use std::sync::Mutex;
@@ -6723,11 +7268,13 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mock = ChannelBody { rx };
 
-        let captured: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+        let captured: Arc<Mutex<Option<pricing::UsageSummary>>> = Arc::new(Mutex::new(None));
         let meter_captured = Arc::clone(&captured);
-        let meter = TeeMeterCallback::new(move |bytes: &[u8], _outcome: StreamOutcome| {
-            *meter_captured.lock().unwrap() = Some(bytes.to_vec());
-        });
+        let meter = TeeMeterCallback::new(
+            move |summary: pricing::UsageSummary, _outcome: StreamOutcome| {
+                *meter_captured.lock().unwrap() = Some(summary);
+            },
+        );
 
         let mut tee = TeeBody::new(mock, MAX_STREAMING_RESPONSE_BYTES, meter);
 
@@ -6787,14 +7334,17 @@ mod tests {
             arrivals[2].0
         );
 
-        // 3. Meter callback fired exactly once with the concatenated
-        //    body.
-        let captured_bytes = captured.lock().unwrap().clone().expect("meter must fire");
-        let expected: Vec<u8> = arrivals
-            .iter()
-            .flat_map(|(_, b)| b.iter().copied())
-            .collect();
-        assert_eq!(captured_bytes, expected, "accumulator must equal full body");
+        // 3. Meter callback fired exactly once. Parser saw three
+        //    `message_delta` frames; none carried a `usage` block, so
+        //    `saw_any_usage` stays false. The point of this test is the
+        //    timing/ordering invariant — the summary is just the proof
+        //    the meter ran.
+        let summary = captured.lock().unwrap().clone().expect("meter must fire");
+        assert!(
+            !summary.saw_message_stop,
+            "no message_stop frame was streamed"
+        );
+        assert_eq!(summary.output_tokens, 0, "no usage frames streamed");
     }
 
     /// Push a body whose total size exceeds the cap; assert the stream
@@ -6811,9 +7361,11 @@ mod tests {
 
         let meter_called: Arc<Mutex<Option<StreamOutcome>>> = Arc::new(Mutex::new(None));
         let meter_called_inner = Arc::clone(&meter_called);
-        let meter = TeeMeterCallback::new(move |_bytes: &[u8], outcome: StreamOutcome| {
-            *meter_called_inner.lock().unwrap() = Some(outcome);
-        });
+        let meter = TeeMeterCallback::new(
+            move |_summary: pricing::UsageSummary, outcome: StreamOutcome| {
+                *meter_called_inner.lock().unwrap() = Some(outcome);
+            },
+        );
 
         let mut tee = TeeBody::new(mock, cap, meter);
 
@@ -6944,7 +7496,9 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mock = ChannelBody { rx };
-        let meter = TeeMeterCallback::new(move |_bytes: &[u8], _outcome: StreamOutcome| {});
+        let meter = TeeMeterCallback::new(
+            move |_summary: pricing::UsageSummary, _outcome: StreamOutcome| {},
+        );
         let mut tee = TeeBody::new_with_slot(mock, 1024, meter, Some(slot));
         drop(tx); // clean EOF on next poll
 
@@ -6980,7 +7534,9 @@ mod tests {
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mock = ChannelBody { rx };
-        let meter = TeeMeterCallback::new(move |_bytes: &[u8], _outcome: StreamOutcome| {});
+        let meter = TeeMeterCallback::new(
+            move |_summary: pricing::UsageSummary, _outcome: StreamOutcome| {},
+        );
         let tee = TeeBody::new_with_slot(mock, 1024, meter, Some(slot));
 
         // Keep `tx` alive so upstream would still have more to send.
@@ -6996,28 +7552,34 @@ mod tests {
     }
 
     /// Metering against the streamed body must produce identical
-    /// per-Statement usage to the buffered path. Drives a TeeBody with a
-    /// chunked Anthropic-shaped JSON body, fires the meter callback,
-    /// then asserts the per-Statement usage matches what the buffered
-    /// `meter_response()` would have computed for the same bytes.
+    /// per-Statement token totals to what the equivalent JSON `usage`
+    /// block would produce on the buffered path. development milestone
+    /// switched the streaming path to a structured `UsageSummary`, so
+    /// "matches buffered" now means "the summary's folded usage matches
+    /// the JSON parser's `ParsedUsage`".
     #[tokio::test(flavor = "current_thread")]
     async fn tee_body_meter_matches_buffered_path() {
-        let body = anthropic_body(700, 300); // 1000 tokens total
+        // SSE-shaped equivalent of `anthropic_body(700, 300)`: 700 input
+        // tokens at message_start, deltas advancing output cumulatively
+        // to 300, and a terminal message_stop so the stream is Complete.
+        let body = anthropic_sse_complete("claude-opus-4-5", 700, &[100, 250, 300]);
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mock = ChannelBody { rx };
 
-        let captured: Arc<std::sync::Mutex<Option<Vec<u8>>>> =
+        let captured: Arc<std::sync::Mutex<Option<pricing::UsageSummary>>> =
             Arc::new(std::sync::Mutex::new(None));
         let cap_inner = Arc::clone(&captured);
-        let meter = TeeMeterCallback::new(move |bytes: &[u8], _outcome: StreamOutcome| {
-            *cap_inner.lock().unwrap() = Some(bytes.to_vec());
-        });
+        let meter = TeeMeterCallback::new(
+            move |summary: pricing::UsageSummary, _outcome: StreamOutcome| {
+                *cap_inner.lock().unwrap() = Some(summary);
+            },
+        );
 
         let mut tee = TeeBody::new(mock, MAX_STREAMING_RESPONSE_BYTES, meter);
 
         // Split the body into 3 roughly-equal chunks so the tee has to
-        // accumulate across multiple frames before the meter sees it.
+        // parse across multiple frames before the meter sees the result.
         let bytes = body.as_bytes();
         let third = bytes.len() / 3;
         for chunk in [&bytes[..third], &bytes[third..2 * third], &bytes[2 * third..]] {
@@ -7034,11 +7596,13 @@ mod tests {
             }
         }
 
-        let captured_bytes = captured.lock().unwrap().clone().expect("meter must fire");
-        let from_streamed =
-            meter_response("api.anthropic.com", &captured_bytes).expect("parsable");
+        let summary = captured.lock().unwrap().clone().expect("meter must fire");
+        let from_streamed = usage_from_summary("api.anthropic.com", &summary).expect("metered");
+        // Buffered-path equivalent: a JSON body with the same token
+        // counts. Both paths must agree token-for-token.
+        let json_body = anthropic_body(700, 300);
         let from_buffered =
-            meter_response("api.anthropic.com", body.as_bytes()).expect("parsable");
+            meter_response("api.anthropic.com", json_body.as_bytes()).expect("parsable");
         assert_eq!(
             from_streamed.tokens, from_buffered.tokens,
             "streamed metering must match buffered metering token-for-token"
@@ -7047,6 +7611,7 @@ mod tests {
             from_streamed.tokens, 1_000,
             "anthropic body 700+300 should yield 1000 tokens"
         );
+        assert!(summary.saw_message_stop, "complete SSE stream is Complete");
     }
 
     /// Build a single SSE frame: `event:\n data:\n\n`. Panics on malformed
@@ -7139,19 +7704,18 @@ mod tests {
         let meter_persona = persona.id.clone();
         let meter_host = "api.anthropic.com".to_string();
         let meter = TeeMeterCallback::new(
-            move |accumulated: &[u8], tee_outcome: StreamOutcome| {
+            move |summary: pricing::UsageSummary, tee_outcome: StreamOutcome| {
                 let outcome = if tee_outcome == StreamOutcome::Complete
                     && pricing::provider_for_host(&meter_host)
                         == Some(pricing::PROVIDER_ANTHROPIC)
-                    && let Some(summary) =
-                        pricing::parse_anthropic_sse_usage(accumulated)
+                    && summary.saw_any_usage
                     && !summary.saw_message_stop
                 {
                     StreamOutcome::Partial
                 } else {
                     tee_outcome
                 };
-                run_post_flight_meter(
+                run_post_flight_meter_from_summary(
                     &meter_state,
                     &meter_grant_id,
                     "S1",
@@ -7159,7 +7723,7 @@ mod tests {
                     &meter_persona,
                     "anthropic-key",
                     &meter_host,
-                    accumulated,
+                    &summary,
                     outcome,
                 );
             },
@@ -7269,19 +7833,18 @@ mod tests {
         let meter_persona = persona.id.clone();
         let meter_host = "api.anthropic.com".to_string();
         let meter = TeeMeterCallback::new(
-            move |accumulated: &[u8], tee_outcome: StreamOutcome| {
+            move |summary: pricing::UsageSummary, tee_outcome: StreamOutcome| {
                 let outcome = if tee_outcome == StreamOutcome::Complete
                     && pricing::provider_for_host(&meter_host)
                         == Some(pricing::PROVIDER_ANTHROPIC)
-                    && let Some(summary) =
-                        pricing::parse_anthropic_sse_usage(accumulated)
+                    && summary.saw_any_usage
                     && !summary.saw_message_stop
                 {
                     StreamOutcome::Partial
                 } else {
                     tee_outcome
                 };
-                run_post_flight_meter(
+                run_post_flight_meter_from_summary(
                     &meter_state,
                     &meter_grant_id,
                     "S1",
@@ -7289,7 +7852,7 @@ mod tests {
                     &meter_persona,
                     "anthropic-key",
                     &meter_host,
-                    accumulated,
+                    &summary,
                     outcome,
                 );
             },
@@ -7400,7 +7963,7 @@ mod tests {
         );
     }
 
-    /// C44-implementation-note-19 regression guard — the proxy.meter audit event
+    /// C44-implementation-note-30 regression guard — the proxy.meter audit event
     /// must NOT emit the raw credential alias in any field. Readers of the
     /// audit log must not be able to correlate persona → credential by
     /// scanning rows. The raw alias stays in `statement_usage`/grant rows;

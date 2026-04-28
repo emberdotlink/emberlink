@@ -53,7 +53,7 @@ struct RawDaemonSection {
     stale_approval_threshold_secs: Option<u64>,
     /// Bind address for the git-echo credential-injection proxy. `None` (key
     /// absent) ⇒ default `127.0.0.1:0` (random port). Empty string ⇒ disabled.
-    /// (implementation-note-10)
+    /// (implementation-note-19)
     git_proxy_addr: Option<String>,
 }
 
@@ -104,7 +104,7 @@ pub struct DaemonConfig {
     pub dashboard_addr: Option<SocketAddr>,
     /// Bind address for the git-echo credential-injection proxy used by
     /// sandboxed agents (`EMBER_PROXY_URL`). `None` disables the proxy.
-    /// Defaults to `127.0.0.1:0` (loopback, ephemeral port). implementation-note-10.
+    /// Defaults to `127.0.0.1:0` (loopback, ephemeral port). implementation-note-19.
     pub git_proxy_addr: Option<SocketAddr>,
     /// Keyring service/account override. `None` fields fall back to env var, then compile-time default.
     pub keyring: KeyringConfig,

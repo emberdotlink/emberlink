@@ -1,4 +1,5 @@
 pub mod grant_chain;
+pub mod presence;
 pub mod secret_handle;
 
 use age::Decryptor;
@@ -78,7 +79,7 @@ pub struct EncryptedContent {
     pub ciphertext: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
+#[derive(Debug, Clone, Zeroize, ZeroizeOnDrop)]
 pub struct LocalKeyPair {
     pub key_id: String,
     #[zeroize(skip)]
@@ -195,22 +196,28 @@ pub fn generate_random_identifier(prefix: &str) -> String {
 // namespaced info string from this table. Adding a new derivation context
 // requires adding a row here first to prevent cross-context key reuse.
 //
-// | info string                        | output purpose                              |
-// |------------------------------------|---------------------------------------------|
-// | `emberlink/v1/content-key`         | XChaCha20-Poly1305 manifest chunk key       |
+// | info string (prefix)                         | output purpose                          |
+// |----------------------------------------------|-----------------------------------------|
+// | `emberlink/v1/content-key/<purpose>`         | XChaCha20-Poly1305 content key          |
 //
+// The `purpose` suffix is caller-supplied and MUST be a stable, lowercase
+// hyphenated label (e.g. "vault-catalog", "vault-payload", "local-state").
 // Info strings are intentionally stable. Never reuse or rename one once it
 // has been used to derive keys in production.
 
 /// Generate a content encryption key using HKDF-SHA256.
 ///
 /// Random input keying material is fed through HKDF with a domain-separation
-/// info string so the output is a proper KDF-derived key rather than raw
-/// random bytes.
-pub fn generate_content_key() -> String {
+/// info string that incorporates `purpose` so keys for different contexts are
+/// cryptographically independent even when the IKM source is the same.
+///
+/// `purpose` MUST be a stable, lowercase hyphenated label identifying the
+/// encryption context (e.g. `"vault-catalog"`, `"vault-payload"`).
+pub fn generate_content_key(purpose: &str) -> String {
     let mut ikm = [0u8; 32];
     os_fill(&mut ikm).expect("OS entropy failure");
-    derive_content_key(&ikm, b"emberlink/v1/content-key")
+    let info = format!("emberlink/v1/content-key/{purpose}");
+    derive_content_key(&ikm, info.as_bytes())
 }
 
 /// Derive a content key from input keying material and an info context using
@@ -607,7 +614,7 @@ mod tests {
 
     #[test]
     fn content_encryption_round_trips() {
-        let key = generate_content_key();
+        let key = generate_content_key("test");
         let encrypted = encrypt_content(&key, b"hello storage", b"manifest-1:0").unwrap();
         let decrypted = decrypt_content(&key, &encrypted, b"manifest-1:0").unwrap();
 
@@ -616,7 +623,7 @@ mod tests {
 
     #[test]
     fn content_encryption_rejects_wrong_aad() {
-        let key = generate_content_key();
+        let key = generate_content_key("test");
         let encrypted = encrypt_content(&key, b"hello storage", b"manifest-1:0").unwrap();
 
         assert!(decrypt_content(&key, &encrypted, b"manifest-1:1").is_err());
@@ -624,7 +631,7 @@ mod tests {
 
     #[test]
     fn content_encryption_uses_random_nonces() {
-        let key = generate_content_key();
+        let key = generate_content_key("test");
         let first = encrypt_content(&key, b"same payload", b"manifest-1:0").unwrap();
         let second = encrypt_content(&key, b"same payload", b"manifest-1:0").unwrap();
 
@@ -651,17 +658,15 @@ mod tests {
 
     /// security check binding test: distinct HKDF info strings produce distinct keys.
     ///
-    /// Verifies that the `emberlink/v1/content-key` info string is unique
-    /// relative to any hypothetical second derivation context. If a future
-    /// contributor adds a second info string and accidentally reuses
-    /// `emberlink/v1/content-key`, the registry table documents the conflict
-    /// and this class of test detects it.
+    /// Verifies that the `emberlink/v1/content-key/<purpose>` info strings are
+    /// unique per purpose. Same IKM with different purpose labels must produce
+    /// cryptographically independent keys.
     #[test]
     fn hkdf_distinct_info_contexts_produce_distinct_keys() {
         let ikm = [0x5e_u8; 32];
-        let content_key = derive_content_key(&ikm, b"emberlink/v1/content-key");
+        let content_key = derive_content_key(&ikm, b"emberlink/v1/content-key/vault-catalog");
         // A hand-rolled second context: same IKM, different info.
-        let other_context = derive_content_key(&ikm, b"emberlink/v1/hypothetical-second-context");
+        let other_context = derive_content_key(&ikm, b"emberlink/v1/content-key/vault-payload");
         assert_ne!(
             content_key, other_context,
             "same IKM with different info strings must produce different keys"
@@ -670,10 +675,22 @@ mod tests {
         assert!(other_context.starts_with("xchacha20-key:"));
     }
 
+    /// security check: same IKM + different `purpose` labels → different derived keys.
+    #[test]
+    fn generate_content_key_different_purposes_produce_different_keys() {
+        let ikm = [0xa7_u8; 32];
+        let key_catalog = derive_content_key(&ikm, b"emberlink/v1/content-key/vault-catalog");
+        let key_payload = derive_content_key(&ikm, b"emberlink/v1/content-key/vault-payload");
+        let key_state = derive_content_key(&ikm, b"emberlink/v1/content-key/local-state");
+        assert_ne!(key_catalog, key_payload, "vault-catalog vs vault-payload must differ");
+        assert_ne!(key_catalog, key_state, "vault-catalog vs local-state must differ");
+        assert_ne!(key_payload, key_state, "vault-payload vs local-state must differ");
+    }
+
     #[test]
     fn generate_content_key_produces_unique_keys() {
-        let key1 = generate_content_key();
-        let key2 = generate_content_key();
+        let key1 = generate_content_key("test");
+        let key2 = generate_content_key("test");
         assert_ne!(key1, key2);
         assert!(key1.starts_with("xchacha20-key:"));
     }

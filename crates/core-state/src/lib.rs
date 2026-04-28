@@ -3215,7 +3215,7 @@ impl EventStore {
 
         let catalog_key = load_local_vault_catalog_head(&self.conn, namespace, self.master_key.as_ref().map(|s| s.as_str()))?
             .map(|(_, content_key)| content_key)
-            .unwrap_or_else(generate_content_key);
+            .unwrap_or_else(|| generate_content_key("vault-catalog"));
         let mut catalog = self
             .local_vault_catalog(namespace)?
             .unwrap_or(create_vault_catalog(namespace.clone())?);
@@ -3264,7 +3264,7 @@ impl EventStore {
             add_vault_object_with_initial_revision(&mut catalog, object, revision.clone())?;
         }
 
-        let payload_key = generate_content_key();
+        let payload_key = generate_content_key("vault-payload");
         let payload_authorized_devices =
             wrap_manifest_key_for_recipients(&recipients, &payload_key)?;
         let catalog_authorized_devices =
@@ -3319,7 +3319,7 @@ impl EventStore {
 
         let catalog_key = load_local_vault_catalog_head(&self.conn, namespace, self.master_key.as_ref().map(|s| s.as_str()))?
             .map(|(_, content_key)| content_key)
-            .unwrap_or_else(generate_content_key);
+            .unwrap_or_else(|| generate_content_key("vault-catalog"));
         let mut catalog = self
             .local_vault_catalog(namespace)?
             .unwrap_or(create_vault_catalog(namespace.clone())?);
@@ -3363,7 +3363,7 @@ impl EventStore {
             add_vault_object_with_initial_revision(&mut catalog, object, revision.clone())?;
         }
 
-        let payload_key = generate_content_key();
+        let payload_key = generate_content_key("vault-payload");
         let payload_authorized_devices =
             wrap_manifest_key_for_recipients(&recipients, &payload_key)?;
         let catalog_authorized_devices =
@@ -3494,7 +3494,7 @@ impl EventStore {
             )));
         }
         let source_payload = self.local_manifest_payload_bytes(&source_revision.manifest_id)?;
-        let artifact_content_key = generate_content_key();
+        let artifact_content_key = generate_content_key("presentation-artifact");
         let artifact_authorized_devices =
             wrap_manifest_key_for_recipients(&recipients, &artifact_content_key)?;
         let (artifact, manifest, blocks) = build_presentation_artifact_manifest(
@@ -4251,7 +4251,7 @@ mod tests {
     }
 
     fn seed_gc_test_catalog(store: &mut EventStore) -> Result<(), ValidationError> {
-        let content_key = generate_content_key();
+        let content_key = generate_content_key("test");
         let old_manifest = publish_manifest(
             "manifest-old",
             "chunk-shared",
@@ -5419,7 +5419,7 @@ mod tests {
             "emberlink-core-state-encrypted-blocks-{unique}.sqlite"
         ));
         let block_dir = local_block_store_root(&path);
-        let content_key = generate_content_key();
+        let content_key = generate_content_key("test");
         let block = encrypt_block("manifest-1", 0, b"root chunk payload", &content_key).unwrap();
 
         {
@@ -5656,7 +5656,7 @@ mod tests {
 
     #[test]
     fn encrypted_local_block_payload_round_trips_in_memory_without_filesystem_store() {
-        let content_key = generate_content_key();
+        let content_key = generate_content_key("test");
         let block = encrypt_block("manifest-1", 0, b"root chunk payload", &content_key).unwrap();
         let mut store = EventStore::open_in_memory().unwrap();
 
@@ -5687,7 +5687,7 @@ mod tests {
             "emberlink-core-state-local-encrypted-manifest-{unique}.sqlite"
         ));
         let block_dir = local_block_store_root(&path);
-        let content_key = generate_content_key();
+        let content_key = generate_content_key("test");
         let plaintext_chunks = vec![
             br#"{"kind":"structured-record"}"#.to_vec(),
             b"payload tail".to_vec(),
@@ -5745,7 +5745,7 @@ mod tests {
         ));
         let block_dir = local_block_store_root(&path);
         let master_key = core_crypto::derive_content_key(b"emberlink-test-key", b"test");
-        let content_key = generate_content_key();
+        let content_key = generate_content_key("vault-catalog");
         let catalog = VaultCatalog {
             namespace: test_namespace(),
             objects: vec![core_types::VaultObject {
@@ -5905,8 +5905,8 @@ mod tests {
         ));
         let block_dir = local_block_store_root(&path);
         let namespace = test_namespace();
-        let catalog_key = generate_content_key();
-        let source_key = generate_content_key();
+        let catalog_key = generate_content_key("vault-catalog");
+        let source_key = generate_content_key("vault-payload");
         let mut catalog = core_storage::create_vault_catalog(namespace.clone()).unwrap();
         let object = core_storage::create_vault_object(
             "obj-1",
@@ -6793,7 +6793,10 @@ mod tests {
             .local_device_encryption_key_pair("device-a")
             .unwrap()
             .unwrap();
-        assert_eq!(loaded, encryption_key_pair);
+        // PartialEq derive removed in security check (timing leak); compare fields explicitly.
+        assert_eq!(loaded.algorithm, encryption_key_pair.algorithm);
+        assert_eq!(loaded.public_key, encryption_key_pair.public_key);
+        assert_eq!(loaded.private_key, encryption_key_pair.private_key);
 
         let _ = std::fs::remove_file(path);
     }
@@ -6832,7 +6835,7 @@ mod tests {
             .upsert_local_device_encryption_key("device-a", &encryption_key_pair)
             .unwrap();
 
-        let content_key = generate_content_key();
+        let content_key = generate_content_key("test");
         let first_block =
             encrypt_block("manifest-1", 0, b"root chunk payload", &content_key).unwrap();
         let second_block =
@@ -6923,7 +6926,7 @@ mod tests {
             SignerBinding::root("root-a", "key-root-a-v1"),
         );
 
-        let content_key = generate_content_key();
+        let content_key = generate_content_key("test");
         let first_block = encrypt_block("manifest-1", 0, b"payload", &content_key).unwrap();
         let manifest = publish_manifest(
             "manifest-1",
@@ -7221,8 +7224,8 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("emberlink-core-state-vault-commit-{unique}.sqlite"));
         let block_dir = local_block_store_root(&path);
-        let catalog_key = generate_content_key();
-        let payload_key = generate_content_key();
+        let catalog_key = generate_content_key("vault-catalog");
+        let payload_key = generate_content_key("vault-payload");
         let namespace = test_namespace();
         let mut catalog = core_storage::create_vault_catalog(namespace.clone()).unwrap();
         let object = core_storage::create_vault_object(

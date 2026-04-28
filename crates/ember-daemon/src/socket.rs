@@ -77,6 +77,61 @@ pub enum SocketError {
     AlreadyBound,
 }
 
+/// P69E.8b: wrap a bind-site `io::Error` so the message includes the path
+/// and (when the kind is `AddrInUse`) actionable hints — `lsof -i :<port>`
+/// for TCP, `lsof -U <path>` for Unix sockets, plus the daemon stop command.
+///
+/// Returns a fresh `io::Error` of the same kind as the input, with a richer
+/// message body. Callers should keep the original kind so downstream
+/// `ErrorKind` matching keeps working; only the human-readable text grows.
+pub(crate) fn annotate_bind_error(err: std::io::Error, target: &str) -> std::io::Error {
+    let kind = err.kind();
+    let original = err.to_string();
+
+    // Heuristic split: `host:port` looks like a TCP socket address, anything
+    // else (a filesystem path, e.g. `~/.ember/sock`) is a Unix domain socket.
+    // We don't try to be exhaustive — `host:port` shapes covered by
+    // `SocketAddr::Display` always contain at least one `:` and end in digits.
+    let looks_tcp = target
+        .rsplit_once(':')
+        .map(|(_, port)| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
+        .unwrap_or(false);
+
+    if kind == std::io::ErrorKind::AddrInUse {
+        let how_to_find = if looks_tcp {
+            // Pull the port out of the trailing `:NNNN` segment.
+            let port = target
+                .rsplit_once(':')
+                .map(|(_, p)| p)
+                .unwrap_or(target);
+            format!("    lsof -i :{port}")
+        } else {
+            format!("    lsof -U {target}")
+        };
+        let body = format!(
+            "failed to bind {target}: {original}\n\
+             \n\
+             Another process is already using this address.\n\
+             \n\
+             Find the conflicting process:\n\
+             \n\
+             {how_to_find}\n\
+             \n\
+             Stop an existing ember daemon:\n\
+             \n\
+             - Foreground: hit Ctrl-C or run `ember daemon stop`\n\
+             - launchd (macOS): launchctl bootout gui/$(id -u)/com.emberlink.ember-daemon\n\
+             - Or kill the conflicting PID directly: `kill -TERM <pid>`\n",
+        );
+        return std::io::Error::new(kind, body);
+    }
+
+    // Non-AddrInUse errors: still include the address so the user sees what
+    // we tried to bind, but skip the lsof hint (it would be misleading for
+    // permission-denied / EACCES / address-not-available paths).
+    std::io::Error::new(kind, format!("failed to bind {target}: {original}"))
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Request {
     pub id: String,
@@ -147,9 +202,13 @@ impl SocketListener {
 
     pub fn bind(&self) -> Result<UnixListener, SocketError> {
         if self.path.exists() {
-            std::fs::remove_file(&self.path).map_err(SocketError::Bind)?;
+            std::fs::remove_file(&self.path).map_err(|e| {
+                SocketError::Bind(annotate_bind_error(e, &self.path.display().to_string()))
+            })?;
         }
-        UnixListener::bind(&self.path).map_err(SocketError::Bind)
+        UnixListener::bind(&self.path).map_err(|e| {
+            SocketError::Bind(annotate_bind_error(e, &self.path.display().to_string()))
+        })
     }
 
     /// Run the accept loop without creating a LocalSet.
@@ -226,6 +285,13 @@ impl SocketListener {
                             let rate_limiter = Rc::clone(&self.rate_limiter);
                             let events_tx = self.events_tx.clone();
                             let events_rx = self.events_tx.subscribe();
+                            // development milestone: forward the kernel-derived
+                            // peer identity into the per-connection task so
+                            // it reaches the request-context layer in handler.rs.
+                            #[cfg(any(target_os = "linux", target_os = "macos"))]
+                            let peer_for_task = Some(peer);
+                            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                            let peer_for_task: Option<PeerIdentity> = None;
                             tokio::task::spawn_local(handle_connection(
                                 stream,
                                 store,
@@ -234,6 +300,7 @@ impl SocketListener {
                                 rate_limiter,
                                 events_tx,
                                 events_rx,
+                                peer_for_task,
                             ));
                         }
                         Err(e) => {
@@ -292,12 +359,17 @@ fn daemon_euid() -> u32 {
 /// `SO_PEERCRED` / `LOCAL_PEERCRED`. Returned from the accepted peer-cred
 /// check so callers can log structured fields without a second kernel
 /// round-trip.
+///
+/// development milestone: Made `pub` and field-public so the handler layer
+/// can carry the peer identity into `RequestContext` for full principal
+/// binding on `delegate_grant`. Without this the socket layer would have
+/// to translate to a parallel struct, doubling the surface area.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PeerIdentity {
-    uid: u32,
+pub struct PeerIdentity {
+    pub uid: u32,
     /// BSD variants don't always surface the peer pid, so this is optional.
-    pid: Option<i32>,
+    pub pid: Option<i32>,
 }
 
 /// Verify that the peer of `stream` is running as the daemon's own euid.
@@ -379,9 +451,10 @@ async fn handle_connection(
     rate_limiter: Rc<RefCell<RateLimiter>>,
     events_tx: broadcast::Sender<GrantEvent>,
     mut events_rx: broadcast::Receiver<GrantEvent>,
+    peer_cred: Option<PeerIdentity>,
 ) {
     let peer = stream.peer_addr().ok();
-    debug!(?peer, "handling connection");
+    debug!(?peer, ?peer_cred, "handling connection");
 
     let (read_half, mut write_half) = stream.into_split();
     let reader = BufReader::new(read_half);
@@ -441,12 +514,13 @@ async fn handle_connection(
 
                 debug!(id = %req.id, method = %req.method, "dispatching request");
 
-                let response = match crate::handler::dispatch_method_with_events(
+                let response = match crate::handler::dispatch_method_with_peer(
                     &store,
                     &vault,
                     &policy,
                     &rate_limiter,
                     Some(&events_tx),
+                    peer_cred,
                     &req.method,
                     &req.params,
                 ).await {
@@ -896,5 +970,72 @@ mod tests {
             let arr = result.as_array().unwrap();
             assert!(arr.is_empty());
         }).await;
+    }
+
+    // ---- P69E.8b: annotate_bind_error -------------------------------
+    //
+    // Three branches: (1) AddrInUse on a TCP `host:port` shape gets the
+    // `lsof -i :<port>` hint + daemon-stop guidance, (2) AddrInUse on a
+    // Unix socket path gets `lsof -U <path>`, (3) any other ErrorKind
+    // is annotated with the address but skips the lsof block (since
+    // `lsof` won't help on EACCES / EADDRNOTAVAIL).
+
+    #[test]
+    fn annotate_bind_error_tcp_addr_in_use_includes_lsof_port_hint() {
+        let raw = io::Error::new(io::ErrorKind::AddrInUse, "Address already in use");
+        let annotated = annotate_bind_error(raw, "127.0.0.1:3141");
+        let msg = annotated.to_string();
+
+        assert_eq!(annotated.kind(), io::ErrorKind::AddrInUse);
+        assert!(
+            msg.contains("lsof -i :3141"),
+            "expected `lsof -i :3141` hint, got: {msg}"
+        );
+        assert!(
+            msg.contains("ember daemon stop") || msg.contains("launchctl bootout"),
+            "expected daemon-stop guidance, got: {msg}"
+        );
+        assert!(
+            msg.contains("127.0.0.1:3141"),
+            "expected the bind addr in the message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn annotate_bind_error_unix_socket_addr_in_use_includes_lsof_unix_hint() {
+        let raw = io::Error::new(io::ErrorKind::AddrInUse, "Address already in use");
+        let annotated = annotate_bind_error(raw, "/Users/operator/.ember/sock");
+        let msg = annotated.to_string();
+
+        assert_eq!(annotated.kind(), io::ErrorKind::AddrInUse);
+        assert!(
+            msg.contains("lsof -U /Users/operator/.ember/sock"),
+            "expected `lsof -U <path>` hint for Unix socket, got: {msg}"
+        );
+        // Should NOT use the `:port` form for filesystem paths.
+        assert!(
+            !msg.contains("lsof -i :"),
+            "must not emit TCP-style hint for a filesystem path, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn annotate_bind_error_non_addr_in_use_skips_lsof_hint() {
+        let raw = io::Error::new(io::ErrorKind::PermissionDenied, "EACCES");
+        let annotated = annotate_bind_error(raw, "0.0.0.0:80");
+        let msg = annotated.to_string();
+
+        assert_eq!(annotated.kind(), io::ErrorKind::PermissionDenied);
+        // Address is still surfaced...
+        assert!(
+            msg.contains("0.0.0.0:80"),
+            "expected the bind addr to still appear, got: {msg}"
+        );
+        // ...but no lsof guidance (it would mislead — the port is free,
+        // we just lack permission to bind it).
+        assert!(
+            !msg.contains("lsof -i"),
+            "must not suggest lsof for non-AddrInUse failures, got: {msg}"
+        );
     }
 }

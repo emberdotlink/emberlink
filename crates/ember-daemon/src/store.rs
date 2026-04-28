@@ -270,7 +270,7 @@ impl DaemonStore {
             CREATE INDEX IF NOT EXISTS idx_receipts_created ON receipts(created_at);",
         )?;
 
-        // implementation-note-3 — backfill `kind` column on legacy DBs so
+        // implementation-note-4 — backfill `kind` column on legacy DBs so
         // the kms_wrap / kms_unwrap rows can land alongside grant rows.
         // Errors swallowed when the column already exists.
         let _ = self.conn.execute(
@@ -278,7 +278,7 @@ impl DaemonStore {
             [],
         );
 
-        // implementation-note-3 — per-key fast-path index for queries shaped
+        // implementation-note-4 — per-key fast-path index for queries shaped
         // `WHERE kind IN ('kms_wrap','kms_unwrap') AND key_name = ?`. Uses
         // SQLite JSON1 (`json_extract`) over the existing `receipt_json`
         // column so we don't have to project key_name into its own
@@ -290,7 +290,7 @@ impl DaemonStore {
                  WHERE kind IN ('kms_wrap','kms_unwrap');",
         )?;
 
-        // EMBER-implementation-note-18 — per-actor and per-resource fast-path indexes
+        // EMBER-implementation-note-28 — per-actor and per-resource fast-path indexes
         // for the `ember audit` query CLI. The existing
         // `idx_receipts_persona` covers persona_id lookups; we keep the
         // `idx_receipts_actor` alias as a stable name the task spec can
@@ -303,7 +303,7 @@ impl DaemonStore {
                  ON receipts(json_extract(receipt_json, '$.summary.resource'));",
         )?;
 
-        // implementation-note-5 — composite-grant approval columns. Existing v0 DBs
+        // implementation-note-13 — composite-grant approval columns. Existing v0 DBs
         // (e.g. the qember.sh demo seed) predate the columns above, so
         // additively backfill them with idempotent ALTER TABLE calls.
         // Errors here are swallowed when the column already exists; any
@@ -344,6 +344,24 @@ impl DaemonStore {
         );
 
         Ok(())
+    }
+}
+
+impl DaemonStore {
+    /// EMBER-implementation-note-28 — query the receipts table with the full
+    /// [`crate::receipt::ReceiptFilter`] filter set (actor/kind/grant_id/
+    /// since_iso/resource/limit). Returns flat [`crate::receipt::ReceiptRow`]
+    /// projections so callers get `materialized_at`, `terminal_reason`,
+    /// `requested_scope`, and `granted_scope` without re-fetching the grant.
+    ///
+    /// Delegates to [`DaemonStore::list_receipt_rows`] (defined in
+    /// `receipt.rs`). Exposed here so it is co-located with the other
+    /// store entry points and discoverable from the `store.rs` index.
+    pub fn query_receipts(
+        &self,
+        filter: &crate::receipt::ReceiptFilter,
+    ) -> Result<Vec<crate::receipt::ReceiptRow>, StoreError> {
+        self.list_receipt_rows(filter)
     }
 }
 

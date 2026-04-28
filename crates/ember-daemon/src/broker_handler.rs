@@ -13,7 +13,7 @@
 //! - `broker_list`   → [`handle_broker_list`]
 //!
 //! Marker for headless ranker grep: **`BrokerIssue`** (this module path is
-//! `broker_handler`, satisfying the marker contract from implementation-note-9.)
+//! `broker_handler`, satisfying the marker contract from implementation-note-17.)
 //!
 //! ## Object-safety adapter
 //!
@@ -41,10 +41,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
 use core_broker::{
-    Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential,
+    Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential, SecretRef,
 };
 use once_cell::sync::OnceCell;
-use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -128,6 +127,13 @@ struct RegistryState {
     /// successful revoke. Used to (a) route `revoke` to the right
     /// provider, and (b) answer `broker_list`.
     active: HashMap<String, MaterializationSummary>,
+    /// `materialization_id` → plaintext credential. Retained inside the
+    /// daemon so `broker_resolve` can hand the secret to the trust
+    /// boundary (ember-proxy / ember-tools) per
+    /// implementation-note-3. Plaintext NEVER returns to the
+    /// agent process — agents hold the opaque `SecretRef` (= the
+    /// `materialization_id`) and present it to the proxy.
+    plaintext: HashMap<String, secrecy::SecretString>,
 }
 
 impl BrokerRegistry {
@@ -165,8 +171,20 @@ impl BrokerRegistry {
         st.active.insert(summary.materialization_id.clone(), summary);
     }
 
+    /// Stash the daemon-internal plaintext for a freshly-issued
+    /// materialization. Companion to [`Self::record_active`]; only the
+    /// daemon ever holds plaintext, and only the trust boundary
+    /// (ember-proxy / ember-tools) ever asks for it back via
+    /// `broker_resolve`. See implementation-note-3.
+    fn record_plaintext(&self, materialization_id: String, plaintext: secrecy::SecretString) {
+        let mut st = self.state.lock().expect("broker registry mutex");
+        st.plaintext.insert(materialization_id, plaintext);
+    }
+
     fn drop_active(&self, materialization_id: &str) -> Option<MaterializationSummary> {
         let mut st = self.state.lock().expect("broker registry mutex");
+        // Drop the plaintext too — once revoked there is nothing to resolve.
+        st.plaintext.remove(materialization_id);
         st.active.remove(materialization_id)
     }
 
@@ -353,11 +371,22 @@ pub async fn issue_with_registry(
     };
     registry.record_active(summary);
 
+    // Stash plaintext daemon-side so the trust boundary
+    // (ember-proxy / ember-tools) can later resolve `secret_ref` →
+    // plaintext via `broker_resolve`. Agent-process callers receive
+    // ONLY the opaque `SecretRef` below.
+    registry.record_plaintext(cred.materialization_id.clone(), cred.token.clone());
+
     // Receipt event (design §c).
     emit_materialization_receipt(store, &req, &cred);
 
+    // implementation-note-3: response shape is
+    // `{ secret_ref, materialization_id, expires_at, issued_at,
+    //   provider }`. There is NO `token` / `value` raw-string field in
+    // the response — agent processes never hold plaintext.
+    let secret_ref = SecretRef::new(cred.materialization_id.clone());
     Ok(json!({
-        "token": cred.token.expose_secret(),
+        "secret_ref": secret_ref,
         "materialization_id": cred.materialization_id,
         "expires_at": expires_at,
         "issued_at": issued_at,
@@ -415,6 +444,39 @@ pub async fn list_with_registry(
         .expect("MaterializationSummary always serializes"))
 }
 
+/// Resolve a `SecretRef` → plaintext at the trust boundary.
+///
+/// Per implementation-note-3 this is the ONLY place plaintext
+/// leaves the daemon, and it MUST emit a per-resolution Receipt
+/// (`broker_resolution`) so every materialization has a downstream
+/// audit trail of where the credential was actually used. The full
+/// implementation lands in implementation-note-18; this stub records the
+/// contract surface so callers cannot accidentally bind to the old
+/// raw-token RPC path.
+///
+/// Stub returns `BrokerError::NotSupported`-shaped error
+/// (`-32001` "operation not supported") with a TODO marker pointing at
+/// the implementation task.
+pub async fn resolve_with_registry(
+    _registry: &BrokerRegistry,
+    _store: &DaemonStore,
+    _params: &Value,
+) -> Result<Value, (i32, String)> {
+    // TODO: real implementation must:
+    //   1. Validate caller identity is the trust boundary
+    //      (ember-proxy / ember-tools), not the agent process.
+    //   2. Look up plaintext by `materialization_id` in the registry's
+    //      `plaintext` table.
+    //   3. Emit a `broker_resolution` Receipt with `actor`,
+    //      `secret_ref_id`, `materialized_at`, `outcome`.
+    //   4. Return plaintext to the caller (the trust boundary, never
+    //      the agent process).
+    Err((
+        -32001,
+        "broker_resolve not yet implemented (implementation-note-18)".to_string(),
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Dispatchers (resolve registry from the process-global OnceCell)
 // ---------------------------------------------------------------------------
@@ -465,6 +527,22 @@ pub async fn handle_broker_list(_params: &Value) -> Result<Value, (i32, String)>
     list_with_registry(registry).await
 }
 
+/// Handle the `broker_resolve` socket RPC.
+///
+/// Params: `{ secret_ref: <opaque-id> }`.
+///
+/// Per implementation-note-3 this is the only path for
+/// plaintext credential resolution. Today this is a stub that returns
+/// `-32001` (operation not supported) with a TODO marker pointing at
+/// implementation-note-18.
+pub async fn handle_broker_resolve(
+    store: &DaemonStore,
+    params: &Value,
+) -> Result<Value, (i32, String)> {
+    let registry = current_registry().ok_or_else(err_no_registry)?;
+    resolve_with_registry(registry, store, params).await
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -499,10 +577,13 @@ mod tests {
         })
     }
 
-    /// 1. Successful issue path: returns a token + materialization id,
-    ///    AND emits a `broker.materialization` row in the audit log.
+    /// 1. Successful issue path: returns a `SecretRef` + materialization
+    ///    id, AND emits a `broker.materialization` row in the audit log.
+    ///    Per implementation-note-3 the response MUST NOT
+    ///    contain a raw `token` / `value` field — agent processes hold
+    ///    only the opaque ref.
     #[tokio::test]
-    async fn broker_issue_returns_token_and_emits_receipt() {
+    async fn broker_issue_returns_secret_ref_and_emits_receipt() {
         let reg = fresh_registry();
         let store = DaemonStore::open_in_memory().unwrap();
 
@@ -510,7 +591,14 @@ mod tests {
             .await
             .expect("issue should succeed");
 
-        assert!(res["token"].as_str().unwrap().starts_with("canary-token-"));
+        // SecretRef contract: opaque id, no raw token leaks into the
+        // response payload.
+        assert!(res.get("token").is_none(), "response must not contain raw token: {res}");
+        assert!(res.get("value").is_none(), "response must not contain raw value: {res}");
+        let sref = res["secret_ref"]
+            .as_str()
+            .expect("secret_ref must be a string");
+        assert!(sref.starts_with("mock-"), "secret_ref aliases the materialization id");
         assert!(res["materialization_id"]
             .as_str()
             .unwrap()
@@ -655,7 +743,7 @@ mod tests {
     async fn broker_issue_method_name_marker_present() {
         // The RPC method name is literally "broker_issue" — assert it
         // here so the marker grep stays load-bearing rather than a
-        // soft contract that drifts. See implementation-note-9 marker req.
+        // soft contract that drifts. See implementation-note-17 marker req.
         let probe = "broker_issue";
         assert_eq!(probe, "broker_issue");
         // Also verify provider names line up with `BrokerProvider::as_str`

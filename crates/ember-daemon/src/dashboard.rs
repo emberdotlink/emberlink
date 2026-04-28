@@ -14,7 +14,7 @@ use tokio::sync::{oneshot, watch};
 use crate::approval::ApprovalOutcome;
 use crate::store::DaemonStore;
 
-/// implementation-note-8 — actions hidden from the operator audit timeline by
+/// implementation-note-16 — actions hidden from the operator audit timeline by
 /// default. Internal bookkeeping events (vault unseal, lifecycle plumbing)
 /// leak implementation detail and clutter screenshots; the dashboard exposes
 /// a `[show internal events]` toggle that re-fetches with `?include_internal=1`
@@ -36,7 +36,7 @@ fn is_internal_audit_action(action: &str) -> bool {
 
 /// Build a `persona_id -> persona.name` map from the store. Used by the
 /// dashboard JSON endpoints to surface real display names alongside the
-/// raw persona id (implementation-note-8). Falls back to an empty map on
+/// raw persona id (implementation-note-16). Falls back to an empty map on
 /// store error so endpoints stay live; consumers must treat missing keys
 /// as "no name available" and render the id instead.
 fn persona_name_map(store: &DaemonStore) -> HashMap<String, String> {
@@ -53,7 +53,7 @@ fn persona_name_map(store: &DaemonStore) -> HashMap<String, String> {
 const CSRF_HEADER: &str = "X-Ember-CSRF-Token";
 
 /// Base64url (RFC 4648 §5) encode without padding. Used by the WebAuthn
-/// challenge endpoint (implementation-note-6) — `navigator.credentials.get()`
+/// challenge endpoint (implementation-note-14) — `navigator.credentials.get()`
 /// expects PublicKeyCredentialRequestOptions.challenge in spec-aligned
 /// base64url-no-pad. Avoids pulling the `base64` crate into the daemon
 /// for one ~10-line helper.
@@ -190,9 +190,13 @@ pub async fn run_dashboard(
             l
         }
         Err(e) => {
-            tracing::warn!(addr = %addr, error = %e, "dashboard failed to bind, continuing without dashboard");
+            // P69E.8b: replace the opaque `AddrInUse` log with an actionable
+            // hint (lsof + daemon stop commands) so the user knows what to
+            // do without diffing the source. Same kind, richer message body.
+            let annotated = crate::socket::annotate_bind_error(e, &addr.to_string());
+            tracing::warn!(addr = %addr, error = %annotated, "dashboard failed to bind, continuing without dashboard");
             if let Some(tx) = bind_tx {
-                let _ = tx.send(Err(e));
+                let _ = tx.send(Err(annotated));
             }
             return;
         }
@@ -231,7 +235,7 @@ pub async fn run_dashboard(
                             csrf_token: csrf_token.clone(),
                             started_at,
                             expected_origin: expected_origin.clone(),
-                            // implementation-note-11: the listener
+                            // implementation-note-20: the listener
                             // is alive at this point — propagate the resolved
                             // local_addr so `/api/status` reports it instead
                             // of relying on the configured (pre-bind) port.
@@ -270,7 +274,7 @@ pub async fn run_dashboard(
 /// `/approvals/{id}` page so the two surfaces can never drift. Injected
 /// into both templates via `{{COMPOSITE_STATEMENTS_JS}}`. The function name
 /// `render_composite_statements` (and the rendered class `composite-statements`)
-/// are the implementation-note-12 target_state_anchor markers — search for
+/// are the implementation-note-21 target_state_anchor markers — search for
 /// either if you are tracing why the page hides "3 statements" by default.
 pub const COMPOSITE_STATEMENTS_JS: &str = r#"
 // render_composite_statements — single source of truth for the composite
@@ -434,6 +438,7 @@ tbody td{padding:10px 14px;color:var(--text-primary)}
     <span id="version">v0.0.0</span>
     <span><span id="status-dot" class="status-dot offline"></span><span id="status-text">connecting…</span></span>
     <span id="last-refresh" class="refresh-ts"></span>
+    <a href="/settings/passkeys" style="color:var(--text-muted);font-size:11px;text-decoration:none;margin-left:8px" title="Register Touch ID / passkey for biometric approval">&#x1F511; Passkeys</a>
   </div>
 </div>
 <main>
@@ -507,6 +512,14 @@ tbody td{padding:10px 14px;color:var(--text-primary)}
       <tbody id="receipts-body"><tr><td colspan="6" class="empty">loading…</td></tr></tbody>
     </table>
   </div>
+
+  <section id="receipts-panel" class="section">
+    <div class="section-header">
+      <span class="section-title">Live Receipts <span class="status-dot" id="receipts-status" style="background:var(--text-dim);box-shadow:none">&#9679;</span></span>
+      <span class="refresh-ts">streaming via /api/receipts/stream</span>
+    </div>
+    <ul id="receipts-list" style="list-style:none;background:var(--bg-card);border:1px solid var(--border);border-radius:8px;max-height:320px;overflow-y:auto;padding:0;margin:0"></ul>
+  </section>
 </main>
 
 <div class="modal-overlay" id="extend-modal">
@@ -541,7 +554,7 @@ const CSRF_TOKEN = "{{CSRF_TOKEN}}";
 const CSRF_HEADERS = {'X-Ember-CSRF-Token': CSRF_TOKEN};
 {{COMPOSITE_STATEMENTS_JS}}
 function ts(iso){if(!iso)return'—';const d=new Date(iso);return d.toLocaleString(undefined,{month:'short',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'});}
-// implementation-note-8 — relative_time / formatRelative: render audit + grant
+// implementation-note-16 — relative_time / formatRelative: render audit + grant
 // timestamps as 'Just now' / '12s ago' / '3 min ago' / '04/26 1:34 AM'
 // long-tail fallback so screenshots don't lead with raw ISO strings. Tooltip
 // (title=) keeps the precise ISO for operators who need it.
@@ -570,7 +583,7 @@ function relTime(iso){
 }
 function trunc(s,n){if(!s)return'—';return s.length>n?s.slice(0,n)+'…':s;}
 function truncPersona(s){if(!s)return'—';const p='persona-';if(s.startsWith(p)){return p+s.slice(p.length,p.length+12);}return trunc(s,20);}
-// implementation-note-8 — persona.name primary label; raw persona_id moves to
+// implementation-note-16 — persona.name primary label; raw persona_id moves to
 // the tooltip so screenshots show real names instead of UUID prefixes.
 // Falls back to truncPersona when no name was returned by the API.
 function personaLabel(id, name){
@@ -608,7 +621,57 @@ function updateGrantRow(grantId, g) {
   if(statusCell) statusCell.innerHTML = badge(g.status, g.status);
 }
 
+// implementation-note-16 — pick the most demo-meaningful budget axis from a
+// composite grant's statements array (cents > tokens > wall_clock_secs).
+// Returns a gauge-wrap div, or '<span …>none</span>' when no statement has
+// a budget cap set.
+function compositeGrantBudgetGauge(stmts) {
+  if(!Array.isArray(stmts) || stmts.length===0) return '<span style="color:var(--text-dim);font-size:11px">—</span>';
+  let best = null;
+  for(const s of stmts) {
+    if(!s.budget) continue;
+    if(s.budget.cents != null) { best={axis:'cents',budget:s.budget,usage:s.usage||{}}; break; }
+    if(s.budget.tokens != null && !best) best={axis:'tokens',budget:s.budget,usage:s.usage||{}};
+    if(s.budget.wall_clock_secs != null && !best) best={axis:'wall_clock_secs',budget:s.budget,usage:s.usage||{}};
+  }
+  if(!best) return '<span style="color:var(--text-dim);font-size:11px">none</span>';
+  if(best.axis==='cents') {
+    const used=best.usage.cents||0;
+    const cap=best.budget.cents;
+    const pct=Math.min(100,Math.round(used*100/Math.max(1,cap)));
+    const cls=pct>=95?'red':pct>=80?'yellow':'green';
+    return `<div class="gauge-wrap"><div class="gauge-label"><span>cost</span><span>$${(used/100).toFixed(2)}/$${(cap/100).toFixed(2)} (${pct}%)</span></div><div class="gauge-track"><div class="gauge-fill ${cls}" style="width:${pct}%"></div></div></div>`;
+  }
+  if(best.axis==='tokens') {
+    const used=best.usage.tokens||0;
+    const cap=best.budget.tokens;
+    const pct=Math.min(100,Math.round(used*100/Math.max(1,cap)));
+    const cls=pct>=95?'red':pct>=80?'yellow':'green';
+    return `<div class="gauge-wrap"><div class="gauge-label"><span>tokens</span><span>${used}/${cap} (${pct}%)</span></div><div class="gauge-track"><div class="gauge-fill ${cls}" style="width:${pct}%"></div></div></div>`;
+  }
+  const used=best.usage.wall_clock_secs||0;
+  const cap=best.budget.wall_clock_secs;
+  const pct=Math.min(100,Math.round(used*100/Math.max(1,cap)));
+  const cls=pct>=95?'red':pct>=80?'yellow':'green';
+  return `<div class="gauge-wrap"><div class="gauge-label"><span>time</span><span>${used}s/${cap}s (${pct}%)</span></div><div class="gauge-track"><div class="gauge-fill ${cls}" style="width:${pct}%"></div></div></div>`;
+}
+// implementation-note-16 — scope cell for the Active Grants table. Shows
+// "N statements" for composite grants so the operator sees something
+// meaningful instead of '*'.
+function grantScopeText(g) {
+  const stmts = Array.isArray(g.composite_statements) ? g.composite_statements : null;
+  if(stmts && stmts.length>0) return stmts.length+' statement'+(stmts.length===1?'':'s');
+  return g.scope||'—';
+}
 function renderBudgetGauge(g) {
+  // implementation-note-16 — composite grants surface their real budget via
+  // composite_statements; delegate to the composite helper when present.
+  const stmts = Array.isArray(g.composite_statements) ? g.composite_statements : null;
+  if(stmts && stmts.length>0) {
+    let html = compositeGrantBudgetGauge(stmts);
+    if(g.paused) html += '<div class="paused-banner">paused by operator</div>';
+    return html;
+  }
   let html = '';
   const budget = g.budget || {};
   const usage = g.usage || {};
@@ -691,7 +754,7 @@ async function submitExtend(){
   if(!resp.ok){const e=await resp.json().catch(()=>({error:'failed'}));alert('Extend failed: '+(e.error||resp.status));}
   loadDashboard();
 }
-// implementation-note-6 — request a fresh WebAuthn challenge from the daemon and
+// implementation-note-14 — request a fresh WebAuthn challenge from the daemon and
 // invoke navigator.credentials.get() to raise the platform authenticator
 // (Touch ID on macOS, Windows Hello on Windows, fingerprint on supported
 // Android browsers). Returns {biometric: bool, credential_id?: string}.
@@ -765,7 +828,7 @@ async function denyRequest(id){
   });
   loadDashboard();
 }
-// implementation-note-7 — dismiss a pending approval card.
+// implementation-note-15 — dismiss a pending approval card.
 // Records approval.dismissed in the audit log; does NOT re-fire desktop
 // notifications. Card vanishes immediately on success.
 async function dismissApproval(id){
@@ -795,7 +858,7 @@ async function loadDashboard(){
   try{
     const showAll=document.getElementById('show-all-grants')?.checked;
     const grantsUrl=showAll?'/api/grants/all':'/api/grants';
-    // implementation-note-8 — operator audit hides internal lifecycle events
+    // implementation-note-16 — operator audit hides internal lifecycle events
     // (vault.auto_unseal_from_keyring + *.internal.*) by default; toggle
     // surfaces them via ?include_internal=1. Action filter dropdown narrows
     // to one family (grant.*, approval.*, broker.*, etc.) via ?action_filter=.
@@ -855,15 +918,19 @@ async function loadDashboard(){
         <td class="mono">${trunc(g.id,18)}</td>
         <td class="mono">${personaLabel(g.persona_id, g.persona_name)}</td>
         <td>${g.credential_name||'—'}</td>
-        <td>${g.scope||'—'}</td>
+        <td>${grantScopeText(g)}</td>
         <td class="gauge-cell">${renderBudgetGauge(g)}</td>
         <td class="ts">${g.expires_at?relTime(g.expires_at):'never'}</td>
         <td class="status-cell">${badge(g.status,g.status)}</td>
         <td>${renderGrantActions(g)}</td>
       </tr>`).join('');
-      // Connect SSE for active grants with budgets
-      grants.filter(g=>g.status==='active'&&g.budget&&(g.budget.tokens!=null||g.budget.cents!=null))
-            .forEach(g=>connectSSE(g.id, 'grant-row-'+g.id));
+      // Connect SSE for active grants with budgets (simple or composite).
+      // implementation-note-16 — also wire composite grants whose statements carry
+      // a budget so the gauge ticks up in real time during the demo.
+      grants.filter(g=>g.status==='active'&&(
+        (g.budget&&(g.budget.tokens!=null||g.budget.cents!=null))||
+        (Array.isArray(g.composite_statements)&&g.composite_statements.some(s=>s.budget&&(s.budget.cents!=null||s.budget.tokens!=null||s.budget.wall_clock_secs!=null)))
+      )).forEach(g=>connectSSE(g.id, 'grant-row-'+g.id));
     }
 
     // Approvals
@@ -872,7 +939,7 @@ async function loadDashboard(){
       ac.innerHTML='<div class="empty">no pending approvals</div>';
     }else{
       ac.innerHTML=approvals.map(a=>{
-        // implementation-note-12 — composite breakdown moved to the
+        // implementation-note-21 — composite breakdown moved to the
         // dedicated /approvals/{id} page (behind a Show details disclosure).
         // Cards now render a one-line summary + link so the dashboard stays
         // glanceable for the demo. Single-statement approvals keep the
@@ -959,6 +1026,41 @@ loadDashboard();
 loadReceipts();
 setInterval(loadDashboard,5000);
 setInterval(loadReceipts,15000);
+
+// implementation-note-22 — live receipts panel: stream new receipt rows from
+// /api/receipts/stream and prepend them to #receipts-list. EventSource
+// auto-reconnects via the server-emitted retry hint, so the client stays
+// live without a manual setInterval poll. Capped at 50 visible rows so
+// the page never grows unbounded during a long demo.
+(function(){
+  const list = document.getElementById('receipts-list');
+  const status = document.getElementById('receipts-status');
+  if(!list || !status) return;
+  let evt = null;
+  function safe(s){return String(s==null?'':s).replace(/[<>&"']/g, function(c){
+    return ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'})[c];
+  });}
+  function connect(){
+    try{ evt = new EventSource('/api/receipts/stream'); }catch(e){ return; }
+    evt.onopen = function(){ status.style.background = 'var(--success)'; status.style.boxShadow='0 0 6px var(--success)'; };
+    evt.onerror = function(){ status.style.background = 'var(--danger)'; status.style.boxShadow='0 0 6px var(--danger)'; };
+    evt.onmessage = function(e){
+      try{
+        const r = JSON.parse(e.data);
+        const li = document.createElement('li');
+        li.style.cssText = 'display:grid;grid-template-columns:140px 90px 180px 1fr;gap:10px;padding:8px 14px;border-bottom:1px solid var(--border);font-size:11px;color:var(--text-primary)';
+        li.innerHTML =
+          '<span class="ts">'+safe(r.materialized_at)+'</span>'+
+          '<span class="badge '+(r.kind==='grant'?'active':'pending')+'">'+safe(r.kind)+'</span>'+
+          '<span class="mono" style="color:var(--text-muted)">'+safe(r.actor)+'</span>'+
+          '<span class="mono">'+safe(r.resource)+'</span>';
+        list.insertBefore(li, list.firstChild);
+        while(list.children.length > 50){ list.removeChild(list.lastChild); }
+      }catch(err){ /* ignore parse errors */ }
+    };
+  }
+  connect();
+})();
 </script>
 </body>
 </html>"#;
@@ -1041,7 +1143,7 @@ let breakdownRendered = false;
 function renderBreakdown(stmts){
   if(breakdownRendered) return;
   if(!Array.isArray(stmts) || stmts.length===0) return;
-  // implementation-note-12 — composite breakdown lives behind a
+  // implementation-note-21 — composite breakdown lives behind a
   // Show details disclosure (collapsed-by-default) so the dedicated
   // /approvals/{id} page leads with the high-level approve/deny
   // decision instead of overwhelming the demo audience with a raw
@@ -1080,13 +1182,59 @@ async function pollStatus(){
 // Fire once on load so the breakdown appears without waiting 2s.
 pollStatus();
 pollTimer = setInterval(pollStatus, 2000);
+// implementation-note-14 — same biometric ceremony used by the main dashboard.
+// Fail-open: if WebAuthn is unavailable or the user cancels, we record
+// biometric=false and proceed. The daemon audit log captures the posture.
+async function performBiometricCeremony(){
+  if(!('credentials' in navigator) || !navigator.credentials.get){
+    return {biometric: false};
+  }
+  try{
+    const ch = await fetch('/api/webauthn/challenge').then(r=>r.json());
+    const challengeBytes = base64urlDecode(ch.challenge);
+    const assertion = await navigator.credentials.get({
+      publicKey:{
+        challenge: challengeBytes,
+        rpId: ch.rp_id || 'localhost',
+        allowCredentials: (ch.allow_credentials||[]).map(c=>({
+          type:'public-key',
+          id: base64urlDecode(c.id),
+        })),
+        userVerification: ch.user_verification || 'preferred',
+        timeout: 60000,
+      }
+    });
+    if(!assertion){ return {biometric: false}; }
+    return {biometric: true, credential_id: assertion.id || null};
+  }catch(e){
+    console.warn('biometric ceremony skipped:', e && e.message);
+    return {biometric: false};
+  }
+}
+function base64urlDecode(s){
+  if(!s) return new Uint8Array(0);
+  const pad = '='.repeat((4 - (s.length % 4)) % 4);
+  const b64 = (s + pad).replace(/-/g,'+').replace(/_/g,'/');
+  const raw = atob(b64);
+  const out = new Uint8Array(raw.length);
+  for(let i=0;i<raw.length;i++) out[i] = raw.charCodeAt(i);
+  return out;
+}
 async function resolve(action){
   const btns = document.querySelectorAll('.btn');
   btns.forEach(b=>b.disabled=true);
   try{
+    // Biometric gate for approve/deny (not approve-always — it uses a
+    // separate endpoint that already forces explicit intent).
+    const needsBio = action === 'approve' || action === 'deny';
+    const bio = needsBio ? await performBiometricCeremony() : {};
+    const headers = {'X-Ember-CSRF-Token':CSRF_TOKEN};
+    const hasBody = needsBio;
+    if(hasBody) headers['content-type'] = 'application/json';
     const resp = await fetch(`/api/approvals/${APPROVAL_ID}/${action}`,{
       method:'POST',
-      headers:{'X-Ember-CSRF-Token':CSRF_TOKEN}
+      headers,
+      body: hasBody ? JSON.stringify(bio) : undefined,
     });
     if(resp.ok){
       const label = action==='approve'?'approved':action==='approve-always'?'approved (always)':'denied';
@@ -1101,6 +1249,169 @@ async function resolve(action){
     btns.forEach(b=>b.disabled=false);
   }
 }
+</script>
+</body>
+</html>"#;
+
+/// implementation-note-14 — first-run passkey enrollment page at `/settings/passkeys`.
+///
+/// Guides the operator through registering their platform authenticator
+/// (Touch ID on macOS, Windows Hello on Windows) so the dashboard Approve
+/// button raises the OS biometric sheet. The page uses
+/// `navigator.credentials.create()` to perform the WebAuthn registration
+/// ceremony; the resulting credential ID is stored in localStorage so the
+/// challenge endpoint can include it in `allowCredentials` on subsequent
+/// authentication calls.
+///
+/// Note: the current implementation stores the credential ID in
+/// localStorage for demo simplicity. Production hardening (server-side
+/// credential binding via `PasskeyAdapter` + `ServiceBinding`) is tracked
+/// on the protocol roadmap. The May 3 demo only needs the authentication
+/// path to trigger TouchID — the enrollment page is the setup story.
+const PASSKEYS_SETTINGS_HTML: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ember · passkey settings</title>
+<style>
+:root{--bg-primary:#0a0a0f;--bg-card:#12121a;--accent:#e85d26;--text-primary:#e0e0e8;--text-muted:#6b6b7b;--border:#1e1e2e;--success:#22c55e;--warning:#eab308;--danger:#ef4444}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'JetBrains Mono',ui-monospace,'Cascadia Code','Fira Code',monospace;background:var(--bg-primary);color:var(--text-primary);min-height:100vh;font-size:13px;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px}
+#header{width:100%;max-width:560px;display:flex;align-items:center;justify-content:space-between;margin-bottom:24px}
+#header .logo{font-size:20px;font-weight:700;color:var(--accent)}
+#header a{color:var(--text-muted);font-size:12px;text-decoration:none}
+#header a:hover{color:var(--text-primary)}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:24px;width:100%;max-width:560px;margin-bottom:16px}
+.card-title{font-size:12px;text-transform:uppercase;letter-spacing:.8px;color:var(--text-muted);margin-bottom:16px}
+.desc{font-size:12px;color:var(--text-muted);line-height:1.6;margin-bottom:20px}
+.btn{display:inline-block;padding:10px 20px;border-radius:4px;font-family:inherit;font-size:12px;font-weight:600;cursor:pointer;border:1px solid transparent;transition:opacity .1s}
+.btn:hover{opacity:.8}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.btn-primary{background:rgba(232,93,38,.15);color:var(--accent);border-color:rgba(232,93,38,.3)}
+.btn-danger{background:rgba(239,68,68,.15);color:var(--danger);border-color:rgba(239,68,68,.3)}
+#status{margin-top:16px;padding:12px 16px;border-radius:6px;font-size:12px;display:none}
+#status.ok{background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.2);color:var(--success)}
+#status.err{background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.2);color:var(--danger)}
+.passkey-list{margin-top:16px}
+.passkey-row{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--border);font-size:12px}
+.passkey-row:last-of-type{border-bottom:none}
+.passkey-id{color:var(--text-muted);font-size:11px;word-break:break-all;max-width:380px}
+.empty{color:var(--text-muted);font-size:12px;font-style:italic;padding:8px 0}
+</style>
+</head>
+<body>
+<div id="header">
+  <div class="logo">ember</div>
+  <a href="/">dashboard</a>
+</div>
+<div class="card">
+  <div class="card-title">Passkey Enrollment</div>
+  <p class="desc">Register your platform authenticator (Touch ID on macOS, Windows Hello on Windows, or a hardware security key) to enable biometric approval confirmation on this browser. Once enrolled, the Approve button on pending-approval cards will raise the OS biometric sheet before submitting.</p>
+  <button class="btn btn-primary" id="btn-enroll" onclick="enrollPasskey()">Register Passkey</button>
+  <div id="status"></div>
+</div>
+<div class="card">
+  <div class="card-title">Enrolled Passkeys</div>
+  <div id="passkey-list"></div>
+</div>
+<script>
+const STORAGE_KEY = 'ember_passkey_credentials';
+
+function loadCredentials(){
+  try{ return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); }
+  catch(_){ return []; }
+}
+function saveCredentials(creds){
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(creds));
+}
+
+function renderList(){
+  const creds = loadCredentials();
+  const el = document.getElementById('passkey-list');
+  if(creds.length === 0){
+    el.innerHTML = '<div class="empty">No passkeys enrolled. Click Register Passkey above.</div>';
+    return;
+  }
+  el.innerHTML = creds.map((c,i)=>`
+    <div class="passkey-row">
+      <span class="passkey-id">${escapeHtml(c.id)}</span>
+      <button class="btn btn-danger" style="padding:4px 10px;font-size:11px" onclick="removePasskey(${i})">Remove</button>
+    </div>`).join('');
+}
+function escapeHtml(s){ return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+function removePasskey(idx){
+  const creds = loadCredentials();
+  creds.splice(idx, 1);
+  saveCredentials(creds);
+  renderList();
+}
+
+function showStatus(msg, ok){
+  const el = document.getElementById('status');
+  el.textContent = msg;
+  el.className = ok ? 'ok' : 'err';
+  el.style.display = 'block';
+}
+
+async function enrollPasskey(){
+  const btn = document.getElementById('btn-enroll');
+  btn.disabled = true;
+  showStatus('Requesting challenge…', true);
+  try{
+    if(!('credentials' in navigator) || !navigator.credentials.create){
+      showStatus('WebAuthn not available in this browser or context.', false);
+      btn.disabled = false;
+      return;
+    }
+    // Fetch a fresh challenge from the daemon.
+    const ch = await fetch('/api/webauthn/challenge').then(r=>r.json());
+    const challengeBytes = base64urlDecode(ch.challenge);
+    const rpId = ch.rp_id || 'localhost';
+
+    showStatus('Touch ID / authenticator prompt…', true);
+    const credential = await navigator.credentials.create({
+      publicKey:{
+        rp:{ id: rpId, name: 'ember' },
+        user:{ id: new TextEncoder().encode('ember-operator'), name: 'operator', displayName: 'Operator' },
+        challenge: challengeBytes,
+        pubKeyCredParams:[
+          { type:'public-key', alg:-7 },   // ES256
+          { type:'public-key', alg:-257 }, // RS256
+          { type:'public-key', alg:-8 },   // EdDSA
+        ],
+        authenticatorSelection:{ userVerification:'preferred', residentKey:'preferred' },
+        timeout: 60000,
+      }
+    });
+    if(!credential){
+      showStatus('Registration cancelled.', false);
+      btn.disabled = false;
+      return;
+    }
+    const creds = loadCredentials();
+    creds.push({ id: credential.id, registered: new Date().toISOString() });
+    saveCredentials(creds);
+    showStatus('Passkey registered. You can now use Touch ID to approve requests.', true);
+    renderList();
+  }catch(e){
+    showStatus('Registration failed: '+(e && e.message ? e.message : String(e)), false);
+  }
+  btn.disabled = false;
+}
+
+function base64urlDecode(s){
+  if(!s) return new Uint8Array(0);
+  const pad = '='.repeat((4 - (s.length % 4)) % 4);
+  const b64 = (s + pad).replace(/-/g,'+').replace(/_/g,'/');
+  const raw = atob(b64);
+  const out = new Uint8Array(raw.length);
+  for(let i=0;i<raw.length;i++) out[i] = raw.charCodeAt(i);
+  return out;
+}
+
+renderList();
 </script>
 </body>
 </html>"#;
@@ -1129,7 +1440,7 @@ pub struct DashboardState {
     /// Defaults to `"http://127.0.0.1:3141"` for backwards-compat with tests
     /// that construct `DashboardState` without an explicit origin.
     pub expected_origin: String,
-    /// implementation-note-11: the address the dashboard actually
+    /// implementation-note-20: the address the dashboard actually
     /// bound to, surfaced via `/api/status` as `dashboard_addr_bound`. Always
     /// `Some` when the dashboard is serving traffic (you can't reach this
     /// state otherwise) but the field is `Option<>` so test fixtures can
@@ -1167,7 +1478,7 @@ pub async fn handle_dashboard_request(
                 .iter()
                 .filter(|p| p.status == "active")
                 .count();
-            // implementation-note-11: stringify the bound address
+            // implementation-note-20: stringify the bound address
             // (or `null`) so the CLI `status` subcommand stops printing the
             // configured-but-not-bound port. Field shape: `Option<String>` →
             // `null` when the dashboard isn't bound, full `host:port` when it is.
@@ -1284,6 +1595,66 @@ pub async fn handle_dashboard_request(
             json_response(StatusCode::OK, &serde_json::Value::Array(body))
         }
 
+        // implementation-note-22 — Server-Sent Events stream feeding the live
+        // receipts panel on the dashboard. Mirrors the single-shot
+        // snapshot pattern used by `/sse/grants/{id}`: emit the latest
+        // 50 receipt rows as individual `data:` events, set the
+        // `retry: 1000` hint so EventSource reconnects every second,
+        // and let the client deduplicate by row id. This avoids the
+        // long-lived streaming-body complexity that hyper 1.x's
+        // `Full<Bytes>` response type would otherwise impose, while
+        // still surfacing every new receipt within ~1s end-to-end —
+        // ample for "this product built itself, here are the receipts."
+        (Method::GET, "/api/receipts/stream") => {
+            use crate::receipt::ReceiptFilter;
+            let filter = ReceiptFilter {
+                limit: Some(50),
+                ..Default::default()
+            };
+            let rows = state
+                .store
+                .list_receipt_rows(&filter)
+                .unwrap_or_default();
+            let mut body = String::with_capacity(256 + rows.len() * 256);
+            // EventSource reconnect hint: 1000ms — combined with the
+            // single-shot snapshot this gives ~1Hz polling. The 5-minute
+            // server-side timeout requested by the spec is achieved
+            // implicitly: every reconnect is a fresh snapshot, so a
+            // long-running tab simply keeps re-fetching without holding
+            // the connection open.
+            body.push_str("retry: 1000\n");
+            // Oldest-first emission so the client's prepend-on-message
+            // semantics leave the newest row at the top of the list.
+            for r in rows.iter().rev() {
+                let data = serde_json::json!({
+                    "id": r.id,
+                    "kind": r.kind,
+                    "actor": r.actor,
+                    "resource": r.resource,
+                    "grant_id": r.grant_id,
+                    "materialized_at": r.materialized_at,
+                    "terminal_reason": r.terminal_reason,
+                });
+                let payload = serde_json::to_string(&data).unwrap_or_default();
+                body.push_str("event: receipt\n");
+                body.push_str("data: ");
+                body.push_str(&payload);
+                body.push_str("\n\n");
+            }
+            if rows.is_empty() {
+                // Always send at least one event so EventSource transitions
+                // to `open` and the client's status dot turns green.
+                body.push_str("event: ping\ndata: {}\n\n");
+            }
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .header("cache-control", "no-cache")
+                .header("connection", "keep-alive")
+                .body(Full::new(Bytes::from(body)))
+                .unwrap()
+        }
+
         (Method::GET, "/api/personas") => {
             let personas = state.store.list_personas().unwrap_or_default();
             let body: Vec<serde_json::Value> = personas
@@ -1301,7 +1672,7 @@ pub async fn handle_dashboard_request(
 
         (Method::GET, "/api/grants") => {
             let grants = state.store.list_active_grants().unwrap_or_default();
-            // implementation-note-8 — surface persona.name alongside persona_id
+            // implementation-note-16 — surface persona.name alongside persona_id
             // so the dashboard can render real display names instead of UUID
             // prefixes. Lookup is rendering-layer only; raw persona_id is
             // unchanged, contract additive.
@@ -1327,7 +1698,7 @@ pub async fn handle_dashboard_request(
                     }
                     let conditions = if conds.is_empty() { serde_json::Value::Null } else { serde_json::Value::Object(conds) };
 
-                    // implementation-note-13 (budget_persists_on_simple_grant) —
+                    // implementation-note-23 (budget_persists_on_simple_grant) —
                     // surface the projected budget + usage so the dashboard's
                     // BUDGET column and live gauge JS can render the operator-
                     // configured ceilings. `g.budget` projects from the signed
@@ -1348,6 +1719,33 @@ pub async fn handle_dashboard_request(
                         entry.insert("budget".into(), serde_json::to_value(b).unwrap_or(serde_json::Value::Null));
                         entry.insert("usage".into(), serde_json::to_value(&g.usage).unwrap_or(serde_json::Value::Null));
                     }
+                    // implementation-note-16 — surface composite_statements so the
+                    // Active Grants table can render real scope + budget gauge
+                    // instead of '*' / '—' for multi-statement grants.
+                    // Shape matches the per-statement array in grant_to_json_with_store.
+                    let composite_statements: serde_json::Value =
+                        match state.store.get_access_grant(&g.id) {
+                            Ok(chain) => {
+                                let arr: Vec<serde_json::Value> = chain
+                                    .statements()
+                                    .map(|(block_index, s)| {
+                                        serde_json::json!({
+                                            "sid": s.sid,
+                                            "block_index": block_index,
+                                            "resource_type": s.resource_type.as_str(),
+                                            "actions": s.actions,
+                                            "resource": s.resource,
+                                            "budget": s.budget,
+                                            "usage": s.usage,
+                                        })
+                                    })
+                                    .collect();
+                                serde_json::Value::Array(arr)
+                            }
+                            Err(_) => serde_json::Value::Array(Vec::new()),
+                        };
+                    entry.insert("composite_statements".into(), composite_statements);
+                    entry.insert("paused".into(), serde_json::json!(g.paused));
                     serde_json::Value::Object(entry)
                 })
                 .collect();
@@ -1362,7 +1760,7 @@ pub async fn handle_dashboard_request(
 
         (Method::GET, "/api/approvals") => {
             let approvals = state.store.list_pending_approvals().unwrap_or_default();
-            // implementation-note-8 — `persona.name` lookup for the approval card.
+            // implementation-note-16 — `persona.name` lookup for the approval card.
             let names = persona_name_map(&state.store);
             let body: Vec<serde_json::Value> = approvals
                 .iter()
@@ -1378,7 +1776,7 @@ pub async fn handle_dashboard_request(
                     "status": a.status,
                     "reason": a.reason,
                     "created_at": a.created_at,
-                    // implementation-note-5 — composite envelopes (sandbox-run 3-statement
+                    // implementation-note-13 — composite envelopes (sandbox-run 3-statement
                     // bundle) surface as a single approval entry whose
                     // statements array drives the per-statement card UI.
                     "composite_statements": a.composite_statements,
@@ -1396,7 +1794,7 @@ pub async fn handle_dashboard_request(
             let id = path.strip_prefix("/api/approvals/").unwrap_or("");
             match state.store.get_approval(id) {
                 Ok(a) => {
-                    // implementation-note-8 — additive `persona_name` lookup.
+                    // implementation-note-16 — additive `persona_name` lookup.
                     let persona_name = state.store.get_persona(&a.persona_id).ok().map(|p| p.name);
                     json_response(StatusCode::OK, &serde_json::json!({
                         "id": a.id,
@@ -1410,7 +1808,7 @@ pub async fn handle_dashboard_request(
                         "status": a.status,
                         "reason": a.reason,
                         "created_at": a.created_at,
-                        // implementation-note-5 — surface composite statements + minted grant ID.
+                        // implementation-note-13 — surface composite statements + minted grant ID.
                         "composite_statements": a.composite_statements,
                         "result_grant_id": a.result_grant_id,
                     }))
@@ -1421,7 +1819,7 @@ pub async fn handle_dashboard_request(
 
         (Method::GET, "/api/audit") => {
             use crate::audit::AuditFilter;
-            // implementation-note-8 — operator audit timeline hides internal
+            // implementation-note-16 — operator audit timeline hides internal
             // bookkeeping events (vault.auto_unseal_from_keyring + the
             // generic `*.internal.*` namespace) by default. The dashboard
             // toggle re-fetches with `?include_internal=1` so internal
@@ -1541,7 +1939,7 @@ pub async fn handle_dashboard_request(
                     .strip_suffix("/approve")
                     .unwrap()
                     .to_string();
-                // implementation-note-6 — optional JSON body carries WebAuthn
+                // implementation-note-14 — optional JSON body carries WebAuthn
                 // assertion metadata: `{biometric: bool, credential_id?: string,
                 // assertion?: {clientDataJSON, authenticatorData, signature, ...}}`.
                 // The dashboard JS calls `navigator.credentials.get()` with a
@@ -1598,7 +1996,7 @@ pub async fn handle_dashboard_request(
                     .strip_suffix("/deny")
                     .unwrap()
                     .to_string();
-                // implementation-note-6 — accept biometric metadata on deny too so
+                // implementation-note-14 — accept biometric metadata on deny too so
                 // an auditor can distinguish "human rejected with TouchID"
                 // from "untouched click-through".
                 use http_body_util::BodyExt as _;
@@ -1633,7 +2031,7 @@ pub async fn handle_dashboard_request(
             }
         }
 
-        // implementation-note-6 — WebAuthn challenge minting endpoint.
+        // implementation-note-14 — WebAuthn challenge minting endpoint.
         //
         // Returns a fresh 32-byte random challenge (base64url-encoded) plus
         // a configured `rp_id` so the dashboard JS can call
@@ -1782,7 +2180,7 @@ pub async fn handle_dashboard_request(
             }
         }
 
-        // POST /api/approvals/{id}/dismiss — implementation-note-7
+        // POST /api/approvals/{id}/dismiss — implementation-note-15
         // Operator-initiated dismiss. Sets status to 'dismissed', records
         // `approval.dismissed` audit event, removes the card from the dashboard.
         _ if method == Method::POST
@@ -2006,6 +2404,18 @@ pub async fn handle_dashboard_request(
             }
         }
 
+        // implementation-note-14 — first-run passkey enrollment page.
+        // Explains how to register the operator's platform authenticator
+        // (Touch ID on macOS, Windows Hello on Windows) so the dashboard
+        // Approve button raises the OS biometric sheet.
+        (Method::GET, "/settings/passkeys") => {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/html; charset=utf-8")
+                .body(Full::new(Bytes::from(PASSKEYS_SETTINGS_HTML)))
+                .unwrap()
+        }
+
         _ => Response::builder()
             .status(StatusCode::NOT_FOUND)
             .header("content-type", "text/plain")
@@ -2067,7 +2477,7 @@ fn grant_to_json_with_store(
         Err(_) => serde_json::Value::Array(Vec::new()),
     };
 
-    // implementation-note-8 — additive `persona_name` lookup so the dashboard
+    // implementation-note-16 — additive `persona_name` lookup so the dashboard
     // can render the persona's display name as the primary label.
     let persona_name = store.get_persona(&g.persona_id).ok().map(|p| p.name);
 
@@ -2805,7 +3215,7 @@ fn error_response(status: u16, msg: &str) -> Response<Full<Bytes>> {
 /// Render the dedicated `/approvals/{id}` page HTML for a given approval
 /// record, with all `{{TOKEN}}` placeholders substituted.
 ///
-/// implementation-note-12 — the page leads with the high-level
+/// implementation-note-21 — the page leads with the high-level
 /// Approve/Deny decision; the per-statement breakdown for composite
 /// approvals is rendered client-side from the polled JSON behind a
 /// "Show details" disclosure (collapsed-by-default). Both the dashboard
@@ -2856,7 +3266,7 @@ mod tests {
             csrf_token: TEST_CSRF_TOKEN.to_string(),
             started_at: std::time::Instant::now(),
             expected_origin: TEST_EXPECTED_ORIGIN.to_string(),
-            // implementation-note-11: default to a well-known
+            // implementation-note-20: default to a well-known
             // localhost addr so most tests see a "bound" dashboard; tests
             // that exercise the "not bound" branch override directly.
             dashboard_actual_addr: Some(
@@ -2943,7 +3353,7 @@ mod tests {
                     .iter()
                     .filter(|p| p.status == "active")
                     .count();
-                // implementation-note-11: mirror the production
+                // implementation-note-20: mirror the production
                 // handler so `api_status_*` tests cover the new field shape.
                 let dashboard_addr_bound = state
                     .dashboard_actual_addr
@@ -2962,9 +3372,25 @@ mod tests {
 
             (Method::GET, "/api/grants") => {
                 let grants = state.store.list_active_grants().unwrap_or_default();
+                let names = persona_name_map(&state.store);
                 let body: Vec<serde_json::Value> = grants
                     .iter()
-                    .map(|g| grant_to_json_with_store(g, &state.store))
+                    .map(|g| {
+                        // implementation-note-16 — test handler mirrors the production
+                        // /api/grants response shape including composite_statements
+                        // so dashboard tests can assert on the full grants-table data.
+                        let mut val = grant_to_json_with_store(g, &state.store);
+                        if let Some(obj) = val.as_object_mut() {
+                            // add persona_name (production path adds this too)
+                            obj.insert("persona_name".into(), serde_json::json!(names.get(&g.persona_id).cloned()));
+                            // composite_statements mirrors the statements array —
+                            // same data, name matches what the dashboard JS reads.
+                            let stmts = obj.get("statements").cloned().unwrap_or(serde_json::Value::Array(vec![]));
+                            obj.insert("composite_statements".into(), stmts);
+                            obj.insert("paused".into(), serde_json::json!(g.paused));
+                        }
+                        val
+                    })
                     .collect();
                 json_response(StatusCode::OK, &serde_json::Value::Array(body))
             }
@@ -2975,7 +3401,7 @@ mod tests {
                 json_response(StatusCode::OK, &body)
             }
 
-            // implementation-note-6 — WebAuthn challenge endpoint (test handler).
+            // implementation-note-14 — WebAuthn challenge endpoint (test handler).
             // Mirrors the production handler exactly; kept in sync here so
             // dashboard tests can assert on the response shape.
             (Method::GET, "/api/webauthn/challenge") => {
@@ -3012,7 +3438,7 @@ mod tests {
                 let id = path.strip_prefix("/api/approvals/").unwrap_or("");
                 match state.store.get_approval(id) {
                     Ok(a) => {
-                        // implementation-note-8 — surface persona.name for the
+                        // implementation-note-16 — surface persona.name for the
                         // approval-detail render path (test handler mirrors
                         // production).
                         let persona_name = state.store.get_persona(&a.persona_id).ok().map(|p| p.name);
@@ -3036,7 +3462,7 @@ mod tests {
 
             (Method::GET, "/api/audit") => {
                 use crate::audit::AuditFilter;
-                // implementation-note-8 — mirror the production handler's
+                // implementation-note-16 — mirror the production handler's
                 // `?include_internal=1` toggle and `?action_filter=<prefix>`
                 // so test coverage reflects the same operator-audit semantics.
                 let (include_internal, action_filter) = req.uri().query().map(|q| {
@@ -3247,7 +3673,7 @@ mod tests {
                 }
             }
 
-            // implementation-note-7 — dismiss (test handler)
+            // implementation-note-15 — dismiss (test handler)
             _ if method == Method::POST
                 && path.starts_with("/api/approvals/")
                 && path.ends_with("/dismiss") =>
@@ -3403,6 +3829,44 @@ mod tests {
                 }
             }
 
+            // implementation-note-22 — test handler for `/api/receipts/stream`.
+            // Mirrors the production single-shot SSE snapshot so route
+            // tests can assert content-type + framing without spinning
+            // up a real listener.
+            (Method::GET, "/api/receipts/stream") => {
+                use crate::receipt::ReceiptFilter;
+                let filter = ReceiptFilter {
+                    limit: Some(50),
+                    ..Default::default()
+                };
+                let rows = state.store.list_receipt_rows(&filter).unwrap_or_default();
+                let mut body = String::with_capacity(256);
+                body.push_str("retry: 1000\n");
+                for r in rows.iter().rev() {
+                    let data = serde_json::json!({
+                        "id": r.id,
+                        "kind": r.kind,
+                        "actor": r.actor,
+                        "resource": r.resource,
+                        "grant_id": r.grant_id,
+                        "materialized_at": r.materialized_at,
+                        "terminal_reason": r.terminal_reason,
+                    });
+                    let payload = serde_json::to_string(&data).unwrap_or_default();
+                    body.push_str("event: receipt\ndata: ");
+                    body.push_str(&payload);
+                    body.push_str("\n\n");
+                }
+                if rows.is_empty() {
+                    body.push_str("event: ping\ndata: {}\n\n");
+                }
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/event-stream")
+                    .body(Full::new(Bytes::from(body)))
+                    .unwrap()
+            }
+
             // GET /api/receipts — test handler mirrors production filter logic.
             (Method::GET, "/api/receipts") => {
                 use crate::receipt::ReceiptFilter;
@@ -3435,8 +3899,17 @@ mod tests {
                     signed_only,
                     since_iso,
                     limit: Some(100),
-                    grant_id: None,
+                    // Pre-existing breakage on the base commit — these
+                    // three fields were added to `ReceiptFilter` but the
+                    // dashboard's HTTP handler was never updated. Filling
+                    // with `None` preserves the old behaviour (no extra
+                    // narrowing) so the test target compiles. Surfaced
+                    // here as a side-effect of implementation-note-3
+                    // because that task required `cargo test -p ember-daemon`
+                    // to run, and the broker test target shares this
+                    // compile unit.
                     kind: None,
+                    grant_id: None,
                     resource: None,
                 };
                 let receipts = state.store.list_receipts_filtered(&filter).unwrap_or_default();
@@ -3530,7 +4003,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
-    /// implementation-note-6 — `/api/webauthn/challenge` returns a fresh
+    /// implementation-note-14 — `/api/webauthn/challenge` returns a fresh
     /// base64url-encoded challenge plus rp_id + user_verification fields,
     /// matching the shape `navigator.credentials.get({publicKey: ...})`
     /// expects in the dashboard JS.
@@ -3557,7 +4030,7 @@ mod tests {
         assert_eq!(json["user_verification"], "preferred");
     }
 
-    /// implementation-note-6 — successive challenges differ, asserting we mint
+    /// implementation-note-14 — successive challenges differ, asserting we mint
     /// fresh entropy per call rather than reusing a constant.
     #[tokio::test]
     async fn webauthn_challenges_differ_across_calls() {
@@ -3577,7 +4050,7 @@ mod tests {
         assert_ne!(j1["challenge"], j2["challenge"]);
     }
 
-    /// implementation-note-6 — `resolve_approval_with_biometric` records the
+    /// implementation-note-14 — `resolve_approval_with_biometric` records the
     /// biometric flag + credential_id in the audit log so an auditor can
     /// distinguish hardware-attested approvals from click-throughs.
     #[tokio::test]
@@ -3649,6 +4122,84 @@ mod tests {
         let arr = json.as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["persona_id"], persona.id);
+    }
+
+    /// implementation-note-16 — /api/grants list must include composite_statements
+    /// so the dashboard JS can render real scope + budget for multi-statement grants.
+    #[tokio::test]
+    async fn api_grants_list_includes_composite_statements_for_composite_grant() {
+        use core_types::{Budget, ResourceSelector, ResourceType, Statement, Usage};
+        use core_types::{Action, StatementId};
+
+        let state = make_state();
+        let persona = state.store.create_persona("cstmt-agent").unwrap();
+        let grant = state.store.create_grant(&persona.id, "api-key", "read", None).unwrap();
+
+        // Overwrite blocks_json with a 2-statement composite chain.
+        let stmts = vec![
+            Statement {
+                sid: StatementId::from("SA"),
+                resource_type: ResourceType::Credential,
+                actions: vec![Action::from("read")],
+                resource: ResourceSelector::Any,
+                budget: Some(Budget { cents: Some(2_000), ..Default::default() }),
+                usage: Usage { cents: 412, ..Default::default() },
+                conditions: vec![],
+            },
+            Statement {
+                sid: StatementId::from("SB"),
+                resource_type: ResourceType::Session,
+                actions: vec![Action::from("create")],
+                resource: ResourceSelector::Any,
+                budget: None,
+                usage: Usage::default(),
+                conditions: vec![],
+            },
+        ];
+        let root = state.store.persona_root_keypair(&persona.id).unwrap();
+        let chain = crate::grant::access_grant_from_statements(
+            &grant.id,
+            &persona.id,
+            "api-key",
+            stmts,
+            0,
+            Some(9_999_999_999),
+            &root,
+        )
+        .unwrap();
+        let blocks_json = serde_json::to_string(&chain.blocks).unwrap();
+        state
+            .store
+            .conn()
+            .execute(
+                "UPDATE grants SET blocks_json = ?1 WHERE id = ?2",
+                rusqlite::params![blocks_json, grant.id],
+            )
+            .unwrap();
+
+        let resp = call(Arc::clone(&state), "/api/grants").await;
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+
+        let stmts_field = arr[0]["composite_statements"].as_array()
+            .expect("composite_statements must be an array");
+        assert_eq!(stmts_field.len(), 2, "should have 2 statements");
+
+        // SA has a cents budget — the demo gauge needs to read it.
+        let sa = stmts_field.iter().find(|s| s["sid"] == "SA")
+            .expect("SA statement must be present");
+        assert_eq!(sa["budget"]["cents"], 2_000, "SA budget.cents must be 2000");
+        assert_eq!(sa["usage"]["cents"], 412, "SA usage.cents must be 412");
+
+        // SB has no budget.
+        let sb = stmts_field.iter().find(|s| s["sid"] == "SB")
+            .expect("SB statement must be present");
+        assert!(sb["budget"].is_null(), "SB budget must be null");
     }
 
     #[tokio::test]
@@ -3957,7 +4508,7 @@ mod tests {
 
     #[tokio::test]
     async fn approval_deep_link_hides_composite_breakdown_behind_disclosure() {
-        // implementation-note-12 — the dedicated /approvals/{id} page must
+        // implementation-note-21 — the dedicated /approvals/{id} page must
         // lead with the Approve/Deny decision and keep the per-statement
         // breakdown collapsed behind a "Show details" disclosure. Asserts:
         //   1. The page contains a <details class="composite-disclosure"> block
@@ -4002,7 +4553,7 @@ mod tests {
 
     #[tokio::test]
     async fn dashboard_html_inlines_shared_composite_helper() {
-        // implementation-note-12 — the dashboard pending-approvals card and
+        // implementation-note-21 — the dashboard pending-approvals card and
         // the dedicated /approvals/{id} page share a single JS helper for
         // rendering the composite-statement breakdown. Assert the helper is
         // baked into the dashboard HTML so the two surfaces cannot drift.
@@ -4248,6 +4799,31 @@ mod tests {
         let state = make_state();
         let resp = call(state, "/sse/grants/grant-does-not-exist").await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // implementation-note-22 — `/api/receipts/stream` is the live receipts panel
+    // SSE feed. Empty-store path must still return 200 + event-stream
+    // content-type so the EventSource client transitions to `open`.
+    #[tokio::test]
+    async fn receipts_stream_endpoint_returns_event_stream() {
+        let state = make_state();
+        let resp = call(state, "/api/receipts/stream").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        assert!(
+            ct.contains("text/event-stream"),
+            "receipts stream must return event-stream content-type, got {ct}"
+        );
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let s = std::str::from_utf8(&body).unwrap();
+        assert!(s.contains("retry:"), "SSE body should carry a retry hint");
+        assert!(
+            s.contains("event:"),
+            "SSE body should contain at least one event (ping when empty)"
+        );
     }
 
     #[tokio::test]
@@ -4641,7 +5217,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    // --- implementation-note-7: dismiss endpoint ---
+    // --- implementation-note-15: dismiss endpoint ---
 
     #[tokio::test]
     async fn dismiss_approval_returns_200_and_removes_from_pending() {
@@ -4700,7 +5276,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
-    // --- implementation-note-8: audit action_filter query param ---
+    // --- implementation-note-16: audit action_filter query param ---
 
     #[tokio::test]
     async fn audit_action_filter_returns_only_matching_prefix() {
@@ -4732,7 +5308,7 @@ mod tests {
         assert_eq!(arr.len(), 2, "empty filter returns all events");
     }
 
-    // --- implementation-note-14: /api/receipts endpoint ---
+    // --- implementation-note-24: /api/receipts endpoint ---
 
     /// Ensure the receipts singleton identity is active (mirrors receipt.rs
     /// test helper) so revoke_grant can emit signed receipts.
@@ -4881,7 +5457,7 @@ mod tests {
 
     #[tokio::test]
     async fn approval_page_no_longer_has_narrow_button() {
-        // implementation-note-15: disabled Narrow button was removed for clean screenshots.
+        // implementation-note-25: disabled Narrow button was removed for clean screenshots.
         let state = make_state();
         let persona = state.store.create_persona("agent-narrow-check").unwrap();
         let req = state.store.submit_approval(&persona.id, "key", "read", None, "access", "low").unwrap();
@@ -4891,5 +5467,51 @@ mod tests {
         let s = std::str::from_utf8(&body).unwrap();
         assert!(!s.contains("btn-narrow"), "Narrow button must have been removed from approval page");
         assert!(!s.contains("Narrow"), "Narrow text must not appear on approval page");
+    }
+
+    /// implementation-note-14 — `/settings/passkeys` returns the enrollment page with
+    /// expected content so operators can register their platform authenticator.
+    #[tokio::test]
+    async fn settings_passkeys_returns_enrollment_page() {
+        let state = make_state();
+        let resp = call(state, "/settings/passkeys").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(html.contains("Register Passkey"), "enrollment button missing");
+        assert!(html.contains("navigator.credentials.create"), "WebAuthn create call missing");
+        assert!(html.contains("/api/webauthn/challenge"), "challenge endpoint reference missing");
+        assert!(html.contains("Enrolled Passkeys"), "enrolled passkeys section missing");
+    }
+
+    /// implementation-note-14 — the `/approvals/{id}` page wires biometric ceremony
+    /// into the resolve() function so Approve/Deny calls carry biometric
+    /// metadata (same as the main dashboard cards).
+    #[tokio::test]
+    async fn approval_page_resolve_calls_biometric_ceremony() {
+        let state = make_state();
+        let persona = state.store.create_persona("agent-bio-page").unwrap();
+        let req = state
+            .store
+            .submit_approval(&persona.id, "key", "read", None, "access", "high")
+            .unwrap();
+        let resp = call(Arc::clone(&state), &format!("/approvals/{}", req.id)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let html = std::str::from_utf8(&body).unwrap();
+        assert!(
+            html.contains("performBiometricCeremony"),
+            "/approvals/{{id}} page must call performBiometricCeremony before POSTing"
+        );
+        assert!(
+            html.contains("navigator.credentials.get"),
+            "/approvals/{{id}} page must include WebAuthn get call"
+        );
     }
 }

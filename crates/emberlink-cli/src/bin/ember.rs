@@ -17,8 +17,8 @@ use ember_daemon::sandbox::SandboxCreateOpts;
 use ember_daemon::store::DaemonStore;
 use ember_daemon::vault::{
     check_production_sentinel, is_cargo_test_binary, keyring_writes_suppressed,
-    try_auto_unseal_from_keyring, verify_keyring_roundtrip, AutoUnsealOutcome, Vault,
-    DEFAULT_KEYRING_ACCOUNT, DEFAULT_KEYRING_SERVICE,
+    try_auto_unseal_from_keyring, validate_credential_name, verify_keyring_roundtrip,
+    AutoUnsealOutcome, Vault, DEFAULT_KEYRING_ACCOUNT, DEFAULT_KEYRING_SERVICE,
 };
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
@@ -32,7 +32,7 @@ mod daemon_agent;
 ///
 /// Format: `ember <semver> (<git-sha-or-(no-git)>) built <rfc3339-utc>`.
 ///
-/// CLI-VERSION-FLAG: the implementation-note-4 root cause was a
+/// CLI-VERSION-FLAG: the implementation-note-11 root cause was a
 /// `v0.2.0` binary running against the `v0.2.17` codebase. Embedding the git
 /// SHA + build timestamp at compile time makes "is the running binary
 /// stale?" a five-second `--version` check.
@@ -73,6 +73,14 @@ enum Commands {
         /// Keyring account name to write into config.toml (overrides default)
         #[arg(long)]
         keyring_account: Option<String>,
+        /// Use Touch ID (Secure Enclave-wrapped master key) instead of a
+        /// passphrase. macOS only. Currently a stub: actual SE wrapping is
+        /// gated behind .A-SE-WIRE; the flag is accepted today so the
+        /// init flow can route through `VaultKeyStore::SecureEnclave` once
+        /// the wiring lands. Until then, passing `--touch-id` prints a
+        /// notice and falls back to the passphrase lane.
+        #[arg(long)]
+        touch_id: bool,
     },
     /// Manage the ember daemon
     Daemon {
@@ -83,6 +91,17 @@ enum Commands {
     Persona {
         #[command(subcommand)]
         action: PersonaAction,
+    },
+    /// Enroll and pair devices (.C scaffold).
+    ///
+    /// The verbs are wired but the WebAuthn / iCloud Passkey ceremony has
+    /// not landed yet — every subcommand currently exits non-zero with a
+    /// pointer to `.C-WEBAUTHN-WIRE`. The CLI surface is locked here so
+    /// downstream tooling (dashboard, smoke tests) can call it today and
+    /// the wire-up patch only needs to swap the bodies, not the shape.
+    Device {
+        #[command(subcommand)]
+        action: DeviceAction,
     },
     /// Manage the credential vault
     Vault {
@@ -206,6 +225,35 @@ enum PersonaAction {
         /// Persona ID to revoke
         id: String,
     },
+}
+
+/// Device-management verbs (.C scaffold).
+///
+/// Locked CLI surface for the iCloud Passkey enrollment flow. Today both
+/// verbs print the typed not-yet-implemented message from
+/// `ember_daemon::device::DeviceEnrollError::WebAuthnNotImplemented` and
+/// exit non-zero — the WebAuthn ceremony itself is tracked under
+/// `.C-WEBAUTHN-WIRE` and will swap only the verb bodies, not this
+/// shape.
+#[derive(Subcommand)]
+enum DeviceAction {
+    /// Initiate device enrollment via WebAuthn / iCloud Passkey.
+    ///
+    /// Stub: the `--passkey` flag is the only ceremony shape we'll ship in
+    /// the wire-up; it's accepted today so smoke tests can lock the
+    /// invocation.
+    Enroll {
+        /// Use an iCloud Passkey (WebAuthn platform authenticator) for
+        /// the ceremony.
+        #[arg(long)]
+        passkey: bool,
+    },
+    /// Run the paired-device side of the WebAuthn ceremony.
+    ///
+    /// Stub: this is the verb the *other* device runs to consume the
+    /// pairing handle emitted by `enroll`. Today it errors with the same
+    /// not-yet-implemented message.
+    Pair,
 }
 
 #[derive(Subcommand)]
@@ -422,7 +470,7 @@ enum SandboxAction {
     /// Delete a sandbox: remove container + DB row + (if no other refs)
     /// auto-created persona. Idempotent on already-gone state.
     ///
-    /// implementation-note-21: unblocks `ember sandbox create --name X` retries
+    /// implementation-note-32: unblocks `ember sandbox create --name X` retries
     /// after a previous container start failed and left the persona row +
     /// stale docker container behind. `ember sandbox delete <id|name>` is
     /// the GC path; `stop` only halts (sandbox row + persona stay).
@@ -572,7 +620,7 @@ enum AuditAction {
         /// Audit event ID
         id: String,
     },
-    /// Query the receipts table (EMBER-implementation-note-18).
+    /// Query the receipts table (EMBER-implementation-note-28).
     ///
     /// Returns the unified audit view across grant, kms_wrap, and
     /// kms_unwrap receipts. Filters AND-combine. Use `--json` for raw
@@ -603,7 +651,7 @@ enum AuditAction {
     },
 }
 
-/// EMBER-implementation-note-18 — parse a `--since` argument.
+/// EMBER-implementation-note-28 — parse a `--since` argument.
 ///
 /// Accepts either an ISO-8601 timestamp (e.g. `2026-04-01T00:00:00Z`) or
 /// a relative duration like `24h` / `7d` / `30m` / `45s`. Relative values
@@ -649,7 +697,7 @@ fn print_banner_preamble(config: &DaemonConfig) {
 
 /// Print the dashboard + git-proxy banner lines, followed by the "Ctrl+C to stop"
 /// footer. Called after both bind results are known (from the StartupBinds callback).
-/// implementation-note-10 extended this from a single dashboard line to the full
+/// implementation-note-19 extended this from a single dashboard line to the full
 /// startup-binds aggregate.
 fn print_banner_startup(binds: &StartupBinds) {
     match &binds.dashboard {
@@ -699,7 +747,7 @@ fn effective_config_path(cli_config: Option<&PathBuf>) -> PathBuf {
         .unwrap_or_else(DaemonConfig::default_config_path)
 }
 
-/// implementation-note-11: probe `/api/status` on the configured
+/// implementation-note-20: probe `/api/status` on the configured
 /// dashboard address and return the daemon's reported `dashboard_addr_bound`.
 ///
 /// `None` means: connect failed, response was malformed, or the daemon
@@ -819,7 +867,7 @@ fn open_store(config: &DaemonConfig) -> DaemonStore {
         }
     };
 
-    // implementation-note-20: in-process CLI subcommands (grant/sandbox/persona) talk to
+    // implementation-note-31: in-process CLI subcommands (grant/sandbox/persona) talk to
     // the same SQLite DB the daemon uses, but without going through the
     // socket — so they need their own attached vault to encrypt/decrypt
     // persona secrets. Best-effort auto-unseal from keyring: if a passphrase
@@ -912,7 +960,28 @@ fn cmd_init(
     cli_config_path: Option<&PathBuf>,
     keyring_service_override: Option<String>,
     keyring_account_override: Option<String>,
+    touch_id: bool,
 ) {
+    // .A: `--touch-id` selects the SE-backed VaultKeyStore lane on macOS.
+    // The SE wiring itself is deferred to .A-SE-WIRE; today the flag is
+    // accepted so the init flow + config schema can land first. Print a
+    // notice and fall back to the passphrase lane until the wiring ships.
+    //
+    // On non-macOS, the flag is a hard error — Touch ID has no meaning.
+    if touch_id {
+        #[cfg(target_os = "macos")]
+        {
+            eprintln!(
+                "note: --touch-id is accepted but not yet wired (.A-SE-WIRE).\n      \
+                 Falling back to the passphrase lane for this init."
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            eprintln!("error: --touch-id is only supported on macOS.");
+            process::exit(1);
+        }
+    }
     // Respect --config: if the user passed one, use it as the init target;
     // otherwise fall back to the default (`~/.ember/config.toml`).
     let config_path = cli_config_path
@@ -1605,6 +1674,9 @@ fn resource_selector_display(sel: &ResourceSelector) -> String {
     match sel {
         ResourceSelector::Exact { value } => value.clone(),
         ResourceSelector::Glob { pattern } => pattern.clone(),
+        ResourceSelector::GlobWithSubtarget { primary_glob, subtarget_glob } => {
+            format!("{primary_glob}:{subtarget_glob}")
+        }
         ResourceSelector::Regex { pattern } => format!("/{pattern}/"),
         ResourceSelector::Any => "*".to_string(),
     }
@@ -1722,7 +1794,7 @@ fn cmd_grant_budget(grant: &AccessGrant) {
     print!("{}", render_grant_budget(grant));
 }
 
-/// Handle `ember sandbox delete <id|name>` — implementation-note-21.
+/// Handle `ember sandbox delete <id|name>` — implementation-note-32.
 ///
 /// Resolves the argument to a sandbox UUID, then asks the store to delete
 /// the row + container + auto-created persona (when unreferenced).
@@ -1765,8 +1837,15 @@ fn main() {
     let config = load_config(cli.config.as_ref());
 
     match cli.command {
-        Commands::Init { name, keyring_service, keyring_account } => {
-            cmd_init(&config, name, cli.config.as_ref(), keyring_service, keyring_account)
+        Commands::Init { name, keyring_service, keyring_account, touch_id } => {
+            cmd_init(
+                &config,
+                name,
+                cli.config.as_ref(),
+                keyring_service,
+                keyring_account,
+                touch_id,
+            )
         }
 
         Commands::Daemon { action } => match action {
@@ -1934,7 +2013,45 @@ fn main() {
             }
         }
 
+        Commands::Device { action } => {
+            // .C scaffold: the verbs are locked but the WebAuthn /
+            // iCloud Passkey ceremony has not landed. Both sides print the
+            // typed `WebAuthnNotImplemented` error from `ember_daemon::device`
+            // (single source of truth so the message tracks the rename if it
+            // moves) and exit non-zero so smoke tests fail loudly until
+            // .C-WEBAUTHN-WIRE flips the implementation.
+            let stub_err = ember_daemon::device::DeviceEnrollError::WebAuthnNotImplemented;
+            match action {
+                DeviceAction::Enroll { passkey: _ } => {
+                    eprintln!("error: {stub_err}");
+                    process::exit(1);
+                }
+                DeviceAction::Pair => {
+                    eprintln!("error: {stub_err}");
+                    process::exit(1);
+                }
+            }
+        }
+
         Commands::Vault { action } => {
+            // Client-side pre-validation: fail fast on a malformed name before
+            // we open the store / unlock the vault (which on macOS would fire
+            // a Touch ID prompt). The daemon-side check in `Vault::add` is
+            // authoritative; this mirror is purely UX. If the regex constants
+            // need to be tweaked, change `validate_credential_name` in
+            // `ember-daemon::vault` — the CLI imports the same fn so they
+            // cannot drift.
+            if let VaultAction::Add { ref name, .. } = action {
+                if let Err(e) = validate_credential_name(name) {
+                    eprintln!("error: invalid credential name: {e}");
+                    eprintln!(
+                        "       see design §5.1 for the path grammar (lowercase \
+                         + digits + hyphen, 1..=4 path segments separated by '/')"
+                    );
+                    process::exit(2);
+                }
+            }
+
             let store = open_store(&config);
             let vault = Vault::open_from_config(&config)
                 .expect("failed to resolve vault — is the daemon initialized?");
@@ -2117,7 +2234,7 @@ fn main() {
                         None => None,
                     };
                     let budget = build_budget(budget_tokens, parsed_cents, budget_requests, budget_seconds);
-                    // implementation-note-13 — budget_persists_on_simple_grant.
+                    // implementation-note-23 — budget_persists_on_simple_grant.
                     //
                     // Pre-fix: this path called `create_grant` (no budget) and
                     // then UPDATE'd the flat `budget_json` column. But
@@ -2638,7 +2755,7 @@ fn main() {
 
                     // Mint the composite grant if a credential resource was supplied.
                     //
-                    // implementation-note-5 — route the composite mint through the policy
+                    // implementation-note-13 — route the composite mint through the policy
                     // engine so `default_decision = "require_approval"` fires
                     // here. Three outcomes:
                     //   - AutoApprove: mint immediately (legacy fast-path)
@@ -2804,7 +2921,7 @@ fn main() {
                     // child process inherits stdin/stdout so Claude Code's output
                     // streams directly to the operator's terminal.
                     //
-                    // implementation-note-5 — when the composite grant is pending approval,
+                    // implementation-note-13 — when the composite grant is pending approval,
                     // skip the agent exec; the operator must approve first
                     // (then re-run / `ember sandbox exec`) to give the agent
                     // its credentials.
@@ -2855,7 +2972,7 @@ fn main() {
                             println!("No pending approvals");
                         } else {
                             for r in &requests {
-                                // implementation-note-5 — composite envelopes render as
+                                // implementation-note-13 — composite envelopes render as
                                 // ONE entry with N statements listed beneath.
                                 if let Some(stmts) = r.composite_statements.as_ref() {
                                     println!(
@@ -2937,7 +3054,7 @@ fn main() {
                             } else {
                                 println!("Approved {id}");
                             }
-                            // implementation-note-5 — surface the grant ID minted by a
+                            // implementation-note-13 — surface the grant ID minted by a
                             // composite-approval resolution so the operator
                             // (or test harness) can use it directly.
                             if let Ok(resolved) = store.get_approval(&id)
@@ -3405,7 +3522,7 @@ fn main() {
                     Ok(status) if status.running => {
                         println!("DAEMON             running (PID {})", status.pid);
                         println!("  Socket:    {}", status.socket.display());
-                        // implementation-note-11: the configured
+                        // implementation-note-20: the configured
                         // address is the *attempted* port. The daemon may
                         // have failed to bind (port collision) and still
                         // be running. Probe `/api/status` to read the
@@ -3597,7 +3714,7 @@ mod tests {
             std::env::set_var("EMBER_VAULT_PASSPHRASE", "test-passphrase");
         }
 
-        cmd_init(&config, Some("test".to_string()), Some(&config_path), None, None);
+        cmd_init(&config, Some("test".to_string()), Some(&config_path), None, None, false);
 
         unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE"); }
 
@@ -3651,6 +3768,7 @@ mod tests {
             Some(&config_path),
             Some("custom-service".to_string()),
             Some("custom-account".to_string()),
+            false,
         );
 
         unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE"); }
@@ -4117,7 +4235,7 @@ mod tests {
         }
     }
 
-    // --- docker_exec_flags unit tests (implementation-note-23) ---
+    // --- docker_exec_flags unit tests (implementation-note-36) ---
 
     #[test]
     fn docker_exec_flags_non_tty_returns_only_i() {
@@ -4313,11 +4431,58 @@ mod tests {
             std::env::set_var("EMBER_VAULT_PASSPHRASE", "sec14-cli-passphrase");
         }
 
-        cmd_init(&config, Some("test".to_string()), Some(&config_path), None, None);
+        cmd_init(&config, Some("test".to_string()), Some(&config_path), None, None, false);
 
         assert!(
             std::env::var("EMBER_VAULT_PASSPHRASE").is_err(),
             "EMBER_VAULT_PASSPHRASE must be absent from the environment after cmd_init"
         );
+    }
+
+    // --- .C device enroll/pair scaffold parse tests ---
+
+    fn parse_device(args: &[&str]) -> DeviceAction {
+        use clap::Parser as _;
+        let full: Vec<&str> = std::iter::once("ember")
+            .chain(std::iter::once("device"))
+            .chain(args.iter().copied())
+            .collect();
+        let cli = Cli::try_parse_from(&full).expect("parse failed");
+        match cli.command {
+            Commands::Device { action } => action,
+            _ => panic!("expected Device command"),
+        }
+    }
+
+    #[test]
+    fn device_enroll_passkey_parses() {
+        let action = parse_device(&["enroll", "--passkey"]);
+        match action {
+            DeviceAction::Enroll { passkey } => {
+                assert!(passkey, "--passkey flag should be set");
+            }
+            _ => panic!("expected DeviceAction::Enroll"),
+        }
+    }
+
+    #[test]
+    fn device_enroll_without_passkey_parses_with_default() {
+        // Locks the surface: invoking `ember device enroll` without
+        // --passkey is still parseable today (clap default for `bool` =
+        // false). Wire-up may flip this to required; the test exists so
+        // that flip is intentional, not accidental.
+        let action = parse_device(&["enroll"]);
+        match action {
+            DeviceAction::Enroll { passkey } => {
+                assert!(!passkey, "--passkey absent => false");
+            }
+            _ => panic!("expected DeviceAction::Enroll"),
+        }
+    }
+
+    #[test]
+    fn device_pair_parses() {
+        let action = parse_device(&["pair"]);
+        assert!(matches!(action, DeviceAction::Pair));
     }
 }

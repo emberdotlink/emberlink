@@ -3,6 +3,7 @@ name = "core-types"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [dependencies]
 hex = "0.4"

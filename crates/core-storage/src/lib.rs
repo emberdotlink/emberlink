@@ -1432,7 +1432,7 @@ mod tests {
             "skills":["rust","distributed-systems"],
             "private":{"ssn":"000-00-0000"}
         }"#;
-        let content_key = generate_content_key();
+        let content_key = generate_content_key("presentation-artifact");
 
         let (artifact, manifest, blocks) = build_presentation_artifact_manifest(
             "artifact-1",
@@ -1487,7 +1487,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let content_key = generate_content_key();
+        let content_key = generate_content_key("presentation-artifact");
 
         let err = build_presentation_artifact_manifest(
             "artifact-1",
@@ -1612,7 +1612,7 @@ mod tests {
         .unwrap();
         add_vault_object_with_initial_revision(&mut catalog, object, revision).unwrap();
 
-        let content_key = generate_content_key();
+        let content_key = generate_content_key("vault-catalog");
         let access = manifest_device_access("device-a", "wrapped-manifest-key");
         let (manifest, blocks) =
             seal_vault_catalog("manifest-catalog-1", &catalog, &content_key, vec![access]).unwrap();
@@ -1625,7 +1625,7 @@ mod tests {
 
     #[test]
     fn payload_manifest_round_trips_through_encrypted_blocks() {
-        let content_key = generate_content_key();
+        let content_key = generate_content_key("test");
         let plaintext_chunks = vec![
             br#"{"profile":"primary"}"#.to_vec(),
             b"attachment chunk".to_vec(),
@@ -2103,7 +2103,7 @@ mod tests {
 
     #[test]
     fn encrypted_block_round_trips_and_binds_chunk_metadata() {
-        let key = generate_content_key();
+        let key = generate_content_key("test");
         let block = encrypt_block("manifest-1", 0, b"root chunk", &key).unwrap();
         let decrypted = decrypt_block(&block, &key).unwrap();
 
@@ -2115,7 +2115,7 @@ mod tests {
 
     #[test]
     fn encrypted_blocks_use_nonce_bound_content_addresses() {
-        let key = generate_content_key();
+        let key = generate_content_key("test");
         let first = encrypt_block("manifest-1", 1, b"same payload", &key).unwrap();
         let second = encrypt_block("manifest-1", 1, b"same payload", &key).unwrap();
 

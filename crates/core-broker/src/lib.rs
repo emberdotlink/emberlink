@@ -37,6 +37,13 @@ pub mod cloudflare;
 #[cfg(not(target_arch = "wasm32"))]
 pub use cloudflare::CloudflareBroker;
 
+// Opaque `SecretRef` contract — agents hold the opaque id, never the
+// plaintext (implementation-note-3). The trust boundary for
+// resolving `SecretRef` → plaintext is ember-proxy / ember-tools, which
+// emits a per-resolution Receipt.
+pub mod secret_ref;
+pub use secret_ref::SecretRef;
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};

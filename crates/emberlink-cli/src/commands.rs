@@ -126,6 +126,9 @@ fn render_resource(r: &ResourceSelector) -> String {
     match r {
         ResourceSelector::Exact { value } => value.clone(),
         ResourceSelector::Glob { pattern } => format!("glob:{pattern}"),
+        ResourceSelector::GlobWithSubtarget { primary_glob, subtarget_glob } => {
+            format!("glob:{primary_glob}:{subtarget_glob}")
+        }
         ResourceSelector::Regex { pattern } => format!("re:{pattern}"),
         ResourceSelector::Any => "*".to_string(),
     }
@@ -198,7 +201,9 @@ impl DemoApp {
             ["import", rest @ ..] => self.handle_import(rest),
             ["show", "vault", rest @ ..] | ["vault", rest @ ..] => self.handle_vault(rest),
             ["show", "grant", rest @ ..] | ["grant", rest @ ..] => self.handle_grant(rest),
-            // implementation-note-6 — `ember approval approve|deny <id>` is the
+            // EMBER-implementation-note-28: Subcommand::Audit — query the receipts table.
+            ["audit", rest @ ..] => self.handle_audit(rest),
+            // implementation-note-14 — `ember approval approve|deny <id>` is the
             // demo-grade approval command. On macOS it triggers
             // LocalAuthentication (Touch ID / device passcode) before
             // mutating state; declined biometric refuses the approval.
@@ -1950,6 +1955,70 @@ impl DemoApp {
             }
         }
         Ok(lines)
+    }
+
+    /// EMBER-implementation-note-28 — Subcommand::Audit dispatch for the demo shell.
+    ///
+    /// Accepts the same filter flags as `ember audit query` (`--actor`,
+    /// `--kind`, `--grant-id`, `--since`, `--limit`, `--format`). In the
+    /// demo shell context the receipts table is owned by `DaemonStore` (not
+    /// the local `EventStore`), so this handler surfaces a usage summary and
+    /// defers actual data to the `ember` binary path (`ember audit query`).
+    pub(crate) fn handle_audit(&mut self, tokens: &[&str]) -> String {
+        match tokens {
+            [] | ["--help"] | ["-h"] => {
+                "audit -- Query the receipts table\n\
+                 \n\
+                 Subcommands:\n\
+                   audit query [--actor <id>] [--kind <kind>] [--grant-id <id>]\n\
+                 \t           [--since <duration|ISO>] [--resource <pattern>]\n\
+                 \t           [--limit <N>] [--format table|json|jsonl]\n\
+                 \n\
+                 Receipt kinds: grant, kms_wrap, kms_unwrap, broker_materialization\n\
+                 Duration examples: 1h, 24h, 7d, 2026-04-01T00:00:00Z\n"
+                    .to_string()
+            }
+            ["query", rest @ ..] => {
+                let mut actor: Option<&str> = None;
+                let mut kind: Option<&str> = None;
+                let mut grant_id: Option<&str> = None;
+                let mut since: Option<&str> = None;
+                let mut resource: Option<&str> = None;
+                let mut limit: usize = 50;
+                let mut format = "table";
+                let mut i = 0;
+                while i < rest.len() {
+                    match rest[i] {
+                        "--actor" if i + 1 < rest.len() => { actor = Some(rest[i + 1]); i += 2; }
+                        "--kind" if i + 1 < rest.len() => { kind = Some(rest[i + 1]); i += 2; }
+                        "--grant-id" if i + 1 < rest.len() => { grant_id = Some(rest[i + 1]); i += 2; }
+                        "--since" if i + 1 < rest.len() => { since = Some(rest[i + 1]); i += 2; }
+                        "--resource" if i + 1 < rest.len() => { resource = Some(rest[i + 1]); i += 2; }
+                        "--limit" if i + 1 < rest.len() => {
+                            limit = rest[i + 1].parse().unwrap_or(50);
+                            i += 2;
+                        }
+                        "--format" if i + 1 < rest.len() => { format = rest[i + 1]; i += 2; }
+                        _ => { i += 1; }
+                    }
+                }
+                // The demo shell's EventStore does not contain receipts (those
+                // live in DaemonStore). Surface the parsed filter so callers
+                // can verify arg parsing; data queries go through `ember audit query`.
+                let mut out = String::new();
+                out.push_str("Audit receipt query (demo shell — receipts stored in DaemonStore)\n");
+                if let Some(a) = actor { out.push_str(&format!("  actor:    {a}\n")); }
+                if let Some(k) = kind { out.push_str(&format!("  kind:     {k}\n")); }
+                if let Some(g) = grant_id { out.push_str(&format!("  grant-id: {g}\n")); }
+                if let Some(s) = since { out.push_str(&format!("  since:    {s}\n")); }
+                if let Some(r) = resource { out.push_str(&format!("  resource: {r}\n")); }
+                out.push_str(&format!("  limit:    {limit}\n"));
+                out.push_str(&format!("  format:   {format}\n"));
+                out.push_str("Run `ember audit query` against a live daemon for real receipt rows.\n");
+                out
+            }
+            _ => "Usage: audit [query] [--actor <id>] [--kind <kind>] [--grant-id <id>] [--since <duration|ISO>] [--resource <pattern>] [--limit <N>] [--format table|json|jsonl]\n".to_string(),
+        }
     }
 
     pub(crate) fn handle_structured_command(&mut self, tokens: &[&str]) -> String {
@@ -6377,7 +6446,7 @@ impl DemoApp {
         }
     }
 
-    // ── implementation-note-6: hardware-attested approval ─────────────────────
+    // ── implementation-note-14: hardware-attested approval ─────────────────────
     //
     // `ember approval approve|deny <id> [--no-biometric] [--reason <r>]`
     //
@@ -6477,7 +6546,7 @@ impl DemoApp {
             Ok(()) => {
                 // Audit line — surfaced in `ember show audit` and tee'd into
                 // the daemon log. The `biometric` + `credential_id` fields
-                // satisfy the implementation-note-6 acceptance criterion.
+                // satisfy the implementation-note-14 acceptance criterion.
                 let cred = credential_id.as_deref().unwrap_or("");
                 format!(
                     "approved\t{}\tbiometric={}\tcredential_id={}\n",
@@ -6694,36 +6763,111 @@ impl DemoApp {
 
     // ── Grant rendering ──────────────────────────────────────────────
 
+    // DRY-10-MIGRATE: this handler is the proof-of-concept migration to the
+    // typed `Output` abstraction. Default callers (string-tokenizer →
+    // `handle_grant_list`) continue to receive human-formatted text via the
+    // back-compat shim below, so the ~380 in-tree string-substring tests
+    // remain green. Future migrations: handle_vault, handle_grant_show,
+    // handle_grant_history, handle_grant_recipient, handle_credential,
+    // handle_passkey, handle_service, handle_recovery, handle_sync,
+    // handle_storage, handle_message, handle_disclose, handle_disclosure,
+    // handle_disclosures, handle_content, handle_broker, handle_trust,
+    // handle_root, handle_device, handle_persona, handle_init, handle_invite,
+    // handle_inspect, handle_compare, handle_status, handle_state,
+    // handle_keys, handle_export_events, handle_import_events,
+    // handle_create_root, handle_create_persona, handle_reset, handle_show,
+    // handle_list, handle_all, handle_claim, handle_grant_offer,
+    // handle_grant_create, handle_grant_use, handle_grant_revoke,
+    // handle_grant_renew, handle_grant_edit, handle_grant_audit,
+    // handle_grant_requests, handle_grant_claim, handle_badge,
+    // handle_credential, handle_passkey_register, handle_passkey_authenticate,
+    // handle_passkey_remove, handle_passkey_list, handle_service_bind,
+    // handle_service_list, handle_service_unbind, handle_import_passwords,
+    // handle_storage_*, handle_sync_*, handle_recovery_*, handle_disclose_*.
     fn render_grant_list(&self, grants: &[core_types::AccessGrantSummary]) -> String {
+        // DRY-10: route through the active output mode. The default (set in
+        // `DemoApp::bootstrap`) is `Human { color: false }`, which preserves
+        // the legacy shape so existing string-substring tests remain green.
+        // Binary entry points (`emberlink-cli` / `ember`) overwrite this
+        // from `Args::output_mode()` before dispatch.
+        self.render_grant_list_with_mode(grants, self.output_mode)
+    }
+
+    /// DRY-10: mode-aware variant of [`Self::render_grant_list`]. Currently
+    /// used by the dedicated mode-specific tests; future work will route
+    /// every `handle_grant_list` caller through here once the active
+    /// `Output::Mode` is plumbed through `DemoApp`.
+    pub(crate) fn render_grant_list_with_mode(
+        &self,
+        grants: &[core_types::AccessGrantSummary],
+        mode: crate::output::Mode,
+    ) -> String {
+        let mut out = crate::output::Output::new(mode);
         if grants.is_empty() {
-            return "No active grants.\n".to_string();
+            // Json: emit empty array on its own line so callers can
+            // `jq -s` over the stream and get [] for the empty case.
+            // Quiet: nothing.
+            // Human: keep the legacy "No active grants." string.
+            match mode {
+                crate::output::Mode::Json => {
+                    out.data(&serde_json::Value::Array(Vec::new()));
+                }
+                crate::output::Mode::Human { .. } => {
+                    return "No active grants.\n".to_string();
+                }
+                crate::output::Mode::Quiet => {}
+            }
+            return out.into_string();
         }
-        let mut out = String::new();
-        writeln!(&mut out, "Active grants").unwrap();
-        writeln!(
-            &mut out,
-            "{:<14} {:<14} {:<16} {:<10} {:<10} STMTS",
-            "GRANT", "PERSONA", "RECIPIENT", "MODE", "PROFILE"
-        )
-        .unwrap();
+
+        out.heading("Active grants");
+        // Header row only renders in Human/Quiet (Json doesn't get a header
+        // line — each row is self-describing as a JSON array).
+        if !matches!(mode, crate::output::Mode::Json) {
+            // Preserve the legacy column-aligned shape for Human/Quiet so
+            // existing scripts grepping the output keep working.
+            let header = format!(
+                "{:<14} {:<14} {:<16} {:<10} {:<10} STMTS",
+                "GRANT", "PERSONA", "RECIPIENT", "MODE", "PROFILE"
+            );
+            // `row` joins with tabs in non-Json modes — but the legacy shape
+            // is space-padded. Push the pre-formatted line directly via a
+            // single-cell row to keep the buffer write path uniform.
+            out.row(&[header.as_str()]);
+        }
+
         for g in grants {
             let persona_label = self
                 .resolve_persona(&g.issuing_persona_id)
                 .map(|p| p.label.as_str())
                 .unwrap_or(&g.issuing_persona_id);
-            writeln!(
-                &mut out,
-                "{:<14} {:<14} {:<16} {:<10} {:<10} {}",
-                truncate_id(&g.id),
-                persona_label,
-                truncate_id(&g.recipient_id),
-                g.mode.as_str(),
-                g.recipient_profile.as_str(),
-                g.statement_count,
-            )
-            .unwrap();
+            match mode {
+                crate::output::Mode::Json => {
+                    out.data(&serde_json::json!({
+                        "id": g.id,
+                        "persona_id": g.issuing_persona_id,
+                        "persona_label": persona_label,
+                        "recipient_id": g.recipient_id,
+                        "mode": g.mode.as_str(),
+                        "profile": g.recipient_profile.as_str(),
+                        "statement_count": g.statement_count,
+                    }));
+                }
+                crate::output::Mode::Human { .. } | crate::output::Mode::Quiet => {
+                    let line = format!(
+                        "{:<14} {:<14} {:<16} {:<10} {:<10} {}",
+                        truncate_id(&g.id),
+                        persona_label,
+                        truncate_id(&g.recipient_id),
+                        g.mode.as_str(),
+                        g.recipient_profile.as_str(),
+                        g.statement_count,
+                    );
+                    out.row(&[line.as_str()]);
+                }
+            }
         }
-        out
+        out.into_string()
     }
 
     fn render_grant_detail(&self, detail: &core_types::AccessGrantDetail) -> String {
@@ -7575,5 +7719,93 @@ impl DemoApp {
             }
             _ => format!("Unknown credential subcommand: {}\n", tokens.join(" ")),
         }
+    }
+}
+
+#[cfg(test)]
+mod dry10_grant_list_output_tests {
+    //! DRY-10 mode-specific tests for the migrated `render_grant_list_with_mode`
+    //! handler. We drive grants in via the public `handle_command` path
+    //! (matching the rest of the test suite), then re-list via
+    //! `app_runtime.store.list_active_grants(...)` and route through each
+    //! `output::Mode` to assert the renderer-specific shape.
+    use crate::DemoApp;
+    use crate::output::Mode;
+
+    fn seed_grants(app: &mut DemoApp) {
+        let _ = app.handle_command(
+            "grant create --persona persona-professional --recipient agent-jx \
+             --kind peer --profile agent --mode standing --label dry10-grant \
+             --cap read_credential:obj-dry10",
+        );
+    }
+
+    #[test]
+    fn grant_list_human_no_color_matches_legacy_shape() {
+        let mut app = DemoApp::ephemeral();
+        seed_grants(&mut app);
+        let grants = app
+            .app_runtime
+            .store
+            .list_active_grants(None, None)
+            .expect("list grants");
+        let out = app.render_grant_list_with_mode(&grants, Mode::Human { color: false });
+        assert!(out.contains("Active grants"));
+        assert!(out.contains("standing"));
+        // No ANSI escapes when color is off.
+        assert!(!out.contains("\x1b["));
+    }
+
+    #[test]
+    fn grant_list_json_emits_ndjson_objects() {
+        let mut app = DemoApp::ephemeral();
+        seed_grants(&mut app);
+        let grants = app
+            .app_runtime
+            .store
+            .list_active_grants(None, None)
+            .expect("list grants");
+        let out = app.render_grant_list_with_mode(&grants, Mode::Json);
+        // No human heading.
+        assert!(!out.contains("Active grants"));
+        // Each non-empty line is parseable JSON.
+        for line in out.lines().filter(|l| !l.is_empty()) {
+            let v: serde_json::Value =
+                serde_json::from_str(line).expect("each ndjson line parses");
+            // Object form for grant rows.
+            assert!(v.get("id").is_some(), "row missing id field: {line}");
+            assert!(v.get("mode").is_some(), "row missing mode field: {line}");
+        }
+        assert!(out.contains("standing"));
+    }
+
+    #[test]
+    fn grant_list_json_empty_emits_empty_array() {
+        let app = DemoApp::ephemeral();
+        // No grants seeded.
+        let grants = app
+            .app_runtime
+            .store
+            .list_active_grants(None, None)
+            .expect("list grants");
+        assert!(grants.is_empty());
+        let out = app.render_grant_list_with_mode(&grants, Mode::Json);
+        // Pretty-printed empty array on a single line.
+        assert!(out.trim() == "[]", "expected empty array, got: {out:?}");
+    }
+
+    #[test]
+    fn grant_list_quiet_suppresses_heading() {
+        let mut app = DemoApp::ephemeral();
+        seed_grants(&mut app);
+        let grants = app
+            .app_runtime
+            .store
+            .list_active_grants(None, None)
+            .expect("list grants");
+        let out = app.render_grant_list_with_mode(&grants, Mode::Quiet);
+        assert!(!out.contains("Active grants"));
+        // Data row still present.
+        assert!(out.contains("standing"));
     }
 }

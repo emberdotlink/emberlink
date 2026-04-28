@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::fmt;
 
+
 pub const SCHEMA_VERSION: &str = "0.1.0";
 
 pub trait Validate {

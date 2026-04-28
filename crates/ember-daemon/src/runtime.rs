@@ -68,7 +68,7 @@ pub enum DashboardBind {
     Timeout,
 }
 
-/// implementation-note-10: outcome of the git-echo credential-injection proxy bind.
+/// implementation-note-19: outcome of the git-echo credential-injection proxy bind.
 /// Mirrors `DashboardBind` semantics. Sent to `run()`'s `start_notify`
 /// callback so the CLI can print `EMBER_PROXY_URL=…` for qember.sh +
 /// ember-git.sh consumers.
@@ -87,7 +87,7 @@ pub enum GitProxyBind {
 /// Aggregate bind report passed to `run()`'s `start_notify` callback. Carries
 /// every listener that may have raced to bind during startup so the CLI can
 /// render a consolidated banner. New listeners get a new field here rather
-/// than a parallel callback. implementation-note-10.
+/// than a parallel callback. implementation-note-19.
 #[derive(Debug, Clone)]
 pub struct StartupBinds {
     pub dashboard: DashboardBind,
@@ -101,7 +101,7 @@ pub struct DaemonRuntime {
     /// Path the config was loaded from — used for the vault identity warning in `run()`.
     /// `None` when config came from defaults (no file on disk).
     config_path: Option<std::path::PathBuf>,
-    /// implementation-note-11: actual address the dashboard
+    /// implementation-note-20: actual address the dashboard
     /// listener bound to (`Some(addr)`) or absent when the dashboard is
     /// disabled / failed to bind / timed out (`None`). Populated from inside
     /// `run()` after the bind result arrives. `Mutex` (not `RefCell`)
@@ -148,7 +148,7 @@ impl DaemonRuntime {
         info!(pid = std::process::id(), socket = %socket_path.display(), "ember daemon starting");
         // CLI-VERSION-FLAG: log the binary's compile-time version + git SHA +
         // build timestamp at INFO so a stale binary running against a newer
-        // codebase (the implementation-note-4 root cause) is
+        // codebase (the implementation-note-11 root cause) is
         // identifiable in seconds via `tail daemon.log`. Also surfaces the
         // `(no-git)` fallback if the build script ran without a working repo.
         info!(
@@ -182,7 +182,7 @@ impl DaemonRuntime {
         let db_path = self.config.data_dir.join("daemon.db");
         let store = Rc::new(DaemonStore::open(&db_path)?);
 
-        // implementation-note-20: auto-unseal the vault from the system keyring. The
+        // implementation-note-31: auto-unseal the vault from the system keyring. The
         // helper's contract: it succeeds only if a keyring entry already
         // exists (or `EMBER_VAULT_PASSPHRASE` is set) — never auto-provisions
         // on daemon start so a wiped keyring can't silently mint a fresh
@@ -219,7 +219,7 @@ impl DaemonRuntime {
         // every persona row is vault-sealed from inception.
         store.set_vault(Rc::clone(&vault));
 
-        // implementation-note-20: emit an audit event for the auto-unseal so operators
+        // implementation-note-31: emit an audit event for the auto-unseal so operators
         // running `audit show` see exactly when (and how) the vault came
         // online. Failures here are non-fatal — the audit log is for
         // observability, not correctness.
@@ -257,7 +257,7 @@ impl DaemonRuntime {
             }
         }
 
-        // implementation-note-9 (design Phase 2): install the credential
+        // implementation-note-17 (design Phase 2): install the credential
         // broker registry. Today the only registered provider is the
         // `MockBroker` (so `ember broker {issue,revoke,list}` round-trips
         // a deterministic canary credential end-to-end). The Anthropic
@@ -348,7 +348,7 @@ impl DaemonRuntime {
             }
         });
 
-        // implementation-note-7 — background sweep marks pending
+        // implementation-note-15 — background sweep marks pending
         // approvals older than `stale_approval_threshold_secs` as `timed_out`.
         // Runs every 60 seconds. Complements the startup sweep (line ~261) which
         // only catches requests left pending from prior sessions. This sweep
@@ -393,7 +393,7 @@ impl DaemonRuntime {
                 None
             };
 
-        // implementation-note-10: spawn the git-echo credential-injection proxy if
+        // implementation-note-19: spawn the git-echo credential-injection proxy if
         // configured. Bind result is captured via a oneshot channel and
         // driven below alongside the dashboard's. Each proxy task gets its
         // own DaemonStore (rusqlite Connection is !Send) and a clone of the
@@ -405,7 +405,7 @@ impl DaemonRuntime {
                 let proxy_shutdown = shutdown_tx.subscribe();
                 let (bind_tx, bind_rx) = oneshot::channel::<Result<SocketAddr, std::io::Error>>();
                 let proxy_vault: Vault = (*vault).clone();
-                // implementation-note-10 marker: spawn_local run_git_echo_proxy via this LocalSet.
+                // implementation-note-19 marker: spawn_local run_git_echo_proxy via this LocalSet.
                 local.spawn_local(async move {
                     let store = match crate::store::DaemonStore::open(&proxy_db_path) {
                         Ok(s) => s,
@@ -538,7 +538,7 @@ impl DaemonRuntime {
             (Some(_), None) => GitProxyBind::Disabled,
         };
 
-        // implementation-note-11: persist the resolved bind
+        // implementation-note-20: persist the resolved bind
         // address on the runtime so out-of-band readers (tests, future
         // introspection helpers) see the same truth as `/api/status`. Only
         // the `Bound` variant maps to `Some`; `Failed`/`Disabled`/`Timeout`

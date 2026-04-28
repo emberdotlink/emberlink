@@ -1,4 +1,7 @@
+pub mod admission;
 pub mod tls;
+
+pub use admission::{AdmissionError, AdmittedRequest};
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -604,11 +607,29 @@ pub fn dispatch_command(
             handle_deposit_offer(stream, state, config, offer_id, expires_at, offer_payload, "anon");
         }
         Command::FetchOffer(offer_id) => {
+            // DRY-8-MIGRATE: representative migration to typed admission token.
+            // The gate produces an `AdmittedRequest` that `handle_fetch_offer`
+            // requires — skipping the gate is now a compile error rather than
+            // a runtime check the next handler might forget. Other handlers
+            // are still on the inline `offer_admission_ok` path; see
+            // DRY-8-MIGRATE follow-ups (one per remaining handler).
             if !offer_admission_ok(config) {
                 respond(stream, b"REJECTED relay admission policy requires authenticated submission");
                 return;
             }
-            handle_fetch_offer(stream, state, &offer_id);
+            // The legacy frame protocol does not carry persona/scope headers,
+            // so we synthesise a minimal admitted-request for the
+            // open-mode/anonymous path. Once the wire format gains those
+            // fields the call becomes `admission::gate(auth, persona, scope)`
+            // and the synthesis disappears.
+            let admitted = match admission::gate(None, Some("anon"), Some(&offer_id)) {
+                Ok(a) => a,
+                Err(e) => {
+                    respond(stream, format!("REJECTED {e}").as_bytes());
+                    return;
+                }
+            };
+            handle_fetch_offer(stream, state, &offer_id, &admitted);
         }
         Command::ClaimOffer(offer_id) => {
             if !offer_admission_ok(config) {
@@ -1357,10 +1378,18 @@ pub fn handle_deposit_offer(
 /// - `OFFER <offer-id> <hex-payload>` on success.
 /// - `NOT-FOUND` if the offer is unknown or expired.
 /// - `CLAIMED` if the offer has already been consumed.
+// DRY-8-MIGRATE: this is the representative handler that consumes a
+// typed `AdmittedRequest`. The token is unused for now (the legacy
+// open-mode wire protocol carries no persona/scope) but the *type
+// signature* enforces that the dispatch site ran the gate. Other
+// handlers (handle_claim_offer, handle_deposit_credential, ...) still
+// take raw arguments; migrating each one is tracked under
+// DRY-8-MIGRATE follow-ups.
 pub fn handle_fetch_offer(
     stream: &mut impl io::Write,
     state: &Arc<Mutex<RelayState>>,
     offer_id: &str,
+    _admission: &AdmittedRequest,
 ) {
     let now = now_epoch_secs();
     let mut s = acquire_state(state);

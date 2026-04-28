@@ -13,38 +13,10 @@ use emberlink_agent::protocol::methods::{
 };
 use emberlink_agent::protocol::AgentRequest;
 use emberlink_agent::runtime::AgentRuntime;
-use serde::{Deserialize, Serialize};
 
-// --- JSON-RPC 2.0 types ---
+// --- JSON-RPC 2.0 types (shared via core-mcp; DRY-5) ---
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JsonRpcRequest {
-    pub jsonrpc: String,
-    #[serde(default)]
-    pub id: Option<serde_json::Value>,
-    pub method: String,
-    #[serde(default)]
-    pub params: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JsonRpcResponse {
-    pub jsonrpc: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result: Option<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<JsonRpcError>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JsonRpcError {
-    pub code: i64,
-    pub message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub data: Option<serde_json::Value>,
-}
+pub use core_mcp::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 
 // --- MCP tool definitions ---
 

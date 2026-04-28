@@ -3,6 +3,7 @@ name = "emberlink-app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 # No tauri / keyring / dirs_next deps — those stay in application shells.
 # Callers supply content_key and paths explicitly.

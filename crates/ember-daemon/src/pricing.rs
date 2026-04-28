@@ -237,6 +237,318 @@ pub struct AnthropicSseSummary {
     pub saw_message_stop: bool,
 }
 
+/// Incremental SSE parsing summary — drop-in replacement for the raw
+/// `Vec<u8>` accumulator that `TeeBody` historically held.
+///
+/// development milestone: the streaming proxy used to accumulate every
+/// upstream byte into a `Vec<u8>` capped at `MAX_STREAMING_RESPONSE_BYTES`
+/// (1 MiB). For metering we only need the integer token counts plus the
+/// model string — a struct that is bytes, not megabytes. `UsageSummary`
+/// is what `AnthropicSseStreamParser::summary()` produces and what the
+/// `TeeMeterCallback` consumes; the raw byte buffer is gone from the
+/// streaming path.
+///
+/// Cache tokens are kept separate from `input_tokens` until the final
+/// fold-into-Usage step so a partial summary can record the message_start
+/// counts even when no `message_delta` arrived. The fold mirrors the
+/// non-streaming JSON path's behaviour exactly (design §metering).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UsageSummary {
+    /// Authoritative `input_tokens` (from `message_start.message.usage`).
+    pub input_tokens: u64,
+    /// Cumulative output high-water mark (max across `message_delta` events).
+    pub output_tokens: u64,
+    /// Cache-creation tokens (from `message_start.message.usage`).
+    pub cache_creation_input_tokens: u64,
+    /// Cache-read tokens (from `message_start.message.usage`).
+    pub cache_read_input_tokens: u64,
+    /// Model identifier (from `message_start.message.model`).
+    pub model: Option<String>,
+    /// `true` once a `message_stop` event has been observed.
+    pub saw_message_stop: bool,
+    /// `true` once any usage field has been observed (matches the
+    /// `Option<AnthropicSseSummary>` semantics of the byte-slice parser:
+    /// callers can skip metering when nothing was seen).
+    pub saw_any_usage: bool,
+}
+
+impl UsageSummary {
+    /// Equivalent of the historical `parse_anthropic_sse_usage` return —
+    /// folds cache tokens into `input_tokens` so the `ParsedUsage` shape
+    /// matches the non-streaming JSON path. Use this when a downstream
+    /// consumer needs the legacy `(input, output)` pair.
+    pub fn folded_usage(&self) -> ParsedUsage {
+        ParsedUsage {
+            input_tokens: self
+                .input_tokens
+                .saturating_add(self.cache_creation_input_tokens)
+                .saturating_add(self.cache_read_input_tokens),
+            output_tokens: self.output_tokens,
+        }
+    }
+}
+
+/// Maximum bytes the streaming SSE parser will buffer between frames.
+///
+/// SSE frames are separated by a blank line. When a chunk arrives that
+/// doesn't end on a frame boundary, the trailing partial frame is held
+/// here until the next chunk completes it. 8 KiB is comfortably above
+/// the largest legitimate Anthropic frame (a `message_start` with model
+/// + usage + headers is ≈ 500 bytes; `message_delta` is < 200) while
+/// keeping per-stream memory bounded regardless of stream length.
+///
+/// A hostile upstream that emits a single >8 KiB frame without a
+/// trailing blank line would otherwise let us pin unbounded RSS. When
+/// the buffer would grow past this cap we drop the oldest bytes and
+/// keep parsing — the `saw_message_stop` flag stays accurate as long as
+/// the stop frame itself fits in the cap.
+pub const SSE_PARTIAL_FRAME_CAP_BYTES: usize = 8 * 1024;
+
+/// Incremental Anthropic SSE parser.
+///
+/// development milestone: replaces the raw-byte accumulator that `TeeBody`
+/// historically held. Bytes arrive in chunks (`feed`) split on arbitrary
+/// boundaries — including mid-frame and mid-line. The parser owns a
+/// bounded partial-frame buffer (see `SSE_PARTIAL_FRAME_CAP_BYTES`),
+/// extracts complete frames as they form, and updates the running
+/// `UsageSummary` exactly the way the byte-slice parser would have.
+///
+/// Frame extraction respects both LF-LF and CRLF-CRLF separators; the
+/// CRLF case is normalised to LF on the fly so the same scan logic
+/// handles both. The cap is enforced at frame-buffer level (single
+/// in-flight frame), not at total-bytes-seen level — total bytes streamed
+/// can be arbitrarily large.
+#[derive(Debug, Default)]
+pub struct AnthropicSseStreamParser {
+    /// In-flight bytes that have not yet completed a frame. Capped at
+    /// `SSE_PARTIAL_FRAME_CAP_BYTES`.
+    partial: Vec<u8>,
+    /// Running summary updated as each complete frame is parsed.
+    summary: UsageSummary,
+}
+
+impl AnthropicSseStreamParser {
+    /// Construct an empty parser.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed a chunk of upstream bytes. Returns `()` — the running
+    /// summary is observable via `summary()` after each call. Frames
+    /// that complete inside this chunk update the summary synchronously;
+    /// trailing partial bytes are buffered for the next chunk.
+    pub fn feed(&mut self, chunk: &[u8]) {
+        if chunk.is_empty() {
+            return;
+        }
+
+        // Append to the partial buffer, capped. If the partial buffer
+        // would overflow the cap, drop the oldest bytes — keeping the
+        // newest is correct because frame separators (`\n\n`) only
+        // become valid at the end of a frame, so we want the trailing
+        // tail of the buffer to stay intact.
+        self.append_capped(chunk);
+
+        // Extract every complete frame currently in the buffer, leaving
+        // the trailing partial (if any) in `self.partial`.
+        // Normalize CRLF → LF in-place inside a borrowed working slice
+        // so both wire shapes parse identically.
+        let normalized: Vec<u8>;
+        let working: &[u8] = if self.partial.contains(&b'\r') {
+            normalized = normalize_crlf(&self.partial);
+            &normalized
+        } else {
+            &self.partial
+        };
+
+        // Walk the working slice for frame separators (`\n\n`). Collect
+        // owned frames + the trailing tail BEFORE releasing the borrow,
+        // then mutate `self`.
+        let (frames, tail): (Vec<Vec<u8>>, Option<Vec<u8>>) = {
+            let mut frames: Vec<Vec<u8>> = Vec::new();
+            let mut start: usize = 0;
+            let mut last_consumed: usize = 0;
+            while let Some(pos) = find_frame_separator(working, start) {
+                frames.push(working[start..pos].to_vec());
+                start = pos + 2;
+                last_consumed = start;
+            }
+            let tail = if last_consumed > 0 {
+                Some(working[last_consumed..].to_vec())
+            } else {
+                None
+            };
+            (frames, tail)
+        };
+
+        for frame in &frames {
+            self.process_frame(frame);
+        }
+        if let Some(tail) = tail {
+            self.partial = tail;
+        }
+    }
+
+    /// Borrow the running summary.
+    pub fn summary(&self) -> &UsageSummary {
+        &self.summary
+    }
+
+    /// Take the running summary by value, leaving the parser at default.
+    /// Used by `TeeBody::poll_frame` when firing the meter callback so
+    /// the summary doesn't need to be cloned.
+    pub fn take_summary(&mut self) -> UsageSummary {
+        std::mem::take(&mut self.summary)
+    }
+
+    /// Bytes currently held in the partial-frame buffer. Test-only —
+    /// used to verify the per-stream memory cap stays bounded.
+    #[cfg(test)]
+    pub fn buffered_bytes(&self) -> usize {
+        self.partial.len()
+    }
+
+    fn append_capped(&mut self, chunk: &[u8]) {
+        let new_len = self.partial.len().saturating_add(chunk.len());
+        if new_len <= SSE_PARTIAL_FRAME_CAP_BYTES {
+            self.partial.extend_from_slice(chunk);
+            return;
+        }
+        // Compute how much of the existing buffer to keep so the result
+        // fits exactly under the cap with the new chunk appended.
+        if chunk.len() >= SSE_PARTIAL_FRAME_CAP_BYTES {
+            // The chunk alone already saturates the cap; keep only the
+            // trailing cap bytes of the chunk.
+            self.partial.clear();
+            let start = chunk.len() - SSE_PARTIAL_FRAME_CAP_BYTES;
+            self.partial.extend_from_slice(&chunk[start..]);
+            return;
+        }
+        // Drop the oldest bytes from the existing partial.
+        let keep_existing = SSE_PARTIAL_FRAME_CAP_BYTES - chunk.len();
+        let drop_n = self.partial.len().saturating_sub(keep_existing);
+        self.partial.drain(..drop_n);
+        self.partial.extend_from_slice(chunk);
+    }
+
+    fn process_frame(&mut self, frame: &[u8]) {
+        // Decode lossily — SSE is UTF-8 spec'd but a malformed byte
+        // inside a JSON string should not abort the whole parse.
+        let frame_text = String::from_utf8_lossy(frame);
+        let mut event_name: Option<&str> = None;
+        let mut data_lines: Vec<&str> = Vec::new();
+        for line in frame_text.lines() {
+            if line.starts_with(':') || line.is_empty() {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("event:") {
+                event_name = Some(rest.trim());
+            } else if let Some(rest) = line.strip_prefix("data:") {
+                data_lines.push(rest.trim_start());
+            }
+        }
+        let data = if data_lines.is_empty() {
+            return;
+        } else if data_lines.len() == 1 {
+            data_lines[0].to_string()
+        } else {
+            data_lines.join("\n")
+        };
+
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&data) else {
+            return;
+        };
+
+        let event_type = event_name
+            .or_else(|| value.get("type").and_then(|v| v.as_str()))
+            .unwrap_or("");
+
+        match event_type {
+            "message_start" => {
+                if let Some(msg) = value.get("message") {
+                    if let Some(m) = msg.get("model").and_then(|v| v.as_str()) {
+                        self.summary.model = Some(m.to_string());
+                    }
+                    if let Some(usage) = msg.get("usage") {
+                        self.summary.saw_any_usage = true;
+                        if let Some(n) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
+                            self.summary.input_tokens = self.summary.input_tokens.max(n);
+                        }
+                        if let Some(n) = usage
+                            .get("cache_creation_input_tokens")
+                            .and_then(|v| v.as_u64())
+                        {
+                            self.summary.cache_creation_input_tokens =
+                                self.summary.cache_creation_input_tokens.max(n);
+                        }
+                        if let Some(n) = usage
+                            .get("cache_read_input_tokens")
+                            .and_then(|v| v.as_u64())
+                        {
+                            self.summary.cache_read_input_tokens =
+                                self.summary.cache_read_input_tokens.max(n);
+                        }
+                        // c44 MSG-START-POISON: deliberately skip
+                        // `output_tokens` here — see the byte-slice
+                        // parser for the full rationale.
+                    }
+                }
+            }
+            "message_delta" => {
+                if let Some(usage) = value.get("usage") {
+                    self.summary.saw_any_usage = true;
+                    // c44 Phase E HIGH: only output_tokens from delta;
+                    // ignore any input_tokens / cache_* injection.
+                    if let Some(n) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
+                        self.summary.output_tokens = self.summary.output_tokens.max(n);
+                    }
+                }
+            }
+            "message_stop" => {
+                self.summary.saw_message_stop = true;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Normalize CRLF → LF. Allocates only when `\r` is present (fast path
+/// in the streaming parser is byte-identical to LF input).
+fn normalize_crlf(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] == b'\r' && i + 1 < input.len() && input[i + 1] == b'\n' {
+            out.push(b'\n');
+            i += 2;
+        } else if input[i] == b'\r' {
+            // Bare CR — drop it (matches `\r\n` → `\n` semantics for
+            // the SSE-frame finder; spec only allows LF or CRLF).
+            i += 1;
+        } else {
+            out.push(input[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Find the next `\n\n` in `input` starting at `from`. Returns the index
+/// of the first `\n` of the pair.
+fn find_frame_separator(input: &[u8], from: usize) -> Option<usize> {
+    if from >= input.len() {
+        return None;
+    }
+    let mut i = from;
+    while i + 1 < input.len() {
+        if input[i] == b'\n' && input[i + 1] == b'\n' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Parse an Anthropic Messages-API SSE stream and accumulate usage
 /// tokens. The wire format is documented at
 /// <https://docs.anthropic.com/en/docs/build-with-claude/streaming>.

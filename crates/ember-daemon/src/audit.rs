@@ -20,7 +20,7 @@ pub struct AuditFilter {
     pub agent_id: Option<String>,
     pub action: Option<String>,
     pub limit: Option<usize>,
-    /// implementation-note-8 — filter to actions that start with this prefix,
+    /// implementation-note-16 — filter to actions that start with this prefix,
     /// e.g. `"grant."` shows only grant-family events. Rendering-layer only;
     /// applied after the SQL fetch so the limit still governs the fetch window.
     pub action_prefix: Option<String>,
@@ -96,7 +96,7 @@ impl DaemonStore {
                 .collect::<Result<Vec<_>, _>>()?,
         };
 
-        // implementation-note-8 — action_prefix filter applied post-fetch so
+        // implementation-note-16 — action_prefix filter applied post-fetch so
         // the SQL limit governs the fetch window; the prefix narrows what
         // the dashboard displays. Empty/whitespace prefix is a no-op.
         if let Some(ref prefix) = filter.action_prefix {

@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "JSON-over-stdio agent protocol for Emberlink grant access"
+publish = false
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["std"] }

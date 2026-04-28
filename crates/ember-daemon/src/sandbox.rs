@@ -526,7 +526,7 @@ impl DaemonStore {
     /// too. Idempotent: returns `Ok(())` when the sandbox is already gone so
     /// `ember sandbox delete` retries don't fail loudly.
     ///
-    /// implementation-note-21: addresses the "stale `coding-agent` container blocks
+    /// implementation-note-32: addresses the "stale `coding-agent` container blocks
     /// retry" demo failure. `stop_sandbox` leaves the row + persona behind so
     /// a second `sandbox create --name coding-agent` hits the
     /// `personas.name` UNIQUE constraint. `delete_sandbox` is the GC path.
@@ -581,7 +581,7 @@ impl DaemonStore {
         }
 
         // Belt-and-suspenders: also reap any container whose --name matches
-        // the sandbox name. Covers the implementation-note-21 case where the row
+        // the sandbox name. Covers the implementation-note-32 case where the row
         // was inserted but `start_container` failed before recording a
         // container_id, leaving an orphan docker container with the sandbox
         // name. `docker rm -f <name>` is a no-op when the container is gone.
@@ -890,7 +890,7 @@ mod tests {
         assert_eq!(persona.status, "revoked");
     }
 
-    // ---------- implementation-note-21: delete_sandbox ----------
+    // ---------- implementation-note-32: delete_sandbox ----------
 
     #[test]
     fn delete_sandbox_removes_row_and_unreferenced_persona() {
@@ -916,7 +916,7 @@ mod tests {
 
     #[test]
     fn delete_sandbox_unblocks_recreate_with_same_name() {
-        // The whole point of implementation-note-21: after a stale sandbox is
+        // The whole point of implementation-note-32: after a stale sandbox is
         // deleted, the demo can re-create a sandbox with the same name
         // without hitting the `personas.name UNIQUE` constraint.
         let store = DaemonStore::open_in_memory().unwrap();

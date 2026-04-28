@@ -1,3 +1,80 @@
+use std::path::Path;
+
+/// Errors returned by [`validate_notifier_path`].
+#[derive(Debug)]
+pub enum NotifyError {
+    RelativePath,
+    DotDotComponent,
+    NotFound,
+    NotAFile,
+    NotExecutable,
+    WorldWritable,
+}
+
+impl std::fmt::Display for NotifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NotifyError::RelativePath => write!(f, "EMBER_NOTIFIER path must be absolute"),
+            NotifyError::DotDotComponent => {
+                write!(f, "EMBER_NOTIFIER path must not contain '..' components")
+            }
+            NotifyError::NotFound => write!(f, "EMBER_NOTIFIER path does not exist"),
+            NotifyError::NotAFile => write!(f, "EMBER_NOTIFIER path is not a regular file"),
+            NotifyError::NotExecutable => {
+                write!(f, "EMBER_NOTIFIER path does not have execute permission")
+            }
+            NotifyError::WorldWritable => {
+                write!(f, "EMBER_NOTIFIER path is world-writable (unsafe)")
+            }
+        }
+    }
+}
+
+/// Validate that `path` is safe to use as the `EMBER_NOTIFIER` binary.
+///
+/// Checks (in order):
+/// 1. Must be an absolute path.
+/// 2. Must not contain `..` components.
+/// 3. Must exist on disk.
+/// 4. Must be a regular file.
+/// 5. Must have at least one execute bit set.
+/// 6. Must NOT be world-writable.
+#[cfg(unix)]
+pub fn validate_notifier_path(path: &Path) -> Result<(), NotifyError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !path.is_absolute() {
+        return Err(NotifyError::RelativePath);
+    }
+
+    for component in path.components() {
+        use std::path::Component;
+        if matches!(component, Component::ParentDir) {
+            return Err(NotifyError::DotDotComponent);
+        }
+    }
+
+    let meta = std::fs::metadata(path).map_err(|_| NotifyError::NotFound)?;
+
+    if !meta.is_file() {
+        return Err(NotifyError::NotAFile);
+    }
+
+    let mode = meta.permissions().mode();
+
+    // At least one of owner/group/other execute bits must be set.
+    if mode & 0o111 == 0 {
+        return Err(NotifyError::NotExecutable);
+    }
+
+    // World-writable: other write bit (bit 1 in the "other" triad).
+    if mode & 0o002 != 0 {
+        return Err(NotifyError::WorldWritable);
+    }
+
+    Ok(())
+}
+
 /// Send a desktop notification. Best-effort — failures are logged but not fatal.
 ///
 /// ## macOS notifier selection (in order):
@@ -136,16 +213,21 @@ fn sanitize(s: &str) -> String {
 
 #[cfg(target_os = "macos")]
 fn try_custom_notifier(title: &str, subtitle: Option<&str>, message: &str) -> bool {
-    let Ok(path) = std::env::var("EMBER_NOTIFIER") else {
+    let Ok(path_str) = std::env::var("EMBER_NOTIFIER") else {
         return false;
     };
-    let mut cmd = std::process::Command::new(&path);
+    let path = std::path::Path::new(&path_str);
+    if let Err(e) = validate_notifier_path(path) {
+        tracing::warn!(path = %path_str, error = %e, "EMBER_NOTIFIER validation failed — skipping notification");
+        return false;
+    }
+    let mut cmd = std::process::Command::new(path);
     cmd.args(["-title", title, "-message", message]);
     if let Some(s) = subtitle.filter(|s| !s.is_empty()) {
         cmd.args(["-subtitle", s]);
     }
     let Ok(status) = cmd.status() else {
-        tracing::warn!(path = %path, "EMBER_NOTIFIER configured but failed to spawn");
+        tracing::warn!(path = %path_str, "EMBER_NOTIFIER configured but failed to spawn");
         return false;
     };
     status.success()
@@ -227,5 +309,51 @@ mod tests {
     #[test]
     fn sanitize_keeps_unicode() {
         assert_eq!(sanitize("naïve résumé"), "naïve résumé");
+    }
+
+    #[cfg(unix)]
+    mod validate_notifier {
+        use super::super::validate_notifier_path;
+        use std::os::unix::fs::PermissionsExt;
+
+        #[test]
+        fn validate_rejects_relative_path() {
+            let path = std::path::Path::new("relative/path/to/notifier");
+            assert!(validate_notifier_path(path).is_err());
+        }
+
+        #[test]
+        fn validate_rejects_dotdot_in_path() {
+            let path = std::path::Path::new("/usr/local/../bin/notifier");
+            assert!(validate_notifier_path(path).is_err());
+        }
+
+        #[test]
+        fn validate_rejects_nonexistent_path() {
+            let path = std::path::Path::new("/absolutely/does/not/exist/notifier-xyz");
+            assert!(validate_notifier_path(path).is_err());
+        }
+
+        #[test]
+        fn validate_rejects_world_writable_file() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let file_path = dir.path().join("notifier");
+            std::fs::write(&file_path, b"#!/bin/sh\n").expect("write");
+            // 0o666 = rw-rw-rw- (world-writable, no execute)
+            std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o666))
+                .expect("chmod");
+            assert!(validate_notifier_path(&file_path).is_err());
+        }
+
+        #[test]
+        fn validate_accepts_safe_executable() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let file_path = dir.path().join("notifier");
+            std::fs::write(&file_path, b"#!/bin/sh\n").expect("write");
+            // 0o755 = rwxr-xr-x
+            std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+            assert!(validate_notifier_path(&file_path).is_ok());
+        }
     }
 }

@@ -334,6 +334,29 @@ fn selector_subset(child: &ResourceSelector, parent: &ResourceSelector) -> bool 
             // the child as a subset iff parent is "*" or parent == child.
             p == "*" || p == c
         }
+        // P69E.5c: GlobWithSubtarget attenuation — the child must satisfy
+        // both the parent's primary AND subtarget. We check primary like a
+        // plain glob; subtarget is checked via string equality (or "*"
+        // parent-subsumes-anything). `Glob` parents accept a
+        // GlobWithSubtarget child only when the child's primary is
+        // covered (the parent has no subtarget restriction), and a
+        // GlobWithSubtarget parent never relaxes — it requires the same
+        // subtarget shape. Conservative fail-closed: anything richer
+        // returns false.
+        (
+            ResourceSelector::GlobWithSubtarget {
+                primary_glob: pp,
+                subtarget_glob: ps,
+            },
+            ResourceSelector::GlobWithSubtarget {
+                primary_glob: cp,
+                subtarget_glob: cs,
+            },
+        ) => (pp == "*" || pp == cp) && (ps == "*" || ps == cs),
+        (
+            ResourceSelector::Glob { pattern: p },
+            ResourceSelector::GlobWithSubtarget { primary_glob: cp, .. },
+        ) => p == "*" || p == cp,
         _ => false,
     }
 }

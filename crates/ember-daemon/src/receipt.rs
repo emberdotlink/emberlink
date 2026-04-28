@@ -180,7 +180,7 @@ pub fn canonical_hash_receipt(receipt: &GrantReceipt) -> [u8; 32] {
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-3 — kms receipt canonical-encoding + signing helpers
+// implementation-note-4 — kms receipt canonical-encoding + signing helpers
 // ---------------------------------------------------------------------------
 
 /// Canonical-encoding prefix for kms receipts. Distinct from
@@ -648,18 +648,18 @@ pub struct ReceiptFilter {
     pub since_iso: Option<String>,
     /// Maximum rows to return. Defaults to 100 when `None`.
     pub limit: Option<u64>,
-    /// EMBER-implementation-note-18 — kind discriminator (`grant`, `kms_wrap`,
+    /// EMBER-implementation-note-28 — kind discriminator (`grant`, `kms_wrap`,
     /// `kms_unwrap`). Mapped 1:1 to the `kind` column.
     pub kind: Option<String>,
-    /// EMBER-implementation-note-18 — restrict to receipts whose `grant_id` matches.
+    /// EMBER-implementation-note-28 — restrict to receipts whose `grant_id` matches.
     pub grant_id: Option<String>,
-    /// EMBER-implementation-note-18 — substring filter on the receipt's `summary.resource`
+    /// EMBER-implementation-note-28 — substring filter on the receipt's `summary.resource`
     /// (grant receipts) or top-level `key_name` (kms receipts). Applied
     /// post-fetch so the JSON1 index can still serve exact-match callers.
     pub resource: Option<String>,
 }
 
-/// EMBER-implementation-note-18 — flat audit row returned by [`DaemonStore::list_receipt_rows`].
+/// EMBER-implementation-note-28 — flat audit row returned by [`DaemonStore::list_receipt_rows`].
 ///
 /// Joins receipt fields with [`crate::grant::GrantInfo`] when the row is a
 /// grant receipt so callers see `requested_scope` / `granted_scope` without
@@ -909,7 +909,7 @@ impl DaemonStore {
         Ok(out)
     }
 
-    /// EMBER-implementation-note-18 — flat audit-row listing for the `ember audit`
+    /// EMBER-implementation-note-28 — flat audit-row listing for the `ember audit`
     /// query CLI. Joins the receipts table with `grants` so the row carries
     /// both the receipt fields and the parent grant's scope.
     ///
@@ -957,28 +957,28 @@ impl DaemonStore {
         sql.push_str(&format!(" LIMIT {limit}"));
 
         let mut stmt = self.conn().prepare(&sql)?;
-        let mapper =
-            |row: &rusqlite::Row<'_>| -> rusqlite::Result<(
-                String,
-                String,
-                String,
-                String,
-                String,
-                String,
-                String,
-                Option<String>,
-            )> {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                ))
-            };
+        type ReceiptRowTuple = (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+        );
+        let mapper = |row: &rusqlite::Row<'_>| -> rusqlite::Result<ReceiptRowTuple> {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+            ))
+        };
 
         let rows: Vec<_> = match binds.len() {
             0 => stmt.query_map([], mapper)?.collect::<Result<Vec<_>, _>>()?,
@@ -1893,7 +1893,7 @@ pub fn trigger_receipt_if_terminal_current(
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-3 — kms receipt sink wiring
+// implementation-note-4 — kms receipt sink wiring
 // ---------------------------------------------------------------------------
 //
 // `core_kms::ReceiptSink` requires `Send + Sync`, but `DaemonStore` is
@@ -2113,7 +2113,7 @@ mod kms_tests {
         current_identity().expect("identity was just initialised")
     }
 
-    /// EMBER-implementation-note-18 — mixed-kind audit query. Seed two kms receipts for
+    /// EMBER-implementation-note-28 — mixed-kind audit query. Seed two kms receipts for
     /// the same persona (one wrap, one unwrap) plus one for a different
     /// persona; the actor filter must return only the matching pair, and
     /// the rows must be sorted `materialized_at DESC`.
@@ -2158,7 +2158,7 @@ mod kms_tests {
         );
     }
 
-    /// EMBER-implementation-note-18 — kind filter narrows to a single discriminator.
+    /// EMBER-implementation-note-28 — kind filter narrows to a single discriminator.
     #[test]
     fn list_receipt_rows_filters_by_kind() {
         let _ = ensure_identity_for_kms_test();
@@ -2180,7 +2180,7 @@ mod kms_tests {
         assert_eq!(wraps[0].resource, "k1");
     }
 
-    /// EMBER-implementation-note-18 — resource substring filter (post-fetch) narrows
+    /// EMBER-implementation-note-28 — resource substring filter (post-fetch) narrows
     /// matches without forcing exact equality.
     #[test]
     fn list_receipt_rows_filters_by_resource_substring() {
@@ -2204,7 +2204,7 @@ mod kms_tests {
         assert!(rows.iter().all(|r| r.resource.contains("tokens")));
     }
 
-    /// EMBER-implementation-note-18 — index existence sanity check. Inspect the
+    /// EMBER-implementation-note-28 — index existence sanity check. Inspect the
     /// sqlite_master catalog and confirm the new audit-CLI indexes were
     /// created by the migration.
     #[test]

@@ -3,6 +3,7 @@ mod biometric;
 pub mod broker;
 pub mod cli;
 mod commands;
+pub mod output;
 mod recovery;
 mod screens;
 mod sync_support;
@@ -138,6 +139,13 @@ pub struct DemoApp {
     tls_config: Arc<rustls::ClientConfig>,
     /// Number of MessageSent events already scanned by auto_import_disclosure_messages.
     disclosure_import_cursor: usize,
+    /// DRY-10: active output renderer mode. Default = `Human { color: false }`
+    /// to keep the ~380 in-tree string-substring tests green; binary entry
+    /// points overwrite this from `Args::output_mode()` before dispatching
+    /// any command. Migrated handlers (currently just `render_grant_list`)
+    /// route through this; un-migrated handlers ignore it and emit the
+    /// legacy human shape.
+    pub(crate) output_mode: crate::output::Mode,
 }
 
 impl DemoApp {
@@ -153,6 +161,19 @@ impl DemoApp {
 
     pub fn ephemeral() -> Self {
         Self::bootstrap(None, true)
+    }
+
+    /// DRY-10: set the active output renderer mode. Migrated handlers
+    /// (currently just `render_grant_list`) honor this; un-migrated
+    /// handlers continue to emit the legacy human shape.
+    pub fn set_output_mode(&mut self, mode: crate::output::Mode) {
+        self.output_mode = mode;
+    }
+
+    /// Read the active output renderer mode. Surface for binaries that
+    /// want to inspect the resolved mode (e.g. for testing).
+    pub fn output_mode(&self) -> crate::output::Mode {
+        self.output_mode
     }
 
     fn bootstrap(data_file: Option<PathBuf>, seed_demo: bool) -> Self {
@@ -280,6 +301,7 @@ impl DemoApp {
             relay_try_tls: false,
             tls_config: Arc::new(build_tls_client_config()),
             disclosure_import_cursor: 0,
+            output_mode: crate::output::Mode::Human { color: false },
             storage_relationship: create_relationship("storage-1", "peer-a", "peer-b"),
             storage_manifest: publish_manifest(
                 "manifest-1",
@@ -737,7 +759,7 @@ impl DemoApp {
         if let Some(content_key) = self.local_manifest_key(manifest_id)? {
             return Ok(content_key);
         }
-        let content_key = generate_content_key();
+        let content_key = generate_content_key("manifest");
         self.app_runtime.store
             .upsert_local_manifest_key(manifest_id, &content_key)?;
         Ok(content_key)
@@ -1493,7 +1515,7 @@ fn resolve_encryption_key() -> Result<String, ValidationError> {
         Ok(entry) => match entry.get_password() {
             Ok(key) => Ok(key),
             Err(keyring::Error::NoEntry) => {
-                let key = core_crypto::generate_content_key();
+                let key = core_crypto::generate_content_key("local-state");
                 entry.set_password(&key).map_err(|err| {
                     ValidationError::new(format!(
                         "failed to store encryption key in keychain: {err}"

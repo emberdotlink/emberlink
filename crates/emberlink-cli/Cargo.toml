@@ -11,6 +11,7 @@ categories = ["authentication", "command-line-utilities"]
 # Disable bin auto-discovery so `src/bin/daemon_agent.rs` is treated as a
 # module of the `ember` binary, not a separate binary of its own.
 autobins = false
+publish = false
 
 [[bin]]
 name = "emberlink-cli"

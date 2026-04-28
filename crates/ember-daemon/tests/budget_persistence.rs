@@ -1,4 +1,4 @@
-//! implementation-note-13 regression coverage.
+//! implementation-note-23 regression coverage.
 //!
 //! Pre-fix the simple-grant CLI path called `store.create_grant(...)` (which
 //! built the canonical block-zero statement with `budget = None`) and then

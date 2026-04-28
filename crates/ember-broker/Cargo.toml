@@ -1,0 +1,18 @@
+[package]
+name = "ember-broker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Approval delivery channels + grant-request routing for ember-broker."
+publish = false
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+core-broker = { path = "../core-broker" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"

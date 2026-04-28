@@ -3,8 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use core_events::{EventEnvelope, EventRef};
 use core_trust::derive_public_statements;
 use core_types::{
-    grant_conditions::GrantCondition, EndpointDescriptor, EventBody, EventRefRelation, FileManifest,
-    TrustAttestation, Validate, ValidationError,
+    grant_conditions::{GrantCondition, MAX_CONDITION_DEPTH},
+    EndpointDescriptor, EventBody, EventRefRelation, FileManifest, TrustAttestation, Validate,
+    ValidationError,
 };
 
 use crate::{
@@ -89,6 +90,29 @@ pub fn advance_chain_head(state: &mut MaterializedState, event: &EventEnvelope) 
     state
         .root_chain_heads
         .insert(root_id, (event.event_id.clone(), seq));
+}
+
+/// Compute the maximum nesting depth of a `serde_json::Value`.
+///
+/// Depth of a scalar (null, bool, number, string) is `0`. Each `Array` or
+/// `Object` layer adds 1 to the deepest child. Used by `apply_event` to
+/// reject signed-payload JSON whose nesting exceeds [`MAX_CONDITION_DEPTH`]
+/// before any structured deserialization (which itself recurses) is attempted.
+/// security check: defence in depth alongside `GrantCondition::validate_depth`.
+pub(crate) fn json_max_depth(v: &serde_json::Value) -> u32 {
+    match v {
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .map(|x| 1 + json_max_depth(x))
+            .max()
+            .unwrap_or(0),
+        serde_json::Value::Object(map) => map
+            .values()
+            .map(|x| 1 + json_max_depth(x))
+            .max()
+            .unwrap_or(0),
+        _ => 0,
+    }
 }
 
 pub fn apply_event(
@@ -660,8 +684,27 @@ pub fn apply_event(
             // storage path that bypasses event validation, add an explicit
             // 100 KiB byte-length check here.
             if !body.conditions_json.is_empty() {
-                let conditions: Vec<GrantCondition> =
+                // security check: traverse the raw JSON once before structured
+                // deserialization to reject deeply-nested payloads early.
+                // `serde_json::from_str::<Vec<GrantCondition>>` itself recurses
+                // and could blow the stack on adversarial input; a flat
+                // `Value` parse is bounded by serde_json's own depth guard
+                // and gives us a cheap pre-check.
+                let raw_value: serde_json::Value =
                     serde_json::from_str(&body.conditions_json).map_err(|e| {
+                        ValidationError::invalid_format(format!(
+                            "grant offer conditions_json is not valid JSON: {e}"
+                        ))
+                    })?;
+                let depth = json_max_depth(&raw_value);
+                if depth > MAX_CONDITION_DEPTH {
+                    return Err(ValidationError::invalid_format(format!(
+                        "grant offer conditions_json rejected (security check): JSON nesting depth \
+                         {depth} exceeds maximum of {MAX_CONDITION_DEPTH}"
+                    )));
+                }
+                let conditions: Vec<GrantCondition> =
+                    serde_json::from_value(raw_value).map_err(|e| {
                         ValidationError::invalid_format(format!(
                             "grant offer conditions_json is not valid JSON: {e}"
                         ))
@@ -1121,6 +1164,104 @@ mod tests {
         );
         apply_event(&mut state, &event2).expect("distinct request_id must succeed");
         assert_eq!(state.recovery_requests_current.len(), 2);
+    }
+
+    // ── security check: race-prone RecoveryApproved must not double-materialize ──
+
+    #[test]
+    fn recovery_approved_duplicate_from_same_guardian_is_idempotent() {
+        // Adversarial: two concurrent `RecoveryApproved` events from the same
+        // guardian for the same request. Both pass authorize (signer is the
+        // enrolled guardian, request exists). Both call `apply_event`. The
+        // second must be a no-op against approvals/threshold — i.e. only the
+        // first materially changes state, the second sees the state already
+        // contains its approval and does not double-count.
+        //
+        // This is the in-memory analog of the daemon-side BEGIN IMMEDIATE
+        // protection (REVIEW2-F3, commit historical_revision): the materialize seam
+        // must be safe under retransmission/replay.
+        let mut state = state_with_recovery_context();
+
+        // Lower threshold to 1 so a single approval flips status to Approved.
+        state
+            .recovery_policies_current
+            .get_mut("root-a")
+            .unwrap()
+            .guardian_threshold = 1;
+
+        // Stage a request.
+        let req_event = make_event(
+            "evt-req",
+            EventBody::RecoveryRequested(RecoveryRequestedEvent {
+                request_id: "req-1".into(),
+                root_id: "root-a".into(),
+                target_device_id: "device-a".into(),
+            }),
+            SignerBinding::root("root-a", "key-root-a"),
+        );
+        apply_event(&mut state, &req_event).expect("request setup");
+
+        // First approval — should flip status to Approved.
+        let approve1 = make_event(
+            "evt-approve-1",
+            EventBody::RecoveryApproved(core_types::RecoveryApprovedEvent {
+                request_id: "req-1".into(),
+                guardian_id: "guardian-1".into(),
+            }),
+            SignerBinding {
+                signer: core_types::EventSubject::new(
+                    core_types::SubjectKind::Guardian,
+                    "guardian-1",
+                ),
+                role: core_types::KeyRole::Guardian,
+                key_id: "key-g1".into(),
+            },
+        );
+        apply_event(&mut state, &approve1).expect("first approval should materialize");
+        let req_after_first = &state.recovery_requests_current["req-1"];
+        assert_eq!(
+            req_after_first.approvals.len(),
+            1,
+            "exactly one approval recorded after first event"
+        );
+        assert!(req_after_first.approvals.contains("guardian-1"));
+        assert_eq!(req_after_first.status, RecoveryRequestStatus::Approved);
+
+        // Second approval — same guardian, same request. Mirrors the
+        // adversarial concurrent-replay scenario the daemon-side BEGIN
+        // IMMEDIATE protects against. apply_event must NOT double-count or
+        // otherwise corrupt state (BTreeSet insert is idempotent).
+        let approve2 = make_event(
+            "evt-approve-2",
+            EventBody::RecoveryApproved(core_types::RecoveryApprovedEvent {
+                request_id: "req-1".into(),
+                guardian_id: "guardian-1".into(),
+            }),
+            SignerBinding {
+                signer: core_types::EventSubject::new(
+                    core_types::SubjectKind::Guardian,
+                    "guardian-1",
+                ),
+                role: core_types::KeyRole::Guardian,
+                key_id: "key-g1".into(),
+            },
+        );
+        apply_event(&mut state, &approve2)
+            .expect("second approval must not error — current materialize is idempotent");
+
+        // State after the second event must be identical to state after the
+        // first — exactly one logical approval, status still Approved, no
+        // split-state side effects.
+        let req_after_second = &state.recovery_requests_current["req-1"];
+        assert_eq!(
+            req_after_second.approvals.len(),
+            1,
+            "duplicate approval from same guardian must not double-count"
+        );
+        assert!(req_after_second.approvals.contains("guardian-1"));
+        assert_eq!(req_after_second.status, RecoveryRequestStatus::Approved);
+        assert!(req_after_second.contested_by.is_empty());
+        assert!(req_after_second.cooldown_until.is_none());
     }
 
     // ── security check: prev_event_id + monotonic sequence chaining ──

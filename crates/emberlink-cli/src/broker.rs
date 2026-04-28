@@ -1,7 +1,7 @@
 //! `ember broker {issue, revoke, list}` — operator + wrapper-script entry
 //! point for the credential broker (design / design).
 //!
-//! The daemon RPC handlers shipped in implementation-note-9
+//! The daemon RPC handlers shipped in implementation-note-17
 //! (`crates/ember-daemon/src/broker_handler.rs`); this module is the CLI
 //! surface that wraps them. Three subcommands:
 //!
@@ -15,7 +15,7 @@
 //!
 //! ## Marker for `target_state_anchor`
 //!
-//! implementation-note-24 uses `BrokerCmd|broker_command` as its grep gate;
+//! implementation-note-37 uses `BrokerCmd|broker_command` as its grep gate;
 //! both literals appear in this file (`pub enum BrokerCmd` below and
 //! `pub fn broker_command` below).
 //!
@@ -28,7 +28,7 @@
 //! secret IS emitted, since the only sensible reason to pipe is to feed
 //! the value into the next process.
 
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -38,7 +38,7 @@ use serde_json::{json, Value};
 /// CLI subcommand surface for `ember broker`.
 ///
 /// Mirrors the daemon's three RPC methods one-to-one. The literal
-/// `BrokerCmd` is the load-bearing marker for the implementation-note-24
+/// `BrokerCmd` is the load-bearing marker for the implementation-note-37
 /// `target_state_anchor`.
 #[derive(Subcommand, Debug)]
 pub enum BrokerCmd {
@@ -201,10 +201,14 @@ pub fn issue(
 
     let result = call_daemon(&opts.socket_path, "broker_issue", &params)?;
 
-    // Result shape: { token, materialization_id, expires_at, issued_at, provider }
+    // Result shape (implementation-note-3):
+    //   { secret_ref, materialization_id, expires_at, issued_at, provider }
+    // The opaque `secret_ref` is what callers pass back to ember-proxy /
+    // ember-tools when the actual credential is needed at a trust
+    // boundary; no plaintext appears in the response.
     if json_out {
         // Programmatic consumer — emit the full JSON unmodified so the
-        // secret is reachable.
+        // SecretRef is reachable.
         println!(
             "{}",
             serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string())
@@ -212,24 +216,20 @@ pub fn issue(
         return Ok(());
     }
 
-    // Pretty path. Mask the secret when stdout is a TTY (the operator
-    // is reading; piping or `--json` is the consumer path).
+    // Pretty path. The response no longer contains plaintext, so there
+    // is nothing to mask — the SecretRef is opaque by construction.
     let mid = result["materialization_id"].as_str().unwrap_or("?");
     let provider_out = result["provider"].as_str().unwrap_or(provider);
     let expires = result["expires_at"].as_str().unwrap_or("?");
     let issued = result["issued_at"].as_str().unwrap_or("?");
-    let token = result["token"].as_str().unwrap_or("");
+    let sref = result["secret_ref"].as_str().unwrap_or("");
 
     println!("Brokered credential");
     println!("  Materialization: {mid}");
     println!("  Provider:        {provider_out}");
     println!("  Issued:          {issued}");
     println!("  Expires:         {expires}");
-    if io::stdout().is_terminal() {
-        println!("  Secret:          [REDACTED — pipe to consumer or use --json]");
-    } else {
-        println!("  Secret:          {token}");
-    }
+    println!("  SecretRef:       {sref}");
 
     Ok(())
 }

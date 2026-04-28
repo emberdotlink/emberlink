@@ -9,8 +9,14 @@
 //! passcode before a SecItem can be read. Without it, any same-UID process
 //! on the box can silently read the vault MEK once macOS' default
 //! per-application ACL is satisfied — which it is, for the daemon's own
-//! identity. Setting `kSecAccessControlUserPresence` on the keychain entry
-//! forces the LocalAuthentication prompt on every fresh read.
+//! identity. Setting `kSecAccessControlBiometryAny | kSecAccessControlOr |
+//! kSecAccessControlDevicePasscode` on the keychain entry forces the
+//! LocalAuthentication prompt on every fresh read — biometric primary
+//! (Touch ID / Face ID for any enrolled user), passcode fallback. We pick
+//! the granular combination over the umbrella `kSecAccessControlUserPresence`
+//! so the policy is explicit in code review and so we can later swap
+//! `BiometryAny` → `BiometryCurrentSet` if we want re-enrolment to invalidate
+//! the entry without further code churn.
 //!
 //! ## Scope
 //!
@@ -56,7 +62,9 @@ use crate::vault::{
 static SESSION_CACHE: Lazy<Mutex<HashMap<(String, String), String>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-/// True when `service` should be wrapped with `kSecAccessControlUserPresence`.
+/// True when `service` should be wrapped with the biometric+passcode ACL
+/// (`kSecAccessControlBiometryAny | kSecAccessControlOr |
+/// kSecAccessControlDevicePasscode`).
 ///
 /// Policy: only the *production* keychain service gets the biometric gate.
 /// Any dev/QA service (anything that isn't the production default) opts out
@@ -146,16 +154,21 @@ pub fn get_password_user_presence(
     }
 }
 
-/// Write a generic password with `kSecAccessControlUserPresence` set.
+/// Write a generic password with the biometric+passcode ACL
+/// (`kSecAccessControlBiometryAny | kSecAccessControlOr |
+/// kSecAccessControlDevicePasscode`).
 ///
-/// On first creation this attaches the SAC (kSecAttrAccessControl) so future
-/// reads require Touch ID / device passcode. The session cache is also
-/// pre-populated so the daemon doesn't prompt on the immediately-following
-/// auto-unseal read.
+/// On first creation this attaches the SAC (`kSecAttrAccessControl`) so future
+/// reads require Touch ID / Face ID OR the device passcode. The session
+/// cache is also pre-populated so the daemon doesn't prompt on the
+/// immediately-following auto-unseal read.
 ///
-/// Note: if an entry already exists *without* user-presence (e.g. from a
-/// pre-security check daemon), the underlying API replaces it with the SAC-wrapped
-/// version. This is the documented one-shot upgrade path.
+/// Note: if an entry already exists with a different SAC (e.g. from a
+/// pre-implementation-note-10 daemon that used `USER_PRESENCE`), the
+/// underlying API replaces it with the new SAC-wrapped version. This is the
+/// documented one-shot upgrade path. Existing entries that pre-date this
+/// branch are NOT migrated automatically — they continue to function under
+/// their original ACL until a write rotates them.
 pub fn set_password_user_presence(
     service: &str,
     account: &str,
@@ -165,7 +178,17 @@ pub fn set_password_user_presence(
     assert_se_safe(service)?;
 
     let mut opts = PasswordOptions::new_generic_password(service, account);
-    opts.set_access_control_options(AccessControlOptions::USER_PRESENCE);
+    // Biometric primary, passcode fallback. The OR flag is mandatory between
+    // the two constraints, otherwise the SAC bitfield is treated as "AND of
+    // every flag set" and the keychain rejects entries it considers
+    // ambiguous. This combination matches the operator's UX brief: first
+    // call of a daemon session prompts Touch ID; subsequent calls in the
+    // same process hit the SESSION_CACHE above.
+    opts.set_access_control_options(
+        AccessControlOptions::BIOMETRY_ANY
+            | AccessControlOptions::OR
+            | AccessControlOptions::DEVICE_PASSCODE,
+    );
     set_generic_password_options(passphrase.as_bytes(), opts)
         .map_err(|e| format!("vault_macos: write: {e}"))?;
 

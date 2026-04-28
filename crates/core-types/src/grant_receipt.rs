@@ -440,7 +440,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------------
-    // KMS receipt tests (implementation-note-3)
+    // KMS receipt tests (implementation-note-4)
     // ----------------------------------------------------------------------
 
     fn minimal_kms_wrap_receipt() -> KmsReceipt {

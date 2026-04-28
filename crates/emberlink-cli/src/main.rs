@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 use clap::Parser;
-use emberlink_cli::{default_data_dir, Args, Cmd, DemoApp};
+use emberlink_cli::{default_data_dir, output, Args, Cmd, DemoApp};
 
 fn main() {
     let raw: Vec<String> = env::args().skip(1).collect();
@@ -22,6 +22,10 @@ fn main() {
             None => DemoApp::seeded(),
         }
     };
+    // DRY-10: honor --json / --quiet / --color for handlers that have
+    // migrated to the typed `Output` abstraction. Un-migrated handlers
+    // ignore this and emit the legacy human shape.
+    app.set_output_mode(options.output_mode);
 
     if let Some(screen) = options.command.first() {
         print!("{}", render_screen(&mut app, screen, &options.command[1..]));
@@ -200,10 +204,13 @@ struct LaunchOptions {
     state_file: Option<PathBuf>,
     no_demo: bool,
     command: Vec<String>,
+    /// DRY-10: resolved output renderer mode (Human/Json/Quiet).
+    output_mode: output::Mode,
 }
 
 impl LaunchOptions {
     fn from_clap(args: Args) -> Self {
+        let output_mode = args.output_mode();
         let command = match args.command {
             Some(Cmd::Legacy(tokens)) => tokens,
             Some(other) => other
@@ -217,6 +224,7 @@ impl LaunchOptions {
             state_file: args.state,
             no_demo: args.no_demo,
             command,
+            output_mode,
         }
     }
 }
@@ -258,6 +266,10 @@ fn parse_launch_args(args: Vec<String>) -> LaunchOptions {
         state_file,
         no_demo,
         command,
+        // DRY-10: legacy tokenizer doesn't parse --json/--quiet/--color, so
+        // fall back to the default human (no color) shape. Anyone who needs
+        // structured output goes through clap.
+        output_mode: output::Mode::Human { color: false },
     }
 }
 
@@ -359,6 +371,55 @@ mod tests {
             options.command,
             vec!["totally-unknown".to_string(), "foo".to_string(), "bar".to_string()]
         );
+    }
+
+    #[test]
+    fn launch_options_from_clap_propagates_json_mode() {
+        let args = Args::try_parse_from([
+            "emberlink-cli",
+            "--json",
+            "grant",
+            "list",
+        ])
+        .unwrap();
+        let options = LaunchOptions::from_clap(args);
+        assert_eq!(options.output_mode, output::Mode::Json);
+    }
+
+    #[test]
+    fn launch_options_from_clap_propagates_quiet_mode() {
+        let args = Args::try_parse_from([
+            "emberlink-cli",
+            "--quiet",
+            "grant",
+            "list",
+        ])
+        .unwrap();
+        let options = LaunchOptions::from_clap(args);
+        assert_eq!(options.output_mode, output::Mode::Quiet);
+    }
+
+    #[test]
+    fn grant_list_json_flag_emits_ndjson_through_demo_app() {
+        // End-to-end: --json flag flows through Args -> LaunchOptions ->
+        // DemoApp::set_output_mode -> handle_command("grant list").
+        let mut app = DemoApp::ephemeral();
+        app.set_output_mode(output::Mode::Json);
+        // Seed a grant.
+        let _ = app.handle_command(
+            "grant create --persona persona-professional --recipient agent-jx \
+             --kind peer --profile agent --mode standing --label dry10-e2e \
+             --cap read_credential:obj-jx",
+        );
+        let listed = app.handle_command("grant list");
+        // Each non-empty line is parseable JSON.
+        for line in listed.lines().filter(|l| !l.is_empty()) {
+            let v: serde_json::Value =
+                serde_json::from_str(line).expect("ndjson line parses");
+            assert!(v.get("id").is_some());
+        }
+        // No human heading.
+        assert!(!listed.contains("Active grants"));
     }
 
     #[test]

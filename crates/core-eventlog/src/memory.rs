@@ -69,10 +69,38 @@ impl MemoryEventLog {
     }
 
     fn append_validated(&mut self, event: EventEnvelope) -> Result<(), ValidationError> {
-        check_chain(&self.materialized, &event)?;
-        apply_event(&mut self.materialized, &event)?;
+        // security check: BEGIN IMMEDIATE analog for the in-memory log.
+        //
+        // The authorize → check_chain → apply_event → advance_chain_head →
+        // apply_storage_event sequence mutates `materialized` mid-stream. If
+        // `apply_storage_event` (or any later step) fails after `apply_event`
+        // has already succeeded, `materialized` is half-mutated while the
+        // event is never persisted to `self.events`, leaving derived state
+        // inconsistent with the authoritative event log. The daemon SQL path
+        // closes the same gap with `BEGIN IMMEDIATE` + RAII rollback
+        // (REVIEW2-F3, commit historical_revision); we mirror it here with a
+        // snapshot/restore guard so any error rolls back atomically.
+        //
+        // Pattern matches `import_sync_batch` below.
+        let snapshot_materialized = self.materialized.clone();
+        let snapshot_manifests = self.storage_manifests.clone();
+
+        if let Err(err) = check_chain(&self.materialized, &event) {
+            return Err(err);
+        }
+        if let Err(err) = apply_event(&mut self.materialized, &event) {
+            self.materialized = snapshot_materialized;
+            self.storage_manifests = snapshot_manifests;
+            return Err(err);
+        }
         advance_chain_head(&mut self.materialized, &event);
-        apply_storage_event(&mut self.storage_manifests, &event, &self.materialized)?;
+        if let Err(err) =
+            apply_storage_event(&mut self.storage_manifests, &event, &self.materialized)
+        {
+            self.materialized = snapshot_materialized;
+            self.storage_manifests = snapshot_manifests;
+            return Err(err);
+        }
 
         let idx = self.events.len();
         self.event_index.insert(event.event_id.clone(), idx);

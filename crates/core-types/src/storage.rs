@@ -808,6 +808,18 @@ pub enum ResourceSelector {
     Exact { value: String },
     /// Shell-style glob, anchored on both ends. `*` matches any run of chars.
     Glob { pattern: String },
+    /// Glob with a structured branch-path subtarget. `primary_glob` matches
+    /// the resource (`owner/repo`), `subtarget_glob` is a secondary check
+    /// applied by the resolver against an out-of-band field (e.g. the branch
+    /// extracted from the request URI). `covers()` only validates the primary
+    /// glob — subtarget enforcement is the resolver's job because the
+    /// concrete subtarget value (branch name) is not part of `resource`.
+    /// Issued from 4-segment legacy scopes like
+    /// `github:push:owner/repo:feat/*` (P69E.5c).
+    GlobWithSubtarget {
+        primary_glob: String,
+        subtarget_glob: String,
+    },
     /// Regex anchored on both ends. Evaluation stub for now — issuers may
     /// declare but evaluator in core-policy is the authoritative matcher.
     Regex { pattern: String },
@@ -817,12 +829,32 @@ pub enum ResourceSelector {
 
 impl ResourceSelector {
     /// True iff this selector covers the given concrete resource string.
+    ///
+    /// For `GlobWithSubtarget` only the `primary_glob` is consulted —
+    /// subtarget matching is the resolver's responsibility (it has access
+    /// to the request URI / method that carries the branch). A primary
+    /// match with a missing subtarget should produce
+    /// `denied_subtarget_scope`, NOT `denied_no_applicable_statement`.
     pub fn covers(&self, resource: &str) -> bool {
         match self {
             Self::Exact { value } => value == resource,
             Self::Glob { pattern } => glob_matches(pattern, resource),
+            Self::GlobWithSubtarget { primary_glob, .. } => {
+                glob_matches(primary_glob, resource)
+            }
             Self::Regex { .. } => false, // evaluator lives in core-policy
             Self::Any => true,
+        }
+    }
+
+    /// Subtarget glob if this selector carries one. Used by the proxy
+    /// resolver to route to `denied_subtarget_scope` instead of
+    /// `denied_no_applicable_statement` on a primary-but-not-subtarget
+    /// match.
+    pub fn subtarget_glob(&self) -> Option<&str> {
+        match self {
+            Self::GlobWithSubtarget { subtarget_glob, .. } => Some(subtarget_glob.as_str()),
+            _ => None,
         }
     }
 
@@ -1803,6 +1835,10 @@ impl Validate for Statement {
             }
             ResourceSelector::Glob { pattern } => {
                 validate_non_empty(pattern, "resource selector glob pattern")?;
+            }
+            ResourceSelector::GlobWithSubtarget { primary_glob, subtarget_glob } => {
+                validate_non_empty(primary_glob, "resource selector primary glob pattern")?;
+                validate_non_empty(subtarget_glob, "resource selector subtarget glob pattern")?;
             }
             ResourceSelector::Regex { pattern } => {
                 validate_non_empty(pattern, "resource selector regex pattern")?;

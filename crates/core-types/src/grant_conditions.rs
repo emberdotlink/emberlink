@@ -548,6 +548,39 @@ mod tests {
         );
     }
 
+    /// security check: a 10-deep condition tree (the inclusive limit) evaluates without
+    /// returning `ConditionsTooDeep`. Mirrors `depth_check_at_limit_ok` under
+    /// the canonical security check test name so spec-driven greps find it.
+    #[test]
+    fn condition_at_depth_10_evaluates() {
+        // Outer All at depth 0, innermost badge at depth 10 → exactly at cap.
+        let mut c = GrantCondition::badge("x");
+        for _ in 0..MAX_CONDITION_DEPTH {
+            c = GrantCondition::All(vec![c]);
+        }
+        assert!(
+            c.validate_depth().is_ok(),
+            "condition tree at MAX_CONDITION_DEPTH (10) must evaluate"
+        );
+    }
+
+    /// security check: an 11-deep condition tree (one past the cap) must be rejected
+    /// with `ConditionsTooDeep`.
+    #[test]
+    fn condition_at_depth_11_returns_too_deep() {
+        let mut c = GrantCondition::badge("x");
+        for _ in 0..=MAX_CONDITION_DEPTH {
+            c = GrantCondition::All(vec![c]);
+        }
+        let err = c
+            .validate_depth()
+            .expect_err("11-deep condition tree must return ConditionsTooDeep");
+        assert!(
+            matches!(err, GrantConditionError::ConditionsTooDeep { .. }),
+            "expected ConditionsTooDeep, got: {err:?}"
+        );
+    }
+
     /// Wire-format stability: a fixed JSON string that predates the development milestone
     /// `BadgeGateRepr` extraction must still deserialize identically.
     #[test]

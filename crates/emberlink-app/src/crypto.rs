@@ -111,7 +111,7 @@ mod tests {
 
     #[test]
     fn round_trip_encrypt_decrypt() {
-        let key = generate_content_key();
+        let key = generate_content_key("local-state");
         let plaintext = b"hello world";
         let ciphertext = encrypt_state(plaintext, &key).unwrap();
         let recovered = decrypt_state(&ciphertext, &key).unwrap();

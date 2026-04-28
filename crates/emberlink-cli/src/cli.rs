@@ -20,9 +20,12 @@
 //! `EMBER_CLI_LEGACY=1` (or `--legacy`) skips clap entirely and runs the raw
 //! tokenizer — escape hatch for anyone who depended on freeform string parsing
 //! that clap-derive's stricter shape would reject.
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+
+use crate::output;
 
 /// Top-level `emberlink-cli` argv.
 #[derive(Debug, Parser)]
@@ -47,8 +50,65 @@ pub struct Args {
     #[arg(long, global = true)]
     pub legacy: bool,
 
+    /// Emit machine-readable NDJSON instead of human-formatted text (DRY-10).
+    /// Suppresses headings and success blurbs; data rows become JSON arrays,
+    /// objects become JSON lines. Mutually exclusive with `--quiet` (Json wins).
+    #[arg(long, global = true)]
+    pub json: bool,
+
+    /// Suppress headings and success messages — emit only data rows and
+    /// warnings/errors. Designed for shell pipelines (DRY-10).
+    #[arg(long, global = true)]
+    pub quiet: bool,
+
+    /// Color output policy (DRY-10). `auto` (default) enables ANSI when stdout
+    /// is a TTY and `NO_COLOR` is unset; `always` forces on; `never` forces off.
+    #[arg(long, global = true, value_enum, default_value_t = ColorMode::Auto)]
+    pub color: ColorMode,
+
     #[command(subcommand)]
     pub command: Option<Cmd>,
+}
+
+/// `--color` policy. See [`Args::output_mode`] for resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ColorMode {
+    Auto,
+    Always,
+    Never,
+}
+
+impl Args {
+    /// Resolve the active output renderer mode from `--json` / `--quiet` /
+    /// `--color`. Precedence:
+    ///
+    /// 1. `--json` always wins.
+    /// 2. `--quiet` wins over Human.
+    /// 3. Otherwise Human, with `color` resolved by `--color` + TTY +
+    ///    `NO_COLOR`.
+    pub fn output_mode(&self) -> output::Mode {
+        if self.json {
+            return output::Mode::Json;
+        }
+        if self.quiet {
+            return output::Mode::Quiet;
+        }
+        let color = match self.color {
+            ColorMode::Always => true,
+            ColorMode::Never => false,
+            ColorMode::Auto => detect_color_auto(),
+        };
+        output::Mode::Human { color }
+    }
+}
+
+/// Auto-detect color: stdout-is-tty AND `NO_COLOR` is unset.
+/// See <https://no-color.org>.
+fn detect_color_auto() -> bool {
+    if std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    std::io::stdout().is_terminal()
 }
 
 /// Top-level subcommands. Each variant captures its trailing tokens verbatim
@@ -181,7 +241,7 @@ pub enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         rest: Vec<String>,
     },
-    /// Approve or deny a pending approval (implementation-note-6).
+    /// Approve or deny a pending approval (implementation-note-14).
     Approval {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         rest: Vec<String>,
@@ -275,6 +335,16 @@ pub enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         rest: Vec<String>,
     },
+    /// Query the receipts audit log (EMBER-implementation-note-28).
+    ///
+    /// Subcommand::Audit — dispatches to the receipt-query handler.
+    /// Filters: --since <duration|ISO>, --actor <persona-id>,
+    /// --kind <grant|kms_wrap|kms_unwrap>, --grant-id <id>,
+    /// --resource <pattern>, --limit <N>, --format <table|json|jsonl>.
+    Audit {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        rest: Vec<String>,
+    },
     /// Quit the interactive shell.
     #[command(alias = "exit", alias = "q")]
     Quit,
@@ -330,6 +400,7 @@ impl Cmd {
             Cmd::CreatePersona { rest } => ("create-persona", rest),
             Cmd::ExportEvents { rest } => ("export-events", rest),
             Cmd::ImportEvents { rest } => ("import-events", rest),
+            Cmd::Audit { rest } => ("audit", rest),
             Cmd::Quit => return "quit".to_string(),
             Cmd::Legacy(tokens) => {
                 return tokens.join(" ");
@@ -462,5 +533,66 @@ mod tests {
     fn args_command_factory_is_well_formed() {
         // Compile-time-ish assertion: clap can build the command graph.
         let _ = Args::command();
+    }
+
+    #[test]
+    fn json_flag_selects_json_mode() {
+        let args =
+            Args::try_parse_from(["emberlink-cli", "--json", "grant", "list"]).unwrap();
+        assert!(args.json);
+        assert_eq!(args.output_mode(), output::Mode::Json);
+    }
+
+    #[test]
+    fn quiet_flag_selects_quiet_mode() {
+        let args =
+            Args::try_parse_from(["emberlink-cli", "--quiet", "grant", "list"]).unwrap();
+        assert!(args.quiet);
+        assert_eq!(args.output_mode(), output::Mode::Quiet);
+    }
+
+    #[test]
+    fn json_wins_over_quiet() {
+        let args = Args::try_parse_from([
+            "emberlink-cli",
+            "--json",
+            "--quiet",
+            "grant",
+            "list",
+        ])
+        .unwrap();
+        assert_eq!(args.output_mode(), output::Mode::Json);
+    }
+
+    #[test]
+    fn color_never_disables_ansi() {
+        let args = Args::try_parse_from([
+            "emberlink-cli",
+            "--color",
+            "never",
+            "grant",
+            "list",
+        ])
+        .unwrap();
+        assert_eq!(args.output_mode(), output::Mode::Human { color: false });
+    }
+
+    #[test]
+    fn color_always_enables_ansi() {
+        let args = Args::try_parse_from([
+            "emberlink-cli",
+            "--color",
+            "always",
+            "grant",
+            "list",
+        ])
+        .unwrap();
+        assert_eq!(args.output_mode(), output::Mode::Human { color: true });
+    }
+
+    #[test]
+    fn color_default_is_auto() {
+        let args = Args::try_parse_from(["emberlink-cli", "grant", "list"]).unwrap();
+        assert_eq!(args.color, ColorMode::Auto);
     }
 }
