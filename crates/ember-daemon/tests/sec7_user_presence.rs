@@ -17,7 +17,7 @@
 
 #![cfg(target_os = "macos")]
 
-use ember_daemon::vault_macos;
+use ember_daemon::infra::vault_macos;
 
 /// One-time per-test guard: skip cleanly when the live-Keychain opt-in is not
 /// set. Stdout marker lets `--nocapture` runs confirm the skip happened.

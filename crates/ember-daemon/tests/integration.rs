@@ -2,15 +2,15 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
-use ember_daemon::approval::ApprovalOutcome;
-use ember_daemon::dashboard::run_dashboard;
-use ember_daemon::policy::{
-    PolicyConfig, PolicyDecision, PolicyEngine, PolicyRule, RiskLevel,
+use ember_daemon::trust::approval::ApprovalOutcome;
+use ember_daemon::infra::dashboard::run_dashboard;
+use ember_daemon::trust::policy::{
+    ApprovalRequirement, PolicyConfig, PolicyEngine, PolicyRule, RiskLevel,
 };
-use ember_daemon::rate_limit::RateLimiter;
-use ember_daemon::socket::SocketListener;
-use ember_daemon::store::{DaemonStore, StoreError};
-use ember_daemon::vault::Vault;
+use ember_daemon::infra::rate_limit::RateLimiter;
+use ember_daemon::infra::socket::SocketListener;
+use ember_daemon::infra::store::{DaemonStore, StoreError};
+use ember_daemon::infra::vault::Vault;
 use tempfile::TempDir;
 use tokio::sync::watch;
 
@@ -29,41 +29,41 @@ fn permissive_test_policy() -> PolicyEngine {
             PolicyRule {
                 action: "credential.access.*".to_string(),
                 risk: RiskLevel::Low,
-                decision: PolicyDecision::AutoApprove,
+                requirement: ApprovalRequirement::Auto,
                 tier: None,
             },
             PolicyRule {
                 action: "credential.access".to_string(),
                 risk: RiskLevel::Low,
-                decision: PolicyDecision::AutoApprove,
+                requirement: ApprovalRequirement::Auto,
                 tier: None,
             },
             PolicyRule {
                 action: "git.push.main".to_string(),
                 risk: RiskLevel::Critical,
-                decision: PolicyDecision::Deny,
+                requirement: ApprovalRequirement::Denied,
                 tier: None,
             },
             PolicyRule {
                 action: "git.push.*".to_string(),
                 risk: RiskLevel::Medium,
-                decision: PolicyDecision::AutoApprove,
+                requirement: ApprovalRequirement::Auto,
                 tier: None,
             },
             PolicyRule {
                 action: "deploy.production".to_string(),
                 risk: RiskLevel::Critical,
-                decision: PolicyDecision::RequireApproval,
+                requirement: ApprovalRequirement::Required,
                 tier: None,
             },
             PolicyRule {
                 action: "deploy.staging".to_string(),
                 risk: RiskLevel::Medium,
-                decision: PolicyDecision::AutoApprove,
+                requirement: ApprovalRequirement::Auto,
                 tier: None,
             },
         ],
-        default_decision: PolicyDecision::RequireApproval,
+        default_requirement: ApprovalRequirement::Required,
         default_risk: RiskLevel::Medium,
     })
 }
@@ -611,7 +611,7 @@ async fn dashboard_tcp_listener_serves_html() {
             .build()
             .unwrap();
         let local = tokio::task::LocalSet::new();
-        local.block_on(&rt, run_dashboard(addr, db, "0.0.0-test".to_string(), shutdown_rx, None));
+        local.block_on(&rt, run_dashboard(addr, db, "0.0.0-test".to_string(), None, shutdown_rx, None));
     });
 
     // Give the listener time to bind.
@@ -667,7 +667,7 @@ async fn dashboard_csrf_protects_post_endpoints() {
             .build()
             .unwrap();
         let local = tokio::task::LocalSet::new();
-        local.block_on(&rt, run_dashboard(addr, db, "0.0.0-test".to_string(), shutdown_rx, None));
+        local.block_on(&rt, run_dashboard(addr, db, "0.0.0-test".to_string(), None, shutdown_rx, None));
     });
 
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -725,7 +725,13 @@ async fn dashboard_csrf_protects_post_endpoints() {
     );
 
     // 4. POST with correct CSRF header AND matching Origin -> passes both checks,
-    //    but fails store lookup (400, proving both guards allowed the request through).
+    //    fails downstream. implementation-note-24: with the WebAuthn gate active
+    //    (no `EMBER_DISABLE_BIO=1`), an empty body reaches the gate and gets
+    //    401 "missing webauthn challenge_id". Without the gate, the legacy
+    //    path reaches the store and gets 400 "approval not found". Either
+    //    code is fine — what we're asserting here is that the CSRF + Origin
+    //    check let the request through; the downstream behaviour is owned
+    //    by other tests.
     let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
     let req = format!(
         "POST /api/approvals/fake-id/approve HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://{addr}\r\nX-Ember-CSRF-Token: {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -735,8 +741,8 @@ async fn dashboard_csrf_protects_post_endpoints() {
     s.read_to_end(&mut resp).await.unwrap();
     let resp_str = std::str::from_utf8(&resp).unwrap();
     assert!(
-        resp_str.starts_with("HTTP/1.1 400"),
-        "expected 400 (store error, CSRF+origin passed), got: {}",
+        resp_str.starts_with("HTTP/1.1 400") || resp_str.starts_with("HTTP/1.1 401"),
+        "expected 400 (legacy store error) or 401 (webauthn gate refusal) — both prove CSRF+origin passed; got: {}",
         &resp_str[..resp_str.len().min(120)]
     );
 
@@ -805,6 +811,7 @@ async fn socket_still_works_when_dashboard_port_occupied() {
                 blocked_addr,
                 db,
                 "0.0.0-test".to_string(),
+                None,
                 shutdown_rx_dash,
                 Some(bind_tx),
             ));
@@ -887,7 +894,7 @@ async fn dashboard_bind_failure_surfaced_via_channel() {
         let local = tokio::task::LocalSet::new();
         local.block_on(
             &rt,
-            run_dashboard(blocked_addr, db, "0.0.0-test".to_string(), shutdown_rx, Some(bind_tx)),
+            run_dashboard(blocked_addr, db, "0.0.0-test".to_string(), None, shutdown_rx, Some(bind_tx)),
         );
     });
 
@@ -910,7 +917,7 @@ async fn dashboard_bind_failure_surfaced_via_channel() {
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-31 — auto-unseal vault from keyring on daemon startup.
+// implementation-note-88 — auto-unseal vault from keyring on daemon startup.
 //
 // The bug: `qember.sh demo up` finished, then `grant create` failed with
 // "persona '<id>' secret is vault-sealed but no vault is attached" because
@@ -926,7 +933,7 @@ async fn dashboard_bind_failure_surfaced_via_channel() {
 // flipping them simultaneously would interfere.
 // ---------------------------------------------------------------------------
 
-/// Serialize all implementation-note-31 tests that mutate process-global env vars
+/// Serialize all implementation-note-88 tests that mutate process-global env vars
 /// (`EMBER_VAULT_PASSPHRASE`, `EMBER_VAULT_TEST_KEYRING_PRESENT`). Without
 /// this, the parallel cargo test runner can interleave env writes between
 /// tests and cause spurious `Unsealed` / `NoKeyringEntry` flips.
@@ -940,8 +947,8 @@ fn demo_ux_8_env_lock() -> std::sync::MutexGuard<'static, ()> {
 
 #[test]
 fn auto_unseal_returns_no_keyring_entry_when_none_configured() {
-    use ember_daemon::config::DaemonConfig;
-    use ember_daemon::vault::{try_auto_unseal_from_keyring, AutoUnsealOutcome};
+    use ember_daemon::infra::config::DaemonConfig;
+    use ember_daemon::infra::vault::{try_auto_unseal_from_keyring, AutoUnsealOutcome};
 
     let _guard = demo_ux_8_env_lock();
 
@@ -973,9 +980,9 @@ fn auto_unseal_returns_no_keyring_entry_when_none_configured() {
 
 #[test]
 fn auto_unseal_returns_unsealed_when_keyring_entry_present() {
-    use ember_daemon::config::DaemonConfig;
-    use ember_daemon::store::DaemonStore;
-    use ember_daemon::vault::{try_auto_unseal_from_keyring, AutoUnsealOutcome};
+    use ember_daemon::infra::config::DaemonConfig;
+    use ember_daemon::infra::store::DaemonStore;
+    use ember_daemon::infra::vault::{try_auto_unseal_from_keyring, AutoUnsealOutcome};
     use std::rc::Rc;
 
     let _guard = demo_ux_8_env_lock();
@@ -1013,7 +1020,7 @@ fn auto_unseal_returns_unsealed_when_keyring_entry_present() {
 
     // Round-trip: attach to store, create a persona, retrieve its keypair.
     // This is the precise call sequence that `grant create` triggers and the
-    // path that was failing in implementation-note-31. If this works end-to-end, the
+    // path that was failing in implementation-note-88. If this works end-to-end, the
     // demo-blocking bug is fixed.
     let store = DaemonStore::open_in_memory().unwrap();
     store.set_vault(Rc::new(vault));
@@ -1025,10 +1032,10 @@ fn auto_unseal_returns_unsealed_when_keyring_entry_present() {
 
 #[test]
 fn daemon_run_logs_vault_auto_unseal_audit_event() {
-    use ember_daemon::audit::AuditFilter;
-    use ember_daemon::config::DaemonConfig;
-    use ember_daemon::runtime::DaemonRuntime;
-    use ember_daemon::store::DaemonStore;
+    use ember_daemon::infra::audit::AuditFilter;
+    use ember_daemon::infra::config::DaemonConfig;
+    use ember_daemon::infra::runtime::DaemonRuntime;
+    use ember_daemon::infra::store::DaemonStore;
 
     let _guard = demo_ux_8_env_lock();
 

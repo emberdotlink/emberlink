@@ -42,7 +42,7 @@ impl DaemonTransport {
             // Receipts (Stream D)
             "list_receipts" => Some("list_receipts"),
             "get_receipt" => Some("get_receipt"),
-            "daemon_identity" => Some("daemon_identity"),
+            "daemon_persona" => Some("daemon_persona"),
             // Budget status (P69K-F1)
             "grant_budget_status" => Some("grant_budget_status"),
             // Vault

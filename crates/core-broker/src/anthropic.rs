@@ -3,7 +3,7 @@
 //! by setting `status=inactive` via `PATCH /v1/organizations/api_keys/<id>`.
 //!
 //! Phase 2 of design + design. The trait shape is async-by-default
-//! (per `implementation-note-1`); the HTTP transport itself is `ureq`
+//! (per `implementation-note-4`); the HTTP transport itself is `ureq`
 //! (sync) — each `issue` / `revoke` call is wrapped so the future
 //! returned by the trait method completes once the blocking call returns.
 //! This is acceptable here because the daemon runs broker calls on a
@@ -517,6 +517,9 @@ mod tests {
             scope: json!({ "name": name }),
             ttl: Duration::from_secs(900),
             reason: "unit test".to_string(),
+            caller_persona: None,
+            grants_file_rev: None,
+            grants_file_credential_name: None,
         }
     }
 

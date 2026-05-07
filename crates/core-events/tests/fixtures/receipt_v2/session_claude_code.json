@@ -1,0 +1,26 @@
+{
+  "version": "2",
+  "kind": "session.claude_code",
+  "receipt_id": "cb5bff15e8de0590f022aae9c85c06a85e3a8b130d41adc38360591fa032c798",
+  "daemon_root_id": "fixture-daemon-root",
+  "termination_authority": "user_session",
+  "body": {
+    "claim_events": [
+      {
+        "input_hash": "blake3:fixture-input-hash",
+        "input_redacted": {
+          "command": "echo hi"
+        },
+        "kind": "approval",
+        "resolved": {
+          "allowed": true
+        },
+        "tool": "Bash",
+        "ts": "2026-05-02T19:30:00Z"
+      }
+    ],
+    "device_id": "device-fixture",
+    "permits_merkle_root": "blake3:fixture-merkle-root"
+  },
+  "signature": "ed25519sig:2444f7cfcdd9b38c188f50912fb76221d1e461d0553b64d900c2b7ccd3f79a8b332e5c3f48715ebbe0af802a9395d6b8679804d3f3842d3f41e56b3185206e00"
+}

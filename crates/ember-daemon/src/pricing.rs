@@ -31,14 +31,49 @@ impl TokenPricing {
         output_cents_per_million: 0,
     };
 
-    /// Cost in integer cents for this call, rounding per-side then summing.
-    /// Integer division truncates, which biases under; for the demo-critical
-    /// "exhausted at 100%" path that's acceptable because the budget check
-    /// is inclusive (`usage + delta > budget` rejects).
+    /// Cost in integer cents for this call. Derived from `cents_micro_for`
+    /// by floor-dividing micro-cents to whole cents — kept for callers and
+    /// tests that only need the human-readable cent value. Use
+    /// `cents_micro_for` when the value will be summed across calls or
+    /// compared to a budget cap (implementation-note-18: per-side
+    /// truncation zeroed every sub-cent call, making the cap unreachable).
     pub fn cents_for(&self, input_tokens: u64, output_tokens: u64) -> u64 {
-        let in_cost = input_tokens.saturating_mul(self.input_cents_per_million) / 1_000_000;
-        let out_cost = output_tokens.saturating_mul(self.output_cents_per_million) / 1_000_000;
-        in_cost.saturating_add(out_cost)
+        self.cents_micro_for(input_tokens, output_tokens) / 1_000_000
+    }
+
+    /// Cost in micro-cents (cents × 10⁶) for this call. Computed without
+    /// per-side rounding so sub-cent calls accumulate honestly.
+    /// `input_cents_per_million` × tokens already lives in cents-per-million
+    /// units, which is the same as micro-cents-per-token, so no extra scale
+    /// is needed.
+    pub fn cents_micro_for(&self, input_tokens: u64, output_tokens: u64) -> u64 {
+        let in_micros = input_tokens.saturating_mul(self.input_cents_per_million);
+        let out_micros = output_tokens.saturating_mul(self.output_cents_per_million);
+        in_micros.saturating_add(out_micros)
+    }
+}
+
+/// Strip a trailing `-YYYYMMDD` (8 contiguous digits) date suffix from a
+/// model name. Anthropic publishes date-pinned aliases that bill at the
+/// family/version rate — e.g. `claude-haiku-4-5-20251001` is the same
+/// price as `claude-haiku-4-5`. Without this, the pricing match falls
+/// through to `UNKNOWN { 0, 0 }` every time Anthropic rolls a new
+/// date-pinned alias and budget enforcement silently breaks at the wire
+/// (implementation-note-18: shipped on `claude-haiku-4-5-20251001`).
+///
+/// Only matches Anthropic's `-YYYYMMDD` shape (8 digits, no separators).
+/// OpenAI's `-YYYY-MM-DD` form has internal hyphens and falls through
+/// untouched, so the explicit OpenAI date-aliases below still apply.
+fn strip_anthropic_date_suffix(model: &str) -> Option<&str> {
+    if model.len() < 9 {
+        return None;
+    }
+    let (head, tail) = model.split_at(model.len() - 9);
+    let bytes = tail.as_bytes();
+    if bytes[0] == b'-' && bytes[1..].iter().all(|b| b.is_ascii_digit()) {
+        Some(head)
+    } else {
+        None
     }
 }
 
@@ -49,6 +84,33 @@ impl TokenPricing {
 /// bounded set of model names, and keeping this static avoids a config
 /// dependency for the metering hot path.
 pub fn pricing_for(provider: &str, model: &str) -> TokenPricing {
+    let exact = pricing_for_exact(provider, model);
+    if !matches!(exact, TokenPricing { input_cents_per_million: 0, output_cents_per_million: 0 })
+    {
+        return exact;
+    }
+    // Fallback: strip a `-YYYYMMDD` Anthropic date suffix and retry once
+    // against the family/version rate. Order matters — exact match wins,
+    // so legacy date-only-named models like `claude-3-haiku-20240307`
+    // (no bare-name parent) still resolve correctly.
+    if let Some(stripped) = strip_anthropic_date_suffix(model) {
+        let retry = pricing_for_exact(provider, stripped);
+        if !matches!(retry, TokenPricing { input_cents_per_million: 0, output_cents_per_million: 0 })
+        {
+            return retry;
+        }
+    }
+    tracing::info!(
+        target: "proxy.meter.skip",
+        reason = "unknown-model",
+        provider = %provider,
+        model = %model,
+        "pricing_for: model not in pricing table (exact or date-suffix-stripped), using TokenPricing::UNKNOWN (0 cents)"
+    );
+    TokenPricing::UNKNOWN
+}
+
+fn pricing_for_exact(provider: &str, model: &str) -> TokenPricing {
     match (provider, model) {
         // --- Anthropic ---
         // Opus (4.5): $15/MTok input, $75/MTok output = 1500 / 7500 cents.
@@ -82,6 +144,14 @@ pub fn pricing_for(provider: &str, model: &str) -> TokenPricing {
             input_cents_per_million: 100,
             output_cents_per_million: 500,
         },
+        // Haiku 3 (legacy): $0.25/MTok input, $1.25/MTok output = 25 / 125 cents.
+        // Used by the May 3 YC composite-grant demo runner — without an entry
+        // here the pricing lookup falls through to UNKNOWN { 0, 0 } and the
+        // cents budget never increments, silently breaking Beat 4.
+        ("anthropic", "claude-3-haiku-20240307") => TokenPricing {
+            input_cents_per_million: 25,
+            output_cents_per_million: 125,
+        },
 
         // --- OpenAI ---
         // gpt-4 classic: $30/MTok in, $60/MTok out.
@@ -106,14 +176,10 @@ pub fn pricing_for(provider: &str, model: &str) -> TokenPricing {
         },
 
         // --- Unknown ---
-        _ => {
-            tracing::debug!(
-                provider = %provider,
-                model = %model,
-                "unknown model pricing, using TokenPricing::UNKNOWN (0 cents)",
-            );
-            TokenPricing::UNKNOWN
-        }
+        // No log here — pricing_for() handles the fallback retry then logs
+        // the final unknown verdict so we don't double-log when the exact
+        // pass is just the first half of a two-pass lookup.
+        _ => TokenPricing::UNKNOWN,
     }
 }
 
@@ -123,6 +189,19 @@ pub fn pricing_for(provider: &str, model: &str) -> TokenPricing {
 /// callers don't have to thread the intermediate `TokenPricing` value.
 pub fn cents_for(model: &str, provider: &str, input_tokens: u64, output_tokens: u64) -> u64 {
     pricing_for(provider, model).cents_for(input_tokens, output_tokens)
+}
+
+/// Compute the cost in micro-cents (cents × 10⁶) for a metered LLM call.
+/// Sister to [`cents_for`]; use this when the value will be summed across
+/// calls or compared against a budget cap. See `Usage::cents_micro` for
+/// the load-bearing rationale.
+pub fn cents_micro_for(
+    model: &str,
+    provider: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+) -> u64 {
+    pricing_for(provider, model).cents_micro_for(input_tokens, output_tokens)
 }
 
 /// Provider identifiers we understand. Derived from the request's target host.
@@ -293,9 +372,9 @@ impl UsageSummary {
 /// SSE frames are separated by a blank line. When a chunk arrives that
 /// doesn't end on a frame boundary, the trailing partial frame is held
 /// here until the next chunk completes it. 8 KiB is comfortably above
-/// the largest legitimate Anthropic frame (a `message_start` with model
-/// + usage + headers is ≈ 500 bytes; `message_delta` is < 200) while
-/// keeping per-stream memory bounded regardless of stream length.
+/// the largest legitimate Anthropic frame (a `message_start` carrying
+/// model, usage, and headers is ≈ 500 bytes; `message_delta` is under
+/// 200) while keeping per-stream memory bounded regardless of length.
 ///
 /// A hostile upstream that emits a single >8 KiB frame without a
 /// trailing blank line would otherwise let us pin unbounded RSS. When
@@ -816,6 +895,15 @@ mod tests {
             cents_for("claude-haiku-4-5", "anthropic", 1_000_000, 1_000_000),
             600
         );
+
+        // Haiku 3 (legacy, used by May-3 demo runner): 25/125 per MTok.
+        // 1M+1M = 150 cents. Regression guard against the bug where this
+        // model fell through to UNKNOWN { 0, 0 } and the cents budget
+        // never incremented. (implementation-note-94)
+        assert_eq!(
+            cents_for("claude-3-haiku-20240307", "anthropic", 1_000_000, 1_000_000),
+            150
+        );
     }
 
     #[test]
@@ -831,6 +919,43 @@ mod tests {
 
         // GPT-4.1: 300/1200. 1M+1M = 1500 cents.
         assert_eq!(cents_for("gpt-4.1", "openai", 1_000_000, 1_000_000), 1_500);
+    }
+
+    /// implementation-note-18 regression: a date-pinned Anthropic
+    /// model alias must bill at the same rate as its bare-name parent.
+    /// Before the fix the pricing match fell through to UNKNOWN { 0, 0 }
+    /// and budget enforcement silently broke at the wire — every Anthropic
+    /// call on `claude-haiku-4-5-20251001` returned cents=0 and the 5¢
+    /// cap never tripped. The strip_anthropic_date_suffix normalizer
+    /// catches every `-YYYYMMDD` shape generically so future date bumps
+    /// don't re-break the demo.
+    #[test]
+    fn pricing_date_pinned_anthropic_aliases_match_family_rate() {
+        // Haiku 4.5 — May 3 demo runner ships against this date alias.
+        assert_eq!(
+            cents_for("claude-haiku-4-5-20251001", "anthropic", 1_000_000, 1_000_000),
+            600,
+        );
+        // Hypothetical future date pin must also match without a table edit.
+        assert_eq!(
+            cents_for("claude-haiku-4-5-20260315", "anthropic", 1_000_000, 1_000_000),
+            600,
+        );
+        // Sonnet 4.6 with a future date pin.
+        assert_eq!(
+            cents_for("claude-sonnet-4-6-20260101", "anthropic", 1_000_000, 1_000_000),
+            1_800,
+        );
+        // Strip helper itself.
+        assert_eq!(
+            strip_anthropic_date_suffix("claude-haiku-4-5-20251001"),
+            Some("claude-haiku-4-5"),
+        );
+        assert_eq!(strip_anthropic_date_suffix("claude-haiku-4-5"), None);
+        // OpenAI's hyphenated date form must NOT be stripped.
+        assert_eq!(strip_anthropic_date_suffix("gpt-4o-2024-08-06"), None);
+        // Too short to have a valid suffix.
+        assert_eq!(strip_anthropic_date_suffix("abc"), None);
     }
 
     #[test]

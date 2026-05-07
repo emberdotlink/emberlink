@@ -1,4 +1,4 @@
-//! implementation-note-39 regression guard — MCP read path must see grants owned by
+//! implementation-note-123 regression guard — MCP read path must see grants owned by
 //! the caller's persona (and only those grants).
 //!
 //! The narrative being guarded is "agent asks -> human approves -> agent
@@ -34,13 +34,13 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
-use ember_daemon::policy::{
-    PolicyConfig, PolicyDecision, PolicyEngine, PolicyRule, RiskLevel,
+use ember_daemon::trust::policy::{
+    ApprovalRequirement, PolicyConfig, PolicyEngine, PolicyRule, RiskLevel,
 };
-use ember_daemon::rate_limit::RateLimiter;
-use ember_daemon::socket::SocketListener;
-use ember_daemon::store::DaemonStore;
-use ember_daemon::vault::Vault;
+use ember_daemon::infra::rate_limit::RateLimiter;
+use ember_daemon::infra::socket::SocketListener;
+use ember_daemon::infra::store::DaemonStore;
+use ember_daemon::infra::vault::Vault;
 use emberlink_agent::runtime::{AgentConfig, AgentRuntime, DaemonClient, DaemonClientError};
 use emberlink_mcp::daemon_transport::DaemonTransport;
 use emberlink_mcp::{JsonRpcRequest, JsonRpcResponse, McpServer};
@@ -56,10 +56,10 @@ fn auto_approve_policy() -> PolicyEngine {
         rules: vec![PolicyRule {
             action: "credential.access.*".to_string(),
             risk: RiskLevel::Low,
-            decision: PolicyDecision::AutoApprove,
+            requirement: ApprovalRequirement::Auto,
             tier: None,
         }],
-        default_decision: PolicyDecision::AutoApprove,
+        default_requirement: ApprovalRequirement::Auto,
         default_risk: RiskLevel::Low,
     })
 }

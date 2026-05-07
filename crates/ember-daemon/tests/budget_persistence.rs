@@ -1,4 +1,4 @@
-//! implementation-note-23 regression coverage.
+//! implementation-note-51 regression coverage.
 //!
 //! Pre-fix the simple-grant CLI path called `store.create_grant(...)` (which
 //! built the canonical block-zero statement with `budget = None`) and then
@@ -28,9 +28,9 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use core_types::Budget;
-use ember_daemon::dashboard::run_dashboard;
-use ember_daemon::store::DaemonStore;
-use ember_daemon::vault::Vault;
+use ember_daemon::infra::dashboard::run_dashboard;
+use ember_daemon::infra::store::DaemonStore;
+use ember_daemon::infra::vault::Vault;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -192,7 +192,7 @@ async fn api_grants_includes_budget_when_set() {
         let local = tokio::task::LocalSet::new();
         local.block_on(
             &rt,
-            run_dashboard(addr, db, "0.0.0-test".to_string(), shutdown_rx, None),
+            run_dashboard(addr, db, "0.0.0-test".to_string(), None, shutdown_rx, None),
         );
     });
 

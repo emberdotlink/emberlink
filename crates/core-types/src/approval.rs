@@ -152,6 +152,53 @@ pub struct ApprovalResponse {
     pub granted_duration_secs: Option<u64>,
 }
 
+/// implementation-note-14 — block-and-poll RPC request shape.
+///
+/// Sent by the proxy hook (`ember-proxy/src/claude_code_hook.rs`) when the
+/// daemon's `evaluate_tool_call` returns a `RequireApproval` outcome with a
+/// `request_id`. The daemon polls `get_approval(request_id)` every 500ms
+/// up to `timeout_secs` and returns the resolved [`ApprovalDecision`] (or
+/// [`ApprovalDecision::TimedOut`] if the deadline fires first).
+///
+/// Wire shape is intentionally minimal — the request_id was already minted
+/// at `submit_approval` time, and the hook side does not need to re-supply
+/// the persona/tool/scope context. The default 5-minute timeout on the hook
+/// side is configurable per-call so a future EmberConfig surface can tune
+/// it without a wire-format bump.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AwaitApprovalRequest {
+    pub request_id: String,
+    pub timeout_secs: u64,
+}
+
+/// implementation-note-14 — block-and-poll RPC response.
+///
+/// Wraps the resolved [`ApprovalDecision`] for the awaited request. A
+/// dedicated wrapper rather than returning `ApprovalDecision` directly
+/// keeps room to add response-level fields (latency, resolver hint) in
+/// future revisions without breaking the wire shape.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AwaitApprovalResponse {
+    pub decision: ApprovalDecision,
+}
+
+/// Outcome of a block-and-poll [`AwaitApprovalRequest`].
+///
+/// Three variants matching the resolved approval state machine:
+/// * `Approved` — the request was approved (also matches NarrowedAndApproved
+///   on the daemon side; the proxy treats both as permit).
+/// * `Denied` — the request was denied or expired by an operator decision.
+///   `reason` carries the human-readable message for the agent.
+/// * `TimedOut` — the daemon's poll deadline fired before any resolution.
+///   Mapped to deny on the hook side.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ApprovalDecision {
+    Approved,
+    Denied { reason: String },
+    TimedOut,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,5 +396,60 @@ mod tests {
         let back: ApprovalResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(back.status, ApprovalStatus::Denied);
         assert!(back.denial_reason.is_some());
+    }
+
+    // ---- implementation-note-14: await_approval RPC types -----------------------
+
+    #[test]
+    fn await_approval_request_roundtrip() {
+        let req = AwaitApprovalRequest {
+            request_id: "approval-abc".into(),
+            timeout_secs: 300,
+        };
+        let wire = serde_json::to_string(&req).unwrap();
+        let back: AwaitApprovalRequest = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back.request_id, "approval-abc");
+        assert_eq!(back.timeout_secs, 300);
+    }
+
+    #[test]
+    fn approval_decision_approved_roundtrip() {
+        let d = ApprovalDecision::Approved;
+        let wire = serde_json::to_string(&d).unwrap();
+        let back: ApprovalDecision = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, ApprovalDecision::Approved);
+    }
+
+    #[test]
+    fn approval_decision_denied_roundtrip() {
+        let d = ApprovalDecision::Denied {
+            reason: "policy block".into(),
+        };
+        let wire = serde_json::to_string(&d).unwrap();
+        let back: ApprovalDecision = serde_json::from_str(&wire).unwrap();
+        assert_eq!(
+            back,
+            ApprovalDecision::Denied {
+                reason: "policy block".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn approval_decision_timed_out_roundtrip() {
+        let d = ApprovalDecision::TimedOut;
+        let wire = serde_json::to_string(&d).unwrap();
+        let back: ApprovalDecision = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, ApprovalDecision::TimedOut);
+    }
+
+    #[test]
+    fn await_approval_response_roundtrip() {
+        let resp = AwaitApprovalResponse {
+            decision: ApprovalDecision::Approved,
+        };
+        let wire = serde_json::to_string(&resp).unwrap();
+        let back: AwaitApprovalResponse = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back.decision, ApprovalDecision::Approved);
     }
 }

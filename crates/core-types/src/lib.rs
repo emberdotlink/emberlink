@@ -124,6 +124,7 @@ mod network;
 pub mod approval;
 pub mod credential_delivery;
 pub mod grant_conditions;
+pub mod persona;
 pub mod policy;
 pub mod qr_encoding;
 mod recovery;
@@ -137,6 +138,7 @@ pub use events::*;
 pub use grant_link::GrantLink;
 pub use identity::*;
 pub use network::*;
+pub use persona::{PersonaIdParseError, PersonaIdSlots, SlotError};
 pub use qr_encoding::{
     QrError, QR_MAX_ALPHANUMERIC_CHARS, QR_PREFIX, SealedOffer, decode_sealed_offer,
     encode_sealed_offer,

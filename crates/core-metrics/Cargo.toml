@@ -1,0 +1,9 @@
+[package]
+name = "core-metrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Prometheus-instrumentation primitives for Emberlink (per design)."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }

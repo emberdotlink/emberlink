@@ -1,0 +1,24 @@
+pub mod vault;
+pub mod config;
+pub mod store;
+pub mod socket;
+pub mod tailnet;
+pub mod rate_limit;
+pub mod audit;
+pub mod anomaly;
+pub mod notification;
+pub mod notify;
+pub mod outbound_leak;
+pub mod persona;
+pub mod pid;
+pub mod image_registry;
+pub mod runtime;
+pub mod sandbox;
+pub mod dashboard;
+pub mod proxy;
+pub mod receipt;
+pub mod events;
+pub mod handler;
+
+#[cfg(target_os = "macos")]
+pub mod vault_macos;

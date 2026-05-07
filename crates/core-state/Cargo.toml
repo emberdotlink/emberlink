@@ -12,6 +12,7 @@ core-events = { path = "../core-events" }
 core-storage = { path = "../core-storage" }
 core-types = { path = "../core-types" }
 base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
 ciborium = "0.2"
 csv = "1"
 ed25519-dalek = "2.1.1"
@@ -21,3 +22,6 @@ serde_json = "1"
 sha2.workspace = true
 urlencoding = "2"
 zeroize = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"

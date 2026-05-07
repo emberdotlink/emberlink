@@ -7,7 +7,7 @@
 //! Provider-specific scopes (Cloudflare, Anthropic, GitHub, AWS STS, GCP,
 //! Tailscale) are represented at the trait boundary as opaque
 //! `serde_json::Value` payloads. Each provider implementation deserializes
-//! this into its own typed struct (see `implementation-note-2` and
+//! this into its own typed struct (see `implementation-note-5` and
 //! sibling tasks). The trait stays provider-agnostic so a single
 //! `Box<dyn Broker>` can be stored in the daemon's broker registry.
 //!
@@ -19,26 +19,26 @@
 #![forbid(unsafe_code)]
 
 // `anthropic` ships the real Anthropic Admin-API broker. ureq does not
-// compile to `wasm32-unknown-unknown`, so the module (and its re-export)
-// is gated off for that target. WASM consumers see the trait + the
-// `MockBroker`; native consumers also get `AnthropicBroker`.
-#[cfg(not(target_arch = "wasm32"))]
+// compile to `wasm32-unknown-unknown`, so the module is also gated off
+// for that target. Feature-gated per implementation-note-6: the trait
+// crate compiles with --no-default-features to trait + types + MockBroker
+// only; provider impls require explicit opt-in.
+#[cfg(all(not(target_arch = "wasm32"), feature = "anthropic"))]
 pub mod anthropic;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "anthropic"))]
 pub use anthropic::AnthropicBroker;
 
 // `cloudflare` ships the Cloudflare API token broker (POST /user/tokens +
-// DELETE /user/tokens/:id). Same WASM gate as `anthropic` — ureq is
-// native-only.
-#[cfg(not(target_arch = "wasm32"))]
+// DELETE /user/tokens/:id). Same gate shape as `anthropic`.
+#[cfg(all(not(target_arch = "wasm32"), feature = "cloudflare"))]
 pub mod cloudflare;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "cloudflare"))]
 pub use cloudflare::CloudflareBroker;
 
 // Opaque `SecretRef` contract — agents hold the opaque id, never the
-// plaintext (implementation-note-3). The trust boundary for
+// plaintext (implementation-note-7). The trust boundary for
 // resolving `SecretRef` → plaintext is ember-proxy / ember-tools, which
 // emits a per-resolution Receipt.
 pub mod secret_ref;
@@ -103,6 +103,17 @@ pub struct BrokerRequest {
     pub ttl: Duration,
     /// Free-form audit reason — recorded in the Grant Receipt.
     pub reason: String,
+    /// Persona on whose behalf this credential is being issued.
+    /// None for legacy callers that pre-date the grant-scope gate.
+    #[serde(default)]
+    pub caller_persona: Option<String>,
+    /// SHA-256 hex of the grants file content when issued via
+    /// `ember broker issue --grants-file`. Propagated into the BrokerReceipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grants_file_rev: Option<String>,
+    /// Credential name from the grants file entry that produced this request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grants_file_credential_name: Option<String>,
 }
 
 /// Successful materialization — what the broker returns.
@@ -364,6 +375,9 @@ mod tests {
             }),
             ttl: Duration::from_secs(ttl_secs),
             reason: "unit test".to_string(),
+            caller_persona: None,
+            grants_file_rev: None,
+            grants_file_credential_name: None,
         }
     }
 

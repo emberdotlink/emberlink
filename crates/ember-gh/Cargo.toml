@@ -1,0 +1,19 @@
+[package]
+name = "ember-gh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Canonical reference Construct: thin RPC shim for `gh` (per design)"
+publish = false
+
+[[bin]]
+name = "ember-gh"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

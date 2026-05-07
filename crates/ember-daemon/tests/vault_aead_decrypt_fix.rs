@@ -10,9 +10,9 @@
 //!
 //! marker: vault-aead-decrypt-fix
 
-use ember_daemon::config::DaemonConfig;
-use ember_daemon::store::DaemonStore;
-use ember_daemon::vault::{Vault, VaultError};
+use ember_daemon::infra::config::DaemonConfig;
+use ember_daemon::infra::store::DaemonStore;
+use ember_daemon::infra::vault::{Vault, VaultError};
 use tempfile::TempDir;
 
 /// Helper: build a `DaemonConfig` whose `data_dir` points at a fresh tempdir

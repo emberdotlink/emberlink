@@ -30,6 +30,26 @@ Output shows each path and the keychain status. Ends with `Run \`ember daemon st
 
 ## Start the daemon
 
+### Separate-uid posture (recommended)
+
+Install the daemon as a system service that runs under a dedicated `ember` service account. This is the production-grade posture (design): the kernel enforces the trust boundary between the agent process and the daemon, so the wedge claim "plaintext never enters the agent's process tree" holds unconditionally.
+
+Works on macOS (LaunchDaemon under `ember` account) and Linux (systemd system unit under `ember` user):
+
+```bash
+ember daemon install-system
+```
+
+This writes the service file, creates the `ember` service account if absent, and starts the daemon. To remove:
+
+```bash
+ember daemon uninstall-system
+```
+
+### Single-uid posture (dev-only escape hatch)
+
+> **Relaxed threat model.** The daemon runs as your own user. The architectural isolation claim is conditional — an adversary with code execution inside the agent process can ptrace or kill the daemon. Use this only for local development on a trusted machine.
+
 ```bash
 ember daemon start
 ```
@@ -100,6 +120,8 @@ Route Claude Code's tool calls through the ember daemon as an MCP server. First 
 ```bash
 cargo install --path crates/emberlink-mcp --bin emberlink-mcp
 ```
+
+The `ember-proxy` binary ships alongside `ember` — a single `cargo install emberlink` installs both on $PATH.
 
 Then add to `~/.claude/settings.json`:
 
@@ -183,16 +205,11 @@ ember daemon stop && ember daemon start
 
 **Docker not installed** — the sandbox commands require Docker. Install Docker Desktop (macOS/Windows) or Docker Engine (Linux). The rest of ember works without it; skip `ember sandbox create` if you don't need container isolation.
 
-## Next steps
+## Auto-start on login (single-uid, dev-only)
 
-- Daemon vision — what the daemon becomes
-- Grant conditions — rate limits, time windows, allow lists
-- Approval flow — JIT escalation for agent requests
-- Policy syntax — `ember policy show` / `ember policy eval <action>`
+> **Relaxed threat model** — use `ember daemon install-system` for the separate-uid production posture.
 
-## Auto-start on login
-
-Works on macOS (LaunchAgent) and Linux (systemd user unit):
+Installs a per-user auto-start entry on macOS (LaunchAgent) and Linux (systemd user unit):
 
 ```bash
 ember daemon install-agent
@@ -203,6 +220,13 @@ This writes and loads the service file, sets the correct binary path, and enable
 ```bash
 ember daemon uninstall-agent
 ```
+
+## Next steps
+
+- Daemon vision — what the daemon becomes
+- Grant conditions — rate limits, time windows, allow lists
+- Approval flow — JIT escalation for agent requests
+- Policy syntax — `ember policy show` / `ember policy eval <action>`
 
 ---
 

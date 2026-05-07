@@ -1,5 +1,5 @@
 //! Integration tests for `ember broker {issue, revoke, list}`
-//! (implementation-note-37).
+//! (implementation-note-121).
 //!
 //! Each test spawns a real `ember-daemon` socket listener on a temp
 //! `UnixStream` path with a `MockBroker`-backed registry installed (the
@@ -37,14 +37,14 @@ use std::rc::Rc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use ember_daemon::broker_handler::{install_registry, BrokerRegistry};
-use ember_daemon::policy::{
-    PolicyConfig, PolicyDecision, PolicyEngine, PolicyRule, RiskLevel,
+use ember_daemon::broker::handler::{install_registry, BrokerRegistry};
+use ember_daemon::trust::policy::{
+    ApprovalRequirement, PolicyConfig, PolicyEngine, PolicyRule, RiskLevel,
 };
-use ember_daemon::rate_limit::RateLimiter;
-use ember_daemon::socket::SocketListener;
-use ember_daemon::store::DaemonStore;
-use ember_daemon::vault::Vault;
+use ember_daemon::infra::rate_limit::RateLimiter;
+use ember_daemon::infra::socket::SocketListener;
+use ember_daemon::infra::store::DaemonStore;
+use ember_daemon::infra::vault::Vault;
 use emberlink_cli::broker::{
     broker_command, BrokerCliError, BrokerCmd, GlobalOpts,
 };
@@ -78,10 +78,10 @@ fn permissive_policy() -> PolicyEngine {
         rules: vec![PolicyRule {
             action: "credential.access.*".to_string(),
             risk: RiskLevel::Low,
-            decision: PolicyDecision::AutoApprove,
+            requirement: ApprovalRequirement::Auto,
             tier: None,
         }],
-        default_decision: PolicyDecision::AutoApprove,
+        default_requirement: ApprovalRequirement::Auto,
         default_risk: RiskLevel::Low,
     })
 }
@@ -165,7 +165,7 @@ fn broker_issue_valid_scope_returns_brokered_credential() {
         provider: "cloudflare".to_string(),
         scope_json: r#"{"zone":"emberlink.dev","permissions":["dns:edit"]}"#.to_string(),
         ttl: "15m".to_string(),
-        reason: "implementation-note-38issue-test".to_string(),
+        reason: "implementation-note-122issue-test".to_string(),
         json: true,
     };
     let res = broker_command(cmd, opts(&socket));

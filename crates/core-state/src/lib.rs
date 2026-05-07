@@ -2,7 +2,10 @@ mod adapters;
 mod blockstore;
 mod persist;
 mod schema;
+pub mod sessions;
+pub mod snapshot;
 
+pub use sessions::{SessionMeta, SessionStore};
 pub use adapters::{
     OAuthAdapter, OAuthAuthorizeRequest, OAuthBindingMeta, OAuthTokenClaims,
     OAuthTokenExchangeRequest, OidcClaimAdapter, PasskeyAdapter, PasskeyAssertionResult,

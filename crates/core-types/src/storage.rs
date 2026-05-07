@@ -701,6 +701,10 @@ impl Budget {
 pub struct Usage {
     #[serde(default)]
     pub tokens: u64,
+    /// Integer-cent display value. Derived from `cents_micro` at increment
+    /// time so receipt JSON / audit rows stay human-readable; do NOT use
+    /// for budget enforcement (sub-cent calls truncate to 0). The
+    /// authoritative budget axis is `cents_micro`.
     #[serde(default)]
     pub cents: u64,
     #[serde(default)]
@@ -713,6 +717,34 @@ pub struct Usage {
     /// created grant that has never been exercised.
     #[serde(default)]
     pub last_updated: u64,
+    /// Sub-cent precision accumulator (cents × 10⁶ = micro-cents).
+    /// Authoritative for budget enforcement: `has_budget_remaining` and
+    /// `emit_threshold_crossings` compare this against the budget cap
+    /// scaled to the same unit. Without this, a single Haiku-4.5 call
+    /// (~0.1¢ per call) rounds to 0¢ via integer division and the cap
+    /// can never accumulate enough to trip — implementation-note-18.
+    /// Defaults to 0 on legacy grants; the next `increment_statement_usage`
+    /// call re-derives the displayed `cents` from this field, so
+    /// pre-existing (non-zero `cents`, zero `cents_micro`) grants flush
+    /// their legacy display value on first new metering — acceptable for
+    /// v0 (no rollback ceremony).
+    ///
+    /// `skip_serializing_if` so a zero value is omitted from canonical
+    /// encoding — preserves the grant-block-v1 signature bytes for any
+    /// grant that hasn't yet accumulated sub-cent usage (the field is
+    /// invisible to signers/verifiers until the meter touches it).
+    /// Once a grant has been metered, the field appears in the canonical
+    /// bytes and re-signing flows through the same persona key path —
+    /// no version bump needed because the field is additive and zero-
+    /// preserving for unaffected chains.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub cents_micro: u64,
+}
+
+/// Serde helper for `Usage::cents_micro` — `skip_serializing_if`
+/// predicate that returns `true` when the field is its default zero.
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
 }
 
 /// Agent attestation posture for a grant. First-class field today (design §
@@ -939,10 +971,23 @@ impl Statement {
         {
             return false;
         }
-        if let Some(cap) = b.cents
-            && self.usage.cents >= cap
-        {
-            return false;
+        if let Some(cap) = b.cents {
+            // implementation-note-18: budget enforcement runs on the
+            // sub-cent `cents_micro` accumulator. Sub-cent calls (typical for
+            // Haiku-4.5 pricing) round the integer `cents` field to 0 per
+            // call, so a cents-only check would never trip. Compare against
+            // the cap scaled to micro-cents (cap × 10⁶); fall back to the
+            // legacy `cents` axis when cents_micro is unset (zero) so
+            // pre-fix grants stored under the old representation still
+            // exhaust correctly.
+            let cap_micro = cap.saturating_mul(1_000_000);
+            if self.usage.cents_micro > 0 {
+                if self.usage.cents_micro >= cap_micro {
+                    return false;
+                }
+            } else if self.usage.cents >= cap {
+                return false;
+            }
         }
         if let Some(cap) = b.requests
             && self.usage.requests >= cap
@@ -961,6 +1006,45 @@ impl Statement {
         }
         true
     }
+}
+
+/// Proposal-shape sibling of [`Statement`]. Carries the per-statement clauses
+/// of a [`GrantProposal`] before it is approved into a runtime [`AccessGrant`].
+/// No `sid` or `usage` — both are minted at grant-creation time, not at proposal.
+///
+/// Per design (composite-grant runtime) + design (Construct collapse).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatementProposal {
+    pub resource_type: ResourceType,
+    pub credential_name: String,
+    pub actions: Vec<Action>,
+    pub resource: ResourceSelector,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<Budget>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<Condition>,
+}
+
+/// Proposal-shape sibling of [`AccessGrant`]. Submitted to emberd to start the
+/// propose-then-approve flow; on approval, materializes into a runtime
+/// [`AccessGrant`].
+///
+/// `skill_ref` is an advisory pointer to the originating Construct/skill
+/// that asked for the grant; emberd does not enforce on it. Per design.
+///
+/// Per design (composite-grant runtime) + design (Construct collapse).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantProposal {
+    pub persona_id: String,
+    pub statements: Vec<StatementProposal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 // --- Block + SignedBlock --------------------------------------------------

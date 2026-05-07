@@ -12,6 +12,8 @@ A grant is the fundamental primitive: scoped, time-bound, persona-bound, budgete
 
 The same primitive that lets an AI agent hit your GitHub token also lets a friend share a login, a partner pay on your behalf, a guardian recover your identity, or a coalition prove something collectively without revealing individual data. We are building the authorization layer for the agent era *as a general trust protocol*, because the shape is general.
 
+Credentials are the doorway. Delegated authority is the category. Signed receipts are the proof.
+
 ## What we are building
 
 Emberlink is **the Grant Warden for AI agents**.
@@ -36,8 +38,9 @@ Emberlink's position is not a permissions system bolted onto agents. It is **the
 
 The relationship is: human approves, agent executes. Not once, at setup. Continuously, at the boundary of what was authorized. The agent never holds raw credentials — it holds a grant. The grant says what the agent may do, for how long, under what conditions. The grant can be revoked from your phone in three seconds.
 
-**Four principles that are not negotiable:**
+**Five principles that are not negotiable:**
 
+0. **Every authorized action is verifiable.** The receipt — not the credential boundary — is the durable artifact. Anyone the operator chooses can confirm the chain of authority outside our infrastructure, with no vendor in the loop.
 1. **Agents never hold raw credentials.** They hold scoped, time-bound grants that reference living credentials. The credentials rotate. The agent gets the current version only while the grant is active.
 2. **Every credential access is auditable.** Not "logged somewhere." Logged in an append-only event record that the human can read, export, and verify. The agent cannot lie about what it did.
 3. **Humans approve, agents execute.** Elevated access requires a human signature. Not a checkbox at setup — a real-time approval from the phone of whoever owns the resource.

@@ -241,7 +241,12 @@ pub enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         rest: Vec<String>,
     },
-    /// Approve or deny a pending approval (implementation-note-14).
+    /// Grants manifest workflows (validate <file>).
+    Grants {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        rest: Vec<String>,
+    },
+    /// Approve or deny a pending approval (implementation-note-56).
     Approval {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         rest: Vec<String>,
@@ -335,13 +340,30 @@ pub enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         rest: Vec<String>,
     },
-    /// Query the receipts audit log (EMBER-implementation-note-28).
+    /// Query the receipts audit log (EMBER-implementation-note-68).
     ///
     /// Subcommand::Audit — dispatches to the receipt-query handler.
     /// Filters: --since <duration|ISO>, --actor <persona-id>,
     /// --kind <grant|kms_wrap|kms_unwrap>, --grant-id <id>,
     /// --resource <pattern>, --limit <N>, --format <table|json|jsonl>.
     Audit {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        rest: Vec<String>,
+    },
+    /// Manage content-hash-pinned binaries (install / list / update / remove).
+    ///
+    /// `ember binary install <tool>@<version> --from-path <path>` registers a
+    /// binary with its blake3 content hash in `~/.ember/binaries/manifest.toml`.
+    Binary {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        rest: Vec<String>,
+    },
+    /// Construct binary signing (sign, verify).
+    ///
+    /// `ember construct sign` produces a JSON sidecar at `<binary>.sig` with
+    /// a blake3 content hash + Ed25519 publisher signature per
+    /// `docs/construct-signing-pipeline.md`.
+    Construct {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         rest: Vec<String>,
     },
@@ -382,6 +404,7 @@ impl Cmd {
             Cmd::Import { rest } => ("import", rest),
             Cmd::Vault { rest } => ("vault", rest),
             Cmd::Grant { rest } => ("grant", rest),
+            Cmd::Grants { rest } => ("grants", rest),
             Cmd::Approval { rest } => ("approval", rest),
             Cmd::Badge { rest } => ("badge", rest),
             Cmd::Credential { rest } => ("credential", rest),
@@ -401,6 +424,8 @@ impl Cmd {
             Cmd::ExportEvents { rest } => ("export-events", rest),
             Cmd::ImportEvents { rest } => ("import-events", rest),
             Cmd::Audit { rest } => ("audit", rest),
+            Cmd::Binary { rest } => ("binary", rest),
+            Cmd::Construct { rest } => ("construct", rest),
             Cmd::Quit => return "quit".to_string(),
             Cmd::Legacy(tokens) => {
                 return tokens.join(" ");

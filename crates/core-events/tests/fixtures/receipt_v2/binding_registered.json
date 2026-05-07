@@ -1,0 +1,18 @@
+{
+  "version": "2",
+  "kind": "binding.registered",
+  "receipt_id": "b77cb2e1df2044dfb99713dac59af1b693acadec04aea854b4f7dbc9ce69f3d5",
+  "daemon_root_id": "fixture-daemon-root",
+  "termination_authority": "user_session",
+  "body": {
+    "binding_request_id": "br-fixture-001",
+    "namespace": "ns-prod",
+    "persona_display_name": "ML Eval Worker",
+    "persona_id": "persona-fixture",
+    "sa_name": "ml-eval",
+    "scopes_granted": [
+      "llm:generate"
+    ]
+  },
+  "signature": "ed25519sig:c5cfa3a3086769c8bcc90a60db31d44618647ef1fb71aa8b3cfdc474fc8ad87a3f2023683d57f0917b5dac23516ab7649d30935e6592f7ce825dc1c2e0149f02"
+}

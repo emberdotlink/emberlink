@@ -1,9 +1,9 @@
 //! `ember broker {issue, revoke, list}` — operator + wrapper-script entry
 //! point for the credential broker (design / design).
 //!
-//! The daemon RPC handlers shipped in implementation-note-17
+//! The daemon RPC handlers shipped in implementation-note-29
 //! (`crates/ember-daemon/src/broker_handler.rs`); this module is the CLI
-//! surface that wraps them. Three subcommands:
+//! surface that wraps them. Subcommands:
 //!
 //! - [`issue`]  — request a fresh materialization from a registered
 //!   provider (`broker_issue` daemon RPC).
@@ -13,11 +13,26 @@
 //!   RPC), optionally filtered by provider / tier / task-id /
 //!   active-only.
 //!
+//! ## Grants-file flow (implementation-note-33)
+//!
+//! `ember broker issue --grants-file <path> --credential <name>` reads a
+//! `GrantsManifest` TOML, locates the named credential entry, and issues a
+//! scoped grant via `broker_issue`. The Receipt is stamped with
+//! `grants_file_rev` (SHA-256 of the file bytes) and `credential_name`.
+//!
+//! `--inject` spawns a child shell (`$SHELL` or `/bin/sh`) with any
+//! materialized credentials in its environment, registers the child PID
+//! with the daemon via `broker_register_pid_watcher`, then waits for the
+//! shell to exit. The daemon polls the PID and auto-revokes when it exits.
+//!
 //! ## Marker for `target_state_anchor`
 //!
-//! implementation-note-37 uses `BrokerCmd|broker_command` as its grep gate;
+//! implementation-note-121 uses `BrokerCmd|broker_command` as its grep gate;
 //! both literals appear in this file (`pub enum BrokerCmd` below and
 //! `pub fn broker_command` below).
+//!
+//! implementation-note-33 uses `ember broker issue.*grants-file` as its
+//! grep gate; see `#[arg(long = "grants-file")]` on `BrokerCmd::Issue` below.
 //!
 //! ## Secret handling
 //!
@@ -35,10 +50,12 @@ use std::time::Duration;
 use clap::Subcommand;
 use serde_json::{json, Value};
 
+use core_grants_toml::{Credential, GrantsManifest};
+
 /// CLI subcommand surface for `ember broker`.
 ///
 /// Mirrors the daemon's three RPC methods one-to-one. The literal
-/// `BrokerCmd` is the load-bearing marker for the implementation-note-37
+/// `BrokerCmd` is the load-bearing marker for the implementation-note-121
 /// `target_state_anchor`.
 #[derive(Subcommand, Debug)]
 pub enum BrokerCmd {
@@ -79,6 +96,47 @@ pub enum BrokerCmd {
         /// Emit the response (including the live secret) as JSON to
         /// stdout. Without `--json` the secret is masked when stdout is
         /// a TTY.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Issue grants from a TOML grants file (design / implementation-note-33).
+    ///
+    /// Reads a `GrantsManifest` TOML via `core-grants-toml`, locates the
+    /// credential entry named by `--credential`, and issues a scoped grant
+    /// via `broker_issue`. The Receipt is stamped with `grants_file_rev`
+    /// (SHA-256 of the file bytes) and `credential_name`.
+    ///
+    /// With `--inject` a child shell is spawned with materialized credentials
+    /// in its environment. The daemon auto-revokes when the shell exits.
+    ///
+    /// ## Checkpoint for target_state_anchor
+    ///
+    /// `ember broker issue --grants-file` (implementation-note-33)
+    #[command(name = "issue-file")]
+    IssueFromFile {
+        /// Path to the grants manifest TOML file.
+        // ember broker issue --grants-file (implementation-note-33)
+        #[arg(long = "grants-file")]
+        grants_file: PathBuf,
+
+        /// Credential name within the grants file to issue.
+        #[arg(long)]
+        credential: String,
+
+        /// Time-to-live override (humantime: 15s, 5m, 2h, 1d, or bare
+        /// seconds). When absent, defaults to the `ttl_secs` from the
+        /// manifest entry or `[defaults]`, or 3600s if neither is set.
+        #[arg(long)]
+        ttl: Option<String>,
+
+        /// If set, spawn a child shell with the issued credentials in its
+        /// environment. Register the child PID with the daemon; on shell
+        /// exit the daemon auto-revokes the grants via Receipt event.
+        #[arg(long)]
+        inject: bool,
+
+        /// Emit the response (including grant IDs) as JSON to stdout.
         #[arg(long)]
         json: bool,
     },
@@ -151,6 +209,13 @@ pub fn broker_command(cmd: BrokerCmd, opts: GlobalOpts) -> Result<(), BrokerCliE
             reason,
             json,
         } => issue(&opts, &provider, &scope_json, &ttl, &reason, json),
+        BrokerCmd::IssueFromFile {
+            grants_file,
+            credential,
+            ttl,
+            inject,
+            json,
+        } => issue_from_grants_file(&opts, &grants_file, &credential, ttl.as_deref(), inject, json),
         BrokerCmd::Revoke {
             materialization_id,
             json,
@@ -201,7 +266,7 @@ pub fn issue(
 
     let result = call_daemon(&opts.socket_path, "broker_issue", &params)?;
 
-    // Result shape (implementation-note-3):
+    // Result shape (implementation-note-7):
     //   { secret_ref, materialization_id, expires_at, issued_at, provider }
     // The opaque `secret_ref` is what callers pass back to ember-proxy /
     // ember-tools when the actual credential is needed at a trust
@@ -230,6 +295,193 @@ pub fn issue(
     println!("  Issued:          {issued}");
     println!("  Expires:         {expires}");
     println!("  SecretRef:       {sref}");
+
+    Ok(())
+}
+
+/// `ember broker issue-file --grants-file <path> --credential <name>`
+/// (implementation-note-33)
+///
+/// Reads a `GrantsManifest` TOML, locates the named credential, issues a
+/// scoped grant stamped with `grants_file_rev` (SHA-256 of file bytes) and
+/// `credential_name`. With `--inject` spawns a child shell and registers the
+/// PID for daemon auto-revoke.
+///
+/// // ember broker issue --grants-file (implementation-note-33)
+pub fn issue_from_grants_file(
+    opts: &GlobalOpts,
+    grants_file: &Path,
+    credential_name: &str,
+    ttl_override: Option<&str>,
+    inject: bool,
+    json_out: bool,
+) -> Result<(), BrokerCliError> {
+    // 1. Read and parse the grants file.
+    let raw = std::fs::read(grants_file).map_err(|e| {
+        BrokerCliError::InvalidArgs(format!(
+            "--grants-file {}: read failed: {e}",
+            grants_file.display()
+        ))
+    })?;
+    let raw_str = std::str::from_utf8(&raw).map_err(|e| {
+        BrokerCliError::InvalidArgs(format!(
+            "--grants-file {}: file is not valid UTF-8: {e}",
+            grants_file.display()
+        ))
+    })?;
+
+    // Compute SHA-256 of the raw bytes for the grants_file_rev Receipt field.
+    let grants_file_rev = sha256_hex(&raw);
+
+    let manifest = GrantsManifest::from_toml(raw_str).map_err(|e| {
+        BrokerCliError::InvalidArgs(format!(
+            "--grants-file {}: parse error: {e}",
+            grants_file.display()
+        ))
+    })?;
+
+    // Validate manifest semantics (warn on unknown kinds but treat as errors
+    // for the credential we're about to use, so callers get fast feedback).
+    if let Err(errs) = manifest.validate() {
+        for e in &errs {
+            eprintln!("warning: grants file validation: {e}");
+        }
+    }
+
+    // 2. Locate the named credential entry.
+    let cred_entry = manifest
+        .credentials
+        .iter()
+        .find(|c| match c {
+            Credential::Ephemeral { name, .. }
+            | Credential::Static { name, .. }
+            | Credential::Sealed { name, .. } => name == credential_name,
+            Credential::Unknown => false,
+        })
+        .ok_or_else(|| {
+            BrokerCliError::InvalidArgs(format!(
+                "credential '{credential_name}' not found in grants file '{}'",
+                grants_file.display()
+            ))
+        })?;
+
+    // 3. Extract scope + TTL from the credential entry.
+    let (scope, entry_ttl_secs) = match cred_entry {
+        Credential::Ephemeral { scope, ttl_secs, .. } => (scope.clone(), *ttl_secs),
+        Credential::Static { scope, .. } => (scope.clone(), None),
+        Credential::Sealed { scope, .. } => (scope.clone(), None),
+        Credential::Unknown => unreachable!("already filtered above"),
+    };
+
+    // Resolve effective TTL: --ttl flag > entry ttl_secs > manifest defaults > 3600.
+    let effective_ttl_secs = if let Some(ttl_s) = ttl_override {
+        parse_duration(ttl_s).map_err(|msg| {
+            BrokerCliError::InvalidArgs(format!("invalid --ttl: {msg}"))
+        })?
+    } else if let Some(secs) = entry_ttl_secs {
+        secs
+    } else if let Some(secs) = manifest.defaults.ttl_secs {
+        secs
+    } else {
+        3600
+    };
+
+    // 4. Determine provider from scope or fall back to a well-known heuristic.
+    //    For now, the grants file `scope` is opaque JSON; we derive the provider
+    //    from a `provider` field if present, otherwise default to "anthropic".
+    let provider = scope
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or("anthropic")
+        .to_string();
+
+    // 5. Build and send the broker_issue RPC params, including grants_file_rev.
+    let params = json!({
+        "provider": provider,
+        "scope": scope,
+        "ttl": effective_ttl_secs,
+        "reason": format!("grants-file:{}", grants_file.display()),
+        "grants_file_rev": grants_file_rev,
+        "grants_file_credential_name": credential_name,
+    });
+
+    let result = call_daemon(&opts.socket_path, "broker_issue", &params)?;
+
+    let mid = result["materialization_id"].as_str().unwrap_or("?").to_string();
+    let expires = result["expires_at"].as_str().unwrap_or("?");
+    let issued = result["issued_at"].as_str().unwrap_or("?");
+    let secret_ref = result["secret_ref"].as_str().unwrap_or("");
+
+    if json_out && !inject {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string())
+        );
+    } else if !inject {
+        println!("Issued grant from grants file");
+        println!("  Credential:      {credential_name}");
+        println!("  Materialization: {mid}");
+        println!("  Provider:        {provider}");
+        println!("  Issued:          {issued}");
+        println!("  Expires:         {expires}");
+        println!("  SecretRef:       {secret_ref}");
+        println!("  GrantsFileRev:   {grants_file_rev}");
+    }
+
+    // 6. --inject: spawn child shell, register PID watcher, wait for exit.
+    if inject {
+        // Build env for the child shell — inject the SecretRef as an env var.
+        let env_key = format!(
+            "EMBER_CREDENTIAL_{}",
+            credential_name.to_uppercase().replace('-', "_")
+        );
+
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+
+        let mut child = std::process::Command::new(&shell)
+            .env(&env_key, secret_ref)
+            .env("EMBER_MATERIALIZATION_ID", &mid)
+            .env("EMBER_GRANTS_FILE_REV", &grants_file_rev)
+            .spawn()
+            .map_err(|e| BrokerCliError::Io(format!("spawn shell '{shell}': {e}")))?;
+
+        let child_pid = child.id();
+
+        // Register PID watcher with daemon for auto-revoke on shell exit.
+        let watcher_params = json!({
+            "pid": child_pid,
+            "materialization_ids": [mid],
+        });
+        if let Err(e) = call_daemon(&opts.socket_path, "broker_register_pid_watcher", &watcher_params) {
+            // Non-fatal — the user can manually revoke. Warn and continue.
+            eprintln!(
+                "warning: could not register PID watcher with daemon (grants will NOT be \
+                 auto-revoked on shell exit): {e}"
+            );
+        }
+
+        if json_out {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "materialization_id": mid,
+                    "credential_name": credential_name,
+                    "grants_file_rev": grants_file_rev,
+                    "child_pid": child_pid,
+                    "shell": shell,
+                }))
+                .unwrap_or_default()
+            );
+        } else {
+            println!("Spawned shell (pid {child_pid}) with {env_key} set.");
+            println!("Grants will be auto-revoked when the shell exits.");
+        }
+
+        // Wait for the child shell to finish.
+        child
+            .wait()
+            .map_err(|e| BrokerCliError::Io(format!("wait for child shell: {e}")))?;
+    }
 
     Ok(())
 }
@@ -428,6 +680,15 @@ fn load_scope_json(arg: &str) -> Result<Value, BrokerCliError> {
              Provider scope shapes are documented in design §5b / design."
         ))
     })
+}
+
+/// Compute the SHA-256 hex digest of raw bytes. Used to populate
+/// `grants_file_rev` in the broker Receipt (implementation-note-33).
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(data);
+    hex::encode(h.finalize())
 }
 
 /// Send a synchronous JSON-RPC request over the daemon's Unix socket

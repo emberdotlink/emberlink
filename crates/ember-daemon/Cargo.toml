@@ -11,20 +11,37 @@ categories = ["authentication", "command-line-utilities"]
 publish = false
 
 [features]
-# implementation-note-8: age keypair generation for SOPS+emberd integration.
-# Off by default — flipping this on is a separate PR after the dep is
-# verified to build cleanly across platforms (implementation-note-9).
+# implementation-note-23: age keypair generation for SOPS+emberd integration.
+# On by default — implementation-note-23 ships persona age keys as a first-class
+# daemon capability. Build with `--no-default-features` to opt out for
+# environments that explicitly don't want the age dep linked.
+#
+# implementation-note-24: webauthn enables server-side passkey ceremony
+# (registration + authentication) so dashboard approvals are gated by
+# a verified WebAuthn assertion against a stored credential pubkey.
+# Default-on: the gate fails closed by default. Build with
+# `--no-default-features` for environments that explicitly opt out.
+default = ["age", "webauthn"]
 age = ["dep:age"]
+webauthn = ["dep:webauthn-rs"]
 
 [dependencies]
 age = { version = "0.10", optional = true, features = ["armor"] }
 anyhow = "1"
+async-trait = "0.1"
 argon2 = "0.5"
+base64 = "0.22"
+blake3 = "1"
 bytes = "1"
 chacha20poly1305 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
+core-approval = { path = "../core-approval" }
 core-broker = { path = "../core-broker" }
+ember-broker = { path = "../ember-broker" }
+core-state = { path = "../core-state" }
 core-crypto = { path = "../core-crypto" }
+core-events = { path = "../core-events" }
+core-grants = { path = "../core-grants" }
 core-kms = { path = "../core-kms" }
 core-types = { path = "../core-types" }
 dirs-next = "2"
@@ -59,8 +76,23 @@ aho-corasick = "1"
 once_cell = "1"
 regex = "1"
 zeroize = { version = "1", features = ["derive"] }
+# implementation-note-24: WebAuthn relying-party. Verifies passkey
+# registration + authentication ceremonies against stored credential
+# pubkeys. Sync API (no Send/async surprises in our LocalSet model).
+# `resident-key-support` feature so the dashboard can authenticate
+# against discoverable platform passkeys (TouchID on macOS).
+#
+# Features:
+# - resident-key-support: dashboard authenticates against discoverable
+#   platform passkeys (TouchID on macOS) without a stored credential ID.
+# - danger-allow-state-serialisation: serialize PasskeyRegistration /
+#   PasskeyAuthentication state to SQLite between begin/finish. The
+#   "danger" prefix flags the requirement that the storage be private
+#   to the daemon; our `webauthn_challenges` table lives in the
+#   daemon's local-only SQLite database, never replicated.
+webauthn-rs = { version = "0.5", features = ["resident-key-support", "danger-allow-state-serialisation"], optional = true }
 
-# security check + implementation-note-10: macOS biometric+passcode gate. The
+# security check + implementation-note-25: macOS biometric+passcode gate. The
 # `keyring` crate (already a dep above) does not expose
 # `kSecAttrAccessControl`, so we drop down to `security-framework` directly
 # on macOS to wrap the vault MEK with

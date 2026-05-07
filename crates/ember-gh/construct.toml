@@ -1,0 +1,47 @@
+# Construct manifest for ember-gh per design §2.
+# Action schema: each [[actions]] declares an allowed (verb, subverb)
+# pair, optional budget caps, biometric requirement, and a permit/deny
+# default. The daemon's broker.resolve consults this to decide whether
+# the action requires a credential mint, an existing grant, or refuses.
+
+[meta]
+name = "ember-gh"
+version = "0.1.0"
+publisher = "did:ember-systems"
+description = "Canonical reference Construct: thin RPC shim for `gh`"
+
+# Default policy for unlisted (verb, subverb) pairs.
+default = "deny"
+
+[[actions]]
+key = "pr_create"
+default = "permit"
+
+[[actions]]
+key = "pr_merge"
+default = "prompt"        # requires biometric/operator approval
+
+[[actions]]
+key = "pr_close"
+default = "permit"
+
+[[actions]]
+key = "pr_list"
+default = "permit"
+
+[[actions]]
+key = "pr_view"
+default = "permit"
+
+[[actions]]
+key = "repo_delete"
+default = "deny"          # never auto-permit; agent must explicitly elevate
+
+[[actions]]
+key = "auth_login"
+default = "deny"          # credential mint goes through ember-kms, not gh's keychain
+
+[[actions]]
+key = "workflow_run"
+default = "permit"
+budget_caps = { wall_clock_secs = 1800, cents = 500 }

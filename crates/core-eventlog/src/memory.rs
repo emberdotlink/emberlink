@@ -85,9 +85,7 @@ impl MemoryEventLog {
         let snapshot_materialized = self.materialized.clone();
         let snapshot_manifests = self.storage_manifests.clone();
 
-        if let Err(err) = check_chain(&self.materialized, &event) {
-            return Err(err);
-        }
+        check_chain(&self.materialized, &event)?;
         if let Err(err) = apply_event(&mut self.materialized, &event) {
             self.materialized = snapshot_materialized;
             self.storage_manifests = snapshot_manifests;

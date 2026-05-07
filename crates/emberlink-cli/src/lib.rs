@@ -1,9 +1,18 @@
 mod activity_support;
 mod biometric;
+pub mod binary;
 pub mod broker;
 pub mod cli;
+pub mod cluster;
+pub mod construct;
+pub mod grants;
 mod commands;
+pub mod demo;
+pub mod launcher;
+pub mod onboarding;
 pub mod output;
+pub mod receipt;
+pub mod session;
 mod recovery;
 mod screens;
 mod sync_support;

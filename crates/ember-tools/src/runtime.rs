@@ -2,7 +2,7 @@
 //!
 //! The `WasmTool` trait describes a single capability-scoped tool that can be
 //! invoked with a JSON input and returns a JSON output. The real
-//! wasmtime-backed implementation lands in `implementation-note-35`; this
+//! wasmtime-backed implementation lands in `implementation-note-106`; this
 //! module ships a `StubRuntime` whose `invoke` always returns
 //! `ToolError::NotImplemented` so callers can wire against the trait today.
 
@@ -47,7 +47,7 @@ pub trait WasmTool: Send + Sync {
 
 /// Placeholder runtime that returns `ToolError::NotImplemented` for every
 /// invocation. Replaced by the wasmtime-backed runtime in
-/// `implementation-note-35`.
+/// `implementation-note-106`.
 pub struct StubRuntime {
     name: String,
 }

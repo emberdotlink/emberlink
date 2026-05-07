@@ -31,7 +31,7 @@ use core_types::{
     MessageSentEvent, PresentationAudienceKind, RecipientProfile, ResourceType, SignerBinding,
     SurvivalMode, SyncProfile, TrustThreshold, Usage, Validate, ValidationError,
 };
-use core_types::approval::{ApprovalResponse, ApprovalStatus};
+use core_approval::{ApprovalResponse, ApprovalStatus};
 
 use crate::biometric::{BiometricError, BiometricOutcome, require_biometric};
 
@@ -201,9 +201,9 @@ impl DemoApp {
             ["import", rest @ ..] => self.handle_import(rest),
             ["show", "vault", rest @ ..] | ["vault", rest @ ..] => self.handle_vault(rest),
             ["show", "grant", rest @ ..] | ["grant", rest @ ..] => self.handle_grant(rest),
-            // EMBER-implementation-note-28: Subcommand::Audit — query the receipts table.
+            // EMBER-implementation-note-68: Subcommand::Audit — query the receipts table.
             ["audit", rest @ ..] => self.handle_audit(rest),
-            // implementation-note-14 — `ember approval approve|deny <id>` is the
+            // implementation-note-56 — `ember approval approve|deny <id>` is the
             // demo-grade approval command. On macOS it triggers
             // LocalAuthentication (Touch ID / device passcode) before
             // mutating state; declined biometric refuses the approval.
@@ -1957,7 +1957,7 @@ impl DemoApp {
         Ok(lines)
     }
 
-    /// EMBER-implementation-note-28 — Subcommand::Audit dispatch for the demo shell.
+    /// EMBER-implementation-note-68 — Subcommand::Audit dispatch for the demo shell.
     ///
     /// Accepts the same filter flags as `ember audit query` (`--actor`,
     /// `--kind`, `--grant-id`, `--since`, `--limit`, `--format`). In the
@@ -2075,6 +2075,76 @@ impl DemoApp {
                     Ok(message) => message,
                     Err(err) => format!("Failed to create persona: {}\n", err),
                 }
+            }
+            ["binary", "install", rest @ ..] => {
+                let mut argv = vec!["ember-binary-install"];
+                argv.extend_from_slice(rest);
+                match <crate::binary::install::BinaryInstallArgs as clap::Parser>::try_parse_from(
+                    argv,
+                ) {
+                    Ok(args) => match crate::binary::install::binary_install(&args) {
+                        Ok(()) => "[binary install] OK\n".to_string(),
+                        Err(e) => format!("binary install error: {e}\n"),
+                    },
+                    Err(e) => format!("{e}\n"),
+                }
+            }
+            ["binary", "list"] => match crate::binary::list::binary_list() {
+                Ok(()) => "[binary list] OK\n".to_string(),
+                Err(e) => format!("binary list error: {e}\n"),
+            },
+            ["binary", "update", rest @ ..] => {
+                let mut argv = vec!["ember-binary-update"];
+                argv.extend_from_slice(rest);
+                match <crate::binary::update::BinaryUpdateArgs as clap::Parser>::try_parse_from(
+                    argv,
+                ) {
+                    Ok(args) => match crate::binary::update::binary_update(&args) {
+                        Ok(()) => "[binary update] OK\n".to_string(),
+                        Err(e) => format!("binary update error: {e}\n"),
+                    },
+                    Err(e) => format!("{e}\n"),
+                }
+            }
+            ["binary", "remove", rest @ ..] => {
+                let mut argv = vec!["ember-binary-remove"];
+                argv.extend_from_slice(rest);
+                match <crate::binary::remove::BinaryRemoveArgs as clap::Parser>::try_parse_from(
+                    argv,
+                ) {
+                    Ok(args) => match crate::binary::remove::binary_remove(&args) {
+                        Ok(()) => "[binary remove] OK\n".to_string(),
+                        Err(e) => format!("binary remove error: {e}\n"),
+                    },
+                    Err(e) => format!("{e}\n"),
+                }
+            }
+            ["binary", ..] => {
+                "Usage: binary install <tool>@<version> --from-path <path>\n       \
+                 binary list\n       binary update <tool>\n       \
+                 binary remove <tool>@<version>\n"
+                    .to_string()
+            }
+            ["construct", "sign", rest @ ..] => {
+                // Build argv with a dummy binary name; clap uses argv[0] as the
+                // program name, so we prepend "ember-construct-sign" and pass
+                // only the flag args.
+                let mut argv = vec!["ember-construct-sign"];
+                argv.extend_from_slice(rest);
+                match <crate::construct::sign::SignConstructArgs as clap::Parser>::try_parse_from(
+                    argv,
+                ) {
+                    Ok(args) => match crate::construct::sign::sign_construct(&args) {
+                        Ok(()) => "[construct sign] OK\n".to_string(),
+                        Err(e) => format!("construct sign error: {e}\n"),
+                    },
+                    Err(e) => format!("{e}\n"),
+                }
+            }
+            ["construct", ..] => {
+                "Usage: construct sign --binary <path> --construct-toml <path> \
+                 --version <semver> --identity-root-keypath <path>\n"
+                    .to_string()
             }
             _ => "Unknown command. Run `help` for examples.\n".to_string(),
         }
@@ -6446,7 +6516,7 @@ impl DemoApp {
         }
     }
 
-    // ── implementation-note-14: hardware-attested approval ─────────────────────
+    // ── implementation-note-56: hardware-attested approval ─────────────────────
     //
     // `ember approval approve|deny <id> [--no-biometric] [--reason <r>]`
     //
@@ -6546,7 +6616,7 @@ impl DemoApp {
             Ok(()) => {
                 // Audit line — surfaced in `ember show audit` and tee'd into
                 // the daemon log. The `biometric` + `credential_id` fields
-                // satisfy the implementation-note-14 acceptance criterion.
+                // satisfy the implementation-note-56 acceptance criterion.
                 let cred = credential_id.as_deref().unwrap_or("");
                 format!(
                     "approved\t{}\tbiometric={}\tcredential_id={}\n",

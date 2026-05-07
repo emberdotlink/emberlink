@@ -9,10 +9,16 @@ publish = false
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 core-broker = { path = "../core-broker" }
+ed25519-dalek = "2.1.1"
+getrandom = "0.3"
+jsonwebtoken = "9"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
+zeroize = { version = "1", features = ["derive"] }

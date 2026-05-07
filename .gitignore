@@ -22,3 +22,5 @@ packages/*/node_modules/
 web/dist/
 .playwright-cli/
 demo/screenshots/
+build/
+infra/pulumi/codegen/helm-values-cache/

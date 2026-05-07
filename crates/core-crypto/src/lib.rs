@@ -1,6 +1,9 @@
+pub mod canonicalize;
 pub mod grant_chain;
 pub mod presence;
 pub mod secret_handle;
+
+pub use canonicalize::{CanonicalizeError, canonicalize_jcs};
 
 use age::Decryptor;
 use age::secrecy::ExposeSecret;
@@ -302,6 +305,50 @@ pub fn sha256_digest_hex(bytes: &[u8]) -> String {
 
 pub fn sha256_digest_raw(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
+}
+
+// HKDF info-string registry addition:
+// | `ember-seal-v1`                               | Daemon Persona snapshot encryption key  |
+
+/// Derive the 32-byte snapshot-encryption content key from an Ed25519 seed.
+///
+/// Uses HKDF-SHA256 with info string `"ember-seal-v1"`, mirroring the X25519
+/// derivation described in design §The primitive and design. The result is
+/// returned as an `xchacha20-key:...` prefixed string compatible with
+/// [`encrypt_content`] and [`decrypt_content`].
+///
+/// This is the key used to seal vault snapshots — only the holder of the
+/// Ed25519 seed (the Daemon Persona) can derive it and decrypt the snapshot.
+pub fn derive_snapshot_encryption_key(ed25519_seed: &[u8]) -> String {
+    let hk = Hkdf::<Sha256>::new(None, ed25519_seed);
+    let mut okm = [0u8; 32];
+    hk.expand(b"ember-seal-v1", &mut okm)
+        .expect("HKDF-SHA256 expand cannot fail for 32-byte output");
+    format!("{CONTENT_KEY_PREFIX}{}", bytes_to_hex(&okm))
+}
+
+/// Derive the EmberSeal X25519 recipient from an Ed25519 Daemon Persona seed.
+///
+/// Per design §The primitive and design:
+///   1. HKDF-SHA256(seed, info="ember-seal-v1") → 32-byte X25519 private scalar.
+///   2. Scalar × Curve25519 basepoint → X25519 public key (32 bytes, hex-encoded).
+///
+/// The returned string is the `recipientPubkey` value for the EmberSeal CR
+/// (hex-encoded raw X25519 public key bytes, 64 hex chars).
+///
+/// Note: this is the *public key* for asymmetric encryption (NaCl box), not
+/// the symmetric snapshot-encryption key from [`derive_snapshot_encryption_key`].
+/// Both are derived from the same HKDF expansion of the Ed25519 seed but serve
+/// different purposes.
+pub fn derive_emberseal_x25519_recipient(ed25519_seed: &[u8]) -> String {
+    let hk = Hkdf::<Sha256>::new(None, ed25519_seed);
+    let mut scalar_bytes = [0u8; 32];
+    hk.expand(b"ember-seal-v1", &mut scalar_bytes)
+        .expect("HKDF-SHA256 expand cannot fail for 32-byte output");
+
+    let static_secret = x25519_dalek::StaticSecret::from(scalar_bytes);
+    let x25519_pubkey = x25519_dalek::PublicKey::from(&static_secret);
+    bytes_to_hex(x25519_pubkey.as_bytes())
 }
 
 /// Extract raw 32-byte Ed25519 public key bytes from a `PublicKey` handle.

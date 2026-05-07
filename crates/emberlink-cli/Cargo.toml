@@ -28,21 +28,30 @@ core-identity = { path = "../core-identity" }
 core-personas = { path = "../core-personas" }
 core-recovery = { path = "../core-recovery" }
 core-sync = { path = "../core-sync" }
+core-approval = { path = "../core-approval" }
 core-state = { path = "../core-state" }
 emberlink-app = { path = "../emberlink-app" }
 core-storage = { path = "../core-storage" }
+core-grants-toml = { path = "../core-grants-toml" }
 core-trust = { path = "../core-trust" }
 core-types = { path = "../core-types" }
+blake3.workspace = true
+sha2.workspace = true
 chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
+ed25519-dalek = "2.1.1"
+hex = "0.4"
+toml.workspace = true
 clap_complete = "4"
 dirs-next = "2"
 ember-daemon = { path = "../ember-daemon" }
 keyring = { version = "3", features = ["apple-native"] }
 rusqlite = { version = "0.39", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+libc = "0.2"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 tokio = { version = "1", features = ["full"] }
 # rpassword: cross-platform no-echo TTY read for `ember vault add` interactive

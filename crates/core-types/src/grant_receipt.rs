@@ -206,16 +206,30 @@ impl Default for Evidence {
 // SENSITIVE metadata only — never plaintext, ciphertext, key material, or
 // any field derived from them. Sizes are recorded for observability only.
 
-/// Discriminator for receipt kinds. The legacy `GrantReceipt` shape is
-/// `Grant`; the new ember-kms receipts are `KmsWrap` (encrypt) and
-/// `KmsUnwrap` (decrypt). Serde rename produces lowercase-snake JSON
-/// (`"grant"`, `"kms_wrap"`, `"kms_unwrap"`).
+/// Discriminator for receipt kinds across every credential surface.
+///
+/// - `Grant` — legacy `GrantReceipt` (grant termination).
+/// - `KmsWrap` / `KmsUnwrap` — `ember-kms` encrypt / decrypt (design).
+/// - `VaultRetrieval` — `ember vault get` retrieval Receipt (per
+///   `RECEIPT-COVERAGE-FIX-implementation-note-15`; emission lands in a
+///   follow-up task — this variant is the type-system seat).
+/// - `BrokerMaterialization` / `BrokerRevocation` — `ember broker`
+///   typed Receipts (per `RECEIPT-COVERAGE-FIX-implementation-note-16`; today
+///   broker emits an audit-log row only — these variants are the
+///   type-system seats for the typed-Receipt promotion).
+///
+/// Serde rename produces lowercase-snake JSON: `"grant"`, `"kms_wrap"`,
+/// `"kms_unwrap"`, `"vault_retrieval"`, `"broker_materialization"`,
+/// `"broker_revocation"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReceiptKind {
     Grant,
     KmsWrap,
     KmsUnwrap,
+    VaultRetrieval,
+    BrokerMaterialization,
+    BrokerRevocation,
 }
 
 /// Outcome of a receipted operation — `success` or `failure`. Failures
@@ -279,6 +293,132 @@ pub struct KmsReceipt {
     pub materialized_at_epoch_secs: u64,
     pub grant_evaluation: GrantEvaluation,
     pub outcome: ReceiptOutcome,
+    pub evidence: Evidence,
+}
+
+// ---------------------------------------------------------------------------
+// Broker receipts (design — broker_materialization / broker_revocation)
+// ---------------------------------------------------------------------------
+//
+// Receipts emitted by the credential broker issue / revoke handlers. Carry
+// NON-SENSITIVE metadata only — never the materialized credential value,
+// token, secret_ref plaintext, or any field derived from them.
+
+/// Receipt body for a single broker credential materialization or revocation.
+///
+/// **Hard invariant:** this struct must NEVER carry the plaintext credential,
+/// the raw token value, the `secret_ref` plaintext, or any byte-derived
+/// field that could leak the brokered credential. Only opaque labels
+/// (`provider`, `materialization_id`, `caller_persona`), scope strings, and
+/// timing metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct BrokerReceipt {
+    pub id: ReceiptId,
+    /// `BrokerMaterialization` for issue, `BrokerRevocation` for revoke.
+    pub kind: ReceiptKind,
+    /// Provider name (e.g. `"cloudflare"`, `"anthropic"`). Treat as opaque.
+    pub provider: String,
+    /// Opaque materialization identifier issued by the upstream provider.
+    /// Stored as a label — never the underlying credential value.
+    pub materialization_id: String,
+    /// Scope string as requested by the caller.
+    pub requested_scope: String,
+    /// Effective scope granted by the broker (may be narrower than requested).
+    pub granted_scope: String,
+    /// Requested TTL in seconds.
+    pub ttl_seconds: u64,
+    /// Unix epoch seconds when the credential was materialized.
+    pub materialized_at_epoch_secs: u64,
+    /// Unix epoch seconds when the credential expires. `None` when the
+    /// expiry was not recorded at materialization time.
+    pub expires_at_epoch_secs: Option<u64>,
+    /// Unix epoch seconds when the credential was revoked. `None` for
+    /// materialization receipts.
+    pub revoked_at_epoch_secs: Option<u64>,
+    /// Human-readable reason supplied by the caller at issue / revoke time.
+    /// `None` when no reason was recorded.
+    pub reason: Option<String>,
+    /// Persona id of the caller that invoked the operation.
+    pub caller_persona: String,
+    /// SHA-256 hex of the grants file content when the credential was issued
+    /// via `ember broker issue --grants-file`. `None` for inline-issued creds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grants_file_rev: Option<String>,
+    /// Credential name from the grants file entry that produced this receipt.
+    /// `None` for inline-issued creds or revocation receipts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_name: Option<String>,
+    pub evidence: Evidence,
+}
+
+// ---------------------------------------------------------------------------
+// Vault receipts (RECEIPT-COVERAGE-FIX-implementation-note-15 — vault_retrieval)
+// ---------------------------------------------------------------------------
+//
+// Receipts emitted by the vault-get handler. Carry NON-SENSITIVE metadata
+// only — never the credential value or any byte-derived proxy for it.
+
+/// Receipt body for a vault credential retrieval. Distinct from KmsReceipt so
+/// the vault path's audit trail is independently verifiable.
+///
+/// **Hard invariant** (mirroring KmsReceipt): never carry the credential
+/// value, never carry byte-derivable proxies for it. Only opaque labels
+/// (`key_name`, `caller_persona`), epoch timestamps, and grant-evaluation
+/// metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct VaultReceipt {
+    pub id: ReceiptId,
+    /// Always `ReceiptKind::VaultRetrieval`.
+    pub kind: ReceiptKind,
+    /// Logical name of the vault credential (e.g. `"production-tokens"`).
+    pub key_name: String,
+    /// Persona id of the caller that invoked the operation. `"unknown"` when
+    /// the caller is not yet identified (early-bootstrap / test paths).
+    pub caller_persona: String,
+    /// Unix epoch seconds when the operation completed (success or failure).
+    pub materialized_at_epoch_secs: u64,
+    pub grant_evaluation: GrantEvaluation,
+    pub outcome: ReceiptOutcome,
+    pub evidence: Evidence,
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot manifest (design — EmberSeal Recovery)
+// ---------------------------------------------------------------------------
+
+/// Signed manifest emitted with each periodic or event-triggered vault snapshot.
+///
+/// Content-addressed: `snapshot_id` is the SHA-256 hex of the canonical body
+/// (manifest serialized with `evidence` set to `Evidence::default()`), prefixed
+/// with `"type=snapshot-manifest-v1\n"`. Chained via `prev_snapshot_id` so
+/// recovery can verify an unbroken sequence.
+///
+/// Signed by the Daemon Persona Ed25519 key — same signing path as [`KmsReceipt`]
+/// and [`BrokerReceipt`].
+///
+/// **Snapshot scope** per the recovery inventory (implementation-note-17):
+/// includes `credentials`, `vault.salt`, `personas`, `grants`, `standing_grants`,
+/// `audit_log`, `receipts`. Excludes `policy.toml` (config, recovered via GitOps)
+/// and active broker materializations (ephemeral, re-issued on restart).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SnapshotManifest {
+    /// Content-addressed identifier: SHA-256 hex of the canonical manifest body.
+    pub snapshot_id: String,
+    /// Chain pointer to the previous snapshot. `None` for the first snapshot.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub prev_snapshot_id: Option<String>,
+    /// Unix epoch seconds when the snapshot was taken.
+    pub taken_at_epoch_secs: u64,
+    /// SHA-256 hex over the encrypted snapshot blob (integrity check).
+    pub vault_state_hash: String,
+    /// The highest event id captured into the delta log at emission time.
+    /// Zero when there are no events in the event log.
+    pub event_log_high_watermark: u64,
+    /// Hex-encoded Ed25519 public key of the signing Daemon Persona (64 chars).
+    pub daemon_persona_pubkey: String,
     pub evidence: Evidence,
 }
 
@@ -440,7 +580,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------------
-    // KMS receipt tests (implementation-note-4)
+    // KMS receipt tests (implementation-note-13)
     // ----------------------------------------------------------------------
 
     fn minimal_kms_wrap_receipt() -> KmsReceipt {
@@ -547,5 +687,34 @@ mod tests {
             serde_json::to_string(&ReceiptKind::KmsUnwrap).unwrap(),
             "\"kms_unwrap\""
         );
+        assert_eq!(
+            serde_json::to_string(&ReceiptKind::VaultRetrieval).unwrap(),
+            "\"vault_retrieval\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ReceiptKind::BrokerMaterialization).unwrap(),
+            "\"broker_materialization\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ReceiptKind::BrokerRevocation).unwrap(),
+            "\"broker_revocation\""
+        );
+    }
+
+    #[test]
+    fn receipt_kind_round_trips_through_serde() {
+        for (variant, wire) in [
+            (ReceiptKind::Grant, "\"grant\""),
+            (ReceiptKind::KmsWrap, "\"kms_wrap\""),
+            (ReceiptKind::KmsUnwrap, "\"kms_unwrap\""),
+            (ReceiptKind::VaultRetrieval, "\"vault_retrieval\""),
+            (ReceiptKind::BrokerMaterialization, "\"broker_materialization\""),
+            (ReceiptKind::BrokerRevocation, "\"broker_revocation\""),
+        ] {
+            let s = serde_json::to_string(&variant).unwrap();
+            assert_eq!(s, wire, "wire form for {variant:?}");
+            let back: ReceiptKind = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, variant, "round-trip for {variant:?}");
+        }
     }
 }

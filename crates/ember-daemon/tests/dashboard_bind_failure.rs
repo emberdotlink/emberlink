@@ -1,4 +1,4 @@
-//! implementation-note-20 regression: when the configured
+//! implementation-note-40 regression: when the configured
 //! dashboard port is already bound by another process, the daemon must
 //! report the failure truthfully via `runtime.dashboard_actual_addr`
 //! (== `None`) and via `/api/status`'s `dashboard_addr_bound` field
@@ -14,10 +14,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ember_daemon::config::DaemonConfig;
-use ember_daemon::dashboard::run_dashboard;
-use ember_daemon::runtime::DaemonRuntime;
-use ember_daemon::store::DaemonStore;
+use ember_daemon::infra::config::DaemonConfig;
+use ember_daemon::infra::dashboard::run_dashboard;
+use ember_daemon::infra::runtime::DaemonRuntime;
+use ember_daemon::infra::store::DaemonStore;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
@@ -120,6 +120,7 @@ async fn api_status_dashboard_addr_bound_reports_resolved_port() {
                 addr,
                 db_path,
                 "0.0.0-test".to_string(),
+                None,
                 shutdown_rx,
                 None,
             ));

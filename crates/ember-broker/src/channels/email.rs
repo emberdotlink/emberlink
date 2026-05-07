@@ -2,7 +2,7 @@
 //! containing an approve/deny token.
 //!
 //! Stub: logs at info and returns `TimedOut`. Real wire ships in
-//! `implementation-note-5` (SMTP send + IMAP / inbox webhook reply
+//! `implementation-note-19` (SMTP send + IMAP / inbox webhook reply
 //! polling).
 
 use anyhow::Result;

@@ -1,4 +1,4 @@
-//! implementation-note-34 regression coverage.
+//! implementation-note-105 regression coverage.
 //!
 //! Reproduces the bug where the TTL-expiry sweep silently failed to emit
 //! a Grant Receipt: the sweep call site discarded the wrapper's return
@@ -21,11 +21,11 @@
 
 use std::rc::Rc;
 
-use ember_daemon::receipt::{
+use ember_daemon::infra::receipt::{
     current_identity, init_identity, verify_receipt,
 };
-use ember_daemon::store::DaemonStore;
-use ember_daemon::vault::Vault;
+use ember_daemon::infra::store::DaemonStore;
+use ember_daemon::infra::vault::Vault;
 use tempfile::TempDir;
 
 /// Deterministic vault key shared across this binary's tests. The actual

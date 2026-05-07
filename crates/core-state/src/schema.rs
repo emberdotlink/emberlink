@@ -307,7 +307,8 @@ CREATE TABLE IF NOT EXISTS access_grants (
     revoked_reason TEXT,
     last_used_at INTEGER,
     resource_types_csv TEXT NOT NULL DEFAULT '',
-    attestation_json TEXT NOT NULL DEFAULT '{"status":"unattested_local_dev"}'
+    attestation_json TEXT NOT NULL DEFAULT '{"status":"unattested_local_dev"}',
+    skill_ref_json TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_grants_persona ON access_grants(issuing_persona_id);
@@ -410,7 +411,8 @@ CREATE TABLE IF NOT EXISTS approval_requests (
     resolved_at INTEGER,
     resolver_id TEXT,
     narrowed_scope_json TEXT,
-    denial_reason TEXT
+    denial_reason TEXT,
+    skill_ref_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_approval_requests_status ON approval_requests(status);
 CREATE INDEX IF NOT EXISTS idx_approval_requests_requester ON approval_requests(requester_id);

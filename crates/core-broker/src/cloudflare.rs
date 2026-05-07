@@ -371,6 +371,9 @@ mod tests {
             }),
             ttl: Duration::from_secs(900),
             reason: "unit test".to_string(),
+            caller_persona: None,
+            grants_file_rev: None,
+            grants_file_credential_name: None,
         }
     }
 

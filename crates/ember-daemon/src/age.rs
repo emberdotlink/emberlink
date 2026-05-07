@@ -4,7 +4,7 @@
 //! Each persona has an age keypair. Public key gets exported to
 //! `.sops.yaml` creation_rules; private key stays in the daemon vault
 //! and is released only via the blessed `sops-as-bot.sh` wrapper
-//! (implementation-note-12 follow-up).
+//! (implementation-note-27 follow-up).
 
 #[cfg_attr(feature = "age", allow(unused_imports))]
 use anyhow::Context;
@@ -47,7 +47,7 @@ pub fn generate_age_keypair() -> Result<AgeKeypair> {
     #[cfg(not(feature = "age"))]
     {
         Err(anyhow::anyhow!(
-            "age feature not enabled; build with --features age (implementation-note-9 follow-up)"
+            "age feature not enabled; build with --features age (implementation-note-28 follow-up)"
         ))
         .context("generate_age_keypair stub — feature gate not yet flipped")
     }

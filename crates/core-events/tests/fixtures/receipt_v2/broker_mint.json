@@ -1,0 +1,19 @@
+{
+  "version": "2",
+  "kind": "broker.mint",
+  "receipt_id": "ac917fcd06ad6ad8067b1eec7bdfbfbf56e9ac229e6017528839422ac3f3d006",
+  "daemon_root_id": "fixture-daemon-root",
+  "termination_authority": "user_session",
+  "body": {
+    "expires_at": "2026-05-02T20:00:00Z",
+    "revoke_token_hash": "blake3:fixture-revoke",
+    "scope_resolved": [
+      "llm:generate",
+      "credential:read"
+    ],
+    "scope_template_id": "tier0-default",
+    "ttl_seconds": 1800,
+    "vault_key": "anthropic-key"
+  },
+  "signature": "ed25519sig:fc786d183a616916b71c809648cb58beb4d31a8628361281db3ed0f110eb8fe9cf8f5a224f0f154a3909bb6411bd9a6926a80981259518ce9a9753426d99690b"
+}
