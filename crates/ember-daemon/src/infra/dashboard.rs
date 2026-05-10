@@ -1,4 +1,4 @@
-// implementation-note-39
+// implementation-note-64
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -16,7 +16,7 @@ use tokio::sync::{oneshot, watch};
 use crate::trust::approval::ApprovalOutcome;
 use crate::infra::store::DaemonStore;
 
-/// implementation-note-35 — actions hidden from the operator audit timeline by
+/// implementation-note-56 — actions hidden from the operator audit timeline by
 /// default. Internal bookkeeping events (vault unseal, lifecycle plumbing)
 /// leak implementation detail and clutter screenshots; the dashboard exposes
 /// a `[show internal events]` toggle that re-fetches with `?include_internal=1`
@@ -38,7 +38,7 @@ fn is_internal_audit_action(action: &str) -> bool {
 
 /// Build a `persona_id -> persona.name` map from the store. Used by the
 /// dashboard JSON endpoints to surface real display names alongside the
-/// raw persona id (implementation-note-35). Falls back to an empty map on
+/// raw persona id (implementation-note-56). Falls back to an empty map on
 /// store error so endpoints stay live; consumers must treat missing keys
 /// as "no name available" and render the id instead.
 fn persona_name_map(store: &DaemonStore) -> HashMap<String, String> {
@@ -50,7 +50,7 @@ fn persona_name_map(store: &DaemonStore) -> HashMap<String, String> {
         .collect()
 }
 
-/// implementation-note-24: default persona for the dashboard's
+/// implementation-note-38: default persona for the dashboard's
 /// single-tenant flows (passkey enrollment, credential listing).
 /// Returns the first persona ordered by `list_personas()` — the QA
 /// daemon ships exactly one, so this is unambiguous; production
@@ -68,7 +68,7 @@ fn default_persona_id(store: &DaemonStore) -> Option<String> {
 /// 69K.7: live budget gauge + pause/extend buttons + receipt viewer.
 const CSRF_HEADER: &str = "X-Ember-CSRF-Token";
 
-// implementation-note-24: the legacy `base64url_encode` helper used by
+// implementation-note-38: the legacy `base64url_encode` helper used by
 // the now-deleted `/api/webauthn/challenge` stub was removed. The
 // new flow returns webauthn-rs's `CreationChallengeResponse` /
 // `RequestChallengeResponse` types directly via `serde_json::to_value`,
@@ -122,7 +122,7 @@ fn loopback_origin_aliases(expected_origin: &str) -> Vec<String> {
     aliases
 }
 
-/// Defense-in-depth origin check for POST endpoints (security check).
+/// Defense-in-depth origin check for POST endpoints.
 ///
 /// Reads the `Origin` header first; if present it must equal `expected_origin`
 /// (or its loopback alias — see `loopback_origin_aliases`) exactly. If `Origin`
@@ -170,7 +170,7 @@ fn origin_ok(headers: &hyper::HeaderMap, expected_origin: &str) -> bool {
 /// `vault` is the master key the main daemon already opened (via keyring auto-unseal
 /// or fallback `Vault::open_from_config`). The dashboard's separate store needs the
 /// same vault attached so the biometric-attested approve path can read vault-sealed
-/// persona secrets when minting composite-grant chains. Pre implementation-note-24 the
+/// persona secrets when minting composite-grant chains. Pre implementation-note-38 the
 /// dashboard approve path never touched persona secrets, so the omission was
 /// invisible; the WebAuthn-attested path triggers `mint_composite_chain_for_grant`
 /// which reads the persona signing key. Mirrors the git-echo proxy pattern in
@@ -243,7 +243,7 @@ pub async fn run_dashboard(
         }
     };
 
-    // implementation-note-24 follow-up: attach the same vault the main daemon
+    // implementation-note-38 follow-up: attach the same vault the main daemon
     // opened so the WebAuthn-attested approve path can read vault-sealed
     // persona secrets when minting composite chains. Pre-WebAuthn the
     // dashboard approve path never touched persona secrets, so the omission
@@ -255,7 +255,7 @@ pub async fn run_dashboard(
         store.set_vault(Rc::new(v));
     }
 
-    // implementation-note-24: build the WebAuthn relying-party gate.
+    // implementation-note-38: build the WebAuthn relying-party gate.
     // `None` is the documented escape hatch for unit tests that
     // construct DashboardState directly; in the production daemon
     // path we always have a configured gate so the dashboard
@@ -296,15 +296,15 @@ pub async fn run_dashboard(
                             csrf_token: csrf_token.clone(),
                             started_at,
                             expected_origin: expected_origin.clone(),
-                            // implementation-note-40: the listener
+                            // implementation-note-65: the listener
                             // is alive at this point — propagate the resolved
                             // local_addr so `/api/status` reports it instead
                             // of relying on the configured (pre-bind) port.
                             dashboard_actual_addr: Some(local_addr),
-                            // implementation-note-38: derive data_dir from
+                            // implementation-note-59: derive data_dir from
                             // db_path parent so snapshot blobs can be served.
                             data_dir: db_path.parent().map(|p| p.to_path_buf()).unwrap_or_default(),
-                            // implementation-note-24: per-connection clone of
+                            // implementation-note-38: per-connection clone of
                             // the gate handle. Cheap (Arc bump). The gate
                             // itself owns the Webauthn config + Store ref.
                             #[cfg(feature = "webauthn")]
@@ -338,12 +338,33 @@ pub async fn run_dashboard(
     }
 }
 
+/// T-CONSTRUCT-ACTION-KEY-DID-PREFIX-MIGRATION-SURFACES — display-time
+/// helper that ensures every action key rendered to a human surface
+/// (dashboard cards, statement gauges, audit timeline) carries a
+/// `did:<method>:<rest>` prefix per design §1. Already-prefixed keys
+/// pass through unchanged; bare keys (legacy fixtures, pre-migration
+/// rows) are decorated with `did:ember:` so the operator sees the
+/// canonical FQ shape consistently. The validator at
+/// `crate::trust::grant::validate_action_keys_did_prefixed` guards
+/// every new write at the RPC gate; this helper bridges the read side
+/// for rows that predate the migration. Exported for tests.
+pub fn display_action_key(action: &str) -> String {
+    if let Some(rest) = action.strip_prefix("did:") {
+        if let Some(colon_idx) = rest.find(':') {
+            if colon_idx > 0 {
+                return action.to_string();
+            }
+        }
+    }
+    format!("did:ember:{action}")
+}
+
 /// Shared JS that renders a composite-statement breakdown into HTML — used
 /// by both the dashboard pending-approvals card and the dedicated
 /// `/approvals/{id}` page so the two surfaces can never drift. Injected
 /// into both templates via `{{COMPOSITE_STATEMENTS_JS}}`. The function name
 /// `render_composite_statements` (and the rendered class `composite-statements`)
-/// are the implementation-note-41 target_state_anchor markers — search for
+/// are the implementation-note-66 target_state_anchor markers — search for
 /// either if you are tracing why the page hides "3 statements" by default.
 pub const COMPOSITE_STATEMENTS_JS: &str = r#"
 // render_composite_statements — single source of truth for the composite
@@ -355,12 +376,27 @@ pub const COMPOSITE_STATEMENTS_JS: &str = r#"
 // We support both that production format and the legacy
 // externally-tagged shape (`{Exact: {value}}` / `{Glob: {pattern}}` /
 // `"Any"`) so unit tests using bespoke fixtures keep rendering.
+// displayActionKey — T-CONSTRUCT-ACTION-KEY-DID-PREFIX-MIGRATION-SURFACES.
+// Per design §1 every action key rendered to a human surface must carry
+// the `did:<method>:<rest>` FQ shape. Already-prefixed keys pass through;
+// bare keys (legacy fixtures or pre-migration audit rows) are decorated
+// with `did:ember:` so the operator sees a consistent canonical form.
+// Mirror of the Rust-side `display_action_key` helper in dashboard.rs.
+function displayActionKey(a){
+  if(typeof a !== 'string' || a.length === 0) return a;
+  if(a.indexOf('did:') === 0){
+    var rest = a.substring(4);
+    var colonIdx = rest.indexOf(':');
+    if(colonIdx > 0) return a;
+  }
+  return 'did:ember:' + a;
+}
 function renderCompositeStatements(stmts){
   if(!Array.isArray(stmts) || stmts.length===0) return '';
   const rows = stmts.map(function(s,i){
-    const actions = (s.actions||[]).join(',');
+    const actions = (s.actions||[]).map(displayActionKey).join(',');
     const resource = renderResourceSelector(s.resource);
-    // implementation-note-42 — `time:wall_clock on * · 90s` reads as
+    // implementation-note-67 — `time:wall_clock on * · 90s` reads as
     // technical noise (time isn't bound to a resource). When the
     // selector resolves to wildcard, drop the `on *` clause and let
     // the budget speak for itself.
@@ -418,7 +454,7 @@ a{color:var(--accent);text-decoration:none}
 #header .meta{display:flex;align-items:center;gap:16px;color:var(--text-muted);font-size:12px}
 #header .status-dot{width:8px;height:8px;border-radius:50%;background:var(--success);display:inline-block;margin-right:6px;box-shadow:0 0 6px var(--success)}
 #header .status-dot.offline{background:var(--danger);box-shadow:0 0 6px var(--danger)}
-/* implementation-note-43: ambient daemon-identity strip in the
+/* implementation-note-68: ambient daemon-identity strip in the
    header. Subtle by design — the viewer registers it in peripheral
    vision so the verify-time --pubkey arg lands as recognition rather
    than mystery. Prominent treatment lives on the receipt detail page. */
@@ -482,7 +518,7 @@ tbody td{padding:10px 14px;color:var(--text-primary)}
 .composite-stmt-idx{color:var(--text-muted);font-weight:600}
 .approval-link{color:var(--accent);text-decoration:none}
 .approval-link:hover{text-decoration:underline}
-/* implementation-note-42 — hover preview of the composite breakdown
+/* implementation-note-67 — hover preview of the composite breakdown
    surfaces what's hidden behind the "N statements" link without
    forcing the operator to navigate. CSS-only — no JS needed; the
    inline preview shares its render with the dedicated /approvals
@@ -550,6 +586,16 @@ tbody td{padding:10px 14px;color:var(--text-primary)}
 .receipt-filters{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .receipt-filters select,.receipt-filters label{font-size:11px;color:var(--text-muted);font-family:inherit}
 .receipt-filters select{background:var(--bg-hover);border:1px solid var(--border);border-radius:4px;padding:3px 6px;cursor:pointer}
+/* DASHBOARD-EMPTY-STATE-FIRST-RECEIPT — zero-state panel teaches Receipts on first launch.
+   Shown when 0 active grants AND 0 receipts; hidden by JS once either populates. */
+.zero-state.dashboard-empty-state-first-receipt{background:var(--bg-card);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:8px;padding:20px 24px;margin-bottom:24px}
+.zero-state h2{font-size:14px;color:var(--text-primary);margin:0 0 12px;font-weight:600;letter-spacing:.2px}
+.zero-state-explainer{color:var(--text-muted);font-size:12px;line-height:1.55;margin:0 0 12px}
+.zero-state-explainer a{color:var(--accent);text-decoration:none}
+.zero-state-explainer a:hover{text-decoration:underline}
+.zero-state-cmd{background:var(--bg-primary);border:1px solid var(--border);border-radius:4px;padding:10px 12px;margin:0 0 8px;overflow-x:auto}
+.zero-state-cmd code{font-family:inherit;font-size:11px;color:var(--text-primary)}
+.zero-state-hint{color:var(--text-dim);font-size:11px;margin:0}
 </style>
 </head>
 <body>
@@ -569,6 +615,16 @@ tbody td{padding:10px 14px;color:var(--text-primary)}
   </div>
 </div>
 <main>
+  <!-- DASHBOARD-EMPTY-STATE-FIRST-RECEIPT — first-launch zero-state panel.
+       Hidden by default; JS surfaces it when 0 active grants AND 0 receipts.
+       Once a Receipt exists, the panel hides and the receipts table renders. -->
+  <div id="zero-state-panel" class="zero-state dashboard-empty-state-first-receipt" style="display:none">
+    <h2>no grants yet — issue your first one to see how Receipts work.</h2>
+    <p class="zero-state-explainer">A <strong>Receipt</strong> is the signed audit trail emitted when a grant terminates. Every action your agent takes lands here, signed by the daemon's Ed25519 identity. <a href="/verify-receipt" target="_blank" rel="noreferrer">What is a Receipt? &rarr;</a></p>
+    <pre class="zero-state-cmd"><code>ember grant create --to &lt;agent&gt; --scope github:repo:read --ttl 5m</code></pre>
+    <p class="zero-state-hint">Run this in your shell, then reload &mdash; the dashboard will show the live grant and (after expiry) the signed Receipt.</p>
+  </div>
+
   <div id="anomaly-section" class="anomaly-section" style="display:none">
     <div class="section-header"><span class="section-title">Anomaly Alerts</span></div>
     <div class="anomaly-list" id="anomaly-list"></div>
@@ -607,7 +663,7 @@ tbody td{padding:10px 14px;color:var(--text-primary)}
           <option value="vault.">vault.*</option>
           <option value="sandbox.">sandbox.*</option>
         </select>
-        <!-- implementation-note-34 — persona/scope/date filters -->
+        <!-- implementation-note-55 — persona/scope/date filters -->
         <input type="text" id="audit-persona-filter" placeholder="persona id" oninput="loadDashboard()" style="background:var(--bg-hover);border:1px solid var(--border);border-radius:4px;color:var(--text-muted);font-family:inherit;font-size:11px;padding:3px 6px;width:120px">
         <input type="text" id="audit-scope-filter" placeholder="scope prefix" oninput="loadDashboard()" style="background:var(--bg-hover);border:1px solid var(--border);border-radius:4px;color:var(--text-muted);font-family:inherit;font-size:11px;padding:3px 6px;width:120px">
         <input type="date" id="audit-since-filter" onchange="loadDashboard()" style="background:var(--bg-hover);border:1px solid var(--border);border-radius:4px;color:var(--text-muted);font-family:inherit;font-size:11px;padding:3px 6px">
@@ -647,7 +703,7 @@ tbody td{padding:10px 14px;color:var(--text-primary)}
         <input type="text" id="receipt-persona-filter" placeholder="persona id…" oninput="loadReceipts()" style="background:var(--bg-hover);border:1px solid var(--border);border-radius:4px;padding:3px 6px;color:var(--text-primary);font-family:inherit;font-size:11px;width:140px">
       </div>
     </div>
-    <!-- implementation-note-44 — cross-receipt search panel.
+    <!-- implementation-note-69 — cross-receipt search panel.
          Three text inputs (persona / scope / grant) live-fire searchReceipts()
          on input; the clear button resets and falls back to loadReceipts(). -->
     <div class="receipt-search" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px;padding:8px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px">
@@ -703,7 +759,7 @@ const CSRF_TOKEN = "{{CSRF_TOKEN}}";
 const CSRF_HEADERS = {'X-Ember-CSRF-Token': CSRF_TOKEN};
 {{COMPOSITE_STATEMENTS_JS}}
 function ts(iso){if(!iso)return'—';const d=new Date(iso);return d.toLocaleString(undefined,{month:'short',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'});}
-// implementation-note-35 — relative_time / formatRelative: render audit + grant
+// implementation-note-56 — relative_time / formatRelative: render audit + grant
 // timestamps as 'Just now' / '12s ago' / '3 min ago' / '04/26 1:34 AM'
 // long-tail fallback so screenshots don't lead with raw ISO strings. Tooltip
 // (title=) keeps the precise ISO for operators who need it.
@@ -732,7 +788,7 @@ function relTime(iso){
 }
 function trunc(s,n){if(!s)return'—';return s.length>n?s.slice(0,n)+'…':s;}
 function truncPersona(s){if(!s)return'—';const p='persona-';if(s.startsWith(p)){return p+s.slice(p.length,p.length+12);}return trunc(s,20);}
-// implementation-note-35 — persona.name primary label; raw persona_id moves to
+// implementation-note-56 — persona.name primary label; raw persona_id moves to
 // the tooltip so screenshots show real names instead of UUID prefixes.
 // Falls back to truncPersona when no name was returned by the API.
 function personaLabel(id, name){
@@ -745,7 +801,7 @@ function personaLabel(id, name){
 function badge(cls,text){return`<span class="badge ${cls}">${text}</span>`;}
 function grantStatusClass(s){if(s==='active')return'active';if(s==='expired')return'expired';if(s==='revoked')return'revoked';if(s==='exhausted_by_budget'||s==='expired_by_budget')return'exhausted';return '';}
 
-// implementation-note-42 — humanize audit-event labels for the timeline
+// implementation-note-67 — humanize audit-event labels for the timeline
 // render. Raw event names are dot-segmented identifiers used by the
 // Python/TS agent SDKs to demultiplex; on screen they read as log
 // lines, not product copy. Map known events to spaces-and-capitals.
@@ -811,13 +867,13 @@ function updateGrantRow(grantId, g) {
   if(statusCell) statusCell.innerHTML = badge(g.status, g.status);
 }
 
-// implementation-note-35 — pick the most demo-meaningful budget axis from a
+// implementation-note-56 — pick the most demo-meaningful budget axis from a
 // composite grant's statements array (cents > tokens > wall_clock_secs).
 // Returns a gauge-wrap div, or '<span …>none</span>' when no statement has
 // a budget cap set.
 function compositeGrantBudgetGauge(stmts) {
   if(!Array.isArray(stmts) || stmts.length===0) return '<span style="color:var(--text-dim);font-size:11px">—</span>';
-  // implementation-note-45 — build a compact per-statement budget summary so
+  // implementation-note-70 — build a compact per-statement budget summary so
   // the operator sees all caps, not just the "best" single axis.
   const capParts = [];
   for(const s of stmts) {
@@ -831,26 +887,29 @@ function compositeGrantBudgetGauge(stmts) {
   if(!capParts.length) return '<span style="color:var(--text-dim);font-size:11px">none</span>';
   return '<span style="color:var(--text-muted);font-size:11px">'+capParts.join(' | ')+'</span>';
 }
-// implementation-note-45: shipped
-// implementation-note-45 — scope cell for the Active Grants table. Composite
+// implementation-note-70: shipped
+// implementation-note-70 — scope cell for the Active Grants table. Composite
 // grants show "N statements · action1, action2, action3" so the operator
 // sees real scope instead of '*'. Single-statement grants show flat scope.
 function grantScopeText(g) {
   const stmts = Array.isArray(g.statements) ? g.statements : null;
   if(stmts && stmts.length>0) {
-    const names = stmts.map(function(s){ return (s.actions||[]).join('/'); }).join(', ');
+    // T-CONSTRUCT-ACTION-KEY-DID-PREFIX-MIGRATION-SURFACES — DID-prefix
+    // every action key so the Active Grants table shows the canonical
+    // `did:ember:<key>` form per design §1.
+    const names = stmts.map(function(s){ return (s.actions||[]).map(displayActionKey).join('/'); }).join(', ');
     return stmts.length+' statement'+(stmts.length===1?'':'s')+' · '+names;
   }
   return g.scope||'—';
 }
 function renderBudgetGauge(g) {
-  // implementation-note-46 — composite grants surface their real
+  // implementation-note-71 — composite grants surface their real
   // budget via the canonical `statements` array (same name across all three
   // /api/grants* endpoints). Delegate to the composite helper when present.
   const stmts = Array.isArray(g.statements) ? g.statements : null;
   if(stmts && stmts.length>0) {
     let html = compositeGrantBudgetGauge(stmts);
-    // implementation-note-42 — only show the budget-cell banner for soft
+    // implementation-note-67 — only show the budget-cell banner for soft
     // pause (paused flag set but status still active). Hard pause flips
     // g.status to "paused" which already renders as a yellow pill in
     // the Status column; doubling up overlaps the budget text.
@@ -939,7 +998,7 @@ async function submitExtend(){
   if(!resp.ok){const e=await resp.json().catch(()=>({error:'failed'}));alert('Extend failed: '+(e.error||resp.status));}
   loadDashboard();
 }
-// implementation-note-24: WebAuthn ceremony — auth/begin → navigator.credentials.get()
+// implementation-note-38: WebAuthn ceremony — auth/begin → navigator.credentials.get()
 // → POST /api/approvals/<id>/<action> with the verified assertion.
 //
 // The daemon mints a challenge bound to the specific approval_id at
@@ -1101,7 +1160,7 @@ function credentialToJson(cred){
   if(typeof cred.authenticatorAttachment === 'string') out.authenticatorAttachment = cred.authenticatorAttachment;
   return out;
 }
-// implementation-note-47 — dismiss a pending approval card.
+// implementation-note-72 — dismiss a pending approval card.
 // Records approval.dismissed in the audit log; does NOT re-fire desktop
 // notifications. Card vanishes immediately on success.
 async function dismissApproval(id){
@@ -1149,17 +1208,28 @@ async function loadMaturation(){
     document.getElementById('maturation-body').innerHTML='<div class="empty">Maturation data unavailable</div>';
   }
 }
+// DASHBOARD-EMPTY-STATE-FIRST-RECEIPT — zero-state panel visibility.
+// Tracks whether each parallel loader has observed any grants / receipts.
+// Panel reveals only after both loaders have reported zero; any non-zero
+// signal hides it. null = "haven't observed yet".
+let _hasGrants=null,_hasReceipts=null;
+function _updateZeroStatePanel(){
+  const el=document.getElementById('zero-state-panel');
+  if(!el)return;
+  if(_hasGrants===false&&_hasReceipts===false){el.style.display='';}
+  else if(_hasGrants===true||_hasReceipts===true){el.style.display='none';}
+}
 async function loadDashboard(){
   try{
     const showAll=document.getElementById('show-all-grants')?.checked;
     const grantsUrl=showAll?'/api/grants/all':'/api/grants';
-    // implementation-note-35 — operator audit hides internal lifecycle events
+    // implementation-note-56 — operator audit hides internal lifecycle events
     // (vault.auto_unseal_from_keyring + *.internal.*) by default; toggle
     // surfaces them via ?include_internal=1. Action filter dropdown narrows
     // to one family (grant.*, approval.*, broker.*, etc.) via ?action_filter=.
     const showInternal=document.getElementById('show-internal-events')?.checked;
     const actionFilter=document.getElementById('audit-action-filter')?.value||'';
-    // implementation-note-34 — persona/scope/since query params.
+    // implementation-note-55 — persona/scope/since query params.
     const personaFilter=document.getElementById('audit-persona-filter')?.value?.trim()||'';
     const scopeFilter=document.getElementById('audit-scope-filter')?.value?.trim()||'';
     const sinceDate=document.getElementById('audit-since-filter')?.value||'';
@@ -1214,13 +1284,19 @@ async function loadDashboard(){
     const pending=Number(status.pending_approvals??approvals.length??0);
     document.getElementById('cnt-approvals').textContent=String(pending);
     document.getElementById('cnt-audit').textContent=status.audit_events??audit.length??'0';
-    // implementation-note-42 — surface pending count in the browser tab
+    // implementation-note-67 — surface pending count in the browser tab
     // title so a YC viewer scanning the take notices the counter
     // tick. Reverts to bare "ember" when nothing's awaiting.
     document.title = pending > 0 ? `ember · ${pending} pending` : 'ember';
 
     // Grants table
     const gb=document.getElementById('grants-body');
+    // DASHBOARD-EMPTY-STATE-FIRST-RECEIPT — feed the zero-state tracker.
+    // active_grants from /api/status is authoritative; grants.length fallback
+    // covers the show-all toggle (which may surface terminated rows even when
+    // active_grants is 0). Either > 0 means we are not in the empty state.
+    _hasGrants=(Number(status.active_grants??0)>0)||(Array.isArray(grants)&&grants.length>0);
+    _updateZeroStatePanel();
     if(!grants||grants.length===0){
       gb.innerHTML='<tr><td colspan="8" class="empty">No active grants yet.</td></tr>';
     }else{
@@ -1235,9 +1311,9 @@ async function loadDashboard(){
         <td>${renderGrantActions(g)}</td>
       </tr>`).join('');
       // Connect SSE for active grants with budgets (simple or composite).
-      // implementation-note-35 — also wire composite grants whose statements carry
+      // implementation-note-56 — also wire composite grants whose statements carry
       // a budget so the gauge ticks up in real time during the demo.
-      // implementation-note-46 — read `statements` (canonical name).
+      // implementation-note-71 — read `statements` (canonical name).
       grants.filter(g=>g.status==='active'&&(
         (g.budget&&(g.budget.tokens!=null||g.budget.cents!=null))||
         (Array.isArray(g.statements)&&g.statements.some(s=>s.budget&&(s.budget.cents!=null||s.budget.tokens!=null||s.budget.wall_clock_secs!=null)))
@@ -1250,13 +1326,13 @@ async function loadDashboard(){
       ac.innerHTML='<div class="empty">Awaiting approval requests.</div>';
     }else{
       ac.innerHTML=approvals.map(a=>{
-        // implementation-note-41 — composite breakdown moved to the
+        // implementation-note-66 — composite breakdown moved to the
         // dedicated /approvals/{id} page (behind a Show details disclosure).
         // Cards now render a one-line summary + link so the dashboard stays
         // glanceable for the demo. Single-statement approvals keep the
         // legacy per-field row layout.
         const stmts = Array.isArray(a.composite_statements) ? a.composite_statements : null;
-        // implementation-note-42 — composite scope cell surfaces a hover
+        // implementation-note-67 — composite scope cell surfaces a hover
         // preview of the inline breakdown so the operator can see what
         // they would be approving without navigating to the detail page.
         // The preview reuses renderCompositeStatements so the dashboard
@@ -1265,12 +1341,12 @@ async function loadDashboard(){
         <div class="row"><span class="field">Scope</span><span class="scope-hover"><a class="field-val approval-link" href="/approvals/${a.id}" tabindex="0">${compositeSummary(stmts)}</a><span class="scope-preview">${renderCompositeStatements(stmts)}</span></span></div>` : `
         <div class="row"><span class="field">Credential</span><span class="field-val">${a.credential_name||'—'}</span></div>
         <div class="row"><span class="field">Scope</span><a class="field-val approval-link" href="/approvals/${a.id}">${a.scope||'—'}</a></div>`;
-        // implementation-note-42 — for composites the row's flat `action` is
+        // implementation-note-67 — for composites the row's flat `action` is
         // statement 0's verb, which misrepresents a multi-verb chain.
         // Surface "composite (N statements)" instead so the card matches
         // the detail page and what the storyboard voiceover claims.
         const action_label = stmts ? `composite (${stmts.length} statements)` : (a.action||'—');
-        // implementation-note-42 — composite approvals are multi-statement
+        // implementation-note-67 — composite approvals are multi-statement
         // chains; the card only shows the summary, not the breakdown.
         // The operator must never approve a chain they cannot see, so
         // for composites the card surfaces Review (→ detail page) +
@@ -1352,6 +1428,9 @@ async function loadReceipts(){
     const data=await fetch(url).then(r=>r.json());
     const rb=document.getElementById('receipts-body');
     if(!rb)return;
+    // DASHBOARD-EMPTY-STATE-FIRST-RECEIPT — feed the zero-state tracker.
+    _hasReceipts=Array.isArray(data)&&data.length>0;
+    _updateZeroStatePanel();
     // Update table header for rollup vs raw view.
     const th=document.querySelector('#receipts-table thead tr');
     if(th){
@@ -1419,7 +1498,7 @@ async function loadReceipts(){
     if(rb)rb.innerHTML='<tr><td colspan="6" class="empty">error loading receipts</td></tr>';
   }
 }
-// implementation-note-44 — cross-receipt search. When any input
+// implementation-note-69 — cross-receipt search. When any input
 // has a value we hit /api/receipts/search and render the result in the
 // existing receipts table; an empty form falls back to loadReceipts() so
 // the standard signed/since filters resume.
@@ -1472,7 +1551,7 @@ function clearReceiptSearch(){
 loadDashboard();
 loadReceipts();
 loadMaturation();
-// implementation-note-43 — fetch the daemon's Ed25519 identity once
+// implementation-note-68 — fetch the daemon's Ed25519 identity once
 // on load + every 2s thereafter. Success populates the header
 // fingerprint and clears the daemon-offline class; failure adds it.
 // The fingerprint persists in the DOM after failure so the closing
@@ -1501,7 +1580,7 @@ async function loadIdentity(){
 }
 loadIdentity();
 setInterval(loadIdentity, 2000);
-// implementation-note-37 — FINDING C: drop the dashboard refresh
+// implementation-note-58 — FINDING C: drop the dashboard refresh
 // cadence from 5s to 2s so the cents-gauge ticks visibly during Beat 4
 // of the WEDGE storyboard (where the agent burns through the budget
 // call-by-call). SSE handles instantaneous warning/exhaust transitions;
@@ -1511,7 +1590,7 @@ setInterval(loadIdentity, 2000);
 setInterval(loadDashboard,2000);
 setInterval(loadReceipts,15000);
 
-// implementation-note-48 — live receipts panel: stream new receipt rows from
+// implementation-note-73 — live receipts panel: stream new receipt rows from
 // /api/receipts/stream and prepend them to #receipts-list. EventSource
 // auto-reconnects via the server-emitted retry hint, so the client stays
 // live without a manual setInterval poll. Capped at 50 visible rows so
@@ -1567,7 +1646,7 @@ body{font-family:'JetBrains Mono',ui-monospace,'Cascadia Code','Fira Code',monos
 .card-title{font-size:12px;text-transform:uppercase;letter-spacing:.8px;color:var(--text-muted);margin-bottom:16px}
 .field{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid var(--border)}
 .field:last-of-type{border-bottom:none;margin-bottom:0;padding-bottom:0}
-/* implementation-note-42 — author-defined `display:flex` overrides the
+/* implementation-note-67 — author-defined `display:flex` overrides the
    user-agent `[hidden]{display:none}` rule (CSS specificity gotcha),
    so `el.hidden = true` had no visible effect on `.field` rows.
    Explicit override below restores the expected behavior. */
@@ -1603,12 +1682,13 @@ body{font-family:'JetBrains Mono',ui-monospace,'Cascadia Code','Fira Code',monos
 <div class="card">
   <div class="card-title">Pending Approval</div>
   <div class="field"><span class="field-label">Action</span><span class="field-val">{{ACTION}}</span></div>
+  {{SKILL_REF_ROW}}
   <div class="field" id="credential-row"><span class="field-label">Credential</span><span class="field-val">{{CREDENTIAL}}</span></div>
   <div class="field" id="scope-row"><span class="field-label">Scope</span><span class="field-val" id="scope-summary">{{SCOPE}}</span></div>
   <div class="field"><span class="field-label">Risk</span><span class="field-val"><span class="badge {{RISK_LEVEL}}">{{RISK_LEVEL}}</span></span></div>
   <div class="field"><span class="field-label">Persona</span><span class="field-val">{{PERSONA_PREFIX}}</span></div>
   <div class="field"><span class="field-label">Requested</span><span class="field-val">{{CREATED_AT}}</span></div>
-  <!-- implementation-note-42 — composite breakdown is the scope. Always
+  <!-- implementation-note-67 — composite breakdown is the scope. Always
        visible so the operator can never approve a chain they cannot
        see. Hidden only for single-statement approvals (which do not
        have a meaningful breakdown). -->
@@ -1632,7 +1712,7 @@ let breakdownRendered = false;
 function renderBreakdown(stmts){
   if(breakdownRendered) return;
   if(!Array.isArray(stmts) || stmts.length===0) return;
-  // implementation-note-42 — composite breakdown is the scope. Show it
+  // implementation-note-67 — composite breakdown is the scope. Show it
   // inline as soon as the page loads; never gate "what am I approving?"
   // behind a disclosure. The flat Credential and Scope rows are
   // statement 0's projection — misleading for a multi-statement chain
@@ -1672,7 +1752,7 @@ async function pollStatus(){
 // Fire once on load so the breakdown appears without waiting 2s.
 pollStatus();
 pollTimer = setInterval(pollStatus, 2000);
-// implementation-note-24: dedicated approval page — same auth/begin →
+// implementation-note-38: dedicated approval page — same auth/begin →
 // navigator.credentials.get() → POST/<action> ceremony as the main
 // dashboard pending-approvals card. Fail-closed: no WebAuthn, no
 // state flip.
@@ -1786,7 +1866,7 @@ async function resolve(action){
 </body>
 </html>"#;
 
-/// implementation-note-24: first-run passkey enrollment page at `/settings/passkeys`.
+/// implementation-note-38: first-run passkey enrollment page at `/settings/passkeys`.
 ///
 /// Guides the operator through registering their platform authenticator
 /// (Touch ID on macOS, Windows Hello on Windows). Calls
@@ -2007,7 +2087,7 @@ loadEnrolledList();
 </body>
 </html>"#;
 
-// implementation-note-49: shipped
+// implementation-note-74: shipped
 /// Compute the ETag for the dashboard HTML using the compile-time git SHA.
 /// Returns the ETag value in the form `"<sha>"` (with surrounding quotes as
 /// required by RFC 7232). If `if_none_match` equals the current ETag the
@@ -2066,7 +2146,7 @@ pub struct DashboardState {
     /// `SystemTime` because it is monotonic and cannot produce a negative
     /// duration due to clock skew.
     pub started_at: std::time::Instant,
-    /// Expected `Origin` for POST requests (security check defense-in-depth).
+    /// Expected `Origin` for POST requests (defense-in-depth).
     ///
     /// Set to `http://127.0.0.1:<port>` derived from the actual bound address
     /// at dashboard startup. Every POST handler checks that the incoming
@@ -2076,7 +2156,7 @@ pub struct DashboardState {
     /// Defaults to `"http://127.0.0.1:3141"` for backwards-compat with tests
     /// that construct `DashboardState` without an explicit origin.
     pub expected_origin: String,
-    /// implementation-note-40: the address the dashboard actually
+    /// implementation-note-65: the address the dashboard actually
     /// bound to, surfaced via `/api/status` as `dashboard_addr_bound`. Always
     /// `Some` when the dashboard is serving traffic (you can't reach this
     /// state otherwise) but the field is `Option<>` so test fixtures can
@@ -2084,10 +2164,10 @@ pub struct DashboardState {
     /// Resolved from `TcpListener::local_addr()` after a successful bind so
     /// port-0 ephemeral assignments are reflected truthfully.
     pub dashboard_actual_addr: Option<SocketAddr>,
-    /// implementation-note-38: daemon data directory — used to serve
+    /// implementation-note-59: daemon data directory — used to serve
     /// cluster-snapshot blobs from `<data_dir>/snapshots/`.
     pub data_dir: std::path::PathBuf,
-    /// implementation-note-24: server-side WebAuthn relying party.
+    /// implementation-note-38: server-side WebAuthn relying party.
     ///
     /// `Some` when the daemon's `webauthn` cargo feature is on AND
     /// the gate initialized successfully. The dashboard's
@@ -2135,7 +2215,7 @@ pub async fn handle_dashboard_request(
                 .iter()
                 .filter(|p| p.status == "active")
                 .count();
-            // implementation-note-40: stringify the bound address
+            // implementation-note-65: stringify the bound address
             // (or `null`) so the CLI `status` subcommand stops printing the
             // configured-but-not-bound port. Field shape: `Option<String>` →
             // `null` when the dashboard isn't bound, full `host:port` when it is.
@@ -2271,7 +2351,7 @@ pub async fn handle_dashboard_request(
             }
         }
 
-        // implementation-note-48 — Server-Sent Events stream feeding the live
+        // implementation-note-73 — Server-Sent Events stream feeding the live
         // receipts panel on the dashboard. Mirrors the single-shot
         // snapshot pattern used by `/sse/grants/{id}`: emit the latest
         // 50 receipt rows as individual `data:` events, set the
@@ -2331,7 +2411,7 @@ pub async fn handle_dashboard_request(
                 .unwrap()
         }
 
-        // implementation-note-44 — cross-receipt search panel.
+        // implementation-note-69 — cross-receipt search panel.
         // GET /api/receipts/search — query receipts by persona / scope /
         // grant_id / resource. Empty result is `[]` (200); store error
         // returns 500 with `{"error": "search failed"}`.
@@ -2423,7 +2503,7 @@ pub async fn handle_dashboard_request(
                             })
                         })
                         .collect();
-                    // implementation-note-50: shipped
+                    // implementation-note-75: shipped
                     json_response(StatusCode::OK, &serde_json::Value::Array(body))
                 }
             }
@@ -2446,7 +2526,7 @@ pub async fn handle_dashboard_request(
 
         (Method::GET, "/api/grants") => {
             let grants = state.store.list_active_grants().unwrap_or_default();
-            // implementation-note-35 — surface persona.name alongside persona_id
+            // implementation-note-56 — surface persona.name alongside persona_id
             // so the dashboard can render real display names instead of UUID
             // prefixes. Lookup is rendering-layer only; raw persona_id is
             // unchanged, contract additive.
@@ -2472,7 +2552,7 @@ pub async fn handle_dashboard_request(
                     }
                     let conditions = if conds.is_empty() { serde_json::Value::Null } else { serde_json::Value::Object(conds) };
 
-                    // implementation-note-51 (budget_persists_on_simple_grant) —
+                    // implementation-note-76 (budget_persists_on_simple_grant) —
                     // surface the projected budget + usage so the dashboard's
                     // BUDGET column and live gauge JS can render the operator-
                     // configured ceilings. `g.budget` projects from the signed
@@ -2493,7 +2573,7 @@ pub async fn handle_dashboard_request(
                         entry.insert("budget".into(), serde_json::to_value(b).unwrap_or(serde_json::Value::Null));
                         entry.insert("usage".into(), serde_json::to_value(&g.usage).unwrap_or(serde_json::Value::Null));
                     }
-                    // implementation-note-46 — emit the per-Statement
+                    // implementation-note-71 — emit the per-Statement
                     // array under `statements` to match `grant_to_json_with_store`
                     // (the canonical serializer used by /api/grants/all and
                     // /api/grants/{id}). Previously this list endpoint emitted
@@ -2501,7 +2581,7 @@ pub async fn handle_dashboard_request(
                     // callers into `g.statements || g.composite_statements`
                     // fallbacks that cemented the divergence.
                     //
-                    // implementation-note-42 — silently dropping the
+                    // implementation-note-67 — silently dropping the
                     // get_access_grant error means the dashboard rendered
                     // BUDGET=`—` for fully-valid grants whenever chain
                     // verification failed (or transiently failed during the
@@ -2516,7 +2596,7 @@ pub async fn handle_dashboard_request(
                                 let arr: Vec<serde_json::Value> = chain
                                     .statements()
                                     .map(|(block_index, s)| {
-                                        // implementation-note-46 —
+                                        // implementation-note-71 —
                                         // per-Statement shape mirrors
                                         // grant_to_json_with_store so the
                                         // list and detail endpoints emit
@@ -2563,7 +2643,7 @@ pub async fn handle_dashboard_request(
 
         (Method::GET, "/api/approvals") => {
             let approvals = state.store.list_pending_approvals().unwrap_or_default();
-            // implementation-note-35 — `persona.name` lookup for the approval card.
+            // implementation-note-56 — `persona.name` lookup for the approval card.
             let names = persona_name_map(&state.store);
             let body: Vec<serde_json::Value> = approvals
                 .iter()
@@ -2579,11 +2659,12 @@ pub async fn handle_dashboard_request(
                     "status": a.status,
                     "reason": a.reason,
                     "created_at": a.created_at,
-                    // implementation-note-52 — composite envelopes (sandbox-run 3-statement
+                    // implementation-note-77 — composite envelopes (sandbox-run 3-statement
                     // bundle) surface as a single approval entry whose
                     // statements array drives the per-statement card UI.
                     "composite_statements": a.composite_statements,
                     "result_grant_id": a.result_grant_id,
+                    "skill_ref": a.skill_ref,
                 }))
                 .collect();
             json_response(StatusCode::OK, &serde_json::Value::Array(body))
@@ -2597,7 +2678,7 @@ pub async fn handle_dashboard_request(
             let id = path.strip_prefix("/api/approvals/").unwrap_or("");
             match state.store.get_approval(id) {
                 Ok(a) => {
-                    // implementation-note-35 — additive `persona_name` lookup.
+                    // implementation-note-56 — additive `persona_name` lookup.
                     let persona_name = state.store.get_persona(&a.persona_id).ok().map(|p| p.name);
                     json_response(StatusCode::OK, &serde_json::json!({
                         "id": a.id,
@@ -2611,9 +2692,10 @@ pub async fn handle_dashboard_request(
                         "status": a.status,
                         "reason": a.reason,
                         "created_at": a.created_at,
-                        // implementation-note-52 — surface composite statements + minted grant ID.
+                        // implementation-note-77 — surface composite statements + minted grant ID.
                         "composite_statements": a.composite_statements,
                         "result_grant_id": a.result_grant_id,
+                        "skill_ref": a.skill_ref,
                     }))
                 }
                 Err(_) => error_response(404, "approval not found"),
@@ -2621,9 +2703,9 @@ pub async fn handle_dashboard_request(
         }
 
         (Method::GET, "/api/audit") => {
-            // implementation-note-53: shipped
+            // implementation-note-78: shipped
             use crate::infra::audit::AuditFilter;
-            // implementation-note-35 — operator audit timeline hides internal
+            // implementation-note-56 — operator audit timeline hides internal
             // bookkeeping events (vault.auto_unseal_from_keyring + the
             // generic `*.internal.*` namespace) by default. The dashboard
             // toggle re-fetches with `?include_internal=1` so internal
@@ -2632,7 +2714,7 @@ pub async fn handle_dashboard_request(
             // (e.g. `grant.`, `approval.`, `broker.`). Both are rendering-
             // layer only — store rows are unchanged.
             //
-            // implementation-note-34 — additional query params:
+            // implementation-note-55 — additional query params:
             //   ?persona_filter=<persona-id> — exact-match agent_id column
             //   ?scope_filter=<prefix>       — credential LIKE prefix%
             //   ?since=<unix-ms>             — inclusive lower-bound timestamp
@@ -2707,7 +2789,7 @@ pub async fn handle_dashboard_request(
         }
 
         (Method::GET, "/api/maturation/candidates") => {
-            // implementation-note-54: shipped
+            // implementation-note-79: shipped
             let conn = state.store.conn();
             let mut stmt = match conn.prepare(
                 "SELECT action, credential, COUNT(*) as freq, MAX(timestamp) as last_seen \
@@ -2736,7 +2818,7 @@ pub async fn handle_dashboard_request(
             && path.starts_with("/api/grants/")
             && path.ends_with("/revoke-statement") =>
         {
-            // implementation-note-55 — per-statement revoke
+            // implementation-note-80 — per-statement revoke
             // wired through the dashboard. Body: `{"sid": "S0"}`.
             if !origin_ok(&headers, &state.expected_origin) {
                 error_response(403, "origin or referer header missing or mismatched")
@@ -2868,7 +2950,7 @@ pub async fn handle_dashboard_request(
             }
         }
 
-        // implementation-note-24: WebAuthn registration ceremony — begin.
+        // implementation-note-38: WebAuthn registration ceremony — begin.
         //
         // Body: optional `{persona_id}`. Defaults to the daemon's
         // first persona (single-tenant local dashboard). Returns
@@ -2932,7 +3014,7 @@ pub async fn handle_dashboard_request(
             }
         }
 
-        // implementation-note-24: WebAuthn registration ceremony — finish.
+        // implementation-note-38: WebAuthn registration ceremony — finish.
         //
         // Body: `{challenge_id, credential}` where `credential` is the
         // `RegisterPublicKeyCredential` JSON the browser produced from
@@ -2992,7 +3074,7 @@ pub async fn handle_dashboard_request(
             }
         }
 
-        // implementation-note-24: WebAuthn authentication ceremony — begin.
+        // implementation-note-38: WebAuthn authentication ceremony — begin.
         //
         // Body: `{approval_id}`. The daemon looks up the approval to
         // determine the persona, loads that persona's enrolled
@@ -3051,7 +3133,7 @@ pub async fn handle_dashboard_request(
             }
         }
 
-        // implementation-note-24: list enrolled credentials for a persona.
+        // implementation-note-38: list enrolled credentials for a persona.
         // Used by the `/settings/passkeys` page to render the list.
         _ if method == Method::GET && path.starts_with("/api/webauthn/credentials") => {
             #[cfg(feature = "webauthn")]
@@ -3086,7 +3168,7 @@ pub async fn handle_dashboard_request(
             }
         }
 
-        // implementation-note-24: delete an enrolled credential. Body
+        // implementation-note-38: delete an enrolled credential. Body
         // `{persona_id, credential_id}`. Used by the settings page's
         // Remove button.
         _ if method == Method::POST && path == "/api/webauthn/credentials/delete" => {
@@ -3140,7 +3222,7 @@ pub async fn handle_dashboard_request(
             json_response(StatusCode::OK, &body)
         }
 
-        // implementation-note-38: GET /api/cluster-snapshot/latest
+        // implementation-note-59: GET /api/cluster-snapshot/latest
         // Returns the most recent snapshot_id from the local snapshots dir.
         // The puller on the operator's daemon calls this to discover the latest
         // snapshot before fetching the full blob.
@@ -3184,7 +3266,7 @@ pub async fn handle_dashboard_request(
             }
         }
 
-        // implementation-note-38: GET /api/cluster-snapshot/{id}
+        // implementation-note-59: GET /api/cluster-snapshot/{id}
         // Returns { manifest, encrypted_blob_hex } for the given snapshot_id prefix.
         // The puller fetches this after discovering the latest snapshot_id.
         _ if method == Method::GET && path.starts_with("/api/cluster-snapshot/") => {
@@ -3328,7 +3410,7 @@ pub async fn handle_dashboard_request(
             }
         }
 
-        // POST /api/approvals/{id}/dismiss — implementation-note-47
+        // POST /api/approvals/{id}/dismiss — implementation-note-72
         // Operator-initiated dismiss. Sets status to 'dismissed', records
         // `approval.dismissed` audit event, removes the card from the dashboard.
         _ if method == Method::POST
@@ -3563,12 +3645,12 @@ pub async fn handle_dashboard_request(
             }
         }
 
-        // implementation-note-56 — first-run passkey enrollment page.
+        // implementation-note-81 — first-run passkey enrollment page.
         // Explains how to register the operator's platform authenticator
         // (Touch ID on macOS, Windows Hello on Windows) so the dashboard
         // Approve button raises the OS biometric sheet.
         (Method::GET, "/settings/passkeys") => {
-            // implementation-note-24: substitute the per-process CSRF token
+            // implementation-note-38: substitute the per-process CSRF token
             // so the page can issue authenticated POSTs to
             // /api/webauthn/{register,credentials/delete}.
             let html = PASSKEYS_SETTINGS_HTML.replace("{{CSRF_TOKEN}}", &state.csrf_token);
@@ -3657,11 +3739,11 @@ fn grant_to_json_with_store(
         }
     };
 
-    // implementation-note-35 — additive `persona_name` lookup so the dashboard
+    // implementation-note-56 — additive `persona_name` lookup so the dashboard
     // can render the persona's display name as the primary label.
     let persona_name = store.get_persona(&g.persona_id).ok().map(|p| p.name);
 
-    // implementation-note-55 — surface seconds-remaining
+    // implementation-note-80 — surface seconds-remaining
     // alongside the absolute timestamp so the dashboard JS can render a
     // tick-down counter without re-parsing RFC3339 in every browser.
     // `null` when the grant has no TTL or the timestamp is unparseable.
@@ -3802,7 +3884,7 @@ pre{{background:var(--bg-hover);border:1px solid var(--border);border-radius:6px
 .btn:hover{{opacity:.8}}
 .actions{{display:flex;gap:8px;margin-top:14px}}
 table td,table th{{padding:6px 10px;border-bottom:1px solid var(--border)}}
-/* implementation-note-43: Signed-by card. Foreground treatment for
+/* implementation-note-68: Signed-by card. Foreground treatment for
    the trust anchor — this is the moment the viewer's eye is on the
    receipt artifact, perfect time to bind pubkey↔receipt visually. */
 .signed-block{{padding:16px 18px;background:rgba(232,93,38,.05);border:1px solid rgba(232,93,38,.22);border-radius:6px;margin-bottom:14px}}
@@ -3918,7 +4000,7 @@ table td,table th{{padding:6px 10px;border-bottom:1px solid var(--border)}}
     )
 }
 
-/// implementation-note-43: render a 64-hex Ed25519 pubkey as a
+/// implementation-note-68: render a 64-hex Ed25519 pubkey as a
 /// short SSH-style fingerprint (`4a5d:a587:dd36:53b2`) using the first
 /// 8 bytes / 16 hex chars. Decorative only — the full pubkey is the
 /// actual trust anchor. Returns `—` for placeholder / empty inputs so
@@ -3974,11 +4056,11 @@ fn build_receipt_json(g: &crate::trust::grant::GrantInfo) -> serde_json::Value {
 /// no budget show an "unbounded" note.
 ///
 /// Pure function of the statement slice — testable without a running server.
-/// implementation-note-55 — per-Statement gauges with an
+/// implementation-note-80 — per-Statement gauges with an
 /// inline "Revoke" button per row. `revoked_sids` is the slice of sids that
 /// have already been revoked (struck through, button hidden). Wires to
 /// `POST /api/grants/{id}/revoke-statement` via the page's JS handler.
-// TERMINAL-implementation-note-57: terminal grants suppress per-Statement Revoke
+// TERMINAL-implementation-note-82: terminal grants suppress per-Statement Revoke
 pub(crate) fn render_statement_gauges_with_revoke(
     grant_id: &str,
     statements: &[(usize, &core_types::Statement)],
@@ -3991,7 +4073,10 @@ pub(crate) fn render_statement_gauges_with_revoke(
     let mut out = String::new();
     for (block_idx, stmt) in statements {
         let is_revoked = revoked_sids.iter().any(|s| s == &stmt.sid);
-        let actions: Vec<&str> = stmt.actions.iter().map(|a| a.as_str()).collect();
+        // T-CONSTRUCT-ACTION-KEY-DID-PREFIX-MIGRATION-SURFACES — DID-prefix
+        // every action key on the way to the operator-facing card so bare
+        // pre-migration keys render in the canonical `did:ember:<key>` form.
+        let actions: Vec<String> = stmt.actions.iter().map(|a| display_action_key(a)).collect();
         let actions_str = if actions.is_empty() {
             "—".to_string()
         } else {
@@ -4070,7 +4155,10 @@ pub(crate) fn render_statement_gauges(statements: &[(usize, &core_types::Stateme
     }
     let mut out = String::new();
     for (block_idx, stmt) in statements {
-        let actions: Vec<&str> = stmt.actions.iter().map(|a| a.as_str()).collect();
+        // T-CONSTRUCT-ACTION-KEY-DID-PREFIX-MIGRATION-SURFACES — same DID
+        // decoration as `render_statement_gauges_with_revoke` so both
+        // gauge surfaces stay in sync on the operator-facing render.
+        let actions: Vec<String> = stmt.actions.iter().map(|a| display_action_key(a)).collect();
         let actions_str = if actions.is_empty() {
             "—".to_string()
         } else {
@@ -4364,7 +4452,7 @@ document.querySelectorAll('form[action$="/pause"],form[action$="/unpause"],form[
   }});
 }});
 
-// implementation-note-55 — per-statement revoke buttons.
+// implementation-note-80 — per-statement revoke buttons.
 document.querySelectorAll('button[data-revoke-sid]').forEach(btn=>{{
   btn.addEventListener('click',async e=>{{
     e.preventDefault();
@@ -4381,7 +4469,7 @@ document.querySelectorAll('button[data-revoke-sid]').forEach(btn=>{{
   }});
 }});
 
-// implementation-note-55 — live tick-down. Computes
+// implementation-note-80 — live tick-down. Computes
 // time-remaining from `expires_at` once per second; flips the status
 // badge to EXPIRED at the boundary. The server-side `expire_stale_grants`
 // sweep is the source of truth for the audit `grant.expired` event;
@@ -4420,9 +4508,9 @@ setInterval(renderTimeRemaining,1000);
 // Mirrors the summary page connectSSE pattern (sseConnections keyed by
 // grant id). Drops the former /api/grants/{id} poll every 2s.
 //
-// implementation-note-58: wall-clock gauge reads server-computed
+// implementation-note-83: wall-clock gauge reads server-computed
 // usage.wall_clock_secs from SSE events; tickWallClockGauge removed.
-// implementation-note-46 — statements array name is canonical.
+// implementation-note-71 — statements array name is canonical.
 function applyUsageGauges(stmts){{
   if(!Array.isArray(stmts))return;
   document.querySelectorAll('span').forEach(sidSpan=>{{
@@ -4828,14 +4916,14 @@ fn error_response(status: u16, msg: &str) -> Response<Full<Bytes>> {
 /// Render the dedicated `/approvals/{id}` page HTML for a given approval
 /// record, with all `{{TOKEN}}` placeholders substituted.
 ///
-/// implementation-note-41 — the page leads with the high-level
+/// implementation-note-66 — the page leads with the high-level
 /// Approve/Deny decision; the per-statement breakdown for composite
 /// approvals is rendered client-side from the polled JSON behind a
 /// "Show details" disclosure (collapsed-by-default). Both the dashboard
 /// pending-approvals card and this page share the same
 /// `renderCompositeStatements` helper via `COMPOSITE_STATEMENTS_JS`,
 /// so the two surfaces cannot drift.
-/// implementation-note-24: shared dashboard handler for approve + deny.
+/// implementation-note-38: shared dashboard handler for approve + deny.
 ///
 /// Verifies a WebAuthn assertion against the persona's enrolled
 /// credentials before flipping approval state. Refuses the state
@@ -4967,12 +5055,12 @@ async fn resolve_approval_via_dashboard(
     }
 }
 
-fn render_approval_page(
+pub fn render_approval_page(
     csrf_token: &str,
     approval: &crate::trust::approval::ApprovalRequestInfo,
     persona_name: Option<&str>,
 ) -> String {
-    // implementation-note-42 — for composite approvals, the row's flat `action`
+    // implementation-note-67 — for composite approvals, the row's flat `action`
     // column is the verb of statement 0; that misrepresents a multi-verb
     // chain on the operator-facing card (e.g. an Anthropic+budget+session
     // bundle showing as "credential.access"). Render an honest summary
@@ -4982,7 +5070,7 @@ fn render_approval_page(
     } else {
         approval.action.clone()
     };
-    // implementation-note-42 — show "name <identifier>" so the operator
+    // implementation-note-67 — show "name <identifier>" so the operator
     // sees both the human-friendly handle (e.g. `qa`) and the unique
     // persona-id suffix used in audit logs and grant chains. The
     // identifier-only fallback covers personas that lack a name.
@@ -4990,11 +5078,22 @@ fn render_approval_page(
         Some(name) => format!("{name} <span class=\"persona-id\">{}</span>", truncate_persona_id(&approval.persona_id)),
         None => truncate_persona_id(&approval.persona_id),
     };
+    // COMPOSITE-prior change-TESTS-DASHBOARD — render skill_ref row when present on the
+    // proposal; hidden (empty string) when None so the card stays clean for
+    // legacy approvals that predate the skill_ref field.
+    let skill_ref_row = match approval.skill_ref.as_deref().filter(|s| !s.is_empty()) {
+        Some(sr) => format!(
+            "<div class=\"field\" id=\"skill-ref-row\"><span class=\"field-label\">Skill</span><span class=\"field-val\">{}</span></div>",
+            sr
+        ),
+        None => String::new(),
+    };
     APPROVAL_HTML_TEMPLATE
         .replace("{{COMPOSITE_STATEMENTS_JS}}", COMPOSITE_STATEMENTS_JS)
         .replace("{{CSRF_TOKEN}}", csrf_token)
         .replace("{{APPROVAL_ID}}", &approval.id)
         .replace("{{ACTION}}", &action_label)
+        .replace("{{SKILL_REF_ROW}}", &skill_ref_row)
         .replace("{{CREDENTIAL}}", &approval.credential_name)
         .replace("{{SCOPE}}", &approval.scope)
         .replace("{{RISK_LEVEL}}", &approval.risk_level)
@@ -5018,6 +5117,65 @@ mod tests {
     use super::*;
     use crate::infra::store::DaemonStore;
 
+    // T-CONSTRUCT-ACTION-KEY-DID-PREFIX-MIGRATION-SURFACES — display-time
+    // unit tests for the action-key DID-prefix decorator. Mirror tests
+    // exist in the JS-side `displayActionKey` (inlined via
+    // COMPOSITE_STATEMENTS_JS); both surfaces must agree on prefixing
+    // behavior or the dashboard render will diverge from the API JSON.
+
+    #[test]
+    fn display_action_key_passes_through_did_ember() {
+        // Bundled-publisher case — the canonical v0.3.0 shape must
+        // round-trip unchanged through the renderer.
+        assert_eq!(
+            display_action_key("did:ember:gh.pr_create"),
+            "did:ember:gh.pr_create"
+        );
+    }
+
+    #[test]
+    fn display_action_key_passes_through_did_web_for_forward_compat() {
+        // design §3 — arbitrary `did:<method>:` prefixes pass through
+        // even though v0.3.0's broker.resolve only routes `did:ember:`.
+        // This locks the forward-compat door at the display layer.
+        assert_eq!(
+            display_action_key("did:web:hashicorp.com:terraform.apply"),
+            "did:web:hashicorp.com:terraform.apply"
+        );
+        assert_eq!(
+            display_action_key("did:key:z6MkkBRG7Ghk:custom-tool.deploy"),
+            "did:key:z6MkkBRG7Ghk:custom-tool.deploy"
+        );
+    }
+
+    #[test]
+    fn display_action_key_decorates_bare_keys_with_did_ember() {
+        // Bare action keys (legacy fixtures, pre-migration audit rows)
+        // are decorated with `did:ember:` so the operator sees the
+        // canonical FQ shape per design §1.
+        assert_eq!(display_action_key("gh.pr_create"), "did:ember:gh.pr_create");
+        assert_eq!(display_action_key("read"), "did:ember:read");
+        assert_eq!(display_action_key("github:push"), "did:ember:github:push");
+        assert_eq!(
+            display_action_key("docker.push.dockerhub"),
+            "did:ember:docker.push.dockerhub"
+        );
+    }
+
+    #[test]
+    fn display_action_key_rejects_did_with_empty_method_or_no_separator() {
+        // Defense-in-depth: structurally-incomplete `did:` strings
+        // (`did::foo`, `did:something_without_colon`) must NOT be
+        // treated as already-prefixed. The validator at write time
+        // refuses these, but the display layer must not silently let
+        // them through with a missing `did:ember:` decoration either.
+        assert_eq!(display_action_key("did::gh.pr_create"), "did:ember:did::gh.pr_create");
+        assert_eq!(
+            display_action_key("did:something_without_a_colon"),
+            "did:ember:did:something_without_a_colon"
+        );
+    }
+
     const TEST_CSRF_TOKEN: &str = "test-csrf-token-0123456789abcdef";
     const TEST_EXPECTED_ORIGIN: &str = "http://127.0.0.1:3141";
 
@@ -5029,14 +5187,14 @@ mod tests {
             csrf_token: TEST_CSRF_TOKEN.to_string(),
             started_at: std::time::Instant::now(),
             expected_origin: TEST_EXPECTED_ORIGIN.to_string(),
-            // implementation-note-40: default to a well-known
+            // implementation-note-65: default to a well-known
             // localhost addr so most tests see a "bound" dashboard; tests
             // that exercise the "not bound" branch override directly.
             dashboard_actual_addr: Some(
                 "127.0.0.1:3141".parse().expect("test addr parse"),
             ),
             data_dir: std::path::PathBuf::from("/tmp/.ember-test/data"),
-            // implementation-note-24: tests don't construct a gate; the
+            // implementation-note-38: tests don't construct a gate; the
             // approval handler falls back to the legacy
             // `{biometric: bool}` body field when this is `None`.
             #[cfg(feature = "webauthn")]
@@ -5121,7 +5279,7 @@ mod tests {
                     .iter()
                     .filter(|p| p.status == "active")
                     .count();
-                // implementation-note-40: mirror the production
+                // implementation-note-65: mirror the production
                 // handler so `api_status_*` tests cover the new field shape.
                 let dashboard_addr_bound = state
                     .dashboard_actual_addr
@@ -5144,7 +5302,7 @@ mod tests {
                 let body: Vec<serde_json::Value> = grants
                     .iter()
                     .map(|g| {
-                        // implementation-note-46 — test handler mirrors
+                        // implementation-note-71 — test handler mirrors
                         // production: emit the per-Statement array under
                         // `statements` (the canonical name from
                         // grant_to_json_with_store) so JS callers no longer
@@ -5185,7 +5343,7 @@ mod tests {
                 let id = path.strip_prefix("/api/approvals/").unwrap_or("");
                 match state.store.get_approval(id) {
                     Ok(a) => {
-                        // implementation-note-35 — surface persona.name for the
+                        // implementation-note-56 — surface persona.name for the
                         // approval-detail render path (test handler mirrors
                         // production).
                         let persona_name = state.store.get_persona(&a.persona_id).ok().map(|p| p.name);
@@ -5201,7 +5359,7 @@ mod tests {
                             "status": a.status,
                             "reason": a.reason,
                             "created_at": a.created_at,
-                            // implementation-note-41 — mirrors production handler so
+                            // implementation-note-66 — mirrors production handler so
                             // the polled /api/approvals/{id} response carries the
                             // composite_statements array; the page JS calls
                             // renderBreakdown(data.composite_statements) on each poll.
@@ -5215,7 +5373,7 @@ mod tests {
 
             (Method::GET, "/api/audit") => {
                 use crate::infra::audit::AuditFilter;
-                // implementation-note-35 — mirror the production handler's
+                // implementation-note-56 — mirror the production handler's
                 // `?include_internal=1` toggle and `?action_filter=<prefix>`
                 // so test coverage reflects the same operator-audit semantics.
                 let (include_internal, action_filter) = req.uri().query().map(|q| {
@@ -5263,7 +5421,7 @@ mod tests {
             }
 
             (Method::GET, "/api/maturation/candidates") => {
-                // implementation-note-54: shipped
+                // implementation-note-79: shipped
                 let conn = state.store.conn();
                 let mut stmt = match conn.prepare(
                     "SELECT action, credential, COUNT(*) as freq, MAX(timestamp) as last_seen \
@@ -5362,7 +5520,7 @@ mod tests {
                 && path.starts_with("/api/grants/")
                 && path.ends_with("/revoke-statement") =>
             {
-                // implementation-note-55 — test handler mirrors
+                // implementation-note-80 — test handler mirrors
                 // the production per-statement revoke route.
                 if !origin_ok(&headers, &state.expected_origin) {
                     error_response(403, "origin or referer header missing or mismatched")
@@ -5502,7 +5660,7 @@ mod tests {
                 }
             }
 
-            // implementation-note-47 — dismiss (test handler)
+            // implementation-note-72 — dismiss (test handler)
             _ if method == Method::POST
                 && path.starts_with("/api/approvals/")
                 && path.ends_with("/dismiss") =>
@@ -5602,7 +5760,7 @@ mod tests {
             }
 
             // 69K.7: grant detail
-            // implementation-note-46 — test handler mirrors
+            // implementation-note-71 — test handler mirrors
             // production by routing through `grant_to_json_with_store`, so
             // /api/grants/{id} emits the canonical `statements` array (same
             // shape as /api/grants and /api/grants/all).
@@ -5662,7 +5820,7 @@ mod tests {
                 }
             }
 
-            // implementation-note-48 — test handler for `/api/receipts/stream`.
+            // implementation-note-73 — test handler for `/api/receipts/stream`.
             // Mirrors the production single-shot SSE snapshot so route
             // tests can assert content-type + framing without spinning
             // up a real listener.
@@ -5772,7 +5930,7 @@ mod tests {
                 }
             }
 
-            // implementation-note-44 — test handler mirrors the
+            // implementation-note-69 — test handler mirrors the
             // production `/api/receipts/search` route so `searchReceipts`-
             // style tests can assert filter behavior without spinning up a
             // real listener.
@@ -5848,7 +6006,7 @@ mod tests {
                 json_response(StatusCode::OK, &serde_json::Value::Array(body))
             }
 
-            // implementation-note-56 — first-run passkey enrollment page. Mirror
+            // implementation-note-81 — first-run passkey enrollment page. Mirror
             // the production handler at line 2411 so test fixtures stay
             // in sync. Without this the test stub's routing table drifts
             // from production and `settings_passkeys_returns_enrollment_page`
@@ -5925,7 +6083,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
-    // implementation-note-24: the old `/api/webauthn/challenge` stub
+    // implementation-note-38: the old `/api/webauthn/challenge` stub
     // (returns random bytes the client claims it signed) is gone;
     // the new flow is `/api/webauthn/{register,auth}/{begin,complete}`
     // with real signature verification at finish time. The new flow's
@@ -5935,7 +6093,7 @@ mod tests {
     // `qember.sh demo headless` (which uses the CLI biometric path
     // that also honors `EMBER_DISABLE_BIO=1`).
 
-    /// implementation-note-56 — `resolve_approval_with_biometric` records the
+    /// implementation-note-81 — `resolve_approval_with_biometric` records the
     /// biometric flag + credential_id in the audit log so an auditor can
     /// distinguish hardware-attested approvals from click-throughs.
     #[tokio::test]
@@ -6009,7 +6167,7 @@ mod tests {
         assert_eq!(arr[0]["persona_id"], persona.id);
     }
 
-    /// implementation-note-46 — /api/grants list must include the
+    /// implementation-note-71 — /api/grants list must include the
     /// per-Statement array under the canonical field name `statements`
     /// (matching grant_to_json_with_store / /api/grants/all / /api/grants/{id})
     /// so the dashboard JS can render real scope + budget for multi-statement
@@ -6078,7 +6236,7 @@ mod tests {
             .expect("statements must be an array");
         assert_eq!(stmts_field.len(), 2, "should have 2 statements");
 
-        // implementation-note-46 — assert the legacy
+        // implementation-note-71 — assert the legacy
         // `composite_statements` field is gone from /api/grants. The list
         // endpoint must align on `statements` (the canonical name used by
         // /api/grants/all and /api/grants/{id}).
@@ -6100,7 +6258,7 @@ mod tests {
         assert!(sb["budget"].is_null(), "SB budget must be null");
     }
 
-    /// implementation-note-46 — /api/grants list and
+    /// implementation-note-71 — /api/grants list and
     /// /api/grants/{id} detail must emit the per-Statement array under the
     /// same field name (`statements`). Without this, dashboard JS callers
     /// have to fall back through `g.statements || g.composite_statements`
@@ -6513,7 +6671,7 @@ mod tests {
 
     #[tokio::test]
     async fn approval_deep_link_renders_composite_breakdown_inline() {
-        // implementation-note-42 — the dedicated /approvals/{id} page must
+        // implementation-note-67 — the dedicated /approvals/{id} page must
         // surface the full per-statement breakdown inline, never gated
         // behind a "Show details" disclosure. The operator must never be
         // one click away from approving authority chains they cannot see.
@@ -6586,7 +6744,7 @@ mod tests {
         assert!(s.contains("Deny"));
     }
 
-    // --- implementation-note-42 — composite render polish ---
+    // --- implementation-note-67 — composite render polish ---
 
     #[tokio::test]
     async fn composite_statements_js_handles_internally_tagged_resource_selector() {
@@ -6613,7 +6771,7 @@ mod tests {
 
     #[tokio::test]
     async fn dashboard_card_template_routes_composite_through_detail_review() {
-        // implementation-note-42 — composite approvals are multi-statement
+        // implementation-note-67 — composite approvals are multi-statement
         // chains; the dashboard pending-approvals card only shows the
         // summary ("composite (N statements)"), not the breakdown. The
         // operator must never approve a chain they cannot see, so the
@@ -6644,7 +6802,7 @@ mod tests {
 
     #[tokio::test]
     async fn composite_statement_render_drops_on_star_for_any_resource() {
-        // implementation-note-42 — `time:wall_clock on * · 90s` reads as
+        // implementation-note-67 — `time:wall_clock on * · 90s` reads as
         // technical noise; time isn't bound to a resource. When the
         // selector resolves to wildcard, the JS render now elides the
         // `on *` clause. Assert the shipped helper contains the elision
@@ -6733,7 +6891,7 @@ mod tests {
 
     #[tokio::test]
     async fn approval_detail_page_renders_persona_name_with_identifier() {
-        // implementation-note-42 — Persona field shows "<name> <identifier>"
+        // implementation-note-67 — Persona field shows "<name> <identifier>"
         // so the operator sees both the human-friendly handle (e.g.
         // `qa`) and the unique persona-id suffix used in audit logs
         // and grant chains. The previous "name only" rendering hid the
@@ -6756,7 +6914,7 @@ mod tests {
 
     #[tokio::test]
     async fn dashboard_html_inlines_shared_composite_helper() {
-        // implementation-note-41 — the dashboard pending-approvals card and
+        // implementation-note-66 — the dashboard pending-approvals card and
         // the dedicated /approvals/{id} page share a single JS helper for
         // rendering the composite-statement breakdown. Assert the helper is
         // baked into the dashboard HTML so the two surfaces cannot drift.
@@ -7004,7 +7162,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
-    // implementation-note-48 — `/api/receipts/stream` is the live receipts panel
+    // implementation-note-73 — `/api/receipts/stream` is the live receipts panel
     // SSE feed. Empty-store path must still return 200 + event-stream
     // content-type so the EventSource client transitions to `open`.
     #[tokio::test]
@@ -7323,7 +7481,7 @@ mod tests {
         assert_eq!(got, "persona-368a0fc5-809", "exactly-12-char UUID portion should be returned as-is");
     }
 
-    // --- security check: Origin/Referer header checks ---
+    // --- Origin/Referer header checks ---
 
     fn make_headers_with_origin(origin: &str) -> hyper::HeaderMap {
         let mut h = hyper::HeaderMap::new();
@@ -7371,7 +7529,7 @@ mod tests {
         assert!(!origin_ok(&h, "http://127.0.0.1:3141"));
     }
 
-    // --- implementation-note-24 follow-up: loopback aliases ---
+    // --- implementation-note-38 follow-up: loopback aliases ---
     // The dashboard binds to 127.0.0.1, but the WebAuthn rp_id is pinned to
     // `localhost`, so a browser following the WebAuthn flow sends
     // `Origin: http://localhost:<port>`. Both forms are the same loopback
@@ -7490,7 +7648,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    // --- implementation-note-47: dismiss endpoint ---
+    // --- implementation-note-72: dismiss endpoint ---
 
     #[tokio::test]
     async fn dismiss_approval_returns_200_and_removes_from_pending() {
@@ -7549,7 +7707,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
-    // --- implementation-note-35: audit action_filter query param ---
+    // --- implementation-note-56: audit action_filter query param ---
 
     #[tokio::test]
     async fn audit_action_filter_returns_only_matching_prefix() {
@@ -7581,7 +7739,7 @@ mod tests {
         assert_eq!(arr.len(), 2, "empty filter returns all events");
     }
 
-    // --- implementation-note-60: /api/receipts endpoint ---
+    // --- implementation-note-85: /api/receipts endpoint ---
 
     /// Ensure the receipts singleton identity is active (mirrors receipt.rs
     /// test helper) so revoke_grant can emit signed receipts.
@@ -7661,7 +7819,7 @@ mod tests {
 
     #[tokio::test]
     async fn receipts_search_persona_isolates_rows() {
-        // implementation-note-44 — `/api/receipts/search?persona=`
+        // implementation-note-69 — `/api/receipts/search?persona=`
         // must surface only receipts whose persona_id matches.
         ensure_receipt_identity();
         let state = make_state();
@@ -7898,9 +8056,42 @@ mod tests {
         assert!(s.contains("function loadReceipts"), "dashboard must contain loadReceipts JS function");
     }
 
+    /// DASHBOARD-EMPTY-STATE-FIRST-RECEIPT — fresh-daemon dashboard ships
+    /// the zero-state panel checkpoint + first-grant CLI command + Receipt
+    /// explainer + /verify-receipt link, plus the JS hook that hides it
+    /// once a grant or receipt populates.
+    #[tokio::test]
+    async fn dashboard_html_contains_zero_state_first_receipt_panel() {
+        let state = make_state();
+        let resp = call(state, "/").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let s = std::str::from_utf8(&body).unwrap();
+        assert!(
+            s.contains("dashboard-empty-state-first-receipt"),
+            "zero-state checkpoint class missing from dashboard"
+        );
+        assert!(
+            s.contains("zero-state-panel"),
+            "zero-state panel element id missing from dashboard"
+        );
+        assert!(
+            s.contains("ember grant create --to"),
+            "zero-state must include copy-paste 'ember grant create' command"
+        );
+        assert!(
+            s.contains("/verify-receipt"),
+            "zero-state must link to /verify-receipt"
+        );
+        assert!(
+            s.contains("_updateZeroStatePanel"),
+            "JS toggle hook _updateZeroStatePanel missing — empty state would never hide once populated"
+        );
+    }
+
     #[tokio::test]
     async fn approval_page_no_longer_has_narrow_button() {
-        // implementation-note-61: disabled Narrow button was removed for clean screenshots.
+        // implementation-note-86: disabled Narrow button was removed for clean screenshots.
         let state = make_state();
         let persona = state.store.create_persona("agent-narrow-check").unwrap();
         let req = state.store.submit_approval(&persona.id, "key", "read", None, "access", "low").unwrap();
@@ -7912,7 +8103,7 @@ mod tests {
         assert!(!s.contains("Narrow"), "Narrow text must not appear on approval page");
     }
 
-    /// implementation-note-56 — `/settings/passkeys` returns the enrollment page with
+    /// implementation-note-81 — `/settings/passkeys` returns the enrollment page with
     /// expected content so operators can register their platform authenticator.
     #[tokio::test]
     async fn settings_passkeys_returns_enrollment_page() {
@@ -7937,7 +8128,7 @@ mod tests {
         assert!(html.contains("Enrolled Passkeys"), "enrolled passkeys section missing");
     }
 
-    /// implementation-note-24 — the `/approvals/{id}` page wires the real
+    /// implementation-note-38 — the `/approvals/{id}` page wires the real
     /// auth/begin → navigator.credentials.get → POST/<action> ceremony
     /// into the resolve() function so Approve/Deny calls carry a verified
     /// WebAuthn assertion (same as the main dashboard cards).
@@ -7970,7 +8161,7 @@ mod tests {
         );
     }
 
-    /// implementation-note-41 — the `/approvals/{id}` dedicated page must
+    /// implementation-note-66 — the `/approvals/{id}` dedicated page must
     /// expose composite_statements via the polled JSON AND embed the shared
     /// renderCompositeStatements helper so the breakdown renders identically
     /// to the main dashboard card. This is the YC-partner deep-link path.

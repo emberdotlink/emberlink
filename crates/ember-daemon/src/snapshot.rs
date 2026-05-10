@@ -7,7 +7,7 @@
 //!      Ed25519 seed with info "ember-seal-v1") using XChaCha20-Poly1305.
 //!   3. Described by a signed [`SnapshotManifest`] chained via `prev_snapshot_id`.
 //!
-//! **Snapshot scope** (per implementation-note-17, design §Decision):
+//! **Snapshot scope** (per implementation-note-21, design §Decision):
 //!   - `credentials` table rows (vault-sealed blobs)
 //!   - `vault.salt` file bytes (critical: without it the MEK cannot be rebuilt)
 //!   - `personas` table rows
@@ -359,7 +359,7 @@ pub fn encrypt_vault_blob(
     let json = serde_json::to_vec(state).map_err(|e| {
         StoreError::InvalidInput(format!("snapshot: serialize vault state: {e}"))
     })?;
-    let content_key = derive_snapshot_encryption_key(&identity.seed_bytes());
+    let content_key = derive_snapshot_encryption_key(&*identity.seed_bytes());
     let encrypted = encrypt_content(&content_key, &json, b"ember-snapshot-v1")
         .map_err(|e| StoreError::InvalidInput(format!("snapshot: encrypt vault state: {e}")))?;
     // Format: `nonce_hex:ciphertext_hex` — both fields are hex strings.
@@ -383,7 +383,7 @@ pub fn decrypt_vault_blob(
         nonce_hex: nonce_hex.to_string(),
         ciphertext,
     };
-    let content_key = derive_snapshot_encryption_key(&identity.seed_bytes());
+    let content_key = derive_snapshot_encryption_key(&*identity.seed_bytes());
     let plaintext = decrypt_content(&content_key, &encrypted, b"ember-snapshot-v1")
         .map_err(|e| StoreError::InvalidInput(format!("snapshot: decrypt vault state: {e}")))?;
     serde_json::from_slice(&plaintext).map_err(|e| {
@@ -420,7 +420,7 @@ pub fn sign_snapshot_manifest(manifest: &mut SnapshotManifest, identity: &Daemon
     let sig_bytes = identity.sign(hash_hex.as_bytes());
     manifest.evidence = Evidence {
         hash: hash_hex,
-        sig: hex::encode(sig_bytes),
+        sig: hex::encode(&*sig_bytes),
         signer_pubkey: identity.pubkey_hex(),
         canonical_version: CANONICAL_VERSION,
     };
@@ -818,7 +818,7 @@ pub async fn pull_cluster_snapshot(
 ///
 /// Call [`SnapshotPuller::maybe_pull`] on a Tokio interval at daemon startup.
 /// Only active when `snapshot_pull_endpoint` is configured (per design
-/// implementation-note-38).
+/// implementation-note-59).
 pub struct SnapshotPuller {
     interval_secs: u64,
     last_pulled_at: Mutex<Option<Instant>>,

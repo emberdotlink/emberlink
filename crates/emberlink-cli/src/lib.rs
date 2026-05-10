@@ -6,6 +6,7 @@ pub mod cli;
 pub mod cluster;
 pub mod construct;
 pub mod grants;
+pub mod install;
 mod commands;
 pub mod demo;
 pub mod launcher;
@@ -17,6 +18,7 @@ mod recovery;
 mod screens;
 mod sync_support;
 mod vault_support;
+pub mod vault_io;
 
 pub use cli::{Args, Cmd};
 

@@ -27,7 +27,7 @@
 //! `GET /daemon/identity.json` as hex so external verifiers can compare
 //! against their trust anchor.
 
-// implementation-note-82: Receipt v2 issuance helper for cohort-A
+// implementation-note-118: Receipt v2 issuance helper for cohort-A
 // `session.claude_code` Receipts. Lives in the `receipt/` sibling
 // directory; this `pub mod` declaration wires it under the existing
 // `receipt` module path so callers see `ember_daemon::receipt::issue`.
@@ -46,6 +46,7 @@ use core_types::grant_receipt::{
 use core_types::{AttestationBinding, StatementId, Usage};
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use once_cell::sync::OnceCell;
+use zeroize::{ZeroizeOnDrop, Zeroizing};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -82,9 +83,34 @@ const IDENTITY_KEY_FILENAME: &str = "daemon_persona.key";
 /// read the same file. This key signs every Grant Receipt; it is the
 /// Daemon Persona signing key and is NOT used for any protocol message
 /// outside of receipt Evidence.
+///
+/// # Zeroization (M1 security hardening — ZeroizeOnDrop_DaemonPersona)
+///
+/// `DaemonPersona` derives `ZeroizeOnDrop`. `SigningKey` (ed25519-dalek 2.x)
+/// also implements `Zeroize`, so the secret scalar is cleared on drop.
+/// `verifying_key` is public material and is skipped.
+///
+/// **OnceCell caveat:** the process-singleton `IDENTITY: OnceCell<DaemonPersona>`
+/// (below) holds the key for the lifetime of the process and therefore `Drop`
+/// is never called on the `DaemonPersona` stored inside it. Zeroization on
+/// drop is still correct discipline for any non-singleton `DaemonPersona`
+/// values (e.g. the temporary created in `load_or_create` before it is
+/// moved into the cell, test instances). Future key-rotation/reload work
+/// that replaces the cell value will benefit from this automatically.
+#[derive(ZeroizeOnDrop)]
 pub struct DaemonPersona {
     signing_key: SigningKey,
+    #[zeroize(skip)]
     verifying_key: VerifyingKey,
+}
+
+impl std::fmt::Debug for DaemonPersona {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never expose signing_key material in Debug output.
+        f.debug_struct("DaemonPersona")
+            .field("pubkey_hex", &self.pubkey_hex())
+            .finish_non_exhaustive()
+    }
 }
 
 impl DaemonPersona {
@@ -95,6 +121,28 @@ impl DaemonPersona {
         })?;
         let path = data_dir.join(IDENTITY_KEY_FILENAME);
         if path.exists() {
+            // M2 mode-check: refuse to load a key file that is wider than 0600.
+            // daemon_persona_key_mode_refuse_world_readable — we do NOT auto-fix
+            // the permissions so the operator can investigate how the file ended
+            // up with insecure mode (backup restore, operator copy, crash, etc.).
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let meta = fs::metadata(&path).map_err(|e| {
+                    StoreError::InvalidInput(format!(
+                        "stat daemon identity key at {}: {e}",
+                        path.display()
+                    ))
+                })?;
+                let mode = meta.permissions().mode();
+                if mode & 0o077 != 0 {
+                    return Err(StoreError::KeyInsecureMode {
+                        path: path.display().to_string(),
+                        mode,
+                    });
+                }
+            }
+
             let bytes = fs::read(&path).map_err(|e| {
                 StoreError::InvalidInput(format!(
                     "read daemon identity key at {}: {e}",
@@ -108,18 +156,18 @@ impl DaemonPersona {
                     bytes.len()
                 )));
             }
-            let mut seed = [0u8; 32];
+            let mut seed = Zeroizing::new([0u8; 32]);
             seed.copy_from_slice(&bytes);
-            let signing_key = SigningKey::from_bytes(&seed);
+            let signing_key = SigningKey::from_bytes(&*seed);
             let verifying_key = signing_key.verifying_key();
             Ok(Self { signing_key, verifying_key })
         } else {
-            let mut seed = [0u8; 32];
-            getrandom::fill(&mut seed).map_err(|e| {
+            let mut seed = Zeroizing::new([0u8; 32]);
+            getrandom::fill(&mut *seed).map_err(|e| {
                 StoreError::InvalidInput(format!("OS RNG failure generating identity: {e}"))
             })?;
-            write_identity_file(&path, &seed)?;
-            let signing_key = SigningKey::from_bytes(&seed);
+            write_identity_file(&path, &*seed)?;
+            let signing_key = SigningKey::from_bytes(&*seed);
             let verifying_key = signing_key.verifying_key();
             Ok(Self { signing_key, verifying_key })
         }
@@ -130,12 +178,13 @@ impl DaemonPersona {
         hex::encode(self.verifying_key.to_bytes())
     }
 
-    /// Sign an arbitrary byte payload.
-    pub fn sign(&self, payload: &[u8]) -> [u8; 64] {
-        self.signing_key.sign(payload).to_bytes()
+    /// Sign an arbitrary byte payload. Returns a `Zeroizing` wrapper so the
+    /// 64-byte signature temp is scrubbed when the caller drops it.
+    pub fn sign(&self, payload: &[u8]) -> Zeroizing<[u8; 64]> {
+        Zeroizing::new(self.signing_key.sign(payload).to_bytes())
     }
 
-    /// Return the Ed25519 signing key seed (32 bytes).
+    /// Return the Ed25519 signing key seed (32 bytes) as a `Zeroizing` wrapper.
     ///
     /// Used by snapshot emission to derive the HKDF-SHA256 snapshot-encryption
     /// key (`HKDF-SHA256(seed, "ember-seal-v1")`) per design §The primitive.
@@ -143,9 +192,12 @@ impl DaemonPersona {
     /// which both the scalar and the nonce prefix are derived. The ed25519-dalek
     /// `to_bytes()` method returns these 32 bytes.
     ///
+    /// The `Zeroizing` wrapper ensures the stack copy is scrubbed when the
+    /// caller's binding goes out of scope.
+    ///
     /// Treat the output as secret. Never log or expose outside the daemon.
-    pub fn seed_bytes(&self) -> [u8; 32] {
-        self.signing_key.to_bytes()
+    pub fn seed_bytes(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(self.signing_key.to_bytes())
     }
 
     /// Ed25519 verifying key (raw 32 bytes) for external verifiers.
@@ -211,7 +263,7 @@ pub fn canonical_hash_receipt(receipt: &GrantReceipt) -> [u8; 32] {
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-13 — kms receipt canonical-encoding + signing helpers
+// implementation-note-16 — kms receipt canonical-encoding + signing helpers
 // ---------------------------------------------------------------------------
 
 /// Canonical-encoding prefix for kms receipts. Distinct from
@@ -248,14 +300,14 @@ pub fn sign_kms_receipt(receipt: &mut KmsReceipt, identity: &DaemonPersona) {
     let sig_bytes = identity.sign(hash_hex.as_bytes());
     receipt.evidence = Evidence {
         hash: hash_hex,
-        sig: hex::encode(sig_bytes),
+        sig: hex::encode(&*sig_bytes),
         signer_pubkey: identity.pubkey_hex(),
         canonical_version: CANONICAL_VERSION,
     };
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-83 — broker receipt canonical-encoding + signing helpers
+// implementation-note-119 — broker receipt canonical-encoding + signing helpers
 // ---------------------------------------------------------------------------
 
 /// Canonical-encoding prefix for broker receipts. Distinct from
@@ -292,7 +344,7 @@ pub fn sign_broker_receipt(receipt: &mut BrokerReceipt, identity: &DaemonPersona
     let sig_bytes = identity.sign(hash_hex.as_bytes());
     receipt.evidence = Evidence {
         hash: hash_hex,
-        sig: hex::encode(sig_bytes),
+        sig: hex::encode(&*sig_bytes),
         signer_pubkey: identity.pubkey_hex(),
         canonical_version: CANONICAL_VERSION,
     };
@@ -350,7 +402,7 @@ pub fn verify_broker_receipt(
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-84 — vault receipt canonical-encoding + signing helpers
+// implementation-note-120 — vault receipt canonical-encoding + signing helpers
 // ---------------------------------------------------------------------------
 
 /// Canonical-encoding prefix for vault receipts. Distinct from
@@ -388,7 +440,7 @@ pub fn sign_vault_receipt(receipt: &mut VaultReceipt, identity: &DaemonPersona) 
     let sig_bytes = identity.sign(hash_hex.as_bytes());
     receipt.evidence = Evidence {
         hash: hash_hex,
-        sig: hex::encode(sig_bytes),
+        sig: hex::encode(&*sig_bytes),
         signer_pubkey: identity.pubkey_hex(),
         canonical_version: CANONICAL_VERSION,
     };
@@ -569,7 +621,7 @@ pub fn trigger_receipt_if_terminal(
 /// Derive a terminal reason from grant status alone.
 ///
 /// For `exhausted_by_budget`, the axis is read from the `budget.exhausted`
-/// audit row (T-implementation-note-85) instead of guessed from which
+/// audit row (T-implementation-note-121) instead of guessed from which
 /// axes the grant's budget configures. The audit row carries the
 /// authoritative axis that actually tripped the cap.
 fn derive_reason(store: &DaemonStore, info: &GrantInfo) -> TerminalReason {
@@ -599,7 +651,7 @@ fn derive_reason(store: &DaemonStore, info: &GrantInfo) -> TerminalReason {
 }
 
 /// Read the exhaustion axis from the `budget.exhausted` audit row for this
-/// grant (T-implementation-note-85).
+/// grant (T-implementation-note-121).
 ///
 /// `budget.exhausted` rows are emitted by the proxy meter when a Statement
 /// usage tally crosses a budget cap. The row's `details` column carries the
@@ -685,7 +737,7 @@ fn build_receipt_body(
     now_epoch_secs: u64,
 ) -> GrantReceipt {
     // 1. Pull the canonical composite chain + envelope-level attestation.
-    //    AUDIT Decision 2 #4 (T-implementation-note-86): the
+    //    AUDIT Decision 2 #4 (T-implementation-note-122): the
     //    AccessGrant envelope carries the live attestation posture
     //    (sandbox / spiffe / tee status). Capture it here alongside the
     //    chain so step 7 can pass it through into the signed receipt
@@ -696,7 +748,7 @@ fn build_receipt_body(
     };
 
     // 2. Per-statement usage tallies from the block-0 statements.
-    // implementation-note-58: derive wall_clock_secs at receipt-build
+    // implementation-note-83: derive wall_clock_secs at receipt-build
     // time so signed receipts record actual time used rather than the stored 0.
     let created_at_secs = parse_rfc3339_epoch(&info.created_at);
     let expires_at_secs = info
@@ -712,8 +764,22 @@ fn build_receipt_body(
                 .iter()
                 .map(|s| {
                     let mut u = s.usage.clone();
+                    // Only derive wall_clock_secs when the stored usage
+                    // value is 0 (i.e. unset / default-zeroed). When the
+                    // caller has supplied a non-zero usage tally, that's
+                    // the canonical "actual time used" — preserve it
+                    // even if a budget cap is also set. Pre-2026-05-08:
+                    // condition was `budget_cap.is_some() || u.wall_clock_secs == 0`,
+                    // which clobbered legitimate usage values whenever a
+                    // budget was configured (the test
+                    // `three_statement_receipt_preserves_per_statement_usage`
+                    // catches this — it sets usage.wall_clock_secs = 120
+                    // alongside budget.wall_clock_secs = Some(3600), and
+                    // the override replaced 120 with elapsed-since-create
+                    // ≈ 0). Per AUDIT D5: per-statement usage is the
+                    // source of truth; derivation is the fallback.
                     let budget_cap = s.budget.as_ref().and_then(|b| b.wall_clock_secs);
-                    if budget_cap.is_some() || u.wall_clock_secs == 0 {
+                    if u.wall_clock_secs == 0 {
                         u.wall_clock_secs = derive_wall_clock_secs(
                             now_epoch_secs,
                             created_at_secs,
@@ -816,7 +882,7 @@ fn build_receipt_body(
         .first()
         .map(|sb| sb.block.issued_at)
         .unwrap_or_else(|| parse_rfc3339_epoch(&info.created_at));
-    // Per AUDIT Decision 2 #5 (T-implementation-note-87):
+    // Per AUDIT Decision 2 #5 (T-implementation-note-123):
     // last_used_at reflects the most recent moment ANY statement was
     // touched. Aggregate Usage.last_updated was a stand-in that swallowed
     // per-statement granularity in the audit trail. Source of truth is the
@@ -845,7 +911,7 @@ fn build_receipt_body(
     };
 
     // 7. Attestation — passes through from the live grant. Per AUDIT
-    //    Decision 2 #4 (T-implementation-note-86): the previous
+    //    Decision 2 #4 (T-implementation-note-122): the previous
     //    `chain.first().and_then(|_| None).unwrap_or_default()` was a
     //    dead-code default that erased sandbox/spiffe/tee status from the
     //    grant before signing. Source of truth is the AccessGrant
@@ -886,7 +952,7 @@ pub fn emit_receipt(
     let sig_bytes = identity.sign(hash_hex.as_bytes());
     receipt.evidence = Evidence {
         hash: hash_hex,
-        sig: hex::encode(sig_bytes),
+        sig: hex::encode(&*sig_bytes),
         signer_pubkey: identity.pubkey_hex(),
         canonical_version: CANONICAL_VERSION,
     };
@@ -934,18 +1000,18 @@ pub struct ReceiptFilter {
     pub since_iso: Option<String>,
     /// Maximum rows to return. Defaults to 100 when `None`.
     pub limit: Option<u64>,
-    /// EMBER-implementation-note-68 — kind discriminator (`grant`, `kms_wrap`,
+    /// EMBER-implementation-note-94 — kind discriminator (`grant`, `kms_wrap`,
     /// `kms_unwrap`). Mapped 1:1 to the `kind` column.
     pub kind: Option<String>,
-    /// EMBER-implementation-note-68 — restrict to receipts whose `grant_id` matches.
+    /// EMBER-implementation-note-94 — restrict to receipts whose `grant_id` matches.
     pub grant_id: Option<String>,
-    /// EMBER-implementation-note-68 — substring filter on the receipt's `summary.resource`
+    /// EMBER-implementation-note-94 — substring filter on the receipt's `summary.resource`
     /// (grant receipts) or top-level `key_name` (kms receipts). Applied
     /// post-fetch so the JSON1 index can still serve exact-match callers.
     pub resource: Option<String>,
 }
 
-/// EMBER-implementation-note-68 — flat audit row returned by [`DaemonStore::list_receipt_rows`].
+/// EMBER-implementation-note-94 — flat audit row returned by [`DaemonStore::list_receipt_rows`].
 ///
 /// Joins receipt fields with [`crate::trust::grant::GrantInfo`] when the row is a
 /// grant receipt so callers see `requested_scope` / `granted_scope` without
@@ -1026,8 +1092,8 @@ impl DaemonStore {
             ReceiptKind::KmsUnwrap => "kms_unwrap",
             // Non-kms variants must never reach this sink — they have
             // their own (planned) typed-Receipt persistence paths per
-            // RECEIPT-COVERAGE-FIX-implementation-note-15 and
-            // RECEIPT-COVERAGE-FIX-implementation-note-16. Reject explicitly so a
+            // RECEIPT-COVERAGE-FIX-implementation-note-19 and
+            // RECEIPT-COVERAGE-FIX-implementation-note-20. Reject explicitly so a
             // mis-routed call surfaces immediately rather than landing
             // a non-kms row in the kms-shaped storage path.
             ReceiptKind::Grant
@@ -1328,7 +1394,7 @@ impl DaemonStore {
         Ok(out)
     }
 
-    /// EMBER-implementation-note-68 — flat audit-row listing for the `ember audit`
+    /// EMBER-implementation-note-94 — flat audit-row listing for the `ember audit`
     /// query CLI. Joins the receipts table with `grants` so the row carries
     /// both the receipt fields and the parent grant's scope.
     ///
@@ -2276,6 +2342,94 @@ mod tests {
 
         verify_receipt(&r, &identity.pubkey_hex()).expect("receipt verifies even with empty chain");
     }
+
+    // -------------------------------------------------------------------------
+    // M1 — zeroize
+    // -------------------------------------------------------------------------
+
+    /// T1 zeroize: `sign()` returns a `Zeroizing<[u8;64]>` wrapper. We
+    /// verify:
+    ///  - the return type compiles as `Zeroizing<[u8;64]>` (type inference
+    ///    would fail if the signature changed to `[u8;64]`)
+    ///  - the bytes are non-zero (a real Ed25519 signature over a known payload)
+    ///  - the wrapper correctly zeroes bytes when manually invoked via
+    ///    `zeroize::Zeroize::zeroize()`, exercising the same volatile-write path
+    ///    that `ZeroizeOnDrop` uses on drop.
+    #[test]
+    fn sign_returns_zeroizing_wrapper_and_clears_bytes() {
+        use zeroize::Zeroize;
+        let dir = tempfile::tempdir().unwrap();
+        let id = DaemonPersona::load_or_create(dir.path()).unwrap();
+        let payload = b"test payload for zeroize check";
+
+        let mut sig: Zeroizing<[u8; 64]> = id.sign(payload);
+        // A real Ed25519 signature must have non-zero bytes.
+        assert!(sig.iter().any(|b| *b != 0), "signature must have non-zero bytes");
+        // Explicitly invoke zeroize (same code path as ZeroizeOnDrop).
+        sig.zeroize();
+        assert!(sig.iter().all(|b| *b == 0), "Zeroizing::zeroize() must clear all bytes");
+    }
+
+    /// T1 zeroize: `seed_bytes()` returns a `Zeroizing<[u8;32]>` wrapper.
+    /// Same verification pattern as `sign_returns_zeroizing_wrapper_and_clears_bytes`.
+    #[test]
+    fn seed_bytes_returns_zeroizing_wrapper_and_clears_bytes() {
+        use zeroize::Zeroize;
+        let dir = tempfile::tempdir().unwrap();
+        let id = DaemonPersona::load_or_create(dir.path()).unwrap();
+
+        let mut seed: Zeroizing<[u8; 32]> = id.seed_bytes();
+        assert!(seed.iter().any(|b| *b != 0), "seed must have non-zero bytes");
+        seed.zeroize();
+        assert!(seed.iter().all(|b| *b == 0), "Zeroizing::zeroize() must clear all bytes");
+    }
+
+    // -------------------------------------------------------------------------
+    // M2 — mode-check
+    // -------------------------------------------------------------------------
+
+    /// T2 mode-check 0644: a key file with group/world read bits set must be
+    /// refused. The daemon returns `StoreError::KeyInsecureMode`.
+    #[test]
+    #[cfg(unix)]
+    fn load_or_create_refuses_world_readable_key_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // Create a valid key file first.
+        let _ = DaemonPersona::load_or_create(dir.path()).unwrap();
+        // Widen the permissions to 0644 — simulating a backup restore or
+        // operator copy that dropped the restrictive mode.
+        let key_path = dir.path().join(IDENTITY_KEY_FILENAME);
+        let mut perms = fs::metadata(&key_path).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&key_path, perms).unwrap();
+        // A second load_or_create must refuse.
+        let err = DaemonPersona::load_or_create(dir.path())
+            .expect_err("should refuse 0644 key file");
+        assert!(
+            matches!(err, StoreError::KeyInsecureMode { .. }),
+            "expected KeyInsecureMode, got: {err:?}"
+        );
+        // Verify the error message contains the path and a mode value that
+        // includes the 644 octal digits (the full mode includes file-type bits
+        // on some platforms, e.g. 0o100644, so we search for "644").
+        let msg = err.to_string();
+        assert!(msg.contains("daemon_persona.key"), "error must name the file: {msg}");
+        assert!(msg.contains("644"), "error must report the insecure mode: {msg}");
+    }
+
+    /// T2 mode-check 0600: a correctly-permissioned key file loads without error.
+    #[test]
+    #[cfg(unix)]
+    fn load_or_create_accepts_correctly_permissioned_key_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // First call generates and writes the key.
+        let id1 = DaemonPersona::load_or_create(dir.path()).unwrap();
+        let pk1 = id1.pubkey_hex();
+        // Second call reads the key — must succeed and return the same pubkey.
+        let id2 = DaemonPersona::load_or_create(dir.path()).unwrap();
+        assert_eq!(id2.pubkey_hex(), pk1, "0600 key must load cleanly and return same pubkey");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2298,6 +2452,17 @@ pub fn identity_key_path(data_dir: &Path) -> PathBuf {
 // called exactly once at runtime startup. In tests that open an in-memory
 // store without a runtime, the cell may be uninitialized — callers should
 // treat that case as "skip receipt emission" and log a warning.
+//
+// ZeroizeOnDrop note: `DaemonPersona` derives `ZeroizeOnDrop`, but the value
+// stored in this `OnceCell` is never dropped during normal process execution —
+// `OnceCell` holds its content for the entire lifetime of the static. This
+// means the signing key is NOT zeroized on process exit via this path.
+// That is accepted steady-state: process exit releases all memory anyway, and
+// OS-level guard pages protect against cross-process reads. The derive still
+// provides correct-by-default discipline for any future rotation/reload path
+// that replaces this cell (which must be a new allocation, not an in-place
+// mutation), and it clears temporary `DaemonPersona` values created in tests
+// or intermediate load paths.
 
 static IDENTITY: OnceCell<DaemonPersona> = OnceCell::new();
 
@@ -2372,7 +2537,7 @@ pub fn trigger_receipt_if_terminal_current(
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-13 — kms receipt sink wiring
+// implementation-note-16 — kms receipt sink wiring
 // ---------------------------------------------------------------------------
 //
 // `core_kms::ReceiptSink` requires `Send + Sync`, but `DaemonStore` is
@@ -2593,7 +2758,7 @@ mod kms_tests {
         current_identity().expect("identity was just initialised")
     }
 
-    /// EMBER-implementation-note-68 — mixed-kind audit query. Seed two kms receipts for
+    /// EMBER-implementation-note-94 — mixed-kind audit query. Seed two kms receipts for
     /// the same persona (one wrap, one unwrap) plus one for a different
     /// persona; the actor filter must return only the matching pair, and
     /// the rows must be sorted `materialized_at DESC`.
@@ -2638,7 +2803,7 @@ mod kms_tests {
         );
     }
 
-    /// EMBER-implementation-note-68 — kind filter narrows to a single discriminator.
+    /// EMBER-implementation-note-94 — kind filter narrows to a single discriminator.
     #[test]
     fn list_receipt_rows_filters_by_kind() {
         let _ = ensure_identity_for_kms_test();
@@ -2660,7 +2825,7 @@ mod kms_tests {
         assert_eq!(wraps[0].resource, "k1");
     }
 
-    /// EMBER-implementation-note-68 — resource substring filter (post-fetch) narrows
+    /// EMBER-implementation-note-94 — resource substring filter (post-fetch) narrows
     /// matches without forcing exact equality.
     #[test]
     fn list_receipt_rows_filters_by_resource_substring() {
@@ -2684,7 +2849,7 @@ mod kms_tests {
         assert!(rows.iter().all(|r| r.resource.contains("tokens")));
     }
 
-    /// EMBER-implementation-note-68 — index existence sanity check. Inspect the
+    /// EMBER-implementation-note-94 — index existence sanity check. Inspect the
     /// sqlite_master catalog and confirm the new audit-CLI indexes were
     /// created by the migration.
     #[test]

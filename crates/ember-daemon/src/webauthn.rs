@@ -1,4 +1,4 @@
-//! implementation-note-24: server-side WebAuthn relying-party.
+//! implementation-note-38: server-side WebAuthn relying-party.
 //!
 //! Wraps `webauthn-rs` with a `DaemonStore`-backed credential and
 //! ceremony-state persistence so the dashboard's Approve flow can
@@ -521,7 +521,7 @@ impl WebauthnGate {
 /// disabled biometric gating via the same env gate the CLI honors.
 /// The dashboard handler treats this as "skip the gate, record
 /// `biometric=false` in the audit log, proceed with the approval"
-/// — same posture as the pre-implementation-note-24 behavior so qember
+/// — same posture as the pre-implementation-note-38 behavior so qember
 /// headless smoke stays green without a real authenticator.
 pub fn bio_disabled_via_env() -> bool {
     std::env::var("EMBER_DISABLE_BIO").is_ok()

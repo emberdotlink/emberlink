@@ -1,0 +1,114 @@
+//! JSON-RPC-over-UDS client for the ember daemon.
+//!
+//! Wire format: newline-delimited JSON per handler.rs::dispatch_method:
+//!   → `{"id":"1","method":<method>,"params":<params>}\n`
+//!   ← `{"id":"1","result":<result>}\n`  or  `{"id":"1","error":{...}}\n`
+//!
+//! Matches `call_daemon` in crates/emberlink-cli/src/broker.rs (same wire
+//! shape, same error-extraction logic).
+
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+
+use serde_json::{json, Value};
+
+// ---------------------------------------------------------------------------
+// Daemon socket resolution
+// ---------------------------------------------------------------------------
+
+/// Resolve the daemon UDS path.
+///
+/// Precedence:
+///   1. `EMBER_SOCKET_PATH` env var (used by qember.sh + integration tests)
+///   2. `~/.ember/run/daemon.sock` (matches DaemonConfig::default())
+///   3. `/tmp/.ember/run/daemon.sock` if $HOME is unset
+pub fn daemon_socket_path() -> PathBuf {
+    if let Ok(p) = std::env::var("EMBER_SOCKET_PATH") {
+        return PathBuf::from(p);
+    }
+    let base = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    base.join(".ember").join("run").join("daemon.sock")
+}
+
+// ---------------------------------------------------------------------------
+// RPC errors
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+pub enum RpcError {
+    DaemonUnavailable(String),
+    Io(String),
+    Protocol(String),
+    DaemonRpc { code: i32, message: String },
+}
+
+impl std::fmt::Display for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RpcError::DaemonUnavailable(s) => write!(f, "daemon unavailable: {s}"),
+            RpcError::Io(s) => write!(f, "io: {s}"),
+            RpcError::Protocol(s) => write!(f, "protocol: {s}"),
+            RpcError::DaemonRpc { code, message } => {
+                write!(f, "daemon rpc error {code}: {message}")
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RPC call
+// ---------------------------------------------------------------------------
+
+/// Send one JSON-RPC request over the daemon socket and return the `result`.
+pub fn call_daemon_rpc(
+    socket_path: &std::path::Path,
+    method: &str,
+    params: &Value,
+) -> Result<Value, RpcError> {
+    let stream = UnixStream::connect(socket_path).map_err(|e| {
+        RpcError::DaemonUnavailable(format!("{}: {e}", socket_path.display()))
+    })?;
+
+    let mut writer = stream
+        .try_clone()
+        .map_err(|e| RpcError::Io(format!("clone socket: {e}")))?;
+    let mut reader = BufReader::new(stream);
+
+    let request = json!({
+        "id": "1",
+        "method": method,
+        "params": params,
+    });
+    let mut line = serde_json::to_string(&request).expect("serialize request");
+    line.push('\n');
+
+    writer
+        .write_all(line.as_bytes())
+        .map_err(|e| RpcError::Io(format!("write request: {e}")))?;
+
+    let mut response_line = String::new();
+    reader
+        .read_line(&mut response_line)
+        .map_err(|e| RpcError::Io(format!("read response: {e}")))?;
+
+    let response: Value = serde_json::from_str(response_line.trim())
+        .map_err(|e| RpcError::Protocol(format!("invalid JSON-RPC response: {e}")))?;
+
+    if let Some(err) = response.get("error").filter(|v| !v.is_null()) {
+        let code = err
+            .get("code")
+            .and_then(|c| c.as_i64())
+            .unwrap_or(-32000) as i32;
+        let message = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown error")
+            .to_string();
+        return Err(RpcError::DaemonRpc { code, message });
+    }
+
+    Ok(response.get("result").cloned().unwrap_or(Value::Null))
+}

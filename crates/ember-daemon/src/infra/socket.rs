@@ -180,6 +180,13 @@ pub struct SocketListener {
     policy: Rc<PolicyEngine>,
     rate_limiter: Rc<RefCell<RateLimiter>>,
     events_tx: broadcast::Sender<GrantEvent>,
+    sessions_dir: Option<PathBuf>,
+    /// implementation-note-88: bound LLM proxy
+    /// URL populated after the proxy listener binds in runtime.rs, then
+    /// plumbed into every connection's RequestContext via handle_connection.
+    llm_proxy_url: Option<String>,
+    /// implementation-note-88: bound git proxy URL.
+    git_proxy_url: Option<String>,
 }
 
 impl SocketListener {
@@ -200,7 +207,30 @@ impl SocketListener {
             policy,
             rate_limiter,
             events_tx,
+            sessions_dir: None,
+            llm_proxy_url: None,
+            git_proxy_url: None,
         }
+    }
+
+    pub fn with_sessions_dir(mut self, sessions_dir: PathBuf) -> Self {
+        self.sessions_dir = Some(sessions_dir);
+        self
+    }
+
+    /// Set the LLM proxy URL on every connection's RequestContext.
+    ///
+    /// Call after the LLM proxy listener binds in runtime.rs. Mirrors
+    /// `with_sessions_dir` from the LAUNCHER-SESSION-RPC plumbing (#2318).
+    pub fn with_llm_proxy_url(mut self, url: Option<String>) -> Self {
+        self.llm_proxy_url = url;
+        self
+    }
+
+    /// Set the git proxy URL on every connection's RequestContext.
+    pub fn with_git_proxy_url(mut self, url: Option<String>) -> Self {
+        self.git_proxy_url = url;
+        self
     }
 
     /// Expose the event broadcast sender so the daemon runtime can publish
@@ -299,6 +329,9 @@ impl SocketListener {
                             let rate_limiter = Rc::clone(&self.rate_limiter);
                             let events_tx = self.events_tx.clone();
                             let events_rx = self.events_tx.subscribe();
+                            let sessions_dir = self.sessions_dir.clone();
+                            let llm_proxy_url = self.llm_proxy_url.clone();
+                            let git_proxy_url = self.git_proxy_url.clone();
                             // development milestone: forward the kernel-derived
                             // peer identity into the per-connection task so
                             // it reaches the request-context layer in handler.rs.
@@ -315,6 +348,9 @@ impl SocketListener {
                                 events_tx,
                                 events_rx,
                                 peer_for_task,
+                                sessions_dir,
+                                llm_proxy_url,
+                                git_proxy_url,
                             ));
                         }
                         Err(e) => {
@@ -597,6 +633,9 @@ async fn handle_connection(
     events_tx: broadcast::Sender<GrantEvent>,
     mut events_rx: broadcast::Receiver<GrantEvent>,
     peer_cred: Option<PeerIdentity>,
+    sessions_dir: Option<PathBuf>,
+    llm_proxy_url: Option<String>,
+    git_proxy_url: Option<String>,
 ) {
     let peer = stream.peer_addr().ok();
     debug!(?peer, ?peer_cred, "handling connection");
@@ -659,13 +698,24 @@ async fn handle_connection(
 
                 debug!(id = %req.id, method = %req.method, "dispatching request");
 
-                let response = match crate::infra::handler::dispatch_method_with_peer(
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                let peer_for_ctx: Option<crate::infra::handler::PeerCred> =
+                    peer_cred.map(Into::into);
+                #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                let peer_for_ctx: Option<crate::infra::handler::PeerCred> = None;
+
+                let mut ctx = crate::infra::handler::RequestContext::socket(peer_for_ctx);
+                ctx.sessions_dir = sessions_dir.clone();
+                ctx.llm_proxy_url = llm_proxy_url.clone();
+                ctx.git_proxy_url = git_proxy_url.clone();
+
+                let response = match crate::infra::handler::dispatch_method_with_context(
                     &store,
                     &vault,
                     &policy,
                     &rate_limiter,
                     Some(&events_tx),
-                    peer_cred,
+                    ctx,
                     &req.method,
                     &req.params,
                 ).await {
@@ -1149,12 +1199,12 @@ mod tests {
     #[test]
     fn annotate_bind_error_unix_socket_addr_in_use_includes_lsof_unix_hint() {
         let raw = io::Error::new(io::ErrorKind::AddrInUse, "Address already in use");
-        let annotated = annotate_bind_error(raw, "/Users/operator/.ember/sock");
+        let annotated = annotate_bind_error(raw, "/Users/example/.ember/sock");
         let msg = annotated.to_string();
 
         assert_eq!(annotated.kind(), io::ErrorKind::AddrInUse);
         assert!(
-            msg.contains("lsof -U /Users/operator/.ember/sock"),
+            msg.contains("lsof -U /Users/example/.ember/sock"),
             "expected `lsof -U <path>` hint for Unix socket, got: {msg}"
         );
         // Should NOT use the `:port` form for filesystem paths.

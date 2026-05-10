@@ -1,1 +1,9 @@
+pub mod aws_sts_config;
+pub mod azure_config;
+pub mod fly_config;
+pub mod gcp_config;
+pub mod github_config;
 pub mod handler;
+pub mod hashivault_config;
+pub mod okta_config;
+pub mod vercel_config;

@@ -17,7 +17,7 @@
 //! name only the violating axis (never the parent's full state) so that a
 //! compromised child cannot use rejections as an oracle for parent state.
 //!
-//! Lifted verbatim from `ember-daemon::attenuation` per implementation-note-12.
+//! Lifted verbatim from `ember-daemon::attenuation` per implementation-note-15.
 //! No I/O — wasm32-compatible.
 
 use core_types::{AccessGrant, Budget, ResourceSelector, Statement, Usage};
@@ -146,7 +146,7 @@ fn parse_scope(scope: &str) -> Result<ScopeParts<'_>, String> {
 ///
 /// Returns `Ok(())` on subset; `Err(DelegationViolation)` otherwise.
 ///
-/// Renamed from `scope_subset` per implementation-note-12 (design §2.1).
+/// Renamed from `scope_subset` per implementation-note-15 (design §2.1).
 /// The behavior is identical — the rename clarifies that this is the
 /// enforcement entry point (returns `Result`), distinct from the bool-returning
 /// `Scope::is_subset_of` helper on the in-memory `core_grants::Grant` type.

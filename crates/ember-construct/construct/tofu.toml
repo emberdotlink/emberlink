@@ -1,0 +1,135 @@
+# CLASSIFICATION: PUBLIC
+# Construct manifest for ember-tofu per design §2.
+#
+# Action schema: each [[actions]] declares an allowed action_key, optional
+# budget caps, biometric requirement, and a permit/deny default. The daemon's
+# broker.resolve consults this to decide whether the action requires a
+# credential mint, an existing grant, or refuses.
+#
+# Credential injection: NONE at the Construct level. OpenTofu is a state-
+# management CLI that consumes existing cloud-provider credentials (AWS /
+# GCP / Azure / etc.) via standard provider env vars. The credential broker
+# lives in the cloud-provider Constructs (`ember-aws`, `ember-az`,
+# `ember-gcloud`, etc.); this Construct only gates destructive state
+# operations. Cloud creds flow through whatever child invocation the OpenTofu
+# providers make.
+#
+# Read-only verbs (`plan`, `validate`, `show`, `state list`, `state show`,
+# `output`, `version`, `providers`, `init`, `fmt`, `console`) classify to
+# `None` (passthrough) and never reach this manifest.
+
+[meta]
+name = "ember-tofu"
+version = "0.1.0"
+publisher = "did:emberlink"
+description = "OpenTofu CLI Construct. Mediates `tofu` state mutations through ember's broker: `tofu destroy` (catastrophic — tears down everything), `tofu force-unlock` (manual lock override), `tofu state {rm, replace-provider, push}` (direct state mutation), and `tofu workspace delete` (workspace-scoped destruction) all require biometric approval. `tofu apply` gates without biometric — apply is the normal operational path and the destructive subset is constrained by what the underlying providers allow (gated by ember-aws / ember-az / ember-gcloud separately). `tofu taint` / `tofu untaint` / `tofu refresh` / `tofu import` / `tofu workspace {new, select}` / `tofu state mv` are gated. NO credential injection at this layer — cloud creds flow through the provider Constructs."
+
+# Default policy for unlisted action keys.
+default = "deny"
+
+# --- top-level mutating verbs ---
+
+# tofu apply: normal operational path. Gate without biometric — the
+# destructive subset of any apply is constrained by what the underlying
+# providers allow, which the cloud-provider Constructs (ember-aws, ember-az,
+# ember-gcloud, etc.) gate separately.
+[[actions]]
+key = "tofu.apply"
+default = "permit"
+mode = "gate"
+
+# tofu destroy: catastrophic — tears down every managed resource.
+# Biometric required.
+[[actions]]
+key = "tofu.destroy"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# tofu import: mutates state to reflect an existing resource. Gated.
+[[actions]]
+key = "tofu.import"
+default = "permit"
+mode = "gate"
+
+# tofu taint / untaint: marks resources for replacement on next apply.
+# Gated (state-mutating; not catastrophic on its own).
+[[actions]]
+key = "tofu.taint"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "tofu.untaint"
+default = "permit"
+mode = "gate"
+
+# tofu refresh: state refresh — touches state file but does not change
+# infrastructure. Gated.
+[[actions]]
+key = "tofu.refresh"
+default = "permit"
+mode = "gate"
+
+# tofu force-unlock: manual state-lock override. Risky — bypasses the
+# concurrency safeguard. Biometric required.
+[[actions]]
+key = "tofu.force-unlock"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- state subcommand (3-level prefix) ---
+
+# tofu state rm: direct removal of resources from state. Resources persist
+# in cloud (orphaned). Biometric required.
+[[actions]]
+key = "tofu.state.rm"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# tofu state mv: rename / re-address resources within state. Gated
+# (reversible by another mv).
+[[actions]]
+key = "tofu.state.mv"
+default = "permit"
+mode = "gate"
+
+# tofu state replace-provider: rewrites provider references across state.
+# Catastrophic if the wrong source/target — biometric required.
+[[actions]]
+key = "tofu.state.replace-provider"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# tofu state push: overwrites remote state with a local file. High-risk —
+# biometric required.
+[[actions]]
+key = "tofu.state.push"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- workspace subcommand (3-level prefix) ---
+
+# tofu workspace new: creates a new workspace. Gated.
+[[actions]]
+key = "tofu.workspace.new"
+default = "permit"
+mode = "gate"
+
+# tofu workspace select: switches active workspace. Gated.
+[[actions]]
+key = "tofu.workspace.select"
+default = "permit"
+mode = "gate"
+
+# tofu workspace delete: workspace-scoped destruction (deletes the state
+# for that workspace). Biometric required.
+[[actions]]
+key = "tofu.workspace.delete"
+default = "permit"
+mode = "gate"
+biometric = "required"

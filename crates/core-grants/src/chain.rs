@@ -1,4 +1,4 @@
-// implementation-note-11 — chain-builder helpers lifted from ember-daemon::trust::grant (design §1 concern 3)
+// implementation-note-14 — chain-builder helpers lifted from ember-daemon::trust::grant (design §1 concern 3)
 
 use core_crypto::grant_chain::{self, RootKeyPair};
 use core_types::{

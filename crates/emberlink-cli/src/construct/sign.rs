@@ -182,7 +182,7 @@ mod tests {
         let toml_path = dir.path().join("construct.toml");
         std::fs::write(
             &toml_path,
-            b"[meta]\npublisher = \"did:ember-systems\"\nname = \"ember-gh\"\n",
+            b"[meta]\npublisher = \"did:emberlink\"\nname = \"ember-gh\"\n",
         )
         .unwrap();
 
@@ -205,7 +205,7 @@ mod tests {
         let sidecar: serde_json::Value = serde_json::from_str(&sidecar_str).unwrap();
 
         assert_eq!(sidecar["schema_version"], 1);
-        assert_eq!(sidecar["publisher_did"], "did:ember-systems");
+        assert_eq!(sidecar["publisher_did"], "did:emberlink");
         assert_eq!(sidecar["name"], "ember-gh");
         assert_eq!(sidecar["version"], "1.0.0");
         assert_eq!(sidecar["signature_alg"], "ed25519");
@@ -220,7 +220,7 @@ mod tests {
         // Verify reproducibility: recompute the hash ourselves.
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"fake-binary-bytes");
-        hasher.update(b"[meta]\npublisher = \"did:ember-systems\"\nname = \"ember-gh\"\n");
+        hasher.update(b"[meta]\npublisher = \"did:emberlink\"\nname = \"ember-gh\"\n");
         let expected_hex = hex::encode(hasher.finalize().as_bytes());
         assert_eq!(
             blake3_field,

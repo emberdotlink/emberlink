@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use ember_daemon::binary_manifest::{
-    BinaryDistributionChannel, BinaryManifest, BinaryManifestEntry, load_manifest,
+    BinaryDistributionChannel, BinaryManifestEntry, load_manifest,
 };
 
 #[derive(Debug, Parser)]
@@ -25,15 +25,11 @@ pub struct BinaryInstallArgs {
     pub publisher: String,
 }
 
-fn manifest_path() -> PathBuf {
-    if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home).join(".ember").join("binaries").join("manifest.toml")
-    } else {
-        PathBuf::from("/usr/local/lib/ember/binaries/manifest.toml")
-    }
+fn manifest_path(home_dir: &std::path::Path) -> PathBuf {
+    home_dir.join(".ember").join("binaries").join("manifest.toml")
 }
 
-pub fn binary_install(args: &BinaryInstallArgs) -> Result<(), Box<dyn std::error::Error>> {
+pub fn binary_install(args: &BinaryInstallArgs, home_dir: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     let (tool_name, version) = args
         .tool_at_version
         .split_once('@')
@@ -52,7 +48,7 @@ pub fn binary_install(args: &BinaryInstallArgs) -> Result<(), Box<dyn std::error
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    let path = manifest_path();
+    let path = manifest_path(home_dir);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -89,7 +85,6 @@ pub fn binary_install(args: &BinaryInstallArgs) -> Result<(), Box<dyn std::error
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
 
     #[test]
     fn install_writes_manifest_entry() {
@@ -99,19 +94,16 @@ mod tests {
         let bin_path = dir.path().join("ember-gh");
         std::fs::write(&bin_path, b"fake-binary").unwrap();
 
-        // Point HOME at a temp dir so manifest goes to a deterministic path.
+        // Use a dedicated tempdir as the home directory; no global env mutation needed.
         let home_dir = tempfile::tempdir().unwrap();
-        // SAFETY: test sets HOME to a tempdir before invoking binary_install.
-        // Single-threaded test; no concurrent env access.
-        unsafe { std::env::set_var("HOME", home_dir.path()); }
 
         let args = BinaryInstallArgs {
             tool_at_version: "ember-gh@1.0.0".to_string(),
             from_path: bin_path.clone(),
-            publisher: "did:ember-systems".to_string(),
+            publisher: "did:emberlink".to_string(),
         };
 
-        binary_install(&args).expect("install should succeed");
+        binary_install(&args, home_dir.path()).expect("install should succeed");
 
         let manifest_path = home_dir.path().join(".ember").join("binaries").join("manifest.toml");
         assert!(manifest_path.exists(), "manifest.toml must be created");

@@ -211,10 +211,10 @@ impl Default for Evidence {
 /// - `Grant` — legacy `GrantReceipt` (grant termination).
 /// - `KmsWrap` / `KmsUnwrap` — `ember-kms` encrypt / decrypt (design).
 /// - `VaultRetrieval` — `ember vault get` retrieval Receipt (per
-///   `RECEIPT-COVERAGE-FIX-implementation-note-15`; emission lands in a
+///   `RECEIPT-COVERAGE-FIX-implementation-note-19`; emission lands in a
 ///   follow-up task — this variant is the type-system seat).
 /// - `BrokerMaterialization` / `BrokerRevocation` — `ember broker`
-///   typed Receipts (per `RECEIPT-COVERAGE-FIX-implementation-note-16`; today
+///   typed Receipts (per `RECEIPT-COVERAGE-FIX-implementation-note-20`; today
 ///   broker emits an audit-log row only — these variants are the
 ///   type-system seats for the typed-Receipt promotion).
 ///
@@ -353,7 +353,7 @@ pub struct BrokerReceipt {
 }
 
 // ---------------------------------------------------------------------------
-// Vault receipts (RECEIPT-COVERAGE-FIX-implementation-note-15 — vault_retrieval)
+// Vault receipts (RECEIPT-COVERAGE-FIX-implementation-note-19 — vault_retrieval)
 // ---------------------------------------------------------------------------
 //
 // Receipts emitted by the vault-get handler. Carry NON-SENSITIVE metadata
@@ -398,7 +398,7 @@ pub struct VaultReceipt {
 /// Signed by the Daemon Persona Ed25519 key — same signing path as [`KmsReceipt`]
 /// and [`BrokerReceipt`].
 ///
-/// **Snapshot scope** per the recovery inventory (implementation-note-17):
+/// **Snapshot scope** per the recovery inventory (implementation-note-21):
 /// includes `credentials`, `vault.salt`, `personas`, `grants`, `standing_grants`,
 /// `audit_log`, `receipts`. Excludes `policy.toml` (config, recovered via GitOps)
 /// and active broker materializations (ephemeral, re-issued on restart).
@@ -580,7 +580,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------------
-    // KMS receipt tests (implementation-note-13)
+    // KMS receipt tests (implementation-note-16)
     // ----------------------------------------------------------------------
 
     fn minimal_kms_wrap_receipt() -> KmsReceipt {

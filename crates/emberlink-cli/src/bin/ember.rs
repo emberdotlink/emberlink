@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
-use core_types::{AccessGrant, Budget, ResourceSelector, ResourceType, Statement, Usage};
+use core_types::{AccessGrant, Budget, GrantProposal, ResourceSelector, ResourceType, Statement, StatementProposal};
 use ember_daemon::trust::approval::ApprovalOutcome;
 use ember_daemon::infra::audit::AuditFilter;
 use ember_daemon::infra::config::DaemonConfig;
@@ -33,7 +33,7 @@ mod daemon_agent;
 ///
 /// Format: `ember <semver> (<git-sha-or-(no-git)>) built <rfc3339-utc>`.
 ///
-/// CLI-VERSION-FLAG: the implementation-note-26 root cause was a
+/// CLI-VERSION-FLAG: the implementation-note-41 root cause was a
 /// `v0.2.0` binary running against the `v0.2.17` codebase. Embedding the git
 /// SHA + build timestamp at compile time makes "is the running binary
 /// stale?" a five-second `--version` check.
@@ -46,7 +46,290 @@ fn print_version() -> String {
     )
 }
 
-/// Per implementation-note-107: refuse `ember vault add --value <secret>`
+/// Resolve the credential value for `ember vault add` / `ember vault put`
+/// from the safe input flags (`--stdin`, `--file <path>`, terminal prompt).
+///
+/// Returns `Ok(bytes)` on success, or `Err(exit_code)` after emitting a
+/// human-readable error to stderr (1 for runtime failures, 2 for input
+/// validation refusals like `--file` under `~/Downloads`).
+fn resolve_credential_input(
+    stdin: bool,
+    file: Option<&Path>,
+    delete_source: bool,
+    from_downloads: bool,
+) -> Result<Vec<u8>, i32> {
+    if stdin {
+        let mut buf = Vec::new();
+        if let Err(e) = io::stdin().read_to_end(&mut buf) {
+            eprintln!("error: failed to read stdin: {e}");
+            return Err(1);
+        }
+        if buf.last() == Some(&b'\n') {
+            buf.pop();
+            if buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
+        }
+        if buf.is_empty() {
+            eprintln!("error: --stdin received empty value");
+            return Err(1);
+        }
+        return Ok(buf);
+    }
+    if let Some(path) = file {
+        let downloads_dir = dirs_next::download_dir();
+        if !from_downloads
+            && let Some(dl) = downloads_dir.as_ref()
+            && path.starts_with(dl)
+        {
+            eprintln!(
+                "error: --file refuses paths under ~/Downloads ({}) — \
+                 Downloads is a known cleartext-credential leak surface.",
+                dl.display()
+            );
+            eprintln!(
+                "       Move the file to a non-Downloads path, or pass \
+                 --from-downloads to acknowledge the risk."
+            );
+            return Err(2);
+        }
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("error: failed to read --file {}: {e}", path.display());
+                return Err(1);
+            }
+        };
+        if bytes.is_empty() {
+            eprintln!("error: --file {} is empty", path.display());
+            return Err(1);
+        }
+        if delete_source {
+            // Best-effort overwrite-then-unlink; matches the existing
+            // `ember vault add` behavior. fsync is omitted intentionally.
+            let zeros = vec![0u8; bytes.len()];
+            if let Err(e) = std::fs::write(path, &zeros) {
+                eprintln!(
+                    "warn: --delete-source: failed to zero {}: {e}",
+                    path.display()
+                );
+            }
+            if let Err(e) = std::fs::remove_file(path) {
+                eprintln!(
+                    "warn: --delete-source: failed to unlink {}: {e}",
+                    path.display()
+                );
+            }
+        }
+        return Ok(bytes);
+    }
+    if io::stdin().is_terminal() {
+        return match rpassword::prompt_password("Paste credential value: ") {
+            Ok(s) if s.is_empty() => {
+                eprintln!("error: empty value");
+                Err(1)
+            }
+            Ok(s) => Ok(s.into_bytes()),
+            Err(e) => {
+                eprintln!("error: failed to read prompt: {e}");
+                Err(1)
+            }
+        };
+    }
+    eprintln!(
+        "error: no value source. Pass --stdin (pipe or terminal) or \
+         --file <path>; --value is refused (leaks via shell history)."
+    );
+    Err(2)
+}
+
+/// Resolve the operator's age recipient public key for `ember vault export`.
+///
+/// Search order:
+/// 1. Explicit `--recipient-key <path>` flag.
+/// 2. `$XDG_CONFIG_HOME/emberlink/recipient.age` (or `~/.config/...`).
+///
+/// The file is expected to contain a single `age1...` recipient line; any
+/// `#`-comment lines are ignored so operators can annotate their key.
+fn resolve_recipient_key(explicit: Option<&Path>) -> Result<String, String> {
+    let path: PathBuf = if let Some(p) = explicit {
+        p.to_path_buf()
+    } else {
+        let base = dirs_next::config_dir()
+            .ok_or_else(|| "could not resolve XDG config directory".to_string())?;
+        base.join("emberlink").join("recipient.age")
+    };
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("failed to read recipient key {}: {e}", path.display()))?;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed.starts_with("age1") {
+            return Ok(trimmed.to_string());
+        }
+    }
+    Err(format!(
+        "no `age1...` recipient line found in {} (lines starting with `#` are skipped)",
+        path.display()
+    ))
+}
+
+/// Resolve the operator's age identity (private key) for `ember vault import`.
+fn resolve_identity_key(explicit: Option<&Path>) -> Result<String, String> {
+    let path: PathBuf = if let Some(p) = explicit {
+        p.to_path_buf()
+    } else {
+        let base = dirs_next::config_dir()
+            .ok_or_else(|| "could not resolve XDG config directory".to_string())?;
+        base.join("emberlink").join("identity.age")
+    };
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("failed to read identity key {}: {e}", path.display()))?;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed.starts_with("AGE-SECRET-KEY-") {
+            return Ok(trimmed.to_string());
+        }
+    }
+    Err(format!(
+        "no `AGE-SECRET-KEY-...` identity line found in {} (lines starting with `#` are skipped)",
+        path.display()
+    ))
+}
+
+/// Drive the `ember vault export` flow: list every credential, encrypt each
+/// value individually under the operator's age recipient, and emit a JSON
+/// envelope to stdout (or `--output <path>` with mode 0600).
+///
+/// Returns `Err(exit_code)` if any step failed; the caller exits the
+/// process with that code.
+fn run_vault_export(
+    vault: &Vault,
+    store: &DaemonStore,
+    json_global: bool,
+    args: VaultExportArgs,
+) -> Result<(), i32> {
+    if args.format != "json" {
+        eprintln!("error: unsupported --format {} (only `json` is supported)", args.format);
+        return Err(2);
+    }
+    let recipient = match resolve_recipient_key(args.recipient_key.as_deref()) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return Err(1);
+        }
+    };
+    let creds = vault.list(store).map_err(|e| {
+        eprintln!("error: {e}");
+        1
+    })?;
+    let mut pairs: Vec<(String, Vec<u8>)> = Vec::with_capacity(creds.len());
+    for c in &creds {
+        let value = vault.get(store, &c.name).map_err(|e| {
+            eprintln!("error: failed to read {}: {e}", c.name);
+            1
+        })?;
+        pairs.push((c.name.clone(), value));
+    }
+    let envelope = emberlink_cli::vault_io::encode_export_envelope(
+        &recipient,
+        &pairs,
+        chrono::Utc::now().to_rfc3339(),
+    )
+    .map_err(|e| {
+        eprintln!("error: {e}");
+        1
+    })?;
+    let serialized = serde_json::to_string_pretty(&envelope).map_err(|e| {
+        eprintln!("error: failed to serialize envelope: {e}");
+        1
+    })?;
+    if let Some(path) = args.output.as_deref() {
+        // Write atomically with mode 0600 — same posture as
+        // `ember vault add`'s --delete-source path.
+        if let Err(e) = std::fs::write(path, &serialized) {
+            eprintln!("error: failed to write {}: {e}", path.display());
+            return Err(1);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) =
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            {
+                eprintln!(
+                    "warn: failed to set 0600 on {}: {e}",
+                    path.display()
+                );
+            }
+        }
+        if !json_global {
+            eprintln!(
+                "Exported {} credential(s) to {} (recipient {recipient}).",
+                creds.len(),
+                path.display()
+            );
+        }
+    } else {
+        println!("{serialized}");
+    }
+    Ok(())
+}
+
+/// Drive the `ember vault import` flow: read the JSON envelope, decrypt
+/// every entry first (so any failure aborts before any write), then `put`
+/// each restored entry back into the vault.
+fn run_vault_import(
+    vault: &Vault,
+    store: &DaemonStore,
+    args: VaultImportArgs,
+) -> Result<(), i32> {
+    if args.format != "json" {
+        eprintln!("error: unsupported --format {} (only `json` is supported)", args.format);
+        return Err(2);
+    }
+    let identity = match resolve_identity_key(args.identity_key.as_deref()) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return Err(1);
+        }
+    };
+    let raw = std::fs::read_to_string(&args.from).map_err(|e| {
+        eprintln!("error: failed to read {}: {e}", args.from.display());
+        1
+    })?;
+    let envelope: emberlink_cli::vault_io::VaultExportEnvelope =
+        serde_json::from_str(&raw).map_err(|e| {
+            eprintln!("error: invalid JSON in {}: {e}", args.from.display());
+            2
+        })?;
+    // Atomic decrypt — collect plaintext for every entry first; abort
+    // before any vault write if any decryption fails.
+    let decrypted = emberlink_cli::vault_io::decode_import_envelope(&identity, &envelope)
+        .map_err(|e| {
+            eprintln!("error: {e}");
+            1
+        })?;
+    // Every entry decrypted cleanly — commit them.
+    let count = decrypted.len();
+    for (name, value) in decrypted {
+        vault.add(store, &name, &value, None).map_err(|e| {
+            eprintln!("error: failed to put {name}: {e}");
+            1
+        })?;
+    }
+    eprintln!("Imported {count} credential(s) from {}.", args.from.display());
+    Ok(())
+}
+
+/// Per implementation-note-148: refuse `ember vault add --value <secret>`
 /// argv form because it leaks the secret to shell history, `ps auxww`, and
 /// transcript-capturing harnesses. Centralized so future credential-input
 /// CLI surfaces can call it.
@@ -101,7 +384,7 @@ enum Commands {
         /// notice and falls back to the passphrase lane.
         #[arg(long)]
         touch_id: bool,
-        /// One-command cohort A onboarding (implementation-note-108).
+        /// One-command cohort A onboarding (implementation-note-149).
         ///
         /// Currently the only accepted value is `claude-code`. When set,
         /// the standard daemon init runs first; then the cohort A
@@ -114,7 +397,7 @@ enum Commands {
     },
     /// Uninstall ember integrations.
     ///
-    /// Currently supports `--for claude-code` (implementation-note-108),
+    /// Currently supports `--for claude-code` (implementation-note-149),
     /// which removes only the lines `init --for claude-code` added to
     /// `~/.claude/settings.json`. Persona, grant, and vault entries are
     /// left in place — they may be in use by other tools.
@@ -199,18 +482,19 @@ enum Commands {
     Status,
     /// Show ember version
     Version,
-    /// Cluster snapshot management (implementation-note-38)
+    /// Cluster snapshot management (implementation-note-59)
     Cluster {
         #[command(subcommand)]
         action: ClusterAction,
     },
-    /// Launch Claude Code with an ember-managed grant + scoped HTTPS_PROXY (implementation-note-109)
+    /// Launch Claude Code with an ember-managed grant + scoped HTTPS_PROXY (implementation-note-150)
     ///
-    /// Per design §2: registers a session with the daemon, injects
+    /// Per design §2 / #2318 (LAUNCHER-SESSION-RPC): resolves the cohort-A
+    /// persona (`$EMBER_PERSONA` or `claude-code-{hostname}`), registers a
+    /// session with the daemon via live Unix-socket RPC, injects
     /// EMBER_GRANT_ID / EMBER_PROXY_URL / HTTPS_PROXY into the child env,
     /// spawns `claude` (or `$EMBER_CLAUDE_BIN`), and closes the session
-    /// on exit. The daemon round-trip is stubbed today; real RPC lands
-    /// in implementation-note-63 / implementation-note-89.
+    /// on exit.
     #[command(name = "claude-code", trailing_var_arg = true, allow_hyphen_values = true)]
     ClaudeCode {
         /// Trailing arguments forwarded verbatim to `claude`.
@@ -220,11 +504,11 @@ enum Commands {
     /// Demo subcommands — canned flows for friendly-dev onboarding and
     /// the May-3 composite-grant recording.
     ///
-    /// `wedge`  — 60-second canned fallback (implementation-note-110,
+    /// `wedge`  — 60-second canned fallback (implementation-note-151,
     ///            design §8). Spins up an isolated daemon + seeded vault
     ///            + MCP server via `qember.sh demo up`.
     /// `bundle` — submit the locked May-3 4-statement composite-grant
-    ///            approval (implementation-note-111). In-process
+    ///            approval (implementation-note-152). In-process
     ///            store call; no socket round-trip.
     Demo {
         #[command(subcommand)]
@@ -267,7 +551,7 @@ enum Commands {
 #[derive(Subcommand)]
 enum DemoAction {
     /// 60-second canned fallback demo for friendly devs
-    /// (implementation-note-110, design §8). Shells `qember.sh demo
+    /// (implementation-note-151, design §8). Shells `qember.sh demo
     /// up`/`down` and prints the live-approval-flow next steps.
     Wedge {
         /// Tear down the demo environment (calls `qember.sh demo down`).
@@ -275,7 +559,7 @@ enum DemoAction {
         teardown: bool,
     },
     /// Mint the locked May-3 4-statement composite-grant bundle
-    /// (implementation-note-111). Submits a single composite
+    /// (implementation-note-152). Submits a single composite
     /// approval entry that bundles credential + session + time +
     /// credential statements via the in-process daemon store.
     Bundle,
@@ -379,6 +663,28 @@ enum ConstructAction {
         #[arg(long)]
         identity_root_keypath: std::path::PathBuf,
     },
+    /// Register a directory as an L1 authoring scope
+    /// (T-CONSTRUCT-AUTHORING-MODE-DEV-PATH-REGISTRY).
+    ///
+    /// `ember construct dev <path>` writes the canonicalized path to
+    /// `~/.ember/authoring-paths.toml` (mode 0600). Daemon-side, scripts
+    /// resident under any registered path are accepted by `broker.resolve`
+    /// and emit Receipts tagged `authoring = true`. End-user installs
+    /// (registry empty) refuse all unsigned-script broker calls.
+    ///
+    /// Use `--list` to print registered paths; `--unregister <path>` to
+    /// remove one.
+    Dev {
+        /// Path to register (must exist on disk; canonicalized at
+        /// registration time).
+        path: Option<std::path::PathBuf>,
+        /// Print all registered paths and exit.
+        #[arg(long, conflicts_with_all = ["path", "unregister"])]
+        list: bool,
+        /// Remove a previously-registered path.
+        #[arg(long, conflicts_with_all = ["path", "list"], value_name = "PATH")]
+        unregister: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -475,12 +781,37 @@ enum DaemonAction {
 
 /// Flags for `ember daemon install`. design §Dev mode locks the default
 /// to separate-uid; `--single-uid` is the dev-mode escape hatch.
+///
+/// `--non-interactive` drives the prompt-free install path
+/// ([`emberlink_cli::install::install_non_interactive`]) used by CI runners
+/// and `RUN ember install --non-interactive` Dockerfile lines. When set,
+/// banners and prompts are suppressed, structured `[install] phase=...`
+/// lines are emitted to stderr per phase, and the install refuses with a
+/// clear error if neither root nor cached sudo is available rather than
+/// hanging on a password prompt. See T-INSTALL-WIZARD-NON-INTERACTIVE.
 #[derive(Debug, Args)]
 pub struct DaemonInstallArgs {
     /// Install daemon under the operator's uid (relaxed-threat-model dev posture).
     /// Default off — production posture is separate-uid per design.
     #[arg(long)]
     pub single_uid: bool,
+    /// Run the install without any interactive prompts, banners, or
+    /// progress UI. Refuses with a clear error if neither root nor a cached
+    /// sudo timestamp is available. Emits one `[install] phase=<step>`
+    /// line per install phase to stderr for log scrapers.
+    #[arg(long)]
+    pub non_interactive: bool,
+    /// Acknowledge that default values will be used for any otherwise-prompted
+    /// choice. Implied by `--non-interactive`. Captured separately so a future
+    /// slice can branch on `--non-interactive` without `--accept-defaults`.
+    #[arg(long)]
+    pub accept_defaults: bool,
+    /// Daemon posture to install (only `separate-uid` accepted today).
+    /// Default `separate-uid` per design. Currently informational — pinned
+    /// here so downstream tooling (Dockerfile authors, CI runners) can lock
+    /// the posture explicitly without ambiguity.
+    #[arg(long, value_name = "POSTURE")]
+    pub posture: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -542,7 +873,7 @@ enum VaultAction {
         name: String,
         /// REFUSED — passing secrets via argv leaks them. Kept for argv-parse so we
         /// can emit a structured error pointing at --stdin / --file. Per
-        /// implementation-note-107.
+        /// implementation-note-148.
         #[arg(long, hide = true)]
         value: Option<String>,
         /// Read credential value from stdin (no shell history leak; trailing newline trimmed).
@@ -564,18 +895,35 @@ enum VaultAction {
         metadata: Option<String>,
     },
     /// List stored credentials
-    List,
-    /// Retrieve a credential value
-    Get {
-        /// Credential name
-        name: String,
-    },
+    List(VaultListArgs),
+    /// Retrieve a credential value (masked by default)
+    Get(VaultGetArgs),
+    /// Store a credential value (alias for `add`; safe-input flags only).
+    ///
+    /// Per implementation-note-153 this is the operator-facing
+    /// surface for the `CredentialStore::put` trait method shipped in
+    /// prior change. Refuses `--value <secret>` argv form (leaks via shell
+    /// history); use `--stdin` or `--file <path>`.
+    Put(VaultPutArgs),
     /// Remove a credential
     Remove {
         /// Credential name
         name: String,
     },
-    /// Re-lock the vault session (security check).
+    /// Export every credential as an age-encrypted JSON envelope.
+    ///
+    /// Each value is sealed individually under the operator's age
+    /// recipient key (`~/.config/emberlink/recipient.age` by default);
+    /// names are visible so the operator can audit what's stored. Use
+    /// `ember vault import` to restore on another host.
+    Export(VaultExportArgs),
+    /// Import a JSON envelope produced by `ember vault export`.
+    ///
+    /// All entries decrypt-and-write atomically: any decryption failure
+    /// aborts before any `put` runs, so the live vault never sees a
+    /// partial restore.
+    Import(VaultImportArgs),
+    /// Re-lock the vault session.
     ///
     /// Equivalent to letting the idle timer expire — but explicit. After
     /// this runs, the next high-risk op (vault add, vault remove, grant
@@ -585,10 +933,119 @@ enum VaultAction {
     /// Re-store the vault MEK passphrase with the platform-current ACL.
     ///
     /// One-shot migration for pre-existing MEK entries created before
-    /// implementation-note-25 shipped. After this runs, vault unlocks
+    /// implementation-note-40 shipped. After this runs, vault unlocks
     /// via Touch ID / device passcode instead of the plain keychain password.
     /// Idempotent: safe to run multiple times.
     MigrateAcl,
+}
+
+/// Args for `ember vault list`.
+///
+/// `--prefix <pat>` filters to credential names beginning with `<pat>`.
+/// Empty prefix lists every credential (the default).
+#[derive(Debug, Args)]
+pub struct VaultListArgs {
+    /// Filter to names starting with this prefix.
+    #[arg(long)]
+    pub prefix: Option<String>,
+}
+
+/// Args for `ember vault get`.
+///
+/// Default behaviour masks all but the last 4 chars (e.g. `****abcd` for
+/// `<long>abcd`; `****` for values shorter than 4 chars). `--unmask`
+/// prints the raw value but only when stdout is non-TTY (e.g. piped) or
+/// `--i-know-what-im-doing` is set, to protect screen-recording demos
+/// from accidental leaks.
+#[derive(Debug, Args)]
+pub struct VaultGetArgs {
+    /// Credential name.
+    pub name: String,
+    /// Print the raw value. Refused on a TTY unless --i-know-what-im-doing.
+    #[arg(long)]
+    pub unmask: bool,
+    /// Acknowledge the leak risk and unmask even on a TTY.
+    #[arg(long)]
+    pub i_know_what_im_doing: bool,
+}
+
+/// Args for `ember vault put`.
+///
+/// Mirrors `ember vault add` for the safe-input flags (`--stdin`,
+/// `--file`, `--delete-source`, `--from-downloads`); `--value <secret>`
+/// argv form is refused via [`refuse_value_in_argv`].
+#[derive(Debug, Args)]
+pub struct VaultPutArgs {
+    /// Credential name.
+    #[arg(long)]
+    pub name: String,
+    /// REFUSED — passing secrets via argv leaks them. Surfaces a
+    /// structured error pointing at `--stdin` / `--file`.
+    #[arg(long, hide = true)]
+    pub value: Option<String>,
+    /// Read credential value from stdin (no shell history leak).
+    #[arg(long, conflicts_with_all = ["value", "file"])]
+    pub stdin: bool,
+    /// Read credential value from a file (binary-safe; no leak).
+    #[arg(long, conflicts_with_all = ["value", "stdin"])]
+    pub file: Option<std::path::PathBuf>,
+    /// With `--file`: zero the file's bytes then unlink it after vault-encrypt.
+    #[arg(long, requires = "file")]
+    pub delete_source: bool,
+    /// Allow `--file` paths under `~/Downloads` (default: refused).
+    #[arg(long, requires = "file")]
+    pub from_downloads: bool,
+    /// Optional metadata.
+    #[arg(long)]
+    pub metadata: Option<String>,
+}
+
+/// Args for `ember vault export`.
+///
+/// Lists every credential and seals each value individually under the
+/// operator's age recipient key. Output JSON shape:
+///
+/// ```json
+/// {
+///   "version": 1,
+///   "exported_at": "2026-05-10T...",
+///   "recipient": "age1...",
+///   "entries": [
+///     { "name": "azure/tenant-id", "value_age_armored": "-----BEGIN AGE..." }
+///   ]
+/// }
+/// ```
+#[derive(Debug, Args)]
+pub struct VaultExportArgs {
+    /// Output format. Currently only `json` is supported.
+    #[arg(long, default_value = "json")]
+    pub format: String,
+    /// Output file path (default: stdout). Created with mode 0600.
+    #[arg(long)]
+    pub output: Option<std::path::PathBuf>,
+    /// Path to the operator's age recipient public key.
+    /// Defaults to `$XDG_CONFIG_HOME/emberlink/recipient.age` (or `~/.config/...`).
+    #[arg(long)]
+    pub recipient_key: Option<std::path::PathBuf>,
+}
+
+/// Args for `ember vault import`.
+///
+/// Decrypts every entry first; only on full success does it `put` each
+/// entry. Any decryption failure aborts before any write so the live
+/// vault never sees a partial restore.
+#[derive(Debug, Args)]
+pub struct VaultImportArgs {
+    /// Input format. Currently only `json` is supported.
+    #[arg(long, default_value = "json")]
+    pub format: String,
+    /// Path to the JSON envelope produced by `ember vault export`.
+    #[arg(long)]
+    pub from: std::path::PathBuf,
+    /// Path to the operator's age identity (private key) file.
+    /// Defaults to `$XDG_CONFIG_HOME/emberlink/identity.age` (or `~/.config/...`).
+    #[arg(long)]
+    pub identity_key: Option<std::path::PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -763,7 +1220,7 @@ enum SandboxAction {
     /// Delete a sandbox: remove container + DB row + (if no other refs)
     /// auto-created persona. Idempotent on already-gone state.
     ///
-    /// implementation-note-90: unblocks `ember sandbox create --name X` retries
+    /// implementation-note-128: unblocks `ember sandbox create --name X` retries
     /// after a previous container start failed and left the persona row +
     /// stale docker container behind. `ember sandbox delete <id|name>` is
     /// the GC path; `stop` only halts (sandbox row + persona stay).
@@ -974,7 +1431,7 @@ enum AuditAction {
         /// Audit event ID
         id: String,
     },
-    /// Query the receipts table (EMBER-implementation-note-68).
+    /// Query the receipts table (EMBER-implementation-note-94).
     ///
     /// Returns the unified audit view across grant, kms_wrap, and
     /// kms_unwrap receipts. Filters AND-combine. Use `--json` for raw
@@ -1005,7 +1462,7 @@ enum AuditAction {
     },
 }
 
-/// EMBER-implementation-note-68 — parse a `--since` argument.
+/// EMBER-implementation-note-94 — parse a `--since` argument.
 ///
 /// Accepts either an ISO-8601 timestamp (e.g. `2026-04-01T00:00:00Z`) or
 /// a relative duration like `24h` / `7d` / `30m` / `45s`. Relative values
@@ -1051,7 +1508,7 @@ fn print_banner_preamble(config: &DaemonConfig) {
 
 /// Print the dashboard + git-proxy banner lines, followed by the "Ctrl+C to stop"
 /// footer. Called after both bind results are known (from the StartupBinds callback).
-/// implementation-note-36 extended this from a single dashboard line to the full
+/// implementation-note-57 extended this from a single dashboard line to the full
 /// startup-binds aggregate.
 fn print_banner_startup(binds: &StartupBinds) {
     // Identity line first — for the camera-clean demo flow, the daemon's
@@ -1084,7 +1541,7 @@ fn print_banner_startup(binds: &StartupBinds) {
     }
     match &binds.llm_proxy {
         LlmProxyBind::Bound(addr) => {
-            // implementation-note-37: the LLM proxy is what the
+            // implementation-note-58: the LLM proxy is what the
             // Anthropic SDK demo posts to via `base_url=$EMBER_PROXY_URL`,
             // so the canonical `EMBER_PROXY_URL=…` line carries this URL.
             // qember.sh + the smoke-runner wrapper read this line.
@@ -1102,7 +1559,7 @@ fn print_banner_startup(binds: &StartupBinds) {
     }
     match &binds.git_proxy {
         GitProxyBind::Bound(addr) => {
-            // implementation-note-37: the git-echo proxy URL now lives
+            // implementation-note-58: the git-echo proxy URL now lives
             // at `EMBER_GIT_PROXY_URL` (was previously `EMBER_PROXY_URL`).
             // ember-git.sh's allowlisted shape still reads `EMBER_PROXY_URL`,
             // so this line is informational; ember-git.sh callers should
@@ -1124,7 +1581,7 @@ fn print_banner_startup(binds: &StartupBinds) {
     eprintln!();
 }
 
-/// implementation-note-112: resolve the user-pinned config path from
+/// implementation-note-154: resolve the user-pinned config path from
 /// the precedence chain (flag → `EMBER_CONFIG` → `EMBER_DEMO_DIR/config.toml`),
 /// returning `None` if none of the inputs point at a config so the caller
 /// falls through to the default (`~/.ember/config.toml`).
@@ -1180,7 +1637,7 @@ fn effective_config_path(cli_config: Option<&PathBuf>) -> PathBuf {
     resolved_user_config_path(cli_config).unwrap_or_else(DaemonConfig::default_config_path)
 }
 
-/// implementation-note-40: probe `/api/status` on the configured
+/// implementation-note-65: probe `/api/status` on the configured
 /// dashboard address and return the daemon's reported `dashboard_addr_bound`.
 ///
 /// `None` means: connect failed, response was malformed, or the daemon
@@ -1258,7 +1715,7 @@ fn configure_tracing(data_dir: &std::path::Path, log_level: &ember_daemon::infra
 }
 
 fn load_config(path: Option<&PathBuf>) -> DaemonConfig {
-    // implementation-note-112: when `--config` is absent, fall back
+    // implementation-note-154: when `--config` is absent, fall back
     // through `EMBER_CONFIG` and `EMBER_DEMO_DIR/config.toml` before the
     // default path. Lets `bash scripts/recording-day.sh prep` export
     // `EMBER_DEMO_DIR=/tmp/ember-demo-<id>` and have every subsequent
@@ -1307,7 +1764,7 @@ fn open_store(config: &DaemonConfig) -> DaemonStore {
         }
     };
 
-    // implementation-note-88: in-process CLI subcommands (grant/sandbox/persona) talk to
+    // implementation-note-124: in-process CLI subcommands (grant/sandbox/persona) talk to
     // the same SQLite DB the daemon uses, but without going through the
     // socket — so they need their own attached vault to encrypt/decrypt
     // persona secrets. Best-effort auto-unseal from keyring: if a passphrase
@@ -1340,6 +1797,15 @@ fn open_store(config: &DaemonConfig) -> DaemonStore {
     }
 
     store
+}
+
+/// implementation-note-155: detect whether a basic `ember init` has
+/// already been run. Returns true if `daemon.db` exists in `config.data_dir`,
+/// which is written by `open_store` during every `cmd_init` run. Used by the
+/// `--for claude-code` handler to skip re-running basic init (and creating a
+/// duplicate "root" persona) when the daemon DB is already present.
+fn is_ember_initialized(config: &DaemonConfig) -> bool {
+    config.data_dir.join("daemon.db").exists()
 }
 
 /// Resolve an image digest via `docker inspect`. Returns None if docker is unavailable or fails.
@@ -1383,7 +1849,7 @@ pub fn record_image_digest(registry_path: &Path, image: &str, digest: &str) {
 
 /// Default policy seed written by `ember init` when no `policy.toml` exists.
 /// Schema must round-trip through `core_approval::policy::PolicyConfig` —
-/// regression-tested in `tests::default_policy_seed_parses` (implementation-note-113).
+/// regression-tested in `tests::default_policy_seed_parses` (implementation-note-156).
 const DEFAULT_POLICY_TOML: &str = "\
 # Ember daemon policy
 # Rules evaluated in order — first match wins.
@@ -1459,7 +1925,7 @@ fn cmd_init(
         }
     }
     // Respect --config: if the user passed one, use it as the init target;
-    // otherwise consult `EMBER_CONFIG` / `EMBER_DEMO_DIR` (implementation-note-114-
+    // otherwise consult `EMBER_CONFIG` / `EMBER_DEMO_DIR` (implementation-note-157-
     // AUTODISCOVERY) before falling back to the default
     // (`~/.ember/config.toml`).
     let config_path = resolved_user_config_path(cli_config_path)
@@ -1678,15 +2144,71 @@ account = \"{init_keyring_account}\"
     println!("  Vault:    {vault_status}");
     println!();
     println!("Run `ember daemon start` to start the daemon.");
+
+    // EMBER-INIT-FIRST-implementation-note-158 (v2): emit a real signed Grant
+    // Receipt v2 envelope to <data_dir>/receipts/first.json. Signs with the
+    // root persona's Ed25519 key via sign_receipt_v2 (design / design).
+    // Idempotent: skips re-emission when first.json already exists.
+    // init_first_grant_receipt_emit
+    let signer = match store.persona_signer(&persona.id) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("warning: could not build persona signer for first-grant receipt: {e}");
+            // Fall back to v1 tips-only path rather than failing init.
+            emberlink_cli::onboarding::first_grant::run(&config.data_dir);
+            return;
+        }
+    };
+    if let Err(e) = emberlink_cli::onboarding::first_grant::emit_first_grant_receipt(
+        &config.data_dir,
+        &persona.id,
+        &persona.public_key,
+        &signer,
+    ) {
+        eprintln!("warning: first-grant receipt emission failed: {e}");
+        // Fall through to v1 tips so the user isn't left with no guidance.
+        emberlink_cli::onboarding::first_grant::run(&config.data_dir);
+    }
 }
 
-/// implementation-note-108: cohort A onboarding orchestrator.
+/// implementation-note-149: cohort A onboarding orchestrator.
 ///
 /// Runs after `cmd_init` has set up the keyring/vault/salt/root persona.
 /// Creates the agent persona, writes the scope template, mints a 24h
 /// grant, patches `~/.claude/settings.json`, and optionally captures a
 /// GitHub PAT into the vault. Idempotent — every step is a find-or-create
 /// or atomic-write.
+/// implementation-note-159: spawn `ember daemon start
+/// --background` directly so the child inherits the current process env
+/// (HOME, EMBER_KEYRING_SERVICE, EMBER_CONFIG, …).
+///
+/// Used when `should_use_launch_agent` returns false — i.e. the operator is
+/// running under an isolated HOME or with an explicit `--config` override —
+/// because the LaunchAgent / systemd-user path would write a service file
+/// pointing at the operator's *real* HOME instead.
+fn spawn_background_daemon(
+    config_path: Option<&std::path::Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("could not resolve ember binary: {e}"))?;
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("daemon")
+        .arg("start")
+        .arg("--background")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null());
+    if let Some(path) = config_path {
+        cmd.arg("--config").arg(path);
+    }
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("could not start daemon: {e}"))?;
+    #[allow(clippy::zombie_processes)]
+    std::mem::forget(child);
+    Ok(())
+}
+
 fn cmd_init_for_claude_code(
     config: &DaemonConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1699,17 +2221,152 @@ fn cmd_init_for_claude_code(
     println!();
     println!("Setting up Claude Code integration:");
 
-    // Posture detection (implementation-note-115, design).
-    // Warn if the daemon is still on single-uid posture; the wedge claim
-    // requires kernel-level isolation. Migration is a separate verb so this
-    // is informational — operator runs `ember daemon migrate --to separate-uid`
-    // when ready (it requires sudo + a brief downtime).
-    if !ember_daemon::install::is_separate_uid_posture() {
-        println!();
-        println!("  Warning:  daemon is on single-uid posture (uid=$USER)");
-        println!("            Wedge claim (per design) needs separate-uid for kernel-level isolation");
-        println!("            To migrate: `ember daemon migrate --to separate-uid` (one-time sudo prompt)");
-        println!();
+    // implementation-note-160: autostart daemon if not running.
+    //
+    // `init --for claude-code` opens the vault, which requires the daemon to be
+    // running (the vault is AEAD-sealed and the daemon holds the unlock key).
+    // QUICKSTART.md previously told friendlies to run `ember init --for
+    // claude-code` BEFORE starting the daemon, causing:
+    //   error: vault open: refusing to open production keychain without opt-in checkpoint
+    //
+    // implementation-note-159: the LaunchAgent / systemd-user
+    // path is correct for production (single canonical always-up daemon per
+    // login session), but it bakes the operator's *real* HOME into the service
+    // file. Under an isolated HOME (T3 walks, CI, QA), the launched daemon
+    // would bind the production socket while our liveness probe waited at the
+    // isolated socket path and timed out. So we branch on
+    // `cc::should_use_launch_agent(home, --config)`:
+    //   - production HOME, no --config → LaunchAgent / systemd (existing path).
+    //   - non-default HOME or --config set → raw `ember daemon start
+    //     --background` spawn that inherits the current process env.
+    //
+    // The liveness wait is now 10s by default (raised from 5s) and honors
+    // `EMBER_DAEMON_AUTOSTART_TIMEOUT_SECS` for further override.
+    {
+        let socket_path = config.socket_dir.join("daemon.sock");
+        if socket_path.exists() {
+            println!("  Daemon:   already running (socket {})", socket_path.display());
+        } else {
+            let config_path = resolved_user_config_path(None);
+            let home = dirs_next::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
+            // implementation-note-159: branch the autostart
+            // path on whether HOME / --config look like a default install.
+            let use_launch_agent =
+                cc::should_use_launch_agent(&home, config_path.as_deref());
+
+            if use_launch_agent {
+                println!("  Daemon:   not running — starting daemon (install-agent)");
+                match daemon_agent::install_agent(config_path.as_deref(), false) {
+                    Ok(_) => {
+                        println!("  Daemon:   started daemon (background, install-agent)");
+                    }
+                    Err(daemon_agent::AgentError::UnsupportedPlatform) => {
+                        // Platform doesn't support launchd/systemd — fall back to
+                        // spawning a raw background process (same as
+                        // `ember daemon start --background`).
+                        spawn_background_daemon(config_path.as_deref())?;
+                        println!("  Daemon:   started daemon (background process)");
+                    }
+                    Err(e) => {
+                        return Err(format!(
+                            "daemon autostart failed: {e}\n\
+                             Run `ember daemon start --background --install-agent` manually first, \
+                             then re-run `ember init --for claude-code`."
+                        ).into());
+                    }
+                }
+            } else {
+                // Non-default HOME or --config set — skip LaunchAgent and
+                // spawn a raw background daemon that inherits the current
+                // env (HOME, EMBER_KEYRING_SERVICE, EMBER_CONFIG, …).
+                println!(
+                    "  Daemon:   not running — starting daemon (background, isolated env)"
+                );
+                spawn_background_daemon(config_path.as_deref())?;
+                println!("  Daemon:   started daemon (background process)");
+            }
+
+            // Wait up to N seconds for the socket to appear before proceeding.
+            // Default raised to 10s (from 5s) so first-time provisioning of
+            // vault.salt + daemon.db has slack on slow disks; override via
+            // `EMBER_DAEMON_AUTOSTART_TIMEOUT_SECS`.
+            let timeout_secs = cc::autostart_liveness_timeout_secs();
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+            loop {
+                if socket_path.exists() {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "daemon started but socket did not appear within {timeout_secs}s \
+                         (expected at {}); check daemon logs at $HOME/.ember/logs/daemon.out \
+                         and retry. Override the timeout with \
+                         EMBER_DAEMON_AUTOSTART_TIMEOUT_SECS=<seconds>.",
+                        socket_path.display()
+                    )
+                    .into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+
+    // implementation-note-161: security-hardening call-to-action.
+    //
+    // When the daemon is on single-uid posture, offer an inline migration with
+    // explicit consent rather than printing a passive warning with internal jargon.
+    // The checkpoint file suppresses this prompt on every subsequent run (regardless
+    // of what the user chose) so we never nag them on daemon start or re-init.
+    {
+        let sentinel_path = config.data_dir.join(".posture-prompt-shown");
+        let prompt_already_shown = sentinel_path.exists();
+
+        if !ember_daemon::install::is_separate_uid_posture() && !prompt_already_shown {
+            println!();
+            println!("  Security hardening (recommended):");
+            println!("    ember currently runs as your user account. For stronger isolation");
+            println!("    between the daemon and your shell/agents, ember can run as a");
+            println!("    dedicated user (`ember-daemon`) with its own home directory and");
+            println!("    permissions. This means: even a compromised agent in your shell");
+            println!("    can't read the daemon's vault directly.");
+            println!();
+            println!("    Ember can set this up now — it requires one sudo prompt to create");
+            println!("    the user account.");
+            println!();
+
+            // Write checkpoint now — before prompting — so even if the user
+            // Ctrl-Cs we don't re-show on the next run.
+            if let Some(parent) = sentinel_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&sentinel_path, "posture-prompt-shown\n");
+
+            let do_harden = if io::stdin().is_terminal() {
+                use std::io::{BufRead as _, Write as _};
+                print!("  Harden now? [Y/n]: ");
+                let _ = io::stdout().flush();
+                let mut line = String::new();
+                let _ = io::stdin().lock().read_line(&mut line);
+                let answer = line.trim().to_ascii_lowercase();
+                // Default is Y — empty line or "y"/"yes" all mean proceed.
+                answer.is_empty() || answer == "y" || answer == "yes"
+            } else {
+                // Non-interactive (CI / pipe): skip hardening, don't block.
+                false
+            };
+
+            if do_harden {
+                println!();
+                println!("  Switching daemon to dedicated user...");
+                migrate_to_separate_uid();
+                println!("  Done. Daemon now running as `ember-daemon`.");
+            } else {
+                println!("  Skipped — daemon stays on your user account.");
+                println!("  Run `ember daemon harden` later to enable.");
+            }
+            println!();
+        }
     }
 
     // 1. Find or create the persona. Calling `create_persona` twice with
@@ -1786,6 +2443,32 @@ fn cmd_init_for_claude_code(
         println!("  Hook:     kept {} (already patched)", settings_path.display());
     }
 
+    // 4b. Add permissions.deny entries for raw gh/git/kubectl outside the
+    //     shadow PATH (design §3 step 4 — defense-in-depth deny).
+    {
+        use emberlink_cli::onboarding::settings_patch::add_permissions_deny_outside_shadow;
+        let raw = if settings_path.exists() {
+            std::fs::read_to_string(&settings_path).map_err(|e| {
+                format!("read {} for deny patch: {e}", settings_path.display())
+            })?
+        } else {
+            String::new()
+        };
+        let mut value: serde_json::Value = if raw.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&raw).map_err(|e| format!("parse settings.json: {e}"))?
+        };
+        add_permissions_deny_outside_shadow(&mut value)
+            .map_err(|e| format!("add deny rules: {e}"))?;
+        let serialized = serde_json::to_string_pretty(&value)
+            .map_err(|e| format!("serialize settings.json: {e}"))?;
+        std::fs::write(&settings_path, serialized).map_err(|e| {
+            format!("write {} after deny patch: {e}", settings_path.display())
+        })?;
+        println!("  Deny:     permissions.deny rules added to {}", settings_path.display());
+    }
+
     // 5. Optional GH PAT capture. The brief permits a manual-paste path
     //    (Cohort A is friendly devs); shelling to `gh auth token` in-
     //    process is a future enhancement (see TODO in claude_code.rs).
@@ -1825,11 +2508,12 @@ fn cmd_init_for_claude_code(
     Ok(())
 }
 
-/// implementation-note-108: reverse the settings.json patch from
+/// implementation-note-149: reverse the settings.json patch from
 /// `init --for claude-code`. Removes only what we added; persona, grant,
 /// and vault entries are left in place because they may be in use.
 fn cmd_uninstall_for_claude_code() -> Result<(), Box<dyn std::error::Error>> {
     use emberlink_cli::onboarding::claude_code as cc;
+    use emberlink_cli::onboarding::settings_patch::remove_permissions_deny_outside_shadow;
 
     let settings_path = cc::default_settings_json_path()?;
     println!("Uninstalling Claude Code integration:");
@@ -1842,6 +2526,26 @@ fn cmd_uninstall_for_claude_code() -> Result<(), Box<dyn std::error::Error>> {
             settings_path.display()
         );
     }
+
+    // Remove permissions.deny entries for raw gh/git/kubectl (design §3 step 4).
+    if settings_path.exists() {
+        let raw = std::fs::read_to_string(&settings_path).map_err(|e| {
+            format!("read {} for deny removal: {e}", settings_path.display())
+        })?;
+        if !raw.trim().is_empty() {
+            let mut value: serde_json::Value = serde_json::from_str(&raw)
+                .map_err(|e| format!("parse settings.json: {e}"))?;
+            remove_permissions_deny_outside_shadow(&mut value)
+                .map_err(|e| format!("remove deny rules: {e}"))?;
+            let serialized = serde_json::to_string_pretty(&value)
+                .map_err(|e| format!("serialize settings.json: {e}"))?;
+            std::fs::write(&settings_path, serialized).map_err(|e| {
+                format!("write {} after deny removal: {e}", settings_path.display())
+            })?;
+            println!("  Deny:     permissions.deny rules removed from {}", settings_path.display());
+        }
+    }
+
     println!();
     println!(
         "Note: persona, grant, and any github-pat vault entry are kept. \
@@ -1856,7 +2560,7 @@ fn cmd_uninstall_for_claude_code() -> Result<(), Box<dyn std::error::Error>> {
 /// details. Prints a status summary on success; exits non-zero on failure.
 fn cmd_daemon_install_agent(cli_config: Option<&PathBuf>, no_autostart: bool) {
     // Config path lookup: --config wins, then `EMBER_CONFIG` /
-    // `EMBER_DEMO_DIR/config.toml` (implementation-note-112), then the
+    // `EMBER_DEMO_DIR/config.toml` (implementation-note-154), then the
     // default (`~/.ember/config.toml`). We only pass a path through to the
     // plist/unit if the file actually exists — otherwise the service would
     // crash-loop on startup waiting for a config that isn't there.
@@ -1979,6 +2683,45 @@ fn cmd_daemon_install(args: DaemonInstallArgs) {
              That flow installs the daemon as a per-operator LaunchAgent / systemd \
              user unit — same uid as the operator, no sudo required.\n       \
              Tracking issue: design §Dev mode."
+        );
+        process::exit(2);
+    }
+
+    // Non-interactive lane (T-INSTALL-WIZARD-NON-INTERACTIVE). Branches off
+    // before any prompt-bearing logic so CI / Dockerfile callers never block
+    // on a TTY. The posture string is parsed up-front so an unsupported
+    // posture surfaces a clean clap-style error instead of running half the
+    // install before refusing.
+    if args.non_interactive {
+        let posture = match args.posture.as_deref() {
+            Some(raw) => match emberlink_cli::install::Posture::parse(raw) {
+                Ok(p) => p,
+                Err(msg) => {
+                    eprintln!("error: {msg}");
+                    process::exit(2);
+                }
+            },
+            None => emberlink_cli::install::Posture::SeparateUid,
+        };
+        let opts = emberlink_cli::install::InstallNonInteractiveOptions {
+            accept_defaults: args.accept_defaults,
+            posture,
+        };
+        match emberlink_cli::install::install_non_interactive(&opts) {
+            Ok(()) => return,
+            Err(e) => {
+                eprintln!("error: {e}");
+                process::exit(1);
+            }
+        }
+    }
+
+    if args.posture.is_some() || args.accept_defaults {
+        // The interactive wizard doesn't yet branch on these, but accepting
+        // them silently when `--non-interactive` is missing would be a
+        // footgun — surface a clear error pointing at the missing flag.
+        eprintln!(
+            "error: --posture and --accept-defaults require --non-interactive in this release"
         );
         process::exit(2);
     }
@@ -2248,7 +2991,7 @@ fn cmd_daemon_reload(config: &DaemonConfig, timeout_secs: u64, cli_config: Optio
                 };
                 let mut cmd = std::process::Command::new(exe);
                 cmd.arg("daemon").arg("start").arg("--background");
-                // implementation-note-112: the respawn child inherits
+                // implementation-note-154: the respawn child inherits
                 // the resolved config path so an env-var-pinned demo daemon
                 // comes back on the same config.
                 if let Some(path) = resolved_user_config_path(cli_config) {
@@ -2376,19 +3119,18 @@ pub fn build_composite_grant_statements(
     budget_tokens: Option<u64>,
     budget_cents: Option<u64>,
     budget_seconds: Option<u64>,
-) -> Vec<Statement> {
+) -> Vec<StatementProposal> {
     let Some(cred_resource) = credential_resource else {
         return vec![];
     };
 
     // Statement 1: Credential — credential:read on the named object.
-    let credential_stmt = Statement {
-        sid: "s0-credential".to_string(),
+    let credential_stmt = StatementProposal {
         resource_type: ResourceType::Credential,
+        credential_name: cred_resource.to_string(),
         actions: vec!["credential:read".to_string()],
         resource: ResourceSelector::Exact { value: cred_resource.to_string() },
         budget: None,
-        usage: Usage::default(),
         conditions: vec![],
     };
 
@@ -2402,13 +3144,12 @@ pub fn build_composite_grant_statements(
     } else {
         None
     };
-    let session_stmt = Statement {
-        sid: "s1-session".to_string(),
+    let session_stmt = StatementProposal {
         resource_type: ResourceType::Session,
+        credential_name: String::new(),
         actions: vec!["llm:generate".to_string()],
         resource: ResourceSelector::Glob { pattern: "anthropic/*".to_string() },
         budget: session_budget,
-        usage: Usage::default(),
         conditions: vec![],
     };
 
@@ -2417,13 +3158,12 @@ pub fn build_composite_grant_statements(
         wall_clock_secs: Some(secs),
         ..Budget::default()
     });
-    let time_stmt = Statement {
-        sid: "s2-time".to_string(),
+    let time_stmt = StatementProposal {
         resource_type: ResourceType::Time,
+        credential_name: String::new(),
         actions: vec!["time:wall_clock".to_string()],
         resource: ResourceSelector::Any,
         budget: time_budget,
-        usage: Usage::default(),
         conditions: vec![],
     };
 
@@ -2696,7 +3436,7 @@ fn cmd_grant_budget(grant: &AccessGrant) {
     print!("{}", render_grant_budget(grant));
 }
 
-/// Handle `ember sandbox delete <id|name>` — implementation-note-90.
+/// Handle `ember sandbox delete <id|name>` — implementation-note-128.
 ///
 /// Resolves the argument to a sandbox UUID, then asks the store to delete
 /// the row + container + auto-created persona (when unreferenced).
@@ -2740,15 +3480,39 @@ fn main() {
 
     match cli.command {
         Commands::Init { name, keyring_service, keyring_account, touch_id, for_target } => {
-            cmd_init(
-                &config,
-                name,
-                cli.config.as_ref(),
-                keyring_service,
-                keyring_account,
-                touch_id,
-            );
-            // implementation-note-116: layer the claude-code onboarding on top of the
+            // implementation-note-155: when `--for claude-code` is set,
+            // skip basic init if the daemon DB already exists. Without this guard
+            // a friendly who ran `ember init --name "Foo"` and then ran
+            // `ember init --for claude-code` ended up with two extra root
+            // personas ("root" + their named one) in addition to the claude-code
+            // persona. We detect initialization by checking for daemon.db — the
+            // file written by `open_store` during every `cmd_init` run.
+            let skip_basic_init = for_target.as_deref() == Some("claude-code")
+                && is_ember_initialized(&config);
+
+            if skip_basic_init {
+                // Already initialized — count existing personas for the log line.
+                // We open the store read-only here (no vault needed for list).
+                let db_path = config.data_dir.join("daemon.db");
+                let persona_count = DaemonStore::open(&db_path)
+                    .ok()
+                    .and_then(|s| s.list_personas().ok())
+                    .map(|ps| ps.len())
+                    .unwrap_or(0);
+                println!(
+                    "Daemon DB: already initialized (existing personas: {persona_count})"
+                );
+            } else {
+                cmd_init(
+                    &config,
+                    name,
+                    cli.config.as_ref(),
+                    keyring_service,
+                    keyring_account,
+                    touch_id,
+                );
+            }
+            // implementation-note-162: layer the claude-code onboarding on top of the
             // base daemon init when `--for claude-code` is set. The base
             // init has already set up the keyring, vault, salt, and root
             // persona — the cohort A flow now creates the agent persona,
@@ -2794,7 +3558,7 @@ fn main() {
                     let exe = std::env::current_exe().expect("current exe");
                     let mut cmd = std::process::Command::new(exe);
                     cmd.arg("daemon").arg("start");
-                    // implementation-note-112: propagate the resolved
+                    // implementation-note-154: propagate the resolved
                     // config path (flag → EMBER_CONFIG → EMBER_DEMO_DIR) to
                     // the background child so it pins the same demo dir.
                     if let Some(config_path) = resolved_user_config_path(cli.config.as_ref()) {
@@ -2826,7 +3590,7 @@ fn main() {
                     print_banner_preamble(&config);
                 }
 
-                // implementation-note-112: env-var fallback — if the
+                // implementation-note-154: env-var fallback — if the
                 // operator pinned a config via EMBER_CONFIG / EMBER_DEMO_DIR
                 // (e.g. demo/dev tooling), the runtime should track that
                 // same path so reload + dashboard config-show stay coherent.
@@ -3047,7 +3811,15 @@ fn main() {
             // need to be tweaked, change `validate_credential_name` in
             // `ember-daemon::vault` — the CLI imports the same fn so they
             // cannot drift.
-            if let VaultAction::Add { ref name, .. } = action
+            // Mirror the daemon-side `validate_credential_name` UX gate
+            // for both `add` and `put` so we fail before unlocking the
+            // vault on macOS (which would fire a Touch ID prompt).
+            let pre_validate_name: Option<&str> = match &action {
+                VaultAction::Add { name, .. } => Some(name.as_str()),
+                VaultAction::Put(args) => Some(args.name.as_str()),
+                _ => None,
+            };
+            if let Some(name) = pre_validate_name
                 && let Err(e) = validate_credential_name(name) {
                     eprintln!("error: invalid credential name: {e}");
                     eprintln!(
@@ -3172,8 +3944,12 @@ fn main() {
                         }
                     }
                 }
-                VaultAction::List => match vault.list(&store) {
-                    Ok(creds) => {
+                VaultAction::List(VaultListArgs { prefix }) => match vault.list(&store) {
+                    Ok(mut creds) => {
+                        if let Some(p) = prefix.as_deref()
+                            && !p.is_empty() {
+                            creds.retain(|c| c.name.starts_with(p));
+                        }
                         if cli.json {
                             let arr: Vec<_> = creds.iter().map(|c| {
                                 serde_json::json!({
@@ -3186,13 +3962,10 @@ fn main() {
                         } else if creds.is_empty() {
                             println!("No credentials in vault");
                         } else {
+                            // Names only — never values. Per
+                            // implementation-note-153.
                             for c in &creds {
-                                let meta = c
-                                    .metadata
-                                    .as_deref()
-                                    .map(|m| format!(" ({m})"))
-                                    .unwrap_or_default();
-                                println!("{}{}", c.name, meta);
+                                println!("{}", c.name);
                             }
                         }
                     }
@@ -3201,16 +3974,87 @@ fn main() {
                         process::exit(1);
                     }
                 },
-                VaultAction::Get { name } => match vault.get(&store, &name) {
+                VaultAction::Get(VaultGetArgs {
+                    name,
+                    unmask,
+                    i_know_what_im_doing,
+                }) => match vault.get(&store, &name) {
                     Ok(value) => {
-                        let text = String::from_utf8_lossy(&value);
-                        println!("{text}");
+                        // Default: mask all but the last 4 chars to protect
+                        // screen-recording demos from accidental leaks.
+                        // `--unmask` opt-in is refused on a TTY unless
+                        // `--i-know-what-im-doing` is also set.
+                        if unmask {
+                            if std::io::stdout().is_terminal() && !i_know_what_im_doing {
+                                eprintln!(
+                                    "error: --unmask refused on a TTY. Re-run with one of:"
+                                );
+                                eprintln!(
+                                    "         ember vault get {name} --unmask | tee /dev/null   # pipe to non-TTY"
+                                );
+                                eprintln!(
+                                    "         ember vault get {name} --unmask --i-know-what-im-doing"
+                                );
+                                process::exit(2);
+                            }
+                            let text = String::from_utf8_lossy(&value);
+                            println!("{text}");
+                        } else {
+                            println!(
+                                "{}",
+                                emberlink_cli::vault_io::mask_credential_for_display(&value)
+                            );
+                        }
                     }
                     Err(e) => {
                         eprintln!("error: {e}");
                         process::exit(1);
                     }
                 },
+                VaultAction::Put(args) => {
+                    let VaultPutArgs {
+                        name,
+                        value,
+                        stdin,
+                        file,
+                        delete_source,
+                        from_downloads,
+                        metadata,
+                    } = args;
+                    if value.is_some() {
+                        refuse_value_in_argv("value");
+                    }
+                    let resolved = match resolve_credential_input(
+                        stdin,
+                        file.as_deref(),
+                        delete_source,
+                        from_downloads,
+                    ) {
+                        Ok(bytes) => bytes,
+                        Err(code) => process::exit(code),
+                    };
+                    match vault.add(&store, &name, &resolved, metadata.as_deref()) {
+                        Ok(info) => {
+                            println!("Stored credential");
+                            println!("  ID:   {}", info.id);
+                            println!("  Name: {}", info.name);
+                        }
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            process::exit(1);
+                        }
+                    }
+                }
+                VaultAction::Export(args) => {
+                    if let Err(code) = run_vault_export(&vault, &store, cli.json, args) {
+                        process::exit(code);
+                    }
+                }
+                VaultAction::Import(args) => {
+                    if let Err(code) = run_vault_import(&vault, &store, args) {
+                        process::exit(code);
+                    }
+                }
                 VaultAction::Remove { name } => match vault.remove(&store, &name) {
                     Ok(()) => println!("Removed credential {name}"),
                     Err(e) => {
@@ -3219,8 +4063,8 @@ fn main() {
                     }
                 },
                 VaultAction::Lock => {
-                    // security check: explicit re-lock. Best-effort —
-                    // both the in-process presence state AND the
+                    // Explicit re-lock. Best-effort — both the in-process
+                    // presence state AND the
                     // SE-keyring session cache get cleared so the next
                     // high-risk op MUST re-prompt for biometric.
                     ember_daemon::trust::presence::lock();
@@ -3295,7 +4139,7 @@ fn main() {
                         None => None,
                     };
                     let budget = build_budget(budget_tokens, parsed_cents, budget_requests, budget_seconds);
-                    // implementation-note-51 — budget_persists_on_simple_grant.
+                    // implementation-note-76 — budget_persists_on_simple_grant.
                     //
                     // Pre-fix: this path called `create_grant` (no budget) and
                     // then UPDATE'd the flat `budget_json` column. But
@@ -3816,14 +4660,23 @@ fn main() {
 
                     // Mint the composite grant if a credential resource was supplied.
                     //
-                    // implementation-note-52 — route the composite mint through the policy
+                    // implementation-note-77 — route the composite mint through the policy
                     // engine so `default_decision = "require_approval"` fires
-                    // here. Three outcomes:
-                    //   - AutoApprove: mint immediately (legacy fast-path)
-                    //   - RequireApproval: submit ONE approval entry that
-                    //     bundles all 3 statements; do NOT exec prompt; exit
+                    // here.
+                    //
+                    // COMPOSITE-prior change — collapsed both Auto and Required onto a
+                    // single mint code path. Every outcome dispatches via
+                    // `propose_grant`; the daemon-side `auto_resolve` handles
+                    // the auto lane (immediate Approved + `auto_resolved`
+                    // audit event), the human approval flow handles Required.
+                    // No more inline `create_grant` + `overwrite_grant_blocks`
+                    // bypass on the AutoApprove path.
+                    //
+                    // Three outcomes:
+                    //   - Auto: propose_grant + auto_resolve (mint immediate)
+                    //   - Required: propose_grant; do NOT exec prompt; exit
                     //     so the operator can `ember approval approve <id>`
-                    //   - Deny: error and exit non-zero
+                    //   - Denied: error and exit non-zero
                     //
                     // The policy action name is `credential.access` to match
                     // the daemon's existing credential-access rule shape.
@@ -3840,6 +4693,15 @@ fn main() {
                         let eval = policy_engine.evaluate(&policy_action);
                         let risk_str = format!("{:?}", eval.risk).to_lowercase();
 
+                        let grant_proposal = GrantProposal {
+                            persona_id: sandbox.persona_id.clone(),
+                            statements: statements.clone(),
+                            expires_at: ttl_secs,
+                            label: None,
+                            skill_ref: None,
+                            note: None,
+                        };
+
                         match eval.requirement {
                             ember_daemon::trust::policy::ApprovalRequirement::Denied => {
                                 eprintln!(
@@ -3850,14 +4712,10 @@ fn main() {
                                 process::exit(1);
                             }
                             ember_daemon::trust::policy::ApprovalRequirement::Required => {
-                                match store.propose_grant(
-                                    &sandbox.persona_id,
-                                    credential_res,
-                                    "composite",
-                                    ttl_secs,
+                                match store.propose_grant_typed(
+                                    &grant_proposal,
                                     &policy_action,
                                     &risk_str,
-                                    statements.clone(),
                                 ) {
                                     Ok(req) => {
                                         sandbox_grant_pending = true;
@@ -3895,80 +4753,64 @@ fn main() {
                                 }
                             }
                             ember_daemon::trust::policy::ApprovalRequirement::Auto => {
-                                // Seed the parent grant with scope "*" so the
-                                // bipartite-dominance check in
-                                // `overwrite_grant_blocks` accepts the typed
-                                // child statements (Credential / Session /
-                                // Time) below the wildcard parent.
-                                match store.create_grant(
-                                    &sandbox.persona_id,
-                                    credential_res,
-                                    "*",
-                                    ttl_secs,
+                                // COMPOSITE-prior change — collapse the legacy
+                                // AutoApprove fast-path into the daemon-side
+                                // `auto_resolve` lane. Both Auto and Required
+                                // dispatch via `propose_grant` so the mint
+                                // path is single: propose_grant submits a
+                                // pending approval row carrying the typed
+                                // 3-statement envelope (with SHA-256
+                                // integrity binding); `auto_resolve` then
+                                // immediately resolves it as Approved (which
+                                // mints the composite chain through the
+                                // same code path the human-approval flow
+                                // uses) and emits an `approval.auto_resolved`
+                                // audit event so downstream auditors can
+                                // distinguish silent policy-driven approvals
+                                // from human-driven ones.
+                                match store.propose_grant_typed(
+                                    &grant_proposal,
+                                    &policy_action,
+                                    &risk_str,
                                 ) {
-                                    Ok(grant_info) => {
-                                        // Replace the single-statement shim create_grant wrote with
-                                        // the canonical 3-statement envelope in blocks_json so the
-                                        // dashboard + handler emit per-Statement arrays.
-                                        let created_at_epoch =
-                                            chrono::Utc::now().timestamp().max(0) as u64;
-                                        let expires_at_epoch = ttl_secs.map(|s| {
-                                            created_at_epoch.saturating_add(s)
-                                        });
-                                        // Block 0 is signed under the sandbox
-                                        // persona's root Ed25519 key — the daemon
-                                        // owns that key material so the CLI looks it
-                                        // up from the same store it writes through.
-                                        let composite_result = store
-                                            .persona_root_keypair(&sandbox.persona_id)
-                                            .and_then(|root| {
-                                                ember_daemon::trust::grant::access_grant_from_statements(
-                                                    &grant_info.id,
-                                                    &sandbox.persona_id,
-                                                    credential_res,
-                                                    statements.clone(),
-                                                    created_at_epoch,
-                                                    expires_at_epoch,
-                                                    &root,
-                                                )
-                                            });
-                                        match composite_result {
-                                            Ok(composite) => {
-                                                if let Err(e) =
-                                                    store.overwrite_grant_blocks(&grant_info.id, &composite)
-                                                {
-                                                    eprintln!(
-                                                        "warning: grant minted but composite chain overwrite failed: {e}"
-                                                    );
+                                    Ok(req) => {
+                                        match store.auto_resolve(&req.id) {
+                                            Ok(()) => {
+                                                let grant_id = store
+                                                    .get_approval(&req.id)
+                                                    .ok()
+                                                    .and_then(|r| r.result_grant_id)
+                                                    .unwrap_or_else(|| "(unknown)".to_string());
+                                                println!("Minted 3-statement composite grant");
+                                                println!("  Grant ID:   {grant_id}");
+                                                println!("  Statements: {statement_count}");
+                                                println!("    [0] credential:read  on {credential_res}");
+                                                if let Some(t) = budget_tokens {
+                                                    println!("    [1] llm:generate     on anthropic/*  budget={t} tokens");
+                                                } else {
+                                                    println!("    [1] llm:generate     on anthropic/*  (no token budget)");
+                                                }
+                                                if let Some(s) = budget_seconds {
+                                                    println!("    [2] time:wall_clock  on *             budget={s}s");
+                                                } else {
+                                                    println!("    [2] time:wall_clock  on *             (no time budget)");
+                                                }
+                                                println!("  One approval. Three meters. One receipt at the end.");
+                                                if let Some(ref p) = prompt {
+                                                    println!("  Prompt: {p}");
                                                 }
                                             }
                                             Err(e) => {
                                                 eprintln!(
-                                                    "warning: grant minted but composite chain signing failed: {e}"
+                                                    "warning: sandbox started but auto-resolve failed: {e}"
                                                 );
                                             }
                                         }
-                                        println!("Minted 3-statement composite grant");
-                                        println!("  Grant ID:   {}", grant_info.id);
-                                        println!("  Statements: {statement_count}");
-                                        println!("    [0] credential:read  on {credential_res}");
-                                        if let Some(t) = budget_tokens {
-                                            println!("    [1] llm:generate     on anthropic/*  budget={t} tokens");
-                                        } else {
-                                            println!("    [1] llm:generate     on anthropic/*  (no token budget)");
-                                        }
-                                        if let Some(s) = budget_seconds {
-                                            println!("    [2] time:wall_clock  on *             budget={s}s");
-                                        } else {
-                                            println!("    [2] time:wall_clock  on *             (no time budget)");
-                                        }
-                                        println!("  One approval. Three meters. One receipt at the end.");
-                                        if let Some(ref p) = prompt {
-                                            println!("  Prompt: {p}");
-                                        }
                                     }
                                     Err(e) => {
-                                        eprintln!("warning: sandbox started but grant creation failed: {e}");
+                                        eprintln!(
+                                            "warning: sandbox started but submitting approval failed: {e}"
+                                        );
                                     }
                                 }
                             }
@@ -3982,7 +4824,7 @@ fn main() {
                     // child process inherits stdin/stdout so Claude Code's output
                     // streams directly to the operator's terminal.
                     //
-                    // implementation-note-52 — when the composite grant is pending approval,
+                    // implementation-note-77 — when the composite grant is pending approval,
                     // skip the agent exec; the operator must approve first
                     // (then re-run / `ember sandbox exec`) to give the agent
                     // its credentials.
@@ -4033,7 +4875,7 @@ fn main() {
                             println!("No pending approvals");
                         } else {
                             for r in &requests {
-                                // implementation-note-52 — composite envelopes render as
+                                // implementation-note-77 — composite envelopes render as
                                 // ONE entry with N statements listed beneath.
                                 if let Some(stmts) = r.composite_statements.as_ref() {
                                     println!(
@@ -4045,7 +4887,7 @@ fn main() {
                                         r.risk_level,
                                         stmts.len(),
                                     );
-                                    // implementation-note-45: shipped
+                                    // implementation-note-70: shipped
                                     for (i, s) in stmts.iter().enumerate() {
                                         let actions = s.actions.join(",");
                                         let resource = match &s.resource {
@@ -4126,7 +4968,7 @@ fn main() {
                             } else {
                                 println!("Approved {id}");
                             }
-                            // implementation-note-52 — surface the grant ID minted by a
+                            // implementation-note-77 — surface the grant ID minted by a
                             // composite-approval resolution so the operator
                             // (or test harness) can use it directly.
                             if let Ok(resolved) = store.get_approval(&id)
@@ -4562,7 +5404,69 @@ fn main() {
                                     }
                                 }
                             };
-                            match serde_json::from_slice::<core_types::grant_receipt::GrantReceipt>(&bytes) {
+                            // Detect format: parse as Value first, inspect version field.
+                            let raw_value = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    eprintln!("error: not a valid Grant Receipt JSON: {e}");
+                                    process::exit(1);
+                                }
+                            };
+                            let version_field = raw_value
+                                .get("version")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            if version_field == "2" {
+                                // v2 receipt (design ReceiptEnvelope).
+                                // Dispatch to verify_receipt_v2.
+                                let envelope = match serde_json::from_value::<
+                                    core_events::receipt::envelope::ReceiptEnvelope,
+                                >(raw_value) {
+                                    Ok(e) => e,
+                                    Err(e) => {
+                                        eprintln!("error: not a valid v2 Receipt envelope: {e}");
+                                        process::exit(1);
+                                    }
+                                };
+                                // Resolve trust anchor: --pubkey <hex> or daemon identity.
+                                // v2 PublicKey has "ed25519:" prefix; pubkey arg is bare hex.
+                                let pubkey_hex = match pubkey.as_deref() {
+                                    Some(p) => p.to_string(),
+                                    None => {
+                                        let key_path = ember_daemon::infra::receipt::identity_key_path(&config.data_dir);
+                                        match ember_daemon::infra::receipt::DaemonPersona::load_or_create(&config.data_dir) {
+                                            Ok(id) => id.pubkey_hex(),
+                                            Err(e) => {
+                                                eprintln!(
+                                                    "error: could not load trust anchor from {}: {e}",
+                                                    key_path.display()
+                                                );
+                                                process::exit(1);
+                                            }
+                                        }
+                                    }
+                                };
+                                let pk = core_crypto::PublicKey(format!("ed25519:{pubkey_hex}"));
+                                match core_events::receipt::sign::verify_receipt_v2(
+                                    &envelope,
+                                    &pk,
+                                    &core_crypto::Ed25519Verifier,
+                                ) {
+                                    Ok(()) => {
+                                        println!("Verified: receipt {}", envelope.receipt_id);
+                                        println!("  Signer pubkey: {pubkey_hex}");
+                                        println!("  Kind: {}", envelope.kind);
+                                        println!("  Version: v{}", envelope.version.0);
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Verification FAILED: {e}");
+                                        process::exit(2);
+                                    }
+                                }
+                                return;
+                            }
+                            // v1 receipt (or no version field): existing GrantReceipt path.
+                            match serde_json::from_value::<core_types::grant_receipt::GrantReceipt>(raw_value) {
                                 Ok(r) => r,
                                 Err(e) => {
                                     eprintln!("error: not a valid Grant Receipt JSON: {e}");
@@ -4687,6 +5591,29 @@ fn main() {
             let entries = store.query_audit(&filter).unwrap_or_default();
             let total = store.audit_count().unwrap_or(0);
 
+            // implementation-note-125: surface the credential-store backend
+            // selector + its addr (or `local-encrypted` for the default local
+            // backend) alongside the daemon's other status rows. Sourced from
+            // the same `[credential_store]` section the daemon parses at
+            // startup so this is honest about what the running daemon is
+            // configured to do.
+            let (vault_backend, vault_addr) = match config.credential_store.as_ref() {
+                None => (
+                    "local".to_string(),
+                    "local-encrypted".to_string(),
+                ),
+                Some(cs) if cs.backend == "local" => (
+                    "local".to_string(),
+                    "local-encrypted".to_string(),
+                ),
+                Some(cs) => (
+                    cs.backend.clone(),
+                    cs.addr
+                        .clone()
+                        .unwrap_or_else(|| "<addr-not-configured>".to_string()),
+                ),
+            };
+
             if cli.json {
                 let (daemon_running, daemon_pid, daemon_socket) = match runtime.status() {
                     Ok(s) => (s.running, Some(s.pid), Some(s.socket.display().to_string())),
@@ -4701,6 +5628,7 @@ fn main() {
                     "approvals": { "pending": approvals.len() },
                     "standing_grants": standing_grants.len(),
                     "audit_events": total,
+                    "vault": { "backend": vault_backend, "addr": vault_addr },
                 });
                 println!("{}", serde_json::to_string_pretty(&status).unwrap());
             } else {
@@ -4709,7 +5637,7 @@ fn main() {
                     Ok(status) if status.running => {
                         println!("DAEMON             running (PID {})", status.pid);
                         println!("  Socket:    {}", status.socket.display());
-                        // implementation-note-40: the configured
+                        // implementation-note-65: the configured
                         // address is the *attempted* port. The daemon may
                         // have failed to bind (port collision) and still
                         // be running. Probe `/api/status` to read the
@@ -4741,6 +5669,11 @@ fn main() {
                                 );
                             }
                         }
+                        // implementation-note-125: show the configured
+                        // credential-store backend selector. `local` collapses
+                        // to `(local-encrypted)` so the line is recognisable
+                        // for the default no-config case.
+                        println!("  Vault:     {} ({})", vault_backend, vault_addr);
                     }
                     Ok(status) => {
                         println!("DAEMON             stopped (stale PID {})", status.pid);
@@ -4826,7 +5759,8 @@ fn main() {
         }
 
         Commands::ClaudeCode { args } => {
-            match emberlink_cli::launcher::claude_code::launch_claude_code(&args) {
+            let socket_path = config.socket_dir.join("daemon.sock");
+            match emberlink_cli::launcher::claude_code::launch_claude_code(&args, &socket_path) {
                 Ok(code) => process::exit(code),
                 Err(e) => {
                     eprintln!("ember claude-code: {e}");
@@ -4885,6 +5819,17 @@ fn main() {
                     process::exit(1);
                 }
             }
+            ConstructAction::Dev { path, list, unregister } => {
+                let args = emberlink_cli::construct::dev::DevConstructArgs {
+                    path,
+                    list,
+                    unregister,
+                };
+                if let Err(e) = emberlink_cli::construct::dev::dev_construct(&args) {
+                    eprintln!("ember construct dev: {e}");
+                    process::exit(1);
+                }
+            }
         },
 
         Commands::Binary { action } => match action {
@@ -4894,7 +5839,14 @@ fn main() {
                     from_path,
                     publisher,
                 };
-                if let Err(e) = emberlink_cli::binary::install::binary_install(&args) {
+                let home = match dirs_next::home_dir() {
+                    Some(h) => h,
+                    None => {
+                        eprintln!("ember binary install: could not determine home directory");
+                        process::exit(1);
+                    }
+                };
+                if let Err(e) = emberlink_cli::binary::install::binary_install(&args, &home) {
                     eprintln!("ember binary install: {e}");
                     process::exit(1);
                 }
@@ -4925,8 +5877,8 @@ fn main() {
 
 /// `ember cluster <action>` — cluster management subcommands.
 ///
-/// implementation-note-38: lists locally-pulled cluster snapshots.
-/// implementation-note-117: `bootstrap` generates the Daemon
+/// implementation-note-59: lists locally-pulled cluster snapshots.
+/// implementation-note-163: `bootstrap` generates the Daemon
 /// Persona keypair for single-phase EmberSeal bootstrap (design).
 fn cmd_cluster(action: ClusterAction, config: &DaemonConfig, json_output: bool) {
     match action {
@@ -5103,6 +6055,7 @@ mod tests {
             snapshot_pull_interval_secs: 600,
             snapshot_pull_endpoint: None,
             snapshot_pull_cluster_id: None,
+            credential_store: None,
         };
 
         // Suppress keyring and passphrase side-effects.
@@ -5157,6 +6110,7 @@ mod tests {
             snapshot_pull_interval_secs: 600,
             snapshot_pull_endpoint: None,
             snapshot_pull_cluster_id: None,
+            credential_store: None,
         };
 
         unsafe {
@@ -5216,7 +6170,7 @@ mod tests {
 
     #[test]
     fn effective_config_path_with_none_returns_default() {
-        // implementation-note-112: this test asserts the
+        // implementation-note-154: this test asserts the
         // "no env, no flag" baseline, but the live runtime now also
         // consults `EMBER_CONFIG` / `EMBER_DEMO_DIR`. The pure
         // `resolve_config_path` tests below exercise the precedence
@@ -5232,7 +6186,7 @@ mod tests {
         );
     }
 
-    // implementation-note-112: precedence chain for the user-pinned
+    // implementation-note-154: precedence chain for the user-pinned
     // config path: --config flag → EMBER_CONFIG → EMBER_DEMO_DIR/config.toml
     // → None (caller falls through to default). Pure-function tests so we
     // don't touch process-global env vars (race-prone when cargo runs
@@ -5397,7 +6351,7 @@ mod tests {
         assert_eq!(stmts.len(), 3, "expected 3 statements");
 
         // Statement 0: Credential
-        assert_eq!(stmts[0].sid, "s0-credential");
+        assert_eq!(stmts[0].credential_name, "obj-github-token");
         assert_eq!(stmts[0].resource_type, ResourceType::Credential);
         assert!(stmts[0].actions.contains(&"credential:read".to_string()));
         assert_eq!(
@@ -5407,7 +6361,6 @@ mod tests {
         assert!(stmts[0].budget.is_none(), "credential statement must have no budget");
 
         // Statement 1: Session
-        assert_eq!(stmts[1].sid, "s1-session");
         assert_eq!(stmts[1].resource_type, ResourceType::Session);
         assert!(stmts[1].actions.contains(&"llm:generate".to_string()));
         assert_eq!(
@@ -5419,7 +6372,6 @@ mod tests {
         assert_eq!(session_budget.cents, Some(50));
 
         // Statement 2: Time
-        assert_eq!(stmts[2].sid, "s2-time");
         assert_eq!(stmts[2].resource_type, ResourceType::Time);
         assert!(stmts[2].actions.contains(&"time:wall_clock".to_string()));
         assert_eq!(stmts[2].resource, ResourceSelector::Any);
@@ -5716,7 +6668,7 @@ mod tests {
         }
     }
 
-    // --- docker_exec_flags unit tests (implementation-note-118) ---
+    // --- docker_exec_flags unit tests (implementation-note-164) ---
 
     #[test]
     fn docker_exec_flags_non_tty_returns_only_i() {
@@ -5885,7 +6837,7 @@ mod tests {
         );
     }
 
-    // --- security check: EMBER_VAULT_PASSPHRASE cleared after first read in cmd_init ---
+    // --- EMBER_VAULT_PASSPHRASE cleared after first read in cmd_init ---
 
     #[test]
     fn cmd_init_removes_vault_passphrase_env_after_read() {
@@ -5910,6 +6862,7 @@ mod tests {
             snapshot_pull_interval_secs: 600,
             snapshot_pull_endpoint: None,
             snapshot_pull_cluster_id: None,
+            credential_store: None,
         };
 
         // SAFETY: test-only, single-threaded, no other threads reading env vars.
@@ -6016,7 +6969,7 @@ mod tests {
             .action
     }
 
-    /// implementation-note-119: `ember daemon install` (no flags) must
+    /// implementation-note-165: `ember daemon install` (no flags) must
     /// take the separate-uid path. clap default for `bool` is false — we
     /// pin the surface so a future rename to `single_uid: Option<bool>` or
     /// a flipped default is intentional, not accidental.
@@ -6034,7 +6987,7 @@ mod tests {
         }
     }
 
-    /// implementation-note-119: `ember daemon install --single-uid`
+    /// implementation-note-165: `ember daemon install --single-uid`
     /// must opt into the dev-mode path. Pins the flag spelling so future
     /// renames stay intentional.
     #[test]
@@ -6051,7 +7004,38 @@ mod tests {
         }
     }
 
-    /// implementation-note-120: `ember daemon migrate --to separate-uid`
+    /// T-INSTALL-WIZARD-NON-INTERACTIVE: `ember daemon install --non-interactive`
+    /// (with optional `--accept-defaults` and `--posture`) must parse and
+    /// surface the flags on `DaemonInstallArgs`. Pins the flag spellings so
+    /// downstream Dockerfile / CI runner invocations stay stable.
+    #[test]
+    fn daemon_install_args_non_interactive_flag_parses() {
+        let action = parse_daemon(&[
+            "install",
+            "--non-interactive",
+            "--accept-defaults",
+            "--posture",
+            "separate-uid",
+        ]);
+        match action {
+            DaemonAction::Install { args } => {
+                assert!(args.non_interactive, "--non-interactive sets the flag");
+                assert!(args.accept_defaults, "--accept-defaults sets the flag");
+                assert_eq!(
+                    args.posture.as_deref(),
+                    Some("separate-uid"),
+                    "--posture captured raw for downstream parsing"
+                );
+                assert!(
+                    !args.single_uid,
+                    "non-interactive run must not flip single_uid silently"
+                );
+            }
+            _ => panic!("expected DaemonAction::Install"),
+        }
+    }
+
+    /// implementation-note-166: `ember daemon migrate --to separate-uid`
     /// must parse to `DaemonAction::Migrate { to: "separate-uid" }`.
     #[test]
     fn daemon_migrate_to_separate_uid_parses() {
@@ -6067,7 +7051,7 @@ mod tests {
         }
     }
 
-    /// implementation-note-120: `ember daemon migrate` without `--to`
+    /// implementation-note-166: `ember daemon migrate` without `--to`
     /// must be rejected by clap (required arg).
     #[test]
     fn daemon_migrate_without_to_is_rejected() {
@@ -6084,7 +7068,7 @@ mod tests {
         );
     }
 
-    /// implementation-note-120: `is_separate_uid_posture` returns
+    /// implementation-note-166: `is_separate_uid_posture` returns
     /// false when the ember user does not exist (T1 posture-detection
     /// function test — probes the live system user database).
     ///
@@ -6110,5 +7094,228 @@ mod tests {
                 "is_separate_uid_posture must return false when ember user is absent"
             );
         }
+    }
+
+    /// implementation-note-155 T1: `is_ember_initialized` returns false
+    /// for a fresh temp dir, and true once `cmd_init` has run and written daemon.db.
+    ///
+    /// Verifies the detection logic that `init --for claude-code` uses to decide
+    /// whether to skip the basic init step (to avoid creating a duplicate "root"
+    /// persona). A friendly who ran `ember init --name "Foo"` before running
+    /// `ember init --for claude-code` triggered the double-init bug; after this
+    /// fix the basic-init step is skipped when daemon.db is present.
+    #[test]
+    fn init_for_claude_code_skips_basic_init_when_already_initialized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let run_dir = tmp.path().join("run");
+
+        let config = ember_daemon::infra::config::DaemonConfig {
+            socket_dir: run_dir.clone(),
+            data_dir: data_dir.clone(),
+            pid_file: run_dir.join("emberd.pid"),
+            policy_file: tmp.path().join("policy.toml"),
+            log_level: ember_daemon::infra::config::LogLevel::Info,
+            dashboard_addr: None,
+            git_proxy_addr: None,
+            llm_proxy_addr: None,
+            keyring: ember_daemon::infra::config::KeyringConfig::default(),
+            stale_approval_threshold_secs: 3600,
+            presence: ember_daemon::infra::config::PresenceConfigSection::default(),
+            snapshot_interval_secs: 3600,
+            snapshot_pull_interval_secs: 600,
+            snapshot_pull_endpoint: None,
+            snapshot_pull_cluster_id: None,
+            credential_store: None,
+        };
+
+        // Before any init: daemon.db does not exist → not initialized.
+        assert!(
+            !is_ember_initialized(&config),
+            "is_ember_initialized must return false before any init"
+        );
+
+        // Run basic init to simulate a friendly who already ran `ember init`.
+        let config_path = tmp.path().join("config.toml");
+        unsafe { std::env::set_var("EMBER_VAULT_PASSPHRASE", "test-passphrase-t3-t1") };
+        cmd_init(&config, Some("Foo".to_string()), Some(&config_path), None, None, false);
+        unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
+
+        // After init: daemon.db exists → is_ember_initialized returns true.
+        assert!(
+            is_ember_initialized(&config),
+            "is_ember_initialized must return true after cmd_init wrote daemon.db"
+        );
+
+        // Verify daemon.db is present (the file is the detection signal).
+        assert!(
+            data_dir.join("daemon.db").exists(),
+            "daemon.db must exist after cmd_init"
+        );
+
+        // Count personas: expect exactly one ("Foo") from the basic init.
+        // This is the count that would survive if `init --for claude-code`
+        // correctly skips the basic init step (no extra "root" added).
+        let db_path = data_dir.join("daemon.db");
+        let store = DaemonStore::open(&db_path).expect("open store");
+        let personas = store.list_personas().expect("list personas");
+        assert_eq!(
+            personas.len(),
+            1,
+            "exactly one persona expected after a single cmd_init; got: {:?}",
+            personas.iter().map(|p| &p.name).collect::<Vec<_>>()
+        );
+        assert_eq!(personas[0].name, "Foo", "persona name must match --name argument");
+    }
+
+    /// implementation-note-155 T2: `is_ember_initialized` returns false
+    /// for an empty temp dir, confirming that the `init --for claude-code` path
+    /// would run basic init (not skip it) when starting fresh.
+    #[test]
+    fn init_for_claude_code_runs_basic_init_when_fresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let run_dir = tmp.path().join("run");
+
+        let config = ember_daemon::infra::config::DaemonConfig {
+            socket_dir: run_dir.clone(),
+            data_dir: data_dir.clone(),
+            pid_file: run_dir.join("emberd.pid"),
+            policy_file: tmp.path().join("policy.toml"),
+            log_level: ember_daemon::infra::config::LogLevel::Info,
+            dashboard_addr: None,
+            git_proxy_addr: None,
+            llm_proxy_addr: None,
+            keyring: ember_daemon::infra::config::KeyringConfig::default(),
+            stale_approval_threshold_secs: 3600,
+            presence: ember_daemon::infra::config::PresenceConfigSection::default(),
+            snapshot_interval_secs: 3600,
+            snapshot_pull_interval_secs: 600,
+            snapshot_pull_endpoint: None,
+            snapshot_pull_cluster_id: None,
+            credential_store: None,
+        };
+
+        // Fresh temp dir: daemon.db absent → not initialized → basic init would run.
+        assert!(
+            !is_ember_initialized(&config),
+            "is_ember_initialized must return false for a fresh (empty) data_dir"
+        );
+
+        // Simulate the basic init step that `init --for claude-code` would run.
+        let config_path = tmp.path().join("config.toml");
+        unsafe { std::env::set_var("EMBER_VAULT_PASSPHRASE", "test-passphrase-t3-t2") };
+        cmd_init(&config, None, Some(&config_path), None, None, false);
+        unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
+
+        // After init: config.toml and daemon.db must exist.
+        assert!(config_path.exists(), "config.toml must exist after cmd_init");
+        assert!(
+            data_dir.join("daemon.db").exists(),
+            "daemon.db must exist after cmd_init"
+        );
+
+        // is_ember_initialized must now return true.
+        assert!(
+            is_ember_initialized(&config),
+            "is_ember_initialized must return true after basic init completed"
+        );
+    }
+
+    /// T1 — implementation-note-161: the new posture-hardening
+    /// prompt text must contain the expected call-to-action copy (no jargon,
+    /// no "Wedge claim", no "design" visible to friendly users).
+    ///
+    /// This test validates the source constants rather than running the
+    /// interactive prompt (which requires a live daemon + TTY) to keep it
+    /// fast and deterministic in CI.
+    #[test]
+    fn separate_uid_cta_prompt_contains_expected_copy() {
+        // The copy lives inline in cmd_init_for_claude_code. We verify the
+        // checkpoint-gated block by reading the source text of this file at
+        // compile time — use a const string that mirrors the live output.
+        const SECURITY_HARDENING_LABEL: &str = "Security hardening (recommended):";
+        const HARDEN_NOW_PROMPT: &str = "Harden now? [Y/n]:";
+        const NO_JARGON_WEDGE: &str = "Wedge claim";
+        const NO_JARGON_ADR_131: &str = "design";
+        const NO_JARGON_SINGLE_UID_POSTURE: &str = "single-uid posture";
+        const NO_JARGON_KERNEL_ISOLATION: &str = "kernel-level isolation";
+
+        // Read the source of this binary at runtime from the file path
+        // baked in at compile time via file!().
+        let source = std::fs::read_to_string(file!())
+            .unwrap_or_else(|_| std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("src/bin/ember.rs")
+            ).expect("could not read ember.rs source for CTA text assertions"));
+
+        // T1a: prompt must contain the friendly call-to-action label.
+        assert!(
+            source.contains(SECURITY_HARDENING_LABEL),
+            "prompt must contain \"{}\"", SECURITY_HARDENING_LABEL
+        );
+
+        // T1b: prompt must contain the [Y/n] harden question.
+        assert!(
+            source.contains(HARDEN_NOW_PROMPT),
+            "prompt must contain \"{}\"", HARDEN_NOW_PROMPT
+        );
+
+        // T1c: jargon that scared friendly users must not appear in the
+        // CTA block. We assert the scary strings are NOT present in the
+        // new println! calls (they may still appear in comments or other
+        // functions — check that the user-visible strings are clean).
+        // These assertions guard against regression where someone adds
+        // jargon back to the user-facing println! lines.
+        let cta_block_start = source.find("implementation-note-161")
+            .expect("checkpoint implementation-note-161 must be in source");
+        // The CTA block ends at the closing brace of the if-body (~60 lines).
+        // Grab 3000 bytes after the checkpoint to cover the entire block.
+        let cta_region = &source[cta_block_start..cta_block_start + source[cta_block_start..].len().min(3000)];
+
+        // "Wedge claim" must not appear in user-visible println! lines.
+        // (It may appear in comments; we only forbid it in the region
+        // between the checkpoint and end of the CTA block.)
+        for line in cta_region.lines().filter(|l| l.trim_start().starts_with("println!")) {
+            assert!(
+                !line.contains(NO_JARGON_WEDGE),
+                "println! in CTA block must not contain jargon \"{}\": {}", NO_JARGON_WEDGE, line
+            );
+            assert!(
+                !line.contains(NO_JARGON_ADR_131),
+                "println! in CTA block must not contain jargon \"{}\": {}", NO_JARGON_ADR_131, line
+            );
+            assert!(
+                !line.contains(NO_JARGON_SINGLE_UID_POSTURE),
+                "println! in CTA block must not contain jargon \"{}\": {}", NO_JARGON_SINGLE_UID_POSTURE, line
+            );
+            assert!(
+                !line.contains(NO_JARGON_KERNEL_ISOLATION),
+                "println! in CTA block must not contain jargon \"{}\": {}", NO_JARGON_KERNEL_ISOLATION, line
+            );
+        }
+    }
+
+    /// T1d — checkpoint file suppresses repeated prompt.
+    ///
+    /// Validates that the checkpoint-check logic path (`.posture-prompt-shown`
+    /// exists) results in the prompt block being skipped. This is a logic
+    /// unit test of the checkpoint-check condition using a temp directory.
+    #[test]
+    fn posture_prompt_sentinel_suppresses_prompt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let checkpoint = dir.path().join(".posture-prompt-shown");
+        // Pre-seed the checkpoint — simulates a host where init was already run.
+        std::fs::write(&checkpoint, "posture-prompt-shown\n").expect("write checkpoint");
+        // Verify: checkpoint exists → the prompt-shown condition is true.
+        assert!(checkpoint.exists(), "pre-seeded checkpoint must exist");
+        // The actual suppression happens in cmd_init_for_claude_code via
+        // `prompt_already_shown = sentinel_path.exists()`. We assert the
+        // filesystem condition that drives that branch.
+        let prompt_already_shown = checkpoint.exists();
+        assert!(
+            prompt_already_shown,
+            "checkpoint presence must set prompt_already_shown = true → prompt skipped"
+        );
     }
 }

@@ -201,9 +201,9 @@ impl DemoApp {
             ["import", rest @ ..] => self.handle_import(rest),
             ["show", "vault", rest @ ..] | ["vault", rest @ ..] => self.handle_vault(rest),
             ["show", "grant", rest @ ..] | ["grant", rest @ ..] => self.handle_grant(rest),
-            // EMBER-implementation-note-68: Subcommand::Audit — query the receipts table.
+            // EMBER-implementation-note-94: Subcommand::Audit — query the receipts table.
             ["audit", rest @ ..] => self.handle_audit(rest),
-            // implementation-note-56 — `ember approval approve|deny <id>` is the
+            // implementation-note-81 — `ember approval approve|deny <id>` is the
             // demo-grade approval command. On macOS it triggers
             // LocalAuthentication (Touch ID / device passcode) before
             // mutating state; declined biometric refuses the approval.
@@ -1957,7 +1957,7 @@ impl DemoApp {
         Ok(lines)
     }
 
-    /// EMBER-implementation-note-68 — Subcommand::Audit dispatch for the demo shell.
+    /// EMBER-implementation-note-94 — Subcommand::Audit dispatch for the demo shell.
     ///
     /// Accepts the same filter flags as `ember audit query` (`--actor`,
     /// `--kind`, `--grant-id`, `--since`, `--limit`, `--format`). In the
@@ -2082,7 +2082,9 @@ impl DemoApp {
                 match <crate::binary::install::BinaryInstallArgs as clap::Parser>::try_parse_from(
                     argv,
                 ) {
-                    Ok(args) => match crate::binary::install::binary_install(&args) {
+                    Ok(args) => match dirs_next::home_dir()
+                        .ok_or_else(|| "could not determine home directory".to_string())
+                        .and_then(|home| crate::binary::install::binary_install(&args, &home).map_err(|e| e.to_string())) {
                         Ok(()) => "[binary install] OK\n".to_string(),
                         Err(e) => format!("binary install error: {e}\n"),
                     },
@@ -2141,9 +2143,27 @@ impl DemoApp {
                     Err(e) => format!("{e}\n"),
                 }
             }
+            ["construct", "dev", rest @ ..] => {
+                // T-CONSTRUCT-AUTHORING-MODE-DEV-PATH-REGISTRY: register the
+                // author's worktree directory so daemon broker.resolve can
+                // honor authoring mode for scripts under that path.
+                let mut argv = vec!["ember-construct-dev"];
+                argv.extend_from_slice(rest);
+                match <crate::construct::dev::DevConstructArgs as clap::Parser>::try_parse_from(
+                    argv,
+                ) {
+                    Ok(args) => match crate::construct::dev::dev_construct(&args) {
+                        Ok(()) => "[construct dev] OK\n".to_string(),
+                        Err(e) => format!("construct dev error: {e}\n"),
+                    },
+                    Err(e) => format!("{e}\n"),
+                }
+            }
             ["construct", ..] => {
                 "Usage: construct sign --binary <path> --construct-toml <path> \
-                 --version <semver> --identity-root-keypath <path>\n"
+                 --version <semver> --identity-root-keypath <path>\n       \
+                 construct dev <path>\n       construct dev --list\n       \
+                 construct dev --unregister <path>\n"
                     .to_string()
             }
             _ => "Unknown command. Run `help` for examples.\n".to_string(),
@@ -6516,7 +6536,7 @@ impl DemoApp {
         }
     }
 
-    // ── implementation-note-56: hardware-attested approval ─────────────────────
+    // ── implementation-note-81: hardware-attested approval ─────────────────────
     //
     // `ember approval approve|deny <id> [--no-biometric] [--reason <r>]`
     //
@@ -6616,7 +6636,7 @@ impl DemoApp {
             Ok(()) => {
                 // Audit line — surfaced in `ember show audit` and tee'd into
                 // the daemon log. The `biometric` + `credential_id` fields
-                // satisfy the implementation-note-56 acceptance criterion.
+                // satisfy the implementation-note-81 acceptance criterion.
                 let cred = credential_id.as_deref().unwrap_or("");
                 format!(
                     "approved\t{}\tbiometric={}\tcredential_id={}\n",

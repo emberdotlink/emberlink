@@ -20,9 +20,6 @@
 //! existing subprocess-shellout pattern in `sandbox.rs` / `notify.rs`) and
 //! always capture stderr per the `feedback_subprocess_logging` rule
 //! (no `let _ = ...output()`).
-//!
-//! See [`project design notes`](../../../project design notes)
-//! for the full architectural rationale and the auth-model layering.
 
 use std::path::Path;
 use std::process::Command;

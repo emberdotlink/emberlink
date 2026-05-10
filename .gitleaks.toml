@@ -1,0 +1,39 @@
+# Emberlink gitleaks config — extends the default ruleset with project-
+# specific allowlists for known false-positive patterns.
+#
+# Trust boundary: every entry here suppresses a finding that gitleaks would
+# otherwise flag. Allowlist regexes MUST be narrow enough that a real
+# credential could not satisfy the same pattern. Each entry must document:
+#   1. WHERE the suppressed pattern lives (file + test/fixture name)
+#   2. WHY a real credential cannot match the regex
+#   3. WHAT the allowlist catches (the literal placeholder shape)
+#
+# CODEOWNERS-protected — broadening any allowlist here requires operator
+# review. Per implementation-note-2.
+
+title = "Emberlink gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = """
+Project-specific false-positive allowlists. Each regex must document the
+fixture it covers and why no real credential could match.
+"""
+
+regexes = [
+  # ──────────────────────────────────────────────────────────────────
+  # ember-daemon GH App credential loader test fixtures
+  # ──────────────────────────────────────────────────────────────────
+  # File:  crates/ember-daemon/src/broker/github_config.rs
+  # Tests: load_from_dir_*, env-missing-* fixtures verifying that the
+  #        loader handles malformed / empty PEM bodies correctly.
+  # Shape: literal "fake" between BEGIN/END PRIVATE KEY markers as the
+  #        test's stand-in for a real PEM.
+  # Why safe: real PEMs contain ~1600 chars of base64 between the
+  #        markers; the literal four-letter word "fake" cannot appear
+  #        as a real PKCS#8 / PKCS#1 / SEC1 key body. The regex matches
+  #        ONLY this fixture shape, not real keys.
+  '''BEGIN PRIVATE KEY-----\\nfake\\n-----END PRIVATE KEY''',
+]

@@ -1,9 +1,11 @@
 pub mod canonicalize;
 pub mod grant_chain;
+pub mod persona;
 pub mod presence;
 pub mod secret_handle;
 
 pub use canonicalize::{CanonicalizeError, canonicalize_jcs};
+pub use persona::{daemon_persona_sign_receipt, daemon_persona_verify_receipt};
 
 use age::Decryptor;
 use age::secrecy::ExposeSecret;
@@ -449,6 +451,67 @@ pub fn unwrap_secret_with_identity(
     reader
         .read_to_end(&mut plaintext)
         .map_err(|err| ValidationError::new(format!("read wrapped secret: {err}")))?;
+    Ok(plaintext)
+}
+
+/// Encrypt `plaintext` to an age x25519 recipient and return the ciphertext
+/// as an ASCII-armored age block (`-----BEGIN AGE ENCRYPTED FILE-----`...).
+///
+/// Used by the `ember vault export` operator-facing surface so the resulting
+/// JSON envelope carries each value as a self-describing armored blob that
+/// `ember vault import` can re-open with the corresponding x25519 identity.
+/// See [`unwrap_armored_with_identity`] for the inverse.
+pub fn wrap_secret_to_recipient_armored(
+    recipient_public_key: &str,
+    plaintext: &[u8],
+) -> Result<String, ValidationError> {
+    let recipient = recipient_public_key
+        .parse::<age::x25519::Recipient>()
+        .map_err(|err| ValidationError::new(format!("invalid x25519 recipient: {err}")))?;
+    let encryptor =
+        age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
+            .map_err(|err| ValidationError::new(format!("create recipient encryptor: {err}")))?;
+    let mut encrypted = Vec::new();
+    let armored = age::armor::ArmoredWriter::wrap_output(
+        &mut encrypted,
+        age::armor::Format::AsciiArmor,
+    )
+    .map_err(|err| ValidationError::new(format!("open armor wrapper: {err}")))?;
+    let mut writer = encryptor
+        .wrap_output(armored)
+        .map_err(|err| ValidationError::new(format!("open recipient wrapper: {err}")))?;
+    writer
+        .write_all(plaintext)
+        .map_err(|err| ValidationError::new(format!("write wrapped secret: {err}")))?;
+    let armored = writer
+        .finish()
+        .map_err(|err| ValidationError::new(format!("finish wrapped secret: {err}")))?;
+    armored
+        .finish()
+        .map_err(|err| ValidationError::new(format!("finish armor wrapper: {err}")))?;
+    String::from_utf8(encrypted)
+        .map_err(|err| ValidationError::new(format!("armored output not utf-8: {err}")))
+}
+
+/// Decrypt an ASCII-armored age block produced by
+/// [`wrap_secret_to_recipient_armored`] using the matching x25519 identity.
+pub fn unwrap_armored_with_identity(
+    identity_private_key: &str,
+    armored: &str,
+) -> Result<Vec<u8>, ValidationError> {
+    let identity = identity_private_key
+        .parse::<age::x25519::Identity>()
+        .map_err(|err| ValidationError::new(format!("invalid x25519 identity: {err}")))?;
+    let armor_reader = age::armor::ArmoredReader::new(armored.as_bytes());
+    let decryptor = Decryptor::new(armor_reader)
+        .map_err(|err| ValidationError::new(format!("open armored secret: {err}")))?;
+    let mut plaintext = Vec::new();
+    let mut reader = decryptor
+        .decrypt(std::iter::once(&identity as &dyn age::Identity))
+        .map_err(|err| ValidationError::new(format!("decrypt armored secret: {err}")))?;
+    reader
+        .read_to_end(&mut plaintext)
+        .map_err(|err| ValidationError::new(format!("read armored secret: {err}")))?;
     Ok(plaintext)
 }
 

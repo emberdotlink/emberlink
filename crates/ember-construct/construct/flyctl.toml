@@ -1,0 +1,323 @@
+# CLASSIFICATION: PUBLIC
+# Construct manifest for ember-flyctl per design §2.
+#
+# Action schema: each [[actions]] declares an allowed action_key, optional
+# budget caps, biometric requirement, and a permit/deny default. The daemon's
+# broker.resolve consults this to decide whether the action requires a
+# credential mint, an existing grant, or refuses.
+#
+# Credential injection: the broker (`BrokerProvider::FlyIo`) issues
+# short-lived org/app-scoped Fly tokens via Fly's GraphQL
+# `create_authentication_token` mutation. The daemon materializes them into
+# `FLY_API_TOKEN` (flyctl honors this for non-interactive auth). Daemon
+# zeroizes on child exit.
+#
+# The daemon installs this binary to `~/.ember/shadow/flyctl` AND
+# `~/.ember/shadow/fly` — both names are used by upstream tooling.
+#
+# Read-only verbs (`status`, `list`, `info`, `logs`, `version`, `dashboard`,
+# `apps list`, `machine list`, `regions list`, `tokens list`, `scale show`)
+# classify to `None` (passthrough) and never reach this manifest.
+
+[meta]
+name = "ember-flyctl"
+version = "0.1.0"
+publisher = "did:emberlink"
+description = "Fly.io CLI Construct. Mediates `flyctl`/`fly` invocations through ember's credential broker: irreversible destruction (apps/machine/volumes/postgres/redis destroy) requires biometric; secrets unset (silent secret loss) requires biometric; tokens/orgs revoke (privilege removal) requires biometric; machine exec and ssh console (arbitrary code execution / interactive shell) require biometric. All other classified mutating verbs gate without biometric. FLY_API_TOKEN is the credential injection env var."
+
+# Default policy for unlisted action keys.
+default = "deny"
+
+# --- apps (lifecycle) ---
+
+[[actions]]
+key = "fly.apps.create"
+default = "permit"
+mode = "gate"
+
+# apps destroy: irreversible app deletion; biometric required.
+[[actions]]
+key = "fly.apps.destroy"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "fly.apps.restart"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "fly.apps.scale"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "fly.apps.deploy"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "fly.apps.releases.rollback"
+default = "permit"
+mode = "gate"
+
+# --- machine (lifecycle + exec) ---
+
+[[actions]]
+key = "fly.machine.run"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "fly.machine.stop"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "fly.machine.start"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "fly.machine.restart"
+default = "permit"
+mode = "gate"
+
+# machine destroy: irreversible; biometric required.
+[[actions]]
+key = "fly.machine.destroy"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# machine exec: arbitrary code execution inside customer machine;
+# biometric required.
+[[actions]]
+key = "fly.machine.exec"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "fly.machine.clone"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "fly.machine.update"
+default = "permit"
+mode = "gate"
+
+# --- volumes ---
+
+[[actions]]
+key = "fly.volumes.create"
+default = "permit"
+mode = "gate"
+
+# volumes destroy: irreversible data loss; biometric required.
+[[actions]]
+key = "fly.volumes.destroy"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "fly.volumes.extend"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "fly.volumes.fork"
+default = "permit"
+mode = "gate"
+
+# --- secrets ---
+
+[[actions]]
+key = "fly.secrets.set"
+default = "permit"
+mode = "gate"
+
+# secrets unset: silent secret loss; biometric required.
+[[actions]]
+key = "fly.secrets.unset"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "fly.secrets.import"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "fly.secrets.deploy"
+default = "permit"
+mode = "gate"
+
+# --- top-level deploy shorthand ---
+
+[[actions]]
+key = "fly.deploy"
+default = "permit"
+mode = "gate"
+
+# --- scale (write subcommands) ---
+
+[[actions]]
+key = "fly.scale.count"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "fly.scale.vm"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "fly.scale.memory"
+default = "permit"
+mode = "gate"
+
+# --- regions ---
+
+[[actions]]
+key = "fly.regions.add"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "fly.regions.remove"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "fly.regions.set"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "fly.regions.backup"
+default = "permit"
+mode = "gate"
+
+# --- postgres ---
+
+[[actions]]
+key = "fly.postgres.create"
+default = "permit"
+mode = "gate"
+
+# postgres destroy: irreversible data loss; biometric required.
+[[actions]]
+key = "fly.postgres.destroy"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "fly.postgres.attach"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "fly.postgres.detach"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "fly.postgres.connect"
+default = "permit"
+mode = "gate"
+
+# --- redis ---
+
+[[actions]]
+key = "fly.redis.create"
+default = "permit"
+mode = "gate"
+
+# redis destroy: irreversible data loss; biometric required.
+[[actions]]
+key = "fly.redis.destroy"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "fly.redis.update"
+default = "permit"
+mode = "gate"
+
+# --- certs ---
+
+[[actions]]
+key = "fly.certs.add"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "fly.certs.remove"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "fly.certs.check"
+default = "permit"
+mode = "gate"
+
+# --- ips ---
+
+[[actions]]
+key = "fly.ips.allocate-v4"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "fly.ips.allocate-v6"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "fly.ips.release"
+default = "permit"
+mode = "gate"
+
+# --- tokens (privilege issuance / removal) ---
+
+[[actions]]
+key = "fly.tokens.create"
+default = "permit"
+mode = "gate"
+
+# tokens revoke: privilege removal; biometric required.
+[[actions]]
+key = "fly.tokens.revoke"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- orgs ---
+
+# orgs revoke: privilege removal; biometric required.
+[[actions]]
+key = "fly.orgs.revoke"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- ssh ---
+
+[[actions]]
+key = "fly.ssh.issue"
+default = "permit"
+mode = "gate"
+
+# ssh console: interactive shell inside customer machine; biometric required.
+[[actions]]
+key = "fly.ssh.console"
+default = "permit"
+mode = "gate"
+biometric = "required"

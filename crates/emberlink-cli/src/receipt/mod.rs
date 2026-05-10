@@ -11,6 +11,8 @@
 
 pub mod render;
 pub mod rollup;
+pub mod verify_dispatch;
 
 pub use render::render_receipt_markdown;
 pub use rollup::{rollup_command, verify_chain, RollupError, RollupFilters, RollupRow};
+pub use verify_dispatch::{dispatch_verify, format_outcome, DispatchOutcome};

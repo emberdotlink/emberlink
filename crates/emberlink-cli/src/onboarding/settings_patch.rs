@@ -1,8 +1,140 @@
 use serde_json::{json, Value};
 
 /// The exact `command` string we look for and write. Exposed for tests
-/// and for implementation-note-116's `--uninstall` path to remove only what we added.
+/// and for implementation-note-162's `--uninstall` path to remove only what we added.
 pub const EMBER_PROXY_HOOK_COMMAND: &str = "ember-proxy hook";
+
+/// Raw tool names that must NOT be invoked outside the shadow PATH shims.
+/// Each entry here generates deny rules for common absolute binary paths.
+/// The shadow shims live at `~/.ember/shadow/<name>` and are allowed
+/// (they do not match any of the denied absolute-path prefixes below).
+///
+/// Extensible: add a name here and the deny/remove functions pick it up
+/// automatically.
+pub const RAW_TOOL_DENY_LIST: &[&str] = &["gh", "git", "kubectl"];
+
+/// Absolute-path prefixes at which each tool in `RAW_TOOL_DENY_LIST` is
+/// commonly found outside the shadow dir. We deny these explicitly so that
+/// even if the shadow PATH is bypassed the raw binaries cannot be exec'd
+/// via the Claude Code Bash hook (design §3 step 4).
+///
+/// The shadow dir itself (`~/.ember/shadow/<tool>`) is NOT listed here, so
+/// shim invocations pass through unblocked.
+const DENY_PATH_PREFIXES: &[&str] = &[
+    "/usr/bin",
+    "/usr/local/bin",
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/sbin",
+    "/snap/bin",
+    "/home/linuxbrew/.linuxbrew/bin",
+];
+
+/// Build the full set of `permissions.deny` entry strings we own.
+/// Format matches the Claude Code permissions schema: `Bash(<path> *)`.
+fn deny_entries() -> Vec<String> {
+    let mut entries = Vec::new();
+    for tool in RAW_TOOL_DENY_LIST {
+        for prefix in DENY_PATH_PREFIXES {
+            entries.push(format!("Bash({prefix}/{tool} *)"));
+        }
+    }
+    entries
+}
+
+/// Add `permissions.deny` entries that block raw invocations of
+/// `gh`, `git`, and `kubectl` via absolute paths outside the shadow dir.
+///
+/// The shadow shims (`~/.ember/shadow/<tool>`) are NOT denied — they are
+/// the sanctioned path. Common absolute-path locations (e.g.
+/// `/usr/bin/git`, `/opt/homebrew/bin/gh`) are denied so that even if the
+/// shadow PATH is overridden mid-session the raw binaries cannot be exec'd
+/// through the Claude Code Bash hook.
+///
+/// Idempotent: already-present entries are not duplicated.
+/// Preserves all user-authored deny entries that are not ours.
+pub fn add_permissions_deny_outside_shadow(settings: &mut Value) -> Result<(), PatchError> {
+    let root = settings
+        .as_object_mut()
+        .ok_or(PatchError::RootNotObject("non-object"))?;
+
+    let permissions = root
+        .entry("permissions")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or(PatchError::RootNotObject("permissions is not an object"))?;
+
+    let deny = permissions
+        .entry("deny")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .ok_or(PatchError::RootNotObject("permissions.deny is not an array"))?;
+
+    for entry in deny_entries() {
+        let already = deny
+            .iter()
+            .any(|v| v.as_str() == Some(entry.as_str()));
+        if !already {
+            deny.push(json!(entry));
+        }
+    }
+
+    Ok(())
+}
+
+/// Remove the `permissions.deny` entries added by
+/// `add_permissions_deny_outside_shadow`. Only removes entries we own;
+/// user-authored deny entries are preserved. Cleans up empty
+/// `permissions.deny` and `permissions` objects that we created, but only
+/// when they contain no other entries.
+pub fn remove_permissions_deny_outside_shadow(settings: &mut Value) -> Result<(), PatchError> {
+    let root = settings
+        .as_object_mut()
+        .ok_or(PatchError::RootNotObject("non-object"))?;
+
+    let permissions_obj = match root.get_mut("permissions").and_then(|v| v.as_object_mut()) {
+        Some(obj) => obj,
+        None => return Ok(()),
+    };
+
+    let deny = match permissions_obj
+        .get_mut("deny")
+        .and_then(|v| v.as_array_mut())
+    {
+        Some(arr) => arr,
+        None => return Ok(()),
+    };
+
+    let our_entries = deny_entries();
+    let before = deny.len();
+    deny.retain(|v| {
+        let s = v.as_str().unwrap_or("");
+        !our_entries.iter().any(|e| e == s)
+    });
+
+    if deny.len() == before {
+        // Nothing changed — our entries weren't present.
+        return Ok(());
+    }
+
+    // Clean up: if deny is now empty and we created it (i.e. has no other
+    // entries), remove it. Same for the permissions object itself.
+    let deny_empty = permissions_obj
+        .get("deny")
+        .and_then(|v| v.as_array())
+        .map(|a| a.is_empty())
+        .unwrap_or(false);
+    if deny_empty {
+        permissions_obj.remove("deny");
+    }
+
+    let permissions_empty = permissions_obj.is_empty();
+    if permissions_empty {
+        root.remove("permissions");
+    }
+
+    Ok(())
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum PatchError {
@@ -190,7 +322,7 @@ pub fn remove_pretooluse_hook(settings: &mut Value) -> Result<bool, PatchError> 
 }
 
 /// Top-level convenience: parse → patch (add) → re-serialize.
-/// Used by `ember init --for claude-code` (implementation-note-116).
+/// Used by `ember init --for claude-code` (implementation-note-162).
 pub fn patch_settings_json(input: &str) -> Result<String, PatchError> {
     let mut value = if input.trim().is_empty() {
         json!({})
@@ -370,5 +502,100 @@ mod tests {
     #[test]
     fn rejects_invalid_json() {
         assert!(patch_settings_json("{not json").is_err());
+    }
+
+    // --- implementation-note-177 tests ---
+
+    #[test]
+    fn add_deny_to_empty_settings() {
+        let mut v: Value = json!({});
+        add_permissions_deny_outside_shadow(&mut v).expect("add deny");
+        let deny = v
+            .pointer("/permissions/deny")
+            .and_then(|d| d.as_array())
+            .expect("permissions.deny must be an array");
+        // Every expected tool must appear as at least one entry.
+        for tool in RAW_TOOL_DENY_LIST {
+            let has_entry = deny
+                .iter()
+                .any(|e| e.as_str().map(|s| s.contains(tool)).unwrap_or(false));
+            assert!(has_entry, "deny list must contain an entry for {tool}");
+        }
+        // Spot-check that entries reference absolute paths, not the shadow dir.
+        for entry in deny {
+            let s = entry.as_str().unwrap_or("");
+            assert!(
+                !s.contains("~/.ember/shadow"),
+                "deny entries must not reference the shadow dir: {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn add_deny_idempotent() {
+        let mut v: Value = json!({});
+        add_permissions_deny_outside_shadow(&mut v).expect("first add");
+        let count_after_first = v
+            .pointer("/permissions/deny")
+            .and_then(|d| d.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        add_permissions_deny_outside_shadow(&mut v).expect("second add");
+        let count_after_second = v
+            .pointer("/permissions/deny")
+            .and_then(|d| d.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        assert_eq!(
+            count_after_first, count_after_second,
+            "second add must not duplicate entries"
+        );
+    }
+
+    #[test]
+    fn remove_deny_round_trips() {
+        let mut v: Value = json!({});
+        add_permissions_deny_outside_shadow(&mut v).expect("add");
+        remove_permissions_deny_outside_shadow(&mut v).expect("remove");
+        assert_eq!(v, json!({}), "round-trip must restore original {{}}");
+    }
+
+    #[test]
+    fn existing_user_deny_entries_preserved() {
+        let user_entry = "Bash(/usr/bin/curl *)";
+        let mut v: Value = json!({
+            "permissions": {
+                "deny": [user_entry]
+            }
+        });
+        add_permissions_deny_outside_shadow(&mut v).expect("add");
+        // User entry still present.
+        let deny = v
+            .pointer("/permissions/deny")
+            .and_then(|d| d.as_array())
+            .expect("deny array");
+        assert!(
+            deny.iter().any(|e| e.as_str() == Some(user_entry)),
+            "user deny entry must survive add"
+        );
+        remove_permissions_deny_outside_shadow(&mut v).expect("remove");
+        let deny_after = v
+            .pointer("/permissions/deny")
+            .and_then(|d| d.as_array())
+            .expect("deny array after remove");
+        assert!(
+            deny_after.iter().any(|e| e.as_str() == Some(user_entry)),
+            "user deny entry must survive remove"
+        );
+        // Our entries are gone.
+        for tool in RAW_TOOL_DENY_LIST {
+            for prefix in DENY_PATH_PREFIXES {
+                let our_entry = format!("Bash({prefix}/{tool} *)");
+                assert!(
+                    !deny_after.iter().any(|e| e.as_str() == Some(our_entry.as_str())),
+                    "our entry {our_entry} must be removed"
+                );
+            }
+        }
     }
 }

@@ -1,0 +1,82 @@
+# Construct manifest for ember-git per design §2.
+# Action schema: each [[actions]] declares an allowed action_key, optional
+# budget caps, biometric requirement, and a permit/deny default. The daemon's
+# broker.resolve consults this to decide whether the action requires a
+# credential mint, an existing grant, or refuses.
+#
+# Cohort-A scope catalog per design §"Cohort-A scopes":
+#   Gated — broker round-trip required (destructive or credential-carrying).
+#   Passthrough — None (read-only / safe write).
+
+[meta]
+name = "ember-git"
+version = "0.1.0"
+publisher = "did:emberlink"
+description = "Git CLI Construct. Mediates destructive and credential-carrying `git` invocations through ember's broker: force-push mints a scoped GITHUB_TOKEN; reset --hard / clean -f are budget-capped at 3/session with biometric confirmation; commit --amend, rebase -i, branch -D, and tag -d are gated. Read-only verbs (status, log, diff, show, etc.) and safe writes (commit, add, checkout, pull, fetch, etc.) are passthrough — no broker mediation."
+
+# Default policy for unlisted action keys.
+default = "deny"
+
+# --- push surface ---
+
+[[actions]]
+key = "git.push"
+default = "permit"
+
+[[actions]]
+key = "git.push.force"
+default = "prompt"         # rewrites remote history; biometric required
+
+[[actions]]
+key = "git.push.tags"
+default = "permit"
+
+# --- local history rewrite ---
+
+[[actions]]
+key = "git.commit.amend"
+default = "prompt"         # rewrites local history
+
+[[actions]]
+key = "git.rebase.interactive"
+default = "prompt"         # interactive rebase rewrites history
+
+# --- destructive local ops (budget-capped) ---
+
+[[actions]]
+key = "git.reset.hard"
+default = "prompt"         # biometric required; discards uncommitted work
+budget_caps = { wall_clock_secs = 86400, max_uses = 3 }
+
+[[actions]]
+key = "git.clean.force"
+default = "prompt"         # biometric required; deletes untracked files
+budget_caps = { wall_clock_secs = 86400, max_uses = 3 }
+
+# --- stash discard (destructive — discards stashed work permanently) ---
+
+[[actions]]
+key = "git.stash.drop"
+default = "prompt"         # biometric required; discards stashed work
+
+# --- ref management ---
+
+[[actions]]
+key = "git.branch.force_delete"
+default = "prompt"         # biometric required; destroys local branch
+
+[[actions]]
+key = "git.tag.delete"
+default = "prompt"         # gated; deleting a tag is non-trivial to undo
+
+# --- repository maintenance ---
+
+[[actions]]
+key = "git.gc.destructive"
+default = "prompt"         # --aggressive or --prune=now; data loss risk
+
+# --- passthrough / safe writes ---
+
+[[actions]]
+key = "git.submodule.update"
+default = "permit"

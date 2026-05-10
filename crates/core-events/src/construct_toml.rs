@@ -40,6 +40,10 @@ pub enum ConstructTomlError {
     InvalidMinVersion(String),
     #[error("invariant 8 violated: action {action} budget_caps.{key} value {value} outside [1, 10000]")]
     BudgetCapOutOfBounds { action: String, key: String, value: i64 },
+    #[error("invariant 9 violated: action {action} on_shim_eof {value:?} not in {{sigterm, drain}}")]
+    InvalidShimEofPolicy { action: String, value: String },
+    #[error("invariant 10 violated: action {action} env_passthrough name {name:?} fails ^[A-Z_][A-Z0-9_]*$ shape")]
+    InvalidEnvPassthroughName { action: String, name: String },
 }
 
 /// Parsed + validated `construct.toml` envelope.
@@ -85,7 +89,45 @@ pub struct ActionBlock {
     pub budget_caps: HashMap<String, i64>,
     #[serde(default)]
     pub receipt_redact: Vec<String>,
+    /// Policy applied when the shim's UDS connection EOFs before the
+    /// daemon-spawned child exits. design §"Shim-EOF correctness" /
+    /// `docs/adversarial/2026-05-07-daemon-supervisor-vs-shim-supervisor.md`
+    /// axis C. Allowed values:
+    ///
+    /// - `"sigterm"` (default) — daemon SIGTERMs the child immediately.
+    ///   Matches the wedge framing: the agent supervises its credential
+    ///   lifecycle; if the agent's representative went away, the work it
+    ///   requested should stop.
+    /// - `"drain"` — child runs to natural completion (e.g. `pulumi up`
+    ///   where mid-run interruption corrupts state). Cred is still revoked
+    ///   on child exit via the normal path; the shim-side has no
+    ///   visibility after disappearing.
+    #[serde(default = "default_on_shim_eof")]
+    pub on_shim_eof: String,
+    /// Per-action env-passthrough allowlist. Only env names declared here
+    /// are forwarded into the broker_exec child for this action; names
+    /// not in this list are stripped silently and counted in the
+    /// `env_passthrough_stripped` Receipt field for forensic visibility.
+    /// design axis A2 / `docs/adversarial/2026-05-07-daemon-supervisor-vs-shim-supervisor.md`.
+    ///
+    /// Each name must match the daemon's defense-in-depth shape regex
+    /// `^[A-Z_][A-Z0-9_]*$`; bad shapes are rejected at construct.toml
+    /// validate time (invariant 10).
+    ///
+    /// Default: empty list — i.e. zero env passthrough beyond the daemon's
+    /// hardcoded baseline (PATH, HOME, USER, LANG, TERM). Cohort-A author
+    /// intent is "declare what you need explicitly per action" so a
+    /// careless top-level allowlist cannot leak credentials into actions
+    /// that don't need them.
+    #[serde(default)]
+    pub env_passthrough: Vec<String>,
 }
+
+fn default_on_shim_eof() -> String {
+    "sigterm".to_string()
+}
+
+const ALLOWED_SHIM_EOF_POLICIES: &[&str] = &["sigterm", "drain"];
 
 const ALLOWED_MODES: &[&str] = &[
     "auto_approve_if_pregranted",
@@ -94,7 +136,7 @@ const ALLOWED_MODES: &[&str] = &[
     "auto_approve",
 ];
 
-const BUNDLED_PUBLISHER: &str = "did:ember-systems";
+const BUNDLED_PUBLISHER: &str = "did:emberlink";
 
 const BUDGET_CAP_MIN: i64 = 1;
 const BUDGET_CAP_MAX: i64 = 10000;
@@ -183,11 +225,49 @@ pub fn validate(c: &ConstructToml) -> Result<()> {
         }
     }
 
+    // Invariant 9: on_shim_eof, if set, must be one of the allowed values.
+    // (design §"Shim-EOF correctness" axis C.) Default is "sigterm" via
+    // `default_on_shim_eof`, so this catches explicit bad values.
+    for (id, block) in &c.actions {
+        if !ALLOWED_SHIM_EOF_POLICIES.contains(&block.on_shim_eof.as_str()) {
+            return Err(ConstructTomlError::InvalidShimEofPolicy {
+                action: id.clone(),
+                value: block.on_shim_eof.clone(),
+            });
+        }
+    }
+
+    // Invariant 10: every env_passthrough name on every action must match
+    // the env-name shape regex (design axis A2). Names that pass here are
+    // safe to compare against caller-supplied env names at broker_exec.
+    for (id, block) in &c.actions {
+        for name in &block.env_passthrough {
+            if !is_valid_env_name(name) {
+                return Err(ConstructTomlError::InvalidEnvPassthroughName {
+                    action: id.clone(),
+                    name: name.clone(),
+                });
+            }
+        }
+    }
+
     Ok(())
 }
 
+/// Per-action env-passthrough name shape. Mirrors the daemon's
+/// defense-in-depth regex (`^[A-Z_][A-Z0-9_]*$`) so the validate-time
+/// check and the runtime broker_exec check can never disagree.
+fn is_valid_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else { return false };
+    if !(first.is_ascii_uppercase() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
 /// Minimal DID validator. Accepts both `did:method` (informal 2-part shape
-/// the codebase has been using for `did:ember-systems`, `did:wrangler-team`)
+/// the codebase has been using for `did:emberlink`, `did:wrangler-team`)
 /// and the formal W3C `did:method:identifier` shape. The trust-graph layer
 /// does the full DID-method resolution; this validator just keeps junk out
 /// of the publisher field.
@@ -247,7 +327,7 @@ schema_version = "1"
 [meta]
 name = "ember-gh"
 version = "1.0.0"
-publisher = "did:ember-systems"
+publisher = "did:emberlink"
 wraps_binary = "gh"
 wraps_binary_min_version = "2.40.0"
 
@@ -287,14 +367,14 @@ budget_caps = { runs_per_session = 5, runs_per_hour = 30 }
 
     #[test]
     fn invariant_2_invalid_publisher_did() {
-        let s = valid_template().replace(r#"publisher = "did:ember-systems""#, r#"publisher = "ember-systems""#);
+        let s = valid_template().replace(r#"publisher = "did:emberlink""#, r#"publisher = "ember-systems""#);
         let err = parse_and_validate(&s).expect_err("expected InvalidPublisherDid");
         assert!(matches!(err, ConstructTomlError::InvalidPublisherDid(_)));
     }
 
     #[test]
     fn invariant_2_did_with_uppercase_method_rejected() {
-        let s = valid_template().replace(r#"publisher = "did:ember-systems""#, r#"publisher = "did:Ember-Systems""#);
+        let s = valid_template().replace(r#"publisher = "did:emberlink""#, r#"publisher = "did:Ember-Systems""#);
         let err = parse_and_validate(&s).expect_err("expected InvalidPublisherDid");
         assert!(matches!(err, ConstructTomlError::InvalidPublisherDid(_)));
     }
@@ -340,7 +420,7 @@ budget_caps = { runs_per_session = 5, runs_per_hour = 30 }
     fn invariant_6_third_party_auto_approve_top_level_allowed() {
         // Third-party publishers can choose dangerous defaults — that's their call.
         let s = valid_template()
-            .replace(r#"publisher = "did:ember-systems""#, r#"publisher = "did:wrangler-team""#)
+            .replace(r#"publisher = "did:emberlink""#, r#"publisher = "did:wrangler-team""#)
             .replace(r#"unknown_action = "deny""#, r#"unknown_action = "auto_approve""#);
         let _ = parse_and_validate(&s).expect("third-party auto_approve should be allowed");
     }
@@ -389,5 +469,89 @@ budget_caps = { runs_per_session = 5, runs_per_hour = 30 }
     fn missing_required_field_returns_parse_error() {
         let err = parse_and_validate(r#"schema_version = "1""#).expect_err("expected Parse (missing meta)");
         assert!(matches!(err, ConstructTomlError::Parse(_)));
+    }
+
+    #[test]
+    fn invariant_9_default_on_shim_eof_is_sigterm() {
+        let c = parse_and_validate(valid_template()).expect("valid template");
+        let pr_create = c.actions.get("pr_create").expect("pr_create block");
+        assert_eq!(pr_create.on_shim_eof, "sigterm");
+        let pr_merge = c.actions.get("pr_merge").expect("pr_merge block");
+        assert_eq!(pr_merge.on_shim_eof, "sigterm");
+    }
+
+    #[test]
+    fn invariant_9_drain_explicit_accepted() {
+        let s = valid_template().replace(
+            r#"[actions.pr_merge]
+mode = "jit_approval""#,
+            r#"[actions.pr_merge]
+on_shim_eof = "drain"
+mode = "jit_approval""#,
+        );
+        let c = parse_and_validate(&s).expect("drain override should validate");
+        assert_eq!(c.actions.get("pr_merge").unwrap().on_shim_eof, "drain");
+    }
+
+    #[test]
+    fn invariant_9_invalid_value_rejected() {
+        let s = valid_template().replace(
+            r#"[actions.pr_merge]
+mode = "jit_approval""#,
+            r#"[actions.pr_merge]
+on_shim_eof = "ignore"
+mode = "jit_approval""#,
+        );
+        let err = parse_and_validate(&s).expect_err("expected InvalidShimEofPolicy");
+        assert!(matches!(err, ConstructTomlError::InvalidShimEofPolicy { ref action, ref value }
+            if action == "pr_merge" && value == "ignore"));
+    }
+
+    #[test]
+    fn invariant_10_env_passthrough_default_empty() {
+        let c = parse_and_validate(valid_template()).expect("valid template");
+        let pr_create = c.actions.get("pr_create").expect("pr_create block");
+        assert!(pr_create.env_passthrough.is_empty());
+    }
+
+    #[test]
+    fn invariant_10_env_passthrough_accepted() {
+        let s = valid_template().replace(
+            r#"[actions.pr_merge]
+mode = "jit_approval""#,
+            r#"[actions.pr_merge]
+env_passthrough = ["GH_TOKEN", "GITHUB_TOKEN", "GH_HOST"]
+mode = "jit_approval""#,
+        );
+        let c = parse_and_validate(&s).expect("env_passthrough should validate");
+        let pr_merge = c.actions.get("pr_merge").unwrap();
+        assert_eq!(pr_merge.env_passthrough, vec!["GH_TOKEN", "GITHUB_TOKEN", "GH_HOST"]);
+    }
+
+    #[test]
+    fn invariant_10_env_passthrough_lowercase_rejected() {
+        let s = valid_template().replace(
+            r#"[actions.pr_merge]
+mode = "jit_approval""#,
+            r#"[actions.pr_merge]
+env_passthrough = ["gh_token"]
+mode = "jit_approval""#,
+        );
+        let err = parse_and_validate(&s).expect_err("expected InvalidEnvPassthroughName");
+        assert!(matches!(err, ConstructTomlError::InvalidEnvPassthroughName { ref action, ref name }
+            if action == "pr_merge" && name == "gh_token"));
+    }
+
+    #[test]
+    fn invariant_10_env_passthrough_starting_digit_rejected() {
+        let s = valid_template().replace(
+            r#"[actions.pr_merge]
+mode = "jit_approval""#,
+            r#"[actions.pr_merge]
+env_passthrough = ["1BAD"]
+mode = "jit_approval""#,
+        );
+        let err = parse_and_validate(&s).expect_err("expected InvalidEnvPassthroughName");
+        assert!(matches!(err, ConstructTomlError::InvalidEnvPassthroughName { .. }));
     }
 }

@@ -1,0 +1,135 @@
+# CLASSIFICATION: PUBLIC
+# Construct manifest for ember-terraform per design §2.
+#
+# Action schema: each [[actions]] declares an allowed action_key, optional
+# budget caps, biometric requirement, and a permit/deny default. The daemon's
+# broker.resolve consults this to decide whether the action requires a
+# credential mint, an existing grant, or refuses.
+#
+# Credential injection: NONE at the Construct level. Terraform is a state-
+# management CLI that consumes existing cloud-provider credentials (AWS /
+# GCP / Azure / etc.) via standard provider env vars. The credential broker
+# lives in the cloud-provider Constructs (`ember-aws`, `ember-az`,
+# `ember-gcloud`, etc.); this Construct only gates destructive state
+# operations. Cloud creds flow through whatever child invocation the Terraform
+# providers make.
+#
+# Read-only verbs (`plan`, `validate`, `show`, `state list`, `state show`,
+# `output`, `version`, `providers`, `init`, `fmt`, `console`) classify to
+# `None` (passthrough) and never reach this manifest.
+
+[meta]
+name = "ember-terraform"
+version = "0.1.0"
+publisher = "did:emberlink"
+description = "HashiCorp Terraform CLI Construct (sister to ember-tofu). Mediates `terraform` state mutations through ember's broker: `terraform destroy` (catastrophic — tears down everything), `terraform force-unlock` (manual lock override), `terraform state {rm, replace-provider, push}` (direct state mutation), and `terraform workspace delete` (workspace-scoped destruction) all require biometric approval. `terraform apply` gates without biometric — apply is the normal operational path and the destructive subset is constrained by what the underlying providers allow (gated by ember-aws / ember-az / ember-gcloud separately). `terraform taint` / `terraform untaint` / `terraform refresh` / `terraform import` / `terraform workspace {new, select}` / `terraform state mv` are gated. NO credential injection at this layer — cloud creds flow through the provider Constructs."
+
+# Default policy for unlisted action keys.
+default = "deny"
+
+# --- top-level mutating verbs ---
+
+# terraform apply: normal operational path. Gate without biometric — the
+# destructive subset of any apply is constrained by what the underlying
+# providers allow, which the cloud-provider Constructs (ember-aws, ember-az,
+# ember-gcloud, etc.) gate separately.
+[[actions]]
+key = "terraform.apply"
+default = "permit"
+mode = "gate"
+
+# terraform destroy: catastrophic — tears down every managed resource.
+# Biometric required.
+[[actions]]
+key = "terraform.destroy"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# terraform import: mutates state to reflect an existing resource. Gated.
+[[actions]]
+key = "terraform.import"
+default = "permit"
+mode = "gate"
+
+# terraform taint / untaint: marks resources for replacement on next apply.
+# Gated (state-mutating; not catastrophic on its own).
+[[actions]]
+key = "terraform.taint"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "terraform.untaint"
+default = "permit"
+mode = "gate"
+
+# terraform refresh: state refresh — touches state file but does not change
+# infrastructure. Gated.
+[[actions]]
+key = "terraform.refresh"
+default = "permit"
+mode = "gate"
+
+# terraform force-unlock: manual state-lock override. Risky — bypasses the
+# concurrency safeguard. Biometric required.
+[[actions]]
+key = "terraform.force-unlock"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- state subcommand (3-level prefix) ---
+
+# terraform state rm: direct removal of resources from state. Resources
+# persist in cloud (orphaned). Biometric required.
+[[actions]]
+key = "terraform.state.rm"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# terraform state mv: rename / re-address resources within state. Gated
+# (reversible by another mv).
+[[actions]]
+key = "terraform.state.mv"
+default = "permit"
+mode = "gate"
+
+# terraform state replace-provider: rewrites provider references across
+# state. Catastrophic if the wrong source/target — biometric required.
+[[actions]]
+key = "terraform.state.replace-provider"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# terraform state push: overwrites remote state with a local file. High-
+# risk — biometric required.
+[[actions]]
+key = "terraform.state.push"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- workspace subcommand (3-level prefix) ---
+
+# terraform workspace new: creates a new workspace. Gated.
+[[actions]]
+key = "terraform.workspace.new"
+default = "permit"
+mode = "gate"
+
+# terraform workspace select: switches active workspace. Gated.
+[[actions]]
+key = "terraform.workspace.select"
+default = "permit"
+mode = "gate"
+
+# terraform workspace delete: workspace-scoped destruction (deletes the
+# state for that workspace). Biometric required.
+[[actions]]
+key = "terraform.workspace.delete"
+default = "permit"
+mode = "gate"
+biometric = "required"

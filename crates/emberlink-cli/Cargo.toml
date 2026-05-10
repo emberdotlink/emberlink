@@ -26,6 +26,7 @@ core-crypto = { path = "../core-crypto" }
 core-events = { path = "../core-events" }
 core-identity = { path = "../core-identity" }
 core-personas = { path = "../core-personas" }
+core-receipts = { path = "../core-receipts" }
 core-recovery = { path = "../core-recovery" }
 core-sync = { path = "../core-sync" }
 core-approval = { path = "../core-approval" }

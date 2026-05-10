@@ -1,0 +1,126 @@
+# Construct manifest for ember-wrangler per design §2.
+# Action schema: each [[actions]] declares an allowed action_key, optional
+# budget caps, biometric requirement, and a permit/deny default. The daemon's
+# broker.resolve consults this to decide whether the action requires a
+# credential mint, an existing grant, or refuses.
+#
+# Credential injection: broker materializes CLOUDFLARE_API_TOKEN from vault
+# key cloudflare/account-c524597f/account/<scope>-token per design. The scope
+# (workers-deploy, r2-edit, kv-edit, d1-edit) is selected daemon-side per verb.
+# The shim declares CLOUDFLARE_API_TOKEN in env_passthrough; daemon zeroizes
+# on child exit.
+
+[meta]
+name = "ember-wrangler"
+version = "0.1.0"
+publisher = "did:emberlink"
+description = "Wrangler CLI Construct. Mediates `wrangler` invocations through ember's credential broker: deploy and all mutation operations require biometric approval; delete (Worker script removal) and r2 object delete are budget-capped; d1 execute (raw SQL) requires biometric; kv:key put/delete and secret put/delete are biometric-gated. CLOUDFLARE_API_TOKEN is injected from vault key cloudflare/account-c524597f/account/<scope>-token per design. Read-only verbs (dev, tail, whoami, version, login, logout, kv:key list/get, r2 object list/get, d1 list/info, secret list) are passthrough — no broker mediation."
+
+# Default policy for unlisted action keys.
+default = "deny"
+
+# --- Workers script publish (biometric required) ---
+
+[[actions]]
+key = "wrangler.deploy"
+default = "permit"
+biometric = "required"
+
+# --- Workers script removal (biometric required, budget cap 1/session) ---
+
+[[actions]]
+key = "wrangler.delete"
+default = "permit"
+biometric = "required"
+budget_caps = { max_per_session = 1 }
+
+# --- Secret mutations (biometric required) ---
+
+[[actions]]
+key = "wrangler.secret.put"
+default = "permit"
+biometric = "required"
+
+[[actions]]
+key = "wrangler.secret.delete"
+default = "permit"
+biometric = "required"
+
+[[actions]]
+key = "wrangler.secret.bulk"
+default = "permit"
+biometric = "required"
+
+# --- R2 object mutations ---
+
+[[actions]]
+key = "wrangler.r2.put"
+default = "permit"
+biometric = "required"
+
+[[actions]]
+key = "wrangler.r2.delete"
+default = "permit"
+biometric = "required"
+budget_caps = { max_per_session = 5 }
+
+# --- R2 bucket mutations (biometric required) ---
+
+[[actions]]
+key = "wrangler.r2.bucket.create"
+default = "permit"
+biometric = "required"
+
+# --- KV key mutations (biometric required) ---
+
+[[actions]]
+key = "wrangler.kv.put"
+default = "permit"
+biometric = "required"
+
+[[actions]]
+key = "wrangler.kv.delete"
+default = "permit"
+biometric = "required"
+
+# --- D1 SQL execution (biometric required) ---
+
+[[actions]]
+key = "wrangler.d1.execute"
+default = "permit"
+biometric = "required"
+
+# --- D1 database provisioning (biometric required) ---
+
+[[actions]]
+key = "wrangler.d1.create"
+default = "permit"
+biometric = "required"
+
+# --- Pages deploy (biometric required) ---
+
+[[actions]]
+key = "wrangler.pages.deploy"
+default = "permit"
+biometric = "required"
+
+# --- Gap-fill from construct-coverage-audit (implementation-note-29) ---
+# wrangler.secret.bulk: bulk-import secrets from JSON; same threat model as secret.put
+# wrangler.r2.bucket.create: persistent R2 bucket creation
+# wrangler.d1.create: persistent D1 database creation
+# (per construct-coverage-audit)
+
+[[actions]]
+key = "wrangler.secret.bulk"
+default = "permit"
+biometric = "required"
+
+[[actions]]
+key = "wrangler.r2.bucket.create"
+default = "permit"
+biometric = "required"
+
+[[actions]]
+key = "wrangler.d1.create"
+default = "permit"
+biometric = "required"

@@ -1,0 +1,86 @@
+# Construct manifest for ember-pulumi per design §2.
+# Action schema: each [[actions]] declares an allowed action_key, optional
+# budget caps, biometric requirement, and a permit/deny default. The daemon's
+# broker.resolve consults this to decide whether the action requires a
+# credential mint, an existing grant, or refuses.
+#
+# Credential injection: broker materializes PULUMI_CONFIG_PASSPHRASE from
+# vault key pulumi/<fqn> (where <fqn> is <org>/<project>/<stack>) per design.
+# The shim declares PULUMI_CONFIG_PASSPHRASE in env_passthrough; daemon
+# zeroizes on child exit.
+
+[meta]
+name = "ember-pulumi"
+version = "0.1.0"
+publisher = "did:emberlink"
+description = "Pulumi CLI Construct. Mediates `pulumi` invocations through ember's credential broker: destructive operations (up, destroy, import) require biometric approval; config mutations (config set, config rm) require biometric approval to protect PULUMI_CONFIG_PASSPHRASE-encrypted secrets; destroy is budget-capped at 1 per session. PULUMI_CONFIG_PASSPHRASE is injected from vault key pulumi/<fqn> per design. Read-only verbs (preview, stack ls, config get, about, version) are passthrough — no broker mediation."
+
+# Default policy for unlisted action keys.
+default = "deny"
+
+# --- cluster mutation (biometric required) ---
+
+[[actions]]
+key = "pulumi.up"
+default = "permit"
+biometric = "required"
+
+# --- destructive (biometric required, budget cap 1/session) ---
+
+[[actions]]
+key = "pulumi.destroy"
+default = "permit"
+biometric = "required"
+budget_caps = { max_per_session = 1 }
+
+# --- stack deletion (irreversible — biometric + budget cap 1/session) ---
+
+[[actions]]
+key = "pulumi.stack.rm"
+default = "permit"
+biometric = "required"
+budget_caps = { max_per_session = 1 }
+
+# --- state surgery (orphans cloud resources — biometric required) ---
+
+[[actions]]
+key = "pulumi.state.delete"
+default = "permit"
+biometric = "required"
+
+# --- state mutation (gated) ---
+
+[[actions]]
+key = "pulumi.refresh"
+default = "permit"
+
+# --- gitops YAML render (gated — design gitops lane) ---
+
+[[actions]]
+key = "pulumi.render"
+default = "permit"
+
+# --- config mutations (biometric required — protect encrypted secrets) ---
+
+[[actions]]
+key = "pulumi.config.set"
+default = "permit"
+biometric = "required"
+
+[[actions]]
+key = "pulumi.config.rm"
+default = "permit"
+biometric = "required"
+
+# --- state-graph mutation (biometric required) ---
+
+[[actions]]
+key = "pulumi.import"
+default = "permit"
+biometric = "required"
+
+# --- policy publish (gated) ---
+
+[[actions]]
+key = "pulumi.policy.publish"
+default = "permit"

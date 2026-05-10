@@ -164,7 +164,7 @@ pub fn get_password_user_presence(
 /// immediately-following auto-unseal read.
 ///
 /// Note: if an entry already exists with a different SAC (e.g. from a
-/// pre-implementation-note-25 daemon that used `USER_PRESENCE`), the
+/// pre-implementation-note-40 daemon that used `USER_PRESENCE`), the
 /// underlying API replaces it with the new SAC-wrapped version. This is the
 /// documented one-shot upgrade path. Existing entries that pre-date this
 /// branch are NOT migrated automatically — they continue to function under

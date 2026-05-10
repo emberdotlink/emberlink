@@ -142,7 +142,7 @@ impl DaemonStore {
             if g.persona_id != persona_id {
                 continue;
             }
-            // security check: enforce allowed_targets at the standing-grant level.
+            // Enforce allowed_targets at the standing-grant level.
             // Empty list is deny-all, not wildcard.
             if !resource_matches_allowed_targets(g.allowed_targets.as_deref(), resource) {
                 continue;
@@ -326,7 +326,7 @@ mod tests {
         assert!(miss.is_none(), "must not match a different persona");
     }
 
-    // --- security check: allowed_targets enforcement tests -------------------------
+    // --- allowed_targets enforcement tests -------------------------
 
     #[test]
     fn resource_matches_allowed_targets_none_is_unrestricted() {

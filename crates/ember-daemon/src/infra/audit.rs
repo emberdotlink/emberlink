@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::infra::store::{DaemonStore, StoreError};
 
-/// implementation-note-34 — convert unix-ms to an RFC3339 string so
+/// implementation-note-55 — convert unix-ms to an RFC3339 string so
 /// the date-range filter compares lexicographically against the existing TEXT
 /// `timestamp` column. Negative or out-of-range values clamp to the unix epoch.
 fn ms_to_rfc3339(ms: i64) -> String {
@@ -33,21 +33,21 @@ pub struct AuditFilter {
     pub agent_id: Option<String>,
     pub action: Option<String>,
     pub limit: Option<usize>,
-    /// implementation-note-35 — filter to actions that start with this prefix,
+    /// implementation-note-56 — filter to actions that start with this prefix,
     /// e.g. `"grant."` shows only grant-family events. Rendering-layer only;
     /// applied after the SQL fetch so the limit still governs the fetch window.
     pub action_prefix: Option<String>,
-    /// implementation-note-34 — alias for `agent_id`. Both populate
+    /// implementation-note-55 — alias for `agent_id`. Both populate
     /// the `agent_id = ?` clause; if both are set, `persona_id` wins.
     pub persona_id: Option<String>,
-    /// implementation-note-34 — narrow to rows whose `credential`
+    /// implementation-note-55 — narrow to rows whose `credential`
     /// column starts with this prefix. SQL `LIKE` with appended `%`.
     pub scope: Option<String>,
-    /// implementation-note-34 — inclusive lower bound (unix ms).
+    /// implementation-note-55 — inclusive lower bound (unix ms).
     /// Converted to RFC3339 before binding so it compares against the
     /// existing TEXT timestamp column.
     pub since_ms: Option<i64>,
-    /// implementation-note-34 — inclusive upper bound (unix ms).
+    /// implementation-note-55 — inclusive upper bound (unix ms).
     pub before_ms: Option<i64>,
 }
 
@@ -70,7 +70,7 @@ impl DaemonStore {
     }
 
     pub fn query_audit(&self, filter: &AuditFilter) -> Result<Vec<AuditEntry>, StoreError> {
-        // implementation-note-34 — dynamic positional binding so we
+        // implementation-note-55 — dynamic positional binding so we
         // can compose any combination of {agent_id, action, persona_id, scope,
         // since_ms, before_ms} without the previous hand-numbered ladder.
         let mut query = String::from(
@@ -135,7 +135,7 @@ impl DaemonStore {
             .query_map(rusqlite::params_from_iter(binds.iter()), map_row)?
             .collect::<Result<Vec<_>, _>>()?;
 
-        // implementation-note-35 — action_prefix filter applied post-fetch so
+        // implementation-note-56 — action_prefix filter applied post-fetch so
         // the SQL limit governs the fetch window; the prefix narrows what
         // the dashboard displays. Empty/whitespace prefix is a no-op.
         if let Some(ref prefix) = filter.action_prefix {
@@ -148,7 +148,7 @@ impl DaemonStore {
         Ok(entries)
     }
 
-    /// implementation-note-34 — test helper to insert an audit row
+    /// implementation-note-55 — test helper to insert an audit row
     /// with an explicit timestamp string (so date-range tests can pin
     /// timestamps without sleeping).
     #[cfg(test)]
@@ -297,7 +297,7 @@ mod tests {
 
     #[test]
     fn persona_filter_isolates_rows() {
-        // implementation-note-34 — persona_id targets the agent_id
+        // implementation-note-55 — persona_id targets the agent_id
         // column; a row tagged "persona-x" should not surface when querying
         // for "persona-y".
         let store = DaemonStore::open_in_memory().unwrap();
@@ -320,7 +320,7 @@ mod tests {
 
     #[test]
     fn since_before_bound_timestamps() {
-        // implementation-note-34 — since_ms / before_ms inclusive
+        // implementation-note-55 — since_ms / before_ms inclusive
         // bounds. Insert three rows at t=100/200/300 ms; query [150, 250]
         // expects only the t=200 row.
         let store = DaemonStore::open_in_memory().unwrap();

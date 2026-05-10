@@ -82,6 +82,9 @@ fn deterministic_envelope_session_claude_code() -> ReceiptEnvelope {
             device_id: Some("device-fixture".to_string()),
         },
         audit_gaps: vec![],
+        termination_reason: None,
+        last_heartbeat_at: None,
+        pid_alive_at_check: None,
     };
     let mut env = ReceiptEnvelope {
         version: ReceiptVersion::default(),

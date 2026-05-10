@@ -1,4 +1,4 @@
-//! implementation-note-40 regression: when the configured
+//! implementation-note-65 regression: when the configured
 //! dashboard port is already bound by another process, the daemon must
 //! report the failure truthfully via `runtime.dashboard_actual_addr`
 //! (== `None`) and via `/api/status`'s `dashboard_addr_bound` field

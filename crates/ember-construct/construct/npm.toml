@@ -1,0 +1,112 @@
+# Construct manifest for ember-npm per design §2.
+# Action schema: each [[actions]] declares an allowed action_key, optional
+# budget caps, biometric requirement, and a permit/deny default. The daemon's
+# broker.resolve consults this to decide whether the action requires a
+# credential mint, an existing grant, or refuses.
+#
+# Per-registry keys (`npm.publish.<host>`, `npm.install.<host>`) are
+# matched by family-prefix at broker resolve time when no exact key is
+# declared here — see design §3 (server-side reclassification).
+
+[meta]
+name = "ember-npm"
+version = "0.1.0"
+publisher = "did:emberlink"
+description = "npm CLI Construct. Mediates `npm` invocations through ember's credential broker: each publish/version/deprecate/dist-tag mints a scoped, time-bound registry token (npmjs.org, GitHub Packages, custom registries), populates a temp .npmrc with the materialized auth, runs the command, then revokes/cleans up on exit. install/ci receive a read-scoped NPM_TOKEN. Read-only verbs (ls, view, info, outdated, audit, config get, search, ping, whoami) are passthrough — no broker mediation. Mutating publish-class actions (publish, version, deprecate, dist-tag) require biometric approval and are budget-capped per session."
+
+# Default policy for unlisted action keys.
+default = "deny"
+
+# --- registry write surface (publish) ---
+
+[[actions]]
+key = "npm.publish"
+default = "permit"          # family fallback for any npm.publish.<host>
+biometric = "required"
+budget_caps = { max_per_session = 5 }
+
+[[actions]]
+key = "npm.publish.npmjs.org"
+default = "permit"
+biometric = "required"
+budget_caps = { max_per_session = 5 }
+
+# --- version bumps ---
+# `npm version <newversion>` mutates package.json + creates a git tag. Treated
+# as publish-adjacent: biometric required.
+
+[[actions]]
+key = "npm.version"
+default = "permit"
+biometric = "required"
+
+# --- registry reads (install, ci) ---
+# install/ci pull tarballs and may require a read-scoped NPM_TOKEN for private
+# packages. Family fallback `npm.install` covers any npm.install.<host>.
+
+[[actions]]
+key = "npm.install"
+default = "permit"
+
+[[actions]]
+key = "npm.install.npmjs.org"
+default = "permit"
+
+[[actions]]
+key = "npm.ci"
+default = "permit"
+
+[[actions]]
+key = "npm.ci.npmjs.org"
+default = "permit"
+
+# --- script execution ---
+# `npm run <script>` runs arbitrary code from package.json. Permitted by
+# default but the daemon may inject scope-narrowed env via the broker.
+
+[[actions]]
+key = "npm.run-script"
+default = "permit"
+
+# --- audit fix ---
+# Mutates the dependency tree by upgrading vulnerable transitive deps. Permit
+# at this layer; the diff is reviewable post-hoc via the receipt.
+
+[[actions]]
+key = "npm.audit-fix"
+default = "permit"
+
+# --- destructive registry ops ---
+# deprecate and dist-tag both mutate published metadata for OTHER consumers,
+# so they're treated as publish-class: biometric required.
+
+[[actions]]
+key = "npm.deprecate"
+default = "permit"
+biometric = "required"
+
+[[actions]]
+key = "npm.dist-tag"
+default = "permit"
+biometric = "required"
+
+# --- explicit deny list (per construct-coverage-audit) ---
+
+# npm.unpublish: explicitly denied. Removing a published package permanently
+# affects every downstream consumer who depends on that version. High blast
+# radius, irreversible on npmjs.org. Never auto-permit; force a human + OOB
+# revocation workflow rather than letting an agent pull the trigger. This is an
+# explicit deny (not just falling through to default=deny) so the reason is
+# machine-readable in the manifest and audit receipts surface the key.
+[[actions]]
+key = "npm.unpublish"
+mode = "deny"
+
+# --- pre-publish local ops ---
+
+# npm.pack: non-destructive. Creates a local .tgz tarball from the current
+# package for inspection before publish. No registry writes, no credential
+# mint needed. Permit without biometric or budget cap.
+[[actions]]
+key = "npm.pack"
+default = "permit"

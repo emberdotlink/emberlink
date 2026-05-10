@@ -1,12 +1,12 @@
 //! Vault MEK + sealed-credentials store.
 //!
-//! ## security check (Tier 1): start-of-session unlock
+//! ## Tier 1: start-of-session unlock
 //!
 //! `Vault::open_from_config` reads the MEK passphrase via the SE-backed
 //! `vault_macos` shim on macOS — first read prompts for Touch ID. See
 //! `vault_macos.rs` for the shim contract.
 //!
-//! ## security check (Tier 2): per-op user presence + idle re-lock
+//! ## Tier 2: per-op user presence + idle re-lock
 //!
 //! After Tier 1 unlocks the vault, the daemon stays "session-permissive"
 //! for read-class operations (vault_get, vault_list, status) but
@@ -16,9 +16,6 @@
 //! gate is dispatch-level, not vault-level). The daemon supervisor calls
 //! `presence::mark_unlocked()` after a successful Tier 1 unlock so
 //! subsequent high-risk ops don't double-prompt within the idle window.
-//!
-//! See `project design notes` (cross-ref) and the
-//! security check task brief for the full layer-cake design.
 
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
 use rusqlite::{OptionalExtension, params};
@@ -52,7 +49,7 @@ pub enum VaultError {
 
 /// Reasons a credential name fails the design path grammar.
 ///
-/// Grammar (per task brief implementation-note-92):
+/// Grammar (per task brief implementation-note-130):
 ///   - Lowercase ASCII letters `a-z`
 ///   - Digits `0-9`
 ///   - Hyphens `-`
@@ -338,10 +335,10 @@ impl Vault {
         }
 
         let passphrase = resolve_passphrase(&service, &account)?;
-        // security check: a successful unlock (Tier 1, possibly via the
-        // macOS user-presence prompt) flips the in-process session state
-        // to Unlocked so per-op `require_user_presence` gates don't
-        // double-prompt within the idle window.
+        // A successful unlock (Tier 1, possibly via the macOS user-presence
+        // prompt) flips the in-process session state to Unlocked so per-op
+        // `require_user_presence` gates don't double-prompt within the
+        // idle window.
         crate::trust::presence::mark_unlocked();
         Ok(Vault::from_passphrase(&passphrase, &salt))
     }
@@ -358,8 +355,8 @@ impl Vault {
     ///   `VaultError::Crypto("not yet implemented; use Passphrase variant")`.
     ///   Wire-up is tracked under **.A-SE-WIRE**.
     ///
-    /// Both passphrase lanes flip the security check presence gate to
-    /// Unlocked on success so per-op `require_user_presence` checks don't
+    /// Both passphrase lanes flip the per-op presence gate to Unlocked on
+    /// success so per-op `require_user_presence` checks don't
     /// double-prompt within the idle window.
     pub fn open_with_key_store(
         config: &DaemonConfig,
@@ -600,7 +597,7 @@ pub enum AutoUnsealOutcome {
 ///   each re-implementing keyring lookup.
 ///
 /// Always-attempted: there is no relay/hosted/first-party mode flag in
-/// `DaemonConfig` today (implementation-note-88 task instructions explicitly note this).
+/// `DaemonConfig` today (implementation-note-124 task instructions explicitly note this).
 /// If one is added later, gate auto-unseal on first-party mode here.
 pub fn try_auto_unseal_from_keyring(config: &DaemonConfig) -> AutoUnsealOutcome {
     let service = resolve_keyring_service(&config.keyring);
@@ -635,8 +632,8 @@ pub fn try_auto_unseal_from_keyring(config: &DaemonConfig) -> AutoUnsealOutcome 
     // "keyring miss" (NoKeyringEntry) from "platform error" (Error).
     match resolve_passphrase_no_provision(&service, &account) {
         Ok(Some(passphrase)) => {
-            // security check: same Tier-1 → Tier-2 hand-off as
-            // `open_from_config` — flip the gate to Unlocked so per-op
+            // Same Tier-1 → Tier-2 hand-off as `open_from_config` — flip
+            // the gate to Unlocked so per-op
             // `require_user_presence` checks succeed within the idle
             // window without re-prompting.
             crate::trust::presence::mark_unlocked();
@@ -680,7 +677,7 @@ pub(crate) fn resolve_passphrase_no_provision(
         return Ok(None);
     }
 
-    // 3. macOS user-presence gate (security check). When the effective service is the
+    // 3. macOS user-presence gate. When the effective service is the
     //    production default, route the read through `vault_macos` so the
     //    Keychain entry's `kSecAttrAccessControl` triggers the LocalAuthentication
     //    prompt (Touch ID / device passcode). The `keyring` crate cannot do
@@ -814,7 +811,7 @@ pub struct MigrateMekAclResult {
 /// (biometric on macOS via `kSecAttrAccessControl`).
 ///
 /// This migrates a pre-existing MEK entry created before
-/// implementation-note-25 shipped so subsequent vault operations
+/// implementation-note-40 shipped so subsequent vault operations
 /// use Touch ID instead of the plain keychain password.
 ///
 /// Safety contract:
@@ -1031,7 +1028,7 @@ fn resolve_passphrase(service: &str, account: &str) -> Result<String, VaultError
         return Ok(format!("test-passphrase-{service}-{account}"));
     }
 
-    // 2. macOS user-presence gate (security check). For the production keychain service
+    // 2. macOS user-presence gate. For the production keychain service
     //    the vault MEK passphrase entry is wrapped with kSecAttrAccessControl
     //    requiring user presence (Touch ID / device passcode); the `keyring`
     //    crate cannot set that attribute. Read first; if absent, generate +
@@ -1250,9 +1247,9 @@ mod tests {
             .add(&store, "round-trip-key", b"secret-value", None)
             .unwrap();
 
-        // Re-set the env var: open_from_config removes it after first read
-        // (security check). The second vault must be derived from the same passphrase
-        // to decrypt what vault1 wrote.
+        // Re-set the env var: open_from_config removes it after first read.
+        // The second vault must be derived from the same passphrase to
+        // decrypt what vault1 wrote.
         // SAFETY: test-only, single-threaded, no other threads reading env vars.
         unsafe { std::env::set_var("EMBER_VAULT_PASSPHRASE", "test-roundtrip-passphrase") };
 
@@ -1382,7 +1379,7 @@ mod tests {
         log_vault_identity(&config, Some(&default_path));
     }
 
-    // --- P69K-security check production-checkpoint tests ---
+    // --- production-checkpoint tests ---
     //
     // The helper is parameterized on home_dir so tests can point at a tempdir
     // and never touch the real `$HOME`. The real production service string is
@@ -1437,7 +1434,7 @@ mod tests {
         );
     }
 
-    // --- security check: EMBER_VAULT_PASSPHRASE cleared after first read ---
+    // --- EMBER_VAULT_PASSPHRASE cleared after first read ---
 
     #[test]
     fn env_var_removed_after_open_from_config() {
@@ -1477,7 +1474,7 @@ mod tests {
         );
     }
 
-    // --- security check: macOS user-presence gate routing ---
+    // --- macOS user-presence gate routing ---
     //
     // The shim itself (`vault_macos`) carries unit tests for the
     // `apply_user_presence` predicate and the SE-safety guard. These tests
@@ -1525,7 +1522,7 @@ mod tests {
         );
     }
 
-    // --- security check: salt file permissions ---
+    // --- salt file permissions ---
 
     #[cfg(unix)]
     #[test]
@@ -1562,7 +1559,7 @@ mod tests {
         unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
     }
 
-    // --- implementation-note-93: migrate_mek_acl ---
+    // --- implementation-note-131: migrate_mek_acl ---
 
     // Serial lock: tests that mutate EMBER_VAULT_TEST_KEYRING_PRESENT must not
     // run concurrently — cargo test threads share the process environment.

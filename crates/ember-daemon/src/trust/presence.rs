@@ -1,8 +1,8 @@
-//! security check: Per-operation user-presence gate.
+//! Per-operation user-presence gate.
 //!
 //! ## Layer cake
 //!
-//! - **Tier 1 (security check, shipped):** start-of-session unlock via Touch ID — the
+//! - **Tier 1 (shipped):** start-of-session unlock via Touch ID — the
 //!   `vault_macos` shim puts `kSecAttrAccessControl=USER_PRESENCE` on the
 //!   vault MEK passphrase entry, so the FIRST read prompts.
 //! - **Tier 2 (this module):** in-process per-op `require_user_presence`
@@ -40,7 +40,7 @@
 //! - returns `Locked { reason }` otherwise — the caller (handler) maps this
 //!   to a JSON-RPC error so the CLI/dashboard can surface a re-auth prompt.
 //!
-//! The handler is responsible for re-running the security check macOS unlock path
+//! The handler is responsible for re-running the macOS unlock path
 //! (clear `vault_macos::SESSION_CACHE`, then read the entry again) when the
 //! caller responds to the lock — that's outside this module's scope.
 //!
@@ -94,7 +94,7 @@ impl HighRiskOp {
 }
 
 /// Default idle timeout: 15 minutes. Matches the value the operator called
-/// out in the security check brief and the macOS Keychain default for
+/// out in the per-op-presence brief and the macOS Keychain default for
 /// "Allow Always" credentials in interactive sessions.
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
@@ -191,7 +191,7 @@ pub fn current_config() -> PresenceConfig {
 }
 
 /// Mark the session unlocked. Called after a successful Tier-1 unlock
-/// (the security check Keychain read returned a passphrase). Resets `last_activity`
+/// (the Keychain read returned a passphrase). Resets `last_activity`
 /// so the idle timer starts fresh.
 ///
 /// # N-calls-1-prompt invariant
@@ -315,7 +315,7 @@ pub fn require_user_presence_at(
         SessionState::Locked => GateOutcome::Locked {
             reason: format!(
                 "{} denied: session is locked; run `ember vault unlock` (or any read op \
-                 that triggers the security check unlock path)",
+                 that triggers the unlock path)",
                 op.as_str()
             ),
         },

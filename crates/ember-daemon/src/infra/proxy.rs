@@ -28,7 +28,7 @@ use crate::infra::vault::VaultError;
 /// Maximum bytes the proxy will buffer from a single request or non-streaming
 /// response body before returning 413 Payload Too Large.
 ///
-/// security check (2026-04-24): an unbounded `.collect()` lets a single large POST
+/// An unbounded `.collect()` lets a single large POST
 /// exhaust daemon RSS. 10 MiB is comfortably above the largest legitimate
 /// Anthropic request body (≈ 200 KB for a maximal prompt) while keeping the
 /// worst-case allocation per request well below the streaming cap of
@@ -554,7 +554,7 @@ const HOP_BY_HOP_HEADERS: &[&str] = &[
 
 /// Explicit allowlist of request headers forwarded to upstream APIs.
 ///
-/// security check (2026-04-24): the proxy previously used a blocklist that stripped
+/// The proxy previously used a blocklist that stripped
 /// only `x-ember-*` and `Authorization`, silently forwarding `Cookie`,
 /// `Host`, `X-Forwarded-*`, `Proxy-Authorization`, and every other header
 /// the client chose to send. An allowlist is the correct security primitive:
@@ -569,7 +569,7 @@ const HOP_BY_HOP_HEADERS: &[&str] = &[
 /// and all legitimate header names are ASCII.
 const ALLOWED_REQUEST_HEADERS: &[&str] = &[
     "accept",
-    // `accept-encoding` deliberately omitted — implementation-note-18.
+    // `accept-encoding` deliberately omitted — implementation-note-22.
     // Passing the client's `Accept-Encoding: gzip` through to upstream
     // returns a gzip-compressed response body, which `parse_usage` cannot
     // recognize as JSON (`looks_like_json` checks for a leading `{` or
@@ -592,7 +592,7 @@ const ALLOWED_REQUEST_HEADERS: &[&str] = &[
 /// Build an outgoing `Request::Builder` from `src` headers using only the
 /// `ALLOWED_REQUEST_HEADERS` allowlist.
 ///
-/// security check (2026-04-24): constructs outbound headers from scratch rather
+/// Constructs outbound headers from scratch rather
 /// than filtering in-place so there is no risk of accidentally carrying
 /// through a header that slips past a blocklist. Any header NOT in
 /// `ALLOWED_REQUEST_HEADERS` is dropped silently — including `Cookie`,
@@ -823,7 +823,7 @@ impl ProxyState {
 /// `std::io::Error`). Bind success/failure must not depend on whether the
 /// receiver is still listening (silent-ignore on dropped rx).
 ///
-/// implementation-note-37 — added `bind_tx` so the daemon runtime can
+/// implementation-note-58 — added `bind_tx` so the daemon runtime can
 /// wait for bind, log the actual URL, and write the `proxy.url` sidecar
 /// before entering the main accept loop, matching `run_git_echo_proxy`'s
 /// startup discipline.
@@ -935,7 +935,7 @@ pub async fn handle_request(
         }
     };
 
-    // implementation-note-80 — when the caller pins the grant
+    // implementation-note-112 — when the caller pins the grant
     // by id (composite-grant flow: a single grant authorizes multiple
     // credentials, so the persona+credential pair alone may match more than
     // one grant), look it up directly. The looked-up grant must still match
@@ -1063,7 +1063,7 @@ pub async fn handle_request(
         return Ok(no_applicable_statement_response());
     }
 
-    // implementation-note-66 — block requests resolving to a
+    // implementation-note-92 — block requests resolving to a
     // Statement whose sid has been individually revoked. The grant remains
     // active for other Statements; only this sid is dead. Logged with a
     // distinct audit outcome so operators can tell per-Statement revoke
@@ -1162,7 +1162,7 @@ pub async fn handle_request(
     // budget check has something to estimate against. `body_bytes_in` is
     // then forwarded unchanged.
     //
-    // security check: wrap in Limited so a single oversized POST cannot OOM the daemon.
+    // Wrap in Limited so a single oversized POST cannot OOM the daemon.
     let (parts, incoming_body) = req.into_parts();
     let body_bytes_in = match Limited::new(incoming_body, MAX_BODY_BYTES)
         .collect()
@@ -1216,7 +1216,7 @@ pub async fn handle_request(
     }
 
     // Decrypt credential from vault.
-    // security check: wrap in Zeroizing so the raw key bytes are wiped on drop.
+    // Wrap in Zeroizing so the raw key bytes are wiped on drop.
     let credential_bytes: Zeroizing<Vec<u8>> = match state.vault.get(&state.store, &credential_name) {
         Ok(b) => Zeroizing::new(b),
         Err(VaultError::NotFound) => {
@@ -1283,7 +1283,7 @@ pub async fn handle_request(
         .uri(effective_uri.to_string());
 
     // Forward only the explicitly-allowed headers to upstream.
-    // security check (2026-04-24): allowlist replaces the former blocklist.
+    // Allowlist replaces the former blocklist.
     // Cookie, Host, X-Forwarded-*, Forwarded, Via, Authorization, and every
     // other header not in ALLOWED_REQUEST_HEADERS are dropped silently.
     // Authorization is injected from the vault below — client-supplied
@@ -1295,7 +1295,7 @@ pub async fn handle_request(
     // Three branches, picked by upstream identity:
     //  1. Anthropic (`api.anthropic.com` and any subdomain) requires
     //     `x-api-key: <token>` and rejects `Authorization: Bearer ...` with
-    //     401. implementation-note-37 — FINDING B from the brief: the
+    //     401. implementation-note-58 — FINDING B from the brief: the
     //     prior unconditional Bearer injection broke every Beat 4 Anthropic
     //     SDK call.
     //  2. Git smart-HTTP (`/info/refs?service=git-*-pack`,
@@ -1348,7 +1348,7 @@ pub async fn handle_request(
         "auth header injected"
     );
 
-    // implementation-note-18: force uncompressed responses upstream
+    // implementation-note-22: force uncompressed responses upstream
     // so the post-flight meter can parse JSON usage blocks. Anthropic
     // (and OpenAI) default to `gzip` if Accept-Encoding is absent or
     // permissive; identity is the only encoding `parse_usage` understands
@@ -1449,6 +1449,11 @@ pub async fn handle_request(
         let meter_persona = persona_id.clone();
         let meter_credential = credential_name.clone();
         let meter_host = target_host.clone();
+        // T-implementation-note-113: capture the upstream
+        // status's 2xx-ness for the meter callback. The closure runs
+        // post-flight on the tee thread; `status` itself is moved into
+        // the response builder below, so we snapshot the bool here.
+        let meter_upstream_ok = status.is_success();
         let meter_cb = TeeMeterCallback::new(
             move |summary: pricing::UsageSummary, tee_outcome: StreamOutcome| {
                 // development milestone: the SSE wire format itself tells
@@ -1479,6 +1484,7 @@ pub async fn handle_request(
                     &meter_host,
                     &summary,
                     outcome,
+                    meter_upstream_ok,
                 );
             },
         );
@@ -1505,7 +1511,7 @@ pub async fn handle_request(
             .unwrap());
     }
 
-    // security check: cap non-streaming response bodies at MAX_BODY_BYTES too.
+    // Cap non-streaming response bodies at MAX_BODY_BYTES too.
     // An upstream that returns a multi-hundred-MiB body would otherwise OOM
     // the daemon while buffering it for the post-flight meter.
     let resp_body = match Limited::new(upstream_resp.into_body(), MAX_BODY_BYTES)
@@ -1526,6 +1532,11 @@ pub async fn handle_request(
     // the response for token + cent usage. If the target isn't an LLM
     // provider we have pricing for, `meter_response` returns `None` and
     // we skip the increment — the request still forwards unchanged.
+    //
+    // T-implementation-note-113: pass `status.is_success()`
+    // so the meter only credits a billable request to the grant when
+    // the upstream actually returned 2xx. A 5xx with a usage-shaped
+    // body (rare) does not count.
     run_post_flight_meter(
         &state,
         &grant.id,
@@ -1536,6 +1547,7 @@ pub async fn handle_request(
         &target_host,
         resp_body.as_ref(),
         StreamOutcome::Complete,
+        status.is_success(),
     );
 
     let mut builder = Response::builder().status(status);
@@ -1604,7 +1616,7 @@ impl StreamOutcome {
     }
 }
 
-/// C44-implementation-note-81: short, stable hash of a credential alias for
+/// C44-implementation-note-114: short, stable hash of a credential alias for
 /// emission into the audit log's `credential` column.
 ///
 /// Returns `credname-<first 16 hex of sha256>` — enough entropy to avoid
@@ -1626,6 +1638,11 @@ fn hash_credential_name_for_audit(credential_name: &str) -> String {
 /// `outcome` tags the audit record `complete` vs `partial` so the Grant
 /// Receipt generated downstream can reflect whether the recorded tokens
 /// are the full call or a best-effort snapshot after an interruption.
+///
+/// `upstream_status_is_success` carries the upstream HTTP response's
+/// 2xx-ness through to the meter so the `usage.requests` counter only
+/// increments on upstream-confirmed responses. See
+/// `record_upstream_request` (T-implementation-note-113).
 #[allow(clippy::too_many_arguments)]
 fn run_post_flight_meter(
     state: &ProxyState,
@@ -1637,6 +1654,7 @@ fn run_post_flight_meter(
     target_host: &str,
     body: &[u8],
     outcome: StreamOutcome,
+    upstream_status_is_success: bool,
 ) {
     tracing::debug!(
         target: "proxy.meter",
@@ -1645,9 +1663,10 @@ fn run_post_flight_meter(
         sid = %statement_sid,
         body_len = body.len(),
         outcome = %outcome.audit_tag(),
+        upstream_ok = upstream_status_is_success,
         "run_post_flight_meter: entering buffered meter path"
     );
-    let Some(delta) = meter_response(target_host, body) else {
+    let Some(mut delta) = meter_response(target_host, body) else {
         tracing::info!(
             target: "proxy.meter.skip",
             reason = "meter-response-none",
@@ -1658,12 +1677,24 @@ fn run_post_flight_meter(
         );
         return;
     };
+    // T-implementation-note-113: fold the upstream-confirmed
+    // request count into the delta. `meter_response` no longer hardcodes
+    // `requests: 1`; this is the single decision point that mints the
+    // billable request against the grant. A successful upstream that
+    // returned a parseable usage block counts as one request; a 5xx
+    // (or any non-2xx) counts as zero, matching what providers
+    // themselves bill.
+    delta.requests = record_upstream_request(
+        target_host,
+        upstream_status_is_success,
+        true, // we got a parseable usage block, by virtue of being past meter_response
+    );
     // Emit a per-call metering audit event so the receipt + `ember audit`
     // can tell a `complete` stream from a `partial` one. The usage row in
     // `statement_usage` is identical for both cases; the audit record is
     // where the distinction lives.
     //
-    // C44-implementation-note-81: the `credential` audit column stores a short
+    // C44-implementation-note-114: the `credential` audit column stores a short
     // hash of the credential alias, not the raw alias. Raw aliases would
     // let anyone with audit-log read access correlate persona ↔ credential
     // across rows, breaking persona isolation. The raw alias still lives
@@ -1737,6 +1768,12 @@ fn run_post_flight_meter(
 /// summary directly. The non-streaming JSON path still uses the
 /// byte-slice `run_post_flight_meter` because its body genuinely is
 /// available as a single `Bytes`.
+///
+/// `upstream_status_is_success` mirrors the buffered path: only a 2xx
+/// upstream response should count as one billable request via
+/// `record_upstream_request`. SSE responses always start with a 2xx
+/// status (Anthropic doesn't open an event stream on 5xx), but plumbing
+/// the bit explicitly keeps both paths symmetric and audit-ready.
 #[allow(clippy::too_many_arguments)]
 fn run_post_flight_meter_from_summary(
     state: &ProxyState,
@@ -1748,6 +1785,7 @@ fn run_post_flight_meter_from_summary(
     target_host: &str,
     summary: &pricing::UsageSummary,
     outcome: StreamOutcome,
+    upstream_status_is_success: bool,
 ) {
     tracing::debug!(
         target: "proxy.meter",
@@ -1757,9 +1795,10 @@ fn run_post_flight_meter_from_summary(
         outcome = %outcome.audit_tag(),
         saw_any_usage = summary.saw_any_usage,
         saw_message_stop = summary.saw_message_stop,
+        upstream_ok = upstream_status_is_success,
         "run_post_flight_meter_from_summary: entering streaming meter path"
     );
-    let Some(delta) = usage_from_summary(target_host, summary) else {
+    let Some(mut delta) = usage_from_summary(target_host, summary) else {
         tracing::info!(
             target: "proxy.meter.skip",
             reason = "usage-from-summary-none",
@@ -1771,6 +1810,18 @@ fn run_post_flight_meter_from_summary(
         );
         return;
     };
+    // T-implementation-note-113: same fold as the buffered
+    // path. `usage_from_summary` no longer hardcodes `requests: 1`; we
+    // mint the billable request here once the upstream's confirmation
+    // is known. A partial stream that observed any usage at all still
+    // counts as one upstream-confirmed request — Anthropic accepted the
+    // request and started responding, the cut-off is downstream of the
+    // billable boundary.
+    delta.requests = record_upstream_request(
+        target_host,
+        upstream_status_is_success,
+        summary.saw_any_usage,
+    );
     // The audit + increment paths below mirror `run_post_flight_meter`
     // verbatim — keep in sync if either evolves.
     let credential_hash = hash_credential_name_for_audit(credential_name);
@@ -1828,6 +1879,11 @@ fn run_post_flight_meter_from_summary(
 /// Returns `None` for non-LLM hosts or when the summary saw no usage at
 /// all — matches the byte-slice `meter_response` semantics so the audit
 /// trail and budget machinery behave identically across the two paths.
+///
+/// T-implementation-note-113: `requests` is left at 0 here.
+/// Callers add the upstream-confirmed request count via
+/// `record_upstream_request` so a network failure / 5xx doesn't inflate
+/// the receipt's request tally.
 pub fn usage_from_summary(
     target_host: &str,
     summary: &pricing::UsageSummary,
@@ -1838,7 +1894,7 @@ pub fn usage_from_summary(
     }
     let folded = summary.folded_usage();
     let model = summary.model.clone().unwrap_or_default();
-    // implementation-note-18: micro-cent precision. See meter_response
+    // implementation-note-22: micro-cent precision. See meter_response
     // for the full rationale; the SSE path mirrors the buffered path so
     // both metering routes accumulate budget identically.
     let cents_micro = pricing::cents_micro_for(
@@ -1851,7 +1907,12 @@ pub fn usage_from_summary(
         tokens: folded.input_tokens.saturating_add(folded.output_tokens),
         cents: cents_micro / 1_000_000,
         cents_micro,
-        requests: 1,
+        // T-implementation-note-113: filled in by the caller
+        // via `record_upstream_request` once upstream confirmation is
+        // known. Leaving this at 0 here means a path that observes
+        // tokens but not a confirmed upstream response (none of the
+        // current call sites — but a future one) would not double-count.
+        requests: 0,
         workload_hours: 0,
         wall_clock_secs: 0,
         last_updated: 0,
@@ -2072,7 +2133,7 @@ fn extract_host_from_url(url: &str) -> Option<String> {
 /// transport upstream is an integrity failure of the vault, not a request
 /// problem.
 ///
-/// implementation-note-37 — FINDING B from the brief: prior code
+/// implementation-note-58 — FINDING B from the brief: prior code
 /// unconditionally injected `Authorization: Bearer ...`, which broke every
 /// Beat 4 Anthropic SDK call.
 pub(crate) fn inject_provider_auth(
@@ -2534,7 +2595,7 @@ pub fn preflight_budget_check(stmt: &core_types::Statement, request_body: &[u8])
     // the cents cap (post-flight cents tick can nudge usage over budget
     // between calls). We don't estimate cents up front — see doc above.
     //
-    // implementation-note-18: compare against the micro-cent
+    // implementation-note-22: compare against the micro-cent
     // accumulator so sub-cent calls aggregate honestly. Fall back to the
     // legacy `cents` axis when cents_micro is unset (zero) so pre-fix
     // grants stored under the old representation still gate correctly.
@@ -2627,7 +2688,7 @@ pub fn meter_response(
     };
     let model =
         pricing::extract_model(provider, response_body).unwrap_or_default();
-    // implementation-note-18: compute micro-cents (cents × 10⁶) and
+    // implementation-note-22: compute micro-cents (cents × 10⁶) and
     // derive whole cents from it. Without micro-cent precision, sub-cent
     // calls (~0.1¢ on Haiku-4.5) round to 0 per call and the budget cap
     // can never accumulate enough to trip.
@@ -2641,11 +2702,54 @@ pub fn meter_response(
         tokens: parsed.input_tokens.saturating_add(parsed.output_tokens),
         cents: cents_micro / 1_000_000,
         cents_micro,
-        requests: 1,
+        // T-implementation-note-113: leave `requests` at 0
+        // here. The caller folds in `record_upstream_request` once the
+        // upstream's confirmation status is known, so a 5xx body that
+        // happens to carry a usage block doesn't get counted as a
+        // billable request.
+        requests: 0,
         workload_hours: 0,
         wall_clock_secs: 0,
         last_updated: 0,
     })
+}
+
+/// Record a single upstream-confirmed request against the proxy meter.
+///
+/// T-implementation-note-113: `usage.requests` historically
+/// incremented by 1 for every proxy invocation that produced a parseable
+/// usage block, regardless of whether the upstream's HTTP response was
+/// itself a success. Per implementation-note-115 Decision 2 #2, the
+/// receipt should reflect what actually happened upstream — Anthropic /
+/// OpenAI confirmed receiving the request — not what we tried to send.
+/// A request counted but rejected by the upstream is a false-positive.
+///
+/// This function is the single decision point for "does this proxy call
+/// count as one request against the grant's request budget?". It
+/// returns 1 only when the upstream is a known LLM provider, the HTTP
+/// response status is in the 2xx range, and the response body parsed
+/// out a real usage signal. All failure paths (network error, timeout,
+/// 4xx, 5xx, non-LLM provider, unparseable body) return 0.
+///
+/// Failure-path note: 4xx is treated as a non-billable failure here
+/// even though the request demonstrably reached the upstream. The
+/// pricing intent is "billable request" alignment with the provider's
+/// own counter; providers do not bill 4xx so neither do we.
+pub(crate) fn record_upstream_request(
+    target_host: &str,
+    upstream_status_is_success: bool,
+    saw_usage_signal: bool,
+) -> u64 {
+    if pricing::provider_for_host(target_host).is_none() {
+        return 0;
+    }
+    if !upstream_status_is_success {
+        return 0;
+    }
+    if !saw_usage_signal {
+        return 0;
+    }
+    1
 }
 
 /// Emit threshold-crossing audit events for a metering update.
@@ -2670,7 +2774,7 @@ pub(crate) fn emit_threshold_crossings(
     prior: &core_types::Usage,
     current: &core_types::Usage,
 ) {
-    // implementation-note-18: cents axis runs on micro-cents internally
+    // implementation-note-22: cents axis runs on micro-cents internally
     // so sub-cent calls accumulate honestly. Both the cap and the
     // before/after counters are scaled to micro-cents; the displayed
     // `used`/`limit` in the emitted audit/push payload are stepped back
@@ -3148,7 +3252,7 @@ enum GlobTok<'a> {
 ///   matches `release/v2`, `release/v2/hotfix`, and `release/`.
 /// * Everything else matches literally; comparisons are case-sensitive.
 ///
-/// Implementation (security check): tokenise the pattern, then run an iterative
+/// Implementation: tokenise the pattern, then run an iterative
 /// reachability-based matcher (DP over `(token_idx, byte_pos)` states).
 /// The previous recursive backtracking implementation could blow up
 /// exponentially on adversarial patterns like `**/a/**/b/**/c/**/d/**/e`
@@ -3204,7 +3308,7 @@ fn glob_match_branch(pattern: &str, s: &str) -> bool {
 
 /// Iterative reachability-based glob matcher. Replaces the prior recursive
 /// backtracking impl which had exponential worst-case behaviour on
-/// non-adjacent `**` patterns (security check / CPU DoS).
+/// non-adjacent `**` patterns (CPU DoS).
 ///
 /// State = `(tok_idx, byte_pos)`. We compute reachable states as a 2D grid
 /// `reach[tok_idx][byte_pos]`. Transitions:
@@ -3378,7 +3482,7 @@ fn internal_error(msg: &str) -> Response<ProxyBody> {
 }
 
 /// HTTP 413 response used when a request or response body exceeds
-/// `MAX_BODY_BYTES` (security check). Signals to well-behaved clients that the
+/// `MAX_BODY_BYTES`. Signals to well-behaved clients that the
 /// payload is too large to pass through the credential-injection layer.
 fn payload_too_large(msg: &str) -> Response<ProxyBody> {
     Response::builder()
@@ -3590,7 +3694,7 @@ pub struct GitEchoConfig {
 /// Exposed `pub` so a separate test binary or an `#[ignore]`-d integration
 /// test can spawn it without reaching into daemon state.
 ///
-/// `bind_tx` (implementation-note-36): when `Some`, the bound `SocketAddr` is sent
+/// `bind_tx` (implementation-note-57): when `Some`, the bound `SocketAddr` is sent
 /// exactly once immediately after `TcpListener::bind` succeeds. Bind errors
 /// are sent as `Err` and the function returns. The receiver gets the actual
 /// local addr (so `127.0.0.1:0` callers can read the assigned port). If the
@@ -3827,7 +3931,7 @@ pub async fn handle_git_echo(
     }
 
     // Fetch the raw credential from the vault. Not in vault → 500 + audit.
-    // security check: wrap in Zeroizing so the raw key bytes are wiped on drop.
+    // Wrap in Zeroizing so the raw key bytes are wiped on drop.
     let credential_bytes: Zeroizing<Vec<u8>> = match config.state.vault.get(&config.state.store, &credential_name) {
         Ok(b) => Zeroizing::new(b),
         Err(VaultError::NotFound) => {
@@ -3853,7 +3957,7 @@ pub async fn handle_git_echo(
 
     // P69L.0b--AUDIT: emit `credential.access` so operators can see
     // that a credential substitution occurred and which repo was targeted.
-    // `action` mirrors the shape from C44-implementation-note-81: "github.push.<owner/repo>".
+    // `action` mirrors the shape from C44-implementation-note-114: "github.push.<owner/repo>".
     tracing::info!(
         event = "credential.access",
         allowed = true,
@@ -4260,7 +4364,7 @@ mod tests {
             Err(msg) => return Ok(bad_request(&msg)),
         };
 
-        // implementation-note-80 test parity — pin grant by id
+        // implementation-note-112 test parity — pin grant by id
         // when the header is present (mirrors production handle_request).
         let pinned_grant_id = headers
             .get("x-ember-grant-id")
@@ -4424,7 +4528,7 @@ mod tests {
             .map(|s| s.to_string());
 
         let (_parts, incoming_body) = req.into_parts();
-        // security check: enforce body size cap in the test harness to match production.
+        // Enforce body size cap in the test harness to match production.
         let body_bytes_in = match Limited::new(incoming_body, MAX_BODY_BYTES)
             .collect()
             .await
@@ -4465,7 +4569,7 @@ mod tests {
             }
         }
 
-        // security check: wrap in Zeroizing so the raw key bytes are wiped on drop.
+        // Wrap in Zeroizing so the raw key bytes are wiped on drop.
         let credential_bytes: Zeroizing<Vec<u8>> = match state.vault.get(&state.store, &credential_name) {
             Ok(b) => Zeroizing::new(b),
             Err(VaultError::NotFound) => {
@@ -4479,7 +4583,7 @@ mod tests {
 
         // P69L.0a (test harness): mirror the production auth-injection
         // branching so the test wrapper routes the same way as
-        // `handle_request`. implementation-note-37 — this now also
+        // `handle_request`. implementation-note-58 — this now also
         // detects Anthropic and emits `auth_mode = "anthropic"` so tests
         // can assert the FINDING B routing without a real upstream socket.
         let effective_path_and_query_test = effective_uri
@@ -4528,7 +4632,13 @@ mod tests {
 
         // Post-flight meter (test parity with production).
         let target_host: String = extract_host_from_url(&target_url).unwrap_or_default();
-        if let Some(delta) = meter_response(&target_host, response_body_bytes.as_ref()) {
+        if let Some(mut delta) = meter_response(&target_host, response_body_bytes.as_ref()) {
+            // T-implementation-note-113: production
+            // metering folds in `record_upstream_request` to mint the
+            // billable request count. The test harness always returns
+            // 200, so success is unconditional — match the production
+            // call shape so the bookkeeping stays identical.
+            delta.requests = record_upstream_request(&target_host, true, true);
             match state
                 .store
                 .increment_statement_usage(&grant.id, &resolved_sid, delta)
@@ -5245,7 +5355,7 @@ mod tests {
         assert!(!glob_match_branch("release-*", "release-1/rc1"));
     }
 
-    /// security check: regression for catastrophic-backtracking glob patterns.
+    /// Regression for catastrophic-backtracking glob patterns.
     ///
     /// The previous recursive matcher had exponential worst-case behaviour
     /// when multiple non-adjacent `**` segments interacted with a
@@ -7235,7 +7345,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // security check: request header allowlist — filter_request_headers
+    // Request header allowlist — filter_request_headers
     // ------------------------------------------------------------------
 
     /// Helper: run `filter_request_headers` and collect the output into a
@@ -7253,7 +7363,7 @@ mod tests {
 
     #[test]
     fn filter_drops_cookie_header() {
-        // security check: Cookie must never reach upstream (session fixation /
+        // Cookie must never reach upstream (session fixation /
         // credential-forwarding risk).
         let mut src = hyper::HeaderMap::new();
         src.insert("cookie", "x=y".parse().unwrap());
@@ -7272,7 +7382,7 @@ mod tests {
 
     #[test]
     fn filter_drops_host_header() {
-        // security check: client-supplied Host must not leak — hyper sets the
+        // Client-supplied Host must not leak — hyper sets the
         // correct Host from the request URI; a spoofed value could
         // confuse SNI-based virtual-hosting at upstream.
         let mut src = hyper::HeaderMap::new();
@@ -7292,7 +7402,7 @@ mod tests {
 
     #[test]
     fn filter_drops_x_forwarded_for_header() {
-        // security check: X-Forwarded-For must never reach upstream — it could
+        // X-Forwarded-For must never reach upstream — it could
         // spoof the apparent client IP in upstream audit/rate-limit logic.
         let mut src = hyper::HeaderMap::new();
         src.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
@@ -7317,7 +7427,7 @@ mod tests {
 
     #[test]
     fn filter_drops_authorization_header() {
-        // security check: any client-supplied Authorization is stripped so that
+        // Any client-supplied Authorization is stripped so that
         // only the vault-injected credential reaches upstream.
         let mut src = hyper::HeaderMap::new();
         src.insert("authorization", "Bearer client-token".parse().unwrap());
@@ -7332,7 +7442,7 @@ mod tests {
 
     #[test]
     fn filter_passes_anthropic_version_header() {
-        // security check: Anthropic-Version is in the allowlist and must reach
+        // Anthropic-Version is in the allowlist and must reach
         // upstream so callers can pin to a specific API version.
         let mut src = hyper::HeaderMap::new();
         src.insert("anthropic-version", "2023-06-01".parse().unwrap());
@@ -7352,7 +7462,7 @@ mod tests {
 
     #[test]
     fn filter_drops_proxy_authorization_forwarded_via_te_trailer_connection() {
-        // security check: verify that the headers explicitly called out in the
+        // Verify that the headers explicitly called out in the
         // acceptance criteria are all absent from the allowlist.
         let mut src = hyper::HeaderMap::new();
         src.insert("proxy-authorization", "Basic abc".parse().unwrap());
@@ -7376,7 +7486,7 @@ mod tests {
         ] {
             assert!(
                 !out.contains_key(name),
-                "{name} must be stripped by the allowlist (security check)"
+                "{name} must be stripped by the allowlist"
             );
         }
     }
@@ -7409,7 +7519,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // implementation-note-37 — FINDING B: provider-aware auth
+    // implementation-note-58 — FINDING B: provider-aware auth
     // injection. Mirrors `git_echo_grant_backed_lookup_injects_correct_auth`
     // for the LLM proxy path, but tests the helper directly because
     // `handle_request` consults the target URL for the live TCP connection
@@ -8325,6 +8435,7 @@ mod tests {
                     &meter_host,
                     &summary,
                     outcome,
+                    true, // upstream success path under test
                 );
             },
         );
@@ -8454,6 +8565,7 @@ mod tests {
                     &meter_host,
                     &summary,
                     outcome,
+                    true, // upstream success path under test
                 );
             },
         );
@@ -8527,6 +8639,7 @@ mod tests {
             "api.anthropic.com",
             body.as_bytes(),
             StreamOutcome::Complete,
+            true, // upstream 2xx
         );
 
         let ag = state.store.get_access_grant(&grant_id).unwrap();
@@ -8563,7 +8676,7 @@ mod tests {
         );
     }
 
-    /// C44-implementation-note-81 regression guard — the proxy.meter audit event
+    /// C44-implementation-note-114 regression guard — the proxy.meter audit event
     /// must NOT emit the raw credential alias in any field. Readers of the
     /// audit log must not be able to correlate persona → credential by
     /// scanning rows. The raw alias stays in `statement_usage`/grant rows;
@@ -8599,6 +8712,7 @@ mod tests {
             "api.anthropic.com",
             body.as_bytes(),
             StreamOutcome::Complete,
+            true, // upstream 2xx
         );
 
         let entries = state
@@ -9604,7 +9718,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // security check: body-size cap tests
+    // Body-size cap tests
     // -------------------------------------------------------------------------
 
     /// A request body at exactly MAX_BODY_BYTES (10 MiB) passes through
@@ -9673,11 +9787,11 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // security check: credential zeroize test
+    // Credential zeroize test
     // -------------------------------------------------------------------------
 
     // -------------------------------------------------------------------------
-    // implementation-note-80 — X-Ember-Grant-Id header support
+    // implementation-note-112 — X-Ember-Grant-Id header support
     // -------------------------------------------------------------------------
 
     /// Build a request with an explicit X-Ember-Grant-Id header so the test
@@ -9880,9 +9994,114 @@ mod tests {
         (**md).zeroize();
         assert!(
             md.iter().all(|&b| b == 0),
-            "Zeroizing<Vec<u8>> must zero bytes on drop (security check)"
+            "Zeroizing<Vec<u8>> must zero bytes on drop"
         );
         // Now safe to drop without re-zeroing.
         unsafe { ManuallyDrop::drop(&mut md) };
+    }
+
+    /// T-implementation-note-113 regression guard.
+    ///
+    /// `usage.requests` must reflect upstream-confirmed responses, not a
+    /// pre-flight tally. Driving the post-flight meter once with an
+    /// upstream-success and once with a 5xx (using identical usage-bearing
+    /// bodies in both cases) must record exactly one request — the
+    /// success — not two.
+    #[test]
+    fn usage_requests_counts_only_upstream_confirmed_calls() {
+        let state = make_state();
+        let persona = state.store.create_persona("audit-usage").unwrap();
+        state
+            .vault
+            .add(&state.store, "anthropic-key", b"sk-secret", None)
+            .unwrap();
+        let grant_id = seed_composite_grant(
+            &state,
+            &persona.id,
+            "anthropic-key",
+            vec![stmt_session("S1", 100_000)],
+        );
+        let resolved_stmt = stmt_session("S1", 100_000);
+
+        // Same usage-bearing body for both calls — the only thing that
+        // changes is the upstream's HTTP status. A pre-flight counter
+        // would record both as billable requests; the post-flight
+        // upstream-confirmed counter must reject the 5xx.
+        let body = anthropic_body(40, 25); // 65 tokens
+
+        // Call 1: upstream-confirmed success.
+        run_post_flight_meter(
+            &state,
+            &grant_id,
+            "S1",
+            &resolved_stmt,
+            &persona.id,
+            "anthropic-key",
+            "api.anthropic.com",
+            body.as_bytes(),
+            StreamOutcome::Complete,
+            true, // upstream returned 2xx
+        );
+
+        // Call 2: upstream returned 5xx. The body still parses, but
+        // the request did NOT happen as far as the provider is
+        // concerned, so the requests counter must not advance.
+        run_post_flight_meter(
+            &state,
+            &grant_id,
+            "S1",
+            &resolved_stmt,
+            &persona.id,
+            "anthropic-key",
+            "api.anthropic.com",
+            body.as_bytes(),
+            StreamOutcome::Complete,
+            false, // upstream returned non-2xx (e.g. 502)
+        );
+
+        let ag = state.store.get_access_grant(&grant_id).unwrap();
+        let stmt = ag
+            .statements()
+            .find(|(_, s)| s.sid == "S1")
+            .map(|(_, s)| s.clone())
+            .expect("S1 present");
+
+        // Tokens accumulate either way (the daemon still observed the
+        // bytes); the budget machinery treats them as best-effort.
+        // What MUST NOT inflate is `requests` — that's the audit-
+        // integrity invariant.
+        assert_eq!(
+            stmt.usage.requests, 1,
+            "usage.requests must count only upstream-confirmed responses; got {} (one success + one 5xx must equal 1, not 2)",
+            stmt.usage.requests
+        );
+    }
+
+    /// `record_upstream_request` direct unit cases. The interface
+    /// contract specifies it returns 1 only when the upstream is a
+    /// known LLM provider, the status is 2xx, and a usage signal was
+    /// observed. All failure paths return 0.
+    #[test]
+    fn record_upstream_request_only_credits_on_success() {
+        // Happy path.
+        assert_eq!(
+            record_upstream_request("api.anthropic.com", true, true),
+            1,
+        );
+        // 5xx / non-2xx upstream — failure path, do not credit.
+        assert_eq!(
+            record_upstream_request("api.anthropic.com", false, true),
+            0,
+        );
+        // No usage parsed — nothing happened we can bill for.
+        assert_eq!(
+            record_upstream_request("api.anthropic.com", true, false),
+            0,
+        );
+        // Unknown / non-LLM provider — outside the metering contract.
+        assert_eq!(
+            record_upstream_request("api.github.com", true, true),
+            0,
+        );
     }
 }

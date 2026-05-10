@@ -240,7 +240,12 @@ pub async fn mint_installation_token(
 }
 
 /// Testable variant of [`mint_installation_token`] with an injected HTTP client.
-pub async fn mint_installation_token_with_client<C: HttpClient>(
+///
+/// The `?Sized` bound lets callers pass `&dyn HttpClient` (or
+/// `Arc<dyn HttpClient>::as_ref()`), which is what
+/// [`crate::github_broker::GitHubBroker`] uses so it can hold the client
+/// behind a trait object and swap implementations at construction time.
+pub async fn mint_installation_token_with_client<C: HttpClient + ?Sized>(
     creds: &GhAppCredentials,
     repos: &[String],
     permissions: &[(String, String)],

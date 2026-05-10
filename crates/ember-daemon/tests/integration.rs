@@ -725,7 +725,7 @@ async fn dashboard_csrf_protects_post_endpoints() {
     );
 
     // 4. POST with correct CSRF header AND matching Origin -> passes both checks,
-    //    fails downstream. implementation-note-24: with the WebAuthn gate active
+    //    fails downstream. implementation-note-38: with the WebAuthn gate active
     //    (no `EMBER_DISABLE_BIO=1`), an empty body reaches the gate and gets
     //    401 "missing webauthn challenge_id". Without the gate, the legacy
     //    path reaches the store and gets 400 "approval not found". Either
@@ -917,7 +917,7 @@ async fn dashboard_bind_failure_surfaced_via_channel() {
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-88 — auto-unseal vault from keyring on daemon startup.
+// implementation-note-124 — auto-unseal vault from keyring on daemon startup.
 //
 // The bug: `qember.sh demo up` finished, then `grant create` failed with
 // "persona '<id>' secret is vault-sealed but no vault is attached" because
@@ -933,7 +933,7 @@ async fn dashboard_bind_failure_surfaced_via_channel() {
 // flipping them simultaneously would interfere.
 // ---------------------------------------------------------------------------
 
-/// Serialize all implementation-note-88 tests that mutate process-global env vars
+/// Serialize all implementation-note-124 tests that mutate process-global env vars
 /// (`EMBER_VAULT_PASSPHRASE`, `EMBER_VAULT_TEST_KEYRING_PRESENT`). Without
 /// this, the parallel cargo test runner can interleave env writes between
 /// tests and cause spurious `Unsealed` / `NoKeyringEntry` flips.
@@ -1020,7 +1020,7 @@ fn auto_unseal_returns_unsealed_when_keyring_entry_present() {
 
     // Round-trip: attach to store, create a persona, retrieve its keypair.
     // This is the precise call sequence that `grant create` triggers and the
-    // path that was failing in implementation-note-88. If this works end-to-end, the
+    // path that was failing in implementation-note-124. If this works end-to-end, the
     // demo-blocking bug is fixed.
     let store = DaemonStore::open_in_memory().unwrap();
     store.set_vault(Rc::new(vault));

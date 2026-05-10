@@ -14,9 +14,11 @@
 //! lines: the caller wires up an argv classifier and a `ConstructSpec`, and
 //! `run_construct` does the rest.
 
+pub mod pty_bridge;
+pub mod rpc;
 pub mod runtime;
 
-pub use runtime::{ConstructSpec, run_construct};
+pub use runtime::{run_construct, run_construct_full, ConstructSpec};
 
 /// Stable identifier for a classified Construct action.
 ///
@@ -41,4 +43,28 @@ impl std::fmt::Display for ActionKey {
 /// with code 2 so the caller can fall back to a passthrough invocation.
 pub trait ClassifyArgv {
     fn classify(&self, argv: &[String]) -> Option<ActionKey>;
+}
+
+/// Per-tool integration surface for the full broker_exec PTY lifecycle.
+///
+/// Each Construct binary implements this trait to supply the construct-specific
+/// bits. [`run_construct`] uses these to drive env-detect → classify →
+/// broker.exec → PTY bridge → exit.
+pub trait ConstructConfig: ClassifyArgv {
+    /// Env var that signals we're inside an ember session (e.g. `"EMBER_SESSION_ID"`).
+    /// If absent at runtime, the shim execs the wrapped binary directly.
+    fn session_id_env(&self) -> &'static str;
+
+    /// Embedded `Construct.toml` bytes (for future broker.resolve payload).
+    fn construct_toml_bytes(&self) -> &'static [u8];
+
+    /// Resolve the absolute path to the wrapped binary.
+    ///
+    /// Implementations may check an env var override (e.g. `EMBER_GH_BINARY`)
+    /// and fall back to PATH lookup. Called only when inside a session.
+    fn resolve_binary(&self) -> String;
+
+    /// Env var keys whose current values should be forwarded to the daemon
+    /// in the `broker_exec` RPC (e.g. `["GH_TOKEN", "GITHUB_TOKEN"]`).
+    fn env_passthrough(&self) -> &'static [&'static str];
 }

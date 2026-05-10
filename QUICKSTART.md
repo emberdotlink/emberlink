@@ -1,5 +1,7 @@
 # Quickstart
 
+<!-- QUICKSTART-future milestone -->
+
 Get ember running in under 5 minutes.
 
 ## Prerequisites
@@ -95,6 +97,23 @@ ember grant create \
 
 Optional conditions: `--rate-limit 10`, `--hours-start 9 --hours-end 17`, `--allowed-targets "github.com,api.github.com"`, `--delegation-depth 1`
 
+## Mint a composite grant
+
+A composite grant bundles multiple action scopes into one approval moment — one biometric tap, one durable trust artifact, one revocation point. Use this when your agent needs more than one credential class for a task (e.g., push code via `git.push` and deploy via `wrangler.deploy`).
+
+```bash
+ember grant create \
+  --persona <persona-id> \
+  --scope gh.pr_create,git.push,wrangler.deploy \
+  --ttl 3600 \
+  --label "release pipeline"
+```
+
+The full cohort-A scope menu — every action key, its biometric default, budget cap, and argv-redaction shape — is documented in:
+
+- **`crates/core-storage/scope.example.toml`** — annotated copy-paste example
+- **`docs/scope-toml-schema.md`** — schema reference for all cohort-A keys
+
 ## Create a sandbox
 
 ```bash
@@ -115,13 +134,74 @@ Shows active personas, grants, running sandboxes, pending approvals, and recent 
 
 ## Claude Code integration
 
-Route Claude Code's tool calls through the ember daemon as an MCP server. First install the MCP binary:
+The fastest path is `ember init --for claude-code`, which sets up the launcher trust boundary in one shot: it installs the `~/.claude/settings.json` `preToolUse` hook, drops shim binaries under `~/.ember/shadow/`, and registers `ember claude-code` as your launcher. After that, every classified action Claude Code attempts (`gh pr create`, `git push`, `kubectl apply`, …) routes through the daemon for grant resolution and signed Receipt emission.
+
+### 1. Start the daemon (required before cohort-A init)
+
+<!-- daemon-before-cohort-a-init -->
+
+The cohort-A init opens the vault to mint a 24h grant, which requires the daemon to be running. Start and install it as a persistent service first:
+
+```bash
+ember daemon start --background --install-agent
+```
+
+`--install-agent` writes a LaunchAgent (macOS) or systemd user unit (Linux) so the daemon survives reboot. Skip it if you only need a one-session daemon.
+
+### 2. Run the cohort-A init
+
+```bash
+ember init --for claude-code
+```
+
+This is the cohort-A onboarding flow (separate from the generic `ember init --name <foo>`). It is idempotent — safe to re-run if you cancelled partway through.
+
+> **Tip:** `ember init --for claude-code` now autostarts the daemon via `install-agent` if it detects the daemon is not running, so you can also run this as a single command — but starting the daemon explicitly first (step 1) is the recommended path and avoids a brief startup delay mid-init.
+
+### 3. Verify hook injection
+
+Confirm the daemon's `preToolUse` hook landed in your Claude Code settings:
+
+```bash
+grep -F 'preToolUse' ~/.claude/settings.json
+```
+
+You should see a `preToolUse` entry pointing at the ember daemon's classification gate. If it's missing, re-run step 2.
+
+### 4. First-launch with `ember claude-code`
+
+Relaunch your Claude Code session through the launcher:
+
+```bash
+ember claude-code
+```
+
+The launcher prepends `~/.ember/shadow/` to `PATH`, mints a session ID via the daemon, and exports it into the spawned Claude Code process. Inside that session, raw `gh` / `git` / `kubectl` invocations resolve to the corresponding ember Construct shims instead of the system binaries.
+
+### 5. Block-and-poll approval flow
+
+Pick a small real task ending in a classified action — `gh pr create`, `git push`, or similar. When Claude Code attempts it, the daemon blocks the call and surfaces a desktop notification + dashboard popup. Approve (or narrow the scope) from the dashboard and the action proceeds; the daemon emits a signed Receipt covering exactly what was authorized.
+
+If you reject, the action fails closed and the rejection lands in the Receipt log too — both branches are auditable.
+
+### 6. Inspect + export the Receipt
+
+After the session, dump the Receipts for the operator's Touch-2 review:
+
+```bash
+ember receipt list                                                    # what got signed this session
+ember receipt export --format md > /home/operator/tmp-example           # human-readable export
+```
+
+Send the markdown file back to the operator so they can verify the trust boundary held end-to-end.
+
+### Advanced: MCP server mode
+
+For programmable tool routing inside Claude Code (in addition to the launcher), the daemon also exposes an MCP server. This is optional — the launcher above handles the trust boundary on its own.
 
 ```bash
 cargo install --path crates/emberlink-mcp --bin emberlink-mcp
 ```
-
-The `ember-proxy` binary ships alongside `ember` — a single `cargo install emberlink` installs both on $PATH.
 
 Then add to `~/.claude/settings.json`:
 
@@ -145,8 +225,6 @@ With the daemon running, Claude Code gets MCP tools that route through the polic
 - `list_receipts` — list signed Grant Receipts
 - `get_receipt` — fetch a single Grant Receipt by ID
 - `grant_budget_status` — live budget + runway for a composite grant
-
-Requests that require approval fire a desktop notification and block until you approve from the dashboard or CLI.
 
 Confirm wiring: start the daemon, then in Claude Code run `/mcp` to verify `ember` is connected, then call `whoami` to confirm the agent identity comes back.
 
@@ -223,10 +301,10 @@ ember daemon uninstall-agent
 
 ## Next steps
 
-- Daemon vision — what the daemon becomes
-- Grant conditions — rate limits, time windows, allow lists
-- Approval flow — JIT escalation for agent requests
-- Policy syntax — `ember policy show` / `ember policy eval <action>`
+- **Configure grant conditions** — `ember policy show` to see active rules; `ember policy edit` to add rate limits, time windows, allowed-action lists.
+- **Approval flow** — `ember grant approve` / `ember grant deny` for JIT escalation when an agent requests something outside its standing scope.
+- **Policy reference** — `ember policy eval <action>` shows the deterministic decision the engine would make for a given action.
+- **Architecture overview** — see `MANIFESTO.md` for the value thesis and `DESIGN.md` for the UX + architecture summary.
 
 ---
 

@@ -1,0 +1,95 @@
+# Construct manifest for ember-docker per design §2.
+# Action schema: each [[actions]] declares an allowed action_key, optional
+# budget caps, biometric requirement, and a permit/deny default. The daemon's
+# broker.resolve consults this to decide whether the action requires a
+# credential mint, an existing grant, or refuses.
+#
+# Per-registry keys (`docker.push.<host>`, `docker.login.<host>`) are
+# matched by family-prefix at broker resolve time when no exact key is
+# declared here — see design §3 (server-side reclassification).
+
+[meta]
+name = "ember-docker"
+version = "0.1.0"
+publisher = "did:emberlink"
+description = "Docker CLI Construct. Mediates `docker` invocations through ember's credential broker: each push/login mints a scoped, time-bound registry token (Docker Hub, ECR, GCR, GHCR, custom registries), populates a temp DOCKER_CONFIG with the materialized auth, runs the command, then revokes/cleans up on exit. Read-only verbs (ps, images, inspect, logs, stats) are passthrough — no broker mediation. Privileged invocations (--privileged, --pid=host, --network=host, host-root volume mounts) are refused outright."
+
+# Default policy for unlisted action keys.
+default = "deny"
+
+# --- registry write surface (push) ---
+
+[[actions]]
+key = "docker.push.dockerhub"
+default = "permit"
+
+[[actions]]
+key = "docker.push"
+default = "permit"          # family fallback for any docker.push.<host>
+
+# --- registry auth (login/logout) ---
+# auth flows through ember-kms; we never delegate to docker's keychain.
+
+[[actions]]
+key = "docker.login"
+default = "deny"
+
+[[actions]]
+key = "docker.logout"
+default = "permit"
+
+# --- container lifecycle ---
+
+[[actions]]
+key = "docker.run"
+default = "permit"
+
+[[actions]]
+key = "docker.run.privileged"
+default = "deny"            # never auto-permit; requires explicit elevation
+
+[[actions]]
+key = "docker.build"
+default = "permit"
+
+[[actions]]
+key = "docker.exec"
+default = "permit"
+
+[[actions]]
+key = "docker.cp"
+default = "prompt"          # cross-boundary file copy; requires approval
+
+# --- container lifecycle (cleanup verbs) ---
+# These are commonly invoked during agent cleanup workflows. Absent classification
+# causes mid-session denials under default = "deny" — H2 exposure (audit 2026-05-09).
+
+[[actions]]
+key = "docker.stop"
+default = "prompt"          # stops a running container; reversible (container still exists)
+
+[[actions]]
+key = "docker.start"
+default = "prompt"          # starts a stopped container; reversible, low blast radius
+
+[[actions]]
+key = "docker.kill"
+default = "prompt"          # sends signal to a container; reversible but abrupt — prompt
+
+[[actions]]
+key = "docker.rm"
+default = "prompt"          # removes a stopped container; irreversible but typically intentional
+
+[[actions]]
+key = "docker.rmi"
+default = "prompt"          # removes an image; can break running containers if image in use
+
+# --- image management ---
+
+[[actions]]
+key = "docker.pull"
+default = "prompt"          # credentialed read — touches registry token + writes to local disk
+
+[[actions]]
+key = "docker.tag"
+default = "prompt"          # local-only state mutation; no remote effect but mutates image refs

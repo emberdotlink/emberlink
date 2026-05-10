@@ -1,0 +1,233 @@
+# CLASSIFICATION: PUBLIC
+# Construct manifest for ember-vercel per design §2.
+#
+# Action schema: each [[actions]] declares an allowed action_key, optional
+# budget caps, biometric requirement, and a permit/deny default. The daemon's
+# broker.resolve consults this to decide whether the action requires a
+# credential mint, an existing grant, or refuses.
+#
+# Credential injection: the broker (`BrokerProvider::Vercel`) issues
+# short-lived scoped Vercel API tokens via Vercel's
+# `https://api.vercel.com/v3/user/tokens` POST endpoint. The daemon
+# materializes them into `VERCEL_TOKEN` (the vercel CLI honors this for
+# non-interactive auth). Daemon zeroizes on child exit.
+#
+# The daemon installs this binary to `~/.ember/shadow/vercel`.
+#
+# Read-only verbs (`list`, `ls`, `inspect`, `logs`, `bisect`, `whoami`,
+# `link`, top-level `pull`, `git connect`, plus subgroup `ls`/`list`)
+# classify to `None` (passthrough) and never reach this manifest.
+
+[meta]
+name = "ember-vercel"
+version = "0.1.0"
+publisher = "did:emberlink"
+description = "Vercel CLI Construct. Mediates `vercel` invocations through ember's credential broker: project/domain/team/secret/alias removals (irreversible loss) require biometric; `domains buy` (spending money) requires biometric; `tokens revoke` (privilege removal) requires biometric; `env remove` (can break prod) requires biometric. All other classified mutating verbs (deploy, env add/pull/push, projects add, domains add, dns/certs ops, alias set, integration add, rollback, promote, teams create/invite, tokens create, secrets add/rename, git disconnect) gate without biometric. VERCEL_TOKEN is the credential injection env var."
+
+# Default policy for unlisted action keys.
+default = "deny"
+
+# --- top-level deploy ---
+
+[[actions]]
+key = "vercel.deploy"
+default = "permit"
+mode = "gate"
+
+# --- env (project environment variables) ---
+
+[[actions]]
+key = "vercel.env.add"
+default = "permit"
+mode = "gate"
+
+# env remove: env var removal can break prod; biometric required.
+[[actions]]
+key = "vercel.env.remove"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "vercel.env.pull"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "vercel.env.push"
+default = "permit"
+mode = "gate"
+
+# --- projects ---
+
+[[actions]]
+key = "vercel.projects.add"
+default = "permit"
+mode = "gate"
+
+# projects remove: project deletion blast radius; biometric required.
+[[actions]]
+key = "vercel.projects.remove"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- domains ---
+
+[[actions]]
+key = "vercel.domains.add"
+default = "permit"
+mode = "gate"
+
+# domains remove: domain loss is hard to undo; biometric required.
+[[actions]]
+key = "vercel.domains.remove"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "vercel.domains.transfer-in"
+default = "permit"
+mode = "gate"
+
+# domains transfer-out: domain loss is hard to undo; biometric required.
+[[actions]]
+key = "vercel.domains.transfer-out"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# domains buy: spending money; biometric required.
+[[actions]]
+key = "vercel.domains.buy"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- dns ---
+
+[[actions]]
+key = "vercel.dns.add"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "vercel.dns.remove"
+default = "permit"
+mode = "gate"
+
+# --- certs ---
+
+[[actions]]
+key = "vercel.certs.add"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "vercel.certs.remove"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "vercel.certs.renew"
+default = "permit"
+mode = "gate"
+
+# --- alias ---
+
+[[actions]]
+key = "vercel.alias.set"
+default = "permit"
+mode = "gate"
+
+# alias remove: alias loss can break routing; biometric required.
+[[actions]]
+key = "vercel.alias.remove"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- teams ---
+
+[[actions]]
+key = "vercel.teams.create"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "vercel.teams.invite"
+default = "permit"
+mode = "gate"
+
+# teams remove: team deletion blast radius; biometric required.
+[[actions]]
+key = "vercel.teams.remove"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- tokens (privilege issuance / removal) ---
+
+[[actions]]
+key = "vercel.tokens.create"
+default = "permit"
+mode = "gate"
+
+# tokens revoke: privilege removal; biometric required.
+[[actions]]
+key = "vercel.tokens.revoke"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- secrets ---
+
+[[actions]]
+key = "vercel.secrets.add"
+default = "permit"
+mode = "gate"
+
+# secrets remove: irreversible secret loss; biometric required.
+[[actions]]
+key = "vercel.secrets.remove"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "vercel.secrets.rename"
+default = "permit"
+mode = "gate"
+
+# --- integration ---
+
+[[actions]]
+key = "vercel.integration.add"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "vercel.integration.remove"
+default = "permit"
+mode = "gate"
+
+# --- rollback / promote (deployment lifecycle) ---
+
+[[actions]]
+key = "vercel.rollback"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "vercel.promote"
+default = "permit"
+mode = "gate"
+
+# --- git ---
+
+# git disconnect: breaks deploy hooks; gate without biometric (operational).
+[[actions]]
+key = "vercel.git.disconnect"
+default = "permit"
+mode = "gate"

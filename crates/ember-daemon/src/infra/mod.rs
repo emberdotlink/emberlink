@@ -1,5 +1,6 @@
 pub mod vault;
 pub mod config;
+pub mod credential_store;
 pub mod store;
 pub mod socket;
 pub mod tailnet;

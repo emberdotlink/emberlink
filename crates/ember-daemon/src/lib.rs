@@ -9,12 +9,13 @@ pub mod device;
 pub mod install;
 pub mod pricing;
 pub mod session_watcher;
+pub mod session;
 pub mod signature_verifier;
 pub mod sops;
 pub mod snapshot;
 pub mod trust_graph;
 
-/// implementation-note-24: server-side WebAuthn relying-party that
+/// implementation-note-38: server-side WebAuthn relying-party that
 /// gates dashboard approvals on a verified passkey assertion.
 /// Feature-gated so non-default builds (e.g. embedded test
 /// targets) don't pull in the webauthn-rs dep tree.

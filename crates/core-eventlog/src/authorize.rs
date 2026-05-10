@@ -1,4 +1,5 @@
-// See project design notes
+// Event authorization matrix — see module docs in this file for the
+// per-event-kind decision logic.
 use core_crypto::PublicKey;
 use core_events::EventEnvelope;
 use core_types::{EventBody, KeyRole, SignerBinding, SubjectKind, ValidationError};

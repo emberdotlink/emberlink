@@ -1,8 +1,8 @@
 use ed25519_dalek::VerifyingKey;
 
-/// Pinned IdentityRoot pubkey for `did:ember-systems`, baked at daemon
-/// build time. Per docs/construct-signing-pipeline.md §"Verification flow"
-/// step 3 — Updates require a daemon-version bump.
+/// Pinned IdentityRoot pubkey for `did:emberlink` (Ember Systems), baked at
+/// daemon build time. Per docs/construct-signing-pipeline.md §"Verification
+/// flow" step 3 — Updates require a daemon-version bump.
 ///
 /// V1 placeholder — replaced via daemon release pipeline before any
 /// production Construct signing happens. The 32-byte all-zero key is
@@ -37,15 +37,16 @@ pub enum TrustGraphError {
 }
 
 /// Resolve a publisher DID to the appropriate Ed25519 pubkey for a given
-/// build_ts. did:ember-systems is pinned via a baked-in constant. All
-/// other DIDs return `PublisherNotTrusted` for v1 (WoT walk is a stub —
-/// follow-up task wires it to the actual delegation graph).
+/// build_ts. `did:emberlink` (Ember Systems' bundled identity) is pinned via
+/// a baked-in constant. All other DIDs return `PublisherNotTrusted` for v1
+/// (WoT walk is a stub — follow-up task wires it to the actual delegation
+/// graph). Per design (action namespace governance).
 pub fn resolve_publisher_pubkey(
     did: &str,
     build_ts: i64,
 ) -> Result<PublisherKey, TrustGraphError> {
     match did {
-        "did:ember-systems" => {
+        "did:emberlink" => {
             // Validity window check.
             if build_ts < EMBER_SYSTEMS_VALID_FROM {
                 return Err(TrustGraphError::NoKeyInValidityWindow {
@@ -80,8 +81,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolves_pinned_ember_systems_publisher() {
-        let result = resolve_publisher_pubkey("did:ember-systems", 1735689600);
+    fn resolves_pinned_ember_publisher() {
+        let result = resolve_publisher_pubkey("did:emberlink", 1735689600);
         assert!(result.is_ok());
     }
 
@@ -101,7 +102,7 @@ mod tests {
         // build_ts succeeds; this test documents the validity-check path
         // by exercising NoKeyInValidityWindow at the boundary.
         // For now, the assert is just that the OK path works for ts >= 0.
-        assert!(resolve_publisher_pubkey("did:ember-systems", 0).is_ok());
+        assert!(resolve_publisher_pubkey("did:emberlink", 0).is_ok());
         // Future: when EMBER_SYSTEMS_VALID_FROM is bumped past 0, add a
         // test here asserting build_ts < valid_from returns
         // NoKeyInValidityWindow.

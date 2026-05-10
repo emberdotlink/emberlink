@@ -1,12 +1,11 @@
 //! TAILNET-1 — k8s credential lease (escape-hatch reference impl).
 //!
 //! This module is the v1 reference implementation of the
-//! "tailnet credential lease" pattern documented in
-//! `project documentation`. The full proposal covers
-//! the end-to-end shape (init container → JWT-verified `/tailnet/v1/lease`
-//! HTTP endpoint → grant policy → leased credential delivered via tmpfs).
-//! TAILNET-1 ships ONLY the daemon-side primitive the rest of that shape
-//! is built on:
+//! "tailnet credential lease" pattern. The end-to-end shape is an
+//! init container → JWT-verified `/tailnet/v1/lease` HTTP endpoint →
+//! grant policy → leased credential delivered via tmpfs. TAILNET-1
+//! ships ONLY the daemon-side primitive the rest of that shape is
+//! built on:
 //!
 //!   `lease_credential(persona_id, credential_name, ttl, caller_tag)`
 //!
@@ -21,10 +20,10 @@
 //!
 //! ### Why "escape-hatch"
 //!
-//! Per the 2026-04-25 amendment on `project documentation
-//! lease.md`, primary Team Zero secret-management is now SOPS-encrypted-
-//! at-rest with emberd as a recipient. The lease pattern in this module
-//! is reserved for the narrow set of cases SOPS cannot serve:
+//! Per the 2026-04-25 design amendment, primary cluster secret-management
+//! is SOPS-encrypted-at-rest with the daemon as a recipient. The lease
+//! pattern in this module is reserved for the narrow set of cases SOPS
+//! cannot serve:
 //! per-request grants, per-pod-identity-bound credentials, workloads
 //! that cannot mount filesystem secrets. Static API keys move to SOPS;
 //! the lease pattern is reached for only when SOPS cannot apply.

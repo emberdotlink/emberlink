@@ -18,12 +18,12 @@ AI agents need authority to do useful work. Today that means a raw token, a broa
 The **Ember Warden** runs on your machine. It holds the credentials. Agents never see them. Every agent action flows through the Warden as a **Grant** — carrying scope, TTL, optional token/dollar budget, persona, policy decision, attestation, and a signed **Grant Receipt** when the grant ends.
 
 - **Credential custody without exposure** — your GitHub token, Anthropic key, and database password stay in the local vault. The agent never holds them.
-- **Grants — the universal authority primitive** — credential grants, token-budget grants, dollar-budget grants, compute grants. Same primitive, same UX, same audit. See design.
+- **Grants — the universal authority primitive** — credential grants, token-budget grants, dollar-budget grants, compute grants. Same primitive, same UX, same audit.
 - **Policy + approval** — narrow, approve, deny, or require human approval. Deterministic policy engine, not a prompt.
 - **Real-time metering + agent self-moderation** — live token + dollar gauges; agent gets pushed an `on_budget_warning` MCP signal at 80% and can wrap up in-budget.
 - **Offline attenuation** — sub-agents inherit a narrower grant; cascade revocation kills the whole chain.
 - **Signed Grant Receipts** — every terminated grant emits a durable, signed record of who delegated what to whom, what was narrowed, what the agent did, and when it ended. Exportable JSON.
-- **Hardened sandbox** — Docker containers with non-root, `no-new-privileges`, read-only rootfs, `cap-drop=ALL`. Credentials are the isolation boundary, not the network. See design.
+- **Hardened sandbox** — Docker containers with non-root, `no-new-privileges`, read-only rootfs, `cap-drop=ALL`. Credentials are the isolation boundary, not the network.
 - **Runtime-neutral** — MCP protocol surface works with Claude Code, OpenClaw, IronClaw, gbrain, Claude Desktop, Cursor. One Warden, many frameworks.
 
 ## Quick demo

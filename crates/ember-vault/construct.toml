@@ -1,0 +1,196 @@
+# CLASSIFICATION: PUBLIC
+# Construct manifest for ember-vault per design §2.
+#
+# Action schema: each [[actions]] declares an allowed action_key, optional
+# budget caps, biometric requirement, and a permit/deny default. The daemon's
+# broker.resolve consults this to decide whether the action requires a
+# credential mint, an existing grant, or refuses.
+#
+# Credential injection: the broker (`BrokerProvider::HashiVault`) issues a
+# scoped Vault child token (minted from a parent token via policy/path
+# scope). The daemon materializes it into VAULT_TOKEN + VAULT_ADDR.
+# Daemon zeroizes on child exit and additionally calls Vault's
+# `auth/token/revoke` to enforce TTL-bound exposure even if broker
+# bookkeeping fails.
+#
+# SPECIAL: `vault read` and `vault kv get` reveal secrets and are
+# auditable — they classify to `mode=gate` (NOT passthrough) so every
+# secret reveal emits a Receipt.
+#
+# SPECIAL: `vault audit disable` defaults to `mode=deny`. Disabling the
+# audit backend is, by definition, a malicious admin action — an explicit
+# grant override is required to overcome the default-deny.
+#
+# Strict read-only top-level verbs (`status`, `version`, `list`,
+# `path-help`) classify to `None` (passthrough) and never reach this
+# manifest.
+
+[meta]
+name = "ember-vault"
+version = "0.1.0"
+publisher = "did:emberlink"
+description = "HashiCorp Vault CLI Construct. Mediates `vault` invocations through ember's credential broker: secret reveals (read, kv get) gate for audit; policy mutations (policy.write/delete), auth-backend removal (auth.disable), secrets-backend removal (secrets.disable), token mass-revoke, lease.revoke-prefix, and irreversible kv.destroy require biometric; audit.disable defaults to deny. Scoped Vault child tokens inject via VAULT_TOKEN / VAULT_ADDR."
+
+# Default policy for unlisted action keys.
+default = "deny"
+
+# --- top-level write/delete (mutation) ---
+
+[[actions]]
+key = "vault.write"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "vault.delete"
+default = "permit"
+mode = "gate"
+
+# --- top-level read (SPECIAL: secret reveal — gated for audit) ---
+
+[[actions]]
+key = "vault.read"
+default = "permit"
+mode = "gate"
+
+# --- kv subsystem ---
+
+[[actions]]
+key = "vault.kv.put"
+default = "permit"
+mode = "gate"
+
+# kv get: secret reveal — gated for audit. Every read emits a Receipt.
+[[actions]]
+key = "vault.kv.get"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "vault.kv.delete"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "vault.kv.patch"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "vault.kv.undelete"
+default = "permit"
+mode = "gate"
+
+# kv destroy: irreversible secret deletion — biometric required.
+[[actions]]
+key = "vault.kv.destroy"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- policy subsystem ---
+#
+# Policy mutation changes the authorization graph; both write and delete
+# require biometric.
+
+[[actions]]
+key = "vault.policy.write"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "vault.policy.delete"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- auth subsystem (auth-method backends) ---
+
+[[actions]]
+key = "vault.auth.enable"
+default = "permit"
+mode = "gate"
+
+# auth disable: removing an auth backend invalidates all tokens minted
+# through it — biometric required.
+[[actions]]
+key = "vault.auth.disable"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "vault.auth.tune"
+default = "permit"
+mode = "gate"
+
+# --- secrets subsystem (secrets-engine backends) ---
+
+[[actions]]
+key = "vault.secrets.enable"
+default = "permit"
+mode = "gate"
+
+# secrets disable: removing a secrets engine destroys its data —
+# biometric required.
+[[actions]]
+key = "vault.secrets.disable"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "vault.secrets.tune"
+default = "permit"
+mode = "gate"
+
+# --- token subsystem ---
+
+[[actions]]
+key = "vault.token.create"
+default = "permit"
+mode = "gate"
+
+# token revoke: revoking the wrong token can lock out workloads —
+# biometric required (mass-revoke risk).
+[[actions]]
+key = "vault.token.revoke"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "vault.token.renew"
+default = "permit"
+mode = "gate"
+
+# --- lease subsystem ---
+
+[[actions]]
+key = "vault.lease.revoke"
+default = "permit"
+mode = "gate"
+
+# lease revoke-prefix: prefix revocation is mass-destructive — biometric
+# required.
+[[actions]]
+key = "vault.lease.revoke-prefix"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- audit subsystem ---
+
+[[actions]]
+key = "vault.audit.enable"
+default = "permit"
+mode = "gate"
+
+# audit disable: disabling the audit backend is by definition a malicious
+# admin action (it severs the trust trail). Default-deny — an explicit
+# grant override is required to overcome.
+[[actions]]
+key = "vault.audit.disable"
+default = "deny"
+mode = "deny"

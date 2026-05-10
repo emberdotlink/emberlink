@@ -81,7 +81,7 @@ mod tests {
                 content_hash: "blake3:abc123".to_string(),
                 absolute_path: PathBuf::from("/usr/local/bin/ember-gh"),
                 installed_at: 1735689600,
-                publisher: "did:ember-systems".to_string(),
+                publisher: "did:emberlink".to_string(),
                 channel: BinaryDistributionChannel::Bundled,
             }],
         };

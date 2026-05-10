@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
 use tokio::signal;
@@ -71,7 +71,7 @@ pub enum DashboardBind {
     Timeout,
 }
 
-/// implementation-note-36: outcome of the git-echo credential-injection proxy bind.
+/// implementation-note-57: outcome of the git-echo credential-injection proxy bind.
 /// Mirrors `DashboardBind` semantics. Sent to `run()`'s `start_notify`
 /// callback so the CLI can print `EMBER_PROXY_URL=…` for qember.sh +
 /// ember-git.sh consumers.
@@ -87,7 +87,7 @@ pub enum GitProxyBind {
     Timeout,
 }
 
-/// implementation-note-37: outcome of the general LLM/HTTP credential-
+/// implementation-note-58: outcome of the general LLM/HTTP credential-
 /// injection proxy bind. Mirrors `GitProxyBind` semantics. The LLM proxy
 /// (`run_proxy` / `handle_request`) is what the Anthropic SDK demo path
 /// posts to; its bound URL is exposed via `EMBER_PROXY_URL` and the
@@ -107,12 +107,12 @@ pub enum LlmProxyBind {
 /// Aggregate bind report passed to `run()`'s `start_notify` callback. Carries
 /// every listener that may have raced to bind during startup so the CLI can
 /// render a consolidated banner. New listeners get a new field here rather
-/// than a parallel callback. implementation-note-36.
+/// than a parallel callback. implementation-note-57.
 #[derive(Debug, Clone)]
 pub struct StartupBinds {
     pub dashboard: DashboardBind,
     pub git_proxy: GitProxyBind,
-    /// implementation-note-37: bind outcome for the LLM proxy.
+    /// implementation-note-58: bind outcome for the LLM proxy.
     pub llm_proxy: LlmProxyBind,
     /// Daemon's Ed25519 signing-identity pubkey (64-hex). Empty string if
     /// identity initialisation failed at startup. Used by the CLI to render
@@ -120,7 +120,7 @@ pub struct StartupBinds {
     pub identity_pubkey: String,
 }
 
-/// implementation-note-43 — render a 64-hex Ed25519 pubkey as a
+/// implementation-note-68 — render a 64-hex Ed25519 pubkey as a
 /// short SSH-style fingerprint (`4a5d:a587:dd36:53b2`) using the first
 /// 8 bytes / 16 hex chars. The dashboard, the receipt detail page, and
 /// the demo teardown printout all use the same shape so a viewer can
@@ -292,7 +292,7 @@ pub struct DaemonRuntime {
     /// Path the config was loaded from — used for the vault identity warning in `run()`.
     /// `None` when config came from defaults (no file on disk).
     config_path: Option<std::path::PathBuf>,
-    /// implementation-note-40: actual address the dashboard
+    /// implementation-note-65: actual address the dashboard
     /// listener bound to (`Some(addr)`) or absent when the dashboard is
     /// disabled / failed to bind / timed out (`None`). Populated from inside
     /// `run()` after the bind result arrives. `Mutex` (not `RefCell`)
@@ -335,7 +335,7 @@ impl DaemonRuntime {
         self.config.ensure_dirs()?;
         self.pid_file.write()?;
 
-        // implementation-note-37 fix: install the rustls process-wide
+        // implementation-note-58 fix: install the rustls process-wide
         // CryptoProvider once at daemon startup. Both the LLM proxy
         // (`run_proxy`) and the git-echo proxy (`run_git_echo_proxy`) call
         // `HttpsConnectorBuilder::with_webpki_roots()` which panics on the
@@ -351,7 +351,7 @@ impl DaemonRuntime {
         info!(pid = std::process::id(), socket = %socket_path.display(), "ember daemon starting");
         // CLI-VERSION-FLAG: log the binary's compile-time version + git SHA +
         // build timestamp at INFO so a stale binary running against a newer
-        // codebase (the implementation-note-26 root cause) is
+        // codebase (the implementation-note-41 root cause) is
         // identifiable in seconds via `tail daemon.log`. Also surfaces the
         // `(no-git)` fallback if the build script ran without a working repo.
         info!(
@@ -361,7 +361,7 @@ impl DaemonRuntime {
             "ember daemon binary version"
         );
 
-        // security check: load the per-op user-presence config from
+        // Load the per-op user-presence config from
         // [presence] in config.toml into the process-global gate. Done
         // BEFORE the vault unlock so the very first `mark_unlocked` call
         // applies the right idle-timeout window.
@@ -427,7 +427,7 @@ impl DaemonRuntime {
             }
         }
 
-        // implementation-note-88: auto-unseal the vault from the system keyring. The
+        // implementation-note-124: auto-unseal the vault from the system keyring. The
         // helper's contract: it succeeds only if a keyring entry already
         // exists (or `EMBER_VAULT_PASSPHRASE` is set) — never auto-provisions
         // on daemon start so a wiped keyring can't silently mint a fresh
@@ -464,7 +464,7 @@ impl DaemonRuntime {
         // every persona row is vault-sealed from inception.
         store.set_vault(Rc::clone(&vault));
 
-        // implementation-note-88: emit an audit event for the auto-unseal so operators
+        // implementation-note-124: emit an audit event for the auto-unseal so operators
         // running `audit show` see exactly when (and how) the vault came
         // online. Failures here are non-fatal — the audit log is for
         // observability, not correctness.
@@ -500,7 +500,7 @@ impl DaemonRuntime {
                     fingerprint = %fingerprint,
                     "daemon identity key loaded"
                 );
-                // implementation-note-43 — emit a structured
+                // implementation-note-68 — emit a structured
                 // operator-facing log line that the demo teardown
                 // script (and any future tooling) can grep without
                 // re-deriving the fingerprint or hitting an HTTP
@@ -523,31 +523,536 @@ impl DaemonRuntime {
             }
         }
 
-        // implementation-note-29 (design Phase 2): install the credential
-        // broker registry. Today the only registered provider is the
-        // `MockBroker` (so `ember broker {issue,revoke,list}` round-trips
-        // a deterministic canary credential end-to-end). The Anthropic
-        // and Cloudflare implementations register themselves here once
-        // their downstream tasks land. Calling `install_registry`
+        // implementation-note-125 (design sub-piece D): construct the
+        // pluggable `CredentialStore` trait object from the
+        // `[credential_store]` config section. Defaults to the
+        // `LocalEncryptedStore` (which adapts the existing Vault) when
+        // the section is absent or `backend = "local"`. The trait
+        // object is shared across the broker-registration loop below
+        // so each provider's `<provider>_config_from_store` sibling can
+        // pull credentials from whatever backend the operator selected.
+        let cred_store: Arc<dyn crate::infra::credential_store::CredentialStore> =
+            match &self.config.credential_store {
+                None => Arc::new(crate::infra::credential_store::LocalEncryptedStore::new(
+                    Arc::new((*vault).clone()),
+                    Rc::clone(&store),
+                )),
+                Some(cs) if cs.backend == "local" => {
+                    Arc::new(crate::infra::credential_store::LocalEncryptedStore::new(
+                        Arc::new((*vault).clone()),
+                        Rc::clone(&store),
+                    ))
+                }
+                Some(cs) if cs.backend == "hashicorp-vault" => {
+                    use crate::infra::config::resolve_at_ref;
+                    use crate::infra::credential_store::HashiVaultStore;
+                    use crate::infra::credential_store::hashicorp_vault::{
+                        HashiVaultAuth, ReqwestHttpClient, UnavailablePolicy,
+                    };
+
+                    let addr = cs.addr.clone().ok_or_else(|| {
+                        DaemonError::Vault(
+                            "credential_store backend=hashicorp-vault requires `addr`"
+                                .to_string(),
+                        )
+                    })?;
+                    let mount = cs.mount.clone();
+                    let auth = match cs.auth.as_deref().unwrap_or("token") {
+                        "token" => {
+                            let raw = cs.token.as_deref().ok_or_else(|| {
+                                DaemonError::Vault(
+                                    "credential_store auth=token requires `token`".to_string(),
+                                )
+                            })?;
+                            let resolved = resolve_at_ref(raw).map_err(|e| {
+                                DaemonError::Vault(format!(
+                                    "credential_store: failed to resolve token: {}",
+                                    e
+                                ))
+                            })?;
+                            HashiVaultAuth::Token {
+                                token: secrecy::SecretString::from(resolved),
+                            }
+                        }
+                        "approle" => {
+                            let role_id = cs.role_id.clone().ok_or_else(|| {
+                                DaemonError::Vault(
+                                    "credential_store auth=approle requires `role_id`"
+                                        .to_string(),
+                                )
+                            })?;
+                            let raw_secret = cs.secret_id.as_deref().ok_or_else(|| {
+                                DaemonError::Vault(
+                                    "credential_store auth=approle requires `secret_id`"
+                                        .to_string(),
+                                )
+                            })?;
+                            let resolved = resolve_at_ref(raw_secret).map_err(|e| {
+                                DaemonError::Vault(format!(
+                                    "credential_store: failed to resolve secret_id: {}",
+                                    e
+                                ))
+                            })?;
+                            HashiVaultAuth::AppRole {
+                                role_id,
+                                secret_id: secrecy::SecretString::from(resolved),
+                            }
+                        }
+                        "aws" => {
+                            // implementation-note-39: AWS IAM auth.
+                            // Daemon proves its surrounding AWS IAM
+                            // identity (env vars / instance metadata
+                            // / IRSA / ECS task role / Fargate) via a
+                            // SigV4-signed sts:GetCallerIdentity
+                            // request that Vault re-plays server-side.
+                            // The `role` field names the Vault
+                            // AWS-auth role (`vault auth/aws/role/<role>`).
+                            let role = cs.role.clone().ok_or_else(|| {
+                                DaemonError::Vault(
+                                    "credential_store auth=aws requires `role`"
+                                        .to_string(),
+                                )
+                            })?;
+                            HashiVaultAuth::Aws { role }
+                        }
+                        "hcp-service-principal" => {
+                            // implementation-note-60: HashiCorp Cloud
+                            // Platform service-principal auth. Exchange
+                            // (client_id, client_secret) at HCP IdP's
+                            // OAuth2 client_credentials endpoint for an
+                            // access_token; submit that as
+                            // `Authorization: Bearer` against the
+                            // HCP-hosted Vault cluster's `addr`.
+                            let client_id = cs.client_id.clone().ok_or_else(|| {
+                                DaemonError::Vault(
+                                    "credential_store auth=hcp-service-principal requires `client_id`"
+                                        .to_string(),
+                                )
+                            })?;
+                            let raw_secret =
+                                cs.client_secret.as_deref().ok_or_else(|| {
+                                    DaemonError::Vault(
+                                        "credential_store auth=hcp-service-principal requires `client_secret`"
+                                            .to_string(),
+                                    )
+                                })?;
+                            let resolved = resolve_at_ref(raw_secret).map_err(|e| {
+                                DaemonError::Vault(format!(
+                                    "credential_store: failed to resolve client_secret: {}",
+                                    e
+                                ))
+                            })?;
+                            HashiVaultAuth::HcpServicePrincipal {
+                                client_id,
+                                client_secret: secrecy::SecretString::from(resolved),
+                            }
+                        }
+                        other => {
+                            return Err(DaemonError::Vault(format!(
+                                "credential_store: unknown auth method '{}'",
+                                other
+                            )));
+                        }
+                    };
+                    let policy = match cs.unavailable_policy.as_str() {
+                        "fail-hard" => UnavailablePolicy::FailHard,
+                        "fall-back-to-cache" => UnavailablePolicy::FallBackToCache,
+                        other => {
+                            return Err(DaemonError::Vault(format!(
+                                "credential_store: unknown unavailable_policy '{}'",
+                                other
+                            )));
+                        }
+                    };
+                    let http = ReqwestHttpClient::new().map_err(|e| {
+                        DaemonError::Vault(format!(
+                            "credential_store: reqwest client construction failed: {}",
+                            e
+                        ))
+                    })?;
+                    let mut s = HashiVaultStore::new(
+                        Arc::new(http),
+                        addr,
+                        mount,
+                        auth,
+                        policy,
+                        cs.cache_ttl_secs.map(std::time::Duration::from_secs),
+                    );
+                    s.login().await.map_err(|e| {
+                        DaemonError::Vault(format!(
+                            "credential_store: vault login failed: {}",
+                            e
+                        ))
+                    })?;
+                    Arc::new(s)
+                }
+                Some(cs) => {
+                    return Err(DaemonError::Vault(format!(
+                        "credential_store: unknown backend '{}'",
+                        cs.backend
+                    )));
+                }
+            };
+
+        let backend_name = self
+            .config
+            .credential_store
+            .as_ref()
+            .map(|c| c.backend.as_str())
+            .unwrap_or("local");
+        let backend_addr = self
+            .config
+            .credential_store
+            .as_ref()
+            .and_then(|c| c.addr.clone())
+            .unwrap_or_else(|| "<local-vault>".to_string());
+        info!(
+            backend = backend_name,
+            addr = %backend_addr,
+            "credential store ready: backend={}",
+            backend_name
+        );
+
+        // implementation-note-47 (design Phase 2): install the credential
+        // broker registry. Real provider implementations replace
+        // `MockBroker` as their downstream tasks ship — currently the
+        // GitHub App broker is wired (T-CONSTRUCT-DAEMON-GH-implementation-note-126);
+        // Anthropic and Cloudflare follow. Calling `install_registry`
         // multiple times is a no-op after the first call (`OnceCell`).
         {
             use core_broker::{BrokerProvider, MockBroker};
+            use ember_broker::{
+                AwsStsBroker, AzureCliBroker, FlyBroker, GcpBroker, GitHubBroker,
+                HashiVaultBroker, OktaBroker, VercelBroker,
+            };
             let mut registry = crate::broker::handler::BrokerRegistry::new();
-            // Register one MockBroker per supported provider so the
-            // daemon answers `broker_issue` for every well-known
-            // provider until real impls land.
+
+            // GitHub: real broker when ~/.config/emberlink/ember-engine.{env,pem}
+            // exist; MockBroker fallback otherwise so dev hosts without
+            // GH App config still answer broker_issue without a panic.
+            //
+            // implementation-note-125: try the credential-store path first;
+            // fall back to the env-file loader on store-miss / store-error so
+            // operators who haven't migrated keep working.
+            let github_from_store = crate::broker::github_config::github_config_from_store(
+                &*cred_store,
+            )
+            .await;
+            let github_creds = match github_from_store {
+                Ok(Some(c)) => Ok(Some(c)),
+                Ok(None) => crate::broker::github_config::load_gh_app_credentials(),
+                Err(e) => {
+                    tracing::warn!(
+                        provider = "github",
+                        error = %e,
+                        "broker: github credential-store read failed; falling back to env file"
+                    );
+                    crate::broker::github_config::load_gh_app_credentials()
+                }
+            };
+            match github_creds {
+                Ok(Some(creds)) => {
+                    registry.register(Box::new(GitHubBroker::new(creds)));
+                    info!(
+                        provider = "github",
+                        "broker registered: GitHubBroker (GH App credentials loaded)"
+                    );
+                }
+                Ok(None) => {
+                    registry.register(Box::new(MockBroker::new(BrokerProvider::Github)));
+                    tracing::warn!(
+                        provider = "github",
+                        "broker registered: MockBroker fallback — GH App credentials not found at ~/.config/emberlink/ember-engine.{{env,pem}}; see project README for GitHub App setup to enable real installation-token minting"
+                    );
+                }
+                Err(e) => {
+                    registry.register(Box::new(MockBroker::new(BrokerProvider::Github)));
+                    tracing::warn!(
+                        provider = "github",
+                        error = %e,
+                        "broker registered: MockBroker fallback — GH App config present but malformed; daemon continues with mock"
+                    );
+                }
+            }
+
+            // AWS STS: real broker when ~/.config/emberlink/aws-sts.env
+            // exists with the required AWS_LONG_LIVED_KEY_ID /
+            // AWS_LONG_LIVED_KEY_SECRET / AWS_LONG_LIVED_REGION keys;
+            // MockBroker fallback otherwise so dev hosts without AWS
+            // config still answer broker_issue without a panic.
+            //
+            // implementation-note-125: store-first, env-fallback.
+            let aws_creds = match crate::broker::aws_sts_config::aws_sts_config_from_store(
+                &*cred_store,
+            )
+            .await
+            {
+                Ok(Some(c)) => Some(c),
+                Ok(None) => crate::broker::aws_sts_config::load_aws_sts_credentials(),
+                Err(e) => {
+                    tracing::warn!(
+                        provider = "aws_sts",
+                        error = %e,
+                        "broker: aws_sts credential-store read failed; falling back to env file"
+                    );
+                    crate::broker::aws_sts_config::load_aws_sts_credentials()
+                }
+            };
+            match aws_creds {
+                Some((creds, default_role_arn)) => {
+                    registry.register(Box::new(AwsStsBroker::new(creds, default_role_arn)));
+                    info!(
+                        provider = "aws_sts",
+                        "broker registered: AwsStsBroker (AWS long-lived credentials loaded)"
+                    );
+                }
+                None => {
+                    registry.register(Box::new(MockBroker::new(BrokerProvider::AwsSts)));
+                    tracing::warn!(
+                        provider = "aws_sts",
+                        "broker registered: MockBroker fallback — AWS long-lived credentials not found at ~/.config/emberlink/aws-sts.env (or required keys missing)"
+                    );
+                }
+            }
+
+            // GCP: real broker when ~/.config/emberlink/gcp.env points
+            // at a valid downloaded service-account JSON key file;
+            // MockBroker fallback otherwise so dev hosts without GCP
+            // config still answer broker_issue without a panic.
+            //
+            // implementation-note-125: store-first, env-fallback.
+            let gcp_creds =
+                match crate::broker::gcp_config::gcp_config_from_store(&*cred_store).await {
+                    Ok(Some(c)) => Some(c),
+                    Ok(None) => crate::broker::gcp_config::load_gcp_credentials(),
+                    Err(e) => {
+                        tracing::warn!(
+                            provider = "gcp",
+                            error = %e,
+                            "broker: gcp credential-store read failed; falling back to env file"
+                        );
+                        crate::broker::gcp_config::load_gcp_credentials()
+                    }
+                };
+            match gcp_creds {
+                Some((key, default_target)) => {
+                    registry.register(Box::new(GcpBroker::new(key, default_target)));
+                    info!(
+                        provider = "gcp",
+                        "broker registered: GcpBroker (GCP service-account key loaded)"
+                    );
+                }
+                None => {
+                    registry.register(Box::new(MockBroker::new(BrokerProvider::Gcp)));
+                    tracing::warn!(
+                        provider = "gcp",
+                        "broker registered: MockBroker fallback — GCP service-account key not found at ~/.config/emberlink/gcp.env (or required JSON fields missing)"
+                    );
+                }
+            }
+
+            // Azure: real broker when ~/.config/emberlink/azure.env
+            // carries the AZURE_TENANT_ID + AZURE_CLIENT_ID +
+            // AZURE_CLIENT_SECRET triple; MockBroker fallback otherwise
+            // so dev hosts without Azure config still answer
+            // broker_issue without a panic.
+            //
+            // implementation-note-125: store-first, env-fallback.
+            let azure_creds = match crate::broker::azure_config::azure_config_from_store(
+                &*cred_store,
+            )
+            .await
+            {
+                Ok(Some(c)) => Some(c),
+                Ok(None) => crate::broker::azure_config::load_azure_credentials(),
+                Err(e) => {
+                    tracing::warn!(
+                        provider = "azure_cli",
+                        error = %e,
+                        "broker: azure credential-store read failed; falling back to env file"
+                    );
+                    crate::broker::azure_config::load_azure_credentials()
+                }
+            };
+            match azure_creds {
+                Some(sp) => {
+                    registry.register(Box::new(AzureCliBroker::new(sp)));
+                    info!(
+                        provider = "azure_cli",
+                        "broker registered: AzureCliBroker (Azure AD service-principal credentials loaded)"
+                    );
+                }
+                None => {
+                    registry.register(Box::new(MockBroker::new(BrokerProvider::AzureCli)));
+                    tracing::warn!(
+                        provider = "azure_cli",
+                        "broker registered: MockBroker fallback — Azure AD service-principal credentials not found at ~/.config/emberlink/azure.env (or required keys missing)"
+                    );
+                }
+            }
+
+            // Fly.io: real broker when ~/.config/emberlink/fly.env
+            // carries FLY_API_TOKEN; MockBroker fallback otherwise so
+            // dev hosts without Fly config still answer broker_issue
+            // without a panic.
+            //
+            // implementation-note-125: store-first, env-fallback.
+            let fly_creds =
+                match crate::broker::fly_config::fly_config_from_store(&*cred_store).await {
+                    Ok(Some(c)) => Some(c),
+                    Ok(None) => crate::broker::fly_config::load_fly_credentials(),
+                    Err(e) => {
+                        tracing::warn!(
+                            provider = "fly_io",
+                            error = %e,
+                            "broker: fly credential-store read failed; falling back to env file"
+                        );
+                        crate::broker::fly_config::load_fly_credentials()
+                    }
+                };
+            match fly_creds {
+                Some(parent) => {
+                    registry.register(Box::new(FlyBroker::new(parent)));
+                    info!(
+                        provider = "fly_io",
+                        "broker registered: FlyBroker (Fly.io parent token loaded)"
+                    );
+                }
+                None => {
+                    registry.register(Box::new(MockBroker::new(BrokerProvider::FlyIo)));
+                    tracing::warn!(
+                        provider = "fly_io",
+                        "broker registered: MockBroker fallback — Fly.io parent token not found at ~/.config/emberlink/fly.env (or FLY_API_TOKEN missing)"
+                    );
+                }
+            }
+
+            // HashiCorp Vault: real broker when
+            // ~/.config/emberlink/hashivault.env carries VAULT_TOKEN +
+            // VAULT_ADDR; MockBroker fallback otherwise so dev hosts
+            // without Vault config still answer broker_issue without a
+            // panic.
+            //
+            // implementation-note-125: store-first, env-fallback.
+            let hashivault_creds =
+                match crate::broker::hashivault_config::hashivault_config_from_store(&*cred_store)
+                    .await
+                {
+                    Ok(Some(c)) => Some(c),
+                    Ok(None) => crate::broker::hashivault_config::load_hashivault_credentials(),
+                    Err(e) => {
+                        tracing::warn!(
+                            provider = "hashi_vault",
+                            error = %e,
+                            "broker: hashivault credential-store read failed; falling back to env file"
+                        );
+                        crate::broker::hashivault_config::load_hashivault_credentials()
+                    }
+                };
+            match hashivault_creds {
+                Some(parent) => {
+                    registry.register(Box::new(HashiVaultBroker::new(parent)));
+                    info!(
+                        provider = "hashi_vault",
+                        "broker registered: HashiVaultBroker (Vault parent token loaded)"
+                    );
+                }
+                None => {
+                    registry.register(Box::new(MockBroker::new(BrokerProvider::HashiVault)));
+                    tracing::warn!(
+                        provider = "hashi_vault",
+                        "broker registered: MockBroker fallback — HashiCorp Vault parent token not found at ~/.config/emberlink/hashivault.env (or VAULT_TOKEN/VAULT_ADDR missing)"
+                    );
+                }
+            }
+
+            // Okta: real broker when ~/.config/emberlink/okta.env
+            // carries OKTA_ORG_URL + OKTA_CLIENT_ID +
+            // OKTA_PRIVATE_KEY_PATH + OKTA_KEY_ID and the referenced
+            // PEM file is readable; MockBroker fallback otherwise so
+            // dev hosts without Okta config still answer broker_issue
+            // without a panic.
+            //
+            // implementation-note-125: store-first, env-fallback.
+            let okta_creds =
+                match crate::broker::okta_config::okta_config_from_store(&*cred_store).await {
+                    Ok(Some(c)) => Some(c),
+                    Ok(None) => crate::broker::okta_config::load_okta_credentials(),
+                    Err(e) => {
+                        tracing::warn!(
+                            provider = "okta",
+                            error = %e,
+                            "broker: okta credential-store read failed; falling back to env file"
+                        );
+                        crate::broker::okta_config::load_okta_credentials()
+                    }
+                };
+            match okta_creds {
+                Some(app) => {
+                    registry.register(Box::new(OktaBroker::new(app)));
+                    info!(
+                        provider = "okta",
+                        "broker registered: OktaBroker (Okta service-app credentials loaded)"
+                    );
+                }
+                None => {
+                    registry.register(Box::new(MockBroker::new(BrokerProvider::Okta)));
+                    tracing::warn!(
+                        provider = "okta",
+                        "broker registered: MockBroker fallback — Okta service-app credentials not found at ~/.config/emberlink/okta.env (or required keys / PEM missing)"
+                    );
+                }
+            }
+
+            // Vercel: real broker when ~/.config/emberlink/vercel.env
+            // carries VERCEL_TOKEN; MockBroker fallback otherwise so
+            // dev hosts without Vercel config still answer broker_issue
+            // without a panic.
+            //
+            // implementation-note-125: store-first, env-fallback.
+            let vercel_creds =
+                match crate::broker::vercel_config::vercel_config_from_store(&*cred_store).await {
+                    Ok(Some(c)) => Some(c),
+                    Ok(None) => crate::broker::vercel_config::load_vercel_credentials(),
+                    Err(e) => {
+                        tracing::warn!(
+                            provider = "vercel",
+                            error = %e,
+                            "broker: vercel credential-store read failed; falling back to env file"
+                        );
+                        crate::broker::vercel_config::load_vercel_credentials()
+                    }
+                };
+            match vercel_creds {
+                Some(parent) => {
+                    registry.register(Box::new(VercelBroker::new(parent)));
+                    info!(
+                        provider = "vercel",
+                        "broker registered: VercelBroker (Vercel parent token loaded)"
+                    );
+                }
+                None => {
+                    registry.register(Box::new(MockBroker::new(BrokerProvider::Vercel)));
+                    tracing::warn!(
+                        provider = "vercel",
+                        "broker registered: MockBroker fallback — Vercel parent token not found at ~/.config/emberlink/vercel.env (or VERCEL_TOKEN missing)"
+                    );
+                }
+            }
+
+            // All other providers still on MockBroker pending their
+            // downstream wiring tasks. Keep this list explicit (not a
+            // catch-all loop) so adding a real impl is a deliberate
+            // edit, not a silent default.
             for provider in [
                 BrokerProvider::Cloudflare,
                 BrokerProvider::Anthropic,
-                BrokerProvider::Github,
-                BrokerProvider::AwsSts,
-                BrokerProvider::Gcp,
                 BrokerProvider::Tailscale,
             ] {
                 registry.register(Box::new(MockBroker::new(provider)));
             }
             crate::broker::handler::install_registry(registry);
-            info!("broker registry installed (mock providers; real impls land per BROKER-* tasks)");
+            info!("broker registry installed (github + aws_sts + gcp + azure_cli + fly_io + hashi_vault + okta + vercel real, others mock)");
         }
 
         // NOTIF-2: sweep approval_requests that were left pending from a prior
@@ -572,6 +1077,7 @@ impl DaemonRuntime {
         let rate_limiter = Rc::new(RefCell::new(RateLimiter::default()));
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let sessions_dir = crate::session_watcher::sessions_dir_from_data(&self.config.data_dir);
         let listener = SocketListener::new(
             socket_path,
             shutdown_rx,
@@ -579,7 +1085,8 @@ impl DaemonRuntime {
             Rc::clone(&vault),
             Rc::clone(&policy),
             Rc::clone(&rate_limiter),
-        );
+        )
+        .with_sessions_dir(sessions_dir.clone());
 
         // Run socket listener and background tasks on a LocalSet (DaemonStore is !Send).
         let local = tokio::task::LocalSet::new();
@@ -614,7 +1121,7 @@ impl DaemonRuntime {
             }
         });
 
-        // implementation-note-47 — background sweep marks pending
+        // implementation-note-72 — background sweep marks pending
         // approvals older than `stale_approval_threshold_secs` as `timed_out`.
         // Runs every 60 seconds. Complements the startup sweep (line ~261) which
         // only catches requests left pending from prior sessions. This sweep
@@ -634,13 +1141,13 @@ impl DaemonRuntime {
             }
         });
 
-        // implementation-note-89 — session heartbeat + TTL watcher.
+        // implementation-note-127 — session heartbeat + TTL watcher.
         // Runs every 60 s. Closes orphaned sessions (launcher PID dead > 5 min)
         // and sessions whose grant is past the 24-hour TTL backstop.
         let session_store_clone = Rc::clone(&store);
-        let sessions_dir = crate::session_watcher::sessions_dir_from_data(&self.config.data_dir);
+        let sessions_dir_for_watcher = sessions_dir.clone();
         local.spawn_local(async move {
-            crate::session_watcher::run(session_store_clone, sessions_dir).await;
+            crate::session_watcher::run(session_store_clone, sessions_dir_for_watcher).await;
         });
         tracing::info!("session heartbeat watcher started");
 
@@ -682,7 +1189,7 @@ impl DaemonRuntime {
             }
         }
 
-        // implementation-note-38 — periodic cluster snapshot pull task.
+        // implementation-note-59 — periodic cluster snapshot pull task.
         // Runs every `snapshot_pull_interval_secs` (default 600, i.e. 10 min).
         // Only active when both `snapshot_pull_endpoint` and
         // `snapshot_pull_cluster_id` are configured. On each tick it calls
@@ -774,7 +1281,7 @@ impl DaemonRuntime {
                 let version = env!("CARGO_PKG_VERSION").to_string();
                 let dashboard_shutdown = shutdown_tx.subscribe();
                 let (bind_tx, bind_rx) = oneshot::channel();
-                // implementation-note-24 follow-up: hand the dashboard task its
+                // implementation-note-38 follow-up: hand the dashboard task its
                 // own clone of the vault so its separate DaemonStore can
                 // decrypt persona secrets when the WebAuthn-attested
                 // approve path mints composite-grant chains. Mirrors the
@@ -793,7 +1300,7 @@ impl DaemonRuntime {
                 None
             };
 
-        // implementation-note-36: spawn the git-echo credential-injection proxy if
+        // implementation-note-57: spawn the git-echo credential-injection proxy if
         // configured. Bind result is captured via a oneshot channel and
         // driven below alongside the dashboard's. Each proxy task gets its
         // own DaemonStore (rusqlite Connection is !Send) and a clone of the
@@ -805,7 +1312,7 @@ impl DaemonRuntime {
                 let proxy_shutdown = shutdown_tx.subscribe();
                 let (bind_tx, bind_rx) = oneshot::channel::<Result<SocketAddr, std::io::Error>>();
                 let proxy_vault: Vault = (*vault).clone();
-                // implementation-note-36 marker: spawn_local run_git_echo_proxy via this LocalSet.
+                // implementation-note-57 marker: spawn_local run_git_echo_proxy via this LocalSet.
                 local.spawn_local(async move {
                     let store = match crate::infra::store::DaemonStore::open(&proxy_db_path) {
                         Ok(s) => s,
@@ -824,7 +1331,7 @@ impl DaemonRuntime {
                     // the Arc is used only within this LocalSet (single-threaded runtime),
                     // mirroring run_proxy / run_git_echo_proxy themselves.
                     //
-                    // implementation-note-18: attach the vault to this fresh
+                    // implementation-note-22: attach the vault to this fresh
                     // store. Without this, increment_statement_usage's re-sign of
                     // block 0 calls persona_root_keypair → self.vault() → None →
                     // "no vault is attached", silently dropping every meter delta
@@ -854,7 +1361,7 @@ impl DaemonRuntime {
                 None
             };
 
-        // implementation-note-37: spawn the general LLM/HTTP credential-
+        // implementation-note-58: spawn the general LLM/HTTP credential-
         // injection proxy (`run_proxy` — provider-aware auth, X-Ember-* header
         // protocol). This is the listener the Anthropic SDK demo posts to via
         // `base_url=$EMBER_PROXY_URL`; previously `run_proxy` was defined but
@@ -878,7 +1385,7 @@ impl DaemonRuntime {
                             return;
                         }
                     };
-                    // implementation-note-18: attach vault to the fresh store
+                    // implementation-note-22: attach vault to the fresh store
                     // so increment_statement_usage's block-0 re-sign can read the
                     // issuing persona's root keypair (vault-sealed). Same fix as
                     // the git-echo proxy spawn block above.
@@ -974,7 +1481,7 @@ impl DaemonRuntime {
                 // launchers (qember.sh demo up) can pick the URL up after
                 // forking the daemon and exiting the parent.
                 //
-                // implementation-note-37: this URL now lives at
+                // implementation-note-58: this URL now lives at
                 // `EMBER_GIT_PROXY_URL` + `<data_dir>/run/git-proxy.url`. The
                 // bare `EMBER_PROXY_URL` and `proxy.url` names are claimed by
                 // the LLM proxy below — that is the listener the Anthropic
@@ -1054,7 +1561,27 @@ impl DaemonRuntime {
             (Some(_), None) => LlmProxyBind::Disabled,
         };
 
-        // implementation-note-40: persist the resolved bind
+        // implementation-note-88: extract the
+        // bound proxy URLs from the bind results and wire them into the
+        // SocketListener. This makes the URLs available in RequestContext for
+        // every inbound RPC without relying on std::env::var across tokio
+        // worker threads (Rust 2024 set_var cross-thread visibility hazard).
+        // The env::set_var calls above are kept as belt-and-suspenders for
+        // other consumers; RequestContext is now the primary path for
+        // register_session.
+        let resolved_llm_proxy_url: Option<String> = match &llm_proxy_bind {
+            LlmProxyBind::Bound(addr) => Some(format!("http://{}", addr)),
+            _ => None,
+        };
+        let resolved_git_proxy_url: Option<String> = match &git_proxy_bind {
+            GitProxyBind::Bound(addr) => Some(format!("http://{}", addr)),
+            _ => None,
+        };
+        let listener = listener
+            .with_llm_proxy_url(resolved_llm_proxy_url)
+            .with_git_proxy_url(resolved_git_proxy_url);
+
+        // implementation-note-65: persist the resolved bind
         // address on the runtime so out-of-band readers (tests, future
         // introspection helpers) see the same truth as `/api/status`. Only
         // the `Bound` variant maps to `Some`; `Failed`/`Disabled`/`Timeout`

@@ -7,7 +7,7 @@
 //! Provider-specific scopes (Cloudflare, Anthropic, GitHub, AWS STS, GCP,
 //! Tailscale) are represented at the trait boundary as opaque
 //! `serde_json::Value` payloads. Each provider implementation deserializes
-//! this into its own typed struct (see `implementation-note-5` and
+//! this into its own typed struct (see `implementation-note-7` and
 //! sibling tasks). The trait stays provider-agnostic so a single
 //! `Box<dyn Broker>` can be stored in the daemon's broker registry.
 //!
@@ -20,7 +20,7 @@
 
 // `anthropic` ships the real Anthropic Admin-API broker. ureq does not
 // compile to `wasm32-unknown-unknown`, so the module is also gated off
-// for that target. Feature-gated per implementation-note-6: the trait
+// for that target. Feature-gated per implementation-note-8: the trait
 // crate compiles with --no-default-features to trait + types + MockBroker
 // only; provider impls require explicit opt-in.
 #[cfg(all(not(target_arch = "wasm32"), feature = "anthropic"))]
@@ -38,7 +38,7 @@ pub mod cloudflare;
 pub use cloudflare::CloudflareBroker;
 
 // Opaque `SecretRef` contract — agents hold the opaque id, never the
-// plaintext (implementation-note-7). The trust boundary for
+// plaintext (implementation-note-9). The trust boundary for
 // resolving `SecretRef` → plaintext is ember-proxy / ember-tools, which
 // emits a per-resolution Receipt.
 pub mod secret_ref;
@@ -61,8 +61,13 @@ pub enum BrokerProvider {
     Anthropic,
     Github,
     AwsSts,
+    AzureCli,
+    FlyIo,
     Gcp,
+    HashiVault,
+    Okta,
     Tailscale,
+    Vercel,
 }
 
 impl BrokerProvider {
@@ -72,8 +77,13 @@ impl BrokerProvider {
             BrokerProvider::Anthropic => "anthropic",
             BrokerProvider::Github => "github",
             BrokerProvider::AwsSts => "aws_sts",
+            BrokerProvider::AzureCli => "azure_cli",
+            BrokerProvider::FlyIo => "fly_io",
             BrokerProvider::Gcp => "gcp",
+            BrokerProvider::HashiVault => "hashi_vault",
+            BrokerProvider::Okta => "okta",
             BrokerProvider::Tailscale => "tailscale",
+            BrokerProvider::Vercel => "vercel",
         }
     }
 }

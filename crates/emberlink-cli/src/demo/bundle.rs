@@ -1,5 +1,5 @@
 //! `ember demo bundle` — mint the locked May-3 4-statement composite-grant
-//! bundle (implementation-note-111).
+//! bundle (implementation-note-152).
 //!
 //! Submits ONE composite-approval entry with the four locked statements:
 //!   - [0] credential:read   on `anthropic-key`
@@ -7,7 +7,7 @@
 //!   - [2] time:wall_clock   on *             (90s)
 //!   - [3] credential:read   on `github-token`
 //!
-//! implementation-note-94: tokens cap is sized as defense-in-depth (1M
+//! implementation-note-132: tokens cap is sized as defense-in-depth (1M
 //! is well above any 90-second realistic session). The cents cap (5¢) is the
 //! load-bearing enforcement axis — the voiceover names it. Pre-flight token
 //! estimation in `pricing::estimate_call_tokens` was previously tripping on
@@ -18,7 +18,7 @@
 //! trip — mirroring the existing `ember sandbox run` composite-mint path
 //! at `bin/ember.rs:3853` (`store.propose_grant(...)`).
 
-use core_types::{Budget, ResourceSelector, ResourceType, Statement, Usage};
+use core_types::{Budget, GrantProposal, ResourceSelector, ResourceType, StatementProposal};
 use ember_daemon::infra::config::DaemonConfig;
 use ember_daemon::infra::store::DaemonStore;
 
@@ -50,18 +50,17 @@ pub fn cmd_demo_bundle(config: &DaemonConfig) -> Result<(), Box<dyn std::error::
                 .to_string()
         })?;
 
-    let statements = locked_bundle_statements();
+    let proposal = GrantProposal {
+        persona_id: persona.id.clone(),
+        statements: locked_bundle_statements(),
+        expires_at: Some(75),
+        label: None,
+        skill_ref: None,
+        note: None,
+    };
 
     let req = store
-        .propose_grant(
-            &persona.id,
-            "anthropic-key",
-            "composite",
-            Some(75),
-            "credential.access",
-            "medium",
-            statements,
-        )
+        .propose_grant_typed(&proposal, "credential.access", "medium")
         .map_err(|e| format!("propose_grant failed: {e}"))?;
 
     println!("Grant requested. Awaiting your decision.");
@@ -83,22 +82,21 @@ pub fn cmd_demo_bundle(config: &DaemonConfig) -> Result<(), Box<dyn std::error::
 /// The four locked statements of the May-3 composite-grant demo bundle.
 /// Pulled out as a separate function so future smoke tests can assert
 /// shape without re-running the full submit path.
-fn locked_bundle_statements() -> Vec<Statement> {
+fn locked_bundle_statements() -> Vec<StatementProposal> {
     vec![
-        Statement {
-            sid: "s0-anthropic".to_string(),
+        StatementProposal {
             resource_type: ResourceType::Credential,
+            credential_name: "anthropic-key".to_string(),
             actions: vec!["credential:read".to_string()],
             resource: ResourceSelector::Exact {
                 value: "anthropic-key".to_string(),
             },
             budget: None,
-            usage: Usage::default(),
             conditions: vec![],
         },
-        Statement {
-            sid: "s1-session".to_string(),
+        StatementProposal {
             resource_type: ResourceType::Session,
+            credential_name: String::new(),
             actions: vec!["llm:generate".to_string()],
             resource: ResourceSelector::Glob {
                 pattern: "anthropic/*".to_string(),
@@ -108,30 +106,27 @@ fn locked_bundle_statements() -> Vec<Statement> {
                 cents: Some(5),
                 ..Budget::default()
             }),
-            usage: Usage::default(),
             conditions: vec![],
         },
-        Statement {
-            sid: "s2-time".to_string(),
+        StatementProposal {
             resource_type: ResourceType::Time,
+            credential_name: String::new(),
             actions: vec!["time:wall_clock".to_string()],
             resource: ResourceSelector::Any,
             budget: Some(Budget {
                 wall_clock_secs: Some(75),
                 ..Budget::default()
             }),
-            usage: Usage::default(),
             conditions: vec![],
         },
-        Statement {
-            sid: "s3-github".to_string(),
+        StatementProposal {
             resource_type: ResourceType::Credential,
+            credential_name: "github-token".to_string(),
             actions: vec!["credential:read".to_string()],
             resource: ResourceSelector::Exact {
                 value: "github-token".to_string(),
             },
             budget: None,
-            usage: Usage::default(),
             conditions: vec![],
         },
     ]
@@ -147,7 +142,7 @@ mod tests {
         assert_eq!(stmts.len(), 4, "bundle must have exactly 4 statements");
 
         // [0] credential:read on anthropic-key
-        assert_eq!(stmts[0].sid, "s0-anthropic");
+        assert_eq!(stmts[0].credential_name, "anthropic-key");
         assert_eq!(stmts[0].resource_type, ResourceType::Credential);
         assert_eq!(stmts[0].actions, vec!["credential:read".to_string()]);
         assert!(matches!(
@@ -156,8 +151,7 @@ mod tests {
         ));
         assert!(stmts[0].budget.is_none());
 
-        // [1] llm:generate on anthropic/* (10000 tokens, 5 cents)
-        assert_eq!(stmts[1].sid, "s1-session");
+        // [1] llm:generate on anthropic/* (1M tokens, 5 cents)
         assert_eq!(stmts[1].resource_type, ResourceType::Session);
         assert_eq!(stmts[1].actions, vec!["llm:generate".to_string()]);
         assert!(matches!(
@@ -171,7 +165,6 @@ mod tests {
         // [2] time:wall_clock on * (75s — locked 2026-05-04 after live-take
         // tuning. Timer starts on grant-approval (not first-redemption).
         // 45s expired before Beat 7, 90s left dead air, 80s closer, 75s lands.)
-        assert_eq!(stmts[2].sid, "s2-time");
         assert_eq!(stmts[2].resource_type, ResourceType::Time);
         assert_eq!(stmts[2].actions, vec!["time:wall_clock".to_string()]);
         assert!(matches!(&stmts[2].resource, ResourceSelector::Any));
@@ -179,7 +172,7 @@ mod tests {
         assert_eq!(budget2.wall_clock_secs, Some(75));
 
         // [3] credential:read on github-token
-        assert_eq!(stmts[3].sid, "s3-github");
+        assert_eq!(stmts[3].credential_name, "github-token");
         assert_eq!(stmts[3].resource_type, ResourceType::Credential);
         assert_eq!(stmts[3].actions, vec!["credential:read".to_string()]);
         assert!(matches!(

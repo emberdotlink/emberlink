@@ -2,16 +2,17 @@
 //!
 //! Per design §"Envelope" + design §7. Builds a `ReceiptEnvelope` wrapping a
 //! `ClaudeCodeBody` (claim_events + audit_gaps + permits_merkle_root) at session
-//! termination. Signing is deferred to a follow-up PR (design persona signing
-//! integration); see TODO comments below.
+//! termination. Signs the envelope in-place using the Daemon Persona key per
+//! design via `daemon_persona_sign_receipt`.
 
 use std::fs;
 use std::path::Path;
 
-use blake3::Hasher;
+use core_crypto::Signer;
+use core_events::receipt::sign::{SignError, sign_receipt_v2};
 use core_events::receipt::{
     AuditGap, ClaimEvent, ClaudeCodeBody, ReceiptBody, ReceiptEnvelope, ReceiptVersion,
-    RECEIPT_KIND_CLAUDE_CODE, TerminationAuthority, merkle_leaf, merkle_root,
+    RECEIPT_KIND_CLAUDE_CODE, TerminationAuthority, TerminationReason, merkle_leaf, merkle_root,
 };
 
 /// Errors raised by [`issue_cohort_a_receipt`].
@@ -25,24 +26,36 @@ pub enum IssueError {
         #[source]
         source: std::io::Error,
     },
+    #[error("sign Receipt v2: {0}")]
+    Sign(#[source] SignError),
 }
 
-/// Build a signed-by-design (signature populated by follow-up PR) cohort-A
-/// `session.claude_code` Receipt envelope.
+/// Optional termination metadata injected into the `ClaudeCodeBody` by the
+/// dirty-exit path (implementation-note-13). Pass `None` for
+/// clean-exit / TTL-expiry / explicit-revoke issuance paths where the reason
+/// is not yet known at build time.
+pub struct TerminationMeta {
+    pub reason: TerminationReason,
+    pub last_heartbeat_at: Option<String>,
+    pub pid_alive_at_check: Option<bool>,
+}
+
+/// Build and sign a cohort-A `session.claude_code` Receipt envelope.
 ///
-/// Steps per design §"Envelope":
+/// Steps per design §"Envelope" + design §"Daemon Persona signing":
 /// 1. Build [`ClaudeCodeBody`] from `claim_events` + parsed `audit_gaps.jsonl`
 ///    (lines parsed individually, malformed lines skipped — fail-open shape
-///    matches implementation-note-8's writer).
+///    matches implementation-note-10's writer). Optional `termination_meta` injects the
+///    reason/heartbeat/pid fields into the body in the same step.
 /// 2. Compute `permits_merkle_root` over `claim_events[].input_hash` blake3
 ///    leaves (design §"Merkle leaf format" — leaf form simplified for now;
 ///    proper canonical leaf payload is a follow-up).
 /// 3. Construct [`ReceiptEnvelope`] with `version="2"`, `kind="session.claude_code"`,
-///    `daemon_root_id`, `termination_authority`, body=JSON, `signature=None`.
-/// 4. Compute `receipt_id = blake3(serde_json::to_vec(envelope_without_signature))`.
-///    TODO: replace with JCS canonicalization per design §"Envelope" once a
-///    JCS helper lands.
-/// 5. Set `receipt_id` and return.
+///    `daemon_root_id`, `termination_authority`, body=JSON.
+/// 4. Sign + stamp `receipt_id` via `sign_receipt_v2` — the single canonical
+///    path (JCS-canonical bytes of envelope with receipt_id, without signature,
+///    Ed25519-signed by the Daemon Persona key per design). Signing routes
+///    through [`daemon_persona_sign_receipt`] as the named design primitive.
 ///
 /// `audit_gaps_path = None` (or a non-existent file) → `audit_gaps = []` —
 /// the daemon was reachable for the entire session.
@@ -52,6 +65,8 @@ pub fn issue_cohort_a_receipt(
     audit_gaps_path: Option<&Path>,
     termination_authority: TerminationAuthority,
     daemon_root_id: &str,
+    termination_meta: Option<TerminationMeta>,
+    signer: &dyn Signer,
 ) -> Result<ReceiptEnvelope, IssueError> {
     // 1. Parse audit gaps (fail-open: skip malformed lines, treat missing
     //    file as "no gaps recorded").
@@ -78,7 +93,13 @@ pub fn issue_cohort_a_receipt(
         hex_lower(&merkle_root(&leaves))
     };
 
-    // 3. Build the body.
+    // 3. Build the body including optional termination metadata so the
+    //    signed envelope captures the full body in one atomic step.
+    let (termination_reason, last_heartbeat_at, pid_alive_at_check) =
+        match termination_meta {
+            Some(m) => (Some(m.reason), m.last_heartbeat_at, m.pid_alive_at_check),
+            None => (None, None, None),
+        };
     let body = ClaudeCodeBody {
         base: ReceiptBody {
             claim_events,
@@ -86,9 +107,12 @@ pub fn issue_cohort_a_receipt(
             device_id: None,
         },
         audit_gaps,
+        termination_reason,
+        last_heartbeat_at,
+        pid_alive_at_check,
     };
 
-    // 4. Build envelope (signature=None, receipt_id placeholder).
+    // 4. Build envelope.
     let body_value = serde_json::to_value(&body).map_err(IssueError::Serialize)?;
     let mut envelope = ReceiptEnvelope {
         version: ReceiptVersion::default(),
@@ -98,26 +122,27 @@ pub fn issue_cohort_a_receipt(
         traceparent: None,
         termination_authority,
         body: body_value,
-        // TODO: Persona-sign per design once the daemon-as-persona signing
-        // helper lands. For now `signature=None` matches the shipped
-        // `ReceiptEnvelope` scaffold's `skip_serializing_if = "Option::is_none"`.
+        // sign_receipt_v2 populates both receipt_id and signature below.
         signature: None,
     };
 
-    // 5. Compute receipt_id over the unsigned envelope.
-    //    TODO: replace plain `serde_json::to_vec` with JCS canonicalization
-    //    per design §"Envelope" once a JCS helper lands. Until then this
-    //    is deterministic-enough for round-trip (serde_json sorts struct
-    //    fields by declaration order) but is NOT yet wire-stable across
-    //    other implementations.
-    let unsigned_bytes = serde_json::to_vec(&envelope).map_err(IssueError::Serialize)?;
-    envelope.receipt_id = format!("blake3:{}", hex_lower(&blake3_bytes(&unsigned_bytes)));
+    // 5. Sign the envelope per design (Daemon Persona signing).
+    //
+    //    Canonicalization: JCS(envelope with receipt_id, without signature)
+    //    per RFC 8785 — UTF-16 key order, I-JSON numbers, minimal escaping.
+    //    Bit-stable across serializer upgrades as long as the field set and
+    //    serde_jcs version are pinned. Any field addition is a wire-breaking
+    //    change requiring a receipt version bump.
+    //
+    //    sign_receipt_v2 calls daemon_persona_sign_receipt (the design named
+    //    primitive in core_crypto::persona) after computing receipt_id.
+    sign_receipt_v2(&mut envelope, signer).map_err(IssueError::Sign)?;
 
     Ok(envelope)
 }
 
 /// Parse `~/.ember/sessions/<id>/audit-gaps.jsonl` line-by-line, skipping
-/// malformed lines (matches the fail-open posture of implementation-note-8's writer).
+/// malformed lines (matches the fail-open posture of implementation-note-10's writer).
 fn parse_audit_gaps(path: &Path) -> Result<Vec<AuditGap>, IssueError> {
     let raw = fs::read_to_string(path).map_err(|source| IssueError::AuditGapsRead {
         path: path.display().to_string(),
@@ -139,12 +164,6 @@ fn parse_audit_gaps(path: &Path) -> Result<Vec<AuditGap>, IssueError> {
     Ok(gaps)
 }
 
-fn blake3_bytes(input: &[u8]) -> [u8; 32] {
-    let mut hasher = Hasher::new();
-    hasher.update(input);
-    *hasher.finalize().as_bytes()
-}
-
 fn hex_lower(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -156,7 +175,9 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core_crypto::{FixtureSigner, FixtureVerifier, Signer as _};
     use core_events::receipt::body::{ClaimEvent, ClaimKind};
+    use core_events::receipt::sign::{compute_receipt_id, verify_receipt_v2};
     use std::io::Write as _;
     use tempfile::NamedTempFile;
 
@@ -171,21 +192,35 @@ mod tests {
         }
     }
 
+    fn fixture_signer() -> FixtureSigner {
+        FixtureSigner::new("issue-rs-fixture")
+    }
+
     #[test]
     fn empty_claim_events_omits_merkle_root() {
+        let signer = fixture_signer();
+        let pk = signer.public_key();
         let env = issue_cohort_a_receipt(
             "sess-1",
             vec![],
             None,
             TerminationAuthority::UserSession,
             "daemon-root-1",
+            None,
+            &signer,
         )
         .unwrap();
         assert_eq!(env.kind, RECEIPT_KIND_CLAUDE_CODE);
         assert_eq!(env.daemon_root_id, "daemon-root-1");
         assert_eq!(env.version.0, "2");
-        assert!(env.signature.is_none());
-        assert!(env.receipt_id.starts_with("blake3:"));
+        // Envelope is now signed — signature must be present and verifiable.
+        assert!(env.signature.is_some(), "issue must populate signature");
+        verify_receipt_v2(&env, &pk, &FixtureVerifier).unwrap();
+        // receipt_id is plain lowercase hex (no `blake3:` prefix) — single
+        // canonical path via sign_receipt_v2.
+        assert_eq!(env.receipt_id.len(), 64);
+        assert!(env.receipt_id.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(!env.receipt_id.contains(':'));
         // Body should serialize without permits_merkle_root (skip_if empty).
         let body_str = serde_json::to_string(&env.body).unwrap();
         assert!(
@@ -196,14 +231,20 @@ mod tests {
 
     #[test]
     fn one_claim_event_populates_merkle_root_and_round_trips() {
+        let signer = fixture_signer();
+        let pk = signer.public_key();
         let env = issue_cohort_a_receipt(
             "sess-2",
             vec![sample_claim_event("blake3:abc123")],
             None,
             TerminationAuthority::DaemonPersona,
             "daemon-root-2",
+            None,
+            &signer,
         )
         .unwrap();
+        // Signed receipt must verify.
+        verify_receipt_v2(&env, &pk, &FixtureVerifier).unwrap();
         // Round-trip the envelope through serde_json — guards against any
         // field that isn't (de)serializable.
         let json = serde_json::to_string(&env).unwrap();
@@ -220,6 +261,7 @@ mod tests {
 
     #[test]
     fn audit_gaps_file_parses_and_skips_malformed_lines() {
+        let signer = fixture_signer();
         let mut f = NamedTempFile::new().unwrap();
         writeln!(
             f,
@@ -241,6 +283,8 @@ mod tests {
             Some(f.path()),
             TerminationAuthority::UserSession,
             "daemon-root-3",
+            None,
+            &signer,
         )
         .unwrap();
         let body: ClaudeCodeBody = serde_json::from_value(env.body).unwrap();
@@ -250,15 +294,86 @@ mod tests {
 
     #[test]
     fn missing_audit_gaps_path_yields_no_gaps() {
+        let signer = fixture_signer();
         let env = issue_cohort_a_receipt(
             "sess-4",
             vec![],
             Some(Path::new("/nonexistent/audit-gaps.jsonl")),
             TerminationAuthority::UserSession,
             "daemon-root-4",
+            None,
+            &signer,
         )
         .unwrap();
         let body: ClaudeCodeBody = serde_json::from_value(env.body).unwrap();
         assert!(body.audit_gaps.is_empty());
+    }
+
+    /// T1 round-trip — `issue_cohort_a_receipt` now signs in-place.
+    /// The returned envelope must verify against the signer's public key.
+    /// Pins implementation-note-116 + implementation-note-117.
+    #[test]
+    fn receipt_id_matches_canonical_compute_and_verifies_after_signing() {
+        let signer = FixtureSigner::new("issue-rs-roundtrip");
+        let pk = signer.public_key();
+
+        let env = issue_cohort_a_receipt(
+            "sess-canonical",
+            vec![sample_claim_event("blake3:canon-1")],
+            None,
+            TerminationAuthority::UserSession,
+            "daemon-root-canon",
+            None,
+            &signer,
+        )
+        .unwrap();
+
+        // Issuer's `receipt_id` must equal the canonical path's output.
+        let canonical = compute_receipt_id(&env).unwrap();
+        assert_eq!(
+            env.receipt_id, canonical,
+            "issue.rs and sign::compute_receipt_id must produce identical receipt_ids"
+        );
+
+        // Envelope signed inside issue — must verify without additional sign call.
+        assert!(env.signature.is_some(), "issue must sign the envelope");
+        verify_receipt_v2(&env, &pk, &FixtureVerifier).unwrap();
+    }
+
+    /// T1 negative — tampering with one byte of `body` after signing must
+    /// fail [`verify_receipt_v2`].
+    #[test]
+    fn body_tamper_after_signing_fails_verification() {
+        let signer = FixtureSigner::new("issue-rs-tamper");
+        let pk = signer.public_key();
+
+        let mut env = issue_cohort_a_receipt(
+            "sess-tamper",
+            vec![sample_claim_event("blake3:tamper-1")],
+            None,
+            TerminationAuthority::UserSession,
+            "daemon-root-tamper",
+            None,
+            &signer,
+        )
+        .unwrap();
+
+        // Tamper one byte of the body — overwrite a known field's value.
+        // The receipt body is a serde_json::Value; mutate the
+        // `permits_merkle_root` to a different (still hex-shaped) string.
+        if let serde_json::Value::Object(map) = &mut env.body {
+            map.insert(
+                "permits_merkle_root".into(),
+                serde_json::Value::String("0".repeat(64)),
+            );
+        } else {
+            panic!("expected body to be a JSON object");
+        }
+
+        let r = verify_receipt_v2(&env, &pk, &FixtureVerifier);
+        assert!(
+            r.is_err(),
+            "body tamper after signing should fail verification, got: {r:?}"
+        );
     }
 }

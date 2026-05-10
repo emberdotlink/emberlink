@@ -2,7 +2,7 @@
 //!
 //! Atomic + session scopes, JCS canonicalization, blake3 receipt_id,
 //! Persona-signed envelopes. This module owns the SHARED type surface;
-//! kind-specific bodies (e.g. session.claude_code per implementation-note-10) live
+//! kind-specific bodies (e.g. session.claude_code per implementation-note-12) live
 //! in sibling modules under `receipt/`.
 
 pub mod atomic;
@@ -21,6 +21,8 @@ pub use atomic::{
 };
 pub use envelope::{ReceiptEnvelope, ReceiptVersion, TerminationAuthority};
 pub use body::{ClaimEvent, ClaimKind, ReceiptBody};
-pub use cohort_a::{AuditGap, ClaudeCodeBody, RECEIPT_KIND_CLAUDE_CODE};
+pub use cohort_a::{
+    AuditGap, ClaudeCodeBody, RECEIPT_KIND_CLAUDE_CODE, TerminationReason,
+};
 pub use merkle::{merkle_leaf, merkle_root};
 pub use sign::{SignError, compute_receipt_id, sign_receipt_v2, verify_receipt_v2};

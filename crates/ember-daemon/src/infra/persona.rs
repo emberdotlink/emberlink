@@ -1,5 +1,7 @@
 use chrono::Utc;
 use core_crypto::grant_chain::RootKeyPair;
+use core_crypto::{LocalKeyPair, LocalKeySigner};
+use core_types::KeyAlgorithm;
 use uuid::Uuid;
 
 use crate::infra::store::{DaemonStore, StoreError};
@@ -189,6 +191,66 @@ impl DaemonStore {
                 "persona '{persona_id}' root key invalid: {e}"
             ))
         })
+    }
+
+    /// Return a `LocalKeySigner` that implements `core_crypto::Signer` for the
+    /// persona's Ed25519 key.
+    ///
+    /// This is the signing adapter used by the first-grant receipt emitter at
+    /// init time (`emit_first_grant_receipt`). It decrypts the vault-sealed
+    /// private key and builds the canonical `LocalKeySigner` from the prefixed
+    /// `LocalKeyPair` format — the same format the store uses for all persona
+    /// key material.
+    pub fn persona_signer(&self, persona_id: &str) -> Result<LocalKeySigner, StoreError> {
+        type PersonaKeyRow = (String, Option<Vec<u8>>, Option<Vec<u8>>);
+        let row: Option<PersonaKeyRow> = self
+            .conn()
+            .query_row(
+                "SELECT public_key, private_key_nonce, \
+                        private_key_ciphertext \
+                 FROM personas WHERE id = ?1",
+                rusqlite::params![persona_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                    ))
+                },
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        let (public_key, nonce, ciphertext) = row.ok_or(StoreError::NotFound)?;
+
+        let (n, ct) = match (nonce, ciphertext) {
+            (Some(n), Some(ct)) => (n, ct),
+            _ => {
+                return Err(StoreError::InvalidInput(format!(
+                    "persona '{persona_id}' has no vault-sealed private key"
+                )));
+            }
+        };
+        let vault = self.vault().ok_or_else(|| {
+            StoreError::Vault(format!(
+                "persona '{persona_id}' secret is vault-sealed but no vault is attached"
+            ))
+        })?;
+        let secret_plain = open_persona_secret(&vault, persona_id, &n, &ct)?;
+
+        // Both public_key and secret_plain are already in prefixed form:
+        //   public_key  = "ed25519:<hex>"
+        //   secret_plain = "ed25519-secret:<hex>"
+        let lkp = LocalKeyPair {
+            key_id: format!("persona-{persona_id}"),
+            algorithm: KeyAlgorithm::Ed25519,
+            public_key,
+            private_key: secret_plain,
+        };
+        LocalKeySigner::from_local_key_pair(&lkp)
+            .map_err(|e| StoreError::InvalidInput(format!("persona signer for '{persona_id}': {e}")))
     }
 
     pub fn revoke_persona(&self, id: &str) -> Result<(), StoreError> {
@@ -384,7 +446,7 @@ mod tests {
 
     #[test]
     fn separate_store_connections_each_need_vault_attached() {
-        // implementation-note-24 follow-up — regression for the dashboard task
+        // implementation-note-38 follow-up — regression for the dashboard task
         // opening its own DaemonStore connection and never calling
         // set_vault. Two stores against the same on-disk DB are independent
         // RefCell<Option<Rc<Vault>>> handles — each must attach the vault

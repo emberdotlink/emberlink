@@ -40,6 +40,12 @@ pub enum StoreError {
     /// Caller does not own the requested resource.
     #[error("unauthorized")]
     Unauthorized,
+    /// daemon_persona_key_mode_refuse_world_readable — the identity key file
+    /// has permissions that allow group or world read/write access.
+    /// The daemon refuses to load it to prevent signing-key disclosure.
+    /// Operator must `chmod 0600` the file after investigating why it is wider.
+    #[error("identity key at {path} has insecure mode {mode:#06o} (expected 0600 — chmod 0600 to fix)")]
+    KeyInsecureMode { path: String, mode: u32 },
 }
 
 impl From<core_grants::scope::DelegationViolation> for StoreError {
@@ -64,7 +70,7 @@ pub struct DaemonStore {
     /// reference through that chain. The `RefCell` is only touched on
     /// the single-threaded LocalSet, so runtime borrow panics cannot race.
     vault: RefCell<Option<Rc<Vault>>>,
-    /// implementation-note-73 Phase 2: in-memory rate-limit set for the
+    /// implementation-note-102 Phase 2: in-memory rate-limit set for the
     /// `sops_unwrap_dek` RPC. Each grant_id is consumed exactly once per
     /// daemon-process lifetime. The set is intentionally non-persistent —
     /// daemon restart clears it (acceptable: a restart-then-replay attack
@@ -124,7 +130,7 @@ impl DaemonStore {
         Ok(store)
     }
 
-    /// implementation-note-73 Phase 2: claim a `grant_id` slot for a
+    /// implementation-note-102 Phase 2: claim a `grant_id` slot for a
     /// `sops_unwrap_dek` RPC call. Returns `true` on first claim,
     /// `false` if the grant has already been consumed for an unwrap.
     ///
@@ -307,7 +313,7 @@ impl DaemonStore {
             CREATE INDEX IF NOT EXISTS idx_receipts_persona ON receipts(persona_id);
             CREATE INDEX IF NOT EXISTS idx_receipts_created ON receipts(created_at);
 
-            -- implementation-note-24: server-persisted WebAuthn credentials.
+            -- implementation-note-38: server-persisted WebAuthn credentials.
             -- Each row is a passkey enrolled by a persona via
             -- /settings/passkeys; the `passkey_json` column is the
             -- webauthn-rs `Passkey` type (serde JSON serialization)
@@ -326,7 +332,7 @@ impl DaemonStore {
             CREATE INDEX IF NOT EXISTS idx_webauthn_credentials_persona
                 ON webauthn_credentials(persona_id);
 
-            -- implementation-note-24: in-flight WebAuthn ceremony state.
+            -- implementation-note-38: in-flight WebAuthn ceremony state.
             -- Registration ceremonies and authentication ceremonies
             -- both stash `state_json` here keyed by a freshly-minted
             -- challenge_id; the corresponding finish endpoint reads it
@@ -353,7 +359,7 @@ impl DaemonStore {
                 ON webauthn_challenges(persona_id);",
         )?;
 
-        // implementation-note-13 — backfill `kind` column on legacy DBs so
+        // implementation-note-16 — backfill `kind` column on legacy DBs so
         // the kms_wrap / kms_unwrap rows can land alongside grant rows.
         // Errors swallowed when the column already exists.
         let _ = self.conn.execute(
@@ -361,7 +367,7 @@ impl DaemonStore {
             [],
         );
 
-        // implementation-note-13 — per-key fast-path index for queries shaped
+        // implementation-note-16 — per-key fast-path index for queries shaped
         // `WHERE kind IN ('kms_wrap','kms_unwrap') AND key_name = ?`. Uses
         // SQLite JSON1 (`json_extract`) over the existing `receipt_json`
         // column so we don't have to project key_name into its own
@@ -373,7 +379,7 @@ impl DaemonStore {
                  WHERE kind IN ('kms_wrap','kms_unwrap');",
         )?;
 
-        // EMBER-implementation-note-68 — per-actor and per-resource fast-path indexes
+        // EMBER-implementation-note-94 — per-actor and per-resource fast-path indexes
         // for the `ember audit` query CLI. The existing
         // `idx_receipts_persona` covers persona_id lookups; we keep the
         // `idx_receipts_actor` alias as a stable name the task spec can
@@ -386,7 +392,7 @@ impl DaemonStore {
                  ON receipts(json_extract(receipt_json, '$.summary.resource'));",
         )?;
 
-        // implementation-note-52 — composite-grant approval columns. Existing v0 DBs
+        // implementation-note-77 — composite-grant approval columns. Existing v0 DBs
         // (e.g. the qember.sh demo seed) predate the columns above, so
         // additively backfill them with idempotent ALTER TABLE calls.
         // Errors here are swallowed when the column already exists; any
@@ -426,7 +432,7 @@ impl DaemonStore {
             [],
         );
 
-        // implementation-note-66 — per-statement revocation list.
+        // implementation-note-92 — per-statement revocation list.
         // Stores a JSON array of revoked Statement sids ("S0", "S1", ...) so
         // the demo can revoke a single Statement without taking down the
         // whole grant. Default `'[]'` keeps the column non-null on legacy
@@ -457,12 +463,22 @@ impl DaemonStore {
             [],
         );
 
+        // COMPOSITE-prior change-TESTS-DASHBOARD — skill_ref advisory pointer from
+        // GrantProposal. Persisted so the dashboard approval card can surface
+        // which Construct/skill originated the proposal. Nullable: pre-existing
+        // rows stay NULL; only proposals submitted with GrantProposal.skill_ref
+        // set will populate this column.
+        let _ = self.conn.execute(
+            "ALTER TABLE approval_requests ADD COLUMN skill_ref TEXT",
+            [],
+        );
+
         Ok(())
     }
 }
 
 impl DaemonStore {
-    /// EMBER-implementation-note-68 — query the receipts table with the full
+    /// EMBER-implementation-note-94 — query the receipts table with the full
     /// [`crate::infra::receipt::ReceiptFilter`] filter set (actor/kind/grant_id/
     /// since_iso/resource/limit). Returns flat [`crate::infra::receipt::ReceiptRow`]
     /// projections so callers get `materialized_at`, `terminal_reason`,
@@ -488,7 +504,7 @@ impl DaemonStore {
     /// Phase C callers replace the embedded `if current_status != "pending"`
     /// string-comparison guard with this fn, which also covers the
     /// scope-narrowing invariant checked by `core_approval::TransitionError::ScopeNotNarrowing`.
-    // implementation-note-91 wires this into resolve_approval_inner.
+    // implementation-note-129 wires this into resolve_approval_inner.
     #[allow(dead_code)]
     pub(crate) fn validate_approval_transition(
         state: core_types::approval::ApprovalStatus,
@@ -539,7 +555,7 @@ mod tests {
             "receipts",
             "sandboxes",
             "standing_grants",
-            // implementation-note-24: server-persisted WebAuthn state.
+            // implementation-note-38: server-persisted WebAuthn state.
             "webauthn_credentials",
             "webauthn_challenges",
         ];

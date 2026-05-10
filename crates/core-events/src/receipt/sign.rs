@@ -8,7 +8,10 @@
 //! representation (`ed25519sig:<hex>`), which is the canonical wire form used
 //! everywhere else in the protocol.
 
-use core_crypto::{CanonicalizeError, PublicKey, Signature, Signer, Verifier, canonicalize_jcs};
+use core_crypto::{
+    CanonicalizeError, PublicKey, Signature, Signer, Verifier, canonicalize_jcs,
+    daemon_persona_sign_receipt,
+};
 use thiserror::Error;
 
 use super::envelope::ReceiptEnvelope;
@@ -53,7 +56,12 @@ pub fn compute_receipt_id(envelope: &ReceiptEnvelope) -> Result<String, SignErro
 }
 
 /// Populate `receipt_id`, then sign `JCS(envelope without signature)` with
-/// Ed25519. The signature is stored as the canonical `ed25519sig:<hex>` form.
+/// Ed25519 via the Daemon Persona per design.
+///
+/// The signature is stored as the canonical `ed25519sig:<hex>` form. Signing
+/// routes through [`daemon_persona_sign_receipt`] — the named primitive for
+/// design Daemon Persona signing — rather than calling `signer.sign` directly,
+/// so the single call site is greppable and auditable.
 pub fn sign_receipt_v2(
     envelope: &mut ReceiptEnvelope,
     signer: &dyn Signer,
@@ -61,12 +69,16 @@ pub fn sign_receipt_v2(
     envelope.receipt_id = compute_receipt_id(envelope)?;
     let v = envelope_for_hashing(envelope, /* include_receipt_id */ true)?;
     let bytes = canonicalize_jcs(&v)?;
-    let sig = signer.sign(&bytes);
+    let sig = daemon_persona_sign_receipt(&bytes, signer);
     envelope.signature = Some(sig.0);
     Ok(())
 }
 
 /// Verify both `receipt_id` and `signature`. Both must match for `Ok`.
+///
+/// Requires a non-None `signature` — unsigned Receipts are rejected with
+/// [`SignError::SignatureMissing`]. Verification routes through
+/// [`daemon_persona_verify_receipt`] per design.
 pub fn verify_receipt_v2(
     envelope: &ReceiptEnvelope,
     public_key: &PublicKey,
@@ -86,7 +98,7 @@ pub fn verify_receipt_v2(
     let sig = Signature(sig_str.to_string());
     let v = envelope_for_hashing(envelope, /* include_receipt_id */ true)?;
     let bytes = canonicalize_jcs(&v)?;
-    if verifier.verify(public_key, &bytes, &sig) {
+    if core_crypto::daemon_persona_verify_receipt(&bytes, public_key, &sig, verifier) {
         Ok(())
     } else {
         Err(SignError::InvalidSignature)

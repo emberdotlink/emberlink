@@ -1,0 +1,63 @@
+# Construct manifest for ember-gh per design §2.
+# Action schema: each [[actions]] declares an allowed (verb, subverb)
+# pair, optional budget caps, biometric requirement, and a permit/deny
+# default. The daemon's broker.resolve consults this to decide whether
+# the action requires a credential mint, an existing grant, or refuses.
+
+[meta]
+name = "ember-gh"
+version = "0.1.0"
+publisher = "did:emberlink"
+description = "GitHub CLI (`gh`) Construct. Mediates `gh` invocations through ember's credential broker: each call mints a scoped, time-bound GitHub App installation token with permissions narrowed to the requested action (pr_create, pr_merge, pr_list, workflow_run, etc.), injects it at exec time, revokes the token on exit, and emits a signed Receipt of the invocation. The agent never holds a long-lived GitHub PAT; every credentialed call is grant-gated, audited, and revocable."
+
+# Default policy for unlisted (verb, subverb) pairs.
+default = "deny"
+
+[[actions]]
+key = "pr_create"
+default = "permit"
+
+[[actions]]
+key = "pr_merge"
+default = "prompt"        # requires biometric/operator approval
+
+[[actions]]
+key = "pr_close"
+default = "permit"
+
+[[actions]]
+key = "pr_list"
+default = "permit"
+
+[[actions]]
+key = "pr_view"
+default = "permit"
+
+[[actions]]
+key = "repo_delete"
+default = "deny"          # never auto-permit; agent must explicitly elevate
+
+[[actions]]
+key = "auth_login"
+default = "deny"          # credential mint goes through ember-kms, not gh's keychain
+
+[[actions]]
+key = "workflow_run"
+default = "permit"
+budget_caps = { wall_clock_secs = 1800, cents = 500 }
+
+[[actions]]
+key = "repo_create"
+default = "prompt"          # creates a new repo — billable on some plans, not auto-deletable without repo_delete grant
+
+[[actions]]
+key = "release_create"
+default = "prompt"          # irreversible publish; tag name is visible in the prompt so operator can confirm before tagging
+
+[[actions]]
+key = "issue_create"
+default = "prompt"          # creates content visible to repo collaborators; easy to close/edit but still a write to remote
+
+[[actions]]
+key = "pr_edit"
+default = "prompt"          # modifies PR title/body/labels visible to reviewers; gated so operator can confirm scope of change

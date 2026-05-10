@@ -95,7 +95,9 @@ pub struct BinaryManifestEntry {
     pub absolute_path: PathBuf,
     /// Unix epoch seconds.
     pub installed_at: i64,
-    /// Publisher DID (e.g. "did:ember-systems").
+    /// Publisher DID (e.g. "did:emberlink" for Ember Systems' bundled identity;
+    /// `did:web:<domain>` / `did:key:<base58-pubkey>` for v0.4+ community
+    /// publishers per design).
     pub publisher: String,
     /// Distribution channel that landed this entry on disk. Per ADR
     /// 124 §7 "binary distribution channel" amendment. Defaults to
@@ -297,7 +299,7 @@ version = "1.0.0"
 content_hash = "blake3:abc123"
 absolute_path = "/usr/local/bin/ember-gh"
 installed_at = 1735689600
-publisher = "did:ember-systems"
+publisher = "did:emberlink"
 "#
         )
         .expect("write");
@@ -385,7 +387,7 @@ publisher = "did:ember-systems"
             content_hash: "blake3:abc123".to_string(),
             absolute_path: bundled_install_dir().join(tool),
             installed_at: 1735689600,
-            publisher: "did:ember-systems".to_string(),
+            publisher: "did:emberlink".to_string(),
             channel: BinaryDistributionChannel::Bundled,
         }
     }
@@ -413,7 +415,7 @@ publisher = "did:ember-systems"
         let entry = lookup_construct(&manifest, "ember-gh").expect("found");
         assert_eq!(entry.tool_name, "ember-gh");
         assert_eq!(entry.channel, BinaryDistributionChannel::Bundled);
-        assert_eq!(entry.publisher, "did:ember-systems");
+        assert_eq!(entry.publisher, "did:emberlink");
     }
 
     #[test]
@@ -451,7 +453,7 @@ version = "1.0.0"
 content_hash = "blake3:abc123"
 absolute_path = "/usr/local/lib/ember/binaries/ember-gh"
 installed_at = 1735689600
-publisher = "did:ember-systems"
+publisher = "did:emberlink"
 "#
         )
         .expect("write");

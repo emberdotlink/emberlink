@@ -18,6 +18,8 @@ pub const RECEIPT_KIND_BINDING_DELETED: &str = "binding.deleted";
 pub const RECEIPT_KIND_SEAL_UNSEALED: &str = "seal.unsealed";
 pub const RECEIPT_KIND_SNAPSHOT_EMITTED: &str = "snapshot.emitted";
 pub const RECEIPT_KIND_IDENTITY_ROTATED: &str = "identity.rotated";
+pub const RECEIPT_KIND_LOCAL_STATE_KEY_RESOLVE: &str = "local_state.key_resolve";
+pub const RECEIPT_KIND_LOCAL_STATE_KEY_ROTATION: &str = "local_state.key_rotation";
 
 // ===== Body structs =====
 
@@ -79,6 +81,34 @@ pub struct IdentityRotatedBody {
     pub rotation_authority: String,
 }
 
+/// Body for `local_state.key_resolve` — daemon vended the per-caller
+/// local-state content key. Emitted per `daemon-sole-keychain-client`
+/// proposal §"Three new daemon socket methods" + design separate-uid
+/// authorization substrate.
+///
+/// `resolved_or_generated` discriminates whether the key was already in
+/// the daemon vault (`"resolved"`) or generated fresh on this call
+/// (`"generated"`). The latter signals a first-touch or migration boundary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalStateKeyResolveBody {
+    pub peer_uid: u32,
+    pub caller: String,
+    pub vault_namespace: String,
+    pub resolved_or_generated: String,
+}
+
+/// Body for `local_state.key_rotation` — daemon-side atomic rotation of
+/// a per-caller local-state content key. `old_key_hash` / `new_key_hash`
+/// are blake3 hashes of the key material (never the keys themselves).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalStateKeyRotationBody {
+    pub peer_uid: u32,
+    pub caller: String,
+    pub vault_namespace: String,
+    pub old_key_hash: String,
+    pub new_key_hash: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,6 +128,35 @@ mod tests {
         assert_eq!(RECEIPT_KIND_SEAL_UNSEALED, "seal.unsealed");
         assert_eq!(RECEIPT_KIND_SNAPSHOT_EMITTED, "snapshot.emitted");
         assert_eq!(RECEIPT_KIND_IDENTITY_ROTATED, "identity.rotated");
+        assert_eq!(RECEIPT_KIND_LOCAL_STATE_KEY_RESOLVE, "local_state.key_resolve");
+        assert_eq!(RECEIPT_KIND_LOCAL_STATE_KEY_ROTATION, "local_state.key_rotation");
+    }
+
+    #[test]
+    fn local_state_key_resolve_body_round_trips() {
+        let body = LocalStateKeyResolveBody {
+            peer_uid: 501,
+            caller: "cli".into(),
+            vault_namespace: "local-state/cli".into(),
+            resolved_or_generated: "generated".into(),
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        let back: LocalStateKeyResolveBody = serde_json::from_value(v).unwrap();
+        assert_eq!(body, back);
+    }
+
+    #[test]
+    fn local_state_key_rotation_body_round_trips() {
+        let body = LocalStateKeyRotationBody {
+            peer_uid: 501,
+            caller: "gui".into(),
+            vault_namespace: "local-state/gui".into(),
+            old_key_hash: "blake3:olddead".into(),
+            new_key_hash: "blake3:newbeef".into(),
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        let back: LocalStateKeyRotationBody = serde_json::from_value(v).unwrap();
+        assert_eq!(body, back);
     }
 
     #[test]

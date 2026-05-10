@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    # implementation-note-1 — vestigial crate removed; name reused by emberlink-cli rename per implementation-note-2
+    # implementation-note-3 — vestigial crate removed; name reused by emberlink-cli rename per implementation-note-4
     "crates/emberlink-agent",
     "crates/emberlink-mcp",
     "crates/emberlink-app",
@@ -8,7 +8,7 @@ members = [
     "crates/emberlink-relay",
     "crates/core-broker",
     "crates/core-construct-runtime",
-    "crates/ember-construct-classify",
+    "crates/ember-construct",
     "crates/core-types",
     "crates/core-crypto",
     "crates/core-events",
@@ -24,21 +24,23 @@ members = [
     "crates/core-mcp",
     "crates/core-metrics",
     "crates/core-policy",
+    "crates/core-receipts",
     "crates/core-approval",
     "crates/core-grants",
     "crates/core-grants-toml",
     "crates/core-config",
     "crates/ember-broker",
     "crates/ember-daemon",
-    "crates/ember-gh",
     "crates/ember-tools",
+    "crates/ember-vault",
 ]
 resolver = "2"
 
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
-version = "0.2.28"
+# version-0-3-0-bumped-cohort-a-v03: bumped 2026-05-09 for cohort-A v0.3.0 ship
+version = "0.3.0"
 
 [workspace.dependencies]
 blake3 = "1"

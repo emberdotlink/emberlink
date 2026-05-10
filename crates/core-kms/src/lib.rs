@@ -2,10 +2,9 @@
 //!
 //! Implements the minimum subset of the HashiCorp Vault Transit API required by
 //! Mozilla SOPS (`hc_vault_transit_uri`) and Pulumi (`hashivault://` secrets
-//! provider) to target the Emberlink daemon as a localhost KMS. See
-//! [design](../../../project design notes) for the full design.
+//! provider) to target the Emberlink daemon as a localhost KMS.
 //!
-//! # Surface (per design §3)
+//! # Surface
 //!
 //! - `POST /v1/<engine>/encrypt/<key>` — wrap a caller-supplied DEK
 //! - `POST /v1/<engine>/decrypt/<key>` — unwrap a previously wrapped DEK

@@ -20,9 +20,9 @@ use core_grants::scope::{
 };
 use crate::infra::store::{DaemonStore, StoreError};
 
-// implementation-note-99 — final phase cleanup pass completed (design phase C-FINAL)
-// implementation-note-100 — internal grant.rs sites walk AccessGrant.blocks[] (design phase C-2)
-// implementation-note-101 — legacy entry points delegate through DaemonGrantStore (design phase C-1)
+// implementation-note-139 — final phase cleanup pass completed (design phase C-FINAL)
+// implementation-note-140 — internal grant.rs sites walk AccessGrant.blocks[] (design phase C-2)
+// implementation-note-141 — legacy entry points delegate through DaemonGrantStore (design phase C-1)
 // --- Phase B: DaemonGrantStore adapter (design §2.3) ---
 // TODO: GrantInfo struct is retained as a daemon-internal DB projection
 // because receipt.rs, dashboard.rs, tailnet.rs, and handler.rs all depend on fields not present
@@ -130,7 +130,7 @@ impl<'a> DaemonGrantStore<'a> {
     /// Load a `core_grants::Grant` by its daemon-format string ID ("grant-{uuid}").
     ///
     /// Thin convenience bridge for handler.rs sites migrated in
-    /// implementation-note-65. Returns the state-machine type so callers can
+    /// implementation-note-91. Returns the state-machine type so callers can
     /// use `grant.state` / `grant.issuer` / `grant.expires_at` directly
     /// without going through the `GrantInfo` projection.
     pub fn load_grant(&self, id: &str) -> Result<core_grants::Grant, StoreError> {
@@ -447,6 +447,77 @@ pub(crate) fn validate_blocks_json_caps(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Composite-grant action-key validator (design §4 — DID-prefixed action keys)
+// ---------------------------------------------------------------------------
+
+/// Per design every composite-grant action key is the
+/// fully-qualified `<publisher-did>:<tool>.<action>` form. The validator
+/// here is the **parse-time gate** — it refuses bare action keys (no
+/// `did:` prefix) with a migration-pointer error so authors of new
+/// grants land on the FQ shape immediately.
+///
+/// Forward-compat: the validator accepts any `did:<method>:<rest>`
+/// shape, even though the v0.3.0 daemon's broker.resolve only routes
+/// `did:ember:` (the bundled publisher). v0.4+ community publishers
+/// (`did:web:<domain>:<tool>.<action>`, `did:key:<base58>:...`) parse
+/// today and become resolvable when the per-publisher trust delegation
+/// UX lands.
+///
+/// `did:` plus a method-name (one or more chars) plus `:` is the
+/// minimum acceptable shape. The validator does NOT enforce a known
+/// method list (that's the resolver's job at runtime, not the parser's
+/// job at submit time).
+pub fn validate_action_keys_did_prefixed(
+    statements: &[Statement],
+) -> Result<(), StoreError> {
+    for s in statements {
+        for action in &s.actions {
+            if !is_did_prefixed_action_key(action) {
+                return Err(StoreError::InvalidInput(format!(
+                    "action key '{action}' lacks did: prefix; per design use \
+                     'did:ember:{action}' (or 'did:web:<your-domain>:{action}' \
+                     for non-emberlink publishers)"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// True iff `action` starts with `did:<method>:` where `<method>` is at
+/// least one character. This is the parse-time admissibility check —
+/// resolvability of any specific DID method is a runtime concern, not a
+/// validator concern.
+fn is_did_prefixed_action_key(action: &str) -> bool {
+    let Some(rest) = action.strip_prefix("did:") else {
+        return false;
+    };
+    // Need a non-empty method name followed by ':'.
+    let Some(colon_idx) = rest.find(':') else {
+        return false;
+    };
+    colon_idx > 0
+}
+
+/// Build the fully-qualified action key from a `(publisher, tool, action)`
+/// tuple per design §1. This is the canonical constructor that
+/// dashboard renderers, receipt emitters, and broker.resolve all share
+/// so the FQ shape stays consistent across surfaces. Wraps the
+/// `<publisher-did>:<tool>.<action>` string format in one place.
+///
+/// Examples:
+///
+/// ```ignore
+/// build_fq_action_key("did:ember", "gh", "pr_create")
+///     // -> "did:ember:gh.pr_create"
+/// build_fq_action_key("did:web:hashicorp.com", "terraform", "apply")
+///     // -> "did:web:hashicorp.com:terraform.apply"
+/// ```
+pub fn build_fq_action_key(publisher_did: &str, tool: &str, action: &str) -> String {
+    format!("{publisher_did}:{tool}.{action}")
+}
+
 /// Build a single-statement block payload from daemon scalar fields.
 ///
 /// Returns the unsigned [`Block`] — signing is a separate step that
@@ -457,7 +528,7 @@ pub(crate) fn validate_blocks_json_caps(
 /// maps [`core_grants::chain::ChainBuildError`] onto `StoreError::InvalidInput`
 /// so daemon callers don't have to juggle two error enums.
 ///
-/// Logic lives in `core_grants::chain::sign_block_zero_with` (implementation-note-11).
+/// Logic lives in `core_grants::chain::sign_block_zero_with` (implementation-note-14).
 pub(crate) fn sign_block_zero_with(
     root: &RootKeyPair,
     block: &Block,
@@ -477,13 +548,13 @@ fn parse_epoch(s: Option<&str>) -> Option<u64> {
 /// per call), so the stored value is always 0. This derivation computes the
 /// actual time the grant has been in force at the moment of the query.
 ///
-/// Rules (per implementation-note-58):
+/// Rules (per implementation-note-83):
 /// - If the grant has already expired (`expires_at` set and `now > expires_at`),
 ///   return `min(expires_at, now) - created_at` clamped to `[0, budget_cap]`.
 /// - Otherwise return `now - created_at` clamped to `[0, budget_cap]`.
 /// - `budget_cap = None` means no wall-clock budget; elapsed time is still
 ///   derived (for audit accuracy) but is not clamped.
-// implementation-note-58: shipped
+// implementation-note-83: shipped
 pub(crate) fn derive_wall_clock_secs(
     now_secs: u64,
     created_at_secs: u64,
@@ -551,7 +622,7 @@ fn row_to_grant(row: &rusqlite::Row<'_>) -> rusqlite::Result<GrantInfo> {
         None => (flat_budget, flat_usage),
     };
 
-    // implementation-note-58: derive wall_clock_secs at read time.
+    // implementation-note-83: derive wall_clock_secs at read time.
     // The proxy never increments this field; compute elapsed seconds from
     // created_at/expires_at so signed receipts record actual time used.
     let now_secs = std::time::SystemTime::now()
@@ -568,7 +639,7 @@ fn row_to_grant(row: &rusqlite::Row<'_>) -> rusqlite::Result<GrantInfo> {
     // Terminal states persisted in the column (revoked, expired, exhausted_by_budget,
     // expired_by_budget, parent_cascade_revoked) are kept as-is.  For non-terminal
     // stored states (active, paused) we additionally derive time-based expiry from
-    // `expires_at`, reusing `GrantStatus::derive` (see prior change / implementation-note-102).
+    // `expires_at`, reusing `GrantStatus::derive` (see prior change / implementation-note-142).
     let effective_status = if matches!(
         status.as_str(),
         "revoked" | "expired" | "exhausted_by_budget" | "expired_by_budget" | "parent_cascade_revoked"
@@ -620,7 +691,7 @@ pub(crate) fn access_grant_blocks_to_json(g: &AccessGrant) -> Result<String, Sto
 ///
 /// Daemon-layer wrapper that maps [`core_grants::chain::ChainBuildError`] onto
 /// `StoreError::InvalidInput`. Logic lives in
-/// `core_grants::chain::access_grant_from_statements` (implementation-note-11).
+/// `core_grants::chain::access_grant_from_statements` (implementation-note-14).
 pub fn access_grant_from_statements(
     id: &str,
     persona_id: &str,
@@ -643,7 +714,7 @@ pub fn access_grant_from_statements(
 /// derived from the store rather than threaded in from the outside.
 /// Existing callers of [`access_grant_from_statements`] continue to
 /// compile unchanged; migrate them to this form incrementally
-/// (TODO P69K-C28-implementation-note-103 caller migration).
+/// (TODO P69K-C28-implementation-note-143 caller migration).
 ///
 /// Returns the same value as calling `access_grant_from_statements` with
 /// the result of `store.persona_root_keypair(persona_id)`.
@@ -925,7 +996,7 @@ impl DaemonStore {
     }
 
     pub fn list_active_grants(&self) -> Result<Vec<GrantInfo>, StoreError> {
-        // implementation-note-42 — `paused` is a reversible state; the operator
+        // implementation-note-67 — `paused` is a reversible state; the operator
         // who pauses a grant must still be able to find and resume it
         // without flipping the "show terminated" toggle (which is for
         // *terminal* states: revoked / expired / exhausted_by_budget).
@@ -1664,7 +1735,7 @@ impl DaemonStore {
         })
     }
 
-    /// implementation-note-66 — read the per-Statement
+    /// implementation-note-92 — read the per-Statement
     /// revocation list for a grant. Returns the deserialized vector of
     /// revoked sids ("S0", "S1", ...). Missing or NULL column is treated
     /// as empty (legacy rows that predate the migration). Malformed JSON
@@ -1700,7 +1771,7 @@ impl DaemonStore {
         self.grant_store().revoke_grant_statement(grant_id, sid)
     }
 
-    /// implementation-note-66 — append `sid` to the per-Statement
+    /// implementation-note-92 — append `sid` to the per-Statement
     /// revocation list for a grant. Idempotent: appending an already-revoked
     /// sid is a no-op. Emits a `grant.statement_revoked` audit event with
     /// the grant_id and statement sid.
@@ -1969,7 +2040,7 @@ impl DaemonStore {
         Ok((exhausted, warned))
     }
 
-    /// implementation-note-70: per-grant version of the
+    /// implementation-note-96: per-grant version of the
     /// background sweeps (`expire_stale_grants` + `expire_grants_by_wall_clock`)
     /// run synchronously on observation. `get_grant` already projects an
     /// `effective_status` from `expires_at` vs `now`, so callers can
@@ -2285,7 +2356,7 @@ impl DaemonStore {
         // metering lets us express the extension as an appended block.
         let mut new_chain = self.get_access_grant(id)?;
 
-        // F-01 (adversarial development cycle): re-signing block 0 mints a fresh
+        // F-01 (adversarial finding): re-signing block 0 mints a fresh
         // pubkey_next, which orphans the signature on every subsequent
         // block (those are signed by the PREVIOUS pubkey_next's secret,
         // which the daemon does not persist). On a multi-block chain
@@ -2473,7 +2544,7 @@ impl DaemonStore {
                 if stmt.sid == statement_sid {
                     let before = stmt.usage.clone();
                     stmt.usage.tokens = stmt.usage.tokens.saturating_add(delta.tokens);
-                    // implementation-note-18: accumulate micro-cents
+                    // implementation-note-22: accumulate micro-cents
                     // (sub-cent precision) and DERIVE the integer `cents`
                     // display value from it. Adding `delta.cents` directly
                     // would lose every sub-cent call to integer truncation,
@@ -2529,7 +2600,7 @@ impl DaemonStore {
             return Err(StoreError::NotFound);
         }
 
-        // F-01 (adversarial development cycle): re-signing block 0 rotates
+        // F-01 (adversarial finding): re-signing block 0 rotates
         // pubkey_next, which orphans blocks 1..N (their signers used the
         // PREVIOUS pubkey_next's secret, which the daemon does not
         // persist). On a multi-block chain that silently bricks the
@@ -2673,7 +2744,7 @@ impl DaemonStore {
         Ok(())
     }
 
-    /// implementation-note-63: evaluate a Claude Code PreToolUse request against the
+    /// implementation-note-89: evaluate a Claude Code PreToolUse request against the
     /// active grant for the supplied persona, emit a `tool_call_attempt`
     /// audit event, and return a `ToolCallDecision`.
     ///
@@ -2684,7 +2755,7 @@ impl DaemonStore {
     ///     and find its first active grant.
     ///
     /// On hit: returns `ToolCallDecision { permit: true, reason: None, .. }`
-    /// (Permit-stub — the real evaluator is implementation-note-64 future work).
+    /// (Permit-stub — the real evaluator is implementation-note-90 future work).
     /// On miss: returns `ToolCallDecision { permit: false, reason: Some(..), .. }`.
     ///
     /// Either way, an audit row is written to the `audit_log` table keyed
@@ -2742,7 +2813,7 @@ impl DaemonStore {
                 ToolCallDecision {
                     permit: false,
                     reason: Some(format!(
-                        "no active grant for persona '{persona}' (implementation-note-63 stub evaluator)"
+                        "no active grant for persona '{persona}' (implementation-note-89 stub evaluator)"
                     )),
                     grant_id: None,
                     emitted_event_id: String::new(),
@@ -2774,13 +2845,13 @@ impl DaemonStore {
     }
 }
 
-/// implementation-note-63: decision returned by [`DaemonStore::evaluate_tool_call`].
+/// implementation-note-89: decision returned by [`DaemonStore::evaluate_tool_call`].
 ///
 /// Wire-compatible with the proxy hook's `HookResponse` shape: `permit`
 /// maps to `allow`, `reason` to `reason` (a `None` reason on the permit
-/// path becomes the canned "permit (implementation-note-63 stub)" string in the
+/// path becomes the canned "permit (implementation-note-89 stub)" string in the
 /// proxy). `grant_id` and `emitted_event_id` are surfaced so future
-/// receipt-termination work (implementation-note-10) can correlate the hook
+/// receipt-termination work (implementation-note-12) can correlate the hook
 /// invocation back to the grant + audit row without a second RPC.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct ToolCallDecision {
@@ -2909,7 +2980,7 @@ mod tests {
         assert!(matches!(result, Err(StoreError::NotFound)));
     }
 
-    // implementation-note-66 — per-statement revoke unit tests.
+    // implementation-note-92 — per-statement revoke unit tests.
 
     #[test]
     fn revoke_grant_statement_appends_sid() {
@@ -3472,7 +3543,7 @@ mod tests {
     }
 
     /// `access_grant_from_statements_for_persona` returns the same `AccessGrant`
-    /// as the explicit-root form when both use the same persona (P69K-C28-implementation-note-103).
+    /// as the explicit-root form when both use the same persona (P69K-C28-implementation-note-143).
     #[test]
     fn access_grant_from_statements_for_persona_matches_explicit_root() {
         let store = setup();
@@ -4262,7 +4333,7 @@ mod tests {
 
     #[test]
     fn list_active_grants_includes_paused() {
-        // implementation-note-42 — paused grants are reversible; the operator
+        // implementation-note-67 — paused grants are reversible; the operator
         // who pauses a grant must still see it on the Active list to be
         // able to resume it. Terminal states (revoked / expired /
         // exhausted_by_budget) belong behind the "show terminated"
@@ -4588,6 +4659,159 @@ mod tests {
         let json = access_grant_blocks_to_json(&grant).unwrap();
         validate_blocks_json_caps(&grant, &json)
             .expect("exact MAX_STATEMENTS_PER_BLOCK must pass");
+    }
+
+    // --- design §4: composite-grant action-key validator ---------------
+
+    fn stmt_with_actions(actions: Vec<&str>) -> Statement {
+        Statement {
+            sid: "s0".into(),
+            resource_type: ResourceType::Credential,
+            actions: actions.into_iter().map(String::from).collect(),
+            resource: ResourceSelector::Exact { value: "cred".into() },
+            budget: None,
+            usage: Usage::default(),
+            conditions: vec![],
+        }
+    }
+
+    #[test]
+    fn validator_rejects_bare_action_key_with_migration_pointer() {
+        // Per design §4: bare action keys (no `did:` prefix) are
+        // rejected at parse time. The error message must point operators
+        // at the new shape so they can migrate without consulting docs.
+        let stmts = vec![stmt_with_actions(vec!["gh.pr_create"])];
+        let err = validate_action_keys_did_prefixed(&stmts).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("lacks did: prefix"),
+            "error must name the missing prefix; got: {msg}"
+        );
+        assert!(
+            msg.contains("did:ember:gh.pr_create"),
+            "error must include the recommended did:ember: migration form; got: {msg}"
+        );
+        assert!(
+            msg.contains("did:web:"),
+            "error must mention the did:web: alternative for non-emberlink publishers; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn validator_rejects_legacy_colon_shape_without_did_prefix() {
+        // Pre-design statements used colon-namespaced verbs like
+        // "github:pull_request:create". The validator must reject these
+        // too — they have no `did:` prefix, so they fail the parse-time
+        // gate even though they look "structured".
+        let stmts = vec![stmt_with_actions(vec!["github:pull_request:create"])];
+        let err = validate_action_keys_did_prefixed(&stmts).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("lacks did: prefix"), "got: {msg}");
+    }
+
+    #[test]
+    fn validator_accepts_did_ember_prefix() {
+        // The bundled publisher case: did:ember:<tool>.<action> is the
+        // canonical v0.3.0 shape. The validator's happy path.
+        let stmts = vec![stmt_with_actions(vec!["did:ember:gh.pr_create"])];
+        validate_action_keys_did_prefixed(&stmts)
+            .expect("did:ember: prefixed action key must pass parse-time validation");
+    }
+
+    #[test]
+    fn validator_accepts_did_web_prefix_for_forward_compat() {
+        // design §3: arbitrary DID methods pass the parser at v0.3.0,
+        // even though the daemon's broker.resolve only routes
+        // `did:ember:` today. This test locks the forward-compat door:
+        // a `did:web:hashicorp.com:terraform.apply` statement parses
+        // cleanly today; community-publisher resolution is the v0.4+
+        // runtime-gate flip.
+        let stmts =
+            vec![stmt_with_actions(vec!["did:web:hashicorp.com:terraform.apply"])];
+        validate_action_keys_did_prefixed(&stmts)
+            .expect("did:web: prefixed action key must pass parse-time validation");
+    }
+
+    #[test]
+    fn validator_accepts_did_key_prefix_for_forward_compat() {
+        // Sister forward-compat case: `did:key:<base58-pubkey>` is the
+        // self-certifying DID method that doesn't need an external
+        // registry lookup. Must parse today even though no `did:key:`
+        // publisher is registered in v0.3.0.
+        let stmts = vec![stmt_with_actions(vec![
+            "did:key:z6MkkBRG7Ghk:custom-tool.deploy",
+        ])];
+        validate_action_keys_did_prefixed(&stmts)
+            .expect("did:key: prefixed action key must pass parse-time validation");
+    }
+
+    #[test]
+    fn validator_rejects_did_with_empty_method_name() {
+        // `did::<rest>` is structurally invalid — DID method names are
+        // non-empty per the W3C DID spec. Reject at parse time so
+        // malformed identifiers can't sneak through the gate.
+        let stmts = vec![stmt_with_actions(vec!["did::gh.pr_create"])];
+        let err = validate_action_keys_did_prefixed(&stmts).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("lacks did: prefix"), "got: {msg}");
+    }
+
+    #[test]
+    fn validator_rejects_did_without_method_separator() {
+        // `did:something_without_a_colon` is not a complete DID URI —
+        // the method-specific identifier separator is missing.
+        let stmts = vec![stmt_with_actions(vec!["did:something_without_a_colon"])];
+        let err = validate_action_keys_did_prefixed(&stmts).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("lacks did: prefix"), "got: {msg}");
+    }
+
+    #[test]
+    fn build_fq_action_key_emits_canonical_shape() {
+        // design §1 — the FQ key is `<publisher-did>:<tool>.<action>`.
+        // Exercise the bundled-publisher and the v0.4+ community-publisher
+        // shapes together so dashboard, receipt, and broker.resolve all
+        // round-trip through the same constructor.
+        assert_eq!(
+            build_fq_action_key("did:ember", "gh", "pr_create"),
+            "did:ember:gh.pr_create",
+        );
+        assert_eq!(
+            build_fq_action_key("did:ember", "git", "push"),
+            "did:ember:git.push",
+        );
+        assert_eq!(
+            build_fq_action_key("did:web:hashicorp.com", "terraform", "apply"),
+            "did:web:hashicorp.com:terraform.apply",
+        );
+
+        // Round-trip: a key built via the constructor must pass the
+        // parse-time validator. Keeps the constructor and the validator
+        // in lockstep — adding a new validator constraint without
+        // updating the constructor would surface here.
+        let stmts = vec![stmt_with_actions(vec![
+            &build_fq_action_key("did:ember", "gh", "pr_create"),
+            &build_fq_action_key("did:ember", "git", "push"),
+        ])];
+        validate_action_keys_did_prefixed(&stmts)
+            .expect("constructor output must satisfy validator");
+    }
+
+    #[test]
+    fn validator_walks_multiple_statements_and_actions() {
+        // The validator runs on every (statement, action) pair. Mixing
+        // a valid did:ember key with a bare key in the same statement
+        // list must surface the bare one as the rejection reason.
+        let stmts = vec![
+            stmt_with_actions(vec!["did:ember:gh.pr_create"]),
+            stmt_with_actions(vec!["did:ember:git.push", "git.bare_push"]),
+        ];
+        let err = validate_action_keys_did_prefixed(&stmts).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("git.bare_push"),
+            "error must name the offending action verbatim; got: {msg}"
+        );
     }
 
     // --- P69K-F04: overwrite_grant_blocks must full-verify chain under
@@ -5763,7 +5987,7 @@ mod tests {
         assert_eq!(store.get_grant(&child.id).unwrap().status, "revoked");
     }
 
-    // ---- implementation-note-63: evaluate_tool_call -----------------------------
+    // ---- implementation-note-89: evaluate_tool_call -----------------------------
 
     #[test]
     fn evaluate_tool_call_persona_with_active_grant_permits() {
@@ -5907,7 +6131,7 @@ mod tests {
         assert_eq!(back, d);
     }
 
-    // --- implementation-note-58: derive_wall_clock_secs unit tests ---
+    // --- implementation-note-83: derive_wall_clock_secs unit tests ---
 
     #[test]
     fn wall_clock_derive_mid_grant() {

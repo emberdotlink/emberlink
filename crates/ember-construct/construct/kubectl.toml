@@ -1,0 +1,183 @@
+# Construct manifest for ember-kubectl per design §2.
+# Action schema: each [[actions]] declares an allowed action_key, optional
+# budget caps, biometric requirement, and a permit/deny default. The daemon's
+# broker.resolve consults this to decide whether the action requires a
+# credential mint, an existing grant, or refuses.
+#
+# Cohort-A scope catalog per design §"Cohort-A scopes":
+#   Gated — broker round-trip required (cluster-state mutation or privileged access).
+#   Passthrough — None (read-only / context switching).
+#
+# Credential injection: kubectl reads KUBECONFIG from disk or the env var.
+# Cloud provider auth vars (AWS_PROFILE, GOOGLE_APPLICATION_CREDENTIALS,
+# AZURE_*) can flow through env_passthrough for cluster access.
+
+[meta]
+name = "ember-kubectl"
+version = "0.1.0"
+publisher = "did:emberlink"
+description = "kubectl CLI Construct. Mediates `kubectl` invocations through ember's broker: apply/patch/edit/replace/create require biometric approval; delete is budget-capped at 3/session with biometric confirmation; exec/cp are biometric-gated (privileged pod access); rollout pause/resume/undo/restart, set image/env/resources, label, annotate, port-forward, proxy, cordon/drain/uncordon/taint, scale, run, and debug are gated. Read-only verbs (get, describe, logs, top, auth, cluster-info, version, api-resources, api-versions, explain, wait, events) and config context ops are passthrough — no broker mediation."
+
+# Default policy for unlisted action keys.
+default = "deny"
+
+# --- Cluster state mutations (biometric required) ---
+
+[[actions]]
+key = "kubectl.apply"
+default = "permit"
+biometric = "required"
+
+[[actions]]
+key = "kubectl.patch"
+default = "permit"
+biometric = "required"
+
+[[actions]]
+key = "kubectl.edit"
+default = "permit"
+biometric = "required"
+
+[[actions]]
+key = "kubectl.replace"
+default = "permit"
+biometric = "required"
+
+# --- Delete (highest blast radius — budget cap 3/session) ---
+
+[[actions]]
+key = "kubectl.delete"
+default = "permit"
+biometric = "required"
+budget_caps = { wall_clock_secs = 86400, max_uses = 3 }
+
+# --- Pod access (privileged) ---
+
+[[actions]]
+key = "kubectl.exec"
+default = "permit"
+biometric = "required"
+
+[[actions]]
+key = "kubectl.cp"
+default = "permit"
+biometric = "required"
+
+# --- Network exposure ---
+
+[[actions]]
+key = "kubectl.port_forward"
+default = "permit"
+
+[[actions]]
+key = "kubectl.proxy"
+default = "permit"
+
+# --- Node state mutations (biometric required) ---
+
+[[actions]]
+key = "kubectl.node.cordon"
+default = "permit"
+biometric = "required"
+
+[[actions]]
+key = "kubectl.node.drain"
+default = "permit"
+biometric = "required"
+
+[[actions]]
+key = "kubectl.node.uncordon"
+default = "permit"
+biometric = "required"
+
+[[actions]]
+key = "kubectl.node.taint"
+default = "permit"
+biometric = "required"
+
+# --- Replica count mutation ---
+
+[[actions]]
+key = "kubectl.scale"
+default = "permit"
+biometric = "required"
+
+# --- Rollout mutations (status is passthrough) ---
+
+[[actions]]
+key = "kubectl.rollout.pause"
+default = "permit"
+
+[[actions]]
+key = "kubectl.rollout.resume"
+default = "permit"
+
+[[actions]]
+key = "kubectl.rollout.undo"
+default = "permit"
+biometric = "required"
+
+[[actions]]
+key = "kubectl.rollout.restart"
+default = "permit"
+
+# --- Live-config mutations ---
+
+[[actions]]
+key = "kubectl.set.image"
+default = "permit"
+biometric = "required"
+
+[[actions]]
+key = "kubectl.set.env"
+default = "permit"
+biometric = "required"
+
+[[actions]]
+key = "kubectl.set.resources"
+default = "permit"
+biometric = "required"
+
+[[actions]]
+key = "kubectl.set"
+default = "permit"
+biometric = "required"
+
+# --- Metadata mutations ---
+
+[[actions]]
+key = "kubectl.label"
+default = "permit"
+biometric = "required"
+
+[[actions]]
+key = "kubectl.annotate"
+default = "permit"
+biometric = "required"
+
+# --- Resource creation ---
+
+[[actions]]
+key = "kubectl.create"
+default = "permit"
+biometric = "required"
+
+# --- Run (creates pods / connects) ---
+
+[[actions]]
+key = "kubectl.run"
+default = "permit"
+biometric = "required"
+
+# --- Debug (creates ephemeral containers or copies pods) ---
+
+[[actions]]
+key = "kubectl.debug"
+default = "permit"
+biometric = "required"
+
+# --- Read-only verbs (passthrough — no broker mediation, no biometric) ---
+
+[[actions]]
+key = "kubectl.read"
+default = "permit"

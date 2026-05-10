@@ -246,7 +246,7 @@ pub enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         rest: Vec<String>,
     },
-    /// Approve or deny a pending approval (implementation-note-56).
+    /// Approve or deny a pending approval (implementation-note-81).
     Approval {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         rest: Vec<String>,
@@ -340,7 +340,7 @@ pub enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         rest: Vec<String>,
     },
-    /// Query the receipts audit log (EMBER-implementation-note-68).
+    /// Query the receipts audit log (EMBER-implementation-note-94).
     ///
     /// Subcommand::Audit — dispatches to the receipt-query handler.
     /// Filters: --since <duration|ISO>, --actor <persona-id>,

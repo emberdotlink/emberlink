@@ -1,0 +1,326 @@
+# CLASSIFICATION: PUBLIC
+# Construct manifest for ember-az per design §2.
+#
+# Action schema: each [[actions]] declares an allowed action_key, optional
+# budget caps, biometric requirement, and a permit/deny default. The daemon's
+# broker.resolve consults this to decide whether the action requires a
+# credential mint, an existing grant, or refuses.
+#
+# Credential injection: the broker (`BrokerProvider::AzureCli`) issues
+# short-lived OAuth bearer tokens via service-principal client-credentials
+# grant scoped to the grant's allowed actions. The daemon materializes them
+# into AZURE_ACCESS_TOKEN (azure-cli honors this for non-interactive auth)
+# or — for the SP-file fallback path — writes a temp service-principal
+# credential file at ~/.ember/shadow/az-sp-<materialization-id>.json and
+# exports AZURE_AUTH_LOCATION. Daemon zeroizes + unlinks on child exit.
+#
+# Read-only verbs (`show`, `list`, `get-*`, `account list`, `account show`)
+# classify to `None` (passthrough) and never reach this manifest.
+
+[meta]
+name = "ember-az"
+version = "0.1.0"
+publisher = "did:emberlink"
+description = "Azure CLI Construct. Mediates `az` invocations through ember's credential broker: privilege removal (role.assignment.delete, role.definition.delete), Key Vault destruction (keyvault.delete, keyvault.key.delete, keyvault.secret.delete) and reveal (keyvault.key.decrypt, keyvault.secret.show), VM destruction (vm.delete, vm.deallocate), AKS/SQL deletion (aks.delete, sql.server.delete, sql.db.delete), storage data destruction (storage.account.delete, storage.blob.delete, storage.container.delete), and webapp/functionapp deletion (functionapp.delete, webapp.delete) all require biometric approval. Resource group deletion (group.delete) is denied by default and requires an explicit grant override. OAuth tokens inject via AZURE_ACCESS_TOKEN; SP-file fallback path uses AZURE_AUTH_LOCATION."
+
+# Default policy for unlisted action keys.
+default = "deny"
+
+# --- vm ---
+
+[[actions]]
+key = "az.vm.create"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "az.vm.start"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "az.vm.stop"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "az.vm.restart"
+default = "permit"
+mode = "gate"
+
+# vm delete: irreversible; biometric required.
+[[actions]]
+key = "az.vm.delete"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# vm deallocate: irreversible (releases compute resources); biometric required.
+[[actions]]
+key = "az.vm.deallocate"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- vmss (Virtual Machine Scale Sets) ---
+
+[[actions]]
+key = "az.vmss.create"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "az.vmss.delete"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "az.vmss.scale"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "az.vmss.update"
+default = "permit"
+mode = "gate"
+
+# --- storage ---
+
+[[actions]]
+key = "az.storage.account.create"
+default = "permit"
+mode = "gate"
+
+# storage account delete: data destruction; biometric required.
+[[actions]]
+key = "az.storage.account.delete"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# storage blob delete: data destruction; biometric required.
+[[actions]]
+key = "az.storage.blob.delete"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "az.storage.blob.upload"
+default = "permit"
+mode = "gate"
+
+# storage container delete: data destruction; biometric required.
+[[actions]]
+key = "az.storage.container.delete"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- keyvault (key/secret destruction + reveal) ---
+
+[[actions]]
+key = "az.keyvault.create"
+default = "permit"
+mode = "gate"
+
+# keyvault delete: key/secret destruction; biometric required.
+[[actions]]
+key = "az.keyvault.delete"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "az.keyvault.key.create"
+default = "permit"
+mode = "gate"
+
+# keyvault key delete: key destruction; biometric required.
+[[actions]]
+key = "az.keyvault.key.delete"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "az.keyvault.key.encrypt"
+default = "permit"
+mode = "gate"
+
+# keyvault key decrypt: secret reveal; biometric required.
+[[actions]]
+key = "az.keyvault.key.decrypt"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "az.keyvault.secret.set"
+default = "permit"
+mode = "gate"
+
+# keyvault secret delete: secret destruction; biometric required.
+[[actions]]
+key = "az.keyvault.secret.delete"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# keyvault secret show: secret reveal; biometric required.
+[[actions]]
+key = "az.keyvault.secret.show"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- role (privilege management) ---
+
+[[actions]]
+key = "az.role.assignment.create"
+default = "permit"
+mode = "gate"
+
+# role assignment delete: privilege removal; biometric required.
+[[actions]]
+key = "az.role.assignment.delete"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "az.role.definition.create"
+default = "permit"
+mode = "gate"
+
+# role definition delete: privilege removal; biometric required.
+[[actions]]
+key = "az.role.definition.delete"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- aks (Azure Kubernetes Service) ---
+
+[[actions]]
+key = "az.aks.create"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "az.aks.scale"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "az.aks.update"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "az.aks.get-credentials"
+default = "permit"
+mode = "gate"
+
+# aks delete: irreversible cluster deletion; biometric required.
+[[actions]]
+key = "az.aks.delete"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- sql ---
+
+[[actions]]
+key = "az.sql.server.create"
+default = "permit"
+mode = "gate"
+
+# sql server delete: irreversible; biometric required.
+[[actions]]
+key = "az.sql.server.delete"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "az.sql.db.create"
+default = "permit"
+mode = "gate"
+
+# sql db delete: irreversible; biometric required.
+[[actions]]
+key = "az.sql.db.delete"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- functionapp ---
+
+[[actions]]
+key = "az.functionapp.create"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "az.functionapp.deploy"
+default = "permit"
+mode = "gate"
+
+# functionapp delete: irreversible; biometric required.
+[[actions]]
+key = "az.functionapp.delete"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- webapp ---
+
+[[actions]]
+key = "az.webapp.create"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "az.webapp.deploy"
+default = "permit"
+mode = "gate"
+
+# webapp delete: irreversible; biometric required.
+[[actions]]
+key = "az.webapp.delete"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- network ---
+
+[[actions]]
+key = "az.network.vnet.delete"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "az.network.nsg.rule.create"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "az.network.nsg.rule.delete"
+default = "permit"
+mode = "gate"
+
+# --- group (resource group) ---
+
+[[actions]]
+key = "az.group.create"
+default = "permit"
+mode = "gate"
+
+# group delete: catastrophic (deletes ALL resources in the group); deny by
+# default. Requires explicit grant override.
+[[actions]]
+key = "az.group.delete"
+default = "deny"
+mode = "deny"
+biometric = "required"

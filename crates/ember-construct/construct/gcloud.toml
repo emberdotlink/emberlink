@@ -1,0 +1,228 @@
+# CLASSIFICATION: PUBLIC
+# Construct manifest for ember-gcloud per design §2.
+#
+# Action schema: each [[actions]] declares an allowed action_key, optional
+# budget caps, biometric requirement, and a permit/deny default. The daemon's
+# broker.resolve consults this to decide whether the action requires a
+# credential mint, an existing grant, or refuses.
+#
+# Credential injection: the broker (`BrokerProvider::Gcp`) issues short-lived
+# OAuth access tokens (or impersonated service-account credentials) scoped to
+# the grant's allowed actions. The daemon materializes them into
+# CLOUDSDK_AUTH_ACCESS_TOKEN (gcloud honors this for non-interactive auth)
+# or — for the SA-key fallback path — writes a temp service-account key file
+# at ~/.ember/shadow/gcp-sa-<materialization-id>.json and exports
+# GOOGLE_APPLICATION_CREDENTIALS. Daemon zeroizes + unlinks on child exit.
+#
+# Read-only verbs (`describe`, `list`, `get-iam-policy`, `auth list`,
+# `config list`) classify to `None` (passthrough) and never reach this manifest.
+
+[meta]
+name = "ember-gcloud"
+version = "0.1.0"
+publisher = "did:emberlink"
+description = "Google Cloud CLI Construct. Mediates `gcloud` invocations through ember's credential broker: IAM privilege removal (service-accounts.delete, roles.delete, policies.remove-iam-policy-binding), KMS key destruction (keys.destroy) and decrypt (keys.decrypt), storage data destruction (storage.rm), VM destruction (compute.instances.delete), function/service deletion (functions.delete, run.services.delete), cluster deletion (container.clusters.delete), and secrets reveal (secrets.versions.access) all require biometric approval. Project deletion (projects.delete) is denied by default and requires an explicit grant override. OAuth tokens inject via CLOUDSDK_AUTH_ACCESS_TOKEN; SA-key fallback path uses GOOGLE_APPLICATION_CREDENTIALS."
+
+# Default policy for unlisted action keys.
+default = "deny"
+
+# --- compute instances ---
+
+[[actions]]
+key = "gcloud.compute.instances.create"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "gcloud.compute.instances.start"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "gcloud.compute.instances.stop"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "gcloud.compute.instances.reset"
+default = "permit"
+mode = "gate"
+
+# compute instances delete: irreversible; biometric required.
+[[actions]]
+key = "gcloud.compute.instances.delete"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- iam (privilege management) ---
+#
+# create / add-iam-policy-binding: privilege grant; gate without biometric.
+# delete / remove-iam-policy-binding: privilege removal; gate with biometric.
+
+[[actions]]
+key = "gcloud.iam.service-accounts.create"
+default = "permit"
+mode = "gate"
+
+# iam service-accounts delete: privilege removal; biometric required.
+[[actions]]
+key = "gcloud.iam.service-accounts.delete"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "gcloud.iam.roles.create"
+default = "permit"
+mode = "gate"
+
+# iam roles delete: privilege removal; biometric required.
+[[actions]]
+key = "gcloud.iam.roles.delete"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "gcloud.iam.policies.add-iam-policy-binding"
+default = "permit"
+mode = "gate"
+
+# iam policies remove-iam-policy-binding: privilege removal; biometric required.
+[[actions]]
+key = "gcloud.iam.policies.remove-iam-policy-binding"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- storage ---
+
+[[actions]]
+key = "gcloud.storage.cp"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "gcloud.storage.mv"
+default = "permit"
+mode = "gate"
+
+# storage rm: data destruction; biometric required.
+[[actions]]
+key = "gcloud.storage.rm"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- kms ---
+
+[[actions]]
+key = "gcloud.kms.keyrings.create"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "gcloud.kms.keys.encrypt"
+default = "permit"
+mode = "gate"
+
+# kms keys destroy: key destruction; biometric required.
+[[actions]]
+key = "gcloud.kms.keys.destroy"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# kms keys decrypt: secret reveal; biometric required.
+[[actions]]
+key = "gcloud.kms.keys.decrypt"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- secrets ---
+
+[[actions]]
+key = "gcloud.secrets.create"
+default = "permit"
+mode = "gate"
+
+# secrets delete: irreversible; biometric required.
+[[actions]]
+key = "gcloud.secrets.delete"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "gcloud.secrets.versions.add"
+default = "permit"
+mode = "gate"
+
+# secrets versions access: secret reveal.
+[[actions]]
+key = "gcloud.secrets.versions.access"
+default = "permit"
+mode = "gate"
+
+# --- functions ---
+
+[[actions]]
+key = "gcloud.functions.deploy"
+default = "permit"
+mode = "gate"
+
+# functions delete: irreversible; biometric required.
+[[actions]]
+key = "gcloud.functions.delete"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- run ---
+
+[[actions]]
+key = "gcloud.run.deploy"
+default = "permit"
+mode = "gate"
+
+# run services delete: irreversible; biometric required.
+[[actions]]
+key = "gcloud.run.services.delete"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- container (GKE) ---
+
+[[actions]]
+key = "gcloud.container.clusters.create"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "gcloud.container.clusters.update"
+default = "permit"
+mode = "gate"
+
+# container clusters delete: irreversible; biometric required.
+[[actions]]
+key = "gcloud.container.clusters.delete"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- projects ---
+
+[[actions]]
+key = "gcloud.projects.create"
+default = "permit"
+mode = "gate"
+
+# projects delete: catastrophic; deny by default. Requires explicit grant override.
+[[actions]]
+key = "gcloud.projects.delete"
+default = "deny"
+mode = "deny"
+biometric = "required"

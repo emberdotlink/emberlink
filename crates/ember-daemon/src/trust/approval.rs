@@ -1,9 +1,9 @@
-// implementation-note-3
+// implementation-note-5
 use chrono::Utc;
 use core_approval::{ApprovalLifecycle, LifecycleError, RequestId, SubmitMetadata};
 use core_approval::ApprovalOutcome as CoreApprovalOutcome;
 use core_types::approval::RequestedScope;
-use core_types::Statement;
+use core_types::{GrantProposal, Statement, Usage};
 use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 use std::rc::Rc;
@@ -98,6 +98,7 @@ impl ApprovalLifecycle for DaemonApprovalStore {
                 metadata.target_host,
                 metadata.target_url,
                 metadata.agent_framework,
+                None,
             )
             .map_err(LifecycleError::from)?;
 
@@ -262,6 +263,7 @@ impl<'a> ApprovalLifecycle for DaemonApprovalStoreRef<'a> {
                 metadata.target_host,
                 metadata.target_url,
                 metadata.agent_framework,
+                None,
             )
             .map_err(LifecycleError::from)?;
 
@@ -439,7 +441,7 @@ pub struct ApprovalRequestInfo {
     pub target_summary: Option<String>,
     pub target_url: Option<String>,
     pub agent_framework: Option<String>,
-    /// implementation-note-52 — composite envelope statements (3-statement
+    /// implementation-note-77 — composite envelope statements (3-statement
     /// credential+session+time bundle minted by `ember sandbox run`)
     /// serialized as JSON when set. Surfaces as a single approval entry
     /// (NOT three) so the dashboard can render all three statements as
@@ -449,6 +451,10 @@ pub struct ApprovalRequestInfo {
     /// approval has `composite_statements` set; the caller (CLI sandbox
     /// run) polls `get_approval` to discover the resulting grant ID.
     pub result_grant_id: Option<String>,
+    /// Advisory pointer to the originating Construct/skill. Persisted from
+    /// the `GrantProposal.skill_ref` field; emberd does not enforce on it.
+    /// Per design. `None` for approvals submitted without a skill_ref.
+    pub skill_ref: Option<String>,
 }
 
 pub enum ApprovalOutcome {
@@ -489,10 +495,11 @@ impl DaemonStore {
             None,
             None,
             None,
+            None,
         )
     }
 
-    /// implementation-note-52 — submit ONE approval entry that bundles a 3-statement
+    /// implementation-note-77 — submit ONE approval entry that bundles a 3-statement
     /// composite envelope (credential + session + time). On `Approved` the
     /// resolver mints a single composite grant whose `blocks_json` is
     /// overwritten with the supplied statement list (matching the shape
@@ -520,6 +527,71 @@ impl DaemonStore {
             None,
             None,
             None,
+            None,
+        )
+    }
+
+    /// Typed variant of `propose_grant` that accepts a [`GrantProposal`]
+    /// (per design / COMPOSITE Decision 2). Each [`StatementProposal`] is
+    /// converted to a runtime [`Statement`] with auto-assigned `sid` and
+    /// default [`Usage`]. The legacy `credential_name` and `scope` columns
+    /// are populated from the first statement's `credential_name` and
+    /// `"composite"` respectively for backward-compatible DB rows.
+    pub fn propose_grant_typed(
+        &self,
+        proposal: &GrantProposal,
+        action: &str,
+        risk_level: &str,
+    ) -> Result<ApprovalRequestInfo, StoreError> {
+        // COMPOSITE-prior change-TESTS-DASHBOARD — validate skill_ref before storing.
+        // skill_ref is advisory but must not corrupt the DB: reject values that
+        // are excessively long (> 256 chars) or contain null bytes.
+        if let Some(sr) = proposal.skill_ref.as_deref() {
+            if sr.len() > 256 {
+                return Err(StoreError::InvalidInput(
+                    "skill_ref must not exceed 256 characters".to_string(),
+                ));
+            }
+            if sr.contains('\0') {
+                return Err(StoreError::InvalidInput(
+                    "skill_ref must not contain null bytes".to_string(),
+                ));
+            }
+        }
+        let statements: Vec<Statement> = proposal
+            .statements
+            .iter()
+            .enumerate()
+            .map(|(i, sp)| Statement {
+                sid: format!("s{i}"),
+                resource_type: sp.resource_type.clone(),
+                actions: sp.actions.clone(),
+                resource: sp.resource.clone(),
+                budget: sp.budget.clone(),
+                usage: Usage::default(),
+                conditions: sp.conditions.clone(),
+            })
+            .collect();
+
+        let legacy_credential_name = proposal
+            .statements
+            .first()
+            .map(|s| s.credential_name.as_str())
+            .unwrap_or("");
+
+        self.submit_approval_inner(
+            &proposal.persona_id,
+            legacy_credential_name,
+            "composite",
+            proposal.expires_at,
+            action,
+            risk_level,
+            Some(statements),
+            None,
+            None,
+            None,
+            None,
+            proposal.skill_ref.clone(),
         )
     }
 
@@ -558,6 +630,7 @@ impl DaemonStore {
             target_host,
             target_url,
             agent_framework,
+            None,
         )
     }
 
@@ -575,6 +648,7 @@ impl DaemonStore {
         target_host: Option<String>,
         target_url: Option<String>,
         agent_framework: Option<String>,
+        skill_ref: Option<String>,
     ) -> Result<ApprovalRequestInfo, StoreError> {
         let id = format!("approval-{}", Uuid::new_v4());
         let created_at = Utc::now().to_rfc3339();
@@ -597,8 +671,8 @@ impl DaemonStore {
             "INSERT INTO approval_requests \
              (id, persona_id, credential_name, scope, ttl_secs, action, risk_level, status, created_at, \
               composite_statements_json, composite_statements_hash, \
-              tool_name, target_host, target_url, agent_framework) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+              tool_name, target_host, target_url, agent_framework, skill_ref) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             rusqlite::params![
                 id,
                 persona_id,
@@ -614,6 +688,7 @@ impl DaemonStore {
                 target_host,
                 target_url,
                 agent_framework,
+                skill_ref,
             ],
         )?;
 
@@ -635,6 +710,7 @@ impl DaemonStore {
             agent_framework,
             composite_statements,
             result_grant_id: None,
+            skill_ref,
         })
     }
 
@@ -642,7 +718,7 @@ impl DaemonStore {
         let mut stmt = self.conn().prepare(
             "SELECT id, persona_id, credential_name, scope, ttl_secs, action, risk_level, \
              status, reason, created_at, composite_statements_json, result_grant_id, \
-             tool_name, target_host, target_url, agent_framework \
+             tool_name, target_host, target_url, agent_framework, skill_ref \
              FROM approval_requests WHERE status = 'pending' ORDER BY created_at",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -669,6 +745,7 @@ impl DaemonStore {
                 agent_framework: row.get(15)?,
                 composite_statements,
                 result_grant_id: row.get(11)?,
+                skill_ref: row.get(16)?,
             })
         })?;
         let mut requests = Vec::new();
@@ -679,7 +756,7 @@ impl DaemonStore {
     }
 
     /// Resolve an approval request with optional biometric attestation
-    /// metadata (implementation-note-56).
+    /// metadata (implementation-note-81).
     ///
     /// `biometric` records whether the approval was gated by a hardware
     /// biometric on the operator's device (Touch ID via LocalAuthentication
@@ -737,7 +814,7 @@ impl DaemonStore {
             committed: false,
         };
 
-        // implementation-note-52 — composite approvals stash their 3-statement envelope
+        // implementation-note-77 — composite approvals stash their 3-statement envelope
         // alongside the legacy single-statement fields, so the SELECT row
         // shape grew by one column. Aliased to keep clippy happy.
         // REVIEW2-F2 — also fetch composite_statements_hash for integrity check.
@@ -816,7 +893,7 @@ impl DaemonStore {
 
         match outcome {
             ApprovalOutcome::Approved => {
-                // implementation-note-52 — for composite approvals the row is created
+                // implementation-note-77 — for composite approvals the row is created
                 // with scope "*" because the typed child statements
                 // (Credential / Session / Time) overwrite `blocks_json`
                 // immediately below; the flat `scope` column is a
@@ -845,7 +922,7 @@ impl DaemonStore {
                     self.create_grant(&persona_id, &credential_name, parent_scope, ttl_secs)?
                 };
 
-                // implementation-note-52 — when the approval bundles a composite envelope,
+                // implementation-note-77 — when the approval bundles a composite envelope,
                 // overwrite the freshly-minted single-statement grant's
                 // blocks_json with the canonical 3-statement composite chain.
                 // Mirrors the path the CLI sandbox-run handler used to take
@@ -866,7 +943,7 @@ impl DaemonStore {
                             "ttl_secs": ttl_secs,
                             "source": "approval",
                             "composite": composite_statements.is_some(),
-                            // implementation-note-56 — `biometric=true` indicates the
+                            // implementation-note-81 — `biometric=true` indicates the
                             // approval was attested by a hardware biometric on
                             // the operator's device (Touch ID via
                             // LocalAuthentication on the macOS CLI, or
@@ -880,7 +957,7 @@ impl DaemonStore {
                         .to_string(),
                     ),
                 );
-                // implementation-note-56 — also emit a dedicated `approval.approved`
+                // implementation-note-81 — also emit a dedicated `approval.approved`
                 // event so downstream auditors can filter on the approval
                 // beat without parsing `grant.issued` semantics.
                 let _ = self.log_event(
@@ -910,7 +987,7 @@ impl DaemonStore {
                      reason = ?2 WHERE id = ?3",
                     rusqlite::params![resolved_at, reason, id],
                 )?;
-                // implementation-note-56 — record the biometric posture on denial too
+                // implementation-note-81 — record the biometric posture on denial too
                 // so an auditor can distinguish "human rejected with TouchID"
                 // from "untouched timeout".
                 let _ = self.log_event(
@@ -1003,7 +1080,7 @@ impl DaemonStore {
             .query_row(
                 "SELECT id, persona_id, credential_name, scope, ttl_secs, action, risk_level, \
                  status, reason, created_at, composite_statements_json, result_grant_id, \
-                 tool_name, target_host, target_url, agent_framework \
+                 tool_name, target_host, target_url, agent_framework, skill_ref \
                  FROM approval_requests WHERE id = ?1",
                 rusqlite::params![id],
                 |row| {
@@ -1030,6 +1107,7 @@ impl DaemonStore {
                         agent_framework: row.get(15)?,
                         composite_statements,
                         result_grant_id: row.get(11)?,
+                        skill_ref: row.get(16)?,
                     })
                 },
             )
@@ -1037,7 +1115,7 @@ impl DaemonStore {
             .ok_or(StoreError::NotFound)
     }
 
-    /// implementation-note-52 — overwrite a freshly-minted single-statement grant's
+    /// implementation-note-77 — overwrite a freshly-minted single-statement grant's
     /// `blocks_json` with the canonical 3-statement composite chain.
     ///
     /// Mirrors the path `ember sandbox run` previously took inline (signing
@@ -1117,6 +1195,61 @@ impl DaemonStore {
         Ok(())
     }
 
+    /// COMPOSITE-prior change — daemon-side "auto" lane for the single-mint code path.
+    ///
+    /// Per COMPOSITE Decision 2 (REVISED), the CLI no longer carries a
+    /// separate "AutoApprove fast-path" that bypasses the approval queue with
+    /// direct `create_grant` + `overwrite_grant_blocks` calls. Instead, every
+    /// `ember sandbox run` (and any future caller) dispatches via
+    /// `propose_grant`; the policy gate decides Auto vs Approval; and on the
+    /// Auto path the daemon calls this method to immediately resolve the
+    /// pending approval as `Approved`, mint the grant, and emit a dedicated
+    /// `auto_resolved` audit event so downstream auditors can distinguish a
+    /// silent policy-driven approval from a human-driven one.
+    ///
+    /// Behaviorally equivalent to `resolve_approval(id, Approved)` plus the
+    /// extra audit event. The same composite-mint, integrity-check, and
+    /// transaction-serialization invariants apply because the underlying
+    /// resolver is the same code path.
+    pub fn auto_resolve(&self, approval_id: &str) -> Result<(), StoreError> {
+        // Look up the request first so the auto_resolved audit event can
+        // record the persona / credential / scope context even if the
+        // approval row gets resolved out from under us by a concurrent
+        // caller (e.g. a human approving the same row in the dashboard
+        // milliseconds before this call lands). The resolve_approval below
+        // is the authoritative gate — it serializes via BEGIN IMMEDIATE
+        // and rejects already-resolved rows.
+        let info = self.get_approval(approval_id)?;
+
+        self.resolve_approval(approval_id, &ApprovalOutcome::Approved)?;
+
+        // Re-read to pick up the freshly-set `result_grant_id` so the
+        // audit event correlates the auto-resolved approval with its
+        // minted grant.
+        let resolved = self.get_approval(approval_id)?;
+
+        let _ = self.log_event(
+            Some(&info.persona_id),
+            "approval.auto_resolved",
+            Some(&info.credential_name),
+            "auto_approved",
+            Some(
+                &serde_json::json!({
+                    "approval_id": approval_id,
+                    "grant_id": resolved.result_grant_id,
+                    "scope": info.scope,
+                    "action": info.action,
+                    "risk_level": info.risk_level,
+                    "composite": info.composite_statements.is_some(),
+                    "source": "policy.auto",
+                })
+                .to_string(),
+            ),
+        );
+
+        Ok(())
+    }
+
     /// Startup sweep: mark `pending` approval_requests older than `threshold_secs` as
     /// `timed_out`. Returns the number of rows updated. Fires zero notifications.
     /// Logs a single `grant.request.stale_expired` audit event when any rows are expired.
@@ -1142,7 +1275,7 @@ impl DaemonStore {
         Ok(count)
     }
 
-    /// implementation-note-47 — operator-initiated dismiss of a pending
+    /// implementation-note-72 — operator-initiated dismiss of a pending
     /// approval card. Sets status to `dismissed`, records an `approval.dismissed`
     /// audit event, and returns. Does NOT fire a desktop notification (the operator
     /// is already looking at the dashboard). Only `pending` rows can be dismissed;
@@ -1586,7 +1719,7 @@ mod tests {
         assert_eq!(still_pending.status, "pending");
     }
 
-    // --- implementation-note-52 — composite-grant approval flow ---
+    // --- implementation-note-77 — composite-grant approval flow ---
 
     fn demo_three_statements(credential: &str) -> Vec<Statement> {
         use core_types::{Budget, ResourceSelector, ResourceType, Usage};
@@ -1713,6 +1846,99 @@ mod tests {
         assert_eq!(block.statements[0].sid, "s0-credential");
         assert_eq!(block.statements[1].sid, "s1-session");
         assert_eq!(block.statements[2].sid, "s2-time");
+    }
+
+    /// COMPOSITE-prior change — `auto_resolve` mints a grant via the same code path
+    /// the human-approval flow uses AND emits an `approval.auto_resolved`
+    /// audit event so downstream auditors can distinguish silent
+    /// policy-driven approvals from human-driven ones.
+    #[test]
+    fn auto_resolve_mints_composite_grant_and_emits_audit_event() {
+        use crate::infra::audit::AuditFilter;
+
+        let store = setup();
+        let pid = persona_id(&store);
+        let stmts = demo_three_statements("obj-auto-token");
+
+        let req = store
+            .propose_grant(
+                &pid,
+                "obj-auto-token",
+                "composite",
+                Some(300),
+                "credential.access",
+                "high",
+                stmts,
+            )
+            .unwrap();
+
+        store.auto_resolve(&req.id).expect("auto_resolve must succeed");
+
+        // The approval row resolved as 'approved' and recorded the grant id —
+        // same shape the human-approval path produces.
+        let resolved = store.get_approval(&req.id).unwrap();
+        assert_eq!(resolved.status, "approved");
+        let grant_id = resolved
+            .result_grant_id
+            .as_deref()
+            .expect("auto_resolve must record result_grant_id");
+        assert!(grant_id.starts_with("grant-"));
+
+        // The minted grant carries the canonical 3-statement composite chain.
+        let access_grant = store.get_access_grant(grant_id).unwrap();
+        let block = &access_grant.blocks[0].block;
+        assert_eq!(
+            block.statements.len(),
+            3,
+            "auto_resolve must mint the composite chain via the shared resolver"
+        );
+
+        // An `approval.auto_resolved` audit row marks this as a policy-driven
+        // (not human-driven) approval and links to the grant.
+        let auto_entries = store
+            .query_audit(&AuditFilter {
+                action: Some("approval.auto_resolved".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            auto_entries.len(),
+            1,
+            "exactly one approval.auto_resolved audit event must be emitted"
+        );
+        let entry = &auto_entries[0];
+        assert_eq!(entry.outcome, "auto_approved");
+        assert_eq!(entry.agent_id.as_deref(), Some(pid.as_str()));
+
+        let details: serde_json::Value =
+            serde_json::from_str(entry.details.as_deref().unwrap_or("{}")).unwrap();
+        assert_eq!(details["approval_id"], req.id);
+        assert_eq!(details["grant_id"], grant_id);
+        assert_eq!(details["composite"], serde_json::json!(true));
+        assert_eq!(details["source"], serde_json::json!("policy.auto"));
+    }
+
+    /// COMPOSITE-prior change — `auto_resolve` is idempotent in the sense that a
+    /// second call against an already-resolved request returns
+    /// `AlreadyResolved` instead of double-minting.
+    #[test]
+    fn auto_resolve_rejects_already_resolved_request() {
+        let store = setup();
+        let pid = persona_id(&store);
+        let req = store
+            .submit_approval(&pid, "api-key", "read", None, "credential.access", "high")
+            .unwrap();
+
+        store.auto_resolve(&req.id).expect("first auto_resolve must succeed");
+        let second = store.auto_resolve(&req.id);
+        assert!(
+            matches!(second, Err(StoreError::AlreadyResolved)),
+            "expected AlreadyResolved, got {second:?}"
+        );
+
+        // Only one grant minted across both calls.
+        let grants = store.list_grants().unwrap();
+        assert_eq!(grants.len(), 1, "auto_resolve must not double-mint");
     }
 
     #[test]
@@ -2509,7 +2735,7 @@ mod tests {
         );
     }
 
-    // --- implementation-note-47: dismiss_approval ---
+    // --- implementation-note-72: dismiss_approval ---
 
     #[test]
     fn dismiss_pending_approval_sets_status_dismissed() {
@@ -2643,7 +2869,7 @@ mod tests {
         );
     }
 
-    // --- implementation-note-98: T1 unit tests ---
+    // --- implementation-note-138: T1 unit tests ---
 
     /// T1: submit_approval_inner persists tool_name, target_host, target_url,
     /// and agent_framework; get_approval reads them back (not None).
@@ -2666,6 +2892,7 @@ mod tests {
                 Some("api.example.com".to_string()),
                 Some("https://api.example.com/v1/data".to_string()),
                 Some("claude-code".to_string()),
+                None,
             )
             .unwrap();
 
@@ -2702,6 +2929,7 @@ mod tests {
                 Some("storage.example.com".to_string()),
                 Some("https://storage.example.com/bucket".to_string()),
                 Some("aider".to_string()),
+                None,
             )
             .unwrap();
 
@@ -2731,7 +2959,7 @@ mod tests {
         assert!(fetched.agent_framework.is_none(), "agent_framework must be None when not provided");
     }
 
-    // --- implementation-note-98: T2 round-trip via ApprovalLifecycle ---
+    // --- implementation-note-138: T2 round-trip via ApprovalLifecycle ---
 
     /// T2: SubmitMetadata carries notify fields → DaemonApprovalStoreRef persists them →
     /// get_approval returns them. This is the seam that was broken before this task.

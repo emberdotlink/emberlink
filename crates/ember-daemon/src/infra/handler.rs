@@ -1,4 +1,4 @@
-// implementation-note-62
+// implementation-note-87
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -18,7 +18,12 @@ use core_grants::GrantState as CoreGrantState;
 use crate::trust::policy::{ApprovalRequirement, PolicyEngine};
 use crate::trust::presence::{self, GateOutcome, HighRiskOp};
 use crate::infra::rate_limit::RateLimiter;
-use crate::infra::receipt::{current_identity, sign_vault_receipt};
+use crate::infra::receipt::{
+    current_identity,
+    issue::{issue_cohort_a_receipt, TerminationMeta},
+    sign_vault_receipt,
+};
+use core_events::receipt::{TerminationAuthority, TerminationReason};
 use crate::infra::store::DaemonStore;
 use crate::infra::vault::Vault;
 
@@ -102,11 +107,9 @@ impl HandlerError {
 
 /// Per-connection request context carrying kernel-derived identity.
 ///
-/// Phase 1 of development milestone — see the proposal at
-/// `project documentation`. The `peer` field
-/// is populated by the socket layer at connection accept time; the
-/// `principal` field is the persona id resolved from `peer.pid` via
-/// `peercred_principal()`. For `Internal` callers, both are `None`.
+/// The `peer` field is populated by the socket layer at connection accept
+/// time; the `principal` field is the persona id resolved from `peer.pid`
+/// via `peercred_principal()`. For `Internal` callers, both are `None`.
 ///
 /// The struct deliberately mirrors what we expect to extend to
 /// session-ticket-based binding (Alternative B) so the handler call
@@ -120,6 +123,22 @@ pub struct RequestContext {
     /// looked it up (e.g. for tests that want to inject a principal
     /// directly without going through the PID registry).
     pub principal: Option<String>,
+    /// Base directory for session sidecars (`~/.ember/sessions/`). Required
+    /// by `register_session` and `close_session` RPC arms to read/write
+    /// `SessionMeta` + `receipt.json`. `None` for internal callers and test
+    /// contexts that don't exercise the session lifecycle.
+    pub sessions_dir: Option<std::path::PathBuf>,
+    /// implementation-note-88: bound LLM proxy
+    /// URL plumbed from the runtime after the proxy listener binds. Populated
+    /// by `SocketListener::with_llm_proxy_url` and consumed by
+    /// `register_session` instead of reading `EMBER_PROXY_URL` from the
+    /// environment, which is unreliable across tokio worker threads (Rust
+    /// 2024 `set_var` cross-thread visibility hazard).
+    pub llm_proxy_url: Option<String>,
+    /// implementation-note-88: bound git proxy
+    /// URL plumbed from the runtime after the git proxy listener binds.
+    /// Matches the pattern of `llm_proxy_url` above.
+    pub git_proxy_url: Option<String>,
 }
 
 impl RequestContext {
@@ -129,6 +148,9 @@ impl RequestContext {
             source: DispatchSource::Internal { reason },
             peer: None,
             principal: None,
+            sessions_dir: None,
+            llm_proxy_url: None,
+            git_proxy_url: None,
         }
     }
 
@@ -139,6 +161,9 @@ impl RequestContext {
             source: DispatchSource::Socket,
             peer,
             principal: None,
+            sessions_dir: None,
+            llm_proxy_url: None,
+            git_proxy_url: None,
         }
     }
 
@@ -150,6 +175,9 @@ impl RequestContext {
             source: DispatchSource::Socket,
             peer,
             principal: Some(principal),
+            sessions_dir: None,
+            llm_proxy_url: None,
+            git_proxy_url: None,
         }
     }
 }
@@ -474,8 +502,8 @@ pub async fn dispatch_method_with_peer(
     .await
 }
 
-/// security check marker: the per-op `require_user_presence` gate is
-/// applied to high-risk operations dispatched here (`vault_add`,
+/// Per-op `require_user_presence` gate is applied to high-risk operations
+/// dispatched here (`vault_add`,
 /// `vault_remove`, `create_grant`). Read-class operations bump the
 /// session's `last_activity` via `presence::record_activity()` so they
 /// don't spam the user with biometric prompts but also keep the session
@@ -509,6 +537,9 @@ pub async fn dispatch_method_with_source(
         source,
         peer: None,
         principal: None,
+        sessions_dir: None,
+        llm_proxy_url: None,
+        git_proxy_url: None,
     };
     dispatch_method_with_context(
         store, vault, policy, rate_limiter, events_tx, ctx, method, params,
@@ -539,11 +570,11 @@ pub async fn dispatch_method_with_context(
     match method {
         "ping" => Ok(json!({"pong": true})),
 
-        // implementation-note-63: Claude Code PreToolUse hook entry point.
+        // implementation-note-89: Claude Code PreToolUse hook entry point.
         // The proxy hook (`ember-proxy/src/claude_code_hook.rs`) calls
         // this with the parsed `tool_name` + `params` + `session_id`,
         // and the daemon performs grant lookup + audit emit + decision.
-        // Real evaluator integration lands in implementation-note-64; this path is
+        // Real evaluator integration lands in implementation-note-90; this path is
         // a Permit-stub on grant-hit, Deny on grant-miss.
         "evaluate_tool_call" => {
             let persona = params["persona"]
@@ -639,8 +670,8 @@ pub async fn dispatch_method_with_context(
             }
             let force = force_requested && source.is_internal();
 
-            // security check: per-op user-presence gate. Applied BEFORE
-            // policy evaluation so a locked session is rejected with a
+            // Per-op user-presence gate. Applied BEFORE policy evaluation
+            // so a locked session is rejected with a
             // re-auth message instead of being silently routed into the
             // approval queue. Internal callers + force-allowed callers
             // bypass (test harness, admin CLI, recovery flow). Quiet
@@ -773,7 +804,7 @@ pub async fn dispatch_method_with_context(
             } else {
                 None
             };
-            // implementation-note-65: load via DaemonGrantStore to obtain
+            // implementation-note-91: load via DaemonGrantStore to obtain
             // core_grants::Grant at the state-machine boundary. Ownership
             // checks below use `parent_grant.issuer.0` (persona_id) directly.
             // TODO: delegate_grant log_event credential_name
@@ -847,7 +878,7 @@ pub async fn dispatch_method_with_context(
                             return Err(HandlerError::PrincipalMismatch.to_jsonrpc());
                         }
                         // Kernel-derived principal must own the parent grant.
-                        // implementation-note-65: compare against issuer.0 (core_grants::PrincipalId).
+                        // implementation-note-91: compare against issuer.0 (core_grants::PrincipalId).
                         if principal != parent_grant.issuer.0 {
                             tracing::warn!(
                                 kernel_persona_id = %principal,
@@ -878,7 +909,7 @@ pub async fn dispatch_method_with_context(
                                  assert the persona delegating the parent grant"
                                     .to_string(),
                             ))?;
-                        // implementation-note-65: compare against issuer.0.
+                        // implementation-note-91: compare against issuer.0.
                         if caller_persona_id != parent_grant.issuer.0 {
                             tracing::warn!(
                                 caller_persona_id = %caller_persona_id,
@@ -987,15 +1018,79 @@ pub async fn dispatch_method_with_context(
             let id = params["id"]
                 .as_str()
                 .ok_or((-32602, "missing 'id'".to_string()))?;
-            // implementation-note-65: load via DaemonGrantStore to get
-            // core_grants::Grant. issuer.0 replaces persona_id.
-            // TODO: migrate revoke_grant credential_name
-            // audit field — not present in core_grants::Grant.
+            // implementation-note-91: load via DaemonGrantStore for issuer.
+            // credential_name lives on GrantInfo (the SQL row projection),
+            // not on core_grants::Grant — fetch both so the audit row carries
+            // the credential identity.
             let core_grant = store.grant_store().load_grant(id).ok();
+            let grant_info = store.get_grant(id).ok();
             let grant_persona = core_grant.as_ref().map(|g| g.issuer.0.clone());
+            let grant_credential = grant_info.as_ref().map(|g| g.credential_name.clone());
             store
                 .revoke_grant(id)
                 .map_err(|e| (-32000, e.to_string()))?;
+
+            // v2_receipt_coverage_audit_v030_2026_05_09: extend Receipt to TTL/revoke per M3 follow-up
+            // Emit a signed v2 cohort-A Receipt with ExplicitRevoke for H1
+            // coverage. Grant may have no live session; use a synthetic
+            // session_id derived from the grant_id so the Receipt envelope is
+            // well-formed (spec option (a)).
+            let synthetic_session_id = format!("grant:{id}");
+            if let Some(identity) = current_identity() {
+                let signer = crate::session::lifecycle::DaemonPersonaSigner::new(identity);
+                match issue_cohort_a_receipt(
+                    &synthetic_session_id,
+                    Vec::new(),
+                    None,
+                    TerminationAuthority::DaemonPersona,
+                    &identity.pubkey_hex(),
+                    Some(TerminationMeta {
+                        reason: TerminationReason::ExplicitRevoke,
+                        last_heartbeat_at: None,
+                        pid_alive_at_check: None,
+                    }),
+                    &signer,
+                ) {
+                    Ok(envelope) => {
+                        // Persist the Receipt sidecar if a sessions_dir is
+                        // available. Best-effort: a write failure does not
+                        // abort the revocation itself.
+                        if let Some(sessions_dir) = &ctx.sessions_dir {
+                            let receipt_dir = sessions_dir.join(&synthetic_session_id);
+                            let _ = std::fs::create_dir_all(&receipt_dir);
+                            let receipt_path = receipt_dir.join("receipt.json");
+                            if let Ok(bytes) = serde_json::to_vec_pretty(&envelope) {
+                                if let Err(e) = std::fs::write(&receipt_path, &bytes) {
+                                    tracing::warn!(
+                                        grant_id = %id,
+                                        path = %receipt_path.display(),
+                                        error = %e,
+                                        "revoke_grant: failed to persist v2 Receipt sidecar"
+                                    );
+                                }
+                            }
+                        }
+                        tracing::info!(
+                            grant_id = %id,
+                            receipt_id = %envelope.receipt_id,
+                            "revoke_grant: signed v2 cohort-A Receipt emitted (ExplicitRevoke)"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            grant_id = %id,
+                            error = %e,
+                            "revoke_grant: failed to issue v2 cohort-A Receipt — revocation still committed"
+                        );
+                    }
+                }
+            } else {
+                tracing::warn!(
+                    grant_id = %id,
+                    "revoke_grant: daemon identity not initialised — skipping v2 Receipt emission"
+                );
+            }
+
             // Push revocation notification (best-effort, queued for polling)
             if let Some(persona_id) = &grant_persona {
                 let _ = store.push_notification(
@@ -1005,11 +1100,10 @@ pub async fn dispatch_method_with_context(
                 );
             }
             // Log the revocation event.
-            // TODO: migrate revoke_grant credential_name audit
             let _ = store.log_event(
                 core_grant.as_ref().map(|g| g.issuer.0.as_str()),
                 "grant.revoked",
-                None,
+                grant_credential.as_deref(),
                 "allowed",
                 Some(&serde_json::json!({"grant_id": id}).to_string()),
             );
@@ -1028,7 +1122,7 @@ pub async fn dispatch_method_with_context(
             Ok(json!({"revoked": true}))
         }
 
-        // implementation-note-66 — revoke a single Statement
+        // implementation-note-92 — revoke a single Statement
         // within a composite grant. The grant remains active; only requests
         // resolving to the named sid are denied at the proxy + use_credential
         // boundaries.
@@ -1066,8 +1160,8 @@ pub async fn dispatch_method_with_context(
         }
 
         "use_credential" => {
-            // security check: read-class — bump session activity so an
-            // active agent keeps the vault unlocked, but do NOT prompt
+            // Read-class — bump session activity so an active agent keeps
+            // the vault unlocked, but do NOT prompt
             // for biometric (would spam the user every credential read).
             presence::record_activity();
             // Two calling conventions:
@@ -1086,7 +1180,7 @@ pub async fn dispatch_method_with_context(
             // or a dedicated lookup helper.
             let (persona_id, credential_name, resolved_grant): (String, String, Option<crate::trust::grant::GrantInfo>) =
                 if let Some(grant_id) = params["grant_id"].as_str() {
-                    // Load core_grants::Grant for state-machine checks (implementation-note-65).
+                    // Load core_grants::Grant for state-machine checks (implementation-note-91).
                     let core_grant = store
                         .grant_store()
                         .load_grant(grant_id)
@@ -1119,7 +1213,7 @@ pub async fn dispatch_method_with_context(
                             }
                             other => (-32000, other.to_string()),
                         })?;
-                    // implementation-note-67: when the caller passes
+                    // implementation-note-93: when the caller passes
                     // both grant_id AND credential_name, honor the caller's
                     // value if it's bound to a Credential Statement on the
                     // grant's chain. Composite grants carry multiple
@@ -1181,7 +1275,7 @@ pub async fn dispatch_method_with_context(
                     .map_err(|e| (-32000, format!("no active grant: {e}")))?
             };
 
-            // implementation-note-66 — block credential reads
+            // implementation-note-92 — block credential reads
             // when the Credential Statement that authorizes THIS specific
             // credential_name has been revoked. The previous shape blocked
             // ALL credential reads if ANY credential statement was revoked,
@@ -1244,8 +1338,8 @@ pub async fn dispatch_method_with_context(
         }
 
         "vault_add" => {
-            // security check: per-op user-presence gate. Internal callers
-            // (admin CLI / test harness) bypass — same trust model as
+            // Per-op user-presence gate. Internal callers (admin CLI /
+            // test harness) bypass — same trust model as
             // development milestone force-flag handling.
             if !source.is_internal() {
                 let override_qh =
@@ -1266,7 +1360,7 @@ pub async fn dispatch_method_with_context(
         }
 
         "vault_remove" => {
-            // security check: high-risk write — gated. Emergency-eligible
+            // High-risk write — gated. Emergency-eligible
             // (vault_remove revokes access; we'd rather let the user shut
             // down a leaked credential mid-quiet-hours than block them).
             if !source.is_internal() {
@@ -1284,7 +1378,7 @@ pub async fn dispatch_method_with_context(
         }
 
         "vault_lock" => {
-            // security check: explicit re-lock. Always allowed (the user
+            // Explicit re-lock. Always allowed (the user
             // is reducing privilege, not escalating). Internal/socket
             // both honored — `ember vault lock` may dispatch this.
             presence::lock();
@@ -1292,7 +1386,7 @@ pub async fn dispatch_method_with_context(
         }
 
         "vault_status" => {
-            // security check: lightweight diagnostic — read-class, never
+            // Lightweight diagnostic — read-class, never
             // prompts. Used by dashboards to show "session unlocked: 3m
             // idle" without forcing a biometric every refresh.
             presence::record_activity();
@@ -1437,7 +1531,7 @@ pub async fn dispatch_method_with_context(
             Ok(json!(list))
         }
 
-        // EMBER-implementation-note-68: unified receipt query — supports the full
+        // EMBER-implementation-note-94: unified receipt query — supports the full
         // `ReceiptFilter` shape (actor/kind/grant_id/since/resource/limit).
         // The `ember audit query` CLI path calls this via JSON-RPC socket.
         "receipt_query" => {
@@ -1504,7 +1598,7 @@ pub async fn dispatch_method_with_context(
             Ok(json!({"id": request_id.0, "status": req.status}))
         }
 
-        // implementation-note-69 — submit a composite approval that bundles
+        // implementation-note-95 — submit a composite approval that bundles
         // an N-Statement envelope. On `Approved`, the resolver mints a single
         // composite grant whose `blocks_json` carries the full statement
         // chain. Wraps the already-shipped `DaemonStore::propose_grant`.
@@ -1538,6 +1632,16 @@ pub async fn dispatch_method_with_context(
             if statements.is_empty() {
                 return Err((-32602, "statements must not be empty".to_string()));
             }
+            // T-CONSTRUCT-ACTION-KEY-DID-PREFIX-MIGRATION-SURFACES — per ADR
+            // 135 §4 every composite-grant action key must be DID-prefixed
+            // (`did:<method>:<rest>`). Reject bare keys at the parse-time
+            // gate so the RPC entry point is the migration enforcement point;
+            // the error message includes the recommended `did:ember:<key>`
+            // form so authors can migrate without consulting docs. Forward-
+            // compat: arbitrary `did:<method>:` prefixes pass even though
+            // v0.3.0's broker.resolve only routes `did:ember:`.
+            crate::trust::grant::validate_action_keys_did_prefixed(&statements)
+                .map_err(|e| (-32602, e.to_string()))?;
             // approval_notify_fields_persisted — use the with_notify variant so
             // tool_name / target_host / target_url / agent_framework land in the DB
             // (not just in the returned struct) for subsequent get_approval calls.
@@ -1602,7 +1706,7 @@ pub async fn dispatch_method_with_context(
             // cannot be used to leak status for another agent's grant.
             let expected_persona = params["persona_id"].as_str();
 
-            // implementation-note-70: if the caller is observing a
+            // implementation-note-96: if the caller is observing a
             // grant whose effective (wall-clock-projected) status is terminal
             // but whose stored status is still `active`, flip the row + emit
             // the signed receipt right now. Without this, the runner's
@@ -1649,7 +1753,7 @@ pub async fn dispatch_method_with_context(
                             .collect(),
                         Err(_) => Vec::new(),
                     };
-                    // implementation-note-66 — surface the
+                    // implementation-note-92 — surface the
                     // per-Statement revocation list so callers can render
                     // strikethrough on individual sids without polling a
                     // separate endpoint.
@@ -1840,7 +1944,7 @@ pub async fn dispatch_method_with_context(
             }
         }
 
-        // implementation-note-14: block-and-poll RPC for the proxy hook approval round-trip.
+        // implementation-note-18: block-and-poll RPC for the proxy hook approval round-trip.
         //
         // Polls `get_approval(request_id)` every 500ms up to `timeout_secs`. On
         // first non-pending state -> return the matching `ApprovalDecision`. On
@@ -1850,7 +1954,7 @@ pub async fn dispatch_method_with_context(
         //
         // Defaults: `timeout_secs = 300` (5 min) when omitted, matching the
         // proxy hook's `call_daemon_await_approval` default. A configurable
-        // EmberConfig surface is out of scope for implementation-note-14 — file as
+        // EmberConfig surface is out of scope for implementation-note-18 — file as
         // follow-up if operators need per-deployment tuning.
         //
         // TODO: T2 integration test with simulated dashboard
@@ -2142,7 +2246,7 @@ pub async fn dispatch_method_with_context(
                 Err(e) => return Err((-32000, e.to_string())),
             };
 
-            // Envelope status: load via DaemonGrantStore (implementation-note-65)
+            // Envelope status: load via DaemonGrantStore (implementation-note-91)
             // to get core_grants::Grant with a typed expires_at
             // (Option<DateTime<Utc>>) rather than an RFC3339 string from
             // GrantInfo. GrantStatus::derive is still used for the "Expired"
@@ -2179,7 +2283,7 @@ pub async fn dispatch_method_with_context(
             }))
         }
 
-        // implementation-note-29 (design Phase 2): broker socket RPC arms.
+        // implementation-note-47 (design Phase 2): broker socket RPC arms.
         //
         // These are intentionally additive — the registry, materialization
         // tracking, Receipt-event emission, and provider-routing logic live
@@ -2187,31 +2291,31 @@ pub async fn dispatch_method_with_context(
         // dispatch surface so concurrent worktrees touching unrelated
         // arms don't conflict on a structural refactor of this fn.
         //
-        // Marker (implementation-note-29): RPC method name "BrokerIssue" lives
+        // Marker (implementation-note-47): RPC method name "BrokerIssue" lives
         // alongside its sibling routes as the literal `broker_issue`. See
         // `broker_handler.rs` for handler bodies + tests.
         "broker_issue" => crate::broker::handler::handle_broker_issue(store, params).await,
         "broker_revoke" => crate::broker::handler::handle_broker_revoke(store, params).await,
         "broker_list" => crate::broker::handler::handle_broker_list(params).await,
-        // implementation-note-7: agent processes hold an
+        // implementation-note-9: agent processes hold an
         // opaque `SecretRef`; the trust boundary (ember-proxy /
         // ember-tools) calls `broker_resolve` to materialise the
         // plaintext credential. Stub today; full impl in
-        // implementation-note-9.
+        // implementation-note-11.
         "broker_resolve" => crate::broker::handler::handle_broker_resolve(store, params).await,
         // design §"daemon-as-process-supervisor": spawn a Construct binary
         // as the daemon's child, capture exit code, emit
         // session.construct_invocation receipt. argv re-classifier deferred
         // (T-CONSTRUCT-EXEC-ARGV-CLASSIFIER).
         "broker_exec" => crate::broker::handler::handle_broker_exec(store, params).await,
-        // implementation-note-71: mint a 1-hour GitHub App installation
+        // implementation-note-97: mint a 1-hour GitHub App installation
         // token using a local-held RSA private key (design credential broker).
         // Credentials loaded from GH_APP_* env vars (placeholder until vault
         // path provisioning lands).
         "broker.mint_gh_token" => {
             crate::broker::handler::handle_broker_mint_gh_token(store, params).await
         }
-        // implementation-note-33 §--inject: register a child shell PID for
+        // implementation-note-53 §--inject: register a child shell PID for
         // auto-revoke when the shell exits. Spawns a background poll task that
         // watches /proc/<pid> (Linux) or kill(pid, 0) (other Unix) and calls
         // broker_revoke on all listed materialization IDs on exit.
@@ -2219,7 +2323,7 @@ pub async fn dispatch_method_with_context(
             crate::broker::handler::handle_broker_register_pid_watcher(store, params).await
         }
 
-        // implementation-note-72 (design §"binding.delete"):
+        // implementation-note-98 (design §"binding.delete"):
         // graceful delete of a SA→Persona binding. Revokes the workload
         // Persona's grants (cascade via `revoke_persona`) so in-flight
         // broker requests holding active grant references drain to
@@ -2230,7 +2334,56 @@ pub async fn dispatch_method_with_context(
         // underscore alias mirrors the broker_* dispatch convention.
         "binding.delete" | "binding_delete" => binding_delete(store, params).await,
 
-        // implementation-note-73 Phase 2: SOPS DEK unwrap RPC.
+        // implementation-note-99 (design
+        // §"binding.revoke_urgent"): compromise-response revocation.
+        // Cascades the same SQL flip as `binding.delete` but tags the
+        // audit row with `binding.revoke_urgent` so the operator can
+        // distinguish the two lifecycle paths in the receipt + alerting
+        // pipeline. Unlike `binding.delete`, the audit `outcome` is
+        // `"urgent"` so downstream consumers (alerting, dashboards,
+        // SOC2 evidence reports) can fire on the high-severity event
+        // without re-parsing details JSON. The wire-form method
+        // "binding.revoke_urgent" is canonical; the underscore alias
+        // matches the broker_* convention.
+        "binding.revoke_urgent" | "binding_revoke_urgent" => {
+            binding_revoke_urgent(store, params).await
+        }
+
+        // implementation-note-100 (design §"binding.update"):
+        // mutate metadata on an existing binding without revoking it.
+        // Today the persona row only carries a mutable `name` column;
+        // the broader binding-metadata fields the brief calls out
+        // (`cred_class_allowlist`, `lease_duration_cap`, etc.) live in
+        // the audit-log details JSON until the schema lands those
+        // columns. The audit row carries a before/after snapshot so
+        // the reconciler + receipt pipeline can correlate the mutation
+        // with its originating `binding_request_id`. The wire-form
+        // method "binding.update" is canonical; the underscore alias
+        // mirrors the broker_* dispatch convention.
+        "binding.update" | "binding_update" => binding_update(store, params).await,
+
+        // implementation-note-101 (design §"binding.upsert"):
+        // idempotent insert-or-update for the SA→Persona binding
+        // surface used by `ember-kernel`'s EmberServiceAccount
+        // reconciler. Replaces the placeholder "method not found"
+        // fallback that today causes the reconciler to log a stub-
+        // bind warning every reconcile pass. Semantics:
+        //   * If the persona row identified by `persona_id` exists,
+        //     update it in place (same surface as `binding.update`)
+        //     and emit `binding.upserted` audit row with a
+        //     before/after snapshot.
+        //   * If the persona row does not exist, create a fresh
+        //     persona using the requested `name` and emit
+        //     `binding.upserted` with `before: null` and the freshly-
+        //     created row in `after`. The daemon's canonical id
+        //     (UUID-suffixed per `create_persona`) is returned to
+        //     the reconciler in `persona_id`; the reconciler
+        //     persists that into `status.bound_persona_id`.
+        // The wire-form method "binding.upsert" is canonical; the
+        // underscore alias matches the broker_* dispatch convention.
+        "binding.upsert" | "binding_upsert" => binding_upsert(store, params).await,
+
+        // implementation-note-102 Phase 2: SOPS DEK unwrap RPC.
         //
         // Authorisation flow:
         //   1. Caller supplies `persona_id`, `grant_id`, and the
@@ -2261,7 +2414,7 @@ pub async fn dispatch_method_with_context(
         //      sent to the caller; whoever calls this RPC is implicitly
         //      trusted with the plaintext DEK by the grant flow.
         //
-        // Phase 3 (implementation-note-27, orchestrator-only) ships
+        // Phase 3 (implementation-note-42, orchestrator-only) ships
         // `.claude/scripts/sops-as-bot.sh` — the only blessed agent path
         // that calls this RPC. Direct callers from the agent harness are
         // out of scope for v0.
@@ -2291,7 +2444,7 @@ pub async fn dispatch_method_with_context(
             })?;
 
             // Grant gating: load via DaemonGrantStore to get core_grants::Grant
-            // at the state-machine boundary (implementation-note-65). State and
+            // at the state-machine boundary (implementation-note-91). State and
             // issuer checks use the core type directly.
             let grant = store
                 .grant_store()
@@ -2458,10 +2611,10 @@ pub async fn dispatch_method_with_context(
             ))
         }
 
-        // SOPS-implementation-note-74 — implementation-note-75. Routes for the Path 2 native SOPS
-        // recipient surface. Until implementation-note-76 lands, the underlying stubs
+        // SOPS-implementation-note-103 — implementation-note-104. Routes for the Path 2 native SOPS
+        // recipient surface. Until implementation-note-105 lands, the underlying stubs
         // return NotImplementedError — wire is reserved so the SOPS Go-fork
-        // (implementation-note-77) can develop against a real RPC shape.
+        // (implementation-note-106) can develop against a real RPC shape.
         "sops.pubkey" => {
             let persona_id = params["persona_id"]
                 .as_str()
@@ -2505,6 +2658,192 @@ pub async fn dispatch_method_with_context(
             }))
         }
 
+        // implementation-note-107: register a new claude-code session.
+        //
+        // Called by the launcher immediately before spawning the `claude` child.
+        // Creates a `SessionMeta` file in `sessions_dir` and returns the
+        // `{session_id, grant_id, proxy_url}` triple the launcher injects as
+        // env vars. The daemon's proxy URL is emitted so the launcher doesn't
+        // need to hard-code a port.
+        //
+        // Params: `{ "persona": "<name_or_id>", "launcher_pid": <u32> }`
+        // Result: `{ "session_id": "...", "grant_id": "...", "proxy_url": "..." }`
+        "register_session" => {
+            let persona_name = params["persona"]
+                .as_str()
+                .ok_or((-32602, "missing 'persona' parameter".to_string()))?;
+            let launcher_pid = params["launcher_pid"]
+                .as_u64()
+                .ok_or((-32602, "missing 'launcher_pid' parameter".to_string()))? as u32;
+
+            let sessions_dir = ctx
+                .sessions_dir
+                .as_ref()
+                .ok_or((-32000, "sessions_dir not configured on this connection".to_string()))?;
+
+            // Resolve persona by name. We try get_persona_by_name; if not found,
+            // treat the parameter as an id directly (for programmatic callers
+            // that already have the id).
+            let persona = store
+                .list_personas()
+                .map_err(|e| (-32000, e.to_string()))?
+                .into_iter()
+                .find(|p| p.name == persona_name || p.id == persona_name)
+                .ok_or_else(|| (-32004, format!("persona '{persona_name}' not found")))?;
+
+            // Look for an active grant for this persona.
+            let grants = store
+                .list_grants()
+                .map_err(|e| (-32000, e.to_string()))?;
+            let active_grant = grants
+                .into_iter()
+                .find(|g| g.persona_id == persona.id && g.status == "active")
+                .ok_or_else(|| (-32004, format!("no active grant for persona '{persona_name}'")))?;
+
+            // Build a unique session id.
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let session_id = format!("sess_{:032x}", nanos);
+
+            let meta = core_state::sessions::SessionMeta {
+                session_id: session_id.clone(),
+                persona: persona.id.clone(),
+                grant_id: active_grant.id.clone(),
+                started_at: chrono::Utc::now(),
+                launcher_pid,
+            };
+
+            let session_store = core_state::SessionStore::new(sessions_dir.clone());
+            session_store
+                .create(&meta)
+                .map_err(|e| (-32000, format!("create session: {e}")))?;
+
+            let _ = store.log_event(
+                Some(&persona.id),
+                "session.opened",
+                None,
+                "ok",
+                Some(&format!("session_id={session_id} grant_id={}", active_grant.id)),
+            );
+
+            // implementation-note-88: read the
+            // LLM proxy URL from RequestContext, NOT from std::env::var.
+            // The runtime populates ctx.llm_proxy_url via SocketListener
+            // builder after the proxy binds. Using env::var here is
+            // unreliable — std::env::set_var is unsafe in Rust 2024 precisely
+            // because its cross-thread visibility is not guaranteed; tokio
+            // worker threads may observe a stale Err(_) and fall back to 8484.
+            let proxy_url = match &ctx.llm_proxy_url {
+                Some(url) => url.clone(),
+                None => {
+                    tracing::warn!(
+                        "register_session: llm_proxy_url absent from RequestContext \
+                         (SocketListener.with_llm_proxy_url not called?) — \
+                         falling back to hardcoded 8484; implementation-note-88"
+                    );
+                    "http://127.0.0.1:8484".to_string()
+                }
+            };
+            // Include the git proxy URL when available so the launcher can
+            // inject EMBER_GIT_PROXY_URL into the child env.
+            let git_proxy_url = ctx.git_proxy_url.clone();
+
+            let mut response = json!({
+                "session_id": session_id,
+                "grant_id": active_grant.id,
+                "proxy_url": proxy_url,
+            });
+            if let Some(gpu) = git_proxy_url {
+                response["git_proxy_url"] = json!(gpu);
+            }
+            Ok(response)
+        }
+
+        // implementation-note-107: close a claude-code session (clean exit).
+        //
+        // Called by the launcher after the `claude` child exits naturally. Emits
+        // a signed v2 `session.claude_code` Receipt with
+        // `termination_reason: clean_exit` into `<session_dir>/receipt.json`,
+        // closes the `SessionMeta`, and logs a `session.closed` audit event.
+        //
+        // implementation-note-108: CleanExit MUST NOT
+        // revoke the grant. A 24h grant supports many sessions; the previous
+        // unconditional revoke_grant call here was the second-half regression
+        // (the launcher goes through this RPC arm, not session_watcher, so
+        // #2366's session_watcher fix did not reach the launcher path).
+        //
+        // Params: `{ "session_id": "..." }`
+        // Result: `{ "closed": true, "receipt_id": "..." }`
+        "close_session" => {
+            let session_id = params["session_id"]
+                .as_str()
+                .ok_or((-32602, "missing 'session_id' parameter".to_string()))?;
+
+            let sessions_dir = ctx
+                .sessions_dir
+                .as_ref()
+                .ok_or((-32000, "sessions_dir not configured on this connection".to_string()))?;
+
+            let session_store = core_state::SessionStore::new(sessions_dir.clone());
+
+            // Load the session meta so we know the grant_id for logging.
+            let meta = session_store
+                .read(session_id)
+                .map_err(|e| (-32000, format!("read session: {e}")))?
+                .ok_or_else(|| (-32004, format!("session '{session_id}' not found or already closed")))?;
+
+            // Emit a signed v2 Receipt with termination_reason = clean_exit
+            // via the canonical atomic builder (design) — same path as the
+            // dirty-exit termination in `session::lifecycle`.
+            let identity = current_identity()
+                .ok_or((-32000, "daemon identity not initialised — cannot sign Receipt".to_string()))?;
+            let signer = crate::session::lifecycle::DaemonPersonaSigner::new(identity);
+
+            let envelope = crate::infra::receipt::issue::issue_cohort_a_receipt(
+                session_id,
+                Vec::new(),
+                None,
+                core_events::receipt::TerminationAuthority::DaemonPersona,
+                &identity.pubkey_hex(),
+                Some(crate::infra::receipt::issue::TerminationMeta {
+                    reason: core_events::receipt::TerminationReason::CleanExit,
+                    last_heartbeat_at: None,
+                    pid_alive_at_check: None,
+                }),
+                &signer,
+            )
+            .map_err(|e| (-32000, format!("issue Receipt: {e}")))?;
+
+            let receipt_id = envelope.receipt_id.clone();
+
+            let session_dir = sessions_dir.join(session_id);
+            let receipt_path = session_dir.join("receipt.json");
+            let receipt_json = serde_json::to_vec_pretty(&envelope)
+                .map_err(|e| (-32000, format!("serialize Receipt JSON: {e}")))?;
+            std::fs::write(&receipt_path, &receipt_json)
+                .map_err(|e| (-32000, format!("persist Receipt: {e}")))?;
+
+            session_store
+                .close(session_id)
+                .map_err(|e| (-32000, format!("close session: {e}")))?;
+
+            let _ = store.log_event(
+                Some(&meta.persona),
+                "session.closed",
+                None,
+                "clean_exit",
+                Some(&format!("session_id={session_id} grant_id={} grant_kept_active=true", meta.grant_id)),
+            );
+
+            Ok(json!({
+                "closed": true,
+                "session_id": session_id,
+                "receipt_id": receipt_id,
+            }))
+        }
+
         _ => Err((-32601, "Method not found".to_string())),
     }
 }
@@ -2534,7 +2873,7 @@ pub async fn dispatch_method_with_context(
 /// the locally-bound `core_grants::Grant` they captured at request entry.
 /// New requests fail because lookup runs after the SQL flip.
 ///
-/// `binding_revoke_urgent` (separate verb, T-EMBERD-BINDING-implementation-note-78)
+/// `binding_revoke_urgent` (separate verb, T-EMBERD-BINDING-implementation-note-109)
 /// will skip the in-flight drain by also poisoning the in-process
 /// grant cache — that path is intentionally NOT reused here because it
 /// inverts the contract callers rely on for the graceful path.
@@ -2583,6 +2922,405 @@ pub async fn binding_delete(
         "deleted": true,
         "persona_id": persona_id,
         "binding_request_id": binding_request_id,
+    }))
+}
+
+/// `binding.revoke_urgent` JSON-RPC verb — compromise-response revocation
+/// of a workload Persona binding.
+///
+/// Per design §"binding.revoke_urgent":
+///   1. Revoke the workload Persona's Grant (cascade via `revoke_persona`).
+///      Same SQL transition as `binding.delete` — persona row flips to
+///      `revoked` and every active grant under it flips to `revoked` in
+///      the same statement.
+///   2. Emit a `binding.revoke_urgent` audit row with outcome `"urgent"`
+///      so alerting pipelines can fire on the high-severity event
+///      without re-parsing the details JSON. Unlike the graceful
+///      `binding.deleted` event, this row is the trigger for compromise-
+///      response automation: rotate the credential, sweep the audit log
+///      for the persona, page the on-call rotation.
+///
+/// Difference from `binding.delete`: this verb does NOT promise
+/// graceful drain semantics. Today the SQL flip is synchronous and the
+/// daemon does not maintain an in-process grant cache, so an in-flight
+/// `use_credential` call holding a `core_grants::Grant` value at request
+/// entry will still complete with that cached value. When the in-process
+/// cache lands (planned with the broker materialization layer), this
+/// verb is the one that will additionally poison the cache so urgent
+/// revocations actually cancel in-flight callers.
+///
+/// Idempotency: re-revoking an already-revoked persona is a NotFound
+/// (mirrors `binding.delete`). The compromise-response runbook is
+/// expected to be idempotent at the orchestration layer — the reconciler
+/// retries with the same `binding_request_id` and treats `-32004` as
+/// "already revoked, no further action needed".
+pub async fn binding_revoke_urgent(
+    store: &DaemonStore,
+    params: &Value,
+) -> Result<Value, (i32, String)> {
+    let persona_id = params["persona_id"]
+        .as_str()
+        .ok_or((-32602, "missing 'persona_id' parameter".to_string()))?;
+    // `binding_request_id` is optional but recommended — the reconciler
+    // uses it for idempotent retries. We log it through to the audit row
+    // so an operator can trace an urgent revocation back to a specific
+    // compromise-response pass.
+    let binding_request_id = params["binding_request_id"].as_str();
+    // `reason` is optional but strongly recommended for compromise
+    // response — it lands in the audit details JSON so the SOC2 evidence
+    // export captures why the urgent revocation fired.
+    let reason = params["reason"].as_str();
+
+    // Step 1 — cascade revoke. Same SQL transition as `binding.delete`;
+    // the wedge that distinguishes urgent from graceful is the audit
+    // event row (action + outcome), NOT the storage layer.
+    match store.revoke_persona(persona_id) {
+        Ok(()) => {}
+        Err(crate::infra::store::StoreError::NotFound) => {
+            return Err((-32004, format!("binding {persona_id} not found")));
+        }
+        Err(e) => return Err((-32000, e.to_string())),
+    }
+
+    // Step 2 — audit-log emission. Action is the literal
+    // `"binding.revoke_urgent"` (NOT the `RECEIPT_KIND_BINDING_REVOKED`
+    // constant — that one is for the graceful-revoke pipeline, this
+    // verb is the urgent-only path). Outcome `"urgent"` makes alerting
+    // queries trivial: `WHERE outcome = 'urgent'`.
+    let details = serde_json::json!({
+        "persona_id": persona_id,
+        "binding_request_id": binding_request_id,
+        "reason": reason,
+    })
+    .to_string();
+    let _ = store.log_event(
+        Some(persona_id),
+        "binding.revoke_urgent",
+        None,
+        "urgent",
+        Some(&details),
+    );
+
+    Ok(json!({
+        "revoked_urgent": true,
+        "persona_id": persona_id,
+        "binding_request_id": binding_request_id,
+    }))
+}
+
+/// `binding.update` JSON-RPC verb — mutate metadata on an existing
+/// workload Persona binding without revoking it.
+///
+/// Per design §"binding.update":
+///   1. Look up the existing binding (persona row). Return `-32004` if
+///      the binding does not exist.
+///   2. Apply each mutable field in turn — today only `name` is
+///      surfaced as a SQL column, but the wire shape accepts the
+///      broader binding-metadata fields (`cred_class_allowlist`,
+///      `lease_duration_cap`, etc.) so callers can already speak the
+///      design contract; those fields land in the audit details JSON
+///      until the schema lands columns for them.
+///   3. Emit a `binding.updated` audit row keyed on
+///      `RECEIPT_KIND_BINDING_UPDATED` with a before/after snapshot
+///      so the reconciler + receipt pipeline can correlate the
+///      mutation with its originating `binding_request_id`.
+///
+/// JSON-RPC params shape (all fields after `binding_id` are optional;
+/// at least one mutable field SHOULD be present):
+/// ```json
+/// {
+///   "binding_id":          "persona-...",          // required
+///   "binding_request_id":  "br-...",               // optional, recommended
+///   "name":                "new-name",             // optional, SQL-mutated
+///   "cred_class_allowlist": ["llm:*", ...],        // optional, audit-only
+///   "lease_duration_cap":  3600,                   // optional, audit-only
+///   "metadata":            { ... }                 // optional, audit-only
+/// }
+/// ```
+///
+/// Backwards-compat: `persona_id` is accepted as a synonym for
+/// `binding_id` so the verb composes with the same callers that drive
+/// `binding.delete` / `binding.revoke_urgent`.
+///
+/// Idempotency: replaying the same params is safe. The SQL UPDATE is
+/// a write of the exact same value when nothing changed; the audit
+/// row is appended each call so the reconciler always sees a fresh
+/// receipt for its retry. The orchestration layer is expected to
+/// dedupe via `binding_request_id` if it cares about exactly-once
+/// audit emission.
+pub async fn binding_update(
+    store: &DaemonStore,
+    params: &Value,
+) -> Result<Value, (i32, String)> {
+    // Accept either `binding_id` (canonical per design) or
+    // `persona_id` (for symmetry with the delete/revoke verbs that
+    // still speak persona_id). At least one must resolve to a string.
+    let binding_id = params["binding_id"]
+        .as_str()
+        .or_else(|| params["persona_id"].as_str())
+        .ok_or((
+            -32602,
+            "missing 'binding_id' parameter".to_string(),
+        ))?;
+    let binding_request_id = params["binding_request_id"].as_str();
+
+    // Step 1 — load the existing binding so we can build a "before"
+    // snapshot for the audit row AND surface NotFound as -32004.
+    let before = match store.get_persona(binding_id) {
+        Ok(p) => p,
+        Err(crate::infra::store::StoreError::NotFound) => {
+            return Err((-32004, format!("binding {binding_id} not found")));
+        }
+        Err(e) => return Err((-32000, e.to_string())),
+    };
+
+    // Step 2 — apply mutable fields. Today only `name` lives in SQL.
+    // The remaining fields (cred_class_allowlist, lease_duration_cap,
+    // metadata) are audit-only until the schema lands columns for
+    // them; they still flow through the wire contract so callers can
+    // forward-compatibly drive design today.
+    let new_name = params["name"].as_str();
+    if let Some(name) = new_name
+        && name != before.name
+    {
+        // SQLite UNIQUE-constraint violations come back as
+        // `Sqlite(SqliteFailure { code: ConstraintViolation, .. })`;
+        // surface as -32005 to give callers an actionable signal
+        // distinct from the generic -32000 "internal" bucket.
+        match store.conn().execute(
+            "UPDATE personas SET name = ?1 WHERE id = ?2",
+            rusqlite::params![name, binding_id],
+        ) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                return Err((
+                    -32005,
+                    format!("name '{name}' already in use"),
+                ));
+            }
+            Err(e) => return Err((-32000, e.to_string())),
+        }
+    }
+
+    // Step 3 — capture the after-snapshot. We re-read so the audit
+    // reflects whatever SQLite actually committed (in particular, if
+    // a future migration adds defaulted columns, the audit row picks
+    // them up automatically).
+    let after = store
+        .get_persona(binding_id)
+        .map_err(|e| (-32000, e.to_string()))?;
+
+    // Step 4 — audit-log emission. Action mirrors
+    // `RECEIPT_KIND_BINDING_UPDATED` so the Receipt v2 pipeline can
+    // correlate audit rows with envelopes. The details JSON carries
+    // both the before/after persona snapshots AND the audit-only
+    // metadata fields the caller passed (so the reconciler can apply
+    // them to its in-memory model even before the schema lands).
+    let details = serde_json::json!({
+        "binding_id": binding_id,
+        "binding_request_id": binding_request_id,
+        "before": {
+            "name": before.name,
+            "status": before.status,
+        },
+        "after": {
+            "name": after.name,
+            "status": after.status,
+        },
+        "requested": {
+            "name": new_name,
+            "cred_class_allowlist": params.get("cred_class_allowlist"),
+            "lease_duration_cap": params.get("lease_duration_cap"),
+            "metadata": params.get("metadata"),
+        },
+    })
+    .to_string();
+    let _ = store.log_event(
+        Some(binding_id),
+        core_events::receipt::atomic::RECEIPT_KIND_BINDING_UPDATED,
+        None,
+        "allowed",
+        Some(&details),
+    );
+
+    Ok(json!({
+        "updated": true,
+        "binding_id": binding_id,
+        "binding_request_id": binding_request_id,
+        "name": after.name,
+    }))
+}
+
+/// `binding.upsert` JSON-RPC verb — idempotent insert-or-update for a
+/// workload Persona binding.
+///
+/// Per design §"binding.upsert": this is the steady-state verb
+/// `ember-kernel`'s EmberServiceAccount reconciler calls every pass.
+/// Today it ships as a thin compose of `get_persona` + `create_persona`
+/// + the SQL `UPDATE` from `binding.update`. The audit row records a
+/// `binding.upserted` event keyed on the (final) persona id with a
+/// before/after diff so the reconciler + receipt pipeline can tell
+/// "first registration" apart from "no-op refresh" without re-parsing
+/// the persona row.
+///
+/// JSON-RPC params shape (all fields optional except either `persona_id`
+/// or `name` MUST be present so the verb has a binding to anchor on):
+/// ```json
+/// {
+///   "namespace":            "ns-prod",                    // optional, audit-only
+///   "name":                 "ml-eval",                    // required when creating
+///   "persona_id":           "persona-...",                // optional, identifier when updating
+///   "binding_request_id":   "br-...",                     // optional, recommended
+///   "cred_class_allowlist": ["llm:*", ...],               // optional, audit-only
+///   "lease_duration_cap":   3600,                         // optional, audit-only
+///   "metadata":             { ... }                       // optional, audit-only
+/// }
+/// ```
+///
+/// Idempotency: replaying the same params is safe. If the persona
+/// already exists with the requested name, the UPDATE is a no-op write
+/// and the audit row records `before == after` (the reconciler still
+/// gets a fresh receipt). If the row does not exist, a fresh persona
+/// is created and the audit row carries `before: null`.
+///
+/// Returns `{ persona_id, created, updated }`. `persona_id` is always
+/// the canonical id the daemon uses (which may differ from the caller's
+/// `persona_id` if the caller asked for a fresh registration). Exactly
+/// one of `created` / `updated` is `true`.
+pub async fn binding_upsert(
+    store: &DaemonStore,
+    params: &Value,
+) -> Result<Value, (i32, String)> {
+    // Either `persona_id` (canonical, looks up an existing binding) or
+    // `name` (required when creating fresh) MUST be present. Mirrors
+    // the `binding.update` `binding_id`/`persona_id` synonym shape.
+    let requested_persona_id = params["persona_id"]
+        .as_str()
+        .or_else(|| params["binding_id"].as_str());
+    let name = params["name"].as_str();
+    let binding_request_id = params["binding_request_id"].as_str();
+
+    if requested_persona_id.is_none() && name.is_none() {
+        return Err((
+            -32602,
+            "binding.upsert requires either 'persona_id' or 'name'".to_string(),
+        ));
+    }
+
+    // Step 1 — try to load the existing binding so we can branch on
+    // create-vs-update. NotFound on a caller-supplied `persona_id`
+    // routes to the create path (idempotent insert); other errors
+    // surface as -32000.
+    let existing = match requested_persona_id {
+        Some(pid) => match store.get_persona(pid) {
+            Ok(p) => Some(p),
+            Err(crate::infra::store::StoreError::NotFound) => None,
+            Err(e) => return Err((-32000, e.to_string())),
+        },
+        None => None,
+    };
+
+    // Step 2 — branch.
+    let (canonical_id, created, before_snapshot, after) = match existing {
+        // ── Update path ──
+        Some(before) => {
+            // Apply the only mutable SQL column today (`name`). Deeper
+            // metadata mutations land in audit-only details JSON until
+            // the schema lands columns for them — same shape as
+            // `binding.update`.
+            if let Some(new_name) = name
+                && new_name != before.name
+            {
+                match store.conn().execute(
+                    "UPDATE personas SET name = ?1 WHERE id = ?2",
+                    rusqlite::params![new_name, before.id],
+                ) {
+                    Ok(_) => {}
+                    Err(rusqlite::Error::SqliteFailure(err, _))
+                        if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+                    {
+                        return Err((
+                            -32005,
+                            format!("name '{new_name}' already in use"),
+                        ));
+                    }
+                    Err(e) => return Err((-32000, e.to_string())),
+                }
+            }
+            let after = store
+                .get_persona(&before.id)
+                .map_err(|e| (-32000, e.to_string()))?;
+            let before_snapshot = json!({
+                "name": before.name,
+                "status": before.status,
+            });
+            (before.id.clone(), false, before_snapshot, after)
+        }
+        // ── Create path ──
+        None => {
+            // Creating a fresh persona requires a name — caller
+            // either passed `persona_id` for a row that doesn't
+            // exist (snapshot drift, fresh cluster) or passed `name`
+            // for a never-registered SA.
+            let create_name = name.ok_or((
+                -32602,
+                "binding.upsert create path requires 'name'".to_string(),
+            ))?;
+            let new_persona = match store.create_persona(create_name) {
+                Ok(p) => p,
+                Err(crate::infra::store::StoreError::Sqlite(
+                    rusqlite::Error::SqliteFailure(err, _),
+                )) if err.code == rusqlite::ErrorCode::ConstraintViolation => {
+                    return Err((
+                        -32005,
+                        format!("name '{create_name}' already in use"),
+                    ));
+                }
+                Err(e) => return Err((-32000, e.to_string())),
+            };
+            (new_persona.id.clone(), true, Value::Null, new_persona)
+        }
+    };
+
+    // Step 3 — audit-log emission. Action `"binding.upserted"` mirrors
+    // the existing `binding.deleted` / `binding.updated` literals —
+    // the kind constant for upsert is not yet locked in
+    // `core_events::receipt::atomic`, so we emit the literal here and
+    // tighten to a constant when design lands the discriminator.
+    let details = serde_json::json!({
+        "persona_id": canonical_id,
+        "binding_request_id": binding_request_id,
+        "created": created,
+        "before": before_snapshot,
+        "after": {
+            "name": after.name,
+            "status": after.status,
+        },
+        "requested": {
+            "namespace": params.get("namespace"),
+            "name": name,
+            "cred_class_allowlist": params.get("cred_class_allowlist"),
+            "lease_duration_cap": params.get("lease_duration_cap"),
+            "metadata": params.get("metadata"),
+        },
+    })
+    .to_string();
+    let _ = store.log_event(
+        Some(&canonical_id),
+        "binding.upserted",
+        None,
+        "allowed",
+        Some(&details),
+    );
+
+    Ok(json!({
+        "persona_id": canonical_id,
+        "binding_request_id": binding_request_id,
+        "created": created,
+        "updated": !created,
+        "name": after.name,
     }))
 }
 
@@ -2719,7 +3457,7 @@ mod tests {
         assert_eq!(err.0, -32602);
     }
 
-    // ---- implementation-note-63: evaluate_tool_call dispatch arm -----------------
+    // ---- implementation-note-89: evaluate_tool_call dispatch arm -----------------
 
     #[tokio::test]
     async fn evaluate_tool_call_dispatch_returns_decision_for_active_grant() {
@@ -3042,7 +3780,7 @@ mod tests {
 
     #[tokio::test]
     async fn revoke_statement_blocks_use_credential() {
-        // implementation-note-66 — per-statement revoke MVP.
+        // implementation-note-92 — per-statement revoke MVP.
         // Revoking the Credential Statement's sid blocks use_credential
         // while the grant is otherwise still active.
         let store = DaemonStore::open_in_memory().unwrap();
@@ -3140,7 +3878,7 @@ mod tests {
 
     #[tokio::test]
     async fn propose_grant_rpc_persists_n_statements() {
-        // implementation-note-69 — N-statement persistence + retrieval.
+        // implementation-note-95 — N-statement persistence + retrieval.
         let store = DaemonStore::open_in_memory().unwrap();
         let vault = test_vault();
         let policy = test_policy();
@@ -3158,11 +3896,14 @@ mod tests {
         let persona_id = persona["id"].as_str().unwrap();
 
         // 3-Statement composite envelope (credential + session + time).
+        // design §4 — composite-grant action keys must carry the
+        // `did:<method>:<rest>` prefix; the RPC layer rejects bare keys
+        // since T-CONSTRUCT-ACTION-KEY-DID-PREFIX-MIGRATION-SURFACES.
         let statements = json!([
             {
                 "sid": "S0",
                 "resource_type": "credential",
-                "actions": ["github:push", "github:read"],
+                "actions": ["did:ember:github.push", "did:ember:github.read"],
                 "resource": {"kind": "any"},
                 "budget": null,
                 "usage": {},
@@ -3171,7 +3912,7 @@ mod tests {
             {
                 "sid": "S1",
                 "resource_type": "session",
-                "actions": ["generic:write"],
+                "actions": ["did:ember:generic.write"],
                 "resource": {"kind": "any"},
                 "budget": {"tokens": 10000},
                 "usage": {},
@@ -3180,7 +3921,7 @@ mod tests {
             {
                 "sid": "S2",
                 "resource_type": "time",
-                "actions": ["generic:write"],
+                "actions": ["did:ember:generic.write"],
                 "resource": {"kind": "any"},
                 "budget": {"wall_clock_secs": 300},
                 "usage": {},
@@ -3256,6 +3997,125 @@ mod tests {
         .await.unwrap_err();
         assert_eq!(err.0, -32602);
         assert!(err.1.contains("statements"));
+    }
+
+    #[tokio::test]
+    async fn propose_grant_rpc_rejects_bare_action_keys_with_migration_pointer() {
+        // T-CONSTRUCT-ACTION-KEY-DID-PREFIX-MIGRATION-SURFACES — per ADR
+        // 135 §4 the propose_grant RPC entry point is the parse-time
+        // gate that refuses bare action keys (no `did:` prefix). The
+        // error message must point operators at the new shape so they
+        // can migrate without consulting docs.
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let persona = dispatch_method(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            "create_persona",
+            &json!({"name": "composite-rpc-bare-key"}),
+        )
+        .await.unwrap();
+        let persona_id = persona["id"].as_str().unwrap();
+
+        let err = dispatch_method(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            "propose_grant",
+            &json!({
+                "persona_id": persona_id,
+                "credential_name": "gh-token",
+                "scope": "*",
+                "action": "credential.access",
+                "risk_level": "high",
+                "statements": [
+                    {
+                        "sid": "S0",
+                        "resource_type": "credential",
+                        "actions": ["gh.pr_create"],
+                        "resource": {"kind": "any"},
+                        "budget": null,
+                        "usage": {},
+                        "conditions": [],
+                    }
+                ],
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, -32602, "bare action key must surface as parse-time -32602");
+        assert!(
+            err.1.contains("did: prefix"),
+            "error must name the missing prefix; got: {}",
+            err.1
+        );
+        assert!(
+            err.1.contains("did:ember:gh.pr_create"),
+            "error must include the recommended did:ember: migration form; got: {}",
+            err.1
+        );
+    }
+
+    #[tokio::test]
+    async fn propose_grant_rpc_accepts_did_web_for_forward_compat() {
+        // T-CONSTRUCT-ACTION-KEY-DID-PREFIX-MIGRATION-SURFACES — arbitrary
+        // `did:<method>:` prefixes pass the parse-time validator at the RPC
+        // gate even though v0.3.0's broker.resolve only routes `did:ember:`.
+        // This locks the forward-compat door so community publishers
+        // (`did:web:hashicorp.com:terraform.apply`) submit cleanly today and
+        // become resolvable when the per-publisher trust delegation UX lands.
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let persona = dispatch_method(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            "create_persona",
+            &json!({"name": "composite-rpc-fwd-compat"}),
+        )
+        .await.unwrap();
+        let persona_id = persona["id"].as_str().unwrap();
+
+        let resp = dispatch_method(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            "propose_grant",
+            &json!({
+                "persona_id": persona_id,
+                "credential_name": "tf-token",
+                "scope": "*",
+                "action": "credential.access",
+                "risk_level": "high",
+                "statements": [
+                    {
+                        "sid": "S0",
+                        "resource_type": "credential",
+                        "actions": ["did:web:hashicorp.com:terraform.apply"],
+                        "resource": {"kind": "any"},
+                        "budget": null,
+                        "usage": {},
+                        "conditions": [],
+                    }
+                ],
+            }),
+        )
+        .await
+        .expect("did:web: prefixed action key must pass the RPC parse-time gate");
+
+        assert!(resp["approval_id"].as_str().unwrap_or("").starts_with("approval-"));
     }
 
     #[tokio::test]
@@ -3780,6 +4640,7 @@ mod tests {
             agent_framework: None,
             composite_statements: None,
             result_grant_id: None,
+            skill_ref: None,
         }
     }
 
@@ -5065,6 +5926,9 @@ mod tests {
             source: DispatchSource::Socket,
             peer: Some(PeerCred { uid: 1000, pid: Some(attacker_pid) }),
             principal: None,
+            sessions_dir: None,
+            llm_proxy_url: None,
+            git_proxy_url: None,
         };
 
         let before = store.list_active_grants().unwrap().len();
@@ -5128,6 +5992,9 @@ mod tests {
             source: DispatchSource::Socket,
             peer: Some(peer),
             principal: None,
+            sessions_dir: None,
+            llm_proxy_url: None,
+            git_proxy_url: None,
         };
         let persona = dispatch_method_with_context(
             &store, &vault, &policy, &rl, None, create_ctx,
@@ -5179,6 +6046,9 @@ mod tests {
             source: DispatchSource::Socket,
             peer: Some(peer),
             principal: None,
+            sessions_dir: None,
+            llm_proxy_url: None,
+            git_proxy_url: None,
         };
         let result = dispatch_method_with_context(
             &store, &vault, &policy, &rl, None, delegate_ctx,
@@ -5228,6 +6098,9 @@ mod tests {
             source: DispatchSource::Socket,
             peer: Some(PeerCred { uid: 1000, pid: None }),
             principal: None,
+            sessions_dir: None,
+            llm_proxy_url: None,
+            git_proxy_url: None,
         };
 
         let before = store.list_active_grants().unwrap().len();
@@ -5312,6 +6185,7 @@ mod tests {
             agent_framework: None,
             composite_statements: None,
             result_grant_id: None,
+            skill_ref: None,
         }
     }
 
@@ -5376,7 +6250,7 @@ mod tests {
         );
     }
 
-    // --- security check: per-op user-presence wiring ---
+    // --- per-op user-presence wiring ---
     //
     // These tests prove the new methods (`vault_remove`, `vault_lock`,
     // `vault_status`) dispatch correctly. The gate's lock/allow state
@@ -5454,7 +6328,7 @@ mod tests {
 
     #[tokio::test]
     async fn vault_get_round_trip_returns_plaintext_value() {
-        // implementation-note-79: pulumi-render.sh + similar headless
+        // implementation-note-110: pulumi-render.sh + similar headless
         // integrations call `ember vault get` -> daemon RPC `vault_get`.
         // This proves the RPC arm is wired and returns the decrypted
         // value under the canonical {"value": ...} shape.
@@ -5532,7 +6406,7 @@ mod tests {
         assert_eq!(result["removed"], json!(true));
     }
 
-    /// EMBER-implementation-note-68 integration test: emit synthetic kms_wrap receipts
+    /// EMBER-implementation-note-94 integration test: emit synthetic kms_wrap receipts
     /// for two actors, then verify `receipt_query` filters by actor and kind.
     #[tokio::test]
     async fn receipt_query_filters_by_actor_and_kind() {
@@ -5627,7 +6501,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // implementation-note-73 Phase 2: sops_unwrap_dek RPC tests
+    // implementation-note-102 Phase 2: sops_unwrap_dek RPC tests
     // -----------------------------------------------------------------
 
     /// Build an age-encrypted DEK ciphertext for the given recipient
@@ -5983,7 +6857,7 @@ mod tests {
         assert_eq!(err.0, -32602);
     }
 
-    // ---- implementation-note-14: await_approval block-and-poll RPC -----------------
+    // ---- implementation-note-18: await_approval block-and-poll RPC -----------------
 
     #[tokio::test]
     async fn await_approval_returns_approved_when_resolved_mid_poll() {
@@ -6119,7 +6993,7 @@ mod tests {
         assert_eq!(err.0, -32602, "got: {err:?}");
     }
 
-    // implementation-note-72 — graceful binding delete (design).
+    // implementation-note-98 — graceful binding delete (design).
     #[tokio::test]
     async fn binding_delete_revokes_persona_and_cascades_grants() {
         let store = DaemonStore::open_in_memory().unwrap();
@@ -6245,5 +7119,839 @@ mod tests {
             &json!({"persona_id": persona_id}),
         ).await.unwrap();
         assert_eq!(resp["deleted"], json!(true));
+    }
+
+    // implementation-note-99 — compromise-response revocation
+    // (design §"binding.revoke_urgent").
+    #[tokio::test]
+    async fn binding_revoke_urgent_cascades_grants_and_emits_urgent_audit() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let persona = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "create_persona",
+            &json!({"name": "compromised-worker"}),
+        ).await.unwrap();
+        let persona_id = persona["id"].as_str().unwrap().to_string();
+
+        // Provision a grant under the persona — it must be cascaded
+        // to `revoked` by the urgent path, same as `binding.delete`.
+        let _grant = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "create_grant",
+            &json!({
+                "persona_id": persona_id,
+                "credential_name": "anthropic-key",
+                "scope": "llm:generate",
+                "ttl_secs": 3600,
+                "force": true,
+            }),
+        ).await.unwrap();
+
+        let resp = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "binding.revoke_urgent",
+            &json!({
+                "persona_id": persona_id,
+                "binding_request_id": "br-urgent-001",
+                "reason": "credential leaked in public repo",
+            }),
+        ).await.unwrap();
+        assert_eq!(resp["revoked_urgent"], json!(true));
+        assert_eq!(resp["persona_id"], json!(persona_id));
+
+        // Cascade assertion: evaluate_grant fails because the urgent
+        // path flipped the grant to `revoked` (same SQL as delete).
+        let err = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "evaluate_grant",
+            &json!({
+                "persona_id": persona_id,
+                "credential_name": "anthropic-key",
+            }),
+        ).await.unwrap_err();
+        assert_eq!(err.0, -32000);
+
+        // Audit assertion: action MUST be `binding.revoke_urgent` (NOT
+        // `binding.deleted` — operators distinguish urgent revocations
+        // from graceful deletes for compliance + alerting).
+        let audit = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "audit_query",
+            &json!({"persona_id": persona_id}),
+        ).await.unwrap();
+        let entries = audit.as_array().expect("audit_query returns array");
+        assert!(
+            entries.iter().any(|e| {
+                e["action"] == json!("binding.revoke_urgent")
+                    && e["outcome"] == json!("urgent")
+            }),
+            "expected binding.revoke_urgent + outcome=urgent audit row, got {entries:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn binding_revoke_urgent_missing_persona_id_returns_32602() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let err = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "binding.revoke_urgent",
+            &json!({}),
+        ).await.unwrap_err();
+        assert_eq!(err.0, -32602);
+    }
+
+    #[tokio::test]
+    async fn binding_revoke_urgent_unknown_persona_returns_32004() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let err = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "binding.revoke_urgent",
+            &json!({"persona_id": "persona-does-not-exist"}),
+        ).await.unwrap_err();
+        assert_eq!(err.0, -32004);
+    }
+
+    #[tokio::test]
+    async fn binding_revoke_urgent_underscore_alias_dispatches_too() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let persona = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "create_persona",
+            &json!({"name": "alias-urgent-worker"}),
+        ).await.unwrap();
+        let persona_id = persona["id"].as_str().unwrap().to_string();
+
+        let resp = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "binding_revoke_urgent",
+            &json!({"persona_id": persona_id}),
+        ).await.unwrap();
+        assert_eq!(resp["revoked_urgent"], json!(true));
+    }
+
+    // implementation-note-100 — mutate binding metadata
+    // (design §"binding.update").
+    #[tokio::test]
+    async fn binding_update_mutates_name_and_emits_before_after_audit() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let persona = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "create_persona",
+            &json!({"name": "old-name"}),
+        ).await.unwrap();
+        let binding_id = persona["id"].as_str().unwrap().to_string();
+
+        let resp = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "binding.update",
+            &json!({
+                "binding_id": binding_id,
+                "binding_request_id": "br-update-001",
+                "name": "new-name",
+                "cred_class_allowlist": ["llm:generate", "fs:read"],
+                "lease_duration_cap": 3600,
+            }),
+        ).await.unwrap();
+        assert_eq!(resp["updated"], json!(true));
+        assert_eq!(resp["binding_id"], json!(binding_id));
+        assert_eq!(resp["name"], json!("new-name"));
+
+        // Persona row in SQL must reflect the new name.
+        let fetched = store.get_persona(&binding_id).unwrap();
+        assert_eq!(fetched.name, "new-name");
+
+        // Audit row carries the before/after snapshot AND the
+        // audit-only metadata fields the caller passed. The
+        // `audit_query` JSON-RPC response strips `details` (operator
+        // dashboards don't paginate details JSON), so read directly
+        // via `query_audit` to assert the full payload landed.
+        let entries = store
+            .query_audit(&AuditFilter {
+                persona_id: Some(binding_id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        let row = entries
+            .iter()
+            .find(|e| e.action == "binding.updated")
+            .unwrap_or_else(|| panic!("expected binding.updated audit row, got {entries:?}"));
+        let details: serde_json::Value = serde_json::from_str(
+            row.details.as_deref().expect("details JSON populated"),
+        )
+        .expect("details parses as JSON");
+        assert_eq!(details["before"]["name"], json!("old-name"));
+        assert_eq!(details["after"]["name"], json!("new-name"));
+        assert_eq!(
+            details["requested"]["cred_class_allowlist"],
+            json!(["llm:generate", "fs:read"])
+        );
+        assert_eq!(details["requested"]["lease_duration_cap"], json!(3600));
+        assert_eq!(details["binding_request_id"], json!("br-update-001"));
+    }
+
+    #[tokio::test]
+    async fn binding_update_missing_binding_id_returns_32602() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let err = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "binding.update",
+            &json!({"name": "irrelevant"}),
+        ).await.unwrap_err();
+        assert_eq!(err.0, -32602);
+    }
+
+    #[tokio::test]
+    async fn binding_update_unknown_binding_returns_32004() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let err = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "binding.update",
+            &json!({
+                "binding_id": "persona-does-not-exist",
+                "name": "ghost",
+            }),
+        ).await.unwrap_err();
+        assert_eq!(err.0, -32004);
+    }
+
+    #[tokio::test]
+    async fn binding_update_duplicate_name_returns_32005() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        // Create two personas — renaming one to the other's name must
+        // hit the UNIQUE constraint and surface as -32005.
+        let _occupant = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "create_persona",
+            &json!({"name": "occupied"}),
+        ).await.unwrap();
+        let other = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "create_persona",
+            &json!({"name": "free"}),
+        ).await.unwrap();
+        let other_id = other["id"].as_str().unwrap().to_string();
+
+        let err = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "binding.update",
+            &json!({
+                "binding_id": other_id,
+                "name": "occupied",
+            }),
+        ).await.unwrap_err();
+        assert_eq!(err.0, -32005);
+    }
+
+    #[tokio::test]
+    async fn binding_update_underscore_alias_and_persona_id_synonym_dispatch() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let persona = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "create_persona",
+            &json!({"name": "alias-update-worker"}),
+        ).await.unwrap();
+        let persona_id = persona["id"].as_str().unwrap().to_string();
+
+        // Underscore alias + `persona_id` synonym for `binding_id`.
+        let resp = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "binding_update",
+            &json!({
+                "persona_id": persona_id,
+                "name": "alias-update-renamed",
+            }),
+        ).await.unwrap();
+        assert_eq!(resp["updated"], json!(true));
+        assert_eq!(resp["name"], json!("alias-update-renamed"));
+    }
+
+    #[tokio::test]
+    async fn binding_update_no_mutation_still_emits_audit() {
+        // Sanity: a no-op update (no `name` change requested) is
+        // still a valid call — it serves as a "touch" for the
+        // reconciler to record a binding-update receipt.
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let persona = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "create_persona",
+            &json!({"name": "touch-target"}),
+        ).await.unwrap();
+        let binding_id = persona["id"].as_str().unwrap().to_string();
+
+        let resp = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "binding.update",
+            &json!({
+                "binding_id": binding_id,
+                "binding_request_id": "br-touch-001",
+                "metadata": {"reconciler_pass": "ts-2026-05-07"},
+            }),
+        ).await.unwrap();
+        assert_eq!(resp["updated"], json!(true));
+        assert_eq!(resp["name"], json!("touch-target"));
+
+        let audit = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "audit_query",
+            &json!({"persona_id": binding_id}),
+        ).await.unwrap();
+        let entries = audit.as_array().expect("audit_query returns array");
+        assert!(
+            entries.iter().any(|e| e["action"] == json!("binding.updated")),
+            "expected binding.updated audit row, got {entries:?}"
+        );
+    }
+
+    // implementation-note-101 — idempotent insert-or-update
+    // (design §"binding.upsert").
+
+    #[tokio::test]
+    async fn binding_upsert_creates_when_persona_absent() {
+        // First-pass reconcile: no persona row exists yet. The verb
+        // creates one and emits a `binding.upserted` audit row with
+        // `before: null` and a populated `after` snapshot.
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let resp = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "binding.upsert",
+            &json!({
+                "namespace": "ns-prod",
+                "name": "ml-eval-worker",
+                "binding_request_id": "br-upsert-001",
+                "cred_class_allowlist": ["llm:generate", "fs:read"],
+                "lease_duration_cap": 3600,
+                "metadata": {"sa_uid": "uid-abc"},
+            }),
+        ).await.unwrap();
+
+        assert_eq!(resp["created"], json!(true));
+        assert_eq!(resp["updated"], json!(false));
+        assert_eq!(resp["name"], json!("ml-eval-worker"));
+        let canonical_id = resp["persona_id"]
+            .as_str()
+            .expect("response carries persona_id");
+
+        // Persona row exists in SQL with `active` status and the
+        // requested name.
+        let row = store.get_persona(canonical_id).unwrap();
+        assert_eq!(row.name, "ml-eval-worker");
+        assert_eq!(row.status, "active");
+
+        // Audit row carries the create snapshot AND the audit-only
+        // metadata fields the caller passed.
+        let entries = store
+            .query_audit(&AuditFilter {
+                persona_id: Some(canonical_id.to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        let row = entries
+            .iter()
+            .find(|e| e.action == "binding.upserted")
+            .unwrap_or_else(|| panic!("expected binding.upserted audit row, got {entries:?}"));
+        let details: serde_json::Value = serde_json::from_str(
+            row.details.as_deref().expect("details JSON populated"),
+        )
+        .expect("details parses as JSON");
+        assert_eq!(details["created"], json!(true));
+        assert_eq!(details["before"], serde_json::Value::Null);
+        assert_eq!(details["after"]["name"], json!("ml-eval-worker"));
+        assert_eq!(details["after"]["status"], json!("active"));
+        assert_eq!(
+            details["requested"]["cred_class_allowlist"],
+            json!(["llm:generate", "fs:read"])
+        );
+        assert_eq!(details["requested"]["lease_duration_cap"], json!(3600));
+        assert_eq!(details["requested"]["namespace"], json!("ns-prod"));
+        assert_eq!(details["requested"]["metadata"], json!({"sa_uid": "uid-abc"}));
+        assert_eq!(details["binding_request_id"], json!("br-upsert-001"));
+    }
+
+    #[tokio::test]
+    async fn binding_upsert_updates_when_persona_present() {
+        // Steady-state reconcile: persona row already exists. The
+        // verb reuses its id, mutates `name` if the request asks for
+        // a rename, and emits an audit row with a populated
+        // before/after diff.
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let persona = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "create_persona",
+            &json!({"name": "old-name"}),
+        ).await.unwrap();
+        let persona_id = persona["id"].as_str().unwrap().to_string();
+
+        let resp = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "binding.upsert",
+            &json!({
+                "persona_id": persona_id,
+                "name": "new-name",
+                "binding_request_id": "br-upsert-002",
+                "cred_class_allowlist": ["llm:generate"],
+                "lease_duration_cap": 7200,
+                "metadata": {"reconciler_pass": "ts-2026-05-07"},
+            }),
+        ).await.unwrap();
+
+        assert_eq!(resp["created"], json!(false));
+        assert_eq!(resp["updated"], json!(true));
+        assert_eq!(resp["persona_id"], json!(persona_id));
+        assert_eq!(resp["name"], json!("new-name"));
+
+        // Persona row name updated in SQL.
+        let row = store.get_persona(&persona_id).unwrap();
+        assert_eq!(row.name, "new-name");
+
+        // Audit row carries before/after diff.
+        let entries = store
+            .query_audit(&AuditFilter {
+                persona_id: Some(persona_id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        let row = entries
+            .iter()
+            .find(|e| e.action == "binding.upserted")
+            .unwrap_or_else(|| panic!("expected binding.upserted audit row, got {entries:?}"));
+        let details: serde_json::Value = serde_json::from_str(
+            row.details.as_deref().expect("details JSON populated"),
+        )
+        .expect("details parses as JSON");
+        assert_eq!(details["created"], json!(false));
+        assert_eq!(details["before"]["name"], json!("old-name"));
+        assert_eq!(details["after"]["name"], json!("new-name"));
+        assert_eq!(
+            details["requested"]["cred_class_allowlist"],
+            json!(["llm:generate"])
+        );
+        assert_eq!(details["requested"]["lease_duration_cap"], json!(7200));
+        assert_eq!(details["binding_request_id"], json!("br-upsert-002"));
+    }
+
+    #[tokio::test]
+    async fn binding_upsert_idempotent_no_mutation_still_emits_audit() {
+        // Replay-safety: calling upsert twice with the same params
+        // updates nothing on the second call but still emits a
+        // fresh `binding.upserted` audit row (the reconciler relies
+        // on per-call receipts for retry idempotency).
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let first = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "binding.upsert",
+            &json!({
+                "name": "stable-worker",
+                "binding_request_id": "br-replay-001",
+            }),
+        ).await.unwrap();
+        let persona_id = first["persona_id"].as_str().unwrap().to_string();
+
+        let second = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "binding.upsert",
+            &json!({
+                "persona_id": persona_id,
+                "name": "stable-worker",
+                "binding_request_id": "br-replay-001",
+            }),
+        ).await.unwrap();
+        assert_eq!(second["created"], json!(false));
+        assert_eq!(second["updated"], json!(true));
+        assert_eq!(second["persona_id"], json!(persona_id));
+
+        let entries = store
+            .query_audit(&AuditFilter {
+                persona_id: Some(persona_id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        let upsert_count = entries
+            .iter()
+            .filter(|e| e.action == "binding.upserted")
+            .count();
+        assert_eq!(
+            upsert_count, 2,
+            "expected two binding.upserted audit rows, got {entries:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn binding_upsert_missing_both_id_and_name_returns_32602() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let err = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "binding.upsert",
+            &json!({"binding_request_id": "br-noop"}),
+        ).await.unwrap_err();
+        assert_eq!(err.0, -32602);
+    }
+
+    #[tokio::test]
+    async fn binding_upsert_unknown_persona_id_with_name_creates_fresh() {
+        // Snapshot-drift path: caller supplies a `persona_id` that
+        // does not exist on this daemon (e.g. cluster restored from
+        // an older etcd snapshot pointing at a rotated id). With a
+        // `name` available, the verb falls through to the create
+        // path and returns the daemon's freshly-minted canonical id.
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let resp = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "binding.upsert",
+            &json!({
+                "persona_id": "persona-stale-id",
+                "name": "drift-recovered-worker",
+            }),
+        ).await.unwrap();
+        assert_eq!(resp["created"], json!(true));
+        let canonical_id = resp["persona_id"].as_str().unwrap();
+        assert_ne!(canonical_id, "persona-stale-id");
+    }
+
+    #[tokio::test]
+    async fn binding_upsert_underscore_alias_dispatches_too() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let resp = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "binding_upsert",
+            &json!({"name": "alias-upsert-worker"}),
+        ).await.unwrap();
+        assert_eq!(resp["created"], json!(true));
+        assert_eq!(resp["name"], json!("alias-upsert-worker"));
+    }
+
+    // -------------------------------------------------------------------------
+    // implementation-note-107: register_session + close_session T2
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn register_session_and_close_session_emit_clean_exit_receipt() {
+        let _id_dir = setup_receipt_identity();
+
+        let store = DaemonStore::open_in_memory().unwrap();
+        store.set_vault(std::rc::Rc::new(test_vault()));
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let sessions_root = tempfile::TempDir::new().unwrap();
+        let sessions_dir = sessions_root.path().to_path_buf();
+
+        let persona = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "create_persona",
+            &json!({"name": "sess-test-persona"}),
+        ).await.unwrap();
+        let persona_id = persona["id"].as_str().unwrap();
+
+        let grant = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "create_grant",
+            &json!({
+                "persona_id": persona_id,
+                "credential_name": "claude-code-default-v1",
+                "scope": "claude-code",
+                "force": true,
+            }),
+        ).await.unwrap();
+        let grant_id = grant["id"].as_str().unwrap();
+        assert!(!grant_id.is_empty(), "grant must be created");
+
+        let mut ctx = RequestContext::internal("test harness");
+        ctx.sessions_dir = Some(sessions_dir.clone());
+
+        let reg = dispatch_method_with_context(
+            &store, &vault, &policy, &rl,
+            None, ctx.clone(),
+            "register_session",
+            &json!({
+                "persona": "sess-test-persona",
+                "launcher_pid": std::process::id(),
+            }),
+        ).await.unwrap();
+
+        let session_id = reg["session_id"].as_str().unwrap().to_string();
+        let reg_grant_id = reg["grant_id"].as_str().unwrap();
+        assert_eq!(reg_grant_id, grant_id, "register_session must return the active grant id");
+        assert!(!session_id.is_empty(), "session_id must be non-empty");
+
+        let session_dir = sessions_dir.join(&session_id);
+        assert!(session_dir.exists(), "session directory must be created");
+        assert!(
+            session_dir.join("meta.json").exists(),
+            "meta.json must be written"
+        );
+
+        let close = dispatch_method_with_context(
+            &store, &vault, &policy, &rl,
+            None, ctx,
+            "close_session",
+            &json!({ "session_id": session_id }),
+        ).await.unwrap();
+
+        assert_eq!(close["closed"], json!(true), "close_session must return closed:true");
+
+        let receipt_path = session_dir.join("receipt.json");
+        let receipt_bytes = std::fs::read(&receipt_path)
+            .expect("receipt.json must be written by close_session");
+        assert!(!receipt_bytes.is_empty(), "receipt.json must be non-empty");
+
+        let envelope: core_events::receipt::ReceiptEnvelope =
+            serde_json::from_slice(&receipt_bytes).expect("receipt.json parses as v2 envelope");
+        assert_eq!(envelope.kind, "session.claude_code");
+        assert!(envelope.signature.is_some(), "receipt must be signed");
+
+        let body: core_events::receipt::ClaudeCodeBody =
+            serde_json::from_value(envelope.body).unwrap();
+        assert_eq!(
+            body.termination_reason,
+            Some(core_events::receipt::TerminationReason::CleanExit),
+            "termination_reason must be clean_exit"
+        );
+
+        assert!(
+            !session_dir.join("meta.json").exists(),
+            "meta.json must be renamed to meta.json.closed on close"
+        );
+        assert!(
+            session_dir.join("meta.json.closed").exists(),
+            "meta.json.closed must exist after close"
+        );
+
+        // implementation-note-108: grant must remain
+        // Active after CleanExit — the handler no longer calls revoke_grant.
+        let grant_after = store.get_grant(grant_id).expect("grant still queryable");
+        assert_eq!(
+            grant_after.status, "active",
+            "CleanExit MUST NOT revoke the grant — multi-session per 24h grant invariant"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_session_fails_without_sessions_dir() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        store.set_vault(std::rc::Rc::new(test_vault()));
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let ctx = RequestContext::internal("test harness");
+
+        let err = dispatch_method_with_context(
+            &store, &vault, &policy, &rl,
+            None, ctx,
+            "register_session",
+            &json!({ "persona": "x", "launcher_pid": 1u32 }),
+        ).await.unwrap_err();
+        assert_eq!(err.0, -32000, "should fail with -32000 when sessions_dir absent");
+        assert!(err.1.contains("sessions_dir"), "error should mention sessions_dir");
+    }
+
+    // implementation-note-111: daemon-side T2 (updated for
+    // implementation-note-88) — register_session
+    // response must include the real LLM proxy URL from RequestContext.
+    #[tokio::test]
+    async fn register_session_response_includes_real_proxy_url() {
+        let _id_dir = setup_receipt_identity();
+
+        let store = DaemonStore::open_in_memory().unwrap();
+        store.set_vault(std::rc::Rc::new(test_vault()));
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let sessions_root = tempfile::TempDir::new().unwrap();
+        let sessions_dir = sessions_root.path().to_path_buf();
+
+        let expected_proxy_url = "http://127.0.0.1:61169";
+
+        let persona = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "create_persona",
+            &json!({"name": "proxy-url-test-persona"}),
+        ).await.unwrap();
+        let persona_id = persona["id"].as_str().unwrap();
+
+        dispatch_method(
+            &store, &vault, &policy, &rl,
+            "create_grant",
+            &json!({
+                "persona_id": persona_id,
+                "credential_name": "claude-code-default-v1",
+                "scope": "claude-code",
+                "force": true,
+            }),
+        ).await.unwrap();
+
+        let mut ctx = RequestContext::internal("test harness");
+        ctx.sessions_dir = Some(sessions_dir.clone());
+        // Wire the URL via RequestContext — the correct path after
+        // implementation-note-88.
+        ctx.llm_proxy_url = Some(expected_proxy_url.to_string());
+
+        let reg = dispatch_method_with_context(
+            &store, &vault, &policy, &rl,
+            None, ctx,
+            "register_session",
+            &json!({
+                "persona": "proxy-url-test-persona",
+                "launcher_pid": std::process::id(),
+            }),
+        ).await.unwrap();
+
+        let got_proxy_url = reg["proxy_url"].as_str().expect("proxy_url must be present in response");
+        assert_eq!(
+            got_proxy_url, expected_proxy_url,
+            "register_session must return the real LLM proxy URL from RequestContext, not the 8484 fallback"
+        );
+        assert_ne!(
+            got_proxy_url, "http://127.0.0.1:8484",
+            "proxy_url must not be the hardcoded 8484 fallback when ctx.llm_proxy_url is set"
+        );
+    }
+
+    // implementation-note-88: T2 test —
+    // register_session must read the LLM proxy URL from RequestContext,
+    // NOT from std::env::var. The env var may be absent or stale due to
+    // Rust 2024 std::env::set_var cross-thread visibility hazard (tokio
+    // worker threads may not observe a set_var from the startup thread).
+    // The fix in #2389 relied on set_var; this test proves the correct fix.
+    //
+    // Key assertion: even if EMBER_PROXY_URL is set to a DIFFERENT (wrong)
+    // value in the environment, the response uses the URL from RequestContext.
+    #[tokio::test]
+    async fn register_session_response_uses_request_context_proxy_url() {
+        let _id_dir = setup_receipt_identity();
+
+        let store = DaemonStore::open_in_memory().unwrap();
+        store.set_vault(std::rc::Rc::new(test_vault()));
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let sessions_root = tempfile::TempDir::new().unwrap();
+        let sessions_dir = sessions_root.path().to_path_buf();
+
+        // Deliberately set EMBER_PROXY_URL to a wrong value to prove the
+        // handler does NOT read it. RequestContext plumbing should win.
+        // SAFETY: test-only; value is removed after the test.
+        unsafe {
+            std::env::set_var("EMBER_PROXY_URL", "http://127.0.0.1:8484");
+        }
+
+        let persona = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "create_persona",
+            &json!({"name": "ctx-proxy-url-test-persona"}),
+        ).await.unwrap();
+        let persona_id = persona["id"].as_str().unwrap();
+
+        dispatch_method(
+            &store, &vault, &policy, &rl,
+            "create_grant",
+            &json!({
+                "persona_id": persona_id,
+                "credential_name": "claude-code-default-v1",
+                "scope": "claude-code",
+                "force": true,
+            }),
+        ).await.unwrap();
+
+        // Populate RequestContext with the real URL — this is what
+        // SocketListener.with_llm_proxy_url wires in production.
+        let mut ctx = RequestContext::internal("test harness");
+        ctx.sessions_dir = Some(sessions_dir.clone());
+        // implementation-note-88: this URL must
+        // appear in the response; the env var ("8484") must be ignored.
+        ctx.llm_proxy_url = Some("http://127.0.0.1:55555".to_string());
+
+        let reg = dispatch_method_with_context(
+            &store, &vault, &policy, &rl,
+            None, ctx,
+            "register_session",
+            &json!({
+                "persona": "ctx-proxy-url-test-persona",
+                "launcher_pid": std::process::id(),
+            }),
+        ).await.unwrap();
+
+        // Restore env so subsequent tests are not polluted.
+        unsafe {
+            std::env::remove_var("EMBER_PROXY_URL");
+        }
+
+        let got_proxy_url = reg["proxy_url"].as_str()
+            .expect("proxy_url must be present in response");
+        assert_eq!(
+            got_proxy_url, "http://127.0.0.1:55555",
+            "register_session must use ctx.llm_proxy_url from RequestContext, not env::var"
+        );
+        assert_ne!(
+            got_proxy_url, "http://127.0.0.1:8484",
+            "register_session must ignore EMBER_PROXY_URL env var; RequestContext wins"
+        );
     }
 }

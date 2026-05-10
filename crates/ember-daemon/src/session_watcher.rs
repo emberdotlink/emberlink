@@ -2,9 +2,15 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use chrono::{DateTime, Duration, Utc};
+use core_events::receipt::{TerminationAuthority, TerminationReason};
 use tracing::{info, warn};
 
+use crate::infra::receipt::{
+    current_identity,
+    issue::{issue_cohort_a_receipt, TerminationMeta},
+};
 use crate::infra::store::DaemonStore;
+use crate::session::lifecycle::DaemonPersonaSigner;
 use core_state::sessions::SessionStore;
 
 /// How long after a session's grant `created_at` before TTL backstop fires.
@@ -66,7 +72,7 @@ pub fn sessions_dir_from_data(data_dir: &std::path::Path) -> PathBuf {
 /// - logs a `session.closed` event into the daemon audit log with the reason
 ///   as the `outcome` field.
 pub async fn run(store: Rc<DaemonStore>, sessions_dir: PathBuf) {
-    let session_store = SessionStore::new(sessions_dir);
+    let session_store = SessionStore::new(sessions_dir.clone());
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
 
     loop {
@@ -94,7 +100,16 @@ pub async fn run(store: Rc<DaemonStore>, sessions_dir: PathBuf) {
                         age_secs = age.num_seconds(),
                         "session watcher: orphaned session — closing"
                     );
-                    close_session(&session_store, &store, session_id, "heartbeat-orphan");
+                    // Orphan close: use HeartbeatLost (launcher PID gone).
+                    close_session(
+                        &session_store,
+                        &store,
+                        session_id,
+                        &session.grant_id,
+                        "heartbeat-orphan",
+                        TerminationReason::HeartbeatLost,
+                        &sessions_dir,
+                    );
                     continue;
                 }
             }
@@ -139,18 +154,171 @@ pub async fn run(store: Rc<DaemonStore>, sessions_dir: PathBuf) {
                     grant_id = %session.grant_id,
                     "session watcher: grant TTL expired — closing session"
                 );
-                close_session(&session_store, &store, session_id, "ttl-expired");
+                // v2_receipt_coverage_audit_v030_2026_05_09: extend Receipt to TTL/revoke per M3 follow-up
+                close_session(
+                    &session_store,
+                    &store,
+                    session_id,
+                    &session.grant_id,
+                    "ttl-expired",
+                    TerminationReason::TtlExpired,
+                    &sessions_dir,
+                );
             }
         }
     }
 }
 
+/// Public entry point for tests and callers that need to directly trigger a
+/// TTL-expiry session close with a signed v2 Receipt. Wraps [`close_session`]
+/// with `TerminationReason::TtlExpired` so test code does not need access to
+/// the private `close_session` signature.
+///
+/// Returns the v2 Receipt envelope on success; `None` if the daemon identity
+/// is not initialised or issuance fails (same best-effort posture as the
+/// background sweep).
+pub fn close_session_ttl_expiry(
+    session_store: &SessionStore,
+    daemon_store: &DaemonStore,
+    session_id: &str,
+    grant_id: &str,
+    sessions_dir: &std::path::Path,
+) {
+    close_session(
+        session_store,
+        daemon_store,
+        session_id,
+        grant_id,
+        "ttl-expired",
+        TerminationReason::TtlExpired,
+        sessions_dir,
+    );
+}
+
+/// Public entry point for tests and callers that need to directly trigger a
+/// clean-exit session close with a signed v2 Receipt. Wraps [`close_session`]
+/// with `TerminationReason::CleanExit` so test code does not need access to
+/// the private `close_session` signature.
+///
+/// implementation-note-134: clean_exit MUST NOT revoke
+/// the grant — multiple sessions per 24h grant is the contract.
+pub fn close_session_clean_exit(
+    session_store: &SessionStore,
+    daemon_store: &DaemonStore,
+    session_id: &str,
+    grant_id: &str,
+    sessions_dir: &std::path::Path,
+) {
+    close_session(
+        session_store,
+        daemon_store,
+        session_id,
+        grant_id,
+        "clean-exit",
+        TerminationReason::CleanExit,
+        sessions_dir,
+    );
+}
+
+/// Emit a signed v2 cohort-A Receipt for the given session, persist the
+/// sidecar to `<sessions_dir>/<session_id>/receipt.json`, close the session
+/// via [`SessionStore::close`], conditionally revoke the broker grant, and
+/// audit-log the transition.
+///
+/// `termination_reason` distinguishes TTL-expiry from orphan (heartbeat-lost)
+/// sweeps so the signed body accurately records the actual cause.
+///
+/// # Grant revocation policy
+///
+/// implementation-note-134: clean_exit MUST NOT revoke
+/// the grant — multiple sessions per 24h grant is the contract.
+///
+/// Grant revocation is performed ONLY for:
+/// - `TerminationReason::TtlExpired` — the 24h window has closed; no new sessions.
+/// - `TerminationReason::ExplicitRevoke` — operator-initiated; grant is terminal.
+/// - `TerminationReason::HeartbeatLost` — dirty exit (orphan sweep); treat as
+///   unclean termination; the grant is revoked so stale credentials cannot be
+///   re-used by a process that disappeared without ceremony.
+///
+/// `TerminationReason::CleanExit` does NOT revoke the grant. The grant remains
+/// `Active` and supports further sessions within the 24h window. This matches
+/// the v0.3 test-plan invariant H3: "a 24h grant supports many sessions".
+///
+/// Receipt emission is best-effort: if the daemon identity is not yet
+/// initialised (test harness, pre-startup paths), this function logs a
+/// warning and continues — the session still gets closed and the audit row
+/// still lands so operators see the transition.
 fn close_session(
     session_store: &SessionStore,
     daemon_store: &DaemonStore,
     session_id: &str,
+    grant_id: &str,
     reason: &str,
+    termination_reason: TerminationReason,
+    sessions_dir: &std::path::Path,
 ) {
+    // Evaluate revocation policy before moving termination_reason into the Receipt.
+    //
+    // implementation-note-134: clean_exit MUST NOT revoke
+    // the grant — multiple sessions per 24h grant is the contract.
+    let should_revoke = !matches!(termination_reason, TerminationReason::CleanExit);
+
+    // 1. Emit a signed v2 cohort-A Receipt before mutating state so the
+    //    audit trail is complete even on partial failure.
+    //    v2_receipt_coverage_audit_v030_2026_05_09: extend Receipt to TTL/revoke per M3 follow-up
+    if let Some(identity) = current_identity() {
+        let signer = DaemonPersonaSigner::new(identity);
+        match issue_cohort_a_receipt(
+            session_id,
+            Vec::new(),
+            None,
+            TerminationAuthority::DaemonPersona,
+            &identity.pubkey_hex(),
+            Some(TerminationMeta {
+                reason: termination_reason,
+                last_heartbeat_at: None,
+                pid_alive_at_check: None,
+            }),
+            &signer,
+        ) {
+            Ok(envelope) => {
+                let receipt_path = sessions_dir.join(session_id).join("receipt.json");
+                match serde_json::to_vec_pretty(&envelope) {
+                    Ok(bytes) => {
+                        if let Err(e) = std::fs::write(&receipt_path, &bytes) {
+                            warn!(
+                                session_id = %session_id,
+                                path = %receipt_path.display(),
+                                error = %e,
+                                "session watcher: failed to persist v2 Receipt sidecar"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            session_id = %session_id,
+                            error = %e,
+                            "session watcher: failed to serialize v2 Receipt"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    session_id = %session_id,
+                    error = %e,
+                    "session watcher: failed to issue v2 cohort-A Receipt"
+                );
+            }
+        }
+    } else {
+        warn!(
+            session_id = %session_id,
+            "session watcher: daemon identity not initialised — skipping v2 Receipt emission"
+        );
+    }
+
+    // 2. Close the session (renames meta.json → meta.json.closed).
     if let Err(e) = session_store.close(session_id) {
         warn!(
             session_id = %session_id,
@@ -160,12 +328,39 @@ fn close_session(
         return;
     }
 
+    // 3. Revoke the broker grant — cascades to children.
+    //
+    // Revoke only on terminal/dirty termination reasons (see policy at top of
+    // function). CleanExit leaves the grant Active.
+    if should_revoke {
+        if let Err(e) = daemon_store.revoke_grant(grant_id) {
+            match e {
+                crate::infra::store::StoreError::NotFound => {
+                    warn!(
+                        session_id = %session_id,
+                        grant_id = %grant_id,
+                        "session watcher: grant absent at close — likely already terminal"
+                    );
+                }
+                other => {
+                    warn!(
+                        session_id = %session_id,
+                        grant_id = %grant_id,
+                        error = %other,
+                        "session watcher: failed to revoke grant"
+                    );
+                }
+            }
+        }
+    }
+
+    // 4. Audit-log the transition.
     if let Err(e) = daemon_store.log_event(
         None,
         "session.closed",
         None,
         reason,
-        Some(&format!("session_id={session_id}")),
+        Some(&format!("session_id={session_id} grant_id={grant_id}")),
     ) {
         warn!(
             session_id = %session_id,

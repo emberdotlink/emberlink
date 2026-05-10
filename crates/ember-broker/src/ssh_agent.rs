@@ -1,4 +1,4 @@
-//! Tier-0 daemon-managed ssh-agent (implementation-note-22).
+//! Tier-0 daemon-managed ssh-agent (implementation-note-28).
 //!
 //! Per the 2026-05-05 grill (Angle A1): the daemon IS the ssh-agent for a
 //! session. A fresh ed25519 keypair is minted in the daemon's address space,
@@ -26,7 +26,7 @@
 //! TODO: on session start, register the session
 //! pubkey as a deploy-key on the target GitHub repo via the GitHub App.
 //! On drop, deregister it. This is a separate task; the ssh-agent
-//! infrastructure (this file) is the deliverable for implementation-note-22.
+//! infrastructure (this file) is the deliverable for implementation-note-28.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -617,40 +617,33 @@ mod tests {
     // --- Drop-guard / zeroize tests ---
 
     #[test]
-    fn session_key_seed_zeroed_on_drop() {
-        // We capture a copy of the seed bytes before drop, then verify
-        // the original Vec is zeroed. We use `unsafe` to read through the
-        // raw pointer after the `drop` call — the memory is still mapped
-        // (we're on the same thread, no dealloc between drop and read in
-        // this single-threaded context) so this is a deterministic probe.
-        let key = SessionKey::generate().expect("keygen");
-        let seed_ptr = key.seed.as_ptr();
-        let seed_len = key.seed.len();
-
-        // Capture seed contents before drop.
-        let original: Vec<u8> = key.seed.clone();
-        assert!(!original.iter().all(|&b| b == 0), "seed must not be all-zero before drop");
-        assert_eq!(seed_len, 32);
-
-        // Drop the key — this calls our `Drop` impl which calls `seed.zeroize()`.
-        drop(key);
-
-        // Read back through the raw pointer. The allocator may have not yet
-        // reclaimed the memory (no realloc happened on this thread). We check
-        // that at least the Zeroize call ran (i.e., seed was cleared at some
-        // point during drop). Because `Vec::zeroize` writes zeroes via
-        // `write_bytes` and the memory stays mapped, reading back zeroes is
-        // the expected outcome. If this assertion is flaky on a specific
-        // allocator, the test guards the behaviour rather than the memory
-        // address.
+    fn session_key_seed_zeroize_mechanism() {
+        // The earlier version of this test read seed memory through a raw
+        // pointer AFTER SessionKey was dropped, asserting the bytes had
+        // been zeroed. That is undefined behaviour: Vec's destructor frees
+        // the allocation when SessionKey goes out of scope, and reading
+        // freed memory has no defined contents on any allocator that may
+        // reuse, scrub, or unmap the page. The test was passing on Linux
+        // and failing on macOS — both outcomes were unsound.
         //
-        // In practice this is the same pattern used in `secrecy` crate tests.
-        let zeroed = unsafe {
-            std::slice::from_raw_parts(seed_ptr, seed_len)
-        };
+        // The real invariant is structural: SessionKey's Drop impl calls
+        // `self.seed.zeroize()` BEFORE the field's Vec destructor releases
+        // the heap allocation (see `impl Drop for SessionKey` above; line
+        // 255 at this revision). Code-review enforces that ordering. What
+        // we CAN test soundly is the mechanism — that `Vec::zeroize` does
+        // what we expect on a buffer of the same shape — so that the Drop
+        // impl's call site has the documented effect.
+        use zeroize::Zeroize;
+        let mut seed: Vec<u8> = (1u8..=32).collect();
+        assert_eq!(seed.len(), 32);
         assert!(
-            zeroed.iter().all(|&b| b == 0),
-            "seed must be zeroed after SessionKey::drop"
+            !seed.iter().all(|&b| b == 0),
+            "fixture must not be all-zero before zeroize"
+        );
+        seed.zeroize();
+        assert!(
+            seed.iter().all(|&b| b == 0),
+            "Vec::zeroize must zero all bytes"
         );
     }
 

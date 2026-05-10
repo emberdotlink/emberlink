@@ -1,0 +1,20 @@
+# Security-critical product paths require maintainer review.
+
+.github/workflows/ @emberdotlink/maintainers
+**/.classification @emberdotlink/maintainers
+.gitleaks.toml @emberdotlink/maintainers
+
+crates/core-crypto/ @emberdotlink/maintainers
+crates/core-eventlog/src/authorize.rs @emberdotlink/maintainers
+crates/core-eventlog/src/materialize.rs @emberdotlink/maintainers
+crates/core-eventlog/src/types.rs @emberdotlink/maintainers
+crates/core-event-types/src/events.rs @emberdotlink/maintainers
+crates/core-grant-types/ @emberdotlink/maintainers
+
+crates/ember-daemon/src/broker/ @emberdotlink/maintainers
+crates/ember-daemon/src/infra/dashboard.rs @emberdotlink/maintainers
+crates/ember-daemon/src/infra/proxy.rs @emberdotlink/maintainers
+crates/ember-daemon/src/infra/sandbox.rs @emberdotlink/maintainers
+crates/ember-daemon/src/infra/vault.rs @emberdotlink/maintainers
+crates/emberlink-agent/src/runtime.rs @emberdotlink/maintainers
+crates/emberlink-mcp/src/daemon_transport.rs @emberdotlink/maintainers

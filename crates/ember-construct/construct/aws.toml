@@ -1,0 +1,282 @@
+# CLASSIFICATION: PUBLIC
+# Construct manifest for ember-aws per design §2.
+#
+# Action schema: each [[actions]] declares an allowed action_key, optional
+# budget caps, biometric requirement, and a permit/deny default. The daemon's
+# broker.resolve consults this to decide whether the action requires a
+# credential mint, an existing grant, or refuses.
+#
+# Credential injection: the broker (`BrokerProvider::AwsSts`) issues STS
+# AssumeRole credentials scoped to the grant's allowed actions. The daemon
+# materializes them into AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY +
+# AWS_SESSION_TOKEN + AWS_DEFAULT_REGION. Daemon zeroizes on child exit.
+#
+# Read-only verbs (`describe-*`, `list-*`, `get-*`, `ls`, `head-object`)
+# classify to `None` (passthrough) and never reach this manifest.
+
+[meta]
+name = "ember-aws"
+version = "0.1.0"
+publisher = "did:emberlink"
+description = "AWS CLI v2 Construct. Mediates `aws` invocations through ember's credential broker: IAM privilege removal (delete-*, detach-*) and KMS key/secret destruction (schedule-key-deletion, decrypt) require biometric approval; S3 destructive ops (rm, delete-object) gate by default and require biometric when targeting a grant's production_buckets; secretsmanager.delete-secret and ec2.terminate-instances require biometric. STS credentials inject via AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN / AWS_DEFAULT_REGION."
+
+# Default policy for unlisted action keys.
+default = "deny"
+
+# --- s3 high-level mutations (data destruction) ---
+
+[[actions]]
+key = "aws.s3.cp"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "aws.s3.sync"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "aws.s3.mv"
+default = "permit"
+mode = "gate"
+
+# s3 rm: data destruction. Biometric required when target bucket is in
+# the grant's `production_buckets` list (enforced daemon-side per the
+# resolved scope).
+[[actions]]
+key = "aws.s3.rm"
+default = "permit"
+mode = "gate"
+biometric_when_production_bucket = true
+
+# --- s3api low-level ---
+
+[[actions]]
+key = "aws.s3api.put-object"
+default = "permit"
+mode = "gate"
+
+# s3api delete-object: same production-bucket-gated biometric as s3 rm.
+[[actions]]
+key = "aws.s3api.delete-object"
+default = "permit"
+mode = "gate"
+biometric_when_production_bucket = true
+
+[[actions]]
+key = "aws.s3api.put-bucket-policy"
+default = "permit"
+mode = "gate"
+
+# --- iam (privilege management) ---
+#
+# create-* / attach-* / put-*: privilege grant; gate without biometric.
+# delete-* / detach-*: privilege removal; gate with biometric.
+
+[[actions]]
+key = "aws.iam.create-user"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "aws.iam.create-role"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "aws.iam.create-policy"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "aws.iam.create-access-key"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "aws.iam.attach-user-policy"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "aws.iam.attach-role-policy"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "aws.iam.attach-group-policy"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "aws.iam.put-user-policy"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "aws.iam.put-role-policy"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "aws.iam.put-group-policy"
+default = "permit"
+mode = "gate"
+
+# Privilege removal — biometric required.
+[[actions]]
+key = "aws.iam.delete-user"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "aws.iam.delete-role"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "aws.iam.delete-policy"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "aws.iam.delete-access-key"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "aws.iam.detach-user-policy"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "aws.iam.detach-role-policy"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "aws.iam.detach-group-policy"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- sts (audited passthrough) ---
+
+[[actions]]
+key = "aws.sts.assume-role"
+default = "permit"
+mode = "gate"
+
+# --- secretsmanager ---
+
+[[actions]]
+key = "aws.secretsmanager.create-secret"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "aws.secretsmanager.update-secret"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "aws.secretsmanager.put-secret-value"
+default = "permit"
+mode = "gate"
+
+# secretsmanager delete-secret: biometric required (irreversible).
+[[actions]]
+key = "aws.secretsmanager.delete-secret"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- kms ---
+
+[[actions]]
+key = "aws.kms.create-key"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "aws.kms.encrypt"
+default = "permit"
+mode = "gate"
+
+# kms schedule-key-deletion: key destruction; biometric required.
+[[actions]]
+key = "aws.kms.schedule-key-deletion"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# kms decrypt: secret reveal; biometric required.
+[[actions]]
+key = "aws.kms.decrypt"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- ec2 ---
+
+[[actions]]
+key = "aws.ec2.delete-volume"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "aws.ec2.delete-snapshot"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "aws.ec2.modify-instance-attribute"
+default = "permit"
+mode = "gate"
+
+# ec2 terminate-instances: irreversible; biometric required.
+[[actions]]
+key = "aws.ec2.terminate-instances"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- lambda ---
+
+[[actions]]
+key = "aws.lambda.update-function-code"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "aws.lambda.delete-function"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "aws.lambda.invoke"
+default = "permit"
+mode = "gate"
+
+# --- cloudformation ---
+
+[[actions]]
+key = "aws.cloudformation.deploy"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "aws.cloudformation.delete-stack"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "aws.cloudformation.update-stack"
+default = "permit"
+mode = "gate"

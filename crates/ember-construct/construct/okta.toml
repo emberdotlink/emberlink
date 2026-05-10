@@ -1,0 +1,258 @@
+# CLASSIFICATION: PUBLIC
+# Construct manifest for ember-okta per design §2.
+#
+# Action schema: each [[actions]] declares an allowed action_key, optional
+# budget caps, biometric requirement, and a permit/deny default. The daemon's
+# broker.resolve consults this to decide whether the action requires a
+# credential mint, an existing grant, or refuses.
+#
+# Credential injection: the broker (`BrokerProvider::Okta`) issues scoped
+# service-token credentials via Okta's API-token-management endpoint. The
+# daemon materializes them into `OKTA_API_TOKEN`. Daemon zeroizes on child
+# exit.
+#
+# Read-only verbs (`list`, `get`, `describe`) classify to `None`
+# (passthrough) and never reach this manifest.
+#
+# This Construct wraps the **Okta admin CLI** (`okta` command). The
+# separate `okta-aws-cli` and the terraform-okta provider are out of
+# scope here.
+
+[meta]
+name = "ember-okta"
+version = "0.1.0"
+publisher = "did:emberlink"
+description = "Okta admin CLI Construct. Mediates `okta` mutations through ember's broker: account-removal verbs (users delete/deactivate/suspend, users reset-password — account-takeover risk), group/app/policy/factor/idps destruction (groups delete, apps delete/deactivate, policies delete/deactivate, factors reset/deactivate, idps delete/deactivate), and session.end (force user logout) all require biometric approval. system-log.export gates without biometric (auditable read but not destructive). All other classified mutating verbs (creates, updates, assignments) gate without biometric. OKTA_API_TOKEN injects via env; daemon zeroizes on child exit."
+
+# Default policy for unlisted action keys.
+default = "deny"
+
+# --- users ---
+#
+# users delete / deactivate / suspend / reset-password are all
+# account-takeover-risk verbs — biometric required.
+
+[[actions]]
+key = "okta.users.create"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "okta.users.delete"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "okta.users.deactivate"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "okta.users.suspend"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "okta.users.update"
+default = "permit"
+mode = "gate"
+
+# users reset-password: account-takeover risk — biometric required.
+[[actions]]
+key = "okta.users.reset-password"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- groups ---
+#
+# groups delete: group-scoped privilege removal — biometric required.
+
+[[actions]]
+key = "okta.groups.create"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "okta.groups.delete"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "okta.groups.add-user"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "okta.groups.remove-user"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "okta.groups.update"
+default = "permit"
+mode = "gate"
+
+# --- apps ---
+#
+# apps delete / deactivate: app removal — affects all assigned users.
+# Biometric required.
+
+[[actions]]
+key = "okta.apps.create"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "okta.apps.delete"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "okta.apps.deactivate"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "okta.apps.update"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "okta.apps.assign-user"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "okta.apps.unassign-user"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "okta.apps.assign-group"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "okta.apps.unassign-group"
+default = "permit"
+mode = "gate"
+
+# --- policies ---
+#
+# policies delete / deactivate: policy mutation = security-posture change.
+# Biometric required.
+
+[[actions]]
+key = "okta.policies.create"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "okta.policies.delete"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "okta.policies.update"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "okta.policies.deactivate"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- factors ---
+#
+# factors reset / deactivate: MFA factor changes — account-takeover risk.
+# Biometric required.
+
+[[actions]]
+key = "okta.factors.enroll"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "okta.factors.reset"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "okta.factors.deactivate"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- idps ---
+#
+# idps delete / deactivate: identity provider removal — federated-auth
+# blast radius. Biometric required.
+
+[[actions]]
+key = "okta.idps.create"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "okta.idps.delete"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "okta.idps.deactivate"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+[[actions]]
+key = "okta.idps.update"
+default = "permit"
+mode = "gate"
+
+# --- zones ---
+
+[[actions]]
+key = "okta.zones.create"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "okta.zones.delete"
+default = "permit"
+mode = "gate"
+
+[[actions]]
+key = "okta.zones.update"
+default = "permit"
+mode = "gate"
+
+# --- session ---
+#
+# session end: force user logout — biometric required.
+
+[[actions]]
+key = "okta.session.end"
+default = "permit"
+mode = "gate"
+biometric = "required"
+
+# --- system-log ---
+#
+# system-log export: audit-log read should be auditable but is not
+# destructive. Gate without biometric.
+
+[[actions]]
+key = "okta.system-log.export"
+default = "permit"
+mode = "gate"

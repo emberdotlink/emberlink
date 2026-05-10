@@ -5,6 +5,13 @@ memory/
 *.pem
 *.p12
 *.pfx
+
+# Sync-to-public operator-only secrets file (implementation-note-1).
+# The .example schema IS committed; the actual sync-secrets.env (with real
+# names / emails / financial figures) MUST NOT commit. Defense-in-depth:
+# scripts/sync-to-public/** is also denylisted in deny-paths.txt, so even
+# if this gitignore line is removed the file won't ship to the public mirror.
+
 .headless-control
 .headless-metrics.jsonl
 .headless-ready-queue.json
