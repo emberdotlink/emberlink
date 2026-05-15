@@ -1,6 +1,6 @@
 use core_approval::{ApprovalLifecycle, ApprovalOutcome, LifecycleError, RequestId, SubmitMetadata};
 use core_grants::Grant;
-use core_types::approval::RequestedScope;
+use core_grant_types::approval::RequestedScope;
 
 struct MockLifecycle;
 

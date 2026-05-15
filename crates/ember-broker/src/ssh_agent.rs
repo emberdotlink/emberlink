@@ -1,4 +1,4 @@
-//! Tier-0 daemon-managed ssh-agent (implementation-note-28).
+//! Tier-0 daemon-managed ssh-agent (implementation-note-56).
 //!
 //! Per the 2026-05-05 grill (Angle A1): the daemon IS the ssh-agent for a
 //! session. A fresh ed25519 keypair is minted in the daemon's address space,
@@ -23,16 +23,33 @@
 //!
 //! ## GitHub deploy-key lifecycle
 //!
-//! TODO: on session start, register the session
-//! pubkey as a deploy-key on the target GitHub repo via the GitHub App.
-//! On drop, deregister it. This is a separate task; the ssh-agent
-//! infrastructure (this file) is the deliverable for implementation-note-28.
+//! [`spawn_session_ssh_agent_with_github_deploy_key`] layers GitHub
+//! deploy-key registration on top of [`spawn_session_ssh_agent`]:
+//!
+//! 1. Mint a fresh ed25519 keypair and bind the UDS (Tier-0 path).
+//! 2. Mint a GitHub App installation token via
+//!    [`crate::github_app::mint_installation_token`].
+//! 3. POST the session pubkey to `/repos/{owner}/{repo}/keys` as a
+//!    read-only deploy-key titled `"ember session <session_id>"`.
+//! 4. Retain the returned [`DeployKeyHandle`] inside the parent
+//!    [`SshAgentHandle`] so dropping the parent fires
+//!    `DELETE /repos/{owner}/{repo}/keys/{key_id}`.
+//!
+//! Registration is **best-effort + auditable**: when the GitHub API call
+//! fails (rate-limited, network down, repo not found, App not configured)
+//! the spawn function still returns `Ok(handle)` and records the failure
+//! reason on the handle via
+//! [`SshAgentHandle::deploy_key_registration_failed`]. Callers can read
+//! the field and decide whether to proceed. Drop-time deregistration logs
+//! via `tracing::warn!` on failure but never panics.
 
+use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
+use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -262,6 +279,200 @@ impl Drop for SessionKey {
 }
 
 // ---------------------------------------------------------------------------
+// Deploy-key error type
+// ---------------------------------------------------------------------------
+
+/// Errors returned by deploy-key registration operations.
+#[derive(Debug, thiserror::Error)]
+pub enum SshAgentError {
+    #[error("GitHub App credentials not configured on this handle")]
+    NotConfigured,
+    #[error("installation token mint failed: {0}")]
+    TokenMint(String),
+    #[error("GitHub API request failed: {0}")]
+    Http(String),
+    #[error("GitHub API returned unexpected status {status}: {body}")]
+    BadResponse { status: u16, body: String },
+    #[error("response parse failed: {0}")]
+    Parse(String),
+}
+
+// ---------------------------------------------------------------------------
+// Deploy-key HTTP client trait (separate from github_app::HttpClient)
+// ---------------------------------------------------------------------------
+
+/// Minimal HTTP client trait for deploy-key registration/deregistration.
+/// Separate from [`crate::github_app::HttpClient`] (which is scoped to
+/// installation-token minting) so the two concerns stay independent.
+///
+/// Tests inject [`MockDeployKeyClient`] (defined in the test module).
+/// Production code uses [`ReqwestDeployKeyClient`].
+#[async_trait::async_trait]
+pub trait DeployKeyHttpClient: Send + Sync {
+    /// POST a JSON body to `url` with `Authorization: Bearer <bearer>`.
+    /// Returns `(status_code, response_body_string)`.
+    async fn post_json_bearer(
+        &self,
+        url: &str,
+        bearer: &str,
+        body: &str,
+    ) -> Result<(u16, String), SshAgentError>;
+
+    /// DELETE `url` with `Authorization: Bearer <bearer>`.
+    /// Returns `(status_code, response_body_string)`.
+    async fn delete_bearer(
+        &self,
+        url: &str,
+        bearer: &str,
+    ) -> Result<(u16, String), SshAgentError>;
+}
+
+// ---------------------------------------------------------------------------
+// Production reqwest-backed DeployKeyHttpClient
+// ---------------------------------------------------------------------------
+
+/// Production [`DeployKeyHttpClient`] backed by `reqwest`.
+pub struct ReqwestDeployKeyClient {
+    inner: reqwest::Client,
+}
+
+impl ReqwestDeployKeyClient {
+    pub fn new() -> Self {
+        let inner = reqwest::Client::builder()
+            .user_agent("ember-broker/deploy-key")
+            .build()
+            .expect("reqwest client construction must not fail in production");
+        Self { inner }
+    }
+}
+
+impl Default for ReqwestDeployKeyClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait::async_trait]
+impl DeployKeyHttpClient for ReqwestDeployKeyClient {
+    async fn post_json_bearer(
+        &self,
+        url: &str,
+        bearer: &str,
+        body: &str,
+    ) -> Result<(u16, String), SshAgentError> {
+        let resp = self
+            .inner
+            .post(url)
+            .header("Authorization", format!("Bearer {bearer}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("Content-Type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(|e| SshAgentError::Http(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.map_err(|e| SshAgentError::Http(e.to_string()))?;
+        Ok((status, text))
+    }
+
+    async fn delete_bearer(
+        &self,
+        url: &str,
+        bearer: &str,
+    ) -> Result<(u16, String), SshAgentError> {
+        let resp = self
+            .inner
+            .delete(url)
+            .header("Authorization", format!("Bearer {bearer}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .send()
+            .await
+            .map_err(|e| SshAgentError::Http(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.map_err(|e| SshAgentError::Http(e.to_string()))?;
+        Ok((status, text))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DeployKeyHandle — holds the registered key id; deregisters on drop
+// ---------------------------------------------------------------------------
+
+/// Handle for a registered GitHub deploy key.
+///
+/// Dropping this handle fires a best-effort `DELETE /repos/<owner>/<repo>/keys/<id>`
+/// using a `tokio::spawn` so the async call can run without blocking `Drop`.
+/// Errors are logged and swallowed — `drop` must not panic.
+pub struct DeployKeyHandle {
+    pub key_id: u64,
+    pub owner: String,
+    pub repo: String,
+    /// Title used when registering: `"ember session <session-id>"`.
+    pub key_title: String,
+    /// Installation token used for the DELETE call. Kept as a plain String
+    /// here (no SecretString) because Drop cannot hold references and the
+    /// token's TTL is already ~1 hour (GH App installation token bound).
+    bearer_token: String,
+    client: Arc<dyn DeployKeyHttpClient>,
+}
+
+impl std::fmt::Debug for DeployKeyHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeployKeyHandle")
+            .field("key_id", &self.key_id)
+            .field("owner", &self.owner)
+            .field("repo", &self.repo)
+            .field("key_title", &self.key_title)
+            .finish()
+    }
+}
+
+impl Drop for DeployKeyHandle {
+    fn drop(&mut self) {
+        let url = format!(
+            "https://api.github.com/repos/{}/{}/keys/{}",
+            self.owner, self.repo, self.key_id
+        );
+        let bearer = self.bearer_token.clone();
+        let client = Arc::clone(&self.client);
+        let key_id = self.key_id;
+        let owner = self.owner.clone();
+        let repo = self.repo.clone();
+        // Best-effort: spawn on the current runtime if one is available.
+        // If no runtime is running (e.g. drop in a sync context) the spawn
+        // returns immediately with a JoinError which we swallow.
+        let _handle = tokio::spawn(async move {
+            match client.delete_bearer(&url, &bearer).await {
+                Ok((204, _)) | Ok((404, _)) => {
+                    tracing::debug!(key_id, owner, repo, "deploy-key deregistered");
+                }
+                Ok((status, body)) => {
+                    tracing::warn!(
+                        key_id,
+                        owner,
+                        repo,
+                        status,
+                        body,
+                        "deploy-key DELETE returned unexpected status"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        key_id,
+                        owner,
+                        repo,
+                        error = %e,
+                        "deploy-key DELETE failed (best-effort, ignoring)"
+                    );
+                }
+            }
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SshAgentHandle
 // ---------------------------------------------------------------------------
 
@@ -274,6 +485,29 @@ pub struct SshAgentHandle {
     _task: tokio::task::JoinHandle<()>,
     /// Drop guard: zeros the privkey and unlinks the socket on drop.
     _guard: Arc<AgentGuard>,
+    /// Session identifier — embedded in deploy-key titles for traceability.
+    session_id: String,
+    /// The session ed25519 keypair (Arc shared with the accept loop).
+    session_key: Arc<SessionKey>,
+    /// GitHub App credentials for deploy-key registration. `None` when
+    /// GH App is not configured (most sessions).
+    gh_creds: Option<crate::github_app::GhAppCredentials>,
+    /// HTTP client used for deploy-key API calls. Swapped for a mock in tests.
+    deploy_key_client: Arc<dyn DeployKeyHttpClient>,
+    /// Idempotency registry: `(owner, repo)` → `key_id`. Ensures that
+    /// calling `register_deploy_key` twice with the same target is a no-op.
+    deploy_key_registry: Mutex<HashMap<(String, String), u64>>,
+    /// Deploy-key handles retained by the spawn-with-deploy-key flow so
+    /// that dropping this `SshAgentHandle` cascades into
+    /// `DELETE /repos/<owner>/<repo>/keys/<id>` for each registered key.
+    /// Other (non-retaining) callers of `register_deploy_key` get the
+    /// `DeployKeyHandle` directly and own its lifecycle.
+    retained_deploy_keys: Mutex<Vec<DeployKeyHandle>>,
+    /// Reason string captured when
+    /// [`spawn_session_ssh_agent_with_github_deploy_key`] failed to
+    /// register the deploy-key (best-effort flow). `None` means either
+    /// registration succeeded or no deploy-key spawn was attempted.
+    deploy_key_registration_failed: Mutex<Option<String>>,
 }
 
 struct AgentGuard {
@@ -283,6 +517,223 @@ struct AgentGuard {
 impl Drop for AgentGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SshAgentHandle — deploy-key registration impl
+// ---------------------------------------------------------------------------
+
+/// Response shape from `POST /repos/<owner>/<repo>/keys`.
+#[derive(serde::Deserialize)]
+struct GhDeployKeyResponse {
+    id: u64,
+}
+
+impl SshAgentHandle {
+    /// Register the session pubkey as a GitHub deploy-key on `owner/repo`.
+    ///
+    /// Mints an installation token via the configured GitHub App, then calls
+    /// `POST /repos/<owner>/<repo>/keys` with the session pubkey. The returned
+    /// `key_id` is stored in the handle so `Drop` can DELETE it.
+    ///
+    /// Idempotent: if this handle has already registered a key for the same
+    /// `(owner, repo)` pair, the existing `key_id` is returned immediately
+    /// without a second POST.
+    pub async fn register_deploy_key(
+        &self,
+        owner: &str,
+        repo: &str,
+    ) -> Result<DeployKeyHandle, SshAgentError> {
+        let creds = self.gh_creds.as_ref().ok_or(SshAgentError::NotConfigured)?;
+
+        // Mint installation token for the API call.
+        let token = crate::github_app::mint_installation_token(creds, &[], &[])
+            .await
+            .map_err(|e| SshAgentError::TokenMint(e.to_string()))?;
+
+        self.register_deploy_key_with_token(owner, repo, &token.token).await
+    }
+
+    /// Inner implementation that accepts a pre-minted bearer token. Used
+    /// by `register_deploy_key` (production) and tests (which supply a
+    /// fixture token to bypass the GitHub App JWT flow).
+    async fn register_deploy_key_with_token(
+        &self,
+        owner: &str,
+        repo: &str,
+        bearer_token: &str,
+    ) -> Result<DeployKeyHandle, SshAgentError> {
+        // Idempotency check.
+        {
+            let registry = self.deploy_key_registry.lock().expect("deploy key registry mutex");
+            if let Some(&key_id) = registry.get(&(owner.to_string(), repo.to_string())) {
+                let key_title = format!("ember session {}", self.session_id);
+                return Ok(DeployKeyHandle {
+                    key_id,
+                    owner: owner.to_string(),
+                    repo: repo.to_string(),
+                    key_title,
+                    bearer_token: bearer_token.to_string(),
+                    client: Arc::clone(&self.deploy_key_client),
+                });
+            }
+        }
+
+        // Build the OpenSSH public key wire format: "ssh-ed25519 <base64-of-blob>".
+        let pk_blob = self.session_key.pubkey_blob();
+        let pk_b64 = base64::engine::general_purpose::STANDARD.encode(&pk_blob);
+        let pubkey_wire = format!("ssh-ed25519 {pk_b64}");
+
+        let key_title = format!("ember session {}", self.session_id);
+
+        let body = serde_json::json!({
+            "title": key_title,
+            "key": pubkey_wire,
+            "read_only": true,
+        })
+        .to_string();
+
+        let url = format!("https://api.github.com/repos/{owner}/{repo}/keys");
+        let (status, resp_body) = self
+            .deploy_key_client
+            .post_json_bearer(&url, bearer_token, &body)
+            .await?;
+
+        if status != 201 {
+            return Err(SshAgentError::BadResponse {
+                status,
+                body: resp_body,
+            });
+        }
+
+        let parsed: GhDeployKeyResponse = serde_json::from_str(&resp_body)
+            .map_err(|e| SshAgentError::Parse(format!("parse deploy key response: {e}")))?;
+
+        let key_id = parsed.id;
+
+        // Record in the idempotency registry.
+        {
+            let mut registry = self.deploy_key_registry.lock().expect("deploy key registry mutex");
+            registry.insert((owner.to_string(), repo.to_string()), key_id);
+        }
+
+        Ok(DeployKeyHandle {
+            key_id,
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            key_title,
+            bearer_token: bearer_token.to_string(),
+            client: Arc::clone(&self.deploy_key_client),
+        })
+    }
+
+    /// Register a deploy-key on `owner/repo` using a pre-minted bearer
+    /// token, retain the resulting [`DeployKeyHandle`] inside this
+    /// [`SshAgentHandle`], and return `()` on success. On failure, the
+    /// error reason is recorded in
+    /// [`SshAgentHandle::deploy_key_registration_failed`] and `Ok(())` is
+    /// returned (best-effort flow — see module docs).
+    ///
+    /// "Retain" means the parent handle owns the `DeployKeyHandle`, so
+    /// dropping the parent fires `DELETE /repos/<owner>/<repo>/keys/<id>`
+    /// for every retained key. Callers that need to manage the deploy-key
+    /// lifecycle themselves should use
+    /// [`SshAgentHandle::register_deploy_key`] (or
+    /// `register_deploy_key_with_token` in tests) and own the returned
+    /// handle directly.
+    pub async fn register_and_retain_deploy_key_with_token(
+        &self,
+        owner: &str,
+        repo: &str,
+        bearer_token: &str,
+    ) {
+        match self
+            .register_deploy_key_with_token(owner, repo, bearer_token)
+            .await
+        {
+            Ok(dk_handle) => {
+                let mut retained = self
+                    .retained_deploy_keys
+                    .lock()
+                    .expect("retained deploy keys mutex");
+                retained.push(dk_handle);
+            }
+            Err(e) => {
+                let mut failed = self
+                    .deploy_key_registration_failed
+                    .lock()
+                    .expect("deploy key registration failed mutex");
+                *failed = Some(e.to_string());
+                tracing::warn!(
+                    owner,
+                    repo,
+                    error = %e,
+                    "deploy-key registration failed (best-effort, returning Ok handle)"
+                );
+            }
+        }
+    }
+
+    /// Returns the failure reason captured by the deploy-key spawn path,
+    /// or `None` if registration succeeded (or no spawn-with-deploy-key
+    /// flow was used). Useful for callers that need to decide whether to
+    /// proceed when the GitHub side of the bring-up failed.
+    pub fn deploy_key_registration_failed(&self) -> Option<String> {
+        self.deploy_key_registration_failed
+            .lock()
+            .expect("deploy key registration failed mutex")
+            .clone()
+    }
+
+    /// Number of retained deploy-key handles. Exposed for tests and
+    /// observability. Production code typically only registers a single
+    /// deploy-key per session.
+    pub fn retained_deploy_key_count(&self) -> usize {
+        self.retained_deploy_keys
+            .lock()
+            .expect("retained deploy keys mutex")
+            .len()
+    }
+
+    /// Configure GitHub App credentials on this handle. Returns `self` for
+    /// chaining. Used by tests and callers that set up GH App after construction.
+    pub fn with_gh_creds(mut self, creds: crate::github_app::GhAppCredentials) -> Self {
+        self.gh_creds = Some(creds);
+        self
+    }
+
+    /// Swap the deploy-key HTTP client. Used by tests to inject a mock.
+    pub fn with_deploy_key_client(mut self, client: Arc<dyn DeployKeyHttpClient>) -> Self {
+        self.deploy_key_client = client;
+        self
+    }
+
+    /// Test-only constructor that creates a minimal handle with no real UDS,
+    /// usable for unit-testing the deploy-key API calls in isolation.
+    #[cfg(test)]
+    #[allow(private_interfaces)]
+    pub fn new_for_test(
+        session_id: &str,
+        session_key: Arc<SessionKey>,
+        deploy_key_client: Arc<dyn DeployKeyHttpClient>,
+    ) -> Self {
+        // Spawn a no-op task as the _task placeholder.
+        let task = tokio::spawn(async {});
+        Self {
+            auth_sock_path: PathBuf::from("/dev/null"),
+            _task: task,
+            _guard: Arc::new(AgentGuard {
+                socket_path: PathBuf::new(),
+            }),
+            session_id: session_id.to_string(),
+            session_key,
+            gh_creds: None,
+            deploy_key_client,
+            deploy_key_registry: Mutex::new(HashMap::new()),
+            retained_deploy_keys: Mutex::new(Vec::new()),
+            deploy_key_registration_failed: Mutex::new(None),
+        }
     }
 }
 
@@ -300,9 +751,9 @@ impl Drop for AgentGuard {
 /// The probe key is immediately discarded; it is not stored anywhere.
 #[cfg(target_os = "macos")]
 fn binary_has_se_entitlement() -> bool {
-    use crate::secure_enclave::generate_secure_enclave_key;
+    use crate::secure_enclave::{generate_secure_enclave_key, SeKeychainTarget};
     // A unique-enough label that won't collide with real session keys.
-    match generate_secure_enclave_key("ember-se-entitlement-probe") {
+    match generate_secure_enclave_key("ember-se-entitlement-probe", SeKeychainTarget::LoginKeychain) {
         Ok(_key) => {
             // Key was created — SE entitlement confirmed.
             // The key is dropped here and never stored.
@@ -345,11 +796,11 @@ pub fn spawn_session_ssh_agent(session_id: &str) -> Result<SshAgentHandle> {
     #[cfg(target_os = "macos")]
     {
         if binary_has_se_entitlement() {
-            use crate::secure_enclave::generate_secure_enclave_key;
+            use crate::secure_enclave::{generate_secure_enclave_key, SeKeychainTarget};
             use crate::ssh_agent_macos::spawn_session_ssh_agent_se;
 
             let label = format!("ember-session-{session_id}");
-            match generate_secure_enclave_key(&label) {
+            match generate_secure_enclave_key(&label, SeKeychainTarget::LoginKeychain) {
                 Ok(se_key) => match spawn_session_ssh_agent_se(session_id, se_key) {
                     Ok(se_handle) => {
                         tracing::info!(
@@ -366,6 +817,20 @@ pub fn spawn_session_ssh_agent(session_id: &str) -> Result<SshAgentHandle> {
                         // because they are different types. Instead we return the Tier-0
                         // handle after the SE agent is running. Since both share a
                         // different socket path, this returns the SE socket path.
+                        // Build a placeholder session_key for the SE path so
+                        // register_deploy_key can read the pubkey. In the SE
+                        // case the real key lives in the SE handle, but we
+                        // need the pubkey bytes here for the deploy-key title.
+                        // Generate a throwaway key for the pubkey bytes only —
+                        // it is never used for signing on the Tier-0 path.
+                        let placeholder_key = Arc::new(
+                            SessionKey::generate().unwrap_or_else(|_| SessionKey {
+                                seed: vec![0u8; 32],
+                                signing_key: SigningKey::from_bytes(&[0u8; 32]),
+                                verifying_key: SigningKey::from_bytes(&[0u8; 32])
+                                    .verifying_key(),
+                            }),
+                        );
                         return Ok(SshAgentHandle {
                             auth_sock_path: se_handle.auth_sock_path.clone(),
                             _task: {
@@ -386,6 +851,13 @@ pub fn spawn_session_ssh_agent(session_id: &str) -> Result<SshAgentHandle> {
                                 // (the SE guard handles the real cleanup).
                                 socket_path: PathBuf::new(),
                             }),
+                            session_id: session_id.to_string(),
+                            session_key: placeholder_key,
+                            gh_creds: None,
+                            deploy_key_client: Arc::new(ReqwestDeployKeyClient::default()),
+                            deploy_key_registry: Mutex::new(HashMap::new()),
+                            retained_deploy_keys: Mutex::new(Vec::new()),
+                            deploy_key_registration_failed: Mutex::new(None),
                         });
                     }
                     Err(e) => {
@@ -429,6 +901,7 @@ pub fn spawn_session_ssh_agent(session_id: &str) -> Result<SshAgentHandle> {
         socket_path: socket_path.clone(),
     });
     let guard_clone = Arc::clone(&guard);
+    let session_key_clone = Arc::clone(&session_key);
 
     let task = tokio::spawn(agent_accept_loop(listener, session_key, guard_clone));
 
@@ -436,7 +909,76 @@ pub fn spawn_session_ssh_agent(session_id: &str) -> Result<SshAgentHandle> {
         auth_sock_path: socket_path,
         _task: task,
         _guard: guard,
+        session_id: session_id.to_string(),
+        session_key: session_key_clone,
+        gh_creds: None,
+        deploy_key_client: Arc::new(ReqwestDeployKeyClient::default()),
+        deploy_key_registry: Mutex::new(HashMap::new()),
+        retained_deploy_keys: Mutex::new(Vec::new()),
+        deploy_key_registration_failed: Mutex::new(None),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Spawn-with-GitHub-deploy-key (Phase 1A entry point)
+// ---------------------------------------------------------------------------
+
+/// Spawn a session ssh-agent (per [`spawn_session_ssh_agent`]) and register
+/// the session pubkey as a GitHub deploy-key on `owner/repo`.
+///
+/// The returned [`SshAgentHandle`]:
+///
+/// - has `gh_creds` populated so subsequent `register_deploy_key` calls work,
+/// - retains the registered [`DeployKeyHandle`] so dropping the parent fires
+///   `DELETE /repos/<owner>/<repo>/keys/<id>`,
+/// - exposes [`SshAgentHandle::deploy_key_registration_failed`] when the
+///   GitHub-side bring-up failed.
+///
+/// **Best-effort failure mode.** If the GitHub App is not configured, the
+/// installation-token mint fails, or the deploy-key POST returns a non-201
+/// status, this function still returns `Ok(handle)` with the failure
+/// reason recorded on the handle. Callers can inspect
+/// [`SshAgentHandle::deploy_key_registration_failed`] and decide whether
+/// to proceed.
+///
+/// The only `Err` return path is when the underlying
+/// [`spawn_session_ssh_agent`] call fails (key generation or UDS bind) —
+/// the deploy-key half is always best-effort.
+pub async fn spawn_session_ssh_agent_with_github_deploy_key(
+    session_id: &str,
+    owner: &str,
+    repo: &str,
+    creds: crate::github_app::GhAppCredentials,
+) -> Result<SshAgentHandle> {
+    let handle = spawn_session_ssh_agent(session_id)?.with_gh_creds(creds);
+
+    // Best-effort: register the deploy-key. Use the public
+    // `register_deploy_key` (which mints its own installation token) so
+    // we go through the full production flow.
+    match handle.register_deploy_key(owner, repo).await {
+        Ok(dk_handle) => {
+            let mut retained = handle
+                .retained_deploy_keys
+                .lock()
+                .expect("retained deploy keys mutex");
+            retained.push(dk_handle);
+        }
+        Err(e) => {
+            let mut failed = handle
+                .deploy_key_registration_failed
+                .lock()
+                .expect("deploy key registration failed mutex");
+            *failed = Some(e.to_string());
+            tracing::warn!(
+                owner,
+                repo,
+                error = %e,
+                "deploy-key registration failed during spawn (best-effort, returning Ok handle)"
+            );
+        }
+    }
+
+    Ok(handle)
 }
 
 // ---------------------------------------------------------------------------
@@ -665,5 +1207,324 @@ mod tests {
         let msg_len = u32::from_be_bytes(frame[0..4].try_into().unwrap());
         assert_eq!(msg_len, 1);
         assert_eq!(frame[4], SSH_AGENT_FAILURE);
+    }
+
+    // -----------------------------------------------------------------------
+    // Deploy-key T1 tests (implementation-note-57)
+    // -----------------------------------------------------------------------
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Recording mock for deploy-key HTTP calls.
+    ///
+    /// Stores the last URL + body for POST calls and the last URL for DELETE
+    /// calls so tests can assert the correct endpoints were hit.
+    struct RecordingMockClient {
+        /// Canned response for POST calls: `(status, body)`.
+        post_response: (u16, String),
+        /// Canned response for DELETE calls: `(status, body)`.
+        delete_response: (u16, String),
+        /// Number of POST calls recorded.
+        post_count: Arc<AtomicU64>,
+        /// Number of DELETE calls recorded.
+        delete_count: Arc<AtomicU64>,
+        /// Last POST URL observed.
+        last_post_url: Arc<Mutex<Option<String>>>,
+        /// Last POST body observed.
+        last_post_body: Arc<Mutex<Option<String>>>,
+        /// Last DELETE URL observed.
+        last_delete_url: Arc<Mutex<Option<String>>>,
+    }
+
+    impl RecordingMockClient {
+        fn new(post_status: u16, post_body: String, delete_status: u16) -> Arc<Self> {
+            Arc::new(Self {
+                post_response: (post_status, post_body),
+                delete_response: (delete_status, String::new()),
+                post_count: Arc::new(AtomicU64::new(0)),
+                delete_count: Arc::new(AtomicU64::new(0)),
+                last_post_url: Arc::new(Mutex::new(None)),
+                last_post_body: Arc::new(Mutex::new(None)),
+                last_delete_url: Arc::new(Mutex::new(None)),
+            })
+        }
+
+        fn post_count(&self) -> u64 {
+            self.post_count.load(Ordering::SeqCst)
+        }
+
+        fn delete_count(&self) -> u64 {
+            self.delete_count.load(Ordering::SeqCst)
+        }
+
+        fn last_post_url(&self) -> Option<String> {
+            self.last_post_url.lock().unwrap().clone()
+        }
+
+        fn last_post_body(&self) -> Option<String> {
+            self.last_post_body.lock().unwrap().clone()
+        }
+
+        fn last_delete_url(&self) -> Option<String> {
+            self.last_delete_url.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DeployKeyHttpClient for RecordingMockClient {
+        async fn post_json_bearer(
+            &self,
+            url: &str,
+            _bearer: &str,
+            body: &str,
+        ) -> Result<(u16, String), SshAgentError> {
+            self.post_count.fetch_add(1, Ordering::SeqCst);
+            *self.last_post_url.lock().unwrap() = Some(url.to_string());
+            *self.last_post_body.lock().unwrap() = Some(body.to_string());
+            Ok((self.post_response.0, self.post_response.1.clone()))
+        }
+
+        async fn delete_bearer(
+            &self,
+            url: &str,
+            _bearer: &str,
+        ) -> Result<(u16, String), SshAgentError> {
+            self.delete_count.fetch_add(1, Ordering::SeqCst);
+            *self.last_delete_url.lock().unwrap() = Some(url.to_string());
+            Ok((self.delete_response.0, self.delete_response.1.clone()))
+        }
+    }
+
+    fn test_session_key() -> Arc<SessionKey> {
+        Arc::new(SessionKey::generate().expect("session key generation must succeed in tests"))
+    }
+
+    /// T1 — register_deploy_key POSTs to the correct URL and includes the
+    /// session pubkey in the request body.
+    #[tokio::test]
+    async fn test_register_deploy_key_posts_to_correct_url() {
+        let mock = RecordingMockClient::new(
+            201,
+            r#"{"id":42,"key":"ssh-ed25519 AAAA","title":"ember session test-session-1","read_only":true,"verified":false,"created_at":"2026-01-01T00:00:00Z","url":"https://api.github.com/repos/test-owner/test-repo/keys/42"}"#.to_string(),
+            204,
+        );
+
+        let session_key = test_session_key();
+        let handle = SshAgentHandle::new_for_test(
+            "test-session-1",
+            session_key,
+            Arc::clone(&mock) as Arc<dyn DeployKeyHttpClient>,
+        );
+
+        let deploy_handle = handle
+            .register_deploy_key_with_token("test-owner", "test-repo", "ghs_fixture_token")
+            .await
+            .expect("register_deploy_key must succeed");
+
+        // Verify key_id from the mocked response.
+        assert_eq!(deploy_handle.key_id, 42, "key_id must be 42 from mocked response");
+        assert_eq!(deploy_handle.owner, "test-owner");
+        assert_eq!(deploy_handle.repo, "test-repo");
+        assert_eq!(deploy_handle.key_title, "ember session test-session-1");
+
+        // Verify POST was called exactly once to the correct URL.
+        assert_eq!(mock.post_count(), 1, "exactly one POST must have been made");
+        assert_eq!(
+            mock.last_post_url().as_deref(),
+            Some("https://api.github.com/repos/test-owner/test-repo/keys"),
+            "POST URL must be the GitHub deploy keys endpoint"
+        );
+
+        // Verify the pubkey appears in the POST body.
+        let body = mock.last_post_body().expect("POST body must have been recorded");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("body must be valid JSON");
+        let key_field = parsed["key"].as_str().expect("body must have a 'key' field");
+        assert!(
+            key_field.starts_with("ssh-ed25519 "),
+            "key field must be an ssh-ed25519 pubkey wire string, got: {key_field}"
+        );
+    }
+
+    /// T2 — dropping a `DeployKeyHandle` fires the DELETE call for the key.
+    #[tokio::test]
+    async fn test_deregister_deploy_key_on_drop() {
+        let mock = RecordingMockClient::new(
+            201,
+            r#"{"id":42,"key":"ssh-ed25519 AAAA","title":"ember session s2","read_only":true,"verified":false,"created_at":"2026-01-01T00:00:00Z","url":"https://api.github.com/repos/test-owner/test-repo/keys/42"}"#.to_string(),
+            204,
+        );
+
+        let session_key = test_session_key();
+        let handle = SshAgentHandle::new_for_test(
+            "s2",
+            session_key,
+            Arc::clone(&mock) as Arc<dyn DeployKeyHttpClient>,
+        );
+
+        let deploy_handle = handle
+            .register_deploy_key_with_token("test-owner", "test-repo", "ghs_fixture_token")
+            .await
+            .expect("register must succeed");
+
+        assert_eq!(mock.delete_count(), 0, "no DELETE before drop");
+
+        // Drop the handle — this must trigger the DELETE call.
+        drop(deploy_handle);
+
+        // The DELETE is spawned asynchronously; yield the runtime to let it run.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(mock.delete_count(), 1, "DELETE must be called on drop");
+        assert_eq!(
+            mock.last_delete_url().as_deref(),
+            Some("https://api.github.com/repos/test-owner/test-repo/keys/42"),
+            "DELETE URL must target the registered key"
+        );
+    }
+
+    /// T4 — `register_and_retain_deploy_key_with_token` retains the
+    /// `DeployKeyHandle` inside the parent `SshAgentHandle`, and dropping
+    /// the parent triggers the DELETE call. This is the lifecycle
+    /// `spawn_session_ssh_agent_with_github_deploy_key` relies on.
+    #[tokio::test]
+    async fn test_spawn_with_github_deploy_key_retains_and_deletes_on_drop() {
+        let mock = RecordingMockClient::new(
+            201,
+            r#"{"id":7,"key":"ssh-ed25519 AAAA","title":"ember session s4","read_only":true,"verified":false,"created_at":"2026-01-01T00:00:00Z","url":"https://api.github.com/repos/owner/repo/keys/7"}"#.to_string(),
+            204,
+        );
+
+        let session_key = test_session_key();
+        let handle = SshAgentHandle::new_for_test(
+            "s4",
+            session_key,
+            Arc::clone(&mock) as Arc<dyn DeployKeyHttpClient>,
+        );
+
+        // Sanity: nothing retained, no failure recorded, no HTTP yet.
+        assert_eq!(handle.retained_deploy_key_count(), 0);
+        assert!(handle.deploy_key_registration_failed().is_none());
+        assert_eq!(mock.post_count(), 0);
+        assert_eq!(mock.delete_count(), 0);
+
+        // Drive the deploy-key registration through the retain path —
+        // this is exactly what `spawn_session_ssh_agent_with_github_deploy_key`
+        // does post-spawn, modulo the installation-token mint.
+        handle
+            .register_and_retain_deploy_key_with_token("owner", "repo", "ghs_fixture_token")
+            .await;
+
+        // POST hit the create-deploy-key endpoint.
+        assert_eq!(mock.post_count(), 1, "deploy-key POST must have fired");
+        assert_eq!(
+            mock.last_post_url().as_deref(),
+            Some("https://api.github.com/repos/owner/repo/keys"),
+        );
+
+        // Handle now retains exactly one deploy key, no failure recorded.
+        assert_eq!(handle.retained_deploy_key_count(), 1);
+        assert!(handle.deploy_key_registration_failed().is_none());
+
+        // No DELETE has fired yet — the retained handle is alive.
+        assert_eq!(mock.delete_count(), 0);
+
+        // Drop the parent `SshAgentHandle` — this drops the retained
+        // `DeployKeyHandle` whose Drop fires the DELETE.
+        drop(handle);
+
+        // The DELETE is `tokio::spawn`-ed; yield repeatedly so the task runs.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(mock.delete_count(), 1, "DELETE must fire on parent drop");
+        assert_eq!(
+            mock.last_delete_url().as_deref(),
+            Some("https://api.github.com/repos/owner/repo/keys/7"),
+            "DELETE must target the registered key by id",
+        );
+    }
+
+    /// T5 — when the deploy-key POST returns a non-201 status,
+    /// `register_and_retain_deploy_key_with_token` swallows the error,
+    /// records the reason on `deploy_key_registration_failed`, and does
+    /// not retain anything. This proves the best-effort contract from the
+    /// module docs.
+    #[tokio::test]
+    async fn test_spawn_with_github_deploy_key_best_effort_on_post_failure() {
+        let mock = RecordingMockClient::new(
+            422, // GitHub returns 422 for "key already in use" / validation errors.
+            r#"{"message":"key is already in use","documentation_url":""}"#.to_string(),
+            204,
+        );
+
+        let session_key = test_session_key();
+        let handle = SshAgentHandle::new_for_test(
+            "s5",
+            session_key,
+            Arc::clone(&mock) as Arc<dyn DeployKeyHttpClient>,
+        );
+
+        handle
+            .register_and_retain_deploy_key_with_token("owner", "repo", "ghs_fixture_token")
+            .await;
+
+        // POST was attempted exactly once.
+        assert_eq!(mock.post_count(), 1, "POST must have been attempted once");
+
+        // Nothing retained.
+        assert_eq!(handle.retained_deploy_key_count(), 0);
+
+        // Failure reason recorded.
+        let failed = handle
+            .deploy_key_registration_failed()
+            .expect("failure reason must be recorded");
+        assert!(
+            failed.contains("422") || failed.to_lowercase().contains("status"),
+            "failure reason should mention the HTTP status, got: {failed}"
+        );
+
+        // Drop fires no DELETE (nothing was retained).
+        drop(handle);
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(mock.delete_count(), 0, "no DELETE when nothing was retained");
+    }
+
+    /// T3 — calling register_deploy_key twice with the same (owner, repo) is
+    /// idempotent: the second call returns the cached key_id without a second POST.
+    #[tokio::test]
+    async fn test_register_deploy_key_idempotent() {
+        let mock = RecordingMockClient::new(
+            201,
+            r#"{"id":99,"key":"ssh-ed25519 AAAA","title":"ember session s3","read_only":true,"verified":false,"created_at":"2026-01-01T00:00:00Z","url":"https://api.github.com/repos/owner/repo/keys/99"}"#.to_string(),
+            204,
+        );
+
+        let session_key = test_session_key();
+        let handle = SshAgentHandle::new_for_test(
+            "s3",
+            session_key,
+            Arc::clone(&mock) as Arc<dyn DeployKeyHttpClient>,
+        );
+
+        let first = handle
+            .register_deploy_key_with_token("owner", "repo", "ghs_fixture_token")
+            .await
+            .expect("first register must succeed");
+
+        let second = handle
+            .register_deploy_key_with_token("owner", "repo", "ghs_fixture_token")
+            .await
+            .expect("second register must succeed");
+
+        // Both handles must report the same key_id.
+        assert_eq!(first.key_id, 99);
+        assert_eq!(second.key_id, 99, "idempotent call must return same key_id");
+
+        // Only one POST must have been made.
+        assert_eq!(mock.post_count(), 1, "second call must not POST again");
     }
 }

@@ -1,4 +1,4 @@
-//! implementation-note-133 — T2 integration tests.
+//! implementation-note-241 — T2 integration tests.
 //!
 //! Asserts that the two gap termination paths (TTL-expiry and explicit-revoke)
 //! each emit signed v2 cohort-A Receipts with the correct `termination_reason`
@@ -17,7 +17,7 @@
 //!   T2c — Regression guard: dirty-exit path still produces a receipt with
 //!          termination_reason = HeartbeatLost (non-regression).
 //!
-//! implementation-note-134 — T3 regression tests.
+//! implementation-note-242 — T3 regression tests.
 //!
 //! Guards the invariant that a CleanExit MUST NOT revoke the grant. A 24h
 //! grant must support many sessions; revoking on CleanExit broke touch #2 of
@@ -325,13 +325,13 @@ fn dirty_exit_still_emits_heartbeat_lost_receipt() {
 
 // ---------------------------------------------------------------------------
 // T3a — CleanExit MUST NOT revoke the grant
-// (implementation-note-134)
+// (implementation-note-242)
 // ---------------------------------------------------------------------------
 
 /// T3a: After a CleanExit session close, the grant must remain Active.
 ///
 /// This guards the multi-session-per-24h-grant invariant from the v0.3 test
-/// plan. Regression introduced by implementation-note-133
+/// plan. Regression introduced by implementation-note-241
 /// M3 which unconditionally called revoke_grant inside close_session.
 #[test]
 fn clean_exit_does_not_revoke_grant() {
@@ -367,13 +367,13 @@ fn clean_exit_does_not_revoke_grant() {
     assert_eq!(
         post_grant.status, "active",
         "CleanExit MUST NOT revoke the grant — multi-session per 24h grant is the contract \
-         (implementation-note-134)"
+         (implementation-note-242)"
     );
 }
 
 // ---------------------------------------------------------------------------
 // T3d — handler close_session RPC arm MUST NOT revoke the grant on CleanExit
-// (implementation-note-108)
+// (implementation-note-187)
 // ---------------------------------------------------------------------------
 
 /// T3d: After calling the handler's close_session RPC arm, the grant must
@@ -386,7 +386,7 @@ fn clean_exit_does_not_revoke_grant() {
 ///
 /// Invariant: a 24h grant supports many sessions. CleanExit closes the
 /// session but MUST leave the grant Active for the next session.
-/// (implementation-note-108)
+/// (implementation-note-187)
 #[tokio::test]
 async fn handler_close_session_does_not_revoke_grant_on_clean_exit() {
     let _id_dir = init_test_identity();
@@ -450,12 +450,12 @@ async fn handler_close_session_does_not_revoke_grant_on_clean_exit() {
     assert_eq!(close["closed"], json!(true), "close_session must return closed:true");
 
     // Post-condition: grant must remain Active — MUST NOT be revoked.
-    // implementation-note-108
+    // implementation-note-187
     let post_grant = store.get_grant(&grant_id).expect("get_grant post-close");
     assert_eq!(
         post_grant.status, "active",
         "handler close_session CleanExit MUST NOT revoke the grant \
-         (implementation-note-108)"
+         (implementation-note-187)"
     );
 }
 

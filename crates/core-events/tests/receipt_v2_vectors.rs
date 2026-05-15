@@ -35,6 +35,7 @@ fn deterministic_envelope_broker_mint() -> ReceiptEnvelope {
         daemon_root_id: "fixture-daemon-root".to_string(),
         traceparent: None,
         termination_authority: TerminationAuthority::UserSession,
+        presence_kind: None,
         body: serde_json::to_value(&body).unwrap(),
         signature: None,
     };
@@ -59,6 +60,7 @@ fn deterministic_envelope_binding_registered() -> ReceiptEnvelope {
         daemon_root_id: "fixture-daemon-root".to_string(),
         traceparent: None,
         termination_authority: TerminationAuthority::UserSession,
+        presence_kind: None,
         body: serde_json::to_value(&body).unwrap(),
         signature: None,
     };
@@ -93,6 +95,7 @@ fn deterministic_envelope_session_claude_code() -> ReceiptEnvelope {
         daemon_root_id: "fixture-daemon-root".to_string(),
         traceparent: None,
         termination_authority: TerminationAuthority::UserSession,
+        presence_kind: None,
         body: serde_json::to_value(&body).unwrap(),
         signature: None,
     };

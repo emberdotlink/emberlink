@@ -1,6 +1,6 @@
 //! `ember claude-code` launcher.
 //!
-//! Per design §2 / implementation-note-150 + design §3 (PATH-shadow wiring, sub-B).
+//! Per design §2 / implementation-note-272 + design §3 (PATH-shadow wiring, sub-B).
 //! Real daemon RPC shipped in #2318 (LAUNCHER-SESSION-RPC); see design §2
 //! for the full protocol contract.
 //!
@@ -15,7 +15,7 @@
 //! 3. Set `EMBER_GRANT_ID` / `EMBER_PROXY_URL` / `EMBER_SESSION_ID` in
 //!    the child env. `HTTPS_PROXY` is intentionally NOT set — the
 //!    daemon's LLM proxy isn't CONNECT-compatible (see
-//!    implementation-note-169). Claude Code talks
+//!    implementation-note-303). Claude Code talks
 //!    to api.anthropic.com directly with the friendly's own auth.
 //! 4. Prepend `shadow_dir` to the child's `PATH` via `Command::env` so that
 //!    tool invocations like `gh pr create` resolve to the ember Construct
@@ -54,13 +54,13 @@ pub struct SessionRegistration {
     pub session_id: String,
     pub grant_id: String,
     pub proxy_url: String,
-    /// Git credential-injection proxy URL (implementation-note-111).
+    /// Git credential-injection proxy URL (implementation-note-195).
     /// When `Some`, the child process receives `EMBER_GIT_PROXY_URL=<url>`.
     /// `None` when the daemon did not allocate a git proxy (git proxy disabled
     /// or pre-fix daemon).
     pub git_proxy_url: Option<String>,
     /// Path to the daemon-managed ssh-agent socket for this session
-    /// (implementation-note-28). When `Some`, the child process
+    /// (implementation-note-56). When `Some`, the child process
     /// receives `SSH_AUTH_SOCK=<path>` so git/ssh in the child tree find
     /// the daemon socket. `None` when the daemon did not allocate an
     /// ssh-agent for this session (e.g. pre-design daemon).
@@ -88,7 +88,7 @@ pub fn register_session_rpc(persona: &str, socket_path: &Path) -> io::Result<Ses
         .as_str()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "daemon: missing grant_id"))?
         .to_string();
-    // implementation-note-111: the daemon should always include
+    // implementation-note-195: the daemon should always include
     // proxy_url in the register_session response (it reads EMBER_PROXY_URL
     // from runtime state). If the fallback to 8484 fires it means the daemon
     // is pre-fix or the LLM proxy failed to bind — Claude Code will hit
@@ -100,7 +100,7 @@ pub fn register_session_rpc(persona: &str, socket_path: &Path) -> io::Result<Ses
                 "ember claude-code: WARNING — daemon did not return proxy_url in \
                  register_session response; falling back to http://127.0.0.1:8484 which \
                  is likely not bound. Claude Code may fail with ECONNREFUSED. \
-                 (implementation-note-111)"
+                 (implementation-note-195)"
             );
             "http://127.0.0.1:8484".to_string()
         }
@@ -238,7 +238,7 @@ pub fn run_with_registration(
     cmd.args(extra_args)
         .env("EMBER_GRANT_ID", &registration.grant_id)
         .env("EMBER_PROXY_URL", &registration.proxy_url)
-        // implementation-note-169: do NOT inject
+        // implementation-note-303: do NOT inject
         // HTTPS_PROXY for Claude Code. The daemon's LLM proxy
         // (`infra::proxy::run_proxy`) is a custom POST endpoint for the
         // Anthropic SDK base_url use case — NOT a CONNECT-supporting
@@ -255,12 +255,12 @@ pub fn run_with_registration(
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    // Inject the git proxy URL when the daemon provided one (implementation-note-111).
+    // Inject the git proxy URL when the daemon provided one (implementation-note-195).
     if let Some(ref gpu) = registration.git_proxy_url {
         cmd.env("EMBER_GIT_PROXY_URL", gpu);
     }
     // Inject daemon-managed ssh-agent socket when the broker provided one
-    // (implementation-note-28). git/ssh in the child tree pick this up
+    // (implementation-note-56). git/ssh in the child tree pick this up
     // automatically without any additional configuration.
     if let Some(ref sock) = registration.ssh_auth_sock {
         cmd.env("SSH_AUTH_SOCK", sock);
@@ -519,7 +519,7 @@ mod tests {
         close_session_rpc("sess_nonexistent", Path::new("/nonexistent.sock"));
     }
 
-    // ── persona resolution tests (implementation-note-170) ──
+    // ── persona resolution tests (implementation-note-304) ──
 
     #[test]
     fn persona_defaults_to_cohort_a_when_env_unset() {
@@ -576,11 +576,11 @@ mod tests {
         );
     }
 
-    // ── implementation-note-111: launcher env injection tests ──
+    // ── implementation-note-195: launcher env injection tests ──
 
     #[test]
     fn registration_with_real_proxy_url_is_not_8484() {
-        // implementation-note-111: verify that a registration
+        // implementation-note-195: verify that a registration
         // carrying a daemon-provided URL (non-8484) is accepted without
         // falling back. This is the T1 launcher acceptance condition.
         let reg = SessionRegistration {
@@ -607,7 +607,7 @@ mod tests {
 
     #[test]
     fn run_with_registration_injects_daemon_proxy_url_not_8484() {
-        // implementation-note-111: T2 launcher — assert that the
+        // implementation-note-195: T2 launcher — assert that the
         // child env receives the daemon-returned proxy URL. We verify this
         // indirectly by confirming run_with_registration succeeds (returns 0)
         // with a registration carrying an ephemeral port. The real child-env

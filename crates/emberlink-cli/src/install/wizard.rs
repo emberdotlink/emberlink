@@ -21,6 +21,9 @@
 //! Each step is a `wizard_step_*` function returning [`StepOutcome`]:
 //! - [`wizard_step_provision_user`] — system user + connect group.
 //! - [`wizard_step_chown_data_dirs`] — chown `~/.ember/{vault,grants,…}`.
+//! - [`wizard_step_provision_mek`] — vault MEK in System.keychain (macOS) /
+//!   keyring (Linux). Without this the daemon refuses to start.
+//!   implementation-note-302.
 //! - [`wizard_step_emit_launch_spec`] — launchd plist or systemd unit.
 //! - [`wizard_step_add_user_to_group`] — operator → `ember-clients`.
 //! - [`wizard_step_verify`] — daemon socket present + responsive.
@@ -112,6 +115,7 @@ pub enum WizardError {
 pub const WIZARD_STEPS: &[&str] = &[
     "provision-user",
     "chown-data-dirs",
+    "provision-mek",
     "emit-launch-spec",
     "add-user-to-group",
     "verify",
@@ -254,7 +258,16 @@ impl WizardContext {
 pub trait InstallPrimitives {
     fn provision_ember_user(&self) -> Result<(), daemon_install::InstallError>;
     fn chown_ember_data_dirs(&self, home: &Path) -> Result<(), daemon_install::InstallError>;
-    fn install_launch_spec(&self, platform: &Platform) -> Result<(), daemon_install::InstallError>;
+    /// Provision the vault MEK in System.keychain (macOS) / keyring (Linux).
+    /// The daemon refuses to start without this. Idempotent — re-running
+    /// against an existing MEK item is a no-op (preserves access to existing
+    /// encrypted state). implementation-note-302.
+    fn provision_se_mek(&self, home: &Path) -> Result<(), daemon_install::InstallError>;
+    fn install_launch_spec(
+        &self,
+        platform: &Platform,
+        operator_home: &Path,
+    ) -> Result<(), daemon_install::InstallError>;
     fn add_operator_to_group(
         &self,
         platform: &Platform,
@@ -271,6 +284,17 @@ pub trait InstallPrimitives {
     /// Reverse of [`chown_ember_data_dirs`] — chown the data dirs back to
     /// the operator's uid/gid. Best-effort.
     fn unwind_chown_ember_data_dirs(
+        &self,
+        _home: &Path,
+    ) -> Result<(), daemon_install::InstallError> {
+        Ok(())
+    }
+    /// Reverse of [`provision_se_mek`]. Default is no-op — unwinding a
+    /// keychain item risks data loss (encrypted state under that key becomes
+    /// unrecoverable), so rollback intentionally leaves the MEK in place.
+    /// An operator who wants to wipe it can do so manually via `security
+    /// delete-generic-password` / `secret-tool clear`.
+    fn unwind_provision_se_mek(
         &self,
         _home: &Path,
     ) -> Result<(), daemon_install::InstallError> {
@@ -325,11 +349,19 @@ impl InstallPrimitives for RealPrimitives {
         daemon_install::chown_ember_data_dirs(home)
     }
 
-    fn install_launch_spec(&self, platform: &Platform) -> Result<(), daemon_install::InstallError> {
+    fn provision_se_mek(&self, home: &Path) -> Result<(), daemon_install::InstallError> {
+        daemon_install::provision_se_mek(home)
+    }
+
+    fn install_launch_spec(
+        &self,
+        platform: &Platform,
+        operator_home: &Path,
+    ) -> Result<(), daemon_install::InstallError> {
         match platform {
-            Platform::MacOS => daemon_install::install_launchd_plist(),
+            Platform::MacOS => daemon_install::install_launchd_plist(operator_home),
             Platform::Linux { .. } | Platform::WslLinux { .. } => {
-                daemon_install::install_systemd_unit()
+                daemon_install::install_systemd_unit(operator_home)
             }
             Platform::Unsupported(name) => Err(daemon_install::InstallError::Subprocess {
                 cmd: "install_launch_spec".to_string(),
@@ -726,6 +758,7 @@ pub fn run_wizard_steps_from<P: InstallPrimitives>(
             let outcome = match *step {
                 "provision-user" => wizard_step_provision_user(ctx, primitives)?,
                 "chown-data-dirs" => wizard_step_chown_data_dirs(ctx, primitives)?,
+                "provision-mek" => wizard_step_provision_mek(ctx, primitives)?,
                 "emit-launch-spec" => wizard_step_emit_launch_spec(ctx, primitives)?,
                 "add-user-to-group" => wizard_step_add_user_to_group(ctx, primitives)?,
                 "verify" => wizard_step_verify(ctx, primitives)?,
@@ -798,7 +831,35 @@ pub fn wizard_step_chown_data_dirs<P: InstallPrimitives>(
     })
 }
 
-/// Step 3 — emit the platform launch spec (LaunchDaemon plist on macOS,
+/// Step 3 — provision the vault MEK in System.keychain (macOS) / keyring
+/// (Linux). Without this the daemon refuses to start: the vault module's
+/// boot path requires a present MEK to derive the file-encryption key.
+///
+/// Idempotent: `provision_se_mek` short-circuits when the keychain item
+/// already exists, preserving access to any existing encrypted state from
+/// a prior install. Re-running this step is safe.
+///
+/// implementation-note-302. The older
+/// non-wizard install path (in `crates/emberlink-cli/src/bin/ember.rs`)
+/// called this between the chown step and the launchd-plist step; the
+/// wizard refactor dropped it, causing every fresh install to end with a
+/// daemon that crash-loops because the MEK isn't in the keychain.
+pub fn wizard_step_provision_mek<P: InstallPrimitives>(
+    ctx: &WizardContext,
+    primitives: &P,
+) -> Result<StepOutcome, WizardError> {
+    primitives
+        .provision_se_mek(&ctx.home)
+        .map_err(|source| WizardError::Install {
+            step: "provision-mek",
+            source,
+        })?;
+    Ok(StepOutcome::Completed {
+        note: "provisioned vault MEK in keychain".to_string(),
+    })
+}
+
+/// Step 4 — emit the platform launch spec (LaunchDaemon plist on macOS,
 /// systemd unit on Linux/WSL) and bootstrap the daemon under the dedicated
 /// uid. Both daemon-side primitives are idempotent — the unit is rewritten
 /// only when the on-disk body drifts from the rendered body.
@@ -807,7 +868,7 @@ pub fn wizard_step_emit_launch_spec<P: InstallPrimitives>(
     primitives: &P,
 ) -> Result<StepOutcome, WizardError> {
     primitives
-        .install_launch_spec(&ctx.platform)
+        .install_launch_spec(&ctx.platform, &ctx.home)
         .map_err(|source| WizardError::Install {
             step: "emit-launch-spec",
             source,
@@ -822,7 +883,7 @@ pub fn wizard_step_emit_launch_spec<P: InstallPrimitives>(
     Ok(StepOutcome::Completed { note })
 }
 
-/// Step 4 — add the invoking operator to the `ember-clients` connect group
+/// Step 5 — add the invoking operator to the `ember-clients` connect group
 /// so the operator's processes can reach the daemon socket. Step 1 already
 /// did this internally; this step re-runs the platform-specific group-add
 /// command so the wizard transcript surfaces a distinct line, and so a
@@ -854,7 +915,7 @@ pub fn wizard_step_add_user_to_group<P: InstallPrimitives>(
     })
 }
 
-/// Step 5 — verify the daemon is responding under `uid=ember`.
+/// Step 6 — verify the daemon is responding under `uid=ember`.
 ///
 /// Two checks: (a) the daemon socket exists at
 /// `~/.ember/run/daemon.sock`; (b) `ps -eo uid,pid,comm | grep emberd`
@@ -1187,6 +1248,14 @@ pub fn run_rollback<P: InstallPrimitives>(
                         source,
                     })?;
             }
+            "provision-mek" => {
+                primitives
+                    .unwind_provision_se_mek(&ctx.home)
+                    .map_err(|source| WizardError::Install {
+                        step: "unwind-provision-mek",
+                        source,
+                    })?;
+            }
             "chown-data-dirs" => {
                 primitives
                     .unwind_chown_ember_data_dirs(&ctx.home)
@@ -1211,6 +1280,252 @@ pub fn run_rollback<P: InstallPrimitives>(
     }
     clear_wizard_state()?;
     Ok(())
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// implementation-note-289 — new-machine daemon detection + prompt
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Three-state result of [`detect_daemon_installed`].
+///
+/// - `Running`: the daemon socket is present on disk (the daemon is accepting
+///   connections).  We skip the install prompt entirely.
+/// - `InstalledNotRunning`: the platform service file (LaunchAgent plist or
+///   systemd user unit) exists but the socket is absent — the daemon has been
+///   installed before but isn't running right now.  We skip the install prompt
+///   and let the operator start the daemon manually or via `ember daemon start`.
+/// - `NotInstalled`: no service file and no socket.  This is the new-machine
+///   path — `ember init` should offer to run `sudo ember daemon install`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonInstallStatus {
+    /// Socket present — daemon is running.
+    Running,
+    /// Service file found but socket absent — installed, not yet running.
+    InstalledNotRunning,
+    /// No service file and no socket — not installed.
+    NotInstalled,
+}
+
+/// Detect whether the ember daemon is installed and/or running.
+///
+/// Detection order:
+/// 1. **Socket probe** — if `socket_path` exists, the daemon is `Running`.
+/// 2. **macOS LaunchAgent** — `~/Library/LaunchAgents/link.ember.daemon.plist`
+///    present → `InstalledNotRunning`.
+/// 3. **macOS system LaunchDaemon** — `/Library/LaunchDaemons/sh.emberlink.daemon.plist`
+///    present → `InstalledNotRunning`.
+/// 4. **Linux systemd user unit** — `~/.config/systemd/user/emberd.service`
+///    present → `InstalledNotRunning`.
+/// 5. None of the above → `NotInstalled`.
+///
+/// The caller supplies `socket_path` so the function is fully testable without
+/// touching the real filesystem (pass a tempdir path in tests).
+pub fn detect_daemon_installed(socket_path: &std::path::Path) -> DaemonInstallStatus {
+    // 1. Socket probe — fastest, no home-dir lookup required.
+    if socket_path.exists() {
+        return DaemonInstallStatus::Running;
+    }
+
+    // 2–4. Service-file probes.
+    if let Some(home) = dirs_next::home_dir() {
+        // macOS LaunchAgent (user-level, single-uid posture).
+        let macos_agent = home
+            .join("Library")
+            .join("LaunchAgents")
+            .join("link.ember.daemon.plist");
+        if macos_agent.exists() {
+            return DaemonInstallStatus::InstalledNotRunning;
+        }
+
+        // Linux systemd user unit.
+        let linux_unit = home
+            .join(".config")
+            .join("systemd")
+            .join("user")
+            .join("emberd.service");
+        if linux_unit.exists() {
+            return DaemonInstallStatus::InstalledNotRunning;
+        }
+    }
+
+    // macOS system-level LaunchDaemon (separate-uid posture, written to /Library).
+    const MACOS_SYSTEM_PLIST: &str = "/Library/LaunchDaemons/sh.emberlink.daemon.plist";
+    if std::path::Path::new(MACOS_SYSTEM_PLIST).exists() {
+        return DaemonInstallStatus::InstalledNotRunning;
+    }
+
+    DaemonInstallStatus::NotInstalled
+}
+
+/// Errors that `prompt_install_daemon` and its testable `_with` variant can
+/// return.
+#[derive(Debug)]
+pub enum DaemonInstallPromptError {
+    /// `--non-interactive` was set — prompting is forbidden.
+    NonInteractive,
+    /// The operator declined the install prompt.
+    Declined,
+    /// `sudo ember daemon install` was spawned but exited non-zero.
+    InstallFailed { exit_code: Option<i32> },
+    /// Could not resolve the current ember binary path.
+    ExeNotFound(std::io::Error),
+    /// Spawning the subprocess failed.
+    SpawnFailed(std::io::Error),
+}
+
+impl std::fmt::Display for DaemonInstallPromptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DaemonInstallPromptError::NonInteractive => {
+                write!(
+                    f,
+                    "daemon is not installed; re-run without --non-interactive to be prompted, \
+                     or run `sudo ember daemon install` manually before `ember init`"
+                )
+            }
+            DaemonInstallPromptError::Declined => {
+                write!(
+                    f,
+                    "daemon install skipped — run `sudo ember daemon install` when ready, \
+                     then re-run `ember init`"
+                )
+            }
+            DaemonInstallPromptError::InstallFailed { exit_code } => {
+                let code = exit_code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                write!(
+                    f,
+                    "`sudo ember daemon install` exited with code {code}; check the output above \
+                     for details, then re-run `ember init`"
+                )
+            }
+            DaemonInstallPromptError::ExeNotFound(e) => {
+                write!(f, "could not locate ember binary: {e}")
+            }
+            DaemonInstallPromptError::SpawnFailed(e) => {
+                write!(f, "failed to spawn `sudo ember daemon install`: {e}")
+            }
+        }
+    }
+}
+
+/// Production entry point: display the cohort-A-friendly explanation and
+/// optionally run `sudo ember daemon install` via subprocess.
+///
+/// Delegates to [`prompt_install_daemon_with`] with real stdin/stdout and the
+/// real subprocess runner so tests can inject stubs.
+///
+/// Returns `Ok(())` when the operator consented and the install succeeded.
+/// Returns `Err(DaemonInstallPromptError::Declined)` when the operator said no.
+/// Returns other `Err` variants for non-interactive mode or subprocess failures.
+// implementation-note-289 checkpoint
+pub fn prompt_install_daemon(non_interactive: bool) -> Result<(), DaemonInstallPromptError> {
+    let stdin = io::stdin();
+    let mut stdout = io::stdout();
+    prompt_install_daemon_with(non_interactive, &mut stdout, &mut stdin.lock(), &RealSudoRunner)
+}
+
+/// Trait for running `sudo ember daemon install`. Abstracted for test injection.
+pub trait SudoRunner {
+    /// Run `sudo <ember-binary> daemon install` and return the exit status.
+    fn run_sudo_install(&self) -> Result<std::process::ExitStatus, std::io::Error>;
+}
+
+/// Production [`SudoRunner`] — resolves the current ember binary and spawns
+/// `sudo <binary> daemon install` as a foreground child.
+pub struct RealSudoRunner;
+
+impl SudoRunner for RealSudoRunner {
+    fn run_sudo_install(&self) -> Result<std::process::ExitStatus, std::io::Error> {
+        let exe = std::env::current_exe()?;
+        let status = Command::new("sudo")
+            .arg(&exe)
+            .arg("daemon")
+            .arg("install")
+            .status()?;
+        Ok(status)
+    }
+}
+
+/// Testable variant of [`prompt_install_daemon`].
+///
+/// Writes the explanation to `out`, reads a single character from `input` for
+/// the y/n prompt, and delegates to `runner` to execute the subprocess.
+///
+/// `non_interactive`: when `true`, returns `Err(NonInteractive)` immediately
+/// without writing any output or touching `runner`.
+pub fn prompt_install_daemon_with<W, R, S>(
+    non_interactive: bool,
+    out: &mut W,
+    input: &mut R,
+    runner: &S,
+) -> Result<(), DaemonInstallPromptError>
+where
+    W: io::Write,
+    R: io::BufRead,
+    S: SudoRunner,
+{
+    if non_interactive {
+        return Err(DaemonInstallPromptError::NonInteractive);
+    }
+
+    // Cohort-A-friendly explanation.
+    writeln!(out).ok();
+    writeln!(
+        out,
+        "The ember daemon is not installed on this machine."
+    )
+    .ok();
+    writeln!(out).ok();
+    writeln!(
+        out,
+        "  The daemon is the trust broker that holds the vault encryption key,\n\
+         enforces grant policy, and signs Receipts for every agent action.\n\
+         Without it, `ember init` cannot open the vault or create a persona."
+    )
+    .ok();
+    writeln!(out).ok();
+    writeln!(
+        out,
+        "  Installing the daemon requires elevated privileges so it can create\n\
+         a dedicated `ember` service account and register a system service\n\
+         (LaunchDaemon on macOS, systemd unit on Linux). The command is:\n\
+         \n\
+             sudo ember daemon install"
+    )
+    .ok();
+    writeln!(out).ok();
+    write!(out, "Run `sudo ember daemon install` now? [y/N] ").ok();
+    out.flush().ok();
+
+    let mut buf = String::new();
+    if input.read_line(&mut buf).is_err() {
+        return Err(DaemonInstallPromptError::Declined);
+    }
+    let answer = buf.trim().to_ascii_lowercase();
+    if answer != "y" && answer != "yes" {
+        return Err(DaemonInstallPromptError::Declined);
+    }
+
+    // Operator consented — run the install.
+    let status = runner
+        .run_sudo_install()
+        .map_err(|e| {
+            if std::env::current_exe().is_err() {
+                DaemonInstallPromptError::ExeNotFound(e)
+            } else {
+                DaemonInstallPromptError::SpawnFailed(e)
+            }
+        })?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(DaemonInstallPromptError::InstallFailed {
+            exit_code: status.code(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1397,9 +1712,17 @@ mod tests {
             self.calls.borrow_mut().push("chown_ember_data_dirs");
             Ok(())
         }
+        fn provision_se_mek(
+            &self,
+            _home: &Path,
+        ) -> Result<(), daemon_install::InstallError> {
+            self.calls.borrow_mut().push("provision_se_mek");
+            Ok(())
+        }
         fn install_launch_spec(
             &self,
             _platform: &Platform,
+            _operator_home: &Path,
         ) -> Result<(), daemon_install::InstallError> {
             self.calls.borrow_mut().push("install_launch_spec");
             Ok(())
@@ -1473,6 +1796,7 @@ mod tests {
             vec![
                 "provision_ember_user",
                 "chown_ember_data_dirs",
+                "provision_se_mek",
                 "install_launch_spec",
                 "add_operator_to_group",
                 "socket_responsive",
@@ -1480,7 +1804,7 @@ mod tests {
         );
     }
 
-    /// Step 4 falls through to a Skipped outcome when neither `$USER` nor
+    /// Step 5 falls through to a Skipped outcome when neither `$USER` nor
     /// `$SUDO_USER` is set — the wizard should still complete the other
     /// steps rather than failing the whole flow.
     #[test]
@@ -1514,9 +1838,16 @@ mod tests {
             ) -> Result<(), daemon_install::InstallError> {
                 Ok(())
             }
+            fn provision_se_mek(
+                &self,
+                _: &Path,
+            ) -> Result<(), daemon_install::InstallError> {
+                Ok(())
+            }
             fn install_launch_spec(
                 &self,
                 _: &Platform,
+                _: &Path,
             ) -> Result<(), daemon_install::InstallError> {
                 Ok(())
             }
@@ -1570,9 +1901,17 @@ mod tests {
             self.calls.borrow_mut().push("chown_ember_data_dirs");
             Ok(())
         }
+        fn provision_se_mek(
+            &self,
+            _: &Path,
+        ) -> Result<(), daemon_install::InstallError> {
+            self.calls.borrow_mut().push("provision_se_mek");
+            Ok(())
+        }
         fn install_launch_spec(
             &self,
             _: &Platform,
+            _: &Path,
         ) -> Result<(), daemon_install::InstallError> {
             self.calls.borrow_mut().push("install_launch_spec");
             Ok(())
@@ -1591,6 +1930,13 @@ mod tests {
         }
         fn unwind_provision_ember_user(&self) -> Result<(), daemon_install::InstallError> {
             self.calls.borrow_mut().push("unwind_provision_ember_user");
+            Ok(())
+        }
+        fn unwind_provision_se_mek(
+            &self,
+            _: &Path,
+        ) -> Result<(), daemon_install::InstallError> {
+            self.calls.borrow_mut().push("unwind_provision_se_mek");
             Ok(())
         }
         fn unwind_chown_ember_data_dirs(
@@ -1661,7 +2007,7 @@ mod tests {
     fn resume_or_rollback_resume_branch() {
         let state = partial_state();
         let action = wizard_resume_or_rollback_with_choice(&state, 'r');
-        // First two completed → resume from index 2 (emit-launch-spec).
+        // First two completed → resume from index 2 (provision-mek).
         assert_eq!(action, ResumeAction::Resume(2));
     }
 
@@ -1732,7 +2078,7 @@ mod tests {
 
     /// T1 — full resume + rollback + cancel scenario:
     /// (a) Simulate a wizard log where provision-user + chown-data-dirs
-    ///     completed and emit-launch-spec failed.
+    ///     completed and provision-mek failed.
     /// (b) Assert wizard_resume_or_rollback offers a resume choice that
     ///     maps to Resume(2) (skip the two completed steps).
     /// (c) Assert the rollback path unwinds completed steps in reverse.
@@ -1742,16 +2088,16 @@ mod tests {
         let state = WizardState {
             completed_steps: vec!["provision-user".into(), "chown-data-dirs".into()],
             last_error: Some(
-                "install step 'emit-launch-spec' failed: subprocess: cmd=launchctl, exit=1"
+                "install step 'provision-mek' failed: subprocess: cmd=security, exit=1"
                     .into(),
             ),
         };
 
-        // (b) Resume → start at index 2 (emit-launch-spec).
+        // (b) Resume → start at index 2 (provision-mek).
         match wizard_resume_or_rollback_with_choice(&state, 'r') {
             ResumeAction::Resume(idx) => {
                 assert_eq!(idx, 2);
-                assert_eq!(WIZARD_STEPS[idx], "emit-launch-spec");
+                assert_eq!(WIZARD_STEPS[idx], "provision-mek");
             }
             other => panic!("expected Resume(2), got {other:?}"),
         }
@@ -1892,5 +2238,151 @@ mod tests {
             }
             other => panic!("expected UserCreationFailed, got {other:?}"),
         }
+    }
+
+    // ----------------------------------------------------------------
+    // implementation-note-289 — T2 tests
+    // ----------------------------------------------------------------
+
+    /// detect_daemon_installed: socket present → Running.
+    #[test]
+    fn detect_daemon_installed_running_when_socket_exists() {
+        let tmp = tempdir().expect("tempdir");
+        let socket = tmp.path().join("daemon.sock");
+        fs::write(&socket, b"").expect("create socket fixture");
+        assert_eq!(
+            detect_daemon_installed(&socket),
+            DaemonInstallStatus::Running
+        );
+    }
+
+    /// detect_daemon_installed: no socket, no service files → NotInstalled.
+    #[test]
+    fn detect_daemon_installed_not_installed_when_nothing_present() {
+        let tmp = tempdir().expect("tempdir");
+        let socket = tmp.path().join("daemon.sock");
+        // We cannot easily suppress the real home-dir probe, but on the CI
+        // host neither the LaunchAgent plist nor the Linux systemd unit should
+        // be present — so this test verifies the non-socket branches don't
+        // false-positive into Running.
+        let status = detect_daemon_installed(&socket);
+        // Socket must not be Running (we didn't create it).
+        assert_ne!(
+            status,
+            DaemonInstallStatus::Running,
+            "socket was not created, must not be Running"
+        );
+    }
+
+    // ── Mock SudoRunner ─────────────────────────────────────────────────────
+
+    /// Stub runner that records whether it was called and returns a
+    /// configurable success/failure status.
+    struct MockSudoRunner {
+        called: std::cell::Cell<bool>,
+        succeed: bool,
+    }
+
+    impl MockSudoRunner {
+        fn succeeds() -> Self {
+            Self { called: std::cell::Cell::new(false), succeed: true }
+        }
+        fn fails() -> Self {
+            Self { called: std::cell::Cell::new(false), succeed: false }
+        }
+    }
+
+    impl SudoRunner for MockSudoRunner {
+        fn run_sudo_install(&self) -> Result<std::process::ExitStatus, std::io::Error> {
+            self.called.set(true);
+            // Build a real ExitStatus from a known exit code via a trivial
+            // child process.  We can't construct ExitStatus directly (it's
+            // opaque), so we spawn `true` (succeeds) or `false` (fails).
+            let status = if self.succeed {
+                std::process::Command::new("true").status()
+            } else {
+                std::process::Command::new("false").status()
+            };
+            status
+        }
+    }
+
+    /// T2 — non-interactive refuses without printing anything or calling the runner.
+    #[test]
+    fn prompt_install_daemon_non_interactive_refuses() {
+        let runner = MockSudoRunner::succeeds();
+        let mut out = Vec::<u8>::new();
+        let input_bytes = b"y\n";
+        let mut input = io::Cursor::new(input_bytes);
+
+        let result = prompt_install_daemon_with(true, &mut out, &mut input, &runner);
+
+        assert!(
+            matches!(result, Err(DaemonInstallPromptError::NonInteractive)),
+            "expected NonInteractive, got {result:?}",
+            result = result.map_err(|e| e.to_string())
+        );
+        // Must not have spawned the subprocess.
+        assert!(!runner.called.get(), "runner must not be called in non-interactive mode");
+    }
+
+    /// T2 — operator answers 'y' → runner is called and Ok(()) returned on success.
+    #[test]
+    fn prompt_install_daemon_consent_spawns_runner() {
+        let runner = MockSudoRunner::succeeds();
+        let mut out = Vec::<u8>::new();
+        let input_bytes = b"y\n";
+        let mut input = io::Cursor::new(input_bytes);
+
+        let result = prompt_install_daemon_with(false, &mut out, &mut input, &runner);
+
+        assert!(result.is_ok(), "expected Ok after consent; got: {}", result.unwrap_err());
+        assert!(runner.called.get(), "runner must be called after operator consent");
+
+        // Output must contain the cohort-A explanation and the command.
+        let printed = String::from_utf8(out).expect("utf8");
+        assert!(
+            printed.contains("sudo ember daemon install"),
+            "explanation must name the command; got: {printed}"
+        );
+        assert!(
+            printed.contains("trust broker"),
+            "explanation must describe the daemon role; got: {printed}"
+        );
+    }
+
+    /// T2 — operator answers 'n' → Declined, runner not called.
+    #[test]
+    fn prompt_install_daemon_decline_does_not_spawn() {
+        let runner = MockSudoRunner::succeeds();
+        let mut out = Vec::<u8>::new();
+        let input_bytes = b"n\n";
+        let mut input = io::Cursor::new(input_bytes);
+
+        let result = prompt_install_daemon_with(false, &mut out, &mut input, &runner);
+
+        assert!(
+            matches!(result, Err(DaemonInstallPromptError::Declined)),
+            "expected Declined"
+        );
+        assert!(!runner.called.get(), "runner must not be called when declined");
+    }
+
+    /// T2 — runner returns non-zero → InstallFailed variant.
+    #[test]
+    fn prompt_install_daemon_runner_failure_returns_install_failed() {
+        let runner = MockSudoRunner::fails();
+        let mut out = Vec::<u8>::new();
+        let input_bytes = b"y\n";
+        let mut input = io::Cursor::new(input_bytes);
+
+        let result = prompt_install_daemon_with(false, &mut out, &mut input, &runner);
+
+        assert!(
+            matches!(result, Err(DaemonInstallPromptError::InstallFailed { .. })),
+            "expected InstallFailed; got: {result:?}",
+            result = result.map_err(|e| e.to_string())
+        );
+        assert!(runner.called.get());
     }
 }

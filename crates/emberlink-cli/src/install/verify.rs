@@ -178,7 +178,7 @@ pub struct TrustedPublisher {
 /// The corresponding Ed25519 secret key is held in the project's hardware
 /// security module — see `docs/install-supply-chain.md` §"Publisher key
 /// custody". The base64 string here is a placeholder that the release
-/// pipeline will overwrite once the production key is provisioned (implementation-note-168
+/// pipeline will overwrite once the production key is provisioned (implementation-note-301
 /// follow-up). Until then, `verify_install_bundle` will fail-closed with
 /// `BadPublisherKey` because the placeholder isn't a valid Ed25519 point.
 pub const EMBERLINK_RELEASE_PUBLISHER_DID: &str = "did:web:ember.link";

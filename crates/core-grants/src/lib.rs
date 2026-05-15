@@ -5,7 +5,8 @@ pub mod state;
 
 pub use grant::{
     Grant, GrantError, GrantSpec, GrantState, PrincipalId, Scope, Usage, UsageDelta, UsageReceipt,
-    MAX_DELEGATION_DEPTH, create, delegate, extend, pause, resume, revoke, use_grant,
+    GRANT_SCHEMA_VERSION_PIN, MAX_DELEGATION_DEPTH, create, delegate, extend, pause, resume,
+    revoke, use_grant,
 };
 pub use scope::{
     DelegationViolation, check_budget_attenuation, check_expiry_attenuation,

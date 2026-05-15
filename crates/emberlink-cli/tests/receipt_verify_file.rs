@@ -80,7 +80,7 @@ fn verify_file_with_garbage_json_errors() {
 }
 
 // ---------------------------------------------------------------------------
-// v2 dispatch tests (implementation-note-180)
+// v2 dispatch tests (implementation-note-317)
 // ---------------------------------------------------------------------------
 
 /// Build a signed v2 ReceiptEnvelope using the deterministic FixtureSigner,
@@ -102,6 +102,7 @@ fn make_signed_v2_receipt() -> (String, String) {
         daemon_root_id: "root-verify-test".into(),
         traceparent: None,
         termination_authority: TerminationAuthority::DaemonPersona,
+        presence_kind: None,
         body: serde_json::json!({
             "session_id": "sess_verify_v2_test",
             "claim_events": [],
@@ -169,8 +170,8 @@ fn verify_v2_sidecar_tamper_fails() {
 
 #[test]
 fn verify_v1_receipt_still_succeeds() {
-    use core_types::grant_receipt::{Evidence, GrantReceipt, Lifecycle, ReceiptSummary, TerminalReason};
-    use core_types::AttestationBinding;
+    use core_grant_types::grant_receipt::{Evidence, GrantReceipt, Lifecycle, ReceiptSummary, TerminalReason};
+    use core_grant_types::AttestationBinding;
     use ember_daemon::infra::receipt::{DaemonPersona, canonical_hash, CANONICAL_VERSION};
 
     // Create a DaemonPersona in a temp dir for signing.

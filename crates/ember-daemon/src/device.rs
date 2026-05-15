@@ -26,7 +26,7 @@
 //! 3. Drop [`DeviceEnrollError::WebAuthnNotImplemented`] (or keep it for the
 //!    "feature compiled out" case).
 
-use core_types::PublicKeyMaterial;
+use core_principals::PublicKeyMaterial;
 use thiserror::Error;
 
 /// Error raised by the device-enrollment scaffold.
@@ -83,7 +83,7 @@ pub fn issue_device_enrolled_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_types::KeyAlgorithm;
+    use core_principals::KeyAlgorithm;
 
     fn fixture_pubkey() -> PublicKeyMaterial {
         PublicKeyMaterial {

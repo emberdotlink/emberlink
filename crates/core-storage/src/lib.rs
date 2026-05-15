@@ -5,14 +5,8 @@ use core_crypto::{
     decrypt_content, encrypt_content, sha256_digest_hex, unwrap_secret_with_identity,
     wrap_secret_to_recipient,
 };
-use core_types::{
-    CanonicalEncode, ChunkReference, ClaimMeta, DurabilityPolicy, EventBody, FileManifest,
-    ManifestDeviceAccess, PayloadKind, PresentationArtifact, PresentationAudienceKind,
-    PresentationTemplate, RetentionPolicy, StorageLedgerEntry, StorageLedgerUpdatedEvent,
-    StorageManifestPublishedEvent, StorageRelationship, StorageRelationshipCreatedEvent,
-    StructuredEncoding, StructuredRecordMeta, Validate, ValidationError, VaultCatalog,
-    VaultNamespace, VaultObject, VaultObjectClass, VaultRevision, bytes_to_hex, hex_to_bytes,
-};
+use core_event_types::{ChunkReference, ClaimMeta, DurabilityPolicy, EventBody, FileManifest, ManifestDeviceAccess, PayloadKind, PresentationArtifact, PresentationAudienceKind, PresentationTemplate, RetentionPolicy, StorageLedgerEntry, StorageLedgerUpdatedEvent, StorageManifestPublishedEvent, StorageRelationship, StorageRelationshipCreatedEvent, StructuredEncoding, StructuredRecordMeta, VaultCatalog, VaultNamespace, VaultObject, VaultObjectClass, VaultRevision};
+use core_types::{CanonicalEncode, Validate, ValidationError, bytes_to_hex, hex_to_bytes};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1140,7 +1134,7 @@ fn block_id_material(encrypted: &EncryptedContent) -> Vec<u8> {
 mod tests {
     use super::*;
     use core_crypto::{generate_content_key, generate_local_encryption_key_pair};
-    use core_types::{EventType, VaultOwnerKind};
+    use core_event_types::{EventType, VaultOwnerKind};
 
     fn test_namespace() -> VaultNamespace {
         VaultNamespace {
@@ -1153,7 +1147,7 @@ mod tests {
         StructuredRecordMeta {
             schema_id: "com.example.profile/basic".into(),
             schema_version: "v1".into(),
-            encoding: core_types::StructuredEncoding::Json,
+            encoding: core_event_types::StructuredEncoding::Json,
             app_namespace: "com.example.profile".into(),
         }
     }

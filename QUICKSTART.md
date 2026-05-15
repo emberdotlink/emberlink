@@ -15,13 +15,47 @@ Get ember running in under 5 minutes.
 cargo install --path crates/emberlink-cli --bin ember
 ```
 
+> **macOS users downloading a release binary directly** (not via `cargo
+> install`): macOS Gatekeeper attaches `com.apple.quarantine` to anything a
+> browser writes, and on first launch shows *"Apple cannot verify that this
+> app is free of malware."* The notarized `.pkg` from a tagged release does
+> not have this problem; raw binaries pulled from the GitHub release page
+> do. Clear the flag once with:
+>
+> ```bash
+> xattr -d com.apple.quarantine ./ember
+> ```
+>
+> Tracking proper notarization-of-raw-binaries as
+> `future milestone` in `release-checklist`.
+
 ## Initialize
 
 ```bash
 ember init --name "your-name"
 ```
 
-This creates:
+On a new machine, `ember init` detects that the daemon service is not yet installed and shows a one-time prompt:
+
+```
+The ember daemon is not installed on this machine.
+
+  The daemon is the trust broker that holds the vault encryption key,
+  enforces grant policy, and signs Receipts for every agent action.
+  Without it, `ember init` cannot open the vault or create a persona.
+
+  Installing the daemon requires elevated privileges so it can create
+  a dedicated `ember` service account and register a system service
+  (LaunchDaemon on macOS, systemd unit on Linux). The command is:
+
+      sudo ember daemon install
+
+Run `sudo ember daemon install` now? [y/N]
+```
+
+Answer **y** to install the daemon automatically (requires `sudo`). Answer **n** to skip and install it manually later with `sudo ember daemon install`, then re-run `ember init`.
+
+After the daemon is installed, `ember init` creates:
 - Config file at `~/.ember/config.toml`
 - Policy file at `~/.ember/policy.toml` (default rules)
 - SQLite database at `~/.ember/data/daemon.db`
@@ -29,6 +63,13 @@ This creates:
 - Vault encryption key stored in the OS keychain
 
 Output shows each path and the keychain status. Ends with `Run \`ember daemon start\` to start the daemon.`
+
+For scripted or CI provisioning, pass `--non-interactive` to skip the prompt and exit with an error if the daemon is not installed:
+
+```bash
+sudo ember daemon install
+ember init --name "your-name" --non-interactive
+```
 
 ## Start the daemon
 
@@ -134,7 +175,18 @@ Shows active personas, grants, running sandboxes, pending approvals, and recent 
 
 ## Claude Code integration
 
-The fastest path is `ember init --for claude-code`, which sets up the launcher trust boundary in one shot: it installs the `~/.claude/settings.json` `preToolUse` hook, drops shim binaries under `~/.ember/shadow/`, and registers `ember claude-code` as your launcher. After that, every classified action Claude Code attempts (`gh pr create`, `git push`, `kubectl apply`, …) routes through the daemon for grant resolution and signed Receipt emission.
+`ember init --for claude-code` is a **required** prerequisite for any host running headless or a sequential Claude Code agent. It is the only step that installs the `~/.ember/shadow/` shim binaries, and without those shims raw `gh` / `git` / `kubectl` invocations bypass the broker entirely — every PR ships under your operator identity, and the audit trail collapses. See `future milestone` for the failure mode this prevents.
+
+What the init does, in one shot: installs the `~/.claude/settings.json` `preToolUse` hook, drops shim binaries under `~/.ember/shadow/`, and registers `ember claude-code` as your launcher. After that, every classified action Claude Code attempts (`gh pr create`, `git push`, `kubectl apply`, …) routes through the daemon for grant resolution and signed Receipt emission.
+
+**Verify after install:**
+
+```bash
+ls ~/.ember/shadow/gh ~/.ember/shadow/git
+ensure_shadow_path_installed   # the assertion run by headless-preflight.sh
+```
+
+If the `ls` errors with `No such file or directory`, the shadow path is missing — re-run `ember init --for claude-code`. The `headless-preflight.sh` invariant check (see `.claude/scripts/headless-preflight.sh`) refuses to start the loop when the daemon is running but the shadow is absent, so the failure surfaces at session start rather than weeks later in a misattributed PR.
 
 ### 1. Start the daemon (required before cohort-A init)
 

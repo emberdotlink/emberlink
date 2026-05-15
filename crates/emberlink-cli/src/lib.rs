@@ -1,11 +1,23 @@
 mod activity_support;
+pub mod audit;
 mod biometric;
 pub mod binary;
+// implementation-note-111 — `ember bind …` admin path
+// for credential bindings. See `bind.rs` doc-comment.
+pub mod bind;
 pub mod broker;
 pub mod cli;
 pub mod cluster;
 pub mod construct;
 pub mod grants;
+// implementation-note-14 — Phase 1 substrate. The
+// `commands.rs` file is a single 300K-line module rather than a
+// `commands/` directory; the `headless` substrate lands as a
+// top-level sibling module per the brief's
+// "(or wherever sibling commands are declared)" clause.
+//
+// implementation-note-15
+pub mod headless;
 pub mod install;
 mod commands;
 pub mod demo;
@@ -19,6 +31,8 @@ mod screens;
 mod sync_support;
 mod vault_support;
 pub mod vault_io;
+pub mod kms;
+pub mod orchestrator;
 
 pub use cli::{Args, Cmd};
 
@@ -42,7 +56,7 @@ use core_crypto::{
 use core_events::EventEnvelope;
 use core_identity::{create_root, device_revoked_event, local_linkage, root_created_event};
 use core_personas::{create_persona, persona_created_event, persona_revoked_event, revoke_persona};
-use core_types::policy::{
+use core_grant_types::policy::{
     PersonaTemplate, disclosure_profile_for_template, parse_persona_template,
     persona_template_for_disclosure_profile, persona_template_label,
 };
@@ -58,11 +72,9 @@ use core_storage::{
     wrap_manifest_key_access,
 };
 use core_sync::LightSyncContext;
-use core_types::{
-    ChunkReference, ContentVisibility, DeviceMembership, DisclosureRevokedEvent, EventBody,
-    IdentityRoot, KeyAlgorithm, LinkageAssertion, Persona, PublicKeyMaterial, RelayAdmission,
-    SignerBinding, SurvivalMode, TrustAttestation, ValidationError, VaultNamespace,
-};
+use core_event_types::{ChunkReference, ContentVisibility, DisclosureRevokedEvent, EventBody, SignerBinding, VaultNamespace};
+use core_principals::{DeviceMembership, IdentityRoot, KeyAlgorithm, LinkageAssertion, Persona, PublicKeyMaterial, RelayAdmission, SurvivalMode, TrustAttestation};
+use core_types::ValidationError;
 
 #[derive(Debug, Clone)]
 struct LocalKeyRecord {
@@ -139,11 +151,11 @@ pub struct DemoApp {
     chain_secrets: std::collections::HashMap<String, GrantChainSecret>,
     linkages: Vec<LinkageAssertion>,
     trust_attestations: Vec<TrustAttestation>,
-    recovery_policy: core_types::RecoveryPolicy,
+    recovery_policy: core_principals::RecoveryPolicy,
     recovery_session: Option<RecoverySession>,
-    storage_relationship: core_types::StorageRelationship,
-    storage_manifest: core_types::FileManifest,
-    storage_ledger: core_types::StorageLedgerEntry,
+    storage_relationship: core_event_types::StorageRelationship,
+    storage_manifest: core_event_types::FileManifest,
+    storage_ledger: core_event_types::StorageLedgerEntry,
     /// Whether to attempt TLS when connecting to relays (falls back to plain TCP).
     relay_try_tls: bool,
     /// Cached TLS client configuration (avoids rebuilding the verifier on every connection).
@@ -828,7 +840,7 @@ impl DemoApp {
         &mut self,
         manifest_id: &str,
         device_id: &str,
-    ) -> Result<core_types::ManifestDeviceAccess, ValidationError> {
+    ) -> Result<core_event_types::ManifestDeviceAccess, ValidationError> {
         let manifest_key = self.ensure_manifest_key_loaded(manifest_id)?;
         let device = self
             .resolve_device_any(device_id)
@@ -858,10 +870,10 @@ impl DemoApp {
         namespace: &VaultNamespace,
     ) -> Result<Vec<core_storage::ManifestKeyRecipient>, ValidationError> {
         let device_ids = match namespace.owner_kind {
-            core_types::VaultOwnerKind::Persona => {
+            core_event_types::VaultOwnerKind::Persona => {
                 self.active_persona_access_device_ids(&namespace.owner_id)?
             }
-            core_types::VaultOwnerKind::Root => self
+            core_event_types::VaultOwnerKind::Root => self
                 .devices
                 .iter()
                 .filter(|device| device.root_id == namespace.owner_id && device.active)
@@ -1498,49 +1510,226 @@ fn default_data_file() -> PathBuf {
     default_data_dir().join("local-state.enc")
 }
 
-#[cfg(not(test))]
-const KEYRING_SERVICE: &str = "com.emberlink";
-#[cfg(not(test))]
-const KEYRING_USER: &str = "local-state-key";
+/// Public entry-point for callers (and integration tests) that need the
+/// current local-state content key without going through a full `DemoApp`
+/// bootstrap. Delegates to `resolve_encryption_key` — see its doc for the
+/// full resolution order.
+pub fn local_state_content_key() -> Result<String, ValidationError> {
+    resolve_encryption_key()
+}
+
 const ENCRYPTED_MAGIC: &[u8] = b"EMBER_ENC\x01";
 
+/// Resolve the daemon Unix-domain socket path.
+///
+/// Precedence:
+///   1. `EMBER_SOCKET_PATH` env var (used by qember.sh + integration tests)
+///   2. `~/.ember/run/daemon.sock` (matches DaemonConfig::default())
+///   3. `/tmp/.ember/run/daemon.sock` if $HOME is unset
+#[cfg(not(test))]
+pub fn daemon_socket_path() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("EMBER_SOCKET_PATH") {
+        return std::path::PathBuf::from(p);
+    }
+    let base = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+    base.join(".ember").join("run").join("daemon.sock")
+}
+
+/// Call a daemon JSON-RPC method over the Unix-domain socket. Returns the
+/// `result` value on success or a `ValidationError` on any failure.
+#[cfg(not(test))]
+pub fn call_daemon_method(
+    socket_path: &std::path::Path,
+    method: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, ValidationError> {
+    use std::io::{BufRead, BufReader, Write as _};
+
+    let stream = std::os::unix::net::UnixStream::connect(socket_path).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
+            ValidationError::new("daemon unavailable; start with 'ember daemon start'")
+        }
+        _ => ValidationError::new(format!("daemon socket error: {e}")),
+    })?;
+
+    let mut writer = stream
+        .try_clone()
+        .map_err(|e| ValidationError::new(format!("clone daemon socket: {e}")))?;
+    let mut reader = BufReader::new(stream);
+
+    let request = serde_json::json!({
+        "id": "1",
+        "method": method,
+        "params": params,
+    });
+    let mut line = serde_json::to_string(&request).expect("serialize daemon request");
+    line.push('\n');
+
+    writer
+        .write_all(line.as_bytes())
+        .map_err(|e| ValidationError::new(format!("write daemon request: {e}")))?;
+
+    let mut response_line = String::new();
+    reader
+        .read_line(&mut response_line)
+        .map_err(|e| ValidationError::new(format!("read daemon response: {e}")))?;
+
+    let response: serde_json::Value = serde_json::from_str(response_line.trim())
+        .map_err(|e| ValidationError::new(format!("invalid daemon JSON-RPC response: {e}")))?;
+
+    if let Some(err) = response.get("error").filter(|v| !v.is_null()) {
+        let message = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown daemon error")
+            .to_string();
+        return Err(ValidationError::new(format!("daemon rpc error: {message}")));
+    }
+
+    Ok(response.get("result").cloned().unwrap_or(serde_json::Value::Null))
+}
+
+/// Return the content key used to encrypt/decrypt local state.
+///
+/// Resolution order:
+///   1. `EMBERLINK_KEY` env var (test bypass — accepts `ek1:<64 hex>` or
+///      `xchacha20-key:<64 hex>` format).
+///   2. In test builds: deterministic fixture key (avoids keychain/daemon I/O).
+///   3. One-time migration: if the legacy keychain item
+///      `com.emberlink/local-state-key` exists, ship it to the daemon via
+///      `local_state_key_set` and delete the keychain copy (warn on delete
+///      failure, do not abort).
+///   4. Daemon socket `local_state_key_get` with `caller = "cli"`. The daemon
+///      generates a fresh `xchacha20-key:…` content key on first call and
+///      stores it in its vault under `local-state/cli`.
 fn resolve_encryption_key() -> Result<String, ValidationError> {
+    // Step 1 — env-var test bypass (preserved for CI and script usage).
     if let Ok(key) = std::env::var("EMBERLINK_KEY") {
-        if key.starts_with("ek1:") && key.len() == 68 {
+        // Accept both the legacy ek1: prefix (4 chars + 64 hex = 68 total)
+        // and the canonical xchacha20-key: prefix (14 chars + 64 hex = 78
+        // total) so that daemon-sourced keys passed via env also work.
+        let valid = (key.starts_with("ek1:") && key.len() == 68)
+            || (key.starts_with("xchacha20-key:") && key.len() == 78);
+        if valid {
             return Ok(key);
         }
         return Err(ValidationError::new(
-            "EMBERLINK_KEY must be a valid content key (ek1: prefix, 68 chars)",
+            "EMBERLINK_KEY must be a valid content key (ek1: prefix 68 chars, or xchacha20-key: prefix 78 chars)",
         ));
     }
+
+    // Step 2 — deterministic fixture key in test builds.
     #[cfg(test)]
     {
-        // In tests, use a deterministic key to avoid keychain prompts in CI
-        Ok(core_crypto::derive_content_key(
+        return Ok(core_crypto::derive_content_key(
             b"emberlink-test-key",
             b"test",
-        ))
+        ));
     }
+
+    // Production path with adversarial-review CRIT-2 race-free migration.
     #[cfg(not(test))]
-    match keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
-        Ok(entry) => match entry.get_password() {
-            Ok(key) => Ok(key),
-            Err(keyring::Error::NoEntry) => {
-                let key = core_crypto::generate_content_key("local-state");
-                entry.set_password(&key).map_err(|err| {
-                    ValidationError::new(format!(
-                        "failed to store encryption key in keychain: {err}"
-                    ))
-                })?;
-                Ok(key)
-            }
-            Err(err) => Err(ValidationError::new(format!(
-                "failed to retrieve encryption key from keychain: {err}"
-            ))),
-        },
-        Err(err) => Err(ValidationError::new(format!(
-            "failed to access keychain: {err}"
-        ))),
+    {
+        let socket_path = daemon_socket_path();
+        let state_file = default_data_file();
+
+        const LEGACY_SERVICE: &str = "com.emberlink";
+        const LEGACY_USER: &str = "local-state-key";
+
+        // Peek the legacy keychain (best-effort; may be absent).
+        let legacy_entry = keyring::Entry::new(LEGACY_SERVICE, LEGACY_USER).ok();
+        let legacy_key = legacy_entry
+            .as_ref()
+            .and_then(|e| e.get_password().ok());
+
+        // Fetch daemon's current key (auto-generates if missing).
+        let get_params = serde_json::json!({ "caller": "cli" });
+        let result = call_daemon_method(&socket_path, "local_state_key_get", &get_params)?;
+        let daemon_key = result
+            .get("key")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                ValidationError::new("daemon local_state_key_get: missing 'key' in response")
+            })?
+            .to_string();
+
+        // CRIT-2 race detection: if `local-state.enc` exists and the
+        // daemon's key does NOT decrypt it, but the legacy keychain key
+        // does, the daemon vended an orphan fresh key (someone else
+        // triggered get-then-generate before this CLI migration).
+        // Force-overwrite the daemon vault entry with the canonical legacy key.
+        let final_key = match probe_decrypt(&state_file, &daemon_key) {
+            ProbeOutcome::DecryptOk | ProbeOutcome::NoFile => daemon_key,
+            ProbeOutcome::DecryptFailed => match legacy_key.as_ref() {
+                Some(legacy)
+                    if matches!(
+                        probe_decrypt(&state_file, legacy),
+                        ProbeOutcome::DecryptOk
+                    ) =>
+                {
+                    let set_params = serde_json::json!({
+                        "caller": "cli",
+                        "key": legacy,
+                        "force": true,
+                    });
+                    call_daemon_method(&socket_path, "local_state_key_set", &set_params).map_err(
+                        |e| {
+                            ValidationError::new(format!(
+                                "race recovery: failed to force-overwrite daemon vault: {e}"
+                            ))
+                        },
+                    )?;
+                    legacy.clone()
+                }
+                _ => {
+                    return Err(ValidationError::new(format!(
+                        "local-state encryption-key recovery failed: daemon vault key does not \
+                         decrypt {} and no legacy key matches. Manual recovery needed (export \
+                         EMBERLINK_KEY).",
+                        state_file.display()
+                    )));
+                }
+            },
+        };
+
+        // After successful flow involving legacy → delete keychain item.
+        if legacy_key.is_some()
+            && let Some(entry) = legacy_entry
+            && let Err(e) = entry.delete_credential()
+        {
+            tracing::warn!(
+                error = %e,
+                "keychain migration: delete legacy keychain item failed (non-fatal)"
+            );
+        }
+
+        Ok(final_key)
+    }
+}
+
+/// Outcome of an attempt-decrypt-probe on the existing `local-state.enc`
+/// using a candidate key. Used by the CRIT-2 race-free migration logic.
+#[cfg(not(test))]
+enum ProbeOutcome {
+    DecryptOk,
+    DecryptFailed,
+    NoFile,
+}
+
+#[cfg(not(test))]
+fn probe_decrypt(state_file: &Path, candidate_key: &str) -> ProbeOutcome {
+    if !state_file.exists() {
+        return ProbeOutcome::NoFile;
+    }
+    let bytes = match std::fs::read(state_file) {
+        Ok(b) => b,
+        Err(_) => return ProbeOutcome::DecryptFailed,
+    };
+    match decrypt_state(&bytes, candidate_key) {
+        Ok(_) => ProbeOutcome::DecryptOk,
+        Err(_) => ProbeOutcome::DecryptFailed,
     }
 }
 
@@ -2653,7 +2842,7 @@ mod tests {
             "artifact-expired-1",
             "vault-object-professional-profile",
             "vault-rev-professional-v2",
-            core_types::PresentationAudienceKind::Service,
+            core_event_types::PresentationAudienceKind::Service,
             "svc.example",
             "com.emberlink.profile/basic",
             "manifest-expired-1",
@@ -5542,8 +5731,8 @@ mod tests {
         assert!(grant.contains("re-wrapped"), "no re-wrap: {grant}");
 
         // Verify device B has access to the vault manifests
-        let namespace = core_types::VaultNamespace {
-            owner_kind: core_types::VaultOwnerKind::Persona,
+        let namespace = core_event_types::VaultNamespace {
+            owner_kind: core_event_types::VaultOwnerKind::Persona,
             owner_id: persona_id.clone(),
         };
         let manifests = app

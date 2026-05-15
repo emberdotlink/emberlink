@@ -1,8 +1,6 @@
 use core_crypto::{PublicKey, Signature, Signer, DOMAIN_EVENT};
-use core_types::{
-    CanonicalEncode, EventBody, EventRefRelation, EventSubject, EventType, SchemaVersion,
-    SignerBinding, Validate, ValidationError, size_limits::validate_envelope_payload_size,
-};
+use core_event_types::{EventBody, EventRefRelation, EventSubject, EventType, SignerBinding};
+use core_types::{CanonicalEncode, SchemaVersion, Validate, ValidationError, size_limits::validate_envelope_payload_size};
 
 pub mod construct_toml;
 pub mod receipt;
@@ -259,10 +257,8 @@ fn canonical_signed_bytes(
 #[cfg(test)]
 mod tests {
     use core_crypto::{FixtureSigner, Verifier};
-    use core_types::{
-        EventBody, KeyAlgorithm, PersonaCreatedEvent, PublicKeyMaterial, RootCreatedEvent,
-        SurvivalMode,
-    };
+    use core_event_types::{EventBody, PersonaCreatedEvent, RootCreatedEvent};
+    use core_principals::{KeyAlgorithm, PublicKeyMaterial, SurvivalMode};
 
     use super::*;
 

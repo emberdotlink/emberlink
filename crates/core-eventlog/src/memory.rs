@@ -2,10 +2,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use core_crypto::{Verifier, DOMAIN_EVENT};
 use core_events::{EventEnvelope, EventRef};
-use core_types::{
-    EventBody, EventRefRelation, EventSubject, EventType, FileManifest, KeyRole, PeerCursor,
-    SchemaVersion, SignerBinding, SubjectKind, Validate, ValidationError,
-};
+use core_event_types::{EventBody, EventRefRelation, EventSubject, EventType, FileManifest, KeyRole, SignerBinding, SubjectKind};
+use core_principals::{PeerCursor};
+use core_types::{SchemaVersion, Validate, ValidationError};
 
 use crate::materialize::{advance_chain_head, apply_event, apply_storage_event, check_chain};
 use crate::{AllowAllAuthorizer, Authorizer, EventLog, MaterializedState, SyncBatchRecord};
@@ -69,7 +68,7 @@ impl MemoryEventLog {
     }
 
     fn append_validated(&mut self, event: EventEnvelope) -> Result<(), ValidationError> {
-        // security check: BEGIN IMMEDIATE analog for the in-memory log.
+        // BEGIN IMMEDIATE analog for the in-memory log.
         //
         // The authorize → check_chain → apply_event → advance_chain_head →
         // apply_storage_event sequence mutates `materialized` mid-stream. If
@@ -505,10 +504,8 @@ impl EventLog for MemoryEventLog {
 mod tests {
     use core_crypto::{FixtureSigner, FixtureVerifier};
     use core_events::EventEnvelope;
-    use core_types::{
-        DeviceAddedEvent, EventBody, KeyAlgorithm, PersonaCreatedEvent, PublicKeyMaterial,
-        RootCreatedEvent, SignerBinding, SurvivalMode,
-    };
+    use core_event_types::{DeviceAddedEvent, EventBody, PersonaCreatedEvent, RootCreatedEvent, SignerBinding};
+    use core_principals::{KeyAlgorithm, PublicKeyMaterial, SurvivalMode};
 
     use super::*;
 
@@ -894,7 +891,7 @@ mod tests {
         append_typed_with_refs(
             &mut source,
             "evt-offer",
-            EventBody::GrantOfferCreated(core_types::GrantOfferCreatedEvent {
+            EventBody::GrantOfferCreated(core_event_types::GrantOfferCreatedEvent {
                 offer_id: "offer-m2".into(),
                 issuer_persona_id: "persona-a".into(),
                 ephemeral_public_key_hex: "aa".into(),
@@ -912,7 +909,7 @@ mod tests {
         // = NOW_CEILING < expires_at → accepted.
         let claim = EventEnvelope::from_body(
             "evt-claim-m2",
-            EventBody::GrantOfferClaimed(core_types::GrantOfferClaimedEvent {
+            EventBody::GrantOfferClaimed(core_event_types::GrantOfferClaimedEvent {
                 offer_id: "offer-m2".into(),
                 recipient_persona_id: "persona-b".into(),
                 claim_response_hex: "cc".into(),

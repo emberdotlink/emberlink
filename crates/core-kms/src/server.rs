@@ -14,7 +14,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
-use core_types::grant_receipt::{
+use core_grant_types::grant_receipt::{
     Evidence, GrantEvaluation, GrantEvaluationOutcome, KmsReceipt, ReceiptKind, ReceiptOutcome,
 };
 use secrecy::{ExposeSecret, SecretString};
@@ -407,6 +407,8 @@ fn emit_kms_receipt(
             grant_id: None,
         },
         outcome,
+        // Loopback path — no mTLS peer identity.
+        peer_identity: None,
         // Evidence is zeroed at the kms surface — the daemon's receipt
         // sink signs and re-stores via its identity key.
         evidence: Evidence::default(),
@@ -728,7 +730,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Receipt emission (implementation-note-16)
+    // Receipt emission (implementation-note-36)
     // -----------------------------------------------------------------------
 
     /// Test-double sink that records every call into a Mutex<Vec<_>>.

@@ -1,4 +1,4 @@
-//! implementation-note-76 regression coverage.
+//! implementation-note-151 regression coverage.
 //!
 //! Pre-fix the simple-grant CLI path called `store.create_grant(...)` (which
 //! built the canonical block-zero statement with `budget = None`) and then
@@ -27,7 +27,7 @@
 use std::rc::Rc;
 use std::time::Duration;
 
-use core_types::Budget;
+use core_grant_types::Budget;
 use ember_daemon::infra::dashboard::run_dashboard;
 use ember_daemon::infra::store::DaemonStore;
 use ember_daemon::infra::vault::Vault;

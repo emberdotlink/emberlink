@@ -1,11 +1,11 @@
-// implementation-note-14 — chain-builder helpers lifted from ember-daemon::trust::grant (design §1 concern 3)
+// implementation-note-37 — chain-builder helpers lifted from ember-daemon::trust::grant (design §1 concern 3)
 
 use core_crypto::grant_chain::{self, RootKeyPair};
-use core_types::{
-    AccessGrant, AttestationBinding, Block, Budget, GrantMode, GrantStatus,
-    PresentationAudienceKind, RecipientProfile, ResourceSelector, ResourceType,
-    SignedBlock, Statement, Usage,
+use core_grant_types::{
+    AccessGrant, AttestationBinding, Block, Budget, GrantMode, GrantStatus, RecipientProfile,
+    ResourceSelector, ResourceType, SignedBlock, Statement, Usage,
 };
+use core_event_types::PresentationAudienceKind;
 
 /// Error type bridged from `StoreError` context — re-used here so callers
 /// that want a standalone chain builder don't need to depend on `ember-daemon`.

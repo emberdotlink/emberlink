@@ -1,5 +1,5 @@
 //! `ember demo bundle` — mint the locked May-3 4-statement composite-grant
-//! bundle (implementation-note-152).
+//! bundle (implementation-note-274).
 //!
 //! Submits ONE composite-approval entry with the four locked statements:
 //!   - [0] credential:read   on `anthropic-key`
@@ -7,7 +7,7 @@
 //!   - [2] time:wall_clock   on *             (90s)
 //!   - [3] credential:read   on `github-token`
 //!
-//! implementation-note-132: tokens cap is sized as defense-in-depth (1M
+//! implementation-note-240: tokens cap is sized as defense-in-depth (1M
 //! is well above any 90-second realistic session). The cents cap (5¢) is the
 //! load-bearing enforcement axis — the voiceover names it. Pre-flight token
 //! estimation in `pricing::estimate_call_tokens` was previously tripping on
@@ -18,7 +18,7 @@
 //! trip — mirroring the existing `ember sandbox run` composite-mint path
 //! at `bin/ember.rs:3853` (`store.propose_grant(...)`).
 
-use core_types::{Budget, GrantProposal, ResourceSelector, ResourceType, StatementProposal};
+use core_grant_types::{Budget, GrantProposal, ResourceSelector, ResourceType, StatementProposal};
 use ember_daemon::infra::config::DaemonConfig;
 use ember_daemon::infra::store::DaemonStore;
 

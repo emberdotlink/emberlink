@@ -270,6 +270,29 @@ fn has_flag(flags: &[String], needles: &[&str]) -> bool {
     flags.iter().any(|f| needles.contains(&f.as_str()))
 }
 
+/// Extract the remote-name positional from a git verb's argv tail.
+///
+/// For verbs in `{"push", "fetch", "pull", "clone"}`, returns the first
+/// positional argument (after skipping flags). For `git push origin main`
+/// the result is `Some("origin")`. For bare `git push` the result is `None`
+/// (caller falls back to upstream resolution or refuses).
+///
+/// For `clone`, returns the first positional which is the URL itself (since
+/// clone doesn't reference a configured remote — caller may distinguish).
+///
+/// Returns `None` for verbs that don't have a remote-name positional
+/// (commit, status, log, etc.) and for malformed argv.
+pub fn extract_git_remote_name(verb: &str, rest: &[String]) -> Option<String> {
+    match verb {
+        "push" | "fetch" | "pull" | "clone" => {}
+        _ => return None,
+    }
+    // Skip leading flags (tokens starting with '-') to find first positional.
+    rest.iter()
+        .find(|a| !a.starts_with('-'))
+        .cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -581,5 +604,43 @@ mod tests {
     #[test]
     fn empty_argv_is_passthrough() {
         assert!(classify_git_argv(&[]).is_none());
+    }
+
+    // --- extract_git_remote_name ---
+
+    #[test]
+    fn extract_remote_name_push_with_origin() {
+        let argv: Vec<String> = vec!["push".into(), "origin".into(), "main".into()];
+        assert_eq!(extract_git_remote_name("push", &argv[1..]), Some("origin".into()));
+    }
+
+    #[test]
+    fn extract_remote_name_push_bare() {
+        let argv: Vec<String> = vec!["push".into()];
+        assert_eq!(extract_git_remote_name("push", &argv[1..]), None);
+    }
+
+    #[test]
+    fn extract_remote_name_push_with_upstream_flag() {
+        // git push -u origin feature/foo
+        let argv: Vec<String> = vec!["push".into(), "-u".into(), "origin".into(), "feature/foo".into()];
+        assert_eq!(extract_git_remote_name("push", &argv[1..]), Some("origin".into()));
+    }
+
+    #[test]
+    fn extract_remote_name_push_with_force_flag() {
+        let argv: Vec<String> = vec!["push".into(), "--force".into(), "upstream".into()];
+        assert_eq!(extract_git_remote_name("push", &argv[1..]), Some("upstream".into()));
+    }
+
+    #[test]
+    fn extract_remote_name_fetch_with_remote() {
+        let argv: Vec<String> = vec!["fetch".into(), "upstream".into()];
+        assert_eq!(extract_git_remote_name("fetch", &argv[1..]), Some("upstream".into()));
+    }
+
+    #[test]
+    fn extract_remote_name_unrelated_verb_returns_none() {
+        assert_eq!(extract_git_remote_name("commit", &["-m".into(), "msg".into()]), None);
     }
 }

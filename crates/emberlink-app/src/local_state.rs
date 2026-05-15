@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use core_crypto::LocalKeyPair;
 use core_crypto::grant_chain::PubkeyNextKeyPair;
-use core_types::KeyAlgorithm;
+use core_principals::KeyAlgorithm;
 use zeroize::Zeroize;
 
 /// A signing key held locally for one owner (root, persona, or device).

@@ -1,7 +1,7 @@
 //! Property tests for `core_grants::scope` predicates
 //! (T1 tier per `.claude/rules/test-tiers.md`).
 //!
-//! Per implementation-note-15 / design §2.1, `core-grants` ships T1
+//! Per implementation-note-39 / design §2.1, `core-grants` ships T1
 //! property tests on day one. These properties exercise the two trust-boundary
 //! invariants that `enforce_subset` and `check_budget_attenuation` are
 //! supposed to uphold:
@@ -13,7 +13,7 @@
 //!    cap exceeds the parent's remaining allowance on a bounded axis.
 
 use core_grants::scope::{check_budget_attenuation, enforce_subset};
-use core_types::{Budget, Usage};
+use core_grant_types::{Budget, Usage};
 use proptest::prelude::*;
 
 // ----------------------------------------------------------------------

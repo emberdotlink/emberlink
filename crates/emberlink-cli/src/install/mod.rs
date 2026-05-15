@@ -19,10 +19,12 @@ pub use verify::{
     BUNDLE_MANIFEST_SCHEMA_VERSION, EMBERLINK_RELEASE_PUBLISHER_DID,
 };
 pub use wizard::{
-    clear_wizard_state, load_wizard_state, run_install_wizard, run_rollback, run_wizard_steps,
+    clear_wizard_state, detect_daemon_installed, load_wizard_state, prompt_install_daemon,
+    prompt_install_daemon_with, run_install_wizard, run_rollback, run_wizard_steps,
     run_wizard_steps_from, save_wizard_state, wizard_resume_or_rollback,
     wizard_resume_or_rollback_with_choice, wizard_step_add_user_to_group,
     wizard_step_chown_data_dirs, wizard_step_emit_launch_spec, wizard_step_provision_user,
-    wizard_step_verify, InstallPrimitives, Platform, RealPrimitives, ResumeAction, StepOutcome,
+    wizard_step_verify, DaemonInstallPromptError, DaemonInstallStatus, InstallPrimitives,
+    Platform, RealPrimitives, RealSudoRunner, ResumeAction, StepOutcome, SudoRunner,
     WizardContext, WizardError, WizardState, WIZARD_STEPS,
 };

@@ -1,9 +1,9 @@
-// implementation-note-5
+// implementation-note-6
 use chrono::Utc;
 use core_approval::{ApprovalLifecycle, LifecycleError, RequestId, SubmitMetadata};
 use core_approval::ApprovalOutcome as CoreApprovalOutcome;
-use core_types::approval::RequestedScope;
-use core_types::{GrantProposal, Statement, Usage};
+use core_grant_types::approval::RequestedScope;
+use core_grant_types::{GrantProposal, Statement, Usage};
 use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 use std::rc::Rc;
@@ -116,13 +116,13 @@ impl ApprovalLifecycle for DaemonApprovalStore {
             .get_approval(&request_id.0)
             .map_err(LifecycleError::from)?;
 
-        let current_status: core_types::approval::ApprovalStatus = match info.status.as_str() {
-            "pending" => core_types::approval::ApprovalStatus::Pending,
-            "approved" => core_types::approval::ApprovalStatus::Approved,
-            "denied" => core_types::approval::ApprovalStatus::Denied,
-            "expired" | "timed_out" => core_types::approval::ApprovalStatus::Expired,
+        let current_status: core_grant_types::approval::ApprovalStatus = match info.status.as_str() {
+            "pending" => core_grant_types::approval::ApprovalStatus::Pending,
+            "approved" => core_grant_types::approval::ApprovalStatus::Approved,
+            "denied" => core_grant_types::approval::ApprovalStatus::Denied,
+            "expired" | "timed_out" => core_grant_types::approval::ApprovalStatus::Expired,
             "narrowed" | "narrowed_and_approved" => {
-                core_types::approval::ApprovalStatus::NarrowedAndApproved
+                core_grant_types::approval::ApprovalStatus::NarrowedAndApproved
             }
             _other => {
                 return Err(LifecycleError::AlreadyDecided);
@@ -281,13 +281,13 @@ impl<'a> ApprovalLifecycle for DaemonApprovalStoreRef<'a> {
             .get_approval(&request_id.0)
             .map_err(LifecycleError::from)?;
 
-        let current_status: core_types::approval::ApprovalStatus = match info.status.as_str() {
-            "pending" => core_types::approval::ApprovalStatus::Pending,
-            "approved" => core_types::approval::ApprovalStatus::Approved,
-            "denied" => core_types::approval::ApprovalStatus::Denied,
-            "expired" | "timed_out" => core_types::approval::ApprovalStatus::Expired,
+        let current_status: core_grant_types::approval::ApprovalStatus = match info.status.as_str() {
+            "pending" => core_grant_types::approval::ApprovalStatus::Pending,
+            "approved" => core_grant_types::approval::ApprovalStatus::Approved,
+            "denied" => core_grant_types::approval::ApprovalStatus::Denied,
+            "expired" | "timed_out" => core_grant_types::approval::ApprovalStatus::Expired,
             "narrowed" | "narrowed_and_approved" => {
-                core_types::approval::ApprovalStatus::NarrowedAndApproved
+                core_grant_types::approval::ApprovalStatus::NarrowedAndApproved
             }
             _other => {
                 return Err(LifecycleError::AlreadyDecided);
@@ -353,7 +353,7 @@ impl<'a> ApprovalLifecycle for DaemonApprovalStoreRef<'a> {
     }
 }
 
-/// Convert a `core_types::AccessGrant` to a `core_grants::Grant` for the
+/// Convert a `core_grant_types::AccessGrant` to a `core_grants::Grant` for the
 /// approval → grant boundary (design + design phase C).
 ///
 /// The mapping is intentionally minimal: `id` is parsed from the "grant-{uuid}"
@@ -364,15 +364,15 @@ impl<'a> ApprovalLifecycle for DaemonApprovalStoreRef<'a> {
 /// TODO: coordinate with C-3A — once handler.rs callers
 /// are also migrated, richer scope round-tripping (resource_id, constraints)
 /// can be added here without breaking the C-3A parallel branch.
-fn access_grant_to_core_grants(ag: &core_types::AccessGrant) -> core_grants::Grant {
+fn access_grant_to_core_grants(ag: &core_grant_types::AccessGrant) -> core_grants::Grant {
     let state = match ag.status {
-        core_types::GrantStatus::Active | core_types::GrantStatus::Pending => {
+        core_grant_types::GrantStatus::Active | core_grant_types::GrantStatus::Pending => {
             core_grants::GrantState::Active
         }
-        core_types::GrantStatus::Paused => core_grants::GrantState::Paused,
-        core_types::GrantStatus::Revoked
-        | core_types::GrantStatus::Expired
-        | core_types::GrantStatus::ExhaustedByBudget => core_grants::GrantState::Revoked,
+        core_grant_types::GrantStatus::Paused => core_grants::GrantState::Paused,
+        core_grant_types::GrantStatus::Revoked
+        | core_grant_types::GrantStatus::Expired
+        | core_grant_types::GrantStatus::ExhaustedByBudget => core_grants::GrantState::Revoked,
     };
 
     // Derive the scope capability from the first statement's first action, if present.
@@ -414,6 +414,7 @@ fn access_grant_to_core_grants(ag: &core_types::AccessGrant) -> core_grants::Gra
         parent_id: None,
         delegation_depth: 0,
         usage: core_grants::Usage { used },
+        schema_version: core_grants::GRANT_SCHEMA_VERSION_PIN,
     }
 }
 
@@ -441,7 +442,7 @@ pub struct ApprovalRequestInfo {
     pub target_summary: Option<String>,
     pub target_url: Option<String>,
     pub agent_framework: Option<String>,
-    /// implementation-note-77 — composite envelope statements (3-statement
+    /// implementation-note-152 — composite envelope statements (3-statement
     /// credential+session+time bundle minted by `ember sandbox run`)
     /// serialized as JSON when set. Surfaces as a single approval entry
     /// (NOT three) so the dashboard can render all three statements as
@@ -499,7 +500,7 @@ impl DaemonStore {
         )
     }
 
-    /// implementation-note-77 — submit ONE approval entry that bundles a 3-statement
+    /// implementation-note-152 — submit ONE approval entry that bundles a 3-statement
     /// composite envelope (credential + session + time). On `Approved` the
     /// resolver mints a single composite grant whose `blocks_json` is
     /// overwritten with the supplied statement list (matching the shape
@@ -756,7 +757,7 @@ impl DaemonStore {
     }
 
     /// Resolve an approval request with optional biometric attestation
-    /// metadata (implementation-note-81).
+    /// metadata (implementation-note-156).
     ///
     /// `biometric` records whether the approval was gated by a hardware
     /// biometric on the operator's device (Touch ID via LocalAuthentication
@@ -814,7 +815,7 @@ impl DaemonStore {
             committed: false,
         };
 
-        // implementation-note-77 — composite approvals stash their 3-statement envelope
+        // implementation-note-152 — composite approvals stash their 3-statement envelope
         // alongside the legacy single-statement fields, so the SELECT row
         // shape grew by one column. Aliased to keep clippy happy.
         // REVIEW2-F2 — also fetch composite_statements_hash for integrity check.
@@ -893,7 +894,7 @@ impl DaemonStore {
 
         match outcome {
             ApprovalOutcome::Approved => {
-                // implementation-note-77 — for composite approvals the row is created
+                // implementation-note-152 — for composite approvals the row is created
                 // with scope "*" because the typed child statements
                 // (Credential / Session / Time) overwrite `blocks_json`
                 // immediately below; the flat `scope` column is a
@@ -922,7 +923,7 @@ impl DaemonStore {
                     self.create_grant(&persona_id, &credential_name, parent_scope, ttl_secs)?
                 };
 
-                // implementation-note-77 — when the approval bundles a composite envelope,
+                // implementation-note-152 — when the approval bundles a composite envelope,
                 // overwrite the freshly-minted single-statement grant's
                 // blocks_json with the canonical 3-statement composite chain.
                 // Mirrors the path the CLI sandbox-run handler used to take
@@ -943,7 +944,7 @@ impl DaemonStore {
                             "ttl_secs": ttl_secs,
                             "source": "approval",
                             "composite": composite_statements.is_some(),
-                            // implementation-note-81 — `biometric=true` indicates the
+                            // implementation-note-156 — `biometric=true` indicates the
                             // approval was attested by a hardware biometric on
                             // the operator's device (Touch ID via
                             // LocalAuthentication on the macOS CLI, or
@@ -957,7 +958,7 @@ impl DaemonStore {
                         .to_string(),
                     ),
                 );
-                // implementation-note-81 — also emit a dedicated `approval.approved`
+                // implementation-note-156 — also emit a dedicated `approval.approved`
                 // event so downstream auditors can filter on the approval
                 // beat without parsing `grant.issued` semantics.
                 let _ = self.log_event(
@@ -987,7 +988,7 @@ impl DaemonStore {
                      reason = ?2 WHERE id = ?3",
                     rusqlite::params![resolved_at, reason, id],
                 )?;
-                // implementation-note-81 — record the biometric posture on denial too
+                // implementation-note-156 — record the biometric posture on denial too
                 // so an auditor can distinguish "human rejected with TouchID"
                 // from "untouched timeout".
                 let _ = self.log_event(
@@ -1115,7 +1116,7 @@ impl DaemonStore {
             .ok_or(StoreError::NotFound)
     }
 
-    /// implementation-note-77 — overwrite a freshly-minted single-statement grant's
+    /// implementation-note-152 — overwrite a freshly-minted single-statement grant's
     /// `blocks_json` with the canonical 3-statement composite chain.
     ///
     /// Mirrors the path `ember sandbox run` previously took inline (signing
@@ -1275,7 +1276,7 @@ impl DaemonStore {
         Ok(count)
     }
 
-    /// implementation-note-72 — operator-initiated dismiss of a pending
+    /// implementation-note-147 — operator-initiated dismiss of a pending
     /// approval card. Sets status to `dismissed`, records an `approval.dismissed`
     /// audit event, and returns. Does NOT fire a desktop notification (the operator
     /// is already looking at the dashboard). Only `pending` rows can be dismissed;
@@ -1719,10 +1720,10 @@ mod tests {
         assert_eq!(still_pending.status, "pending");
     }
 
-    // --- implementation-note-77 — composite-grant approval flow ---
+    // --- implementation-note-152 — composite-grant approval flow ---
 
     fn demo_three_statements(credential: &str) -> Vec<Statement> {
-        use core_types::{Budget, ResourceSelector, ResourceType, Usage};
+        use core_grant_types::{Budget, ResourceSelector, ResourceType, Usage};
 
         vec![
             Statement {
@@ -2436,7 +2437,7 @@ mod tests {
     // properties the bound must hold.
 
     fn three_disjoint_statements() -> Vec<Statement> {
-        use core_types::{ResourceSelector, ResourceType, Usage};
+        use core_grant_types::{ResourceSelector, ResourceType, Usage};
         vec![
             Statement {
                 sid: "s0-push".into(),
@@ -2512,7 +2513,7 @@ mod tests {
         // function `overwrite_grant_blocks` runs internally).
         let bound_stmts =
             crate::trust::attenuation::compute_statements_union_bound(&stmts);
-        let bound_block = core_types::Block {
+        let bound_block = core_grant_types::Block {
             statements: bound_stmts,
             nbf: None,
             expires_at: None,
@@ -2524,17 +2525,17 @@ mod tests {
         let root = store.persona_root_keypair(&pid).unwrap();
         let signed_bound =
             crate::trust::grant::sign_block_zero_with(&root, &bound_block).unwrap();
-        let bound_grant = core_types::AccessGrant {
+        let bound_grant = core_grant_types::AccessGrant {
             id: grant_id.to_string(),
             version: 1,
             issuing_persona_id: pid.clone(),
-            recipient_kind: core_types::PresentationAudienceKind::Service,
+            recipient_kind: core_event_types::PresentationAudienceKind::Service,
             recipient_id: "obj-cred".into(),
-            recipient_profile: core_types::RecipientProfile::Agent,
-            status: core_types::GrantStatus::Active,
-            mode: core_types::GrantMode::OneShot,
+            recipient_profile: core_grant_types::RecipientProfile::Agent,
+            status: core_grant_types::GrantStatus::Active,
+            mode: core_grant_types::GrantMode::OneShot,
             blocks: vec![signed_bound],
-            attestation: core_types::AttestationBinding::default(),
+            attestation: core_grant_types::AttestationBinding::default(),
             created_at: 0,
             updated_at: 0,
             revoked_at: None,
@@ -2552,7 +2553,7 @@ mod tests {
     /// trivially accepted this child — this test guards the regression.
     #[test]
     fn parent_scope_does_not_contain_unapproved_action() {
-        use core_types::{ResourceSelector, ResourceType, Usage};
+        use core_grant_types::{ResourceSelector, ResourceType, Usage};
 
         let store = setup();
         let pid = persona_id(&store);
@@ -2580,7 +2581,7 @@ mod tests {
         // Build the bound and a hypothetical "admin" child grant.
         let bound_stmts =
             crate::trust::attenuation::compute_statements_union_bound(&approved);
-        let bound_block = core_types::Block {
+        let bound_block = core_grant_types::Block {
             statements: bound_stmts,
             nbf: None,
             expires_at: None,
@@ -2592,17 +2593,17 @@ mod tests {
         let root = store.persona_root_keypair(&pid).unwrap();
         let signed_bound =
             crate::trust::grant::sign_block_zero_with(&root, &bound_block).unwrap();
-        let bound_grant = core_types::AccessGrant {
+        let bound_grant = core_grant_types::AccessGrant {
             id: "grant-bound".into(),
             version: 1,
             issuing_persona_id: pid.clone(),
-            recipient_kind: core_types::PresentationAudienceKind::Service,
+            recipient_kind: core_event_types::PresentationAudienceKind::Service,
             recipient_id: "obj-cred".into(),
-            recipient_profile: core_types::RecipientProfile::Agent,
-            status: core_types::GrantStatus::Active,
-            mode: core_types::GrantMode::OneShot,
+            recipient_profile: core_grant_types::RecipientProfile::Agent,
+            status: core_grant_types::GrantStatus::Active,
+            mode: core_grant_types::GrantMode::OneShot,
             blocks: vec![signed_bound],
-            attestation: core_types::AttestationBinding::default(),
+            attestation: core_grant_types::AttestationBinding::default(),
             created_at: 0,
             updated_at: 0,
             revoked_at: None,
@@ -2620,7 +2621,7 @@ mod tests {
             usage: Usage::default(),
             conditions: vec![],
         }];
-        let child_block = core_types::Block {
+        let child_block = core_grant_types::Block {
             statements: admin_child,
             nbf: None,
             expires_at: None,
@@ -2631,17 +2632,17 @@ mod tests {
         };
         let signed_child =
             crate::trust::grant::sign_block_zero_with(&root, &child_block).unwrap();
-        let child_grant = core_types::AccessGrant {
+        let child_grant = core_grant_types::AccessGrant {
             id: "grant-bound".into(),
             version: 1,
             issuing_persona_id: pid.clone(),
-            recipient_kind: core_types::PresentationAudienceKind::Service,
+            recipient_kind: core_event_types::PresentationAudienceKind::Service,
             recipient_id: "obj-cred".into(),
-            recipient_profile: core_types::RecipientProfile::Agent,
-            status: core_types::GrantStatus::Active,
-            mode: core_types::GrantMode::OneShot,
+            recipient_profile: core_grant_types::RecipientProfile::Agent,
+            status: core_grant_types::GrantStatus::Active,
+            mode: core_grant_types::GrantMode::OneShot,
             blocks: vec![signed_child],
-            attestation: core_types::AttestationBinding::default(),
+            attestation: core_grant_types::AttestationBinding::default(),
             created_at: 0,
             updated_at: 0,
             revoked_at: None,
@@ -2666,7 +2667,7 @@ mod tests {
         // Counter-check: a wildcard parent (the pre-fix shape, scope `*`
         // projecting to actions=["*"], resource=Any) WOULD have falsely
         // accepted the same child.
-        let wildcard_block = core_types::Block {
+        let wildcard_block = core_grant_types::Block {
             statements: vec![Statement {
                 sid: "S0".into(),
                 resource_type: ResourceType::Credential,
@@ -2685,7 +2686,7 @@ mod tests {
         };
         let signed_wild =
             crate::trust::grant::sign_block_zero_with(&root, &wildcard_block).unwrap();
-        let wildcard_grant = core_types::AccessGrant {
+        let wildcard_grant = core_grant_types::AccessGrant {
             blocks: vec![signed_wild],
             ..bound_grant.clone()
         };
@@ -2701,13 +2702,13 @@ mod tests {
     /// dominance check passes by definition.
     #[test]
     fn single_statement_composite_parent_matches_child() {
-        use core_types::{ResourceSelector, ResourceType, Usage};
+        use core_grant_types::{ResourceSelector, ResourceType, Usage};
         let only = vec![Statement {
             sid: "s0".into(),
             resource_type: ResourceType::Credential,
             actions: vec!["github:read".into()],
             resource: ResourceSelector::Exact { value: "acme/widgets".into() },
-            budget: Some(core_types::Budget {
+            budget: Some(core_grant_types::Budget {
                 tokens: Some(100),
                 ..Default::default()
             }),
@@ -2735,7 +2736,7 @@ mod tests {
         );
     }
 
-    // --- implementation-note-72: dismiss_approval ---
+    // --- implementation-note-147: dismiss_approval ---
 
     #[test]
     fn dismiss_pending_approval_sets_status_dismissed() {
@@ -2804,7 +2805,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn test_daemon_approval_store_roundtrip() {
         use core_approval::{ApprovalLifecycle, ApprovalOutcome as CoreApprovalOutcome, RequestId};
-        use core_types::approval::RequestedScope;
+        use core_grant_types::approval::RequestedScope;
         use std::rc::Rc;
 
         let store = DaemonStore::open_in_memory().expect("in-memory store");
@@ -2869,7 +2870,7 @@ mod tests {
         );
     }
 
-    // --- implementation-note-138: T1 unit tests ---
+    // --- implementation-note-248: T1 unit tests ---
 
     /// T1: submit_approval_inner persists tool_name, target_host, target_url,
     /// and agent_framework; get_approval reads them back (not None).
@@ -2959,14 +2960,14 @@ mod tests {
         assert!(fetched.agent_framework.is_none(), "agent_framework must be None when not provided");
     }
 
-    // --- implementation-note-138: T2 round-trip via ApprovalLifecycle ---
+    // --- implementation-note-248: T2 round-trip via ApprovalLifecycle ---
 
     /// T2: SubmitMetadata carries notify fields → DaemonApprovalStoreRef persists them →
     /// get_approval returns them. This is the seam that was broken before this task.
     #[tokio::test(flavor = "current_thread")]
     async fn notify_fields_round_trip_via_daemon_approval_store_ref() {
         // approval_notify_fields_persisted
-        use core_types::approval::RequestedScope;
+        use core_grant_types::approval::RequestedScope;
 
         let store = DaemonStore::open_in_memory().expect("in-memory store");
         store.create_persona("notify-test").expect("create persona");
@@ -3007,7 +3008,7 @@ mod tests {
     /// get_approval returns them.
     #[tokio::test(flavor = "current_thread")]
     async fn notify_fields_round_trip_via_daemon_approval_store() {
-        use core_types::approval::RequestedScope;
+        use core_grant_types::approval::RequestedScope;
         use std::rc::Rc;
 
         let store = DaemonStore::open_in_memory().expect("in-memory store");

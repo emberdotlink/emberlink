@@ -1,0 +1,34 @@
+# Construct manifest for ember-scion per design §2.
+# Action schema: each [actions.X] block declares an allowed subcommand,
+# its approval policy, and optional budget caps. The daemon's broker.resolve
+# consults this to decide whether the action requires jit_approval (operator
+# confirmation at invocation time) or can be auto_approve_if_pregranted
+# (proceed if a matching grant is already in scope).
+#
+
+[meta]
+name = "ember-scion"
+version = "0.1.0"
+publisher = "did:emberlink"
+description = "SCION container lifecycle Construct. Mediates ember-scion invocations through ember's broker: start and delete require just-in-time operator approval; stop, attach, logs, and list are auto-approved when a matching pre-granted scope exists. Every credentialed call is audited and revocable."
+
+# Default policy for unlisted subcommands.
+default = "deny"
+
+[actions.start]
+approval = "jit_approval"
+
+[actions.delete]
+approval = "jit_approval"
+
+[actions.stop]
+approval = "auto_approve_if_pregranted"
+
+[actions.attach]
+approval = "auto_approve_if_pregranted"
+
+[actions.logs]
+approval = "auto_approve_if_pregranted"
+
+[actions.list]
+approval = "auto_approve_if_pregranted"

@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use core_types::TrustAttestation;
+use core_principals::TrustAttestation;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------

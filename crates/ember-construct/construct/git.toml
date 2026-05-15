@@ -7,12 +7,18 @@
 # Cohort-A scope catalog per design §"Cohort-A scopes":
 #   Gated — broker round-trip required (destructive or credential-carrying).
 #   Passthrough — None (read-only / safe write).
+#
+# git_toml_passthrough_description_reconciled: the [meta].description used to
+# describe pull / fetch as passthrough, which contradicted `policy.rs` —
+# fetch / clone / pull mint a GitHub App installation token (contents:read)
+# for private-repo auth via URL rewrite. The description now reflects the
+# policy.rs reality: they're broker-mediated (auth-only), not passthrough.
 
 [meta]
 name = "ember-git"
 version = "0.1.0"
 publisher = "did:emberlink"
-description = "Git CLI Construct. Mediates destructive and credential-carrying `git` invocations through ember's broker: force-push mints a scoped GITHUB_TOKEN; reset --hard / clean -f are budget-capped at 3/session with biometric confirmation; commit --amend, rebase -i, branch -D, and tag -d are gated. Read-only verbs (status, log, diff, show, etc.) and safe writes (commit, add, checkout, pull, fetch, etc.) are passthrough — no broker mediation."
+description = "Git CLI Construct. Mediates destructive and credential-carrying `git` invocations through ember's broker: push mints a scoped installation token (contents:write); fetch/clone/pull mint a scoped installation token (contents:read) via URL rewrite for private-repo auth; force-push, reset --hard, clean -f, commit --amend, rebase -i, branch -D, and tag -d are gated (some budget-capped at 3/session with biometric confirmation). Read-only local verbs (status, log, diff, show, etc.) and safe local writes (commit, add, checkout, etc.) are passthrough — no broker mediation."
 
 # Default policy for unlisted action keys.
 default = "deny"

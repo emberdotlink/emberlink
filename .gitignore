@@ -5,6 +5,12 @@ memory/
 *.pem
 *.p12
 *.pfx
+# Allow PEM/KEY test fixtures under crates/<crate>/tests/fixtures/. Path is
+# covered by the .gitleaks.toml allowlist (`crates/.+/tests/fixtures/.+`),
+# so the BEGIN PRIVATE KEY markers in these fixtures don't trip the
+# public-mirror sync gate.
+!crates/*/tests/fixtures/*.pem
+!crates/*/tests/fixtures/*.key
 
 # Sync-to-public operator-only secrets file (implementation-note-1).
 # The .example schema IS committed; the actual sync-secrets.env (with real
@@ -20,6 +26,7 @@ memory/
 .headless-failures.jsonl
 .demo-test-outcomes.jsonl
 .demo-test-blockers.txt
+docs/operations/*.results.jsonl
 .ember/runtime/
 **/.ember/runtime/
 ember-ext/extension/pkg/

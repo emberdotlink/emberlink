@@ -53,25 +53,41 @@ struct RawDaemonSection {
     stale_approval_threshold_secs: Option<u64>,
     /// Bind address for the git-echo credential-injection proxy. `None` (key
     /// absent) ⇒ default `127.0.0.1:0` (random port). Empty string ⇒ disabled.
-    /// (implementation-note-57)
+    /// (implementation-note-123)
     git_proxy_addr: Option<String>,
     /// Bind address for the general LLM/HTTP credential-injection proxy
     /// (`run_proxy` / `handle_request` — provider-aware auth, X-Ember-* header
     /// protocol). `None` (key absent) ⇒ default `127.0.0.1:0`. Empty string ⇒
     /// disabled. The Anthropic SDK demo path posts to this listener.
-    /// (implementation-note-58)
+    /// (implementation-note-124)
     llm_proxy_addr: Option<String>,
     /// design: vault snapshot interval. Defaults to 3600 (1 hour). `0` disables.
     snapshot_interval_secs: Option<u64>,
-    /// implementation-note-59: interval in seconds between snapshot pull
+    /// implementation-note-125: interval in seconds between snapshot pull
     /// attempts. Defaults to 600 (10 minutes). `0` disables pulling.
     snapshot_pull_interval_secs: Option<u64>,
-    /// implementation-note-59: base URL of the remote EIC snapshot endpoint.
+    /// implementation-note-125: base URL of the remote EIC snapshot endpoint.
     /// `None` disables pulling. Example: `http://eic.tz-net.ts.net:3141`.
     snapshot_pull_endpoint: Option<String>,
-    /// implementation-note-59: cluster id for keying pulled snapshots in the
+    /// implementation-note-125: cluster id for keying pulled snapshots in the
     /// local vault. Required when `snapshot_pull_endpoint` is set.
     snapshot_pull_cluster_id: Option<String>,
+    /// implementation-note-126: absolute path to the pre-built SCION
+    /// fork binary the daemon shells out to at agent-spawn time. `None`
+    /// (key absent) ⇒ pin verification is disabled (development /
+    /// non-SCION installs).
+    scion_binary_path: Option<String>,
+    /// implementation-note-126: operator-pinned SHA-256 of the SCION
+    /// fork binary (lower-hex, 64 chars). `None` (key absent) ⇒ pin
+    /// verification is disabled. When `Some`, the daemon refuses to
+    /// fork-exec the binary unless its on-disk bytes hash to this value
+    /// (CRIT-B TOCTOU defense).
+    scion_binary_sha256: Option<String>,
+    /// design Component 1 — bind address for the in-container mTLS bridge.
+    /// `None` (key absent) ⇒ platform-specific default (127.0.0.1 on macOS,
+    /// 0.0.0.0 on Linux). Empty string ⇒ disabled. Env-var override
+    /// `EMBER_BRIDGE_BIND` takes precedence over both.
+    bridge_bind: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,7 +117,7 @@ struct RawConfig {
 /// cache_ttl_secs = 60
 /// ```
 ///
-/// For the AWS IAM auth method (implementation-note-39) the wire shape is:
+/// For the AWS IAM auth method (implementation-note-75) the wire shape is:
 ///
 /// ```toml
 /// [credential_store]
@@ -118,7 +134,7 @@ struct RawConfig {
 /// / IRSA / ECS task role / Fargate). Vault re-plays a SigV4-signed
 /// `sts:GetCallerIdentity` request server-side as the proof.
 ///
-/// For HashiCorp Cloud Platform (HCP) Vault — implementation-note-60 —
+/// For HashiCorp Cloud Platform (HCP) Vault — implementation-note-127 —
 /// the wire shape is:
 ///
 /// ```toml
@@ -158,14 +174,14 @@ pub struct CredentialStoreConfig {
     /// or `"hcp-service-principal"`. The `"aws"` variant uses the
     /// daemon's surrounding AWS IAM identity (env vars / instance
     /// metadata) to sign a `sts:GetCallerIdentity` request that Vault
-    /// re-plays as the proof (implementation-note-39). The
+    /// re-plays as the proof (implementation-note-75). The
     /// `"hcp-service-principal"` variant exchanges
     /// `(client_id, client_secret)` at HashiCorp Cloud Platform's
     /// OAuth2 IdP for an access_token, then uses that as
     /// `Authorization: Bearer` against the HCP-hosted Vault cluster
-    /// (implementation-note-60). Other methods (Kubernetes SA, JWT/OIDC,
+    /// (implementation-note-127). Other methods (Kubernetes SA, JWT/OIDC,
     /// cert) are out of scope — file follow-ups as
-    /// `implementation-note-61-<METHOD>`.
+    /// `implementation-note-128-<METHOD>`.
     #[serde(default)]
     pub auth: Option<String>,
 
@@ -187,19 +203,19 @@ pub struct CredentialStoreConfig {
     /// `vault auth/aws/role/<role>`). Only consulted when
     /// `auth = "aws"`. AWS credentials themselves come from the
     /// daemon's surrounding identity (env / IMDS / IRSA / etc.), not
-    /// from this config (implementation-note-39).
+    /// from this config (implementation-note-75).
     #[serde(default)]
     pub role: Option<String>,
 
     /// HCP service-principal auth: client id (always inline —
     /// non-secret). Only consulted when
-    /// `auth = "hcp-service-principal"` (implementation-note-60).
+    /// `auth = "hcp-service-principal"` (implementation-note-127).
     #[serde(default)]
     pub client_id: Option<String>,
 
     /// HCP service-principal auth: client secret. Supports `@<path>`
     /// to read from a file. Only consulted when
-    /// `auth = "hcp-service-principal"` (implementation-note-60).
+    /// `auth = "hcp-service-principal"` (implementation-note-127).
     #[serde(default)]
     pub client_secret: Option<String>,
 
@@ -299,6 +315,21 @@ pub struct PresenceConfigSection {
     pub quiet_hours_end: Option<u8>,
 }
 
+/// Daemon-level configuration loaded from `~/.ember/config.toml` (or the path
+/// resolved from `--config` / `EMBER_CONFIG`).
+///
+/// **No `impl Default`** — per implementation-note-129, every
+/// constructor must be explicit so that test partial-overrides can't silently
+/// pull user-home paths. The type system pins the rule:
+///
+/// ```compile_fail
+/// use ember_daemon::infra::config::DaemonConfig;
+/// let _ = DaemonConfig::default();
+/// ```
+///
+/// Use [`DaemonConfig::for_test`] in tests and [`DaemonConfig::load`] in
+/// production. The latter calls a private `load_defaults` ctor for per-field
+/// fallbacks when the on-disk TOML omits a key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonConfig {
     pub socket_dir: PathBuf,
@@ -311,14 +342,14 @@ pub struct DaemonConfig {
     pub dashboard_addr: Option<SocketAddr>,
     /// Bind address for the git-echo credential-injection proxy used by
     /// sandboxed agents (`EMBER_GIT_PROXY_URL`). `None` disables the proxy.
-    /// Defaults to `127.0.0.1:0` (loopback, ephemeral port). implementation-note-57.
+    /// Defaults to `127.0.0.1:0` (loopback, ephemeral port). implementation-note-123.
     pub git_proxy_addr: Option<SocketAddr>,
     /// Bind address for the general LLM/HTTP credential-injection proxy
     /// (`run_proxy` / `handle_request`). Surfaced to clients as
     /// `EMBER_PROXY_URL` and `<data_dir>/run/proxy.url`. Provider-aware auth
     /// (Anthropic `x-api-key`, generic Bearer). `None` disables the listener.
     /// Defaults to `127.0.0.1:0` (loopback, ephemeral port).
-    /// implementation-note-58.
+    /// implementation-note-124.
     pub llm_proxy_addr: Option<SocketAddr>,
     /// Keyring service/account override. `None` fields fall back to env var, then compile-time default.
     pub keyring: KeyringConfig,
@@ -328,13 +359,13 @@ pub struct DaemonConfig {
     /// design — vault snapshot interval in seconds. Default 3600 (1 hour).
     /// Set to 0 to disable periodic snapshots.
     pub snapshot_interval_secs: u64,
-    /// implementation-note-59 — periodic pull interval in seconds. Default
+    /// implementation-note-125 — periodic pull interval in seconds. Default
     /// 600 (10 min). Set to 0 to disable pulling.
     pub snapshot_pull_interval_secs: u64,
-    /// implementation-note-59 — base URL of the remote EIC snapshot endpoint.
+    /// implementation-note-125 — base URL of the remote EIC snapshot endpoint.
     /// `None` means pulling is not configured.
     pub snapshot_pull_endpoint: Option<String>,
-    /// implementation-note-59 — cluster id used to key pulled snapshots in
+    /// implementation-note-125 — cluster id used to key pulled snapshots in
     /// the local vault. Required when `snapshot_pull_endpoint` is `Some`.
     pub snapshot_pull_cluster_id: Option<String>,
     /// Per-op user-presence gate. Loaded from `[presence]`
@@ -344,6 +375,30 @@ pub struct DaemonConfig {
     /// means no `[credential_store]` section was present, which the
     /// daemon treats as `backend = "local"` (the existing vault path).
     pub credential_store: Option<CredentialStoreConfig>,
+    /// implementation-note-126 — absolute path to the pre-built
+    /// SCION fork binary the daemon shells out to at agent-spawn time.
+    /// `PathBuf::new()` (empty) means pin verification is disabled
+    /// (development / non-SCION installs).
+    pub scion_binary_path: PathBuf,
+    /// implementation-note-126 — operator-pinned SHA-256 of the
+    /// SCION fork binary (lower-hex, 64 chars). Empty string means
+    /// pin verification is disabled. When non-empty, the spawn path
+    /// calls [`crate::spawn::scion::verify_scion_binary_hash`] before
+    /// fork-exec and refuses on mismatch (CRIT-B TOCTOU defense).
+    pub scion_binary_sha256: String,
+    /// design Component 1 — bind address for the in-container mTLS
+    /// bridge. `None` disables the bridge listener.
+    ///
+    /// ember_bridge_bind_platform_defaults: platform-specific defaults
+    /// when neither the config file nor `EMBER_BRIDGE_BIND` env var is
+    /// set — `127.0.0.1` on macOS (loopback; host.docker.internal
+    /// resolves to a virtual address that Docker NATs to the host),
+    /// `0.0.0.0` on Linux (host.docker.internal resolves to the docker0
+    /// bridge IP, which the daemon must bind to receive container-
+    /// originated mTLS connections). Operators on multi-tenant Linux
+    /// hosts SHOULD override via `EMBER_BRIDGE_BIND=<docker0-IP>` for
+    /// surgical scoping; see [design §"Multi-tenant hardening"].
+    pub bridge_bind: Option<SocketAddr>,
 }
 
 fn expand_tilde(path: &str) -> Result<PathBuf, ConfigError> {
@@ -357,10 +412,62 @@ fn expand_tilde(path: &str) -> Result<PathBuf, ConfigError> {
     }
 }
 
-impl Default for DaemonConfig {
-    fn default() -> Self {
-        // Fallback to a fixed path when home dir is unavailable — tests that
-        // call `Default::default()` without a real home dir will still compile.
+/// ember_bridge_bind_platform_defaults — design Component 1 platform-conditional
+/// default for the mTLS bridge listener. macOS uses loopback (host.docker.internal
+/// NATs to the host); Linux uses 0.0.0.0 because host.docker.internal resolves
+/// to the docker0 bridge IP, which the daemon must bind to receive container-
+/// originated connections. Multi-tenant Linux hosts SHOULD override via
+/// `EMBER_BRIDGE_BIND=<docker0-IP>` (see design §"Multi-tenant hardening").
+/// Port `0` lets the kernel assign; the daemon will advertise the bound port
+/// to clients via bridge-discovery once the listener ships.
+fn default_bridge_bind() -> SocketAddr {
+    #[cfg(target_os = "macos")]
+    {
+        "127.0.0.1:0".parse().expect("valid default bridge_bind")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Linux + every non-macOS target. Container DNS for the host
+        // (host.docker.internal on Docker Desktop, the docker0 bridge IP
+        // for native Docker engine) only reaches a daemon bound to a
+        // routable address; 127.0.0.1 won't work from inside a container.
+        "0.0.0.0:0".parse().expect("valid default bridge_bind")
+    }
+}
+
+// implementation-note-130: `impl Default for DaemonConfig`
+// is REMOVED. The May-12 25-hour leaked-daemon incident was rooted in
+// `DaemonConfig { data_dir: tmpdir.path()..., ..Default::default() }`
+// partial-overrides silently inheriting user-home paths. The type
+// system now enforces "every constructor is explicit": tests use
+// `DaemonConfig::for_test(&tmpdir)`, production uses
+// `DaemonConfig::load(&path)`, and `load`'s field-level fallbacks come
+// from `Self::load_defaults()` (private; see below). See doc-test on
+// the struct above for the compile_fail pin.
+//
+// implementation-note-131
+
+impl DaemonConfig {
+    /// implementation-note-132 (Phase 1 substrate) — tempdir-scoped
+    /// test constructor. Sets every path-bearing field under `tmpdir` so a
+    /// T3 test cannot accidentally bind the operator's real
+    /// `~/.ember/run/daemon.sock` (the May-12 25-hour leaked-daemon
+    /// incident root cause).
+    ///
+    /// Tests MUST use this instead of `..Default::default()` partial-overrides.
+    /// Subtask B (implementation-note-133) migrates existing
+    /// callers off `Default` so the type system enforces the rule by
+    /// removing `impl Default` entirely.
+    ///
+    /// # target_state_anchor
+    ///
+    /// `DaemonConfig::for_test`
+    /// implementation-note-130: private fallback ctor used by
+    /// `load` when the on-disk TOML omits a field. Replaces the prior
+    /// `impl Default` role. Tests that previously asserted on
+    /// `DaemonConfig::default()`'s shape now call this method directly via
+    /// the `mod tests` re-export.
+    pub(crate) fn load_defaults() -> Self {
         let base = dirs_next::home_dir()
             .map(|h| h.join(".ember"))
             .unwrap_or_else(|| PathBuf::from("/tmp/.ember"));
@@ -382,11 +489,53 @@ impl Default for DaemonConfig {
             snapshot_pull_cluster_id: None,
             presence: PresenceConfigSection::default(),
             credential_store: None,
+            // implementation-note-126: empty defaults mean verification
+            // is opt-in — production configs MUST set both.
+            scion_binary_path: PathBuf::new(),
+            scion_binary_sha256: String::new(),
+            // design Component 1 — platform-specific default. Port 0 → kernel
+            // assigns; the daemon advertises the bound port to clients via the
+            // bridge-discovery flow once that ships. Linux uses 0.0.0.0 so
+            // host.docker.internal (docker0 bridge) can reach the daemon.
+            bridge_bind: Some(default_bridge_bind()),
         }
     }
-}
 
-impl DaemonConfig {
+    pub fn for_test(tmpdir: &std::path::Path) -> Self {
+        // Flat layout — every test artifact lives directly under tmpdir.
+        // Matches the pre-for_test pattern (`let mut c = DaemonConfig::default();
+        // c.data_dir = tmp.path()`) so vault tests that expect to write
+        // `<data_dir>/vault.salt` find an existing parent directory.
+        // Path uniqueness across socket / data / pid / policy is via
+        // filename, not subdirectory.
+        Self {
+            socket_dir: tmpdir.to_path_buf(),
+            data_dir: tmpdir.to_path_buf(),
+            pid_file: tmpdir.join("emberd.pid"),
+            policy_file: tmpdir.join("policy.toml"),
+            log_level: LogLevel::Info,
+            // Tests default the dashboard / proxies to disabled. A test that
+            // wants them enabled overrides explicitly — that's safer than
+            // tests silently binding loopback ports they don't expect.
+            dashboard_addr: None,
+            git_proxy_addr: None,
+            llm_proxy_addr: None,
+            keyring: KeyringConfig::default(),
+            stale_approval_threshold_secs: 3600,
+            snapshot_interval_secs: 0,
+            snapshot_pull_interval_secs: 0,
+            snapshot_pull_endpoint: None,
+            snapshot_pull_cluster_id: None,
+            presence: PresenceConfigSection::default(),
+            credential_store: None,
+            scion_binary_path: PathBuf::new(),
+            scion_binary_sha256: String::new(),
+            // Tests disable the bridge by default — explicit opt-in via
+            // override matches dashboard_addr / git_proxy_addr / llm_proxy_addr.
+            bridge_bind: None,
+        }
+    }
+
     pub fn default_config_path() -> PathBuf {
         dirs_next::home_dir()
             .map(|h| h.join(".ember").join("config.toml"))
@@ -397,7 +546,7 @@ impl DaemonConfig {
         let text = fs::read_to_string(path)?;
         let raw: RawConfig = toml::from_str(&text)?;
 
-        let defaults = DaemonConfig::default();
+        let defaults = DaemonConfig::load_defaults();
         let section = raw.daemon.unwrap_or(RawDaemonSection {
             socket_dir: None,
             data_dir: None,
@@ -412,6 +561,9 @@ impl DaemonConfig {
             snapshot_pull_interval_secs: None,
             snapshot_pull_endpoint: None,
             snapshot_pull_cluster_id: None,
+            scion_binary_path: None,
+            scion_binary_sha256: None,
+            bridge_bind: None,
         });
 
         let socket_dir = match section.socket_dir {
@@ -473,6 +625,46 @@ impl DaemonConfig {
 
         let credential_store = raw.credential_store;
 
+        // implementation-note-126: expand `~` so operators can write
+        // the path naturally; empty/absent fields fall back to defaults
+        // (empty path, empty hash) which disable verification — same
+        // semantics as not setting the keys at all.
+        let scion_binary_path = match section.scion_binary_path {
+            Some(ref s) if s.is_empty() => defaults.scion_binary_path,
+            Some(ref s) => expand_tilde(s)?,
+            None => defaults.scion_binary_path,
+        };
+        let scion_binary_sha256 = section
+            .scion_binary_sha256
+            .unwrap_or(defaults.scion_binary_sha256);
+
+        // design Component 1 — bridge_bind resolution order:
+        //   1. `EMBER_BRIDGE_BIND` env var (operator override, highest precedence;
+        //      empty string disables, matches dashboard/proxy convention).
+        //   2. `[daemon].bridge_bind` config field (empty string disables).
+        //   3. Platform-conditional default (127.0.0.1:0 on macOS, 0.0.0.0:0
+        //      on Linux/other) — see `default_bridge_bind()`.
+        let bridge_bind: Option<SocketAddr> = {
+            let env_value = std::env::var("EMBER_BRIDGE_BIND").ok();
+            match (env_value.as_deref(), section.bridge_bind.as_deref()) {
+                // Empty string at either layer disables the bridge.
+                (Some(""), _) | (None, Some("")) => None,
+                // Env override wins when present + non-empty.
+                (Some(s), _) => Some(SocketAddr::from_str(s).map_err(|e| {
+                    ConfigError::Validation(format!(
+                        "invalid EMBER_BRIDGE_BIND env value '{}': {}",
+                        s, e
+                    ))
+                })?),
+                // Config-file value when env is absent + config is non-empty.
+                (None, Some(s)) => Some(SocketAddr::from_str(s).map_err(|e| {
+                    ConfigError::Validation(format!("invalid bridge_bind '{}': {}", s, e))
+                })?),
+                // Neither override present → platform-specific default.
+                (None, None) => defaults.bridge_bind,
+            }
+        };
+
         let cfg = DaemonConfig {
             socket_dir,
             data_dir,
@@ -490,6 +682,9 @@ impl DaemonConfig {
             snapshot_pull_cluster_id,
             presence,
             credential_store,
+            scion_binary_path,
+            scion_binary_sha256,
+            bridge_bind,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -532,7 +727,7 @@ mod tests {
 
     #[test]
     fn default_paths_contain_ember() {
-        let cfg = DaemonConfig::default();
+        let cfg = DaemonConfig::load_defaults();
         assert!(cfg.socket_dir.to_string_lossy().contains(".ember"));
         assert!(cfg.data_dir.to_string_lossy().contains(".ember"));
         assert!(cfg.pid_file.to_string_lossy().contains(".ember"));
@@ -541,7 +736,7 @@ mod tests {
 
     #[test]
     fn round_trip_toml() {
-        let defaults = DaemonConfig::default();
+        let defaults = DaemonConfig::load_defaults();
 
         // Build a TOML string from defaults and re-parse it.
         let toml_str = format!(
@@ -582,6 +777,9 @@ mod tests {
             snapshot_pull_cluster_id: None,
             presence: PresenceConfigSection::default(),
             credential_store: None,
+            scion_binary_path: PathBuf::new(),
+            scion_binary_sha256: String::new(),
+            bridge_bind: None,
         };
 
         cfg.ensure_dirs().unwrap();
@@ -599,7 +797,7 @@ mod tests {
         f.write_all(toml_str.as_bytes()).unwrap();
 
         let loaded = DaemonConfig::load(f.path()).unwrap();
-        let defaults = DaemonConfig::default();
+        let defaults = DaemonConfig::load_defaults();
 
         assert_eq!(loaded.socket_dir, defaults.socket_dir);
         assert_eq!(loaded.data_dir, defaults.data_dir);
@@ -614,7 +812,7 @@ mod tests {
         f.write_all(toml_str.as_bytes()).unwrap();
 
         let loaded = DaemonConfig::load(f.path()).unwrap();
-        let defaults = DaemonConfig::default();
+        let defaults = DaemonConfig::load_defaults();
 
         assert_eq!(loaded, defaults);
     }
@@ -650,7 +848,7 @@ mod tests {
 
     #[test]
     fn validate_default_config_passes() {
-        let cfg = DaemonConfig::default();
+        let cfg = DaemonConfig::load_defaults();
         assert!(cfg.validate().is_ok());
     }
 
@@ -673,6 +871,9 @@ mod tests {
             snapshot_pull_cluster_id: None,
             presence: PresenceConfigSection::default(),
             credential_store: None,
+            scion_binary_path: PathBuf::new(),
+            scion_binary_sha256: String::new(),
+            bridge_bind: None,
         };
         let err = cfg.validate().unwrap_err();
         assert!(matches!(err, ConfigError::Validation(ref s) if s.contains("socket_dir")));
@@ -697,6 +898,9 @@ mod tests {
             snapshot_pull_cluster_id: None,
             presence: PresenceConfigSection::default(),
             credential_store: None,
+            scion_binary_path: PathBuf::new(),
+            scion_binary_sha256: String::new(),
+            bridge_bind: None,
         };
         let err = cfg.validate().unwrap_err();
         assert!(matches!(err, ConfigError::Validation(ref s) if s.contains("must be different")));
@@ -817,5 +1021,29 @@ mod tests {
         let loaded = DaemonConfig::load(f.path()).unwrap();
         assert_eq!(loaded.keyring.service.as_deref(), Some("only-service"));
         assert!(loaded.keyring.account.is_none());
+    }
+
+    #[test]
+    fn scion_binary_pin_absent_gives_empty_defaults() {
+        // implementation-note-126: when neither key is set the
+        // daemon treats verification as disabled (dev installs).
+        let toml_str = "[daemon]\nlog_level = \"info\"\n";
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+        let loaded = DaemonConfig::load(f.path()).unwrap();
+        assert_eq!(loaded.scion_binary_path, PathBuf::new());
+        assert_eq!(loaded.scion_binary_sha256, "");
+    }
+
+    #[test]
+    fn scion_binary_pin_loaded_from_toml() {
+        // implementation-note-126: both fields round-trip through
+        // TOML so operators can pin the binary in `config.toml`.
+        let toml_str = "[daemon]\nlog_level = \"info\"\nscion_binary_path = \"/opt/scion/scion\"\nscion_binary_sha256 = \"abc123\"\n";
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+        let loaded = DaemonConfig::load(f.path()).unwrap();
+        assert_eq!(loaded.scion_binary_path, PathBuf::from("/opt/scion/scion"));
+        assert_eq!(loaded.scion_binary_sha256, "abc123");
     }
 }

@@ -36,7 +36,7 @@ use ember_daemon::bootstrap::vault_key_for_cluster;
 use ember_daemon::infra::config::DaemonConfig;
 use ember_daemon::infra::runtime::DaemonRuntime;
 use ember_daemon::infra::store::DaemonStore;
-use ember_daemon::infra::vault::{Vault, VaultError, validate_credential_name};
+use ember_daemon::infra::vault::{Vault, VaultError, VaultScope, validate_credential_name};
 
 /// Run `ember cluster bootstrap <cluster-id> [--two-phase]`.
 ///
@@ -84,7 +84,7 @@ pub fn cmd_cluster_bootstrap(
     };
 
     // Check whether a keypair for this cluster already exists in the vault.
-    match vault.get(&store, &vault_key) {
+    match vault.get(VaultScope::Interactive, &store, &vault_key) {
         Ok(_existing_seed) => {
             // Already generated — retrieve and re-print pubkeys (idempotent).
             print_existing_bootstrap(&vault, &store, cluster_id, &vault_key, json_output);
@@ -104,7 +104,7 @@ pub fn cmd_cluster_bootstrap(
 
     // Store the privkey seed in the vault (hex-encoded).
     let seed_hex = hex::encode(seed);
-    match vault.add(&store, &vault_key, seed_hex.as_bytes(), Some("daemon-persona-seed")) {
+    match vault.add(VaultScope::Interactive, &store, &vault_key, seed_hex.as_bytes(), Some("daemon-persona-seed")) {
         Ok(_) => {}
         Err(e) => {
             eprintln!("error: failed to store Daemon Persona seed in vault: {e}");
@@ -189,7 +189,7 @@ pub fn cmd_cluster_restore(
     };
 
     // Fetch privkey seed from vault.
-    let seed_hex = match vault.get(&store, &vault_key) {
+    let seed_hex = match vault.get(VaultScope::Interactive, &store, &vault_key) {
         Ok(bytes) => match std::str::from_utf8(&bytes) {
             Ok(s) => s.trim().to_string(),
             Err(_) => {
@@ -388,7 +388,7 @@ fn print_existing_bootstrap(
     vault_key: &str,
     json_output: bool,
 ) {
-    let seed_hex_bytes = match vault.get(store, vault_key) {
+    let seed_hex_bytes = match vault.get(VaultScope::Interactive, store, vault_key) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("error: cannot re-read vault key {vault_key}: {e}");

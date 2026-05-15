@@ -1,7 +1,7 @@
 use serde_json::{json, Value};
 
 /// The exact `command` string we look for and write. Exposed for tests
-/// and for implementation-note-162's `--uninstall` path to remove only what we added.
+/// and for implementation-note-290's `--uninstall` path to remove only what we added.
 pub const EMBER_PROXY_HOOK_COMMAND: &str = "ember-proxy hook";
 
 /// Raw tool names that must NOT be invoked outside the shadow PATH shims.
@@ -322,7 +322,7 @@ pub fn remove_pretooluse_hook(settings: &mut Value) -> Result<bool, PatchError> 
 }
 
 /// Top-level convenience: parse → patch (add) → re-serialize.
-/// Used by `ember init --for claude-code` (implementation-note-162).
+/// Used by `ember init --for claude-code` (implementation-note-290).
 pub fn patch_settings_json(input: &str) -> Result<String, PatchError> {
     let mut value = if input.trim().is_empty() {
         json!({})
@@ -504,7 +504,7 @@ mod tests {
         assert!(patch_settings_json("{not json").is_err());
     }
 
-    // --- implementation-note-177 tests ---
+    // --- implementation-note-311 tests ---
 
     #[test]
     fn add_deny_to_empty_settings() {

@@ -1,9 +1,5 @@
-use core_types::{
-    DeviceAddedEvent, DeviceEncryptionKeyRotatedEvent, DeviceFrozenEvent, DeviceKeyRotatedEvent,
-    DeviceReplacedEvent, DeviceRevokedEvent, DisclosedLinkage, DisclosedPersona, DisclosureView,
-    EventBody, IdentityRoot, LinkageAssertion, Persona, PublicKeyMaterial, RootCreatedEvent,
-    RootKeyRotatedEvent, RootRevokedEvent,
-};
+use core_event_types::{DeviceAddedEvent, DeviceEncryptionKeyRotatedEvent, DeviceFrozenEvent, DeviceKeyRotatedEvent, DeviceReplacedEvent, DeviceRevokedEvent, EventBody, RootCreatedEvent, RootKeyRotatedEvent, RootRevokedEvent};
+use core_principals::{DisclosedLinkage, DisclosedPersona, DisclosureView, IdentityRoot, LinkageAssertion, Persona, PublicKeyMaterial};
 
 pub fn create_root(
     id: impl Into<String>,
@@ -171,7 +167,8 @@ pub fn disclosure_view(
 
 #[cfg(test)]
 mod tests {
-    use core_types::{EventType, KeyAlgorithm, SurvivalMode};
+    use core_event_types::{EventType};
+    use core_principals::{KeyAlgorithm, SurvivalMode};
 
     use super::*;
 
@@ -194,7 +191,7 @@ mod tests {
                 survival_mode: SurvivalMode::Strict,
                 active_key: PublicKeyMaterial {
                     key_id: "key-persona-a1".into(),
-                    algorithm: core_types::KeyAlgorithm::DevEd25519Like,
+                    algorithm: core_principals::KeyAlgorithm::DevEd25519Like,
                     public_key: "devpub:a1".into(),
                 },
             },
@@ -206,7 +203,7 @@ mod tests {
                 survival_mode: SurvivalMode::Strict,
                 active_key: PublicKeyMaterial {
                     key_id: "key-persona-a2".into(),
-                    algorithm: core_types::KeyAlgorithm::DevEd25519Like,
+                    algorithm: core_principals::KeyAlgorithm::DevEd25519Like,
                     public_key: "devpub:a2".into(),
                 },
             },
@@ -218,7 +215,7 @@ mod tests {
                 survival_mode: SurvivalMode::Strict,
                 active_key: PublicKeyMaterial {
                     key_id: "key-persona-b1".into(),
-                    algorithm: core_types::KeyAlgorithm::DevEd25519Like,
+                    algorithm: core_principals::KeyAlgorithm::DevEd25519Like,
                     public_key: "devpub:b1".into(),
                 },
             },

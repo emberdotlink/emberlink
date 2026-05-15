@@ -69,7 +69,7 @@ Free, open, and permissionless. Forever.
 - **The grant protocol.** Structure, signing, exchange, revocation. Open standard.
 - **The core libraries.** Identity, event log, grants, vault, recovery, sync, trust, storage. Open source, Apache-2.0.
 - **The relay protocol.** Accept, store, deliver encrypted envelopes. Open spec with reference implementation.
-- **The reference applications.** CLI (`ember`), daemon (`emberd`), proxy (`ember-proxy`), sandbox (`ember-sandbox`), dashboard (`ember-dashboard`), engine (`ember-engine`). All open source.
+- **The reference applications.** CLI (`ember`), daemon (`emberd`), proxy (`ember-proxy`), sandbox (`ember-sandbox`), dashboard (`ember-dashboard`), forge (`headless-runtime`). All open source.
 
 This can never be taken away, locked down, or enshittified.
 

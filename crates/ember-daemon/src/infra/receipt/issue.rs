@@ -31,7 +31,7 @@ pub enum IssueError {
 }
 
 /// Optional termination metadata injected into the `ClaudeCodeBody` by the
-/// dirty-exit path (implementation-note-13). Pass `None` for
+/// dirty-exit path (implementation-note-29). Pass `None` for
 /// clean-exit / TTL-expiry / explicit-revoke issuance paths where the reason
 /// is not yet known at build time.
 pub struct TerminationMeta {
@@ -45,7 +45,7 @@ pub struct TerminationMeta {
 /// Steps per design §"Envelope" + design §"Daemon Persona signing":
 /// 1. Build [`ClaudeCodeBody`] from `claim_events` + parsed `audit_gaps.jsonl`
 ///    (lines parsed individually, malformed lines skipped — fail-open shape
-///    matches implementation-note-10's writer). Optional `termination_meta` injects the
+///    matches implementation-note-11's writer). Optional `termination_meta` injects the
 ///    reason/heartbeat/pid fields into the body in the same step.
 /// 2. Compute `permits_merkle_root` over `claim_events[].input_hash` blake3
 ///    leaves (design §"Merkle leaf format" — leaf form simplified for now;
@@ -121,6 +121,7 @@ pub fn issue_cohort_a_receipt(
         daemon_root_id: daemon_root_id.into(),
         traceparent: None,
         termination_authority,
+        presence_kind: None,
         body: body_value,
         // sign_receipt_v2 populates both receipt_id and signature below.
         signature: None,
@@ -142,7 +143,7 @@ pub fn issue_cohort_a_receipt(
 }
 
 /// Parse `~/.ember/sessions/<id>/audit-gaps.jsonl` line-by-line, skipping
-/// malformed lines (matches the fail-open posture of implementation-note-10's writer).
+/// malformed lines (matches the fail-open posture of implementation-note-11's writer).
 fn parse_audit_gaps(path: &Path) -> Result<Vec<AuditGap>, IssueError> {
     let raw = fs::read_to_string(path).map_err(|source| IssueError::AuditGapsRead {
         path: path.display().to_string(),
@@ -311,7 +312,7 @@ mod tests {
 
     /// T1 round-trip — `issue_cohort_a_receipt` now signs in-place.
     /// The returned envelope must verify against the signer's public key.
-    /// Pins implementation-note-116 + implementation-note-117.
+    /// Pins implementation-note-202 + implementation-note-203.
     #[test]
     fn receipt_id_matches_canonical_compute_and_verifies_after_signing() {
         let signer = FixtureSigner::new("issue-rs-roundtrip");

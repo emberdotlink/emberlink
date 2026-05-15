@@ -70,7 +70,7 @@ pub struct DaemonStore {
     /// reference through that chain. The `RefCell` is only touched on
     /// the single-threaded LocalSet, so runtime borrow panics cannot race.
     vault: RefCell<Option<Rc<Vault>>>,
-    /// implementation-note-102 Phase 2: in-memory rate-limit set for the
+    /// implementation-note-181 Phase 2: in-memory rate-limit set for the
     /// `sops_unwrap_dek` RPC. Each grant_id is consumed exactly once per
     /// daemon-process lifetime. The set is intentionally non-persistent —
     /// daemon restart clears it (acceptable: a restart-then-replay attack
@@ -130,7 +130,7 @@ impl DaemonStore {
         Ok(store)
     }
 
-    /// implementation-note-102 Phase 2: claim a `grant_id` slot for a
+    /// implementation-note-181 Phase 2: claim a `grant_id` slot for a
     /// `sops_unwrap_dek` RPC call. Returns `true` on first claim,
     /// `false` if the grant has already been consumed for an unwrap.
     ///
@@ -172,6 +172,20 @@ impl DaemonStore {
         self.vault.borrow().clone()
     }
 
+    /// implementation-note-23 C2: drop the attached `Rc<Vault>` so the
+    /// final outstanding reference is released — the MEK is wiped via
+    /// `ZeroizeOnDrop` once every clone of the `Rc` has dropped. Called
+    /// from `trust::presence::lock()` (explicit user-initiated lock) so
+    /// the daemon enters hard-lock semantics: the next vault op MUST
+    /// re-derive the MEK from the keyring-stored passphrase.
+    ///
+    /// Idle auto-lock does NOT call this — it retains soft-lock so
+    /// background headless survives the idle window without forcing a
+    /// re-prompt.
+    pub fn drop_vault(&self) {
+        *self.vault.borrow_mut() = None;
+    }
+
     pub fn conn(&self) -> &Connection {
         &self.conn
     }
@@ -207,7 +221,9 @@ impl DaemonStore {
                 action TEXT NOT NULL,
                 credential TEXT,
                 outcome TEXT NOT NULL,
-                details TEXT
+                details TEXT,
+                prev_hash TEXT,
+                row_hash TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_audit_agent ON audit_log(agent_id);
             CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp);
@@ -313,7 +329,7 @@ impl DaemonStore {
             CREATE INDEX IF NOT EXISTS idx_receipts_persona ON receipts(persona_id);
             CREATE INDEX IF NOT EXISTS idx_receipts_created ON receipts(created_at);
 
-            -- implementation-note-38: server-persisted WebAuthn credentials.
+            -- implementation-note-74: server-persisted WebAuthn credentials.
             -- Each row is a passkey enrolled by a persona via
             -- /settings/passkeys; the `passkey_json` column is the
             -- webauthn-rs `Passkey` type (serde JSON serialization)
@@ -332,7 +348,7 @@ impl DaemonStore {
             CREATE INDEX IF NOT EXISTS idx_webauthn_credentials_persona
                 ON webauthn_credentials(persona_id);
 
-            -- implementation-note-38: in-flight WebAuthn ceremony state.
+            -- implementation-note-74: in-flight WebAuthn ceremony state.
             -- Registration ceremonies and authentication ceremonies
             -- both stash `state_json` here keyed by a freshly-minted
             -- challenge_id; the corresponding finish endpoint reads it
@@ -356,10 +372,30 @@ impl DaemonStore {
             CREATE INDEX IF NOT EXISTS idx_webauthn_challenges_approval
                 ON webauthn_challenges(approval_id);
             CREATE INDEX IF NOT EXISTS idx_webauthn_challenges_persona
-                ON webauthn_challenges(persona_id);",
+                ON webauthn_challenges(persona_id);
+
+            -- credential_bindings_table_schema — implementation-note-221
+            -- Daemon-controlled credential-target allowlist: binds a
+            -- principal (persona) + working-tree (canonical absolute
+            -- repo-root path) + remote-name to a specific remote URL.
+            -- The broker consults this table to decide whether an
+            -- outbound credential injection is authorized for the
+            -- requested target. Composite primary key matches the
+            -- lookup pattern (principal + tree + remote) so single-row
+            -- gets are index hits without a secondary scan.
+            CREATE TABLE IF NOT EXISTS credential_bindings (
+                principal_id    TEXT NOT NULL,
+                working_tree_id TEXT NOT NULL,
+                remote_name     TEXT NOT NULL,
+                remote_url      TEXT NOT NULL,
+                created_at      INTEGER NOT NULL,
+                PRIMARY KEY (principal_id, working_tree_id, remote_name)
+            );
+            CREATE INDEX IF NOT EXISTS idx_credential_bindings_principal
+                ON credential_bindings(principal_id);",
         )?;
 
-        // implementation-note-16 — backfill `kind` column on legacy DBs so
+        // implementation-note-36 — backfill `kind` column on legacy DBs so
         // the kms_wrap / kms_unwrap rows can land alongside grant rows.
         // Errors swallowed when the column already exists.
         let _ = self.conn.execute(
@@ -367,7 +403,7 @@ impl DaemonStore {
             [],
         );
 
-        // implementation-note-16 — per-key fast-path index for queries shaped
+        // implementation-note-36 — per-key fast-path index for queries shaped
         // `WHERE kind IN ('kms_wrap','kms_unwrap') AND key_name = ?`. Uses
         // SQLite JSON1 (`json_extract`) over the existing `receipt_json`
         // column so we don't have to project key_name into its own
@@ -379,7 +415,7 @@ impl DaemonStore {
                  WHERE kind IN ('kms_wrap','kms_unwrap');",
         )?;
 
-        // EMBER-implementation-note-94 — per-actor and per-resource fast-path indexes
+        // EMBER-implementation-note-172 — per-actor and per-resource fast-path indexes
         // for the `ember audit` query CLI. The existing
         // `idx_receipts_persona` covers persona_id lookups; we keep the
         // `idx_receipts_actor` alias as a stable name the task spec can
@@ -392,7 +428,7 @@ impl DaemonStore {
                  ON receipts(json_extract(receipt_json, '$.summary.resource'));",
         )?;
 
-        // implementation-note-77 — composite-grant approval columns. Existing v0 DBs
+        // implementation-note-152 — composite-grant approval columns. Existing v0 DBs
         // (e.g. the qember.sh demo seed) predate the columns above, so
         // additively backfill them with idempotent ALTER TABLE calls.
         // Errors here are swallowed when the column already exists; any
@@ -432,7 +468,7 @@ impl DaemonStore {
             [],
         );
 
-        // implementation-note-92 — per-statement revocation list.
+        // implementation-note-170 — per-statement revocation list.
         // Stores a JSON array of revoked Statement sids ("S0", "S1", ...) so
         // the demo can revoke a single Statement without taking down the
         // whole grant. Default `'[]'` keeps the column non-null on legacy
@@ -473,12 +509,198 @@ impl DaemonStore {
             [],
         );
 
+        // implementation-note-40 (design §9 + §6) — bind a
+        // workload Persona to the container identity it was minted for so
+        // the reconciler can refuse to spawn a second container into the
+        // same enrollment slot if the daemon restarts mid-spawn (CRIT-4
+        // in-flight key checkpointing). `enrolling` is a new persona
+        // `status` value (legal lifecycle: `enrolling -> active`; the row
+        // is created in `enrolling` before the attenuated child grant
+        // mints, and flips to `active` only on successful two-phase
+        // commit). The reconciler treats `enrolling` rows as poisoned —
+        // a daemon restart that crashed between phase-1 row insertion
+        // and phase-2 grant minting leaves the row in `enrolling`, and
+        // the reconciler refuses to spawn into that slot. Nullable —
+        // legacy personas predate the binding and retain NULL.
+        let _ = self.conn.execute(
+            "ALTER TABLE personas ADD COLUMN container_id TEXT",
+            [],
+        );
+        let _ = self.conn.execute(
+            "ALTER TABLE personas ADD COLUMN parent_grant_id TEXT",
+            [],
+        );
+
+        // implementation-note-168 (design §"In-container
+        // extension") — per-socket Persona enrollment table. At spawn
+        // time the daemon records `(agent_socket_path, persona_id,
+        // grant_id, brief_content_hash)` so subsequent RPCs on that
+        // socket resolve identity from the enrollment table rather
+        // than trusting the wire-claimed `caller_persona_id` /
+        // `caller_grant_id`. The socket path is the identity primitive
+        // for per-agent UDS sockets at `/run/emberd/agent-<uuid>.sock`.
+        //
+        // `state` is `'active'` for enrollments that should resolve
+        // RPCs and `'revoked'` for tombstoned slots (the row stays so
+        // a subsequent enrollment with the same socket path can detect
+        // reuse). The default `'active'` matches the spawn-time happy
+        // path.
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS agent_socket_enrollments (
+                socket_path TEXT PRIMARY KEY,
+                persona_id TEXT NOT NULL,
+                grant_id TEXT NOT NULL,
+                brief_content_hash TEXT NOT NULL,
+                enrolled_at TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'active'
+            );",
+        )?;
+
+        // implementation-note-120 — tamper-evident chain columns on the
+        // audit_log table + split-brain migration checkpoint. Pre-chain rows
+        // carry NULL hashes; the genesis row marks the boundary between
+        // pre-chain audit history and the new chained-from-here regime.
+        // Errors swallowed when columns already exist (fresh DBs have them
+        // via the CREATE TABLE above; old DBs need the ALTER).
+        let _ = self
+            .conn
+            .execute("ALTER TABLE audit_log ADD COLUMN prev_hash TEXT", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE audit_log ADD COLUMN row_hash TEXT", []);
+        // Idempotent genesis: insert only if no genesis row exists yet.
+        // chain_v1_genesis acts as the chain anchor — subsequent
+        // append_audit_event_with_chain calls hash the prior row's
+        // row_hash into the new row, with this genesis providing the
+        // initial non-NULL prev_hash for chain readers.
+        let has_genesis: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE action = 'audit.chain_v1_genesis'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if has_genesis == 0 {
+            let genesis_hash = blake3::hash(b"audit.chain_v1_genesis")
+                .to_hex()
+                .to_string();
+            let _ = self.conn.execute(
+                "INSERT INTO audit_log \
+                 (timestamp, agent_id, action, credential, outcome, details, prev_hash, row_hash) \
+                 VALUES (?1, NULL, 'audit.chain_v1_genesis', NULL, 'ok', NULL, NULL, ?2)",
+                rusqlite::params![chrono::Utc::now().to_rfc3339(), genesis_hash],
+            );
+        }
+
+        Ok(())
+    }
+}
+
+/// implementation-note-168 (design §"In-container
+/// extension") — projection of an `agent_socket_enrollments` row.
+///
+/// Returned by [`DaemonStore::lookup_agent_socket_enrollment`] when an
+/// active enrollment exists for the queried socket path. Revoked rows
+/// are NOT surfaced — the helper returns `Ok(None)` for them so
+/// dispatch can refuse the RPC with `PrincipalNotEnrolled`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSocketEnrollment {
+    pub socket_path: String,
+    pub persona_id: String,
+    pub grant_id: String,
+    pub brief_content_hash: String,
+    pub enrolled_at: String,
+    pub state: String,
+}
+
+impl DaemonStore {
+    /// implementation-note-168 — record a fresh per-socket
+    /// Persona enrollment.
+    ///
+    /// Called at agent-spawn time by the scion spawn pipeline once a
+    /// per-agent UDS socket has been created at `/run/emberd/agent-
+    /// <uuid>.sock`. The `(socket_path, persona_id, grant_id,
+    /// brief_content_hash)` quadruple is the kernel-attested identity
+    /// substrate for every subsequent RPC on that socket — the handler
+    /// reads from this table rather than trusting wire-claimed
+    /// `caller_persona_id` / `caller_grant_id` per design.
+    ///
+    /// The row is inserted with `state = 'active'`. Subsequent
+    /// re-enrollment of the same `socket_path` replaces the prior row
+    /// (`INSERT OR REPLACE`) so a tombstoned slot can be reclaimed
+    /// after the original agent exits.
+    pub fn record_agent_socket_enrollment(
+        &self,
+        socket_path: &str,
+        persona_id: &str,
+        grant_id: &str,
+        brief_content_hash: &str,
+    ) -> Result<(), StoreError> {
+        let enrolled_at = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT OR REPLACE INTO agent_socket_enrollments \
+                (socket_path, persona_id, grant_id, brief_content_hash, enrolled_at, state) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 'active')",
+            rusqlite::params![socket_path, persona_id, grant_id, brief_content_hash, enrolled_at],
+        )?;
+        Ok(())
+    }
+
+    /// implementation-note-168 — resolve the Persona
+    /// bound to a per-agent UDS socket.
+    ///
+    /// Returns `Ok(Some(...))` only when an `active` enrollment row is
+    /// present for the requested socket path. Revoked rows yield
+    /// `Ok(None)` so the dispatch layer can map the miss to
+    /// `HandlerError::PrincipalNotEnrolled`.
+    pub fn lookup_agent_socket_enrollment(
+        &self,
+        socket_path: &str,
+    ) -> Result<Option<AgentSocketEnrollment>, StoreError> {
+        let result = self.conn.query_row(
+            "SELECT socket_path, persona_id, grant_id, brief_content_hash, enrolled_at, state \
+             FROM agent_socket_enrollments WHERE socket_path = ?1 AND state = 'active'",
+            rusqlite::params![socket_path],
+            |row| {
+                Ok(AgentSocketEnrollment {
+                    socket_path: row.get(0)?,
+                    persona_id: row.get(1)?,
+                    grant_id: row.get(2)?,
+                    brief_content_hash: row.get(3)?,
+                    enrolled_at: row.get(4)?,
+                    state: row.get(5)?,
+                })
+            },
+        );
+        match result {
+            Ok(row) => Ok(Some(row)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(StoreError::Sqlite(e)),
+        }
+    }
+
+    /// implementation-note-168 — tombstone an enrollment.
+    ///
+    /// Flips the row's `state` column to `'revoked'`; the row itself
+    /// stays so the slot is observable for post-mortem audit and so a
+    /// future re-enrollment of the same `socket_path` (via
+    /// [`Self::record_agent_socket_enrollment`]'s `INSERT OR REPLACE`)
+    /// is a deliberate operator action rather than a silent overwrite.
+    ///
+    /// No-op when the row does not exist — the operator-facing surface
+    /// (e.g. agent-exit cleanup) shouldn't have to pre-check.
+    pub fn revoke_agent_socket_enrollment(&self, socket_path: &str) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE agent_socket_enrollments SET state = 'revoked' WHERE socket_path = ?1",
+            rusqlite::params![socket_path],
+        )?;
         Ok(())
     }
 }
 
 impl DaemonStore {
-    /// EMBER-implementation-note-94 — query the receipts table with the full
+    /// EMBER-implementation-note-172 — query the receipts table with the full
     /// [`crate::infra::receipt::ReceiptFilter`] filter set (actor/kind/grant_id/
     /// since_iso/resource/limit). Returns flat [`crate::infra::receipt::ReceiptRow`]
     /// projections so callers get `materialized_at`, `terminal_reason`,
@@ -504,12 +726,12 @@ impl DaemonStore {
     /// Phase C callers replace the embedded `if current_status != "pending"`
     /// string-comparison guard with this fn, which also covers the
     /// scope-narrowing invariant checked by `core_approval::TransitionError::ScopeNotNarrowing`.
-    // implementation-note-129 wires this into resolve_approval_inner.
+    // implementation-note-222 wires this into resolve_approval_inner.
     #[allow(dead_code)]
     pub(crate) fn validate_approval_transition(
-        state: core_types::approval::ApprovalStatus,
+        state: core_grant_types::approval::ApprovalStatus,
         outcome: &core_approval::ApprovalOutcome,
-    ) -> Result<core_types::approval::ApprovalStatus, StoreError> {
+    ) -> Result<core_grant_types::approval::ApprovalStatus, StoreError> {
         core_approval::states::transition(state, outcome).map_err(|e| match e {
             core_approval::TransitionError::AlreadyDecided => StoreError::AlreadyResolved,
             core_approval::TransitionError::ScopeNotNarrowing => {
@@ -545,6 +767,9 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         let expected = [
+            // implementation-note-168: per-socket Persona
+            // enrollment table keyed by `socket_path`.
+            "agent_socket_enrollments",
             "approval_requests",
             "audit_log",
             "credentials",
@@ -555,11 +780,11 @@ mod tests {
             "receipts",
             "sandboxes",
             "standing_grants",
-            // implementation-note-38: server-persisted WebAuthn state.
+            // implementation-note-74: server-persisted WebAuthn state.
             "webauthn_credentials",
             "webauthn_challenges",
         ];
-        assert_eq!(tables.len(), 12);
+        assert_eq!(tables.len(), 13);
         for name in &expected {
             assert!(tables.contains(&name.to_string()), "missing table: {name}");
         }

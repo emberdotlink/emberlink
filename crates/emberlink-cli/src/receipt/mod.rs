@@ -11,8 +11,14 @@
 
 pub mod render;
 pub mod rollup;
+pub mod tree;
 pub mod verify_dispatch;
 
 pub use render::render_receipt_markdown;
 pub use rollup::{rollup_command, verify_chain, RollupError, RollupFilters, RollupRow};
+pub use tree::{
+    build_tree, cmd_receipt_tree, format_verify_outcome, read_tree_export, render_tree_ascii,
+    verify_tree_offline, TreeError, TreeExport, TreeGrant, TreeReceipt, TreeSpawnWitness,
+    VerifyTreeOutcome,
+};
 pub use verify_dispatch::{dispatch_verify, format_outcome, DispatchOutcome};

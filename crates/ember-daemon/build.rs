@@ -2,7 +2,7 @@
 //! consumption in `runtime.rs`.
 //!
 //! CLI-VERSION-FLAG: the daemon startup log line records both so a stale
-//! binary running against a newer codebase (the implementation-note-41
+//! binary running against a newer codebase (the implementation-note-79
 //! root cause) is identifiable in seconds.
 //!
 //! See `crates/emberlink-cli/build.rs` for the same algorithm — duplicated
@@ -14,6 +14,29 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
+    // implementation-note-5 (Cluster D D1, design review 20260513-122447):
+    // refuse to compile a release-binary build that also enabled the
+    // qa-mock feature. The intent is "qa-mock exposes test substrate;
+    // release artifacts must never carry it." Operators who want a
+    // staging build with test helpers should set qa-mock and OMIT
+    // EMBER_RELEASE; production-shipping pipelines set EMBER_RELEASE=1
+    // and the daemon's CI gate refuses any binary that came in via
+    // the qa-mock path. Production checkpoint approaches were rejected
+    // (runtime-deletable); the build.rs panic is the structural gate.
+    let qa_mock_on = std::env::var_os("CARGO_FEATURE_QA_MOCK").is_some();
+    let ember_release = std::env::var("EMBER_RELEASE").as_deref() == Ok("1");
+    if qa_mock_on && ember_release {
+        panic!(
+            "implementation-note-5: refusing to build ember-daemon with \
+             `qa-mock` feature enabled AND EMBER_RELEASE=1. The qa-mock \
+             feature exposes test substrate (MockBroker, mock fixtures, \
+             test helpers) that MUST NOT ship in release artifacts. Either \
+             drop the qa-mock feature for the release build, or unset \
+             EMBER_RELEASE for a staging build."
+        );
+    }
+    println!("cargo:rerun-if-env-changed=EMBER_RELEASE");
+
     let sha = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .output()

@@ -25,12 +25,11 @@ use core_sync::{
     relevant_event_ids_for_context, wrap_for_relay,
 };
 use core_trust::{derive_score, trust_attested_event, trust_revoked_event};
-use core_types::{
-    AccessGrant, AttestationBinding, Block, Condition, GrantMode, GrantStatus, ResourceSelector,
-    Statement, AdmissionToken, ContentPublishedEvent, ContentVisibility, EventBody,
-    MessageSentEvent, PresentationAudienceKind, RecipientProfile, ResourceType, SignerBinding,
-    SurvivalMode, SyncProfile, TrustThreshold, Usage, Validate, ValidationError,
-};
+use core_grant_types::{AccessGrant, AttestationBinding, Block, Condition, GrantMode, GrantStatus, RecipientProfile, ResourceSelector, ResourceType, Statement, Usage};
+use core_event_types::{ContentPublishedEvent, ContentVisibility, EventBody, MessageSentEvent, PresentationAudienceKind, SignerBinding};
+use core_principals::{SurvivalMode, SyncProfile, TrustThreshold};
+use core_principals::{AdmissionToken};
+use core_types::{Validate, ValidationError};
 use core_approval::{ApprovalResponse, ApprovalStatus};
 
 use crate::biometric::{BiometricError, BiometricOutcome, require_biometric};
@@ -201,9 +200,9 @@ impl DemoApp {
             ["import", rest @ ..] => self.handle_import(rest),
             ["show", "vault", rest @ ..] | ["vault", rest @ ..] => self.handle_vault(rest),
             ["show", "grant", rest @ ..] | ["grant", rest @ ..] => self.handle_grant(rest),
-            // EMBER-implementation-note-94: Subcommand::Audit — query the receipts table.
+            // EMBER-implementation-note-172: Subcommand::Audit — query the receipts table.
             ["audit", rest @ ..] => self.handle_audit(rest),
-            // implementation-note-81 — `ember approval approve|deny <id>` is the
+            // implementation-note-156 — `ember approval approve|deny <id>` is the
             // demo-grade approval command. On macOS it triggers
             // LocalAuthentication (Touch ID / device passcode) before
             // mutating state; declined biometric refuses the approval.
@@ -530,7 +529,7 @@ impl DemoApp {
             .map(|root| root.id.clone())
             .ok_or_else(|| ValidationError::new(format!("unknown root: {root_ref}")))?;
 
-        // C-1: guardian_public_key must be the actual Ed25519 pubkey
+        // Signer-pubkey binding: guardian_public_key must be the actual Ed25519 pubkey
         // string, not an opaque label. The authorizer binds signer.public_key
         // material to the enrolled guardian's stored public_key; if we stored
         // a label here and signed with FixtureSigner(label), the pubkey
@@ -623,8 +622,8 @@ impl DemoApp {
             return Err(ValidationError::new("no active recovery request"));
         };
 
-        // C-1: signer_binding.key_id for guardians is the pubkey material
-        // itself (not an opaque label). Derive it from the same FixtureSigner
+        // Signer-pubkey binding: signer_binding.key_id for guardians is the
+        // pubkey material itself (not an opaque label). Derive it from the same FixtureSigner
         // used to produce the signature so the authorizer's pubkey-material
         // binding check passes.
         let guardian_fixture_label = format!("guardian-key-{guardian_id}");
@@ -678,7 +677,7 @@ impl DemoApp {
             return Err(ValidationError::new("no active recovery request"));
         };
 
-        // C-1: signer_binding.key_id for guardians is the pubkey material.
+        // Signer-pubkey binding: signer_binding.key_id for guardians is the pubkey material.
         let guardian_fixture_label = format!("guardian-key-{guardian_id}");
         let guardian_signer = AppSigner::Fixture(FixtureSigner::new(&guardian_fixture_label));
         let guardian_pubkey = {
@@ -776,7 +775,7 @@ impl DemoApp {
         }
         self.append_live_event(
             self.allocate_event_id("recovery-executed"),
-            recovery_executed_event(&session.request_id, core_types::RecoveryScope::FreezeDevice),
+            recovery_executed_event(&session.request_id, core_principals::RecoveryScope::FreezeDevice),
             SignerBinding::root(&session.root_id, root_key_id.clone()),
             &root_signer,
         )?;
@@ -1363,10 +1362,10 @@ impl DemoApp {
                     "seed vault namespace has no active recipient devices",
                 ));
             }
-            let structured_record = core_types::StructuredRecordMeta {
+            let structured_record = core_event_types::StructuredRecordMeta {
                 schema_id: "com.emberlink.profile/basic".into(),
                 schema_version: "v1".into(),
-                encoding: core_types::StructuredEncoding::Json,
+                encoding: core_event_types::StructuredEncoding::Json,
                 app_namespace: "com.emberlink.profile".into(),
             };
             self.app_runtime.store.upsert_local_structured_record(
@@ -1379,8 +1378,8 @@ impl DemoApp {
                 "device-root-a-01",
                 structured_record.clone(),
                 br#"{"full_name":"Jordan Hudson","employment":{"status":"operator","team":"systems"},"skills":["rust","distributed-systems"],"private":{"signal":"local-only:v1"}}"#,
-                core_types::DurabilityPolicy::ReplicatedToApprovedPeers,
-                core_types::RetentionPolicy::KeepLatest,
+                core_event_types::DurabilityPolicy::ReplicatedToApprovedPeers,
+                core_event_types::RetentionPolicy::KeepLatest,
                 recipients.clone(),
             )?;
             self.app_runtime.store.upsert_local_structured_record(
@@ -1393,8 +1392,8 @@ impl DemoApp {
                 "device-root-a-01",
                 structured_record,
                 br#"{"full_name":"Jordan Hudson","employment":{"status":"operator","team":"systems"},"skills":["rust","distributed-systems","identity-brokering"],"profile":{"headline":"Local-first identity broker"},"private":{"signal":"local-only:v2"}}"#,
-                core_types::DurabilityPolicy::ReplicatedToApprovedPeers,
-                core_types::RetentionPolicy::KeepLatest,
+                core_event_types::DurabilityPolicy::ReplicatedToApprovedPeers,
+                core_event_types::RetentionPolicy::KeepLatest,
                 recipients,
             )?;
         }
@@ -1408,7 +1407,7 @@ impl DemoApp {
                 namespace.clone(),
                 "vault-object-professional-profile",
                 "com.emberlink.profile/basic",
-                core_types::PresentationAudienceKind::Service,
+                core_event_types::PresentationAudienceKind::Service,
                 vec![
                     "employment.status".into(),
                     "full_name".into(),
@@ -1430,7 +1429,7 @@ impl DemoApp {
                 namespace.clone(),
                 "vault-object-professional-profile",
                 "com.emberlink.profile/basic",
-                core_types::PresentationAudienceKind::Peer,
+                core_event_types::PresentationAudienceKind::Peer,
                 vec![
                     "full_name".into(),
                     "profile.headline".into(),
@@ -1446,7 +1445,7 @@ impl DemoApp {
 
     pub(crate) fn seed_vault_namespace(&self) -> VaultNamespace {
         VaultNamespace {
-            owner_kind: core_types::VaultOwnerKind::Persona,
+            owner_kind: core_event_types::VaultOwnerKind::Persona,
             owner_id: "persona-professional".into(),
         }
     }
@@ -1464,8 +1463,8 @@ impl DemoApp {
             ));
         };
         let owner_kind = match kind {
-            "root" => core_types::VaultOwnerKind::Root,
-            "persona" => core_types::VaultOwnerKind::Persona,
+            "root" => core_event_types::VaultOwnerKind::Root,
+            "persona" => core_event_types::VaultOwnerKind::Persona,
             _ => {
                 return Err(ValidationError::new(
                     "namespace kind must be root or persona",
@@ -1496,8 +1495,8 @@ impl DemoApp {
             .local_vault_namespaces()?
             .into_iter()
             .filter(|namespace| match namespace.owner_kind {
-                core_types::VaultOwnerKind::Root => namespace.owner_id == root_id,
-                core_types::VaultOwnerKind::Persona => {
+                core_event_types::VaultOwnerKind::Root => namespace.owner_id == root_id,
+                core_event_types::VaultOwnerKind::Persona => {
                     persona_root(&namespace.owner_id) == Some(root_id)
                 }
             })
@@ -1529,7 +1528,7 @@ impl DemoApp {
 
     pub(crate) fn current_storage_manifest(
         &self,
-    ) -> Result<core_types::FileManifest, ValidationError> {
+    ) -> Result<core_event_types::FileManifest, ValidationError> {
         Ok(self
             .app_runtime.store
             .file_manifest(&self.storage_manifest.id)
@@ -1538,7 +1537,7 @@ impl DemoApp {
 
     pub(crate) fn build_seed_storage_manifest(
         &mut self,
-    ) -> Result<core_types::FileManifest, ValidationError> {
+    ) -> Result<core_event_types::FileManifest, ValidationError> {
         let manifest_id = self.storage_manifest.id.clone();
         let content_key = self.ensure_local_manifest_key(&manifest_id)?;
         let plaintext_chunks: Vec<Vec<u8>> = (0..12)
@@ -1576,7 +1575,7 @@ impl DemoApp {
         Ok(manifest)
     }
 
-    pub(crate) fn current_storage_relationship(&self) -> core_types::StorageRelationship {
+    pub(crate) fn current_storage_relationship(&self) -> core_event_types::StorageRelationship {
         match self
             .app_runtime.store
             .materialized()
@@ -1590,7 +1589,7 @@ impl DemoApp {
         }
     }
 
-    pub(crate) fn current_storage_ledger(&self) -> core_types::StorageLedgerEntry {
+    pub(crate) fn current_storage_ledger(&self) -> core_event_types::StorageLedgerEntry {
         match self
             .app_runtime.store
             .materialized()
@@ -1606,8 +1605,8 @@ impl DemoApp {
         &self,
     ) -> Result<
         (
-            core_types::StorageRelationship,
-            core_types::FileManifest,
+            core_event_types::StorageRelationship,
+            core_event_types::FileManifest,
             String,
             Vec<ChunkReference>,
         ),
@@ -1634,7 +1633,7 @@ impl DemoApp {
     pub(crate) fn storage_open_snapshot(
         &mut self,
         device_ref: Option<&str>,
-    ) -> Result<(core_types::FileManifest, String, Vec<Vec<u8>>), ValidationError> {
+    ) -> Result<(core_event_types::FileManifest, String, Vec<Vec<u8>>), ValidationError> {
         let manifest = self.current_storage_manifest()?;
         let device_id = match device_ref {
             Some(device_ref) => self
@@ -1687,7 +1686,7 @@ impl DemoApp {
 
     pub(crate) fn storage_manifest_root_id(
         &self,
-        manifest: &core_types::FileManifest,
+        manifest: &core_event_types::FileManifest,
     ) -> Result<String, ValidationError> {
         if let Some(root_id) = manifest.authorized_devices.iter().find_map(|access| {
             self.devices
@@ -1707,7 +1706,7 @@ impl DemoApp {
     pub(crate) fn publish_storage_manifest_event(
         &mut self,
         root_id: &str,
-        manifest: core_types::FileManifest,
+        manifest: core_event_types::FileManifest,
         event_tag: &str,
     ) -> Result<(), ValidationError> {
         let signer = self.root_signer(root_id)?;
@@ -1724,7 +1723,7 @@ impl DemoApp {
     pub(crate) fn publish_storage_relationship_event(
         &mut self,
         root_id: &str,
-        relationship: core_types::StorageRelationship,
+        relationship: core_event_types::StorageRelationship,
         event_tag: &str,
     ) -> Result<(), ValidationError> {
         let signer = self.root_signer(root_id)?;
@@ -1741,7 +1740,7 @@ impl DemoApp {
     pub(crate) fn publish_storage_ledger_event(
         &mut self,
         root_id: &str,
-        entry: core_types::StorageLedgerEntry,
+        entry: core_event_types::StorageLedgerEntry,
         event_tag: &str,
     ) -> Result<(), ValidationError> {
         let signer = self.root_signer(root_id)?;
@@ -1957,7 +1956,7 @@ impl DemoApp {
         Ok(lines)
     }
 
-    /// EMBER-implementation-note-94 — Subcommand::Audit dispatch for the demo shell.
+    /// EMBER-implementation-note-172 — Subcommand::Audit dispatch for the demo shell.
     ///
     /// Accepts the same filter flags as `ember audit query` (`--actor`,
     /// `--kind`, `--grant-id`, `--since`, `--limit`, `--format`). In the
@@ -4652,7 +4651,7 @@ impl DemoApp {
         };
         let raw_batch = if peer_state_path.is_some() {
             let source_peer_id = self.current_peer_id();
-            let cursor = core_types::PeerCursor {
+            let cursor = core_principals::PeerCursor {
                 peer_id: source_peer_id,
                 last_event_id: current_cursor.clone().flatten(),
             };
@@ -5348,7 +5347,7 @@ impl DemoApp {
         device_id: &str,
     ) -> Result<usize, ValidationError> {
         let namespace = VaultNamespace {
-            owner_kind: core_types::VaultOwnerKind::Persona,
+            owner_kind: core_event_types::VaultOwnerKind::Persona,
             owner_id: persona_id.to_string(),
         };
         let manifests_with_keys = self
@@ -5437,7 +5436,7 @@ impl DemoApp {
         let mut expires_in_secs: Option<u64> = None;
         let mut mode = "one_shot".to_string();
         let mut relay: Option<String> = None;
-        let mut conditions: Vec<core_types::grant_conditions::GrantCondition> = Vec::new();
+        let mut conditions: Vec<core_grant_types::grant_conditions::GrantCondition> = Vec::new();
 
         let mut i = 0;
         while i < tokens.len() {
@@ -5462,7 +5461,7 @@ impl DemoApp {
                     i += 2;
                 }
                 "--condition" if i + 1 < tokens.len() => {
-                    match core_types::grant_conditions::GrantCondition::parse_cli(tokens[i + 1]) {
+                    match core_grant_types::grant_conditions::GrantCondition::parse_cli(tokens[i + 1]) {
                         Ok(cond) => conditions.push(cond),
                         Err(e) => return format!("invalid --condition: {e}\n"),
                     }
@@ -5523,7 +5522,7 @@ impl DemoApp {
         let mut capabilities: Vec<String> = Vec::new();
         let mut expires_in_secs: Option<u64> = None;
         let mut mode = "one_shot".to_string();
-        let mut conditions: Vec<core_types::grant_conditions::GrantCondition> = Vec::new();
+        let mut conditions: Vec<core_grant_types::grant_conditions::GrantCondition> = Vec::new();
 
         let mut i = 0;
         while i < tokens.len() {
@@ -5544,7 +5543,7 @@ impl DemoApp {
                     i += 2;
                 }
                 "--condition" if i + 1 < tokens.len() => {
-                    match core_types::grant_conditions::GrantCondition::parse_cli(tokens[i + 1]) {
+                    match core_grant_types::grant_conditions::GrantCondition::parse_cli(tokens[i + 1]) {
                         Ok(cond) => conditions.push(cond),
                         Err(e) => return format!("invalid --condition: {e}\n"),
                     }
@@ -5603,11 +5602,11 @@ impl DemoApp {
     /// - Relay-assisted URL claims (`emberlink://...` or web URL) — FETCH_OFFER
     ///   from the relay, then CLAIM_OFFER after success.
     ///
-    /// : If no identity exists, one is created automatically.
-    /// : If `--persona` is supplied, that persona claims the offer.
-    ///        Otherwise the first active persona is used.
+    /// If no identity exists, one is created automatically (new-user flow).
+    /// If `--persona` is supplied, that persona claims the offer; otherwise
+    /// the first active persona is used (existing-user flow).
     fn handle_grant_claim(&mut self, tokens: &[&str]) -> String {
-        use core_types::{GrantLink, SealedOffer, encode_sealed_offer};
+        use core_grant_types::{GrantLink, SealedOffer, encode_sealed_offer};
 
         let usage = "Usage: grant claim <link-url-or-qr-string> [--persona <persona-id>] \
                      [--name <display-name>] [--relay <addr>]\n";
@@ -5881,7 +5880,7 @@ impl DemoApp {
             &caps,
         ) {
             Ok(msg) => {
-                // : after grant creation, attempt auto-deposit for ReadCredential caps.
+                // Auto-deposit: after grant creation, attempt auto-deposit for ReadCredential caps.
                 let deposit_note = self.attempt_credential_deposit_for_caps(
                     &msg,
                     &parsed_caps,
@@ -5893,7 +5892,7 @@ impl DemoApp {
         }
     }
 
-    // ── : grant use <id> ────────────────────────────────────────
+    // ── grant use <id> ───────────────────────────────────────────────
     //
     // Fetch and display the credential associated with an active grant.
     // Checks local deposit first; falls back to relay fetch if not found locally.
@@ -6019,7 +6018,7 @@ impl DemoApp {
         )
     }
 
-    // ── : auto-deposit helper ────────────────────────────────────
+    // ── auto-deposit helper ──────────────────────────────────────────
     //
     // After a grant is created, attempt to deposit the referenced credential
     // to the relay so the recipient can fetch it with `grant use`.
@@ -6098,8 +6097,8 @@ impl DemoApp {
         let mat = self.app_runtime.store.materialized();
         // Try persona namespaces first.
         for persona_id in mat.personas_current.keys() {
-            let ns = core_types::VaultNamespace {
-                owner_kind: core_types::VaultOwnerKind::Persona,
+            let ns = core_event_types::VaultNamespace {
+                owner_kind: core_event_types::VaultOwnerKind::Persona,
                 owner_id: persona_id.clone(),
             };
             if let Ok(Some(catalog)) = self.app_runtime.store.local_vault_catalog(&ns)
@@ -6117,8 +6116,8 @@ impl DemoApp {
         }
         // Try root namespaces.
         for root_id in mat.roots_current.keys() {
-            let ns = core_types::VaultNamespace {
-                owner_kind: core_types::VaultOwnerKind::Root,
+            let ns = core_event_types::VaultNamespace {
+                owner_kind: core_event_types::VaultOwnerKind::Root,
                 owner_id: root_id.clone(),
             };
             if let Ok(Some(catalog)) = self.app_runtime.store.local_vault_catalog(&ns)
@@ -6332,7 +6331,7 @@ impl DemoApp {
         }
     }
 
-    // ── Grant credential access audit log ───────────────────
+    // ── Grant credential access audit log ────────────────────────────
 
     fn handle_grant_audit(&self, grant_id: &str) -> String {
         let entries = match self.app_runtime.store.get_credential_access_log(grant_id) {
@@ -6536,7 +6535,7 @@ impl DemoApp {
         }
     }
 
-    // ── implementation-note-81: hardware-attested approval ─────────────────────
+    // ── implementation-note-156: hardware-attested approval ─────────────────────
     //
     // `ember approval approve|deny <id> [--no-biometric] [--reason <r>]`
     //
@@ -6636,7 +6635,7 @@ impl DemoApp {
             Ok(()) => {
                 // Audit line — surfaced in `ember show audit` and tee'd into
                 // the daemon log. The `biometric` + `credential_id` fields
-                // satisfy the implementation-note-81 acceptance criterion.
+                // satisfy the implementation-note-156 acceptance criterion.
                 let cred = credential_id.as_deref().unwrap_or("");
                 format!(
                     "approved\t{}\tbiometric={}\tcredential_id={}\n",
@@ -6874,7 +6873,7 @@ impl DemoApp {
     // handle_passkey_remove, handle_passkey_list, handle_service_bind,
     // handle_service_list, handle_service_unbind, handle_import_passwords,
     // handle_storage_*, handle_sync_*, handle_recovery_*, handle_disclose_*.
-    fn render_grant_list(&self, grants: &[core_types::AccessGrantSummary]) -> String {
+    fn render_grant_list(&self, grants: &[core_grant_types::AccessGrantSummary]) -> String {
         // DRY-10: route through the active output mode. The default (set in
         // `DemoApp::bootstrap`) is `Human { color: false }`, which preserves
         // the legacy shape so existing string-substring tests remain green.
@@ -6889,7 +6888,7 @@ impl DemoApp {
     /// `Output::Mode` is plumbed through `DemoApp`.
     pub(crate) fn render_grant_list_with_mode(
         &self,
-        grants: &[core_types::AccessGrantSummary],
+        grants: &[core_grant_types::AccessGrantSummary],
         mode: crate::output::Mode,
     ) -> String {
         let mut out = crate::output::Output::new(mode);
@@ -6960,7 +6959,7 @@ impl DemoApp {
         out.into_string()
     }
 
-    fn render_grant_detail(&self, detail: &core_types::AccessGrantDetail) -> String {
+    fn render_grant_detail(&self, detail: &core_grant_types::AccessGrantDetail) -> String {
         let g = &detail.grant;
         let mut out = String::new();
         writeln!(&mut out, "Grant {}", g.id).unwrap();
@@ -7081,7 +7080,7 @@ impl DemoApp {
         &self,
         recipient_id: &str,
         kind: &str,
-        grants: &[core_types::AccessGrantSummary],
+        grants: &[core_grant_types::AccessGrantSummary],
     ) -> String {
         let mut out = String::new();
         writeln!(&mut out, "Recipient {} ({})", recipient_id, kind).unwrap();
@@ -7117,7 +7116,7 @@ impl DemoApp {
 
     fn render_grant_history_timeline(
         &self,
-        entries: &[core_types::AccessGrantHistoryEntry],
+        entries: &[core_grant_types::AccessGrantHistoryEntry],
     ) -> String {
         if entries.is_empty() {
             return "No grant history.\n".to_string();

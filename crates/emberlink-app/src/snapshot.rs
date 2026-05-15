@@ -184,12 +184,12 @@ pub struct GrantDetailView {
 /// so we re-export them directly instead of building parallel wire types.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct BlockView {
-    pub statements: Vec<core_types::Statement>,
+    pub statements: Vec<core_grant_types::Statement>,
     pub nbf: Option<u64>,
     pub expires_at: Option<u64>,
     pub issued_by: String,
     pub issued_at: u64,
-    pub approval: Option<core_types::ApprovalChallenge>,
+    pub approval: Option<core_grant_types::ApprovalChallenge>,
     pub note: Option<String>,
     /// Hex-encoded public key that signs the next appended block.
     pub pubkey_next: String,
@@ -313,7 +313,7 @@ impl AppSnapshot {
 }
 
 impl GrantDetailView {
-    pub fn from_detail(detail: &core_types::AccessGrantDetail) -> Self {
+    pub fn from_detail(detail: &core_grant_types::AccessGrantDetail) -> Self {
         let g = &detail.grant;
         Self {
             id: g.id.clone(),

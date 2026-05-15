@@ -14,7 +14,8 @@ aes-gcm = "0.10"
 axum = "0.8"
 base64 = "0.22"
 core-types = { path = "../core-types" }
-getrandom = "0.2"
+core-grant-types = { path = "../core-grant-types" }
+getrandom = "0.4"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync"] }
 tower = "0.5"
 secrecy = { version = "0.10" }

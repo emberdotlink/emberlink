@@ -2,7 +2,8 @@
 // per-event-kind decision logic.
 use core_crypto::PublicKey;
 use core_events::EventEnvelope;
-use core_types::{EventBody, KeyRole, SignerBinding, SubjectKind, ValidationError};
+use core_event_types::{EventBody, KeyRole, SignerBinding, SubjectKind};
+use core_types::{ValidationError};
 
 use crate::{
     DeviceStatus, GrantOfferStatus, MaterializedState, PersonaStatus, RecoveryRequestStatus,
@@ -137,7 +138,7 @@ impl IdentityAuthorizer {
                 authorize_device_key(&event.signer_binding, signer_pk, &body.device_id, state)
             }
             EventBody::DeviceReplaced(body) => {
-                // H-1: authorize the signing root first, then require that
+                // Cross-root ownership check: authorize the signing root first, then require that
                 // BOTH the replaced and replacement devices are owned by that root.
                 // Without the ownership checks, root-A could flip device-B (owned
                 // by root-B) into Replaced status, setting its replacement to any
@@ -451,7 +452,7 @@ impl IdentityAuthorizer {
             EventBody::CredentialRevoked(body) => {
                 authorize_persona_key(&event.signer_binding, signer_pk, &body.revoker_id, state)?;
                 // Verify a deposit exists for this grant and the revoker is the original issuer.
-                // M-1: require ALL deposits sharing this grant_id to have been
+                // Multi-deposit issuer check: require ALL deposits sharing this grant_id to have been
                 // issued by the revoker. If grant_id uniqueness drifts (current schema
                 // does not enforce uniqueness at the grant_id level), a single owned
                 // deposit would otherwise let the revoker revoke other issuers' deposits
@@ -513,7 +514,7 @@ fn authorize_root_key(
             signer_binding.key_id, root_id
         )));
     }
-    // C-1: bind the signer's public-key material to the stored active key.
+    // Signer-pubkey binding: bind the signer's public-key material to the stored active key.
     // Without this, a peer signing a well-formed event with their own pubkey but
     // a forged `signer_binding.key_id = "<victim-key-id>"` would pass the string
     // match above and impersonate the victim root in the sync path.
@@ -542,7 +543,7 @@ fn authorize_device_key(
             signer_binding.key_id, device_id
         )));
     }
-    // C-1: bind signer pubkey material to stored active device key.
+    // Signer-pubkey binding: bind signer pubkey material to stored active device key.
     if device.active_key.public_key != signer_public_key.0 {
         return Err(ValidationError::unauthorized(format!(
             "signer public key does not match active device key material for {}",
@@ -617,7 +618,7 @@ fn authorize_enrolled_guardian(
             signer_binding.key_id
         )));
     }
-    // C-1: bind signer pubkey material to the enrolled guardian key.
+    // Signer-pubkey binding: bind signer pubkey material to the enrolled guardian key.
     // For guardians the enrolled identifier is the public key itself, so
     // `signer_public_key.0` must equal `guardian.public_key` for the signature
     // to represent the enrolled guardian (not just a peer echoing the key id).
@@ -645,7 +646,7 @@ fn authorize_persona_key(
             signer_binding.key_id, persona_id
         )));
     }
-    // C-1: bind signer pubkey material to stored active persona key.
+    // Signer-pubkey binding: bind signer pubkey material to stored active persona key.
     if persona.active_key.public_key != signer_public_key.0 {
         return Err(ValidationError::unauthorized(format!(
             "signer public key does not match active persona key material for {}",
@@ -1022,15 +1023,13 @@ mod tests {
     use super::*;
     use core_crypto::{DOMAIN_EVENT, FixtureSigner, Signer as _, Verifier as _};
     use core_events::EventEnvelope;
-    use core_types::{
-        DeviceFrozenEvent, DeviceRevokedEvent, EventBody, KeyAlgorithm, PersonaRevokedEvent,
-        PublicKeyMaterial, RootCreatedEvent, SignerBinding, SurvivalMode,
-    };
+    use core_event_types::{DeviceFrozenEvent, DeviceRevokedEvent, EventBody, PersonaRevokedEvent, RootCreatedEvent, SignerBinding};
+    use core_principals::{KeyAlgorithm, PublicKeyMaterial, SurvivalMode};
 
     use crate::{DeviceRecord, PersonaRecord, RootRecord};
 
     fn make_key(key_id: &str) -> PublicKeyMaterial {
-        // C-1: derive the stored public_key from the FixtureSigner that
+        // Signer-pubkey binding: derive the stored public_key from the FixtureSigner that
         // events are signed with — authorize now binds signer.public_key material
         // to the record's active_key.public_key, so the strings must match.
         let signer = FixtureSigner::new(key_id);
@@ -1229,7 +1228,7 @@ mod tests {
         let auth = IdentityAuthorizer;
         let event = make_event(
             "evt-1",
-            EventBody::DeviceAdded(core_types::DeviceAddedEvent {
+            EventBody::DeviceAdded(core_event_types::DeviceAddedEvent {
                 root_id: "root-a".into(),
                 device_id: "device-new".into(),
                 label: "New".into(),
@@ -1250,7 +1249,7 @@ mod tests {
         let auth = IdentityAuthorizer;
         let event = make_event(
             "evt-1",
-            EventBody::PersonaCreated(core_types::PersonaCreatedEvent {
+            EventBody::PersonaCreated(core_event_types::PersonaCreatedEvent {
                 root_id: "root-a".into(),
                 persona_id: "persona-new".into(),
                 label: "New".into(),
@@ -1299,7 +1298,7 @@ mod tests {
         assert!(auth.authorize(&event, &state, 0).is_ok());
     }
 
-    // ── C-1: GrantOfferClaimed offer status/expiry checks ──
+    // ── GrantOfferClaimed offer status/expiry checks ──
 
     fn state_with_pending_offer(expires_at: u64) -> MaterializedState {
         let mut state = two_root_state();
@@ -1325,7 +1324,7 @@ mod tests {
     fn make_claim_event(offer_id: &str, recipient: &str, key: &str) -> core_events::EventEnvelope {
         make_event(
             "evt-claim",
-            EventBody::GrantOfferClaimed(core_types::GrantOfferClaimedEvent {
+            EventBody::GrantOfferClaimed(core_event_types::GrantOfferClaimedEvent {
                 offer_id: offer_id.into(),
                 recipient_persona_id: recipient.into(),
                 claim_response_hex: "cafebabe".into(),
@@ -1405,7 +1404,7 @@ mod tests {
         );
     }
 
-    // ── C-2: GrantOfferRevoked issuer ownership check ──
+    // ── GrantOfferRevoked issuer ownership check ──
 
     fn make_revoke_offer_event(
         offer_id: &str,
@@ -1415,7 +1414,7 @@ mod tests {
     ) -> core_events::EventEnvelope {
         make_event(
             "evt-revoke-offer",
-            EventBody::GrantOfferRevoked(core_types::GrantOfferRevokedEvent {
+            EventBody::GrantOfferRevoked(core_event_types::GrantOfferRevokedEvent {
                 offer_id: offer_id.into(),
                 issuer_persona_id: issuer.into(),
                 reason: reason.into(),
@@ -1450,7 +1449,7 @@ mod tests {
         );
     }
 
-    // ── C-3: BadgeRevoked issuer ownership check ──
+    // ── BadgeRevoked issuer ownership check ──
 
     fn state_with_badge() -> MaterializedState {
         let mut state = two_root_state();
@@ -1479,7 +1478,7 @@ mod tests {
     ) -> core_events::EventEnvelope {
         make_event(
             "evt-revoke-badge",
-            EventBody::BadgeRevoked(core_types::BadgeRevokedEvent {
+            EventBody::BadgeRevoked(core_event_types::BadgeRevokedEvent {
                 badge_id: badge_id.into(),
                 revoker_persona_id: revoker.into(),
                 reason: "test".into(),
@@ -1514,7 +1513,7 @@ mod tests {
         );
     }
 
-    // ── C-1: signer public-key material must bind to the stored active key ──
+    // ── Signer-pubkey binding: must bind to the stored active key ──
     //
     // These regressions protect against a peer-impersonation attack: a valid
     // signature over a well-formed envelope whose `signer_binding.key_id` claims
@@ -1610,7 +1609,7 @@ mod tests {
         let attacker = FixtureSigner::new("attacker-root-forgery");
         let event = forged_envelope(
             "evt-forged-root",
-            EventBody::RootRevoked(core_types::RootRevokedEvent {
+            EventBody::RootRevoked(core_event_types::RootRevokedEvent {
                 root_id: "root-a".into(),
                 reason: "attack".into(),
             }),
@@ -1646,7 +1645,7 @@ mod tests {
         let attacker = FixtureSigner::new("attacker-persona-forgery");
         let event = forged_envelope(
             "evt-forged-persona",
-            EventBody::MessageSent(core_types::MessageSentEvent {
+            EventBody::MessageSent(core_event_types::MessageSentEvent {
                 message_id: "msg-1".into(),
                 sender_persona_id: "persona-a".into(),
                 recipient_persona_id: "persona-b".into(),
@@ -1679,11 +1678,11 @@ mod tests {
         let attacker = FixtureSigner::new("attacker-device-forgery");
         let event = forged_envelope(
             "evt-forged-device",
-            EventBody::DeviceKeyRotated(core_types::DeviceKeyRotatedEvent {
+            EventBody::DeviceKeyRotated(core_event_types::DeviceKeyRotatedEvent {
                 root_id: "root-a".into(),
                 device_id: "device-a".into(),
                 previous_key_id: "key-device-a".into(),
-                new_key: core_types::PublicKeyMaterial {
+                new_key: core_principals::PublicKeyMaterial {
                     key_id: "key-device-a-v2".into(),
                     algorithm: KeyAlgorithm::Ed25519,
                     public_key: "ed25519:attacker-new".into(),
@@ -1745,7 +1744,7 @@ mod tests {
         let attacker = FixtureSigner::new("attacker-guardian-forgery");
         let event = forged_envelope(
             "evt-forged-guardian",
-            EventBody::RecoveryApproved(core_types::RecoveryApprovedEvent {
+            EventBody::RecoveryApproved(core_event_types::RecoveryApprovedEvent {
                 request_id: "req-1".into(),
                 guardian_id: "guardian-1".into(),
             }),
@@ -1769,7 +1768,7 @@ mod tests {
         );
     }
 
-    // ── H-1: DeviceReplaced must enforce cross-root ownership ──
+    // ── DeviceReplaced must enforce cross-root ownership ──
 
     #[test]
     fn cross_root_device_replace_rejected() {
@@ -1780,7 +1779,7 @@ mod tests {
         let auth = IdentityAuthorizer;
         let event = make_event(
             "evt-cross-replace",
-            EventBody::DeviceReplaced(core_types::DeviceReplacedEvent {
+            EventBody::DeviceReplaced(core_event_types::DeviceReplacedEvent {
                 root_id: "root-a".into(),
                 replaced_device_id: "device-b".into(),
                 replacement_device_id: "device-a".into(),
@@ -1818,7 +1817,7 @@ mod tests {
         let auth = IdentityAuthorizer;
         let event = make_event(
             "evt-cross-replacement",
-            EventBody::DeviceReplaced(core_types::DeviceReplacedEvent {
+            EventBody::DeviceReplaced(core_event_types::DeviceReplacedEvent {
                 root_id: "root-a".into(),
                 replaced_device_id: "device-a".into(),
                 replacement_device_id: "device-b".into(),
@@ -1852,7 +1851,7 @@ mod tests {
         let auth = IdentityAuthorizer;
         let event = make_event(
             "evt-replace-ok",
-            EventBody::DeviceReplaced(core_types::DeviceReplacedEvent {
+            EventBody::DeviceReplaced(core_event_types::DeviceReplacedEvent {
                 root_id: "root-a".into(),
                 replaced_device_id: "device-a".into(),
                 replacement_device_id: "device-a2".into(),
@@ -1865,7 +1864,7 @@ mod tests {
         );
     }
 
-    // ── M-1: CredentialRevoked must require ALL deposits with this grant_id ──
+    // ── CredentialRevoked must require ALL deposits with this grant_id ──
     // are issued by the revoker, not just the first-found one.
 
     #[test]
@@ -1909,7 +1908,7 @@ mod tests {
         // be rejected.
         let event = make_event(
             "evt-cred-revoke",
-            EventBody::CredentialRevoked(core_types::CredentialRevokedEvent {
+            EventBody::CredentialRevoked(core_event_types::CredentialRevokedEvent {
                 grant_id: "grant-shared".into(),
                 revoker_id: "persona-a".into(),
                 reason: "test".into(),
@@ -1939,7 +1938,7 @@ mod tests {
         let auth = IdentityAuthorizer;
         let event = make_event(
             "evt-device-key-rotate-mismatch",
-            EventBody::DeviceKeyRotated(core_types::DeviceKeyRotatedEvent {
+            EventBody::DeviceKeyRotated(core_event_types::DeviceKeyRotatedEvent {
                 root_id: "root-b".into(),
                 device_id: "device-a".into(),
                 previous_key_id: "key-device-a".into(),
@@ -1962,7 +1961,7 @@ mod tests {
         let auth = IdentityAuthorizer;
         let event = make_event(
             "evt-device-enc-rotate-mismatch",
-            EventBody::DeviceEncryptionKeyRotated(core_types::DeviceEncryptionKeyRotatedEvent {
+            EventBody::DeviceEncryptionKeyRotated(core_event_types::DeviceEncryptionKeyRotatedEvent {
                 root_id: "root-b".into(),
                 device_id: "device-a".into(),
                 previous_encryption_key_id: "enc-device-a".into(),
@@ -1986,7 +1985,7 @@ mod tests {
         let auth = IdentityAuthorizer;
         let event = make_event(
             "evt-device-key-rotate-ok",
-            EventBody::DeviceKeyRotated(core_types::DeviceKeyRotatedEvent {
+            EventBody::DeviceKeyRotated(core_event_types::DeviceKeyRotatedEvent {
                 root_id: "root-a".into(),
                 device_id: "device-a".into(),
                 previous_key_id: "key-device-a".into(),
@@ -2006,7 +2005,7 @@ mod tests {
         let mut state = two_root_state();
         state.endpoints_current.insert(
             "peer-relay".into(),
-            core_types::EndpointDescriptor {
+            core_principals::EndpointDescriptor {
                 peer_id: "peer-relay".into(),
                 device_id: "device-a".into(),
                 transport_hint: "wss://relay.example".into(),
@@ -2023,7 +2022,7 @@ mod tests {
         let auth = IdentityAuthorizer;
         let event = make_event(
             "evt-relay-shutdown",
-            EventBody::RelayShutdownNotice(core_types::RelayShutdownNoticeEvent {
+            EventBody::RelayShutdownNotice(core_event_types::RelayShutdownNoticeEvent {
                 relay_peer_id: "peer-relay".into(),
                 reason: "attacker".into(),
                 deadline_epoch: 9999,
@@ -2046,7 +2045,7 @@ mod tests {
         let auth = IdentityAuthorizer;
         let event = make_event(
             "evt-relay-shutdown-ok",
-            EventBody::RelayShutdownNotice(core_types::RelayShutdownNoticeEvent {
+            EventBody::RelayShutdownNotice(core_event_types::RelayShutdownNoticeEvent {
                 relay_peer_id: "peer-relay".into(),
                 reason: "maintenance".into(),
                 deadline_epoch: 9999,
@@ -2067,7 +2066,7 @@ mod tests {
         let auth = IdentityAuthorizer;
         let event = make_event(
             "evt-relay-shutdown-unknown",
-            EventBody::RelayShutdownNotice(core_types::RelayShutdownNoticeEvent {
+            EventBody::RelayShutdownNotice(core_event_types::RelayShutdownNoticeEvent {
                 relay_peer_id: "peer-unknown".into(),
                 reason: "no endpoint on file".into(),
                 deadline_epoch: 9999,
@@ -2096,12 +2095,12 @@ mod tests {
             .clone();
         let event = make_event(
             "evt-collide-root",
-            EventBody::RootCreated(core_types::RootCreatedEvent {
+            EventBody::RootCreated(core_event_types::RootCreatedEvent {
                 root_id: "root-c".into(),
                 display_name: "Colliding".into(),
-                initial_key: core_types::PublicKeyMaterial {
+                initial_key: core_principals::PublicKeyMaterial {
                     key_id: "key-root-c".into(),
-                    algorithm: core_types::KeyAlgorithm::Ed25519,
+                    algorithm: core_principals::KeyAlgorithm::Ed25519,
                     // Reuse root-a's public key material.
                     public_key: existing_pubkey_material.public_key.clone(),
                 },
@@ -2123,7 +2122,7 @@ mod tests {
         let auth = IdentityAuthorizer;
         let event = make_event(
             "evt-fresh-root",
-            EventBody::RootCreated(core_types::RootCreatedEvent {
+            EventBody::RootCreated(core_event_types::RootCreatedEvent {
                 root_id: "root-c".into(),
                 display_name: "Fresh".into(),
                 initial_key: make_key("key-root-c-fresh"),
@@ -2148,7 +2147,7 @@ mod tests {
         let auth = IdentityAuthorizer;
         let event = make_event(
             "evt-trust-revoked-unknown",
-            EventBody::TrustRevoked(core_types::TrustRevokedEvent {
+            EventBody::TrustRevoked(core_event_types::TrustRevokedEvent {
                 attestation_id: "does-not-exist".into(),
                 attester_persona_id: "persona-a".into(),
             }),
@@ -2172,7 +2171,7 @@ mod tests {
         let auth = IdentityAuthorizer;
         let event = make_event(
             "evt-disclosure-revoked",
-            EventBody::DisclosureRevoked(core_types::DisclosureRevokedEvent {
+            EventBody::DisclosureRevoked(core_event_types::DisclosureRevokedEvent {
                 revocation_id: "rev-1".into(),
                 artifact_id: "artifact-1".into(),
                 revoker_persona_id: "persona-a".into(),
@@ -2194,7 +2193,7 @@ mod tests {
         let auth = IdentityAuthorizer;
         let event = make_event(
             "evt-disclosure-revoked-wrong-role",
-            EventBody::DisclosureRevoked(core_types::DisclosureRevokedEvent {
+            EventBody::DisclosureRevoked(core_event_types::DisclosureRevokedEvent {
                 revocation_id: "rev-1".into(),
                 artifact_id: "artifact-1".into(),
                 revoker_persona_id: "persona-a".into(),
@@ -2220,7 +2219,7 @@ mod tests {
         let auth = IdentityAuthorizer;
         let event = make_event(
             "evt-signer-mismatch",
-            EventBody::MessageSent(core_types::MessageSentEvent {
+            EventBody::MessageSent(core_event_types::MessageSentEvent {
                 message_id: "msg-1".into(),
                 sender_persona_id: "persona-a".into(),
                 recipient_persona_id: "persona-b".into(),
@@ -2245,7 +2244,7 @@ mod tests {
         let auth = IdentityAuthorizer;
         let event = make_event(
             "evt-signer-wrong-kind",
-            EventBody::DeviceKeyRotated(core_types::DeviceKeyRotatedEvent {
+            EventBody::DeviceKeyRotated(core_event_types::DeviceKeyRotatedEvent {
                 root_id: "root-a".into(),
                 device_id: "device-a".into(),
                 previous_key_id: "key-device-a".into(),
@@ -2389,7 +2388,7 @@ mod tests {
         let auth = IdentityAuthorizer;
         let event = make_event(
             "evt-unknown-root",
-            EventBody::RootRevoked(core_types::RootRevokedEvent {
+            EventBody::RootRevoked(core_event_types::RootRevokedEvent {
                 root_id: "root-nonexistent".into(),
                 reason: "test".into(),
             }),
@@ -2423,7 +2422,7 @@ mod tests {
         let auth = IdentityAuthorizer;
         let event = make_event(
             "evt-revoked-root",
-            EventBody::PersonaCreated(core_types::PersonaCreatedEvent {
+            EventBody::PersonaCreated(core_event_types::PersonaCreatedEvent {
                 root_id: "root-a".into(),
                 persona_id: "persona-new".into(),
                 label: "New".into(),
@@ -2460,7 +2459,7 @@ mod tests {
         let auth = IdentityAuthorizer;
         let event = make_event(
             "evt-ok-root-revoke",
-            EventBody::RootRevoked(core_types::RootRevokedEvent {
+            EventBody::RootRevoked(core_event_types::RootRevokedEvent {
                 root_id: "root-a".into(),
                 reason: "self-revoke".into(),
             }),
@@ -2479,7 +2478,7 @@ mod tests {
         let attacker = FixtureSigner::new("attacker-sanitize-test");
         let event = forged_envelope(
             "evt-sanitize-test",
-            EventBody::RootRevoked(core_types::RootRevokedEvent {
+            EventBody::RootRevoked(core_event_types::RootRevokedEvent {
                 root_id: "root-a".into(),
                 reason: "attack".into(),
             }),
@@ -2525,7 +2524,7 @@ mod tests {
     ) -> core_events::EventEnvelope {
         make_event(
             "evt-disclosure-revoke",
-            EventBody::DisclosureRevoked(core_types::DisclosureRevokedEvent {
+            EventBody::DisclosureRevoked(core_event_types::DisclosureRevokedEvent {
                 revocation_id: "rev-1".into(),
                 artifact_id: artifact_id.into(),
                 revoker_persona_id: revoker.into(),

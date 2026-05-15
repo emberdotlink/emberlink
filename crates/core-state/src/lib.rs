@@ -48,14 +48,13 @@ use core_storage::{
     tombstone_vault_object, unwrap_manifest_key_access, wrap_manifest_key_access,
     wrap_manifest_key_for_recipients,
 };
-use core_types::{
-    AccessGrant, AccessGrantDetail, AccessGrantHistoryEntry, AccessGrantSummary, BlockStore,
-    ChunkReference, DurabilityPolicy, EventBody, EventType, FileManifest, GrantMode, GrantStatus,
-    ImportedClaim, ManifestDeviceAccess, PeerCursor, PresentationArtifact,
-    PresentationAudienceKind, PresentationTemplate, RecipientProfile, RetentionPolicy,
-    ServiceBinding, SignedBlock, Statement, StructuredRecordMeta, Validate, ValidationError,
-    VaultCatalog, VaultNamespace, VaultOwnerKind,
+use core_grant_types::{
+    AccessGrant, AccessGrantDetail, AccessGrantHistoryEntry, AccessGrantSummary, GrantMode,
+    GrantStatus, RecipientProfile, SignedBlock, Statement,
 };
+use core_event_types::{BlockStore, ChunkReference, DurabilityPolicy, EventBody, EventType, FileManifest, ImportedClaim, ManifestDeviceAccess, PresentationArtifact, PresentationAudienceKind, PresentationTemplate, RetentionPolicy, ServiceBinding, StructuredRecordMeta, VaultCatalog, VaultNamespace, VaultOwnerKind};
+use core_principals::{PeerCursor};
+use core_types::{Validate, ValidationError};
 use rusqlite::{Connection, OptionalExtension, params};
 use zeroize::Zeroizing;
 use serde_json::Value as JsonValue;
@@ -359,7 +358,7 @@ fn structured_record_meta_for_claim_schema(schema: &str) -> StructuredRecordMeta
     StructuredRecordMeta {
         schema_id: schema.to_string(),
         schema_version: schema_version.to_string(),
-        encoding: core_types::StructuredEncoding::Json,
+        encoding: core_event_types::StructuredEncoding::Json,
         app_namespace: app_namespace.to_string(),
     }
 }
@@ -589,8 +588,8 @@ fn statement_dominated_by(new: &Statement, existing: &[Statement]) -> bool {
 /// glob(p) ⊇ glob(c) requires the patterns be equal or parent is `*`. This
 /// is coarse-grained on purpose — the authoritative evaluator in core-policy
 /// (design Open Questions) will subsume this.
-fn resource_covers(parent: &core_types::ResourceSelector, child: &core_types::ResourceSelector) -> bool {
-    use core_types::ResourceSelector as R;
+fn resource_covers(parent: &core_grant_types::ResourceSelector, child: &core_grant_types::ResourceSelector) -> bool {
+    use core_grant_types::ResourceSelector as R;
     match (parent, child) {
         (R::Any, _) => true,
         (R::Exact { value: p }, R::Exact { value: c }) => p == c,
@@ -633,7 +632,7 @@ fn parent_glob_covers_exact(pattern: &str, value: &str) -> bool {
 /// Child budget ≤ parent budget on every axis the parent constrains. If
 /// parent is `None`, anything is fine. If parent sets an axis that child
 /// leaves open, child fails (unbounded > bounded).
-fn budget_le(child: &Option<core_types::Budget>, parent: &Option<core_types::Budget>) -> bool {
+fn budget_le(child: &Option<core_grant_types::Budget>, parent: &Option<core_grant_types::Budget>) -> bool {
     let Some(p) = parent else { return true };
     let c = child.clone().unwrap_or_default();
     if let Some(cap) = p.tokens
@@ -945,10 +944,8 @@ impl EventStore {
     ) -> Result<usize, ValidationError> {
         use core_crypto::{PublicKey, Signature};
         use core_events::EventRef;
-        use core_types::{
-            EventBody, EventRefRelation, EventSubject, KeyRole, SchemaVersion, SignerBinding,
-            SubjectKind,
-        };
+        use core_event_types::{EventBody, EventRefRelation, EventSubject, KeyRole, SignerBinding, SubjectKind};
+        use core_types::{SchemaVersion};
 
         let mut imported = 0;
         for line in data.lines() {
@@ -1921,7 +1918,7 @@ impl EventStore {
     /// Insert a new approval request into the database.
     pub fn insert_approval_request(
         &self,
-        req: &core_types::approval::ApprovalRequest,
+        req: &core_grant_types::approval::ApprovalRequest,
     ) -> Result<(), ValidationError> {
         let scope_json = serde_json::to_string(&req.requested_scope)
             .map_err(|err| ValidationError::new(format!("serialize requested_scope: {err}")))?;
@@ -2030,16 +2027,16 @@ impl EventStore {
     pub fn resolve_approval_request(
         &self,
         request_id: &str,
-        response: &core_types::approval::ApprovalResponse,
+        response: &core_grant_types::approval::ApprovalResponse,
     ) -> Result<(), ValidationError> {
         let row = self
             .get_approval_request(request_id)?
             .ok_or_else(|| ValidationError::new(format!("approval request not found: {request_id}")))?;
 
-        let scope: core_types::approval::RequestedScope =
+        let scope: core_grant_types::approval::RequestedScope =
             serde_json::from_str(&row.requested_scope_json)
                 .map_err(|err| ValidationError::new(format!("deserialize scope: {err}")))?;
-        let mut domain_req = core_types::approval::ApprovalRequest {
+        let mut domain_req = core_grant_types::approval::ApprovalRequest {
             request_id: row.request_id,
             requester_id: row.requester_id,
             requester_label: row.requester_label,
@@ -2950,11 +2947,11 @@ impl EventStore {
         durability: DurabilityPolicy,
         retention: RetentionPolicy,
         recipients: Vec<ManifestKeyRecipient>,
-    ) -> Result<core_types::VaultRevision, ValidationError> {
+    ) -> Result<core_event_types::VaultRevision, ValidationError> {
         self.upsert_local_structured_object(
             namespace,
             object_id,
-            core_types::VaultObjectClass::StructuredRecord,
+            core_event_types::VaultObjectClass::StructuredRecord,
             revision_id,
             payload_manifest_id,
             catalog_manifest_id,
@@ -2980,16 +2977,16 @@ impl EventStore {
         created_at: u64,
         created_by_device_id: &str,
         structured_record: StructuredRecordMeta,
-        claim: core_types::ClaimMeta,
+        claim: core_event_types::ClaimMeta,
         payload_json: &[u8],
         durability: DurabilityPolicy,
         retention: RetentionPolicy,
         recipients: Vec<ManifestKeyRecipient>,
-    ) -> Result<core_types::VaultRevision, ValidationError> {
+    ) -> Result<core_event_types::VaultRevision, ValidationError> {
         self.upsert_local_structured_object(
             namespace,
             object_id,
-            core_types::VaultObjectClass::PersonaCredential,
+            core_event_types::VaultObjectClass::PersonaCredential,
             revision_id,
             payload_manifest_id,
             catalog_manifest_id,
@@ -3010,7 +3007,7 @@ impl EventStore {
         created_by_device_id: &str,
         imported_claims: &[ImportedClaim],
         recipients: Vec<ManifestKeyRecipient>,
-    ) -> Result<Vec<core_types::VaultRevision>, ValidationError> {
+    ) -> Result<Vec<core_event_types::VaultRevision>, ValidationError> {
         if namespace.owner_kind != VaultOwnerKind::Persona {
             return Err(ValidationError::new(
                 "persona credential imports require a persona-owned namespace",
@@ -3031,7 +3028,7 @@ impl EventStore {
         for (index, imported_claim) in imported_claims.iter().enumerate() {
             imported_claim.validate()?;
             let claim_type =
-                core_types::ClaimType::parse(&imported_claim.claim_type).ok_or_else(|| {
+                core_event_types::ClaimType::parse(&imported_claim.claim_type).ok_or_else(|| {
                     ValidationError::new(format!(
                         "unsupported imported claim type: {}",
                         imported_claim.claim_type
@@ -3058,7 +3055,7 @@ impl EventStore {
                         None => now_epoch_secs.saturating_add(index as u64),
                     }
                 });
-            let claim = core_types::ClaimMeta {
+            let claim = core_event_types::ClaimMeta {
                 claim_type,
                 issuer_persona_id: namespace.owner_id.clone(),
                 subject_persona_id: namespace.owner_id.clone(),
@@ -3079,8 +3076,8 @@ impl EventStore {
                 structured_record_meta_for_claim_schema(claim_schema),
                 claim,
                 imported_claim.payload_json.as_bytes(),
-                core_types::DurabilityPolicy::ReplicatedToApprovedPeers,
-                core_types::RetentionPolicy::KeepLatest,
+                core_event_types::DurabilityPolicy::ReplicatedToApprovedPeers,
+                core_event_types::RetentionPolicy::KeepLatest,
                 recipients.clone(),
             )?;
             revisions.push(revision);
@@ -3095,7 +3092,7 @@ impl EventStore {
     /// and delegates to [`import_persona_credentials`]. Returns the `object_id`
     /// of the created credential.
     ///
-    /// `claim_type` must be a valid [`core_types::ClaimType`] string
+    /// `claim_type` must be a valid [`core_event_types::ClaimType`] string
     /// (e.g. `"self-asserted"`). `payload_json` must be a JSON object with a
     /// top-level `"schema"` string field (e.g. `{"schema":"password","username":"foo"}`).
     pub fn create_persona_credential(
@@ -3157,19 +3154,19 @@ impl EventStore {
         &mut self,
         namespace: &VaultNamespace,
         object_id: &str,
-        object_class: core_types::VaultObjectClass,
+        object_class: core_event_types::VaultObjectClass,
         revision_id: &str,
         payload_manifest_id: &str,
         catalog_manifest_id: &str,
         created_at: u64,
         created_by_device_id: &str,
         structured_record: StructuredRecordMeta,
-        claim: Option<core_types::ClaimMeta>,
+        claim: Option<core_event_types::ClaimMeta>,
         payload_json: &[u8],
         durability: DurabilityPolicy,
         retention: RetentionPolicy,
         recipients: Vec<ManifestKeyRecipient>,
-    ) -> Result<core_types::VaultRevision, ValidationError> {
+    ) -> Result<core_event_types::VaultRevision, ValidationError> {
         namespace.validate()?;
         structured_record.validate()?;
         if recipients.is_empty() {
@@ -3178,15 +3175,15 @@ impl EventStore {
             ));
         }
         match object_class {
-            core_types::VaultObjectClass::StructuredRecord => {
+            core_event_types::VaultObjectClass::StructuredRecord => {
                 if claim.is_some() {
                     return Err(ValidationError::new(
                         "claim metadata requires persona-credential vault objects",
                     ));
                 }
             }
-            core_types::VaultObjectClass::PersonaCredential => {
-                if namespace.owner_kind != core_types::VaultOwnerKind::Persona {
+            core_event_types::VaultObjectClass::PersonaCredential => {
+                if namespace.owner_kind != core_event_types::VaultOwnerKind::Persona {
                     return Err(ValidationError::new(
                         "persona credentials require a persona-owned namespace",
                     ));
@@ -3203,7 +3200,7 @@ impl EventStore {
                 ));
             }
         }
-        if structured_record.encoding == core_types::StructuredEncoding::Json {
+        if structured_record.encoding == core_event_types::StructuredEncoding::Json {
             let decoded = serde_json::from_slice::<JsonValue>(payload_json).map_err(|err| {
                 ValidationError::new(format!(
                     "structured record payload must be valid json: {err}"
@@ -3231,7 +3228,7 @@ impl EventStore {
             revision_id,
             object_id,
             payload_manifest_id,
-            core_types::PayloadKind::StructuredRecord,
+            core_event_types::PayloadKind::StructuredRecord,
             "application/json",
             created_at,
             created_by_device_id,
@@ -3305,11 +3302,11 @@ impl EventStore {
         file_name: &str,
         content_type: &str,
         file_bytes: &[u8],
-        object_class: core_types::VaultObjectClass,
+        object_class: core_event_types::VaultObjectClass,
         durability: DurabilityPolicy,
         retention: RetentionPolicy,
         recipients: Vec<ManifestKeyRecipient>,
-    ) -> Result<core_types::VaultRevision, ValidationError> {
+    ) -> Result<core_event_types::VaultRevision, ValidationError> {
         namespace.validate()?;
         if recipients.is_empty() {
             return Err(ValidationError::new(
@@ -3335,7 +3332,7 @@ impl EventStore {
             revision_id,
             object_id,
             payload_manifest_id,
-            core_types::PayloadKind::BinaryBlob,
+            core_event_types::PayloadKind::BinaryBlob,
             content_type,
             created_at,
             created_by_device_id,
@@ -3578,7 +3575,7 @@ impl EventStore {
         &self,
         envelope: &PresentationArtifactEnvelope,
     ) -> Result<(), ValidationError> {
-        if envelope.artifact.recipient_kind == core_types::PresentationAudienceKind::Peer
+        if envelope.artifact.recipient_kind == core_event_types::PresentationAudienceKind::Peer
             && !self
                 .materialized
                 .personas_current
@@ -3768,7 +3765,7 @@ impl EventStore {
         &self,
         manifest_id: &str,
         device_id: &str,
-        relationship: &core_types::StorageRelationship,
+        relationship: &core_event_types::StorageRelationship,
     ) -> Result<Vec<ChunkReference>, ValidationError> {
         let device = self
             .materialized
@@ -3810,7 +3807,7 @@ impl EventStore {
     pub fn plan_storage_restore(
         &self,
         manifest_id: &str,
-        relationship: &core_types::StorageRelationship,
+        relationship: &core_event_types::StorageRelationship,
     ) -> Result<(String, Vec<ChunkReference>), ValidationError> {
         let device_id = self.select_active_restore_device_for_manifest(manifest_id)?;
         let chunks = self.plan_storage_restore_for_device(manifest_id, &device_id, relationship)?;
@@ -4132,13 +4129,13 @@ impl EventLog for EventStore {
     }
 }
 
-fn parse_approval_status(s: &str) -> Result<core_types::approval::ApprovalStatus, ValidationError> {
+fn parse_approval_status(s: &str) -> Result<core_grant_types::approval::ApprovalStatus, ValidationError> {
     match s {
-        "pending" => Ok(core_types::approval::ApprovalStatus::Pending),
-        "approved" => Ok(core_types::approval::ApprovalStatus::Approved),
-        "denied" => Ok(core_types::approval::ApprovalStatus::Denied),
-        "expired" => Ok(core_types::approval::ApprovalStatus::Expired),
-        "narrowed_and_approved" => Ok(core_types::approval::ApprovalStatus::NarrowedAndApproved),
+        "pending" => Ok(core_grant_types::approval::ApprovalStatus::Pending),
+        "approved" => Ok(core_grant_types::approval::ApprovalStatus::Approved),
+        "denied" => Ok(core_grant_types::approval::ApprovalStatus::Denied),
+        "expired" => Ok(core_grant_types::approval::ApprovalStatus::Expired),
+        "narrowed_and_approved" => Ok(core_grant_types::approval::ApprovalStatus::NarrowedAndApproved),
         other => Err(ValidationError::invalid_format(format!(
             "unknown approval status: {other}"
         ))),
@@ -4160,30 +4157,21 @@ mod tests {
         publish_manifest, storage_ledger_updated_event, storage_manifest_published_event,
         storage_relationship_created_event, wrap_manifest_key_access,
     };
-    use core_types::{
-        ContentPublishedEvent, ContentVisibility, DeviceAddedEvent,
-        DeviceEncryptionKeyRotatedEvent, DeviceFrozenEvent, DeviceKeyRotatedEvent,
-        DeviceReplacedEvent, DeviceRevokedEvent, EndpointRotatedEvent, EventBody,
-        GuardianEnrolledEvent, MessageSentEvent, PersonaCreatedEvent, PersonaKeyRotatedEvent,
-        PersonaRevokedEvent, PublicKeyMaterial, RecoveryApprovedEvent, RecoveryContestedEvent,
-        RecoveryExecutedEvent, RecoveryPolicyCreatedEvent, RecoveryRejectedEvent,
-        RecoveryRequestedEvent, RecoveryScope, RelayHintUpdatedEvent, RootCreatedEvent,
-        RootKeyRotatedEvent, RootRevokedEvent, SignerBinding, SurvivalMode, TrustAttestedEvent,
-        TrustRevokedEvent,
-    };
+    use core_event_types::{ContentPublishedEvent, ContentVisibility, DeviceAddedEvent, DeviceEncryptionKeyRotatedEvent, DeviceFrozenEvent, DeviceKeyRotatedEvent, DeviceReplacedEvent, DeviceRevokedEvent, EndpointRotatedEvent, EventBody, GuardianEnrolledEvent, MessageSentEvent, PersonaCreatedEvent, PersonaKeyRotatedEvent, PersonaRevokedEvent, RecoveryApprovedEvent, RecoveryContestedEvent, RecoveryExecutedEvent, RecoveryPolicyCreatedEvent, RecoveryRejectedEvent, RecoveryRequestedEvent, RelayHintUpdatedEvent, RootCreatedEvent, RootKeyRotatedEvent, RootRevokedEvent, SignerBinding, TrustAttestedEvent, TrustRevokedEvent};
+    use core_principals::{PublicKeyMaterial, RecoveryScope, SurvivalMode};
     use rusqlite::OptionalExtension;
 
     use super::*;
 
     fn test_key(key_id: &str) -> PublicKeyMaterial {
-        // C-1: authorize now binds signer.public_key material to
+        // Signer-pubkey binding: authorize now binds signer.public_key material to
         // active_key.public_key, so the stored string must match the real
         // pubkey derived from the FixtureSigner that signs events with this key_id.
         use core_crypto::Signer as _;
         let signer = FixtureSigner::new(key_id);
         PublicKeyMaterial {
             key_id: key_id.into(),
-            algorithm: core_types::KeyAlgorithm::Ed25519,
+            algorithm: core_principals::KeyAlgorithm::Ed25519,
             public_key: signer.public_key().0,
         }
     }
@@ -4191,12 +4179,12 @@ mod tests {
     fn test_encryption_key(key_id: &str) -> PublicKeyMaterial {
         PublicKeyMaterial {
             key_id: format!("enc-{key_id}"),
-            algorithm: core_types::KeyAlgorithm::AgeX25519,
+            algorithm: core_principals::KeyAlgorithm::AgeX25519,
             public_key: format!("age1{key_id}fixture"),
         }
     }
 
-    /// C-1: for guardian enrollment the on-event `guardian_public_key` is the
+    /// Signer-pubkey binding: for guardian enrollment the on-event `guardian_public_key` is the
     /// real pubkey string. Tests that previously embedded opaque labels
     /// ("guardian-key-alex") break under the pubkey-material binding check, so
     /// derive the real pubkey from FixtureSigner(label) here.
@@ -4235,14 +4223,14 @@ mod tests {
 
     fn test_namespace() -> VaultNamespace {
         VaultNamespace {
-            owner_kind: core_types::VaultOwnerKind::Persona,
+            owner_kind: core_event_types::VaultOwnerKind::Persona,
             owner_id: "persona-a".into(),
         }
     }
 
-    fn test_claim_meta() -> core_types::ClaimMeta {
-        core_types::ClaimMeta {
-            claim_type: core_types::ClaimType::SelfAsserted,
+    fn test_claim_meta() -> core_event_types::ClaimMeta {
+        core_event_types::ClaimMeta {
+            claim_type: core_event_types::ClaimType::SelfAsserted,
             issuer_persona_id: "persona-a".into(),
             subject_persona_id: "persona-a".into(),
             claim_schema: "emberlink:claim:password:1.0".into(),
@@ -4275,23 +4263,23 @@ mod tests {
         );
         let catalog = VaultCatalog {
             namespace: test_namespace(),
-            objects: vec![core_types::VaultObject {
+            objects: vec![core_event_types::VaultObject {
                 id: "obj-1".into(),
                 namespace: test_namespace(),
-                class: core_types::VaultObjectClass::PersonaDocument,
+                class: core_event_types::VaultObjectClass::PersonaDocument,
                 latest_revision_id: "rev-2".into(),
                 created_at: 1,
                 updated_at: 2,
-                durability: core_types::DurabilityPolicy::ReplicatedToApprovedPeers,
-                retention: core_types::RetentionPolicy::KeepLatest,
+                durability: core_event_types::DurabilityPolicy::ReplicatedToApprovedPeers,
+                retention: core_event_types::RetentionPolicy::KeepLatest,
                 deleted: false,
             }],
             revisions: vec![
-                core_types::VaultRevision {
+                core_event_types::VaultRevision {
                     id: "rev-1".into(),
                     object_id: "obj-1".into(),
                     manifest_id: "manifest-old".into(),
-                    payload_kind: core_types::PayloadKind::BinaryBlob,
+                    payload_kind: core_event_types::PayloadKind::BinaryBlob,
                     content_type: "application/octet-stream".into(),
                     created_at: 1,
                     created_by_device_id: "device-a".into(),
@@ -4299,11 +4287,11 @@ mod tests {
                     structured_record: None,
                     claim: None,
                 },
-                core_types::VaultRevision {
+                core_event_types::VaultRevision {
                     id: "rev-2".into(),
                     object_id: "obj-1".into(),
                     manifest_id: "manifest-current".into(),
-                    payload_kind: core_types::PayloadKind::BinaryBlob,
+                    payload_kind: core_event_types::PayloadKind::BinaryBlob,
                     content_type: "application/octet-stream".into(),
                     created_at: 2,
                     created_by_device_id: "device-a".into(),
@@ -4916,10 +4904,10 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "emberlink-core-state-service-bindings-{unique}.sqlite"
         ));
-        let binding = core_types::ServiceBinding {
+        let binding = core_event_types::ServiceBinding {
             id: "binding-1".into(),
             persona_id: "persona-a".into(),
-            descriptor: core_types::ServiceDescriptor {
+            descriptor: core_event_types::ServiceDescriptor {
                 adapter_kind: "password".into(),
                 service_label: "GitHub".into(),
                 endpoint: "https://github.com".into(),
@@ -4992,10 +4980,10 @@ mod tests {
 
         let mut store = EventStore::open(&path).unwrap();
         let err = store
-            .upsert_service_binding(&core_types::ServiceBinding {
+            .upsert_service_binding(&core_event_types::ServiceBinding {
                 id: "binding-1".into(),
                 persona_id: "persona-missing".into(),
-                descriptor: core_types::ServiceDescriptor {
+                descriptor: core_event_types::ServiceDescriptor {
                     adapter_kind: "password".into(),
                     service_label: "GitHub".into(),
                     endpoint: "https://github.com".into(),
@@ -5751,30 +5739,30 @@ mod tests {
         let content_key = generate_content_key("vault-catalog");
         let catalog = VaultCatalog {
             namespace: test_namespace(),
-            objects: vec![core_types::VaultObject {
+            objects: vec![core_event_types::VaultObject {
                 id: "obj-1".into(),
                 namespace: test_namespace(),
-                class: core_types::VaultObjectClass::StructuredRecord,
+                class: core_event_types::VaultObjectClass::StructuredRecord,
                 latest_revision_id: "rev-1".into(),
                 created_at: 1,
                 updated_at: 1,
-                durability: core_types::DurabilityPolicy::ReplicatedToApprovedPeers,
-                retention: core_types::RetentionPolicy::KeepLatest,
+                durability: core_event_types::DurabilityPolicy::ReplicatedToApprovedPeers,
+                retention: core_event_types::RetentionPolicy::KeepLatest,
                 deleted: false,
             }],
-            revisions: vec![core_types::VaultRevision {
+            revisions: vec![core_event_types::VaultRevision {
                 id: "rev-1".into(),
                 object_id: "obj-1".into(),
                 manifest_id: "manifest-record-1".into(),
-                payload_kind: core_types::PayloadKind::StructuredRecord,
+                payload_kind: core_event_types::PayloadKind::StructuredRecord,
                 content_type: "application/json".into(),
                 created_at: 1,
                 created_by_device_id: "device-a".into(),
                 parent_revision_id: None,
-                structured_record: Some(core_types::StructuredRecordMeta {
+                structured_record: Some(core_event_types::StructuredRecordMeta {
                     schema_id: "com.example.profile/basic".into(),
                     schema_version: "v1".into(),
-                    encoding: core_types::StructuredEncoding::Json,
+                    encoding: core_event_types::StructuredEncoding::Json,
                     app_namespace: "com.example.profile".into(),
                 }),
                 claim: None,
@@ -5834,7 +5822,7 @@ mod tests {
             test_namespace(),
             "obj-1",
             "com.example.profile/basic",
-            core_types::PresentationAudienceKind::Service,
+            core_event_types::PresentationAudienceKind::Service,
             vec!["full_name".into(), "skills".into()],
             Some(3600),
         )
@@ -5866,7 +5854,7 @@ mod tests {
             "artifact-1",
             "obj-1",
             "rev-1",
-            core_types::PresentationAudienceKind::Service,
+            core_event_types::PresentationAudienceKind::Service,
             "svc.example",
             "com.example.profile/basic",
             "manifest-artifact-1",
@@ -5914,26 +5902,26 @@ mod tests {
         let object = core_storage::create_vault_object(
             "obj-1",
             namespace.clone(),
-            core_types::VaultObjectClass::StructuredRecord,
+            core_event_types::VaultObjectClass::StructuredRecord,
             "rev-1",
             1,
-            core_types::DurabilityPolicy::ReplicatedToApprovedPeers,
-            core_types::RetentionPolicy::KeepLatest,
+            core_event_types::DurabilityPolicy::ReplicatedToApprovedPeers,
+            core_event_types::RetentionPolicy::KeepLatest,
         )
         .unwrap();
         let revision = core_storage::create_vault_revision(
             "rev-1",
             "obj-1",
             "manifest-source-1",
-            core_types::PayloadKind::StructuredRecord,
+            core_event_types::PayloadKind::StructuredRecord,
             "application/json",
             1,
             "device-a",
             None,
-            Some(core_types::StructuredRecordMeta {
+            Some(core_event_types::StructuredRecordMeta {
                 schema_id: "com.example.profile/basic".into(),
                 schema_version: "v1".into(),
-                encoding: core_types::StructuredEncoding::Json,
+                encoding: core_event_types::StructuredEncoding::Json,
                 app_namespace: "com.example.profile".into(),
             }),
             None,
@@ -5961,7 +5949,7 @@ mod tests {
             namespace.clone(),
             "obj-1",
             "com.example.profile/basic",
-            core_types::PresentationAudienceKind::Service,
+            core_event_types::PresentationAudienceKind::Service,
             vec!["full_name".into(), "skills".into()],
             Some(3600),
         )
@@ -6102,7 +6090,7 @@ mod tests {
         let meta = StructuredRecordMeta {
             schema_id: "com.example.profile/basic".into(),
             schema_version: "v1".into(),
-            encoding: core_types::StructuredEncoding::Json,
+            encoding: core_event_types::StructuredEncoding::Json,
             app_namespace: "com.example.profile".into(),
         };
         let template = core_storage::create_presentation_template(
@@ -6110,7 +6098,7 @@ mod tests {
             namespace.clone(),
             "obj-owner",
             "com.example.profile/basic",
-            core_types::PresentationAudienceKind::Service,
+            core_event_types::PresentationAudienceKind::Service,
             vec!["full_name".into()],
             Some(3600),
         )
@@ -6127,8 +6115,8 @@ mod tests {
                 "device-a",
                 meta,
                 br#"{"full_name":"Jane Doe","private":"secret"}"#,
-                core_types::DurabilityPolicy::ReplicatedToApprovedPeers,
-                core_types::RetentionPolicy::KeepLatest,
+                core_event_types::DurabilityPolicy::ReplicatedToApprovedPeers,
+                core_event_types::RetentionPolicy::KeepLatest,
                 vec![test_manifest_recipient("device-a")],
             )
             .unwrap();
@@ -6184,7 +6172,7 @@ mod tests {
             "artifact-received-1",
             "obj-1",
             "rev-1",
-            core_types::PresentationAudienceKind::Peer,
+            core_event_types::PresentationAudienceKind::Peer,
             "persona-target",
             "com.example.profile/basic",
             "manifest-artifact-1",
@@ -6257,10 +6245,10 @@ mod tests {
         ));
         let block_dir = local_block_store_root(&path);
         let namespace = test_namespace();
-        let meta = core_types::StructuredRecordMeta {
+        let meta = core_event_types::StructuredRecordMeta {
             schema_id: "com.example.profile/basic".into(),
             schema_version: "v1".into(),
-            encoding: core_types::StructuredEncoding::Json,
+            encoding: core_event_types::StructuredEncoding::Json,
             app_namespace: "com.example.profile".into(),
         };
 
@@ -6277,8 +6265,8 @@ mod tests {
                     "device-a",
                     meta.clone(),
                     br#"{"full_name":"Jane"}"#,
-                    core_types::DurabilityPolicy::ReplicatedToApprovedPeers,
-                    core_types::RetentionPolicy::KeepLatest,
+                    core_event_types::DurabilityPolicy::ReplicatedToApprovedPeers,
+                    core_event_types::RetentionPolicy::KeepLatest,
                     vec![test_manifest_recipient("device-a")],
                 )
                 .unwrap();
@@ -6293,8 +6281,8 @@ mod tests {
                     "device-a",
                     meta,
                     br#"{"full_name":"Jane Doe","skills":["rust"]}"#,
-                    core_types::DurabilityPolicy::ReplicatedToApprovedPeers,
-                    core_types::RetentionPolicy::KeepLatest,
+                    core_event_types::DurabilityPolicy::ReplicatedToApprovedPeers,
+                    core_event_types::RetentionPolicy::KeepLatest,
                     vec![test_manifest_recipient("device-a")],
                 )
                 .unwrap();
@@ -6335,10 +6323,10 @@ mod tests {
         ));
         let block_dir = local_block_store_root(&path);
         let namespace = test_namespace();
-        let meta = core_types::StructuredRecordMeta {
+        let meta = core_event_types::StructuredRecordMeta {
             schema_id: "com.example.profile/basic".into(),
             schema_version: "v1".into(),
-            encoding: core_types::StructuredEncoding::Json,
+            encoding: core_event_types::StructuredEncoding::Json,
             app_namespace: "com.example.profile".into(),
         };
 
@@ -6354,8 +6342,8 @@ mod tests {
                 "device-a",
                 meta,
                 br#"["not","an","object"]"#,
-                core_types::DurabilityPolicy::ReplicatedToApprovedPeers,
-                core_types::RetentionPolicy::KeepLatest,
+                core_event_types::DurabilityPolicy::ReplicatedToApprovedPeers,
+                core_event_types::RetentionPolicy::KeepLatest,
                 vec![test_manifest_recipient("device-a")],
             )
             .unwrap_err();
@@ -6377,10 +6365,10 @@ mod tests {
         ));
         let block_dir = local_block_store_root(&path);
         let namespace = test_namespace();
-        let meta = core_types::StructuredRecordMeta {
+        let meta = core_event_types::StructuredRecordMeta {
             schema_id: "emberlink:claim:password:1.0".into(),
             schema_version: "v1".into(),
-            encoding: core_types::StructuredEncoding::Json,
+            encoding: core_event_types::StructuredEncoding::Json,
             app_namespace: "emberlink".into(),
         };
         let claim = test_claim_meta();
@@ -6399,8 +6387,8 @@ mod tests {
                     meta,
                     claim.clone(),
                     br#"{"service_url":"https://github.com","username":"alice","password":"secret"}"#,
-                    core_types::DurabilityPolicy::ReplicatedToApprovedPeers,
-                    core_types::RetentionPolicy::KeepLatest,
+                    core_event_types::DurabilityPolicy::ReplicatedToApprovedPeers,
+                    core_event_types::RetentionPolicy::KeepLatest,
                     vec![test_manifest_recipient("device-a")],
                 )
                 .unwrap();
@@ -6421,7 +6409,7 @@ mod tests {
 
         assert_eq!(
             object.class,
-            core_types::VaultObjectClass::PersonaCredential
+            core_event_types::VaultObjectClass::PersonaCredential
         );
         assert_eq!(revision.claim.as_ref(), Some(&claim));
         assert_eq!(
@@ -6449,7 +6437,7 @@ mod tests {
         ));
         let block_dir = local_block_store_root(&path);
         let namespace = VaultNamespace {
-            owner_kind: core_types::VaultOwnerKind::Root,
+            owner_kind: core_event_types::VaultOwnerKind::Root,
             owner_id: "root-a".into(),
         };
 
@@ -6463,16 +6451,16 @@ mod tests {
                 "manifest-catalog-cred-1",
                 42,
                 "device-a",
-                core_types::StructuredRecordMeta {
+                core_event_types::StructuredRecordMeta {
                     schema_id: "emberlink:claim:password:1.0".into(),
                     schema_version: "v1".into(),
-                    encoding: core_types::StructuredEncoding::Json,
+                    encoding: core_event_types::StructuredEncoding::Json,
                     app_namespace: "emberlink".into(),
                 },
                 test_claim_meta(),
                 br#"{"service_url":"https://github.com","username":"alice","password":"secret"}"#,
-                core_types::DurabilityPolicy::ReplicatedToApprovedPeers,
-                core_types::RetentionPolicy::KeepLatest,
+                core_event_types::DurabilityPolicy::ReplicatedToApprovedPeers,
+                core_event_types::RetentionPolicy::KeepLatest,
                 vec![test_manifest_recipient("device-a")],
             )
             .unwrap_err();
@@ -6495,8 +6483,8 @@ mod tests {
         let block_dir = local_block_store_root(&path);
         let namespace = test_namespace();
 
-        let imported_claim = core_types::ImportedClaim {
-            claim_type: core_types::ClaimType::SelfAsserted.as_str().into(),
+        let imported_claim = core_event_types::ImportedClaim {
+            claim_type: core_event_types::ClaimType::SelfAsserted.as_str().into(),
             payload_json: r#"{"schema":"emberlink:claim:password:1.0","service_name":"GitHub","service_url":"https://github.com","username":"alice","password":"secret","totp_secret":null,"notes":"imported"}"#.into(),
             external_issuer: "bitwarden".into(),
             external_issued_at: Some(42),
@@ -6530,7 +6518,7 @@ mod tests {
         assert_eq!(catalog.objects.len(), 1);
         assert_eq!(
             catalog.objects[0].class,
-            core_types::VaultObjectClass::PersonaCredential
+            core_event_types::VaultObjectClass::PersonaCredential
         );
         assert_eq!(
             catalog.revisions[0].claim.as_ref().unwrap().claim_schema,
@@ -6560,10 +6548,10 @@ mod tests {
             std::env::temp_dir().join(format!("emberlink-core-state-vault-delete-{unique}.sqlite"));
         let block_dir = local_block_store_root(&path);
         let namespace = test_namespace();
-        let meta = core_types::StructuredRecordMeta {
+        let meta = core_event_types::StructuredRecordMeta {
             schema_id: "com.example.profile/basic".into(),
             schema_version: "v1".into(),
-            encoding: core_types::StructuredEncoding::Json,
+            encoding: core_event_types::StructuredEncoding::Json,
             app_namespace: "com.example.profile".into(),
         };
         let template = core_storage::create_presentation_template(
@@ -6571,7 +6559,7 @@ mod tests {
             namespace.clone(),
             "obj-delete-1",
             "com.example.profile/basic",
-            core_types::PresentationAudienceKind::Service,
+            core_event_types::PresentationAudienceKind::Service,
             vec!["full_name".into()],
             Some(3600),
         )
@@ -6590,8 +6578,8 @@ mod tests {
                     "device-a",
                     meta.clone(),
                     br#"{"full_name":"Jane Doe","private":{"ssn":"000-00-0000"}}"#,
-                    core_types::DurabilityPolicy::ReplicatedToApprovedPeers,
-                    core_types::RetentionPolicy::KeepLatest,
+                    core_event_types::DurabilityPolicy::ReplicatedToApprovedPeers,
+                    core_event_types::RetentionPolicy::KeepLatest,
                     vec![test_manifest_recipient("device-a")],
                 )
                 .unwrap();
@@ -6618,8 +6606,8 @@ mod tests {
                     "device-a",
                     meta,
                     br#"{"full_name":"Jane Updated"}"#,
-                    core_types::DurabilityPolicy::ReplicatedToApprovedPeers,
-                    core_types::RetentionPolicy::KeepLatest,
+                    core_event_types::DurabilityPolicy::ReplicatedToApprovedPeers,
+                    core_event_types::RetentionPolicy::KeepLatest,
                     vec![test_manifest_recipient("device-a")],
                 )
                 .unwrap_err();
@@ -6796,7 +6784,7 @@ mod tests {
             .local_device_encryption_key_pair("device-a")
             .unwrap()
             .unwrap();
-        // PartialEq derive removed in security check (timing leak); compare fields explicitly.
+        // PartialEq derive was removed to avoid a timing leak; compare fields explicitly.
         assert_eq!(loaded.algorithm, encryption_key_pair.algorithm);
         assert_eq!(loaded.public_key, encryption_key_pair.public_key);
         assert_eq!(loaded.private_key, encryption_key_pair.private_key);
@@ -7117,10 +7105,10 @@ mod tests {
         ));
         let block_dir = local_block_store_root(&path);
         let namespace = test_namespace();
-        let meta = core_types::StructuredRecordMeta {
+        let meta = core_event_types::StructuredRecordMeta {
             schema_id: "com.example.profile/basic".into(),
             schema_version: "v1".into(),
-            encoding: core_types::StructuredEncoding::Json,
+            encoding: core_event_types::StructuredEncoding::Json,
             app_namespace: "com.example.profile".into(),
         };
 
@@ -7137,8 +7125,8 @@ mod tests {
                     "device-a",
                     meta.clone(),
                     br#"{"full_name":"Jane Doe"}"#,
-                    core_types::DurabilityPolicy::ReplicatedToApprovedPeers,
-                    core_types::RetentionPolicy::KeepLatest,
+                    core_event_types::DurabilityPolicy::ReplicatedToApprovedPeers,
+                    core_event_types::RetentionPolicy::KeepLatest,
                     vec![test_manifest_recipient("device-a")],
                 )
                 .unwrap();
@@ -7153,8 +7141,8 @@ mod tests {
                     "device-a",
                     meta,
                     br#"{"full_name":"Jane Updated"}"#,
-                    core_types::DurabilityPolicy::ReplicatedToApprovedPeers,
-                    core_types::RetentionPolicy::KeepLatest,
+                    core_event_types::DurabilityPolicy::ReplicatedToApprovedPeers,
+                    core_event_types::RetentionPolicy::KeepLatest,
                     vec![test_manifest_recipient("device-a")],
                 )
                 .unwrap();
@@ -7234,26 +7222,26 @@ mod tests {
         let object = core_storage::create_vault_object(
             "obj-structured-1",
             namespace.clone(),
-            core_types::VaultObjectClass::StructuredRecord,
+            core_event_types::VaultObjectClass::StructuredRecord,
             "rev-structured-1",
             1,
-            core_types::DurabilityPolicy::ReplicatedToApprovedPeers,
-            core_types::RetentionPolicy::KeepLatest,
+            core_event_types::DurabilityPolicy::ReplicatedToApprovedPeers,
+            core_event_types::RetentionPolicy::KeepLatest,
         )
         .unwrap();
         let revision = core_storage::create_vault_revision(
             "rev-structured-1",
             "obj-structured-1",
             "manifest-structured-1",
-            core_types::PayloadKind::StructuredRecord,
+            core_event_types::PayloadKind::StructuredRecord,
             "application/json",
             1,
             "device-a",
             None,
-            Some(core_types::StructuredRecordMeta {
+            Some(core_event_types::StructuredRecordMeta {
                 schema_id: "com.example.profile/basic".into(),
                 schema_version: "v1".into(),
-                encoding: core_types::StructuredEncoding::Json,
+                encoding: core_event_types::StructuredEncoding::Json,
                 app_namespace: "com.example.profile".into(),
             }),
             None,
@@ -7385,15 +7373,15 @@ mod tests {
                 "manifest-local-catalog-1",
                 1,
                 "device-a",
-                core_types::StructuredRecordMeta {
+                core_event_types::StructuredRecordMeta {
                     schema_id: "com.example.profile/basic".into(),
                     schema_version: "v1".into(),
-                    encoding: core_types::StructuredEncoding::Json,
+                    encoding: core_event_types::StructuredEncoding::Json,
                     app_namespace: "com.example.profile".into(),
                 },
                 br#"{"full_name":"Jordan Hudson"}"#,
-                core_types::DurabilityPolicy::ReplicatedToApprovedPeers,
-                core_types::RetentionPolicy::KeepLatest,
+                core_event_types::DurabilityPolicy::ReplicatedToApprovedPeers,
+                core_event_types::RetentionPolicy::KeepLatest,
                 vec![manifest_key_recipient(
                     "device-a",
                     device_a_encryption.public_key.clone(),
@@ -7489,15 +7477,15 @@ mod tests {
                 "manifest-local-catalog-1",
                 1,
                 "device-a",
-                core_types::StructuredRecordMeta {
+                core_event_types::StructuredRecordMeta {
                     schema_id: "com.example.profile/basic".into(),
                     schema_version: "v1".into(),
-                    encoding: core_types::StructuredEncoding::Json,
+                    encoding: core_event_types::StructuredEncoding::Json,
                     app_namespace: "com.example.profile".into(),
                 },
                 br#"{"full_name":"Jordan Hudson"}"#,
-                core_types::DurabilityPolicy::ReplicatedToApprovedPeers,
-                core_types::RetentionPolicy::KeepLatest,
+                core_event_types::DurabilityPolicy::ReplicatedToApprovedPeers,
+                core_event_types::RetentionPolicy::KeepLatest,
                 vec![manifest_key_recipient(
                     "device-a",
                     device_a_encryption.public_key.clone(),
@@ -7636,7 +7624,7 @@ mod tests {
         append_typed(
             &mut store,
             "evt-device-freeze-1",
-            EventBody::DeviceFrozen(core_types::DeviceFrozenEvent {
+            EventBody::DeviceFrozen(core_event_types::DeviceFrozenEvent {
                 root_id: "root-a".into(),
                 device_id: "device-a".into(),
                 reason: "lost".into(),
@@ -9071,12 +9059,12 @@ mod tests {
 
     // Grant CRUD tests deferred — see design follow-up PR for composite grant test port.
 
-    fn sample_approval_request(id: &str) -> core_types::approval::ApprovalRequest {
-        core_types::approval::ApprovalRequest::new(
+    fn sample_approval_request(id: &str) -> core_grant_types::approval::ApprovalRequest {
+        core_grant_types::approval::ApprovalRequest::new(
             id.into(),
             "agent-claude".into(),
             Some("Claude agent".into()),
-            core_types::approval::RequestedScope {
+            core_grant_types::approval::RequestedScope {
                 capability: "ReadCredential".into(),
                 resource_id: Some("cred-netflix".into()),
                 constraints: vec!["read-only".into()],
@@ -9122,9 +9110,9 @@ mod tests {
         assert_eq!(pending[0].request_id, "req-2");
         assert_eq!(pending[1].request_id, "req-1");
 
-        let response = core_types::approval::ApprovalResponse {
+        let response = core_grant_types::approval::ApprovalResponse {
             request_id: "req-1".into(),
-            status: core_types::approval::ApprovalStatus::Approved,
+            status: core_grant_types::approval::ApprovalStatus::Approved,
             resolver_id: "josh".into(),
             resolved_at: 1700000120,
             narrowed_scope: None,
@@ -9144,9 +9132,9 @@ mod tests {
         let req = sample_approval_request("req-1");
         store.insert_approval_request(&req).unwrap();
 
-        let response = core_types::approval::ApprovalResponse {
+        let response = core_grant_types::approval::ApprovalResponse {
             request_id: "req-1".into(),
-            status: core_types::approval::ApprovalStatus::Denied,
+            status: core_grant_types::approval::ApprovalStatus::Denied,
             resolver_id: "josh".into(),
             resolved_at: 1700000120,
             narrowed_scope: None,
@@ -9168,9 +9156,9 @@ mod tests {
         let req = sample_approval_request("req-1");
         store.insert_approval_request(&req).unwrap();
 
-        let response1 = core_types::approval::ApprovalResponse {
+        let response1 = core_grant_types::approval::ApprovalResponse {
             request_id: "req-1".into(),
-            status: core_types::approval::ApprovalStatus::Approved,
+            status: core_grant_types::approval::ApprovalStatus::Approved,
             resolver_id: "josh".into(),
             resolved_at: 1700000120,
             narrowed_scope: None,
@@ -9179,9 +9167,9 @@ mod tests {
         };
         store.resolve_approval_request("req-1", &response1).unwrap();
 
-        let response2 = core_types::approval::ApprovalResponse {
+        let response2 = core_grant_types::approval::ApprovalResponse {
             request_id: "req-1".into(),
-            status: core_types::approval::ApprovalStatus::Denied,
+            status: core_grant_types::approval::ApprovalStatus::Denied,
             resolver_id: "attacker".into(),
             resolved_at: 1700000180,
             narrowed_scope: None,

@@ -1,7 +1,7 @@
 //! `ember broker {issue, revoke, list}` — operator + wrapper-script entry
 //! point for the credential broker (design / design).
 //!
-//! The daemon RPC handlers shipped in implementation-note-47
+//! The daemon RPC handlers shipped in implementation-note-94
 //! (`crates/ember-daemon/src/broker_handler.rs`); this module is the CLI
 //! surface that wraps them. Subcommands:
 //!
@@ -13,7 +13,7 @@
 //!   RPC), optionally filtered by provider / tier / task-id /
 //!   active-only.
 //!
-//! ## Grants-file flow (implementation-note-53)
+//! ## Grants-file flow (implementation-note-110)
 //!
 //! `ember broker issue --grants-file <path> --credential <name>` reads a
 //! `GrantsManifest` TOML, locates the named credential entry, and issues a
@@ -27,11 +27,11 @@
 //!
 //! ## Marker for `target_state_anchor`
 //!
-//! implementation-note-167 uses `BrokerCmd|broker_command` as its grep gate;
+//! implementation-note-296 uses `BrokerCmd|broker_command` as its grep gate;
 //! both literals appear in this file (`pub enum BrokerCmd` below and
 //! `pub fn broker_command` below).
 //!
-//! implementation-note-53 uses `ember broker issue.*grants-file` as its
+//! implementation-note-110 uses `ember broker issue.*grants-file` as its
 //! grep gate; see `#[arg(long = "grants-file")]` on `BrokerCmd::Issue` below.
 //!
 //! ## Secret handling
@@ -55,7 +55,7 @@ use core_grants_toml::{Credential, GrantsManifest};
 /// CLI subcommand surface for `ember broker`.
 ///
 /// Mirrors the daemon's three RPC methods one-to-one. The literal
-/// `BrokerCmd` is the load-bearing marker for the implementation-note-167
+/// `BrokerCmd` is the load-bearing marker for the implementation-note-296
 /// `target_state_anchor`.
 #[derive(Subcommand, Debug)]
 pub enum BrokerCmd {
@@ -100,7 +100,7 @@ pub enum BrokerCmd {
         json: bool,
     },
 
-    /// Issue grants from a TOML grants file (design / implementation-note-53).
+    /// Issue grants from a TOML grants file (design / implementation-note-110).
     ///
     /// Reads a `GrantsManifest` TOML via `core-grants-toml`, locates the
     /// credential entry named by `--credential`, and issues a scoped grant
@@ -112,11 +112,11 @@ pub enum BrokerCmd {
     ///
     /// ## Checkpoint for target_state_anchor
     ///
-    /// `ember broker issue --grants-file` (implementation-note-53)
+    /// `ember broker issue --grants-file` (implementation-note-110)
     #[command(name = "issue-file")]
     IssueFromFile {
         /// Path to the grants manifest TOML file.
-        // ember broker issue --grants-file (implementation-note-53)
+        // ember broker issue --grants-file (implementation-note-110)
         #[arg(long = "grants-file")]
         grants_file: PathBuf,
 
@@ -266,7 +266,7 @@ pub fn issue(
 
     let result = call_daemon(&opts.socket_path, "broker_issue", &params)?;
 
-    // Result shape (implementation-note-9):
+    // Result shape (implementation-note-10):
     //   { secret_ref, materialization_id, expires_at, issued_at, provider }
     // The opaque `secret_ref` is what callers pass back to ember-proxy /
     // ember-tools when the actual credential is needed at a trust
@@ -300,14 +300,14 @@ pub fn issue(
 }
 
 /// `ember broker issue-file --grants-file <path> --credential <name>`
-/// (implementation-note-53)
+/// (implementation-note-110)
 ///
 /// Reads a `GrantsManifest` TOML, locates the named credential, issues a
 /// scoped grant stamped with `grants_file_rev` (SHA-256 of file bytes) and
 /// `credential_name`. With `--inject` spawns a child shell and registers the
 /// PID for daemon auto-revoke.
 ///
-/// // ember broker issue --grants-file (implementation-note-53)
+/// // ember broker issue --grants-file (implementation-note-110)
 pub fn issue_from_grants_file(
     opts: &GlobalOpts,
     grants_file: &Path,
@@ -683,7 +683,7 @@ fn load_scope_json(arg: &str) -> Result<Value, BrokerCliError> {
 }
 
 /// Compute the SHA-256 hex digest of raw bytes. Used to populate
-/// `grants_file_rev` in the broker Receipt (implementation-note-53).
+/// `grants_file_rev` in the broker Receipt (implementation-note-110).
 fn sha256_hex(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();

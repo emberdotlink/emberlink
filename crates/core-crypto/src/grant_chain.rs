@@ -3,7 +3,8 @@
 // the chain attenuation invariant without another token encoding.
 
 use crate::DOMAIN_GRANT_CHAIN;
-use core_types::{Block, CanonicalEncode, SignedBlock};
+use core_grant_types::{Block, SignedBlock};
+use core_types::CanonicalEncode;
 use ed25519_dalek::{
     Signature as DalekSignature, Signer as DalekSigner, SigningKey, VerifyingKey,
 };
@@ -387,7 +388,7 @@ pub fn root_pubkey_bytes_from_ed25519_hex(hex: &str) -> Result<[u8; 32], ChainEr
 pub fn root_key_from_local_key_pair(
     key_pair: &crate::LocalKeyPair,
 ) -> Result<RootKeyPair, ChainError> {
-    if key_pair.algorithm != core_types::KeyAlgorithm::Ed25519 {
+    if key_pair.algorithm != core_principals::KeyAlgorithm::Ed25519 {
         return Err(ChainError::InvalidEncoding(
             "root key must be Ed25519".into(),
         ));
@@ -407,7 +408,8 @@ fn strip_prefix<'a>(value: &'a str, prefix: &str) -> Result<&'a str, ChainError>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_types::{KeyAlgorithm, ResourceSelector, ResourceType, Statement, Usage};
+    use core_grant_types::{ResourceSelector, ResourceType, Statement, Usage};
+    use core_principals::KeyAlgorithm;
 
     fn fresh_root_keypair() -> (RootKeyPair, [u8; 32]) {
         make_root_keypair(42)
@@ -671,7 +673,7 @@ mod tests {
         );
     }
 
-    /// security check regression: `verify_chain` uses `verify_strict` in `verify_one`,
+    /// Torsion-point regression: `verify_chain` uses `verify_strict` in `verify_one`,
     /// which rejects any block whose signature R component is a torsion point.
     ///
     /// Without `verify_strict`, an attacker could substitute a valid block

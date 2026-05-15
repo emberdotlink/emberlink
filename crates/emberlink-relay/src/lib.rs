@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use core_crypto::Ed25519Verifier;
 use core_sync::{PortableRelaySubmission, check_relay_submission_admission};
-use core_types::{RelayAdmission, RelayMode, TrustThreshold};
+use core_principals::{RelayAdmission, RelayMode, TrustThreshold};
 
 use crate::tls::{RelayStream, TlsMode};
 

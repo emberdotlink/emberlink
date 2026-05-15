@@ -80,7 +80,7 @@ pub trait GrantStore: Send + Sync {
     async fn revoke(
         &self,
         grant_id: &str,
-        actor: core_types::grant_receipt::RevokeActor,
+        actor: core_grant_types::grant_receipt::RevokeActor,
     ) -> Result<(), StoreError>;
 
     /// List all grants for a persona, in creation order (oldest first).

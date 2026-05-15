@@ -2,11 +2,10 @@ use std::collections::{HashMap, HashSet};
 
 use core_crypto::{PublicKey, Signature, Verifier};
 use core_events::EventEnvelope;
-use core_types::{
-    AdmissionToken, EndpointRotatedEvent, EventBody, PeerCursor, RelayAdmission, RelayEnvelope,
-    RelayHintUpdatedEvent, RelayMode, RelayShutdownNoticeEvent, SyncBatch, SyncProfile,
-    TrustThreshold, Validate, ValidationError,
-};
+use core_event_types::{EndpointRotatedEvent, EventBody, RelayHintUpdatedEvent, RelayShutdownNoticeEvent};
+use core_principals::{PeerCursor, RelayAdmission, RelayMode, SyncProfile, TrustThreshold};
+use core_principals::{AdmissionToken, RelayEnvelope, SyncBatch};
+use core_types::{Validate, ValidationError};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default)]
@@ -293,20 +292,20 @@ fn wire_event_from(event: &EventEnvelope) -> WireEvent {
 fn wire_event_to_envelope(w: WireEvent) -> Result<EventEnvelope, ValidationError> {
     let schema_version = core_types::SchemaVersion::parse(&w.schema_version)
         .ok_or_else(|| ValidationError::new("invalid schema version"))?;
-    let event_type = core_types::EventType::parse(&w.event_type)
+    let event_type = core_event_types::EventType::parse(&w.event_type)
         .ok_or_else(|| ValidationError::new("invalid event type"))?;
-    let subject = core_types::EventSubject::new(
-        core_types::SubjectKind::parse(&w.subject_kind)
+    let subject = core_event_types::EventSubject::new(
+        core_event_types::SubjectKind::parse(&w.subject_kind)
             .ok_or_else(|| ValidationError::new("invalid subject kind"))?,
         w.subject_id,
     );
-    let signer_binding = core_types::SignerBinding {
-        signer: core_types::EventSubject::new(
-            core_types::SubjectKind::parse(&w.signer_kind)
+    let signer_binding = core_event_types::SignerBinding {
+        signer: core_event_types::EventSubject::new(
+            core_event_types::SubjectKind::parse(&w.signer_kind)
                 .ok_or_else(|| ValidationError::new("invalid signer kind"))?,
             w.signer_id,
         ),
-        role: core_types::KeyRole::parse(&w.signer_role)
+        role: core_event_types::KeyRole::parse(&w.signer_role)
             .ok_or_else(|| ValidationError::new("invalid signer role"))?,
         key_id: w.signer_key_id,
     };
@@ -315,7 +314,7 @@ fn wire_event_to_envelope(w: WireEvent) -> Result<EventEnvelope, ValidationError
         .into_iter()
         .map(|r| {
             Ok(core_events::EventRef {
-                relation: core_types::EventRefRelation::parse(&r.relation)
+                relation: core_event_types::EventRefRelation::parse(&r.relation)
                     .ok_or_else(|| ValidationError::new("invalid ref relation"))?,
                 target_event_id: r.target_event_id,
                 seq: 0,
@@ -779,17 +778,13 @@ mod tests {
     use super::*;
     use core_crypto::{Ed25519Verifier, FixtureSigner, Signer as CryptoSigner};
     use core_events::{EventEnvelope, EventRef};
-    use core_types::{
-        ChunkReference, ContentPublishedEvent, ContentVisibility, DeviceAddedEvent, EventType,
-        FileManifest, ManifestDeviceAccess, MessageSentEvent, PublicKeyMaterial, RootCreatedEvent,
-        SignerBinding, StorageLedgerEntry, StorageLedgerUpdatedEvent,
-        StorageManifestPublishedEvent, StorageRelationship, StorageRelationshipCreatedEvent,
-    };
+    use core_event_types::{ChunkReference, ContentPublishedEvent, ContentVisibility, DeviceAddedEvent, EventType, FileManifest, ManifestDeviceAccess, MessageSentEvent, RootCreatedEvent, SignerBinding, StorageLedgerEntry, StorageLedgerUpdatedEvent, StorageManifestPublishedEvent, StorageRelationship, StorageRelationshipCreatedEvent};
+    use core_principals::{PublicKeyMaterial};
 
     fn test_key(key_id: &str) -> PublicKeyMaterial {
         PublicKeyMaterial {
             key_id: key_id.into(),
-            algorithm: core_types::KeyAlgorithm::Ed25519,
+            algorithm: core_principals::KeyAlgorithm::Ed25519,
             public_key: format!("ed25519:{key_id}"),
         }
     }
@@ -797,7 +792,7 @@ mod tests {
     fn test_encryption_key(key_id: &str) -> PublicKeyMaterial {
         PublicKeyMaterial {
             key_id: format!("enc-{key_id}"),
-            algorithm: core_types::KeyAlgorithm::AgeX25519,
+            algorithm: core_principals::KeyAlgorithm::AgeX25519,
             public_key: format!("age1{key_id}fixture"),
         }
     }
@@ -888,8 +883,8 @@ mod tests {
 
         assert_eq!(updated.event_type(), EventType::RelayHintUpdated);
         assert_eq!(rotated.event_type(), EventType::EndpointRotated);
-        assert_eq!(updated.subject().kind, core_types::SubjectKind::Endpoint);
-        assert_eq!(rotated.subject().kind, core_types::SubjectKind::Endpoint);
+        assert_eq!(updated.subject().kind, core_event_types::SubjectKind::Endpoint);
+        assert_eq!(rotated.subject().kind, core_event_types::SubjectKind::Endpoint);
     }
 
     #[test]
@@ -1422,7 +1417,7 @@ mod tests {
 
     #[test]
     fn node_tier_default_behaviors() {
-        use core_types::{NodeTier, SyncProfile};
+        use core_principals::{NodeTier, SyncProfile};
 
         assert_eq!(
             NodeTier::MobileLight.default_sync_profile(),

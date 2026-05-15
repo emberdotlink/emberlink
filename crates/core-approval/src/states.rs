@@ -1,4 +1,4 @@
-use core_types::approval::ApprovalStatus;
+use core_grant_types::approval::ApprovalStatus;
 
 use crate::outcome::ApprovalOutcome;
 

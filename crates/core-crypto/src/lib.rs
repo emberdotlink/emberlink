@@ -1,9 +1,26 @@
+// `ca` and `x509` are daemon-side X.509 / SPIFFE cert minting. They depend
+// on `rcgen`, which transitively requires ring's `SystemRandom` to satisfy
+// the sealed `SecureRandom` trait — only true on non-wasm32 targets. Gate
+// the modules and their re-exports off the wasm32 path so the ember-ext
+// browser extension + the website's /verify-receipt.html WASM module build.
+// Daemon binaries (ember-daemon, emberlink-cli, ember-proxy) keep full
+// access on their native targets.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod ca;
 pub mod canonicalize;
 pub mod grant_chain;
 pub mod persona;
 pub mod presence;
 pub mod secret_handle;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod x509;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub use ca::{
+    ca_fingerprint, generate_edge_ca, parse_csr_signed_by, parse_spiffe_uri, sign_client_cert,
+};
+#[cfg(not(target_arch = "wasm32"))]
+pub use x509::{mint_per_agent_ca_with_name_constraints, mint_per_agent_client_cert, X509Error};
 pub use canonicalize::{CanonicalizeError, canonicalize_jcs};
 pub use persona::{daemon_persona_sign_receipt, daemon_persona_verify_receipt};
 
@@ -11,7 +28,8 @@ use age::Decryptor;
 use age::secrecy::ExposeSecret;
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
-use core_types::{KeyAlgorithm, ValidationError, bytes_to_hex, hex_to_bytes};
+use core_principals::{KeyAlgorithm};
+use core_types::{ValidationError, bytes_to_hex, hex_to_bytes};
 use ed25519_dalek::{
     Signature as DalekSignature, Signer as DalekSigner, SigningKey, VerifyingKey,
 };
@@ -25,7 +43,7 @@ use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-// Domain separator constants — security check.
+// Domain separator constants.
 //
 // Every signed-message type in the protocol must bind a context tag so that
 // a valid signature produced in one context cannot be replayed in another.
@@ -108,10 +126,72 @@ pub trait Verifier {
     fn verify(&self, public_key: &PublicKey, payload: &[u8], signature: &Signature) -> bool;
 }
 
-#[derive(Debug, Clone)]
+/// implementation-note-23 C6: probe trait that lets `LocalKeySigner`
+/// refuse to sign when the underlying persona's status is anything
+/// other than `active` (revoked, enrolling, archived, …). Injected at
+/// signer construction time so `core-crypto` does not pull a SQLite or
+/// `ember-daemon` dependency — the probe lives in whichever crate owns
+/// the persona-status source-of-truth (typically `ember-daemon`).
+///
+/// Implementations are expected to be cheap (a single SQLite point
+/// lookup, or a cached in-memory check). The probe is consulted on
+/// every `try_sign` call so revocations land immediately rather than
+/// surviving until the next signer rebuild.
+pub trait PersonaActiveProbe: Send + Sync {
+    /// Return `true` when the persona is in `active` status and signing
+    /// is allowed; `false` for any other status (revoked, enrolling,
+    /// archived, missing).
+    fn is_active(&self) -> bool;
+}
+
+/// implementation-note-23 C6: error variant returned from
+/// [`LocalKeySigner::try_sign`] when the attached
+/// [`PersonaActiveProbe`] reports the persona is not active. Surfaced as
+/// a fresh error rather than reusing `ValidationError` so call sites
+/// can match on the specific "persona inactive" cause without parsing
+/// strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignerError {
+    /// The probe attached to the signer reported the persona is not in
+    /// `active` status. The signing operation refuses to proceed.
+    PersonaNotActive,
+}
+
+impl std::fmt::Display for SignerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SignerError::PersonaNotActive => {
+                write!(f, "signer refused: persona is not active")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SignerError {}
+
+#[derive(Clone)]
 pub struct LocalKeySigner {
     public_key: PublicKey,
     signing_key: SigningKey,
+    /// implementation-note-23 C6 — optional probe consulted by
+    /// [`LocalKeySigner::try_sign`]. `None` for legacy construction
+    /// paths (tests + any caller predating C6) which means try_sign
+    /// always succeeds. Production callers attach a probe via
+    /// [`LocalKeySigner::with_probe`] so signing fails closed when the
+    /// persona is revoked.
+    probe: Option<std::sync::Arc<dyn PersonaActiveProbe>>,
+}
+
+impl std::fmt::Debug for LocalKeySigner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // SigningKey doesn't implement Debug in ed25519-dalek; the
+        // probe is a trait object that doesn't implement Debug either.
+        // Print only the public key so we don't leak private material.
+        f.debug_struct("LocalKeySigner")
+            .field("public_key", &self.public_key)
+            .field("probe_attached", &self.probe.is_some())
+            .finish()
+    }
 }
 
 impl LocalKeySigner {
@@ -133,12 +213,55 @@ impl LocalKeySigner {
         Ok(Self {
             public_key: PublicKey(derived_public),
             signing_key,
+            probe: None,
         })
+    }
+
+    /// implementation-note-23 C6: attach a [`PersonaActiveProbe`] so
+    /// [`Self::try_sign`] consults it before signing. Returns the same
+    /// signer with the probe set — chains naturally off
+    /// `from_local_key_pair`.
+    pub fn with_probe(
+        mut self,
+        probe: std::sync::Arc<dyn PersonaActiveProbe>,
+    ) -> Self {
+        self.probe = Some(probe);
+        self
+    }
+
+    /// implementation-note-23 C6: fallible signing entry point.
+    /// Consults the attached [`PersonaActiveProbe`] (if any) and
+    /// refuses to sign when the persona is not active. When no probe
+    /// is attached, behaves identically to [`Signer::sign`].
+    pub fn try_sign(&self, payload: &[u8]) -> Result<Signature, SignerError> {
+        if let Some(ref probe) = self.probe
+            && !probe.is_active()
+        {
+            return Err(SignerError::PersonaNotActive);
+        }
+        let signature = self.signing_key.sign(payload);
+        Ok(Signature(encode_signature(&signature)))
     }
 }
 
 impl Signer for LocalKeySigner {
+    /// implementation-note-23 C6 note: the legacy infallible `sign`
+    /// remains for call sites that have not migrated to [`Self::try_sign`].
+    /// When a probe is attached and reports the persona is inactive,
+    /// this method panics with a clear message — fail-loud is preferred
+    /// over silently producing a signature an inactive persona was not
+    /// authorized to mint. Callers that need to handle the refusal
+    /// gracefully must use [`Self::try_sign`].
     fn sign(&self, payload: &[u8]) -> Signature {
+        if let Some(ref probe) = self.probe
+            && !probe.is_active()
+        {
+            panic!(
+                "LocalKeySigner::sign called on inactive persona — \
+                 callers that may face an inactive persona must use \
+                 LocalKeySigner::try_sign and handle SignerError::PersonaNotActive"
+            );
+        }
         let signature = self.signing_key.sign(payload);
         Signature(encode_signature(&signature))
     }
@@ -659,6 +782,52 @@ fn decode_hex_to_array<const N: usize>(value: &str) -> Result<[u8; N], Validatio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    /// implementation-note-23 C6: `LocalKeySigner::try_sign` consults
+    /// the attached `PersonaActiveProbe` and refuses to sign when the
+    /// persona is not active. The test injects two probes (active and
+    /// inactive) and asserts the corresponding outcome.
+    #[test]
+    fn sign_checks_persona_active() {
+        struct InactiveProbe;
+        impl PersonaActiveProbe for InactiveProbe {
+            fn is_active(&self) -> bool {
+                false
+            }
+        }
+        struct ActiveProbe;
+        impl PersonaActiveProbe for ActiveProbe {
+            fn is_active(&self) -> bool {
+                true
+            }
+        }
+
+        let key_pair = generate_local_key_pair("root", "root-c6");
+
+        // Inactive probe → try_sign refuses with SignerError::PersonaNotActive.
+        let inactive_signer = LocalKeySigner::from_local_key_pair(&key_pair)
+            .unwrap()
+            .with_probe(Arc::new(InactiveProbe));
+        assert_eq!(
+            inactive_signer.try_sign(b"should-not-sign"),
+            Err(SignerError::PersonaNotActive)
+        );
+
+        // Active probe → try_sign succeeds.
+        let active_signer = LocalKeySigner::from_local_key_pair(&key_pair)
+            .unwrap()
+            .with_probe(Arc::new(ActiveProbe));
+        let sig = active_signer
+            .try_sign(b"should-sign")
+            .expect("active probe should allow signing");
+        let verifier = Ed25519Verifier;
+        assert!(verifier.verify(&active_signer.public_key(), b"should-sign", &sig));
+
+        // No probe attached → try_sign succeeds (legacy backward-compat).
+        let no_probe_signer = LocalKeySigner::from_local_key_pair(&key_pair).unwrap();
+        assert!(no_probe_signer.try_sign(b"legacy-no-probe").is_ok());
+    }
 
     #[test]
     fn fixture_signatures_are_deterministic_and_verifiable() {
@@ -766,7 +935,7 @@ mod tests {
         assert_ne!(key_a, key_b);
     }
 
-    /// security check binding test: distinct HKDF info strings produce distinct keys.
+    /// Info-string binding test: distinct HKDF info strings produce distinct keys.
     ///
     /// Verifies that the `emberlink/v1/content-key/<purpose>` info strings are
     /// unique per purpose. Same IKM with different purpose labels must produce
@@ -785,7 +954,7 @@ mod tests {
         assert!(other_context.starts_with("xchacha20-key:"));
     }
 
-    /// security check: same IKM + different `purpose` labels → different derived keys.
+    /// Same IKM + different `purpose` labels → different derived keys.
     #[test]
     fn generate_content_key_different_purposes_produce_different_keys() {
         let ikm = [0xa7_u8; 32];
@@ -805,7 +974,7 @@ mod tests {
         assert!(key1.starts_with("xchacha20-key:"));
     }
 
-    /// security check property: a signature produced under one domain does NOT verify
+    /// Domain-separation property: a signature produced under one domain does NOT verify
     /// under a different domain.
     #[test]
     fn cross_context_signatures_are_rejected() {
@@ -852,7 +1021,7 @@ mod tests {
         );
     }
 
-    /// security check regression: `Ed25519Verifier` uses `verify_strict` which rejects
+    /// Torsion-point regression: `Ed25519Verifier` uses `verify_strict` which rejects
     /// signatures whose R component is a torsion (small-order) point.
     ///
     /// Signature malleability via torsion: Ed25519 has a cofactor of 8, so

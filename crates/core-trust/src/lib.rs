@@ -4,10 +4,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use core_crypto::Signer;
 use core_events::EventEnvelope;
-use core_types::{
-    DerivedTrustStatement, EventBody, EventRefRelation, SignerBinding, TrustAttestation,
-    TrustAttestedEvent, TrustExplanation, TrustRevokedEvent, TrustThreshold,
-};
+use core_event_types::{EventBody, EventRefRelation, SignerBinding, TrustAttestedEvent, TrustRevokedEvent};
+use core_principals::{TrustAttestation, TrustThreshold};
+use core_principals::{DerivedTrustStatement, TrustExplanation};
 
 // ---------------------------------------------------------------------------
 // Badge authority weighting (design)
@@ -352,7 +351,7 @@ impl ConditionResult {
 /// Returns `Met` only if ALL conditions are satisfied. On first failure,
 /// returns `Unmet` with the reason.
 pub fn evaluate_grant_conditions(
-    conditions: &[core_types::grant_conditions::GrantCondition],
+    conditions: &[core_grant_types::grant_conditions::GrantCondition],
     input: &BadgeGateInput<'_>,
 ) -> ConditionResult {
     if conditions.is_empty() {
@@ -368,10 +367,10 @@ pub fn evaluate_grant_conditions(
 }
 
 fn evaluate_single_condition(
-    condition: &core_types::grant_conditions::GrantCondition,
+    condition: &core_grant_types::grant_conditions::GrantCondition,
     input: &BadgeGateInput<'_>,
 ) -> ConditionResult {
-    use core_types::grant_conditions::GrantCondition;
+    use core_grant_types::grant_conditions::GrantCondition;
 
     match condition {
         GrantCondition::BadgeGate {
@@ -652,7 +651,7 @@ pub fn derive_public_statements(attestations: &[TrustAttestation]) -> Vec<Derive
 mod tests {
     use super::*;
     use core_crypto::FixtureSigner;
-    use core_types::{EventType, SignerBinding};
+    use core_event_types::{EventType, SignerBinding};
 
     fn test_attestation(
         attester: &str,
@@ -1107,7 +1106,7 @@ mod tests {
         let mut counts = std::collections::BTreeMap::new();
         counts.insert("badge-issuer".into(), 5);
 
-        let conditions = vec![core_types::grant_conditions::GrantCondition::badge("verified-dev")];
+        let conditions = vec![core_grant_types::grant_conditions::GrantCondition::badge("verified-dev")];
         let input = badge_gate_input("issuer", "claimant", &badges, &edges, &counts);
         let result = evaluate_grant_conditions(&conditions, &input);
         assert!(result.is_met());
@@ -1115,7 +1114,7 @@ mod tests {
 
     #[test]
     fn badge_gate_badge_not_held() {
-        let conditions = vec![core_types::grant_conditions::GrantCondition::badge("verified-dev")];
+        let conditions = vec![core_grant_types::grant_conditions::GrantCondition::badge("verified-dev")];
         let empty_counts = std::collections::BTreeMap::new();
         let input = badge_gate_input("issuer", "claimant", &[], &[], &empty_counts);
         let result = evaluate_grant_conditions(&conditions, &input);
@@ -1138,7 +1137,7 @@ mod tests {
         counts.insert("far-issuer".into(), 1);
 
         // max_distance=2 should fail (issuer is 3 hops away)
-        let conditions = vec![core_types::grant_conditions::GrantCondition::badge_with_thresholds(
+        let conditions = vec![core_grant_types::grant_conditions::GrantCondition::badge_with_thresholds(
             "subway-rider", None, Some(2), None,
         )];
         let input = badge_gate_input("issuer", "claimant", &badges, &edges, &counts);
@@ -1146,7 +1145,7 @@ mod tests {
         assert!(!result.is_met());
 
         // max_distance=3 should pass
-        let conditions = vec![core_types::grant_conditions::GrantCondition::badge_with_thresholds(
+        let conditions = vec![core_grant_types::grant_conditions::GrantCondition::badge_with_thresholds(
             "subway-rider", None, Some(3), None,
         )];
         let result = evaluate_grant_conditions(&conditions, &input);
@@ -1163,9 +1162,9 @@ mod tests {
         let mut counts = std::collections::BTreeMap::new();
         counts.insert("badge-issuer".into(), 2);
 
-        let conditions = vec![core_types::grant_conditions::GrantCondition::All(vec![
-            core_types::grant_conditions::GrantCondition::badge("verified-dev"),
-            core_types::grant_conditions::GrantCondition::badge("subway-rider"),
+        let conditions = vec![core_grant_types::grant_conditions::GrantCondition::All(vec![
+            core_grant_types::grant_conditions::GrantCondition::badge("verified-dev"),
+            core_grant_types::grant_conditions::GrantCondition::badge("subway-rider"),
         ])];
         let input = badge_gate_input("issuer", "claimant", &badges, &edges, &counts);
         let result = evaluate_grant_conditions(&conditions, &input);
@@ -1179,9 +1178,9 @@ mod tests {
         let mut counts = std::collections::BTreeMap::new();
         counts.insert("badge-issuer".into(), 1);
 
-        let conditions = vec![core_types::grant_conditions::GrantCondition::Any(vec![
-            core_types::grant_conditions::GrantCondition::badge("verified-dev"),
-            core_types::grant_conditions::GrantCondition::badge("subway-rider"),
+        let conditions = vec![core_grant_types::grant_conditions::GrantCondition::Any(vec![
+            core_grant_types::grant_conditions::GrantCondition::badge("verified-dev"),
+            core_grant_types::grant_conditions::GrantCondition::badge("subway-rider"),
         ])];
         let input = badge_gate_input("issuer", "claimant", &badges, &edges, &counts);
         let result = evaluate_grant_conditions(&conditions, &input);
@@ -1198,7 +1197,7 @@ mod tests {
     fn empty_all_combinator_evaluates_unmet() {
         let empty_counts = std::collections::BTreeMap::new();
         let input = badge_gate_input("issuer", "claimant", &[], &[], &empty_counts);
-        let conditions = vec![core_types::grant_conditions::GrantCondition::All(vec![])];
+        let conditions = vec![core_grant_types::grant_conditions::GrantCondition::All(vec![])];
         let result = evaluate_grant_conditions(&conditions, &input);
         assert!(!result.is_met(), "empty All must be Unmet (fail-closed)");
         if let ConditionResult::Unmet(reason) = result {
@@ -1213,7 +1212,7 @@ mod tests {
     fn empty_any_combinator_evaluates_unmet() {
         let empty_counts = std::collections::BTreeMap::new();
         let input = badge_gate_input("issuer", "claimant", &[], &[], &empty_counts);
-        let conditions = vec![core_types::grant_conditions::GrantCondition::Any(vec![])];
+        let conditions = vec![core_grant_types::grant_conditions::GrantCondition::Any(vec![])];
         let result = evaluate_grant_conditions(&conditions, &input);
         assert!(!result.is_met(), "empty Any must be Unmet (fail-closed)");
         if let ConditionResult::Unmet(reason) = result {

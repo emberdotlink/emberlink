@@ -1,4 +1,5 @@
-use core_types::{BlockStore, ValidationError};
+use core_event_types::{BlockStore};
+use core_types::{ValidationError};
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// SQLite-backed BlockStore implementation.

@@ -1,4 +1,4 @@
-//! Vault round-trip contract tests — pin the post-security check vault flow to the
+//! Vault round-trip contract tests — pin the post-fix vault flow to the
 //! observable behavior `ember vault add` + `ember vault get` depend on.
 //!
 //! Pre-launch, we accept that an existing-vault user with key drift wipes
@@ -12,16 +12,13 @@
 
 use ember_daemon::infra::config::DaemonConfig;
 use ember_daemon::infra::store::DaemonStore;
-use ember_daemon::infra::vault::{Vault, VaultError};
+use ember_daemon::infra::vault::{Vault, VaultError, VaultScope};
 use tempfile::TempDir;
 
 /// Helper: build a `DaemonConfig` whose `data_dir` points at a fresh tempdir
 /// so each test owns its own `vault.salt`.
 fn config_with_data_dir(tmp: &TempDir) -> DaemonConfig {
-    DaemonConfig {
-        data_dir: tmp.path().to_path_buf(),
-        ..Default::default()
-    }
+    DaemonConfig::for_test(tmp.path())
 }
 
 /// End-to-end round-trip: open a vault, write a credential, drop the vault,
@@ -40,11 +37,11 @@ fn vault_open_add_get_round_trips_across_sessions() {
     {
         let vault1 = Vault::open_from_config(&config).expect("open vault 1");
         vault1
-            .add(&store1, "decrypt-fix-key", b"super-secret-value", None)
+            .add(VaultScope::Interactive, &store1, "decrypt-fix-key", b"super-secret-value", None)
             .expect("add credential");
 
         let same_session = vault1
-            .get(&store1, "decrypt-fix-key")
+            .get(VaultScope::Interactive, &store1, "decrypt-fix-key")
             .expect("get within session 1");
         assert_eq!(same_session, b"super-secret-value");
     }
@@ -53,7 +50,7 @@ fn vault_open_add_get_round_trips_across_sessions() {
     // disk). The store from session 1 still holds the encrypted credential.
     let vault2 = Vault::open_from_config(&config).expect("open vault 2");
     let across_sessions = vault2
-        .get(&store1, "decrypt-fix-key")
+        .get(VaultScope::Interactive, &store1, "decrypt-fix-key")
         .expect("get across session boundary");
     assert_eq!(across_sessions, b"super-secret-value");
 }
@@ -71,7 +68,7 @@ fn vault_key_stable_across_opens_with_persistent_salt() {
     {
         let vault1 = Vault::open_from_config(&config).expect("open 1");
         vault1
-            .add(&store, "stable-key", b"stable-value", None)
+            .add(VaultScope::Interactive, &store, "stable-key", b"stable-value", None)
             .expect("add");
     }
 
@@ -80,7 +77,7 @@ fn vault_key_stable_across_opens_with_persistent_salt() {
     for i in 0..5 {
         let v = Vault::open_from_config(&config).expect("re-open");
         let value = v
-            .get(&store, "stable-key")
+            .get(VaultScope::Interactive, &store, "stable-key")
             .unwrap_or_else(|e| panic!("get on re-open #{i} failed: {e:?}"));
         assert_eq!(value, b"stable-value", "re-open #{i} returned wrong plaintext");
     }
@@ -99,23 +96,23 @@ fn multi_credential_multi_session_all_decrypt() {
     // Add three credentials under three different opens.
     {
         let v = Vault::open_from_config(&config).expect("open 1");
-        v.add(&store, "pulumi/operator/team-zero-dev/team-zero-dev", b"pulumi-pass", None)
+        v.add(VaultScope::Interactive, &store, "pulumi/operator/team-zero-dev/team-zero-dev", b"pulumi-pass", None)
             .expect("add pulumi");
     }
     {
         let v = Vault::open_from_config(&config).expect("open 2");
-        v.add(&store, "tailscale/api-token", b"ts-token", None)
+        v.add(VaultScope::Interactive, &store, "tailscale/api-token", b"ts-token", None)
             .expect("add tailscale token");
     }
     {
         let v = Vault::open_from_config(&config).expect("open 3");
-        v.add(&store, "tailscale/tailnet", b"tailnet-name", None)
+        v.add(VaultScope::Interactive, &store, "tailscale/tailnet", b"tailnet-name", None)
             .expect("add tailnet");
     }
 
     // List sees all three (mirrors the operator's working `vault list`).
     let list_vault = Vault::open_from_config(&config).expect("open for list");
-    let listed = list_vault.list(&store).expect("list");
+    let listed = list_vault.list(VaultScope::Interactive, &store).expect("list");
     assert_eq!(listed.len(), 3, "all three entries must be present in index");
 
     // Get every entry under a fresh vault open — every read must succeed.
@@ -127,7 +124,7 @@ fn multi_credential_multi_session_all_decrypt() {
     for (name, expected) in names_and_expected {
         let v = Vault::open_from_config(&config).expect("open for get");
         let got = v
-            .get(&store, name)
+            .get(VaultScope::Interactive, &store, name)
             .unwrap_or_else(|e| panic!("AEAD decrypt failed on {name:?}: {e:?}"));
         assert_eq!(got, expected, "wrong plaintext for {name:?}");
     }
@@ -144,12 +141,12 @@ fn aead_decrypt_failure_surfaces_as_vault_error_crypto() {
     let store = DaemonStore::open_in_memory().expect("store");
     let v_seal = Vault::new([1u8; 32]);
     v_seal
-        .add(&store, "cred", b"plaintext", None)
+        .add(VaultScope::Interactive, &store, "cred", b"plaintext", None)
         .expect("seal");
 
     let v_open_wrong_key = Vault::new([2u8; 32]);
     let err = v_open_wrong_key
-        .get(&store, "cred")
+        .get(VaultScope::Interactive, &store, "cred")
         .expect_err("must fail with AEAD error under wrong key");
 
     match err {

@@ -858,7 +858,7 @@ mod tests {
     // hold a `MockBroker::new(BrokerProvider::HashiVault)`, and a request
     // that declares `provider = HashiVault` round-trips through issue →
     // revoke without panicking. Real HashiVault impl is
-    // implementation-note-147 (separate task).
+    // implementation-note-269 (separate task).
 
     use core_broker::{
         Broker, BrokerError, BrokerProvider, BrokerRequest, MockBroker,

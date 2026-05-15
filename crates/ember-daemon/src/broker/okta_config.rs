@@ -183,9 +183,11 @@ mod tests {
     use super::*;
     use secrecy::ExposeSecret;
 
-    const FIXTURE_PEM: &str = "\x2d----BEGIN PRIVATE KEY-----\n\
-        MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQD1K64WSvEo\n\
-        -----END PRIVATE KEY-----\n";
+    // PEM fixture lives at `crates/ember-daemon/tests/fixtures/okta_service_app.pem`
+    // so it resolves under the gitleaks `.gitleaks.toml` path allowlist for
+    // `crates/.+/tests/fixtures/.+` and never appears as an inline PEM literal
+    // in `src/` (which the public-mirror sync would otherwise flag).
+    const FIXTURE_PEM: &str = include_str!("../../tests/fixtures/okta_service_app.pem");
 
     fn write(path: &std::path::Path, contents: &str) {
         if let Some(parent) = path.parent() {

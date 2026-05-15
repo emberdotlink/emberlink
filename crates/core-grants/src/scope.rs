@@ -17,10 +17,10 @@
 //! name only the violating axis (never the parent's full state) so that a
 //! compromised child cannot use rejections as an oracle for parent state.
 //!
-//! Lifted verbatim from `ember-daemon::attenuation` per implementation-note-15.
+//! Lifted verbatim from `ember-daemon::attenuation` per implementation-note-39.
 //! No I/O — wasm32-compatible.
 
-use core_types::{AccessGrant, Budget, ResourceSelector, Statement, Usage};
+use core_grant_types::{AccessGrant, Budget, ResourceSelector, Statement, Usage};
 
 /// Attenuation failure. `reason` names the violating dimension only —
 /// parent values are deliberately elided so the error is not an oracle for a
@@ -146,7 +146,7 @@ fn parse_scope(scope: &str) -> Result<ScopeParts<'_>, String> {
 ///
 /// Returns `Ok(())` on subset; `Err(DelegationViolation)` otherwise.
 ///
-/// Renamed from `scope_subset` per implementation-note-15 (design §2.1).
+/// Renamed from `scope_subset` per implementation-note-39 (design §2.1).
 /// The behavior is identical — the rename clarifies that this is the
 /// enforcement entry point (returns `Result`), distinct from the bool-returning
 /// `Scope::is_subset_of` helper on the in-memory `core_grants::Grant` type.
@@ -302,7 +302,7 @@ pub fn check_budget_attenuation(
 /// - `parent == Some` & `child == None` → FAIL.
 /// - else child ≤ parent (equal is allowed).
 ///
-/// Both sides are epoch seconds (u64) as per `core_types::AccessGrant`.
+/// Both sides are epoch seconds (u64) as per `core_grant_types::AccessGrant`.
 pub fn check_expiry_attenuation(
     parent_expires_at: Option<u64>,
     child_expires_at: Option<u64>,
@@ -718,11 +718,11 @@ mod tests {
 
     // --- per-Statement attenuation tests ---
 
-    fn make_grant(statements: Vec<core_types::Statement>) -> AccessGrant {
-        use core_types::{
-            AttestationBinding, Block, GrantMode, GrantStatus,
-            PresentationAudienceKind, RecipientProfile, SignedBlock,
+    fn make_grant(statements: Vec<core_grant_types::Statement>) -> AccessGrant {
+        use core_grant_types::{
+            AttestationBinding, Block, GrantMode, GrantStatus, RecipientProfile, SignedBlock,
         };
+        use core_event_types::PresentationAudienceKind;
         AccessGrant {
             id: "g".into(),
             version: 1,
@@ -760,9 +760,9 @@ mod tests {
         actions: Vec<String>,
         resource: ResourceSelector,
         budget: Option<Budget>,
-    ) -> core_types::Statement {
-        use core_types::ResourceType;
-        core_types::Statement {
+    ) -> core_grant_types::Statement {
+        use core_grant_types::ResourceType;
+        core_grant_types::Statement {
             sid: sid.into(),
             resource_type: ResourceType::Session,
             actions,

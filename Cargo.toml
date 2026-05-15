@@ -10,6 +10,9 @@ members = [
     "crates/core-construct-runtime",
     "crates/ember-construct",
     "crates/core-types",
+    "crates/core-principals",
+    "crates/core-event-types",
+    "crates/core-grant-types",
     "crates/core-crypto",
     "crates/core-events",
     "crates/core-eventlog",
@@ -24,6 +27,7 @@ members = [
     "crates/core-mcp",
     "crates/core-metrics",
     "crates/core-policy",
+    "crates/core-proxy-forward",
     "crates/core-receipts",
     "crates/core-approval",
     "crates/core-grants",
@@ -31,10 +35,27 @@ members = [
     "crates/core-config",
     "crates/ember-broker",
     "crates/ember-daemon",
+    "crates/ember-claude-hook",
+    "crates/ember-exec",
     "crates/ember-tools",
     "crates/ember-vault",
 ]
 resolver = "2"
+
+# implementation-note-5 (Cluster D D1, design review 20260513-122447):
+# Workspace-level convention for the `qa-mock` feature flag. Real
+# feature declarations live per-crate (e.g. `crates/ember-daemon/Cargo.toml`
+# carries `qa-mock = []` in its `[features]` section). The per-crate
+# `build.rs` is the structural gate that refuses to build a release
+# artifact (`EMBER_RELEASE=1`) with `qa-mock` enabled — test substrate
+# must never ship in release binaries. Cluster D D2 trait refactor
+# rides on top of this substrate.
+
+# v0.3.0 audit Cluster D D1: release builds strip debug assertions
+# explicitly so `cfg!(debug_assertions)`-gated paths are guaranteed
+# off in shipping artifacts.
+[profile.release]
+debug-assertions = false
 
 [workspace.package]
 edition = "2024"

@@ -6,7 +6,7 @@
 //! are available:
 //!
 //! * **sync** (`serve_stdio_sync`) — plain `std::io`, used by
-//!   `ember-engine-mcp`.
+//!   `headless-runtime`.
 //! * **async** (`serve_stdio_async`, feature `async-stdio`) — tokio
 //!   `AsyncBufRead`, used by `emberlink-mcp`.
 //!

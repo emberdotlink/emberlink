@@ -14,6 +14,7 @@
 //! Daemon → client: raw bytes (child pty output, no framing).
 
 use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -146,12 +147,24 @@ pub fn pty_bridge_client(listener: UnixListener, done: Arc<Mutex<bool>>) {
     let mut write_stream = stream;
 
     read_stream.set_nonblocking(true).ok();
+    let stream_fd = read_stream.as_raw_fd();
 
     let mut stdin = io::stdin();
     let mut stdout = io::stdout();
+    let stdin_fd = stdin.as_raw_fd();
 
     let mut buf = [0u8; 4096];
     let mut stdin_buf = [0u8; 4096];
+
+    // Once stdin EOFs we stop polling it, but the daemon→stdout half of
+    // the bridge must keep pumping until either the daemon closes its
+    // end (child exited) or the main thread sets `done = true` after
+    // the broker_exec RPC reply lands. Treating stdin EOF as bridge
+    // teardown caused `BridgeExit::ShimDisappeared` → SIGTERM cascade
+    // on every non-interactive shim invocation (headless scripts run
+    // shims with stdin=/dev/null), killing the credential-injected
+    // child mid-flight. See implementation-note-19.
+    let mut stdin_eof = false;
 
     loop {
         if let Ok(d) = done.lock()
@@ -198,6 +211,30 @@ pub fn pty_bridge_client(listener: UnixListener, done: Arc<Mutex<bool>>) {
             }
         }
 
+        // Wait for activity on either fd, with a 100ms timeout so the
+        // `done` flag and signal flags get re-checked promptly. Without
+        // this throttle, the loop busy-spins after stdin EOF because
+        // both reads return WouldBlock immediately.
+        #[cfg(unix)]
+        {
+            let stdin_events = if stdin_eof { 0 } else { libc::POLLIN };
+            let mut fds = [
+                libc::pollfd { fd: stream_fd, events: libc::POLLIN, revents: 0 },
+                libc::pollfd { fd: stdin_fd, events: stdin_events, revents: 0 },
+            ];
+            let r = unsafe {
+                libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 100)
+            };
+            if r < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                tracing::debug!(error = %err, "pty bridge: poll");
+                break;
+            }
+        }
+
         // Read from daemon (child pty output) → our stdout.
         match read_stream.read(&mut buf) {
             Ok(0) => break,
@@ -214,17 +251,133 @@ pub fn pty_bridge_client(listener: UnixListener, done: Arc<Mutex<bool>>) {
             }
         }
 
-        // Read from our stdin → daemon as TAG_DATA frames.
-        match stdin.read(&mut stdin_buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                let framed = encode_data_frame(&stdin_buf[..n]);
-                if write_stream.write_all(&framed).is_err() {
-                    break;
-                }
+        // Read from our stdin → daemon as TAG_DATA frames. Once stdin
+        // EOFs (or errors), stop polling it but keep the bridge alive
+        // for the daemon→stdout direction.
+        if !stdin_eof {
+            match pump_stdin_once(&mut stdin, &mut stdin_buf, &mut write_stream) {
+                PumpStdin::Continue => {}
+                PumpStdin::Eof => stdin_eof = true,
+                PumpStdin::WriteError => break,
             }
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
-            Err(_) => {}
         }
+    }
+}
+
+/// Outcome of a single stdin → daemon read+forward attempt.
+///
+/// Distinguishes "stdin is EOF, but the bridge should keep pumping the
+/// daemon→stdout direction" from "the daemon stream is unwriteable, so
+/// the bridge must tear down." The previous implementation collapsed
+/// these into a single `break`, which surfaced to the daemon as
+/// `BridgeExit::ShimDisappeared` and triggered the SIGTERM cascade on
+/// non-interactive shim invocations (regression covered by tests below).
+enum PumpStdin {
+    Continue,
+    Eof,
+    WriteError,
+}
+
+fn pump_stdin_once<R: Read, W: Write>(
+    stdin: &mut R,
+    stdin_buf: &mut [u8],
+    write_stream: &mut W,
+) -> PumpStdin {
+    match stdin.read(stdin_buf) {
+        Ok(0) => PumpStdin::Eof,
+        Ok(n) => {
+            let framed = encode_data_frame(&stdin_buf[..n]);
+            if write_stream.write_all(&framed).is_err() {
+                PumpStdin::WriteError
+            } else {
+                PumpStdin::Continue
+            }
+        }
+        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => PumpStdin::Continue,
+        Err(_) => PumpStdin::Eof,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// Regression for implementation-note-19.
+    ///
+    /// When stdin returns `Ok(0)` (EOF — the steady state for headless
+    /// shim invocations whose stdin is `/dev/null`), the previous
+    /// implementation broke out of the bridge loop. That dropped the
+    /// daemon-facing UDS write half, which the daemon-side
+    /// `pty_bridge_run` observed as `BridgeExit::ShimDisappeared`,
+    /// firing the default `SIGTERM` cascade and reaping the spawned
+    /// real binary mid-flight. Net effect: every `ember-gh pr create`
+    /// from an headless script came back with exit code -15 and a
+    /// missing credential injection.
+    ///
+    /// The fix transitions to `stdin_eof = true` and keeps the
+    /// daemon→stdout half pumping until the daemon closes its end
+    /// (natural child exit) or the main thread sets `done = true`.
+    #[test]
+    fn stdin_eof_does_not_request_teardown() {
+        let mut stdin = Cursor::new(Vec::<u8>::new());
+        let mut buf = [0u8; 1024];
+        let mut sink = Vec::<u8>::new();
+        let outcome = pump_stdin_once(&mut stdin, &mut buf, &mut sink);
+        assert!(matches!(outcome, PumpStdin::Eof));
+        assert!(sink.is_empty(), "no TAG_DATA frame should be emitted for EOF");
+    }
+
+    #[test]
+    fn stdin_data_emits_framed_payload() {
+        let payload = b"hello daemon";
+        let mut stdin = Cursor::new(payload.to_vec());
+        let mut buf = [0u8; 1024];
+        let mut sink = Vec::<u8>::new();
+        let outcome = pump_stdin_once(&mut stdin, &mut buf, &mut sink);
+        assert!(matches!(outcome, PumpStdin::Continue));
+        // TAG_DATA + 2-byte big-endian length + payload.
+        assert_eq!(sink[0], TAG_DATA);
+        let len = ((sink[1] as usize) << 8) | (sink[2] as usize);
+        assert_eq!(len, payload.len());
+        assert_eq!(&sink[3..3 + len], payload);
+    }
+
+    #[test]
+    fn write_error_signals_teardown() {
+        struct ErroringWriter;
+        impl Write for ErroringWriter {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "test"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut stdin = Cursor::new(b"x".to_vec());
+        let mut buf = [0u8; 1024];
+        let mut writer = ErroringWriter;
+        let outcome = pump_stdin_once(&mut stdin, &mut buf, &mut writer);
+        assert!(matches!(outcome, PumpStdin::WriteError));
+    }
+
+    #[test]
+    fn wouldblock_returns_continue() {
+        struct WouldBlockReader;
+        impl Read for WouldBlockReader {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::WouldBlock, "no data yet"))
+            }
+        }
+        let mut stdin = WouldBlockReader;
+        let mut buf = [0u8; 1024];
+        let mut sink = Vec::<u8>::new();
+        let outcome = pump_stdin_once(&mut stdin, &mut buf, &mut sink);
+        assert!(matches!(outcome, PumpStdin::Continue));
+        assert!(sink.is_empty());
     }
 }

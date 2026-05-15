@@ -2,6 +2,35 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_DELEGATION_DEPTH: u32 = 8;
 
+/// Grant schema version pinned by this daemon build (implementation-note-38).
+///
+/// Every `Grant` consumed at a broker entry point must carry a
+/// `schema_version` equal to this constant. A mismatch is refused with
+/// JSON-RPC error code `-32010` ("grant schema version mismatch") at
+/// the broker boundary — see
+/// `ember_daemon::broker::handler::check_grant_schema_version`.
+///
+/// This is the CRIT-A remediation from the first adversarial review:
+/// a grant minted under an older schema must not be processed under a
+/// newer (potentially wider) interpretation. When the schema bumps,
+/// this constant bumps in lockstep and all live grants must either be
+/// migrated forward or refused.
+pub const GRANT_SCHEMA_VERSION_PIN: u32 = 1;
+
+/// Serde default for `Grant::schema_version` so on-disk grants written
+/// before this field existed deserialize successfully and surface their
+/// "missing version" state as `GRANT_SCHEMA_VERSION_PIN` at the broker
+/// boundary.
+///
+/// Older persisted grants get the current pin on read; the broker's
+/// check therefore short-circuits on the in-memory rebuild path. New
+/// grants explicitly set `schema_version` at construction and ride the
+/// state machine through with the version preserved across
+/// transitions.
+fn default_schema_version() -> u32 {
+    GRANT_SCHEMA_VERSION_PIN
+}
+
 /// Opaque principal identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrincipalId(pub String);
@@ -117,6 +146,16 @@ pub struct Grant {
     pub parent_id: Option<uuid::Uuid>,
     pub delegation_depth: u32,
     pub usage: Usage,
+    /// Schema version this grant was minted under
+    /// (implementation-note-38).
+    ///
+    /// Defaults to [`GRANT_SCHEMA_VERSION_PIN`] when missing on
+    /// deserialization (pre-field on-disk records). The broker boundary
+    /// refuses any grant whose `schema_version` does not match this
+    /// daemon's compiled-in pin — see
+    /// `ember_daemon::broker::handler::check_grant_schema_version`.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
 }
 
 /// Errors produced by grant state machine operations.
@@ -146,6 +185,7 @@ pub fn create(spec: GrantSpec) -> Result<Grant, GrantError> {
         parent_id: None,
         delegation_depth: 0,
         usage: Usage::zero(),
+        schema_version: GRANT_SCHEMA_VERSION_PIN,
     })
 }
 
@@ -198,6 +238,7 @@ pub fn delegate(grant: &Grant, narrowed_scope: Scope) -> Result<Grant, GrantErro
         parent_id: Some(grant.id),
         delegation_depth: grant.delegation_depth + 1,
         usage: Usage::zero(),
+        schema_version: grant.schema_version,
     })
 }
 

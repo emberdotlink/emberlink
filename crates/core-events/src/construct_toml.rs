@@ -12,7 +12,7 @@
 //! integration land in follow-up PRs.
 
 use std::collections::HashMap;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Result alias for validator errors.
@@ -47,7 +47,7 @@ pub enum ConstructTomlError {
 }
 
 /// Parsed + validated `construct.toml` envelope.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConstructToml {
     pub schema_version: String,
     pub meta: Meta,
@@ -55,9 +55,35 @@ pub struct ConstructToml {
     pub default: DefaultBlock,
     #[serde(default)]
     pub actions: HashMap<String, ActionBlock>,
+    /// Named credential-type definitions. Keys are credential type names
+    /// (e.g. `"aws_iam"`, `"github_token"`); values describe which vault
+    /// entries they consume and which broker implementation materialises them.
+    /// Actions reference these by name via `needs_credentials = true` plus
+    /// the action's own `credential_type` key (resolved at broker_exec time).
+    #[serde(default)]
+    pub credential_types: HashMap<String, CredentialType>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// Descriptor for a named credential type declared in a `construct.toml`.
+///
+/// Each `[credential_types.<name>]` table declares:
+/// - which vault entries (by path pattern) the credential consumes, and
+/// - which broker implementation is responsible for materialising the
+///   credential into env vars or files at `broker_exec` time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CredentialType {
+    /// Vault entry path patterns consumed by this credential type.
+    /// Patterns follow the same syntax as vault path globs used in
+    /// grant conditions (e.g. `"secret/data/aws/*"`).
+    #[serde(default)]
+    pub vault_entries: Vec<String>,
+    /// Name of the broker plugin responsible for materialising this
+    /// credential. Must be a non-empty string identifying a registered
+    /// `BrokerImpl` variant (e.g. `"aws_iam_env"`, `"gh_token_env"`).
+    pub broker_impl: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Meta {
     pub name: String,
     pub version: String,
@@ -67,7 +93,7 @@ pub struct Meta {
     pub wraps_binary_min_version: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DefaultBlock {
     #[serde(default = "default_unknown_action")]
     pub unknown_action: String,
@@ -79,7 +105,7 @@ fn default_unknown_action() -> String {
     "deny".to_string()
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionBlock {
     pub mode: String,
     pub classify_argv: String,
@@ -121,6 +147,19 @@ pub struct ActionBlock {
     /// that don't need them.
     #[serde(default)]
     pub env_passthrough: Vec<String>,
+    /// Whether this action requires credential injection at broker_exec time.
+    ///
+    /// When `true`, the broker resolves the action's `credential_type` key
+    /// against the envelope's `[credential_types]` table and materialises
+    /// the credential before handing control to the child process. When
+    /// `false` (the default), no credential injection occurs regardless of
+    /// what `[credential_types]` declares — the action runs with env
+    /// passthrough only.
+    ///
+    /// Default: `false` — existing construct.toml files that omit this field
+    /// behave identically to their current semantics (no credential injection).
+    #[serde(default)]
+    pub needs_credentials: bool,
 }
 
 fn default_on_shim_eof() -> String {
@@ -553,5 +592,132 @@ mode = "jit_approval""#,
         );
         let err = parse_and_validate(&s).expect_err("expected InvalidEnvPassthroughName");
         assert!(matches!(err, ConstructTomlError::InvalidEnvPassthroughName { .. }));
+    }
+
+    // -----------------------------------------------------------------------
+    // needs_credentials + credential_types tests (implementation-note-25)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn needs_credentials_defaults_to_false() {
+        let c = parse_and_validate(valid_template()).expect("valid template");
+        let pr_create = c.actions.get("pr_create").expect("pr_create block");
+        assert!(!pr_create.needs_credentials, "needs_credentials should default to false");
+        let pr_merge = c.actions.get("pr_merge").expect("pr_merge block");
+        assert!(!pr_merge.needs_credentials, "needs_credentials should default to false");
+    }
+
+    #[test]
+    fn needs_credentials_true_parses() {
+        let s = valid_template().replace(
+            r#"[actions.pr_merge]
+mode = "jit_approval""#,
+            r#"[actions.pr_merge]
+needs_credentials = true
+mode = "jit_approval""#,
+        );
+        let c = parse_and_validate(&s).expect("needs_credentials = true should validate");
+        let pr_merge = c.actions.get("pr_merge").unwrap();
+        assert!(pr_merge.needs_credentials);
+        // Other action retains false default.
+        assert!(!c.actions.get("pr_create").unwrap().needs_credentials);
+    }
+
+    #[test]
+    fn credential_types_absent_defaults_to_empty_map() {
+        let c = parse_and_validate(valid_template()).expect("valid template");
+        assert!(c.credential_types.is_empty(), "credential_types should default to empty map");
+    }
+
+    #[test]
+    fn credential_types_table_parses() {
+        let s = format!(
+            "{}\n\
+[credential_types.github_token]\n\
+vault_entries = [\"secret/data/github/*\"]\n\
+broker_impl = \"gh_token_env\"\n\
+\n\
+[credential_types.aws_iam]\n\
+vault_entries = [\"secret/data/aws/access_key\", \"secret/data/aws/secret_key\"]\n\
+broker_impl = \"aws_iam_env\"\n",
+            valid_template()
+        );
+        let c = parse_and_validate(&s).expect("credential_types table should validate");
+        assert_eq!(c.credential_types.len(), 2);
+
+        let gh = c.credential_types.get("github_token").expect("github_token type");
+        assert_eq!(gh.vault_entries, vec!["secret/data/github/*"]);
+        assert_eq!(gh.broker_impl, "gh_token_env");
+
+        let aws = c.credential_types.get("aws_iam").expect("aws_iam type");
+        assert_eq!(aws.vault_entries, vec!["secret/data/aws/access_key", "secret/data/aws/secret_key"]);
+        assert_eq!(aws.broker_impl, "aws_iam_env");
+    }
+
+    #[test]
+    fn credential_type_vault_entries_defaults_to_empty() {
+        let s = format!(
+            "{}\n\
+[credential_types.minimal]\n\
+broker_impl = \"noop\"\n",
+            valid_template()
+        );
+        let c = parse_and_validate(&s).expect("credential_type with no vault_entries should validate");
+        let minimal = c.credential_types.get("minimal").expect("minimal type");
+        assert!(minimal.vault_entries.is_empty());
+        assert_eq!(minimal.broker_impl, "noop");
+    }
+
+    #[test]
+    fn round_trip_parse_serialize_parse_stable() {
+        // Round-trip via serde_json (JSON is a universal serde round-trip target;
+        // the TOML feature set in this crate enables parse-only, not display).
+        let s = format!(
+            "{}\n\
+[credential_types.github_token]\n\
+vault_entries = [\"secret/data/github/*\"]\n\
+broker_impl = \"gh_token_env\"\n",
+            valid_template().replace(
+                r#"[actions.pr_merge]
+mode = "jit_approval""#,
+                r#"[actions.pr_merge]
+needs_credentials = true
+mode = "jit_approval""#,
+            )
+        );
+        let first: ConstructToml = parse_and_validate(&s).expect("first parse");
+        let json = serde_json::to_string(&first).expect("serialize to json");
+        let second: ConstructToml = serde_json::from_str(&json).expect("deserialize from json");
+
+        // Structural equality checks.
+        assert_eq!(first.schema_version, second.schema_version);
+        assert_eq!(first.meta.name, second.meta.name);
+        assert_eq!(first.meta.publisher, second.meta.publisher);
+        assert_eq!(first.actions.len(), second.actions.len());
+        assert_eq!(
+            first.actions.get("pr_merge").unwrap().needs_credentials,
+            second.actions.get("pr_merge").unwrap().needs_credentials,
+        );
+        assert_eq!(
+            first.actions.get("pr_create").unwrap().needs_credentials,
+            second.actions.get("pr_create").unwrap().needs_credentials,
+        );
+        assert_eq!(first.credential_types.len(), second.credential_types.len());
+        let gh1 = first.credential_types.get("github_token").unwrap();
+        let gh2 = second.credential_types.get("github_token").unwrap();
+        assert_eq!(gh1.vault_entries, gh2.vault_entries);
+        assert_eq!(gh1.broker_impl, gh2.broker_impl);
+    }
+
+    #[test]
+    fn back_compat_existing_toml_without_new_fields_still_valid() {
+        // The valid_template() fixture has no needs_credentials or credential_types —
+        // this is the backward-compatibility contract: existing construct.toml files
+        // that omit these fields must continue to parse and validate without error.
+        let c = parse_and_validate(valid_template()).expect("back-compat: existing toml must still parse");
+        assert!(c.credential_types.is_empty());
+        for (_id, block) in &c.actions {
+            assert!(!block.needs_credentials);
+        }
     }
 }

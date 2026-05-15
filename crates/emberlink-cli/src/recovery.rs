@@ -1,4 +1,4 @@
-/// — Guardian enrollment via grant link.
+/// Guardian enrollment via grant link.
 ///
 /// `recovery guardian-invite` — generate a guardian enrollment link.
 /// `recovery guardian-list`   — list enrolled guardians.

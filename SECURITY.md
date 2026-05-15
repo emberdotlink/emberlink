@@ -1,5 +1,15 @@
 # Security Policy
 
+## Supported versions
+
+| Release line | Status | Security fixes |
+|---|---|---|
+| `0.3.x` (v0.3.0 friendly drop, v0.3.1 public mirror) | **Active** | Yes — within the SLAs below |
+| `0.2.x` and earlier | End-of-life | No — please upgrade to 0.3.x |
+| Unreleased `main` | Development | Best-effort, not under SLA |
+
+Per design (v0.3.0 ship boundary), v0.3.0 is a friendly drop to a small named cohort and v0.3.1 is the first public-mirror release. Both ship under the same security policy and the same disclosure SLAs.
+
 ## Reporting a Vulnerability
 
 **Please do not report security vulnerabilities through public GitHub issues.**
@@ -49,11 +59,21 @@ Your report should contain as much of the following as possible:
 
 ## Safe harbor
 
+We adopt the [disclose.io](https://disclose.io/) safe-harbor framework. Specifically:
+
+> Activities conducted in a manner consistent with this policy will be considered authorized conduct, and we will not initiate legal action against you. If legal action is initiated by a third party against you in connection with activities conducted under this policy, we will take steps to make it known that your actions were conducted in compliance with this policy.
+
 If you act in good faith, avoid privacy violations and service disruption, and give us reasonable time to address the issue before public disclosure, we will:
 
 - Acknowledge your report in the CHANGELOG and release notes (with your permission)
 - Work with you to understand and resolve the issue
 - Not pursue legal action against you for the research
+
+## Recognition
+
+For v0.3.x we offer **discretionary credit** — recognition in the CHANGELOG and release notes, plus optional inclusion in a public hall-of-fame page that will ship alongside the v0.3.1 public mirror. We do **not** publish a bounty schedule or fixed dollar amount in v0.3.x. A small internal reserve exists to acknowledge particularly impactful reports at the maintainer's discretion.
+
+A formal bounty programme (HackerOne or equivalent, with published amounts and tiers) is targeted for v0.4.0+. The earliest signal of that programme will be a published amendment to this file.
 
 ## Cryptographic components
 

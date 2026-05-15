@@ -9,6 +9,8 @@ publish = false
 core-crypto = { path = "../core-crypto" }
 core-events = { path = "../core-events" }
 core-types = { path = "../core-types" }
+core-principals = { path = "../core-principals" }
+core-event-types = { path = "../core-event-types" }
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 rmp-serde = "1"

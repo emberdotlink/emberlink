@@ -1,5 +1,5 @@
 //! `core-receipts` — receipt v2 surface for verify dispatch + redaction +
-//! tool registry (implementation-note-17).
+//! tool registry (implementation-note-44).
 //!
 //! This crate is the home for *behavior* applied to receipts:
 //!
@@ -8,8 +8,11 @@
 //!   tool references in v2 receipts.
 //! - [`ReceiptV2`] + [`verify_v2`] — the v2 receipt struct used by
 //!   `ember receipt verify` to route based on the on-disk `version` field.
+//! - [`SpawnWitness`] — body shape for `spawn.witness` Receipt v2 kind
+//!   (implementation-note-30, CRIT-7): the parent-persona dual
+//!   signature that binds a spawned persona to its parent's authorization.
 //!
-//! v1 (`core_types::grant_receipt::GrantReceipt`) is preserved for
+//! v1 (`core_grant_types::grant_receipt::GrantReceipt`) is preserved for
 //! back-compat; this crate does not re-export it.
 
 pub mod redaction;
@@ -17,6 +20,10 @@ pub mod tool_registry;
 
 use serde::{Deserialize, Serialize};
 use tool_registry::ToolRegistry;
+
+/// Locked `kind` discriminator for `spawn.witness` Receipt v2 envelopes.
+/// Placed on `ReceiptEnvelope.kind` per design §"Envelope".
+pub const RECEIPT_KIND_SPAWN_WITNESS: &str = "spawn.witness";
 
 /// Locked at `2`. Receipts with a different `version` field must NOT be
 /// accepted by [`verify_v2`].
@@ -53,6 +60,70 @@ impl ReceiptV2 {
             redactions_applied: false,
             body: serde_json::Value::Null,
         }
+    }
+}
+
+/// Body for `spawn.witness` Receipt v2 kind (implementation-note-30).
+///
+/// Binds a spawned persona to its parent's authorization: the parent persona
+/// signs `JCS(body)` with `parent_signature` excluded, then the issuer
+/// (typically `emberd`) signs the outer Receipt envelope per design.
+///
+/// **CRIT-7 mitigation:** without `parent_signature`, an `emberd` impersonator
+/// could forge a fresh `spawned_persona_id` and present it as legitimate. The
+/// dual-signature binding requires the parent to have authorized the spawn,
+/// preventing unilateral persona fabrication.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpawnWitness {
+    /// Persona id created by `emberd` for the spawned child.
+    pub spawned_persona_id: String,
+    /// Persona id of the parent that requested the spawn.
+    pub parent_persona_id: String,
+    /// Docker / SCION container id hosting the spawned persona.
+    pub container_id: String,
+    /// Grant id authorizing the spawn operation.
+    pub spawn_grant_id: String,
+    /// Ed25519 signature by the parent persona over JCS of this body with
+    /// `parent_signature` excluded. Wire form: `ed25519sig:<hex>` (matches
+    /// `core_crypto::Signature`'s canonical representation).
+    pub parent_signature: String,
+}
+
+impl SpawnWitness {
+    /// Construct a fresh `SpawnWitness` with `parent_signature` empty.
+    ///
+    /// Use [`canonical_bytes_for_parent_signature`] to obtain the bytes the
+    /// parent must sign, then populate `parent_signature` before placing this
+    /// body on a `ReceiptEnvelope`.
+    pub fn new(
+        spawned_persona_id: impl Into<String>,
+        parent_persona_id: impl Into<String>,
+        container_id: impl Into<String>,
+        spawn_grant_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            spawned_persona_id: spawned_persona_id.into(),
+            parent_persona_id: parent_persona_id.into(),
+            container_id: container_id.into(),
+            spawn_grant_id: spawn_grant_id.into(),
+            parent_signature: String::new(),
+        }
+    }
+
+    /// Return the JSON representation of this body with `parent_signature`
+    /// removed. Pair with `core_crypto::canonicalize_jcs` to produce the
+    /// exact bytes the parent persona must Ed25519-sign.
+    ///
+    /// **Pre:** `parent_signature` may be empty or populated — either way it
+    /// is excluded from the returned value.
+    /// **Post:** the returned `serde_json::Value` is an Object with exactly
+    /// the four non-signature fields.
+    pub fn body_for_parent_signature(&self) -> serde_json::Value {
+        let mut v = serde_json::to_value(self).expect("SpawnWitness serializes to Value");
+        if let serde_json::Value::Object(map) = &mut v {
+            map.remove("parent_signature");
+        }
+        v
     }
 }
 
@@ -152,5 +223,68 @@ mod tests {
     fn version_field_pins_at_2() {
         let r = ReceiptV2::new("a", "b", "ember-aws");
         assert_eq!(r.version, 2);
+    }
+
+    #[test]
+    fn spawn_witness_kind_constant_matches_adr() {
+        assert_eq!(RECEIPT_KIND_SPAWN_WITNESS, "spawn.witness");
+    }
+
+    #[test]
+    fn spawn_witness_round_trips_via_serde() {
+        let w = SpawnWitness {
+            spawned_persona_id: "persona-child-001".into(),
+            parent_persona_id: "persona-parent-001".into(),
+            container_id: "container-abc".into(),
+            spawn_grant_id: "grant-spawn-001".into(),
+            parent_signature: "ed25519sig:deadbeef".into(),
+        };
+        let s = serde_json::to_string(&w).unwrap();
+        let back: SpawnWitness = serde_json::from_str(&s).unwrap();
+        assert_eq!(w, back);
+    }
+
+    #[test]
+    fn spawn_witness_body_for_parent_signature_omits_signature() {
+        let w = SpawnWitness {
+            spawned_persona_id: "persona-child-001".into(),
+            parent_persona_id: "persona-parent-001".into(),
+            container_id: "container-abc".into(),
+            spawn_grant_id: "grant-spawn-001".into(),
+            parent_signature: "ed25519sig:deadbeef".into(),
+        };
+        let v = w.body_for_parent_signature();
+        let obj = v.as_object().expect("body serializes to object");
+        assert!(!obj.contains_key("parent_signature"));
+        assert!(obj.contains_key("spawned_persona_id"));
+        assert!(obj.contains_key("parent_persona_id"));
+        assert!(obj.contains_key("container_id"));
+        assert!(obj.contains_key("spawn_grant_id"));
+        assert_eq!(obj.len(), 4);
+    }
+
+    #[test]
+    fn spawn_witness_body_for_parent_signature_stable_across_signature_changes() {
+        // Whatever the parent_signature field holds, the value-to-be-signed
+        // must remain identical — otherwise the parent can never produce a
+        // signature that matches what the verifier recomputes.
+        let mut w = SpawnWitness::new("child", "parent", "container", "grant");
+        let body_empty = w.body_for_parent_signature();
+        w.parent_signature = "ed25519sig:111".into();
+        let body_v1 = w.body_for_parent_signature();
+        w.parent_signature = "ed25519sig:222".into();
+        let body_v2 = w.body_for_parent_signature();
+        assert_eq!(body_empty, body_v1);
+        assert_eq!(body_v1, body_v2);
+    }
+
+    #[test]
+    fn spawn_witness_new_leaves_signature_empty() {
+        let w = SpawnWitness::new("c", "p", "ctr", "grt");
+        assert!(w.parent_signature.is_empty());
+        assert_eq!(w.spawned_persona_id, "c");
+        assert_eq!(w.parent_persona_id, "p");
+        assert_eq!(w.container_id, "ctr");
+        assert_eq!(w.spawn_grant_id, "grt");
     }
 }

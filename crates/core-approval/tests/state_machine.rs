@@ -1,5 +1,5 @@
 use core_approval::{ApprovalOutcome, TransitionError, transition, ttl_elapsed};
-use core_types::approval::{ApprovalStatus, RequestedScope};
+use core_grant_types::approval::{ApprovalStatus, RequestedScope};
 use proptest::prelude::*;
 
 /// Helper: returns true iff `narrowed` is a syntactic subset of `request`.

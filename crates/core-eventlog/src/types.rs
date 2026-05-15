@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use core_types::{
-    DerivedTrustStatement, EndpointDescriptor, PublicKeyMaterial, RecoveryScope, StorageLedgerEntry,
-    StorageRelationship, SurvivalMode, TrustAttestation,
-};
+use core_event_types::{StorageLedgerEntry, StorageRelationship};
+
+use core_principals::{EndpointDescriptor, PublicKeyMaterial, RecoveryScope, SurvivalMode, TrustAttestation};
+
+use core_principals::{DerivedTrustStatement};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RootStatus {
@@ -101,7 +102,7 @@ pub struct BadgeRecord {
     pub recipient_persona_id: String,
     pub badge_type: String,
     pub display_name: String,
-    pub evidence: Option<core_types::BadgeEvidence>,
+    pub evidence: Option<core_event_types::BadgeEvidence>,
     pub issued_at: u64,
     pub expires_at: Option<u64>,
     pub revoked: bool,

@@ -1,8 +1,8 @@
-//! Proptest scaffold for the protocol layer (security check).
+//! Proptest scaffold for the protocol layer.
 //!
 //! Catches encoder-roundtrip regressions that would silently break signature
 //! verification against persisted events or grant-link signatures. The
-//! corresponding `cargo-fuzz` harness is filed as `TZ-security check` follow-up.
+//! corresponding `cargo-fuzz` harness is filed as a follow-up.
 //!
 //! Coverage:
 //! - `EventBody::canonical_encode` -> `EventBody::decode_canonical` roundtrip
@@ -14,10 +14,10 @@
 //! - `GrantLink::signing_payload` determinism (same inputs => same bytes,
 //!   any input change => different bytes).
 
-use core_types::{
-    CanonicalEncode, EventBody, GrantLink, KeyAlgorithm, PublicKeyMaterial, RecoveryExecutedEvent,
-    RecoveryScope, RootCreatedEvent, RootRevokedEvent, SurvivalMode, PersonaCreatedEvent,
-};
+use core_grant_types::GrantLink;
+use core_event_types::{EventBody, PersonaCreatedEvent, RecoveryExecutedEvent, RootCreatedEvent, RootRevokedEvent};
+use core_principals::{KeyAlgorithm, PublicKeyMaterial, RecoveryScope, SurvivalMode};
+use core_types::{CanonicalEncode};
 use proptest::prelude::*;
 
 // ── Strategies ──────────────────────────────────────────────────────────────
@@ -129,7 +129,7 @@ fn arb_grant_link() -> impl Strategy<Value = GrantLink> {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
-    /// security check: encoder regression smoke test. `decode(encode(x))`'s re-encoding
+    /// Encoder regression smoke test. `decode(encode(x))`'s re-encoding
     /// must equal `encode(x)` byte-for-byte. Drift here invalidates persisted
     /// signatures.
     #[test]
@@ -144,7 +144,7 @@ proptest! {
         );
     }
 
-    /// security check: grant link URL roundtrip stability. Native and web URL forms
+    /// Grant link URL roundtrip stability. Native and web URL forms
     /// must round-trip through `parse` without losing any field.
     #[test]
     fn grant_link_native_url_roundtrip(link in arb_grant_link()) {
@@ -154,7 +154,7 @@ proptest! {
         prop_assert_eq!(parsed, link);
     }
 
-    /// security check: web URL form is reachable via fragment routing; the parser
+    /// Web URL form is reachable via fragment routing; the parser
     /// must extract the same fields the renderer wrote.
     #[test]
     fn grant_link_web_url_roundtrip(link in arb_grant_link()) {
@@ -164,7 +164,7 @@ proptest! {
         prop_assert_eq!(parsed, link);
     }
 
-    /// security check: signing payload is deterministic — same inputs always produce
+    /// Signing payload is deterministic — same inputs always produce
     /// the same bytes. This is what the issuer signs; non-determinism here
     /// would silently break verification.
     #[test]

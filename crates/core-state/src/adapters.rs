@@ -4,10 +4,8 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use core_crypto::{
     LocalKeySigner, Signer as CryptoSigner, public_key_raw_bytes, sha256_digest_raw,
 };
-use core_types::{
-    ClaimType, ImportedClaim, PresentationResult, ServiceAdapter, ServiceBinding, Validate,
-    ValidationError,
-};
+use core_event_types::{ClaimType, ImportedClaim, PresentationResult, ServiceAdapter, ServiceBinding};
+use core_types::{Validate, ValidationError};
 use csv::{ReaderBuilder, StringRecord, Trim};
 use serde_json::json;
 
@@ -983,7 +981,7 @@ mod tests {
         ServiceBinding {
             id: "binding-password-import".into(),
             persona_id: "persona-a".into(),
-            descriptor: core_types::ServiceDescriptor {
+            descriptor: core_event_types::ServiceDescriptor {
                 adapter_kind: "password".into(),
                 service_label: "Password Import".into(),
                 endpoint: "file://import.csv".into(),
@@ -1049,7 +1047,7 @@ mod tests {
         let local_signer = core_crypto::LocalKeySigner::from_local_key_pair(
             &core_crypto::LocalKeyPair {
                 key_id: key_id.clone(),
-                algorithm: core_types::KeyAlgorithm::Ed25519,
+                algorithm: core_principals::KeyAlgorithm::Ed25519,
                 public_key: signer.public_key().0.clone(),
                 private_key: fixture_private_key("passkey-test-device"),
             },
@@ -1071,7 +1069,7 @@ mod tests {
         ServiceBinding {
             id: "binding-passkey-github".into(),
             persona_id: "persona-a".into(),
-            descriptor: core_types::ServiceDescriptor {
+            descriptor: core_event_types::ServiceDescriptor {
                 adapter_kind: "passkey".into(),
                 service_label: "GitHub".into(),
                 endpoint: "https://github.com".into(),
@@ -1191,7 +1189,7 @@ mod tests {
         let binding = ServiceBinding {
             id: "binding-wrong".into(),
             persona_id: "persona-a".into(),
-            descriptor: core_types::ServiceDescriptor {
+            descriptor: core_event_types::ServiceDescriptor {
                 adapter_kind: "oauth2".into(),
                 service_label: "Wrong".into(),
                 endpoint: "https://example.com".into(),
@@ -1255,7 +1253,7 @@ mod tests {
         ServiceBinding {
             id: "binding-oauth-github".into(),
             persona_id: "persona-a".into(),
-            descriptor: core_types::ServiceDescriptor {
+            descriptor: core_event_types::ServiceDescriptor {
                 adapter_kind: "oauth2".into(),
                 service_label: "GitHub".into(),
                 endpoint: "https://github.com".into(),
@@ -1418,7 +1416,7 @@ mod tests {
         let binding = ServiceBinding {
             id: "binding-wrong".into(),
             persona_id: "persona-a".into(),
-            descriptor: core_types::ServiceDescriptor {
+            descriptor: core_event_types::ServiceDescriptor {
                 adapter_kind: "passkey".into(),
                 service_label: "Wrong".into(),
                 endpoint: "https://example.com".into(),
@@ -1435,7 +1433,7 @@ mod tests {
         ServiceBinding {
             id: "binding-oidc-google".into(),
             persona_id: "persona-a".into(),
-            descriptor: core_types::ServiceDescriptor {
+            descriptor: core_event_types::ServiceDescriptor {
                 adapter_kind: "oidc".into(),
                 service_label: "Google".into(),
                 endpoint: "https://accounts.google.com".into(),
@@ -1514,7 +1512,7 @@ mod tests {
         let binding = ServiceBinding {
             id: "binding-wrong".into(),
             persona_id: "persona-a".into(),
-            descriptor: core_types::ServiceDescriptor {
+            descriptor: core_event_types::ServiceDescriptor {
                 adapter_kind: "oauth2".into(),
                 service_label: "Wrong".into(),
                 endpoint: "https://example.com".into(),

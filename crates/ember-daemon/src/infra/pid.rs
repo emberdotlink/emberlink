@@ -84,12 +84,37 @@ impl Drop for PidFile {
     }
 }
 
+/// `daemon_status_pid_liveness_check` — implementation-note-196.
+///
+/// Discriminate `kill(0)` errno states so cross-uid daemons aren't
+/// misclassified as gone under design separate-uid posture:
+///
+/// - `kill(pid, 0)` returns 0 → process exists, callable from this uid → alive
+/// - errno `EPERM` → process exists but owned by a different uid (we can't
+///   signal it, but it's there) → alive
+/// - errno `ESRCH` → process truly gone → stale
+///
+/// The previous implementation forked `kill -0 <pid>` and treated exit-1 as
+/// "gone" — which conflated EPERM with ESRCH and made `ember daemon status`
+/// report a healthy daemon as stale whenever the operator uid (e.g. operator)
+/// differed from the daemon uid (e.g. ember). Per session_watcher::pid_alive
+/// which has used this pattern for the heartbeat watcher.
 fn is_process_running(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    daemon_status_pid_liveness_check(pid)
+}
+
+fn daemon_status_pid_liveness_check(pid: u32) -> bool {
+    // SAFETY: kill(pid, 0) is a read-only syscall — never delivers a signal.
+    // The only effect is setting errno, which we inspect to discriminate.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if rc == 0 {
+        return true;
+    }
+    let os_err = std::io::Error::last_os_error();
+    let raw = os_err.raw_os_error().unwrap_or(0);
+    // ESRCH — no such process → stale.
+    // EPERM (or anything else) — process exists but inaccessible → alive.
+    raw != libc::ESRCH
 }
 
 #[cfg(test)]
@@ -187,6 +212,35 @@ mod tests {
 
         assert!(path.exists(), "reader's drop must not remove writer's file");
         assert_eq!(writer.read().unwrap(), Some(std::process::id()));
+    }
+
+    /// implementation-note-196 — regression test
+    /// for the cross-uid case under design separate-uid posture.
+    ///
+    /// PID 1 (init/launchd) always exists and is owned by root. When the
+    /// test process runs as a non-root user, `kill(0)` against PID 1
+    /// returns `EPERM`. The old `kill -0 <pid>` subprocess implementation
+    /// misclassified this as "stale" (exit 1 → false). The new errno
+    /// discriminator returns true for `EPERM` and only false for `ESRCH`.
+    ///
+    /// When the test happens to run as root (CI containers sometimes do),
+    /// `kill(0)` against PID 1 returns 0 and the assertion still holds —
+    /// the function is correct in both cases.
+    #[test]
+    fn pid_1_is_alive_even_when_caller_lacks_signal_permission() {
+        // PID 1 always exists on every unix host this codebase supports.
+        assert!(
+            is_process_running(1),
+            "PID 1 (init/launchd) must be classified as alive — the old \
+             implementation incorrectly returned false when the caller's \
+             uid couldn't signal it (kill -0 → exit 1 → EPERM)."
+        );
+    }
+
+    #[test]
+    fn impossibly_high_pid_is_stale() {
+        // 999_999_999 should never be a valid PID; kill(0) → ESRCH → stale.
+        assert!(!is_process_running(999_999_999));
     }
 
     #[test]

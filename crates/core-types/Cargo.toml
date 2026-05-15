@@ -15,3 +15,12 @@ base45 = "3"
 [dev-dependencies]
 proptest = "1"
 sha2.workspace = true
+# Dev-only — proptest_canonical.rs exercises types that moved out
+# (GrantLink in core-grant-types, EventBody / RootCreatedEvent / etc.
+# in core-event-types; PublicKeyMaterial / KeyAlgorithm / RecoveryScope /
+# SurvivalMode in core-principals) per design. Follow-up: migrate the
+# test into the destination crates' tests/ directories to eliminate these
+# dev-deps.
+core-grant-types = { path = "../core-grant-types" }
+core-event-types = { path = "../core-event-types" }
+core-principals = { path = "../core-principals" }

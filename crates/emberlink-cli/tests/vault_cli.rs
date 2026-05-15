@@ -1,5 +1,5 @@
 //! Integration tests for `ember vault list/get/put/export/import`
-//! (implementation-note-153).
+//! (implementation-note-276).
 //!
 //! The argv-parsing surface lives in `bin/ember.rs`; the round-trip
 //! semantics live in `emberlink_cli::vault_io`. These tests exercise:
@@ -28,7 +28,7 @@ use std::rc::Rc;
 
 use core_crypto::{generate_local_encryption_key_pair, LocalKeyPair};
 use ember_daemon::infra::store::DaemonStore;
-use ember_daemon::infra::vault::Vault;
+use ember_daemon::infra::vault::{Vault, VaultScope};
 use emberlink_cli::vault_io::{
     decode_import_envelope, encode_export_envelope, mask_credential_for_display,
     VaultExportEnvelope,
@@ -68,16 +68,16 @@ fn put_then_list_then_get_round_trip() {
 
     // Put — same path the `ember vault put` dispatch invokes.
     vault
-        .add(&store, "azure/tenant-id", b"tnt-123-XYZQ", None)
+        .add(VaultScope::Interactive, &store, "azure/tenant-id", b"tnt-123-XYZQ", None)
         .expect("put succeeded");
 
     // List should reflect the new entry.
-    let creds = vault.list(&store).expect("list succeeded");
+    let creds = vault.list(VaultScope::Interactive, &store).expect("list succeeded");
     assert_eq!(creds.len(), 1);
     assert_eq!(creds[0].name, "azure/tenant-id");
 
     // Get returns the raw bytes; default CLI behaviour masks them.
-    let raw = vault.get(&store, "azure/tenant-id").expect("get succeeded");
+    let raw = vault.get(VaultScope::Interactive, &store, "azure/tenant-id").expect("get succeeded");
     assert_eq!(raw, b"tnt-123-XYZQ");
     assert_eq!(mask_credential_for_display(&raw), "****XYZQ");
 }
@@ -132,16 +132,16 @@ fn export_import_round_trip() {
         ("anthropic/api-key", b"sk-anthropic-aaaa-bbbb".to_vec()),
     ];
     for (name, value) in &entries {
-        vault.add(&store, name, value, None).expect("put");
+        vault.add(VaultScope::Interactive, &store, name, value, None).expect("put");
     }
-    assert_eq!(vault.list(&store).unwrap().len(), 3);
+    assert_eq!(vault.list(VaultScope::Interactive, &store).unwrap().len(), 3);
 
-    // Read them back via `vault.list()` + `vault.get()`, exactly the
+    // Read them back via `vault.list(VaultScope::Interactive, )` + `vault.get(VaultScope::Interactive, )`, exactly the
     // path the binary's `run_vault_export` follows.
-    let creds = vault.list(&store).unwrap();
+    let creds = vault.list(VaultScope::Interactive, &store).unwrap();
     let mut pairs: Vec<(String, Vec<u8>)> = Vec::new();
     for c in &creds {
-        let v = vault.get(&store, &c.name).unwrap();
+        let v = vault.get(VaultScope::Interactive, &store, &c.name).unwrap();
         pairs.push((c.name.clone(), v));
     }
     let envelope =
@@ -171,9 +171,9 @@ fn export_import_round_trip() {
 
     // Wipe the live vault to simulate restoring on a fresh host.
     for (name, _) in &entries {
-        vault.remove(&store, name).unwrap();
+        vault.remove(VaultScope::Interactive, &store, name).unwrap();
     }
-    assert!(vault.list(&store).unwrap().is_empty());
+    assert!(vault.list(VaultScope::Interactive, &store).unwrap().is_empty());
 
     // Decrypt every entry first (atomic-import contract); only on full
     // success do we `put` them back.
@@ -181,12 +181,12 @@ fn export_import_round_trip() {
         .expect("decode envelope succeeded");
     assert_eq!(decrypted.len(), 3);
     for (name, value) in decrypted {
-        vault.add(&store, &name, &value, None).expect("re-put");
+        vault.add(VaultScope::Interactive, &store, &name, &value, None).expect("re-put");
     }
 
     // Verify all three round-tripped byte-for-byte.
     for (name, expected) in &entries {
-        let got = vault.get(&store, name).unwrap();
+        let got = vault.get(VaultScope::Interactive, &store, name).unwrap();
         assert_eq!(&got, expected, "{name} did not round-trip");
     }
 }

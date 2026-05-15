@@ -34,15 +34,7 @@ use std::path::{Path, PathBuf};
 /// pre-bundles inside `emberd`'s artifact and the daemon discovers
 /// from [`bundled_install_dir`] at startup. Order is stable for
 /// release-tooling determinism.
-pub const COHORT_A_CONSTRUCTS: &[&str] = &[
-    "ember-git",
-    "ember-gh",
-    "ember-kubectl",
-    "ember-npm",
-    "ember-docker",
-    "ember-wrangler",
-    "ember-pulumi",
-];
+pub const COHORT_A_CONSTRUCTS: &[&str] = &["ember-gh", "ember-git", "ember-kubectl"];
 
 /// Where the v0.3.0 release pipeline lays down bundled Construct
 /// binaries on disk. The daemon scans this directory at startup +
@@ -274,6 +266,207 @@ pub fn verify_manifest_signature(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// implementation-note-83 — peer binary pinning
+// ---------------------------------------------------------------------------
+
+/// Error variants surfaced by [`verify_peer_binary`]. Distinct from
+/// [`PinError`] / [`LookupError`] because peer-binary verification
+/// crosses a different trust boundary: rather than verifying a binary
+/// the daemon is about to spawn, it verifies the binary the kernel
+/// already attests is on the other end of an open socket. The
+/// caller-side broker handlers map this onto error code `-32008`
+/// (distinct from `-32004` uid binding mismatch and `-32007`
+/// principal-not-alive) so operators can tell the failure modes apart.
+#[derive(Debug, thiserror::Error)]
+pub enum ManifestVerifyError {
+    /// Computed blake3 of `/proc/<pid>/exe` did not match any
+    /// `content_hash` in the manifest. The peer's binary is not pinned.
+    #[error("binary blake3 hash {hash} not in manifest (peer pid {pid})")]
+    HashNotInManifest { pid: i32, hash: String },
+    /// Hash matched a manifest entry but the on-disk path of the peer
+    /// binary disagrees with the manifest's recorded `absolute_path`.
+    /// This is the "hash-collision-on-disk OR daemon mis-config"
+    /// surface — the manifest's `absolute_path` is also pinned.
+    #[error(
+        "binary path {actual:?} not in manifest (peer pid {pid}; manifest expected {expected:?})"
+    )]
+    PathNotInManifest {
+        pid: i32,
+        actual: PathBuf,
+        expected: PathBuf,
+    },
+    /// `/proc/<pid>/status` reports a non-zero `TracerPid:` — a
+    /// debugger (or ptrace-capable controller) is attached, so the
+    /// bytes on disk no longer reflect the running code. Refuse the
+    /// connection rather than vend a credential the attacker can lift
+    /// out of the traced process's memory.
+    #[error("peer pid {pid} is being traced by pid {tracer_pid}")]
+    TracerAttached { pid: i32, tracer_pid: i32 },
+    /// Reading `/proc/<pid>/exe` or `/proc/<pid>/status` failed —
+    /// fail-closed so a kernel-level oddity doesn't silently bypass
+    /// the pin check.
+    #[error("failed reading /proc/{pid}/{what}: {reason}")]
+    ProcReadFailed {
+        pid: i32,
+        what: &'static str,
+        reason: String,
+    },
+    /// `std::fs::read` on the resolved binary path failed — same
+    /// fail-closed posture.
+    #[error("failed hashing binary at {path:?} (peer pid {pid}): {reason}")]
+    BinaryHashFailed {
+        pid: i32,
+        path: PathBuf,
+        reason: String,
+    },
+}
+
+/// Parse the `TracerPid:` line out of `/proc/<pid>/status` contents.
+///
+/// Returns `Some(0)` when the process has no debugger attached (the
+/// kernel always emits a `TracerPid:` line, value 0 when untraced).
+/// Returns `Some(pid)` for any non-zero tracer. Returns `None` when
+/// the input has no `TracerPid:` line — caller treats that as a
+/// `ProcReadFailed` (malformed `/proc` entry).
+///
+/// Public so the test suite can exercise the parse logic directly
+/// without standing up a traced process.
+pub fn parse_tracer_pid(status: &str) -> Option<i32> {
+    for line in status.lines() {
+        // Linux's /proc/<pid>/status uses tab separation:
+        //   "TracerPid:\t0\n"
+        if let Some(rest) = line.strip_prefix("TracerPid:") {
+            let trimmed = rest.trim();
+            if let Ok(n) = trimmed.parse::<i32>() {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+/// Verify the binary on the other end of a peer-cred-attested socket
+/// matches the signed binary-pin manifest.
+///
+/// On Linux:
+/// 1. Read `/proc/<pid>/status` and refuse if `TracerPid:` is non-zero
+///    (a debugger is attached; the on-disk bytes don't reflect the
+///    running code).
+/// 2. Read `/proc/<pid>/exe` (a symlink to the running binary).
+/// 3. Blake3-hash the binary bytes.
+/// 4. Look up the hash in the manifest. Refuse if not found.
+/// 5. Verify the resolved absolute path matches the manifest entry's
+///    `absolute_path`. Refuse on mismatch.
+///
+/// On non-Linux (macOS, etc.): no `/proc` filesystem exists. The
+/// caller-side broker handlers gracefully degrade via a `tracing::debug!`
+/// and a no-op `Ok(…)` return is NOT available here — the caller is
+/// expected to skip the check entirely on non-Linux. This function
+/// therefore returns a `cfg(not(target_os = "linux"))` stub that
+/// surfaces a structured error so the caller cannot accidentally
+/// honor a request against an unverified binary.
+#[cfg(target_os = "linux")]
+pub fn verify_peer_binary(
+    pid: i32,
+    manifest: &BinaryManifest,
+) -> Result<&BinaryManifestEntry, ManifestVerifyError> {
+    // (1) TracerPid gate.
+    let status_path = format!("/proc/{pid}/status");
+    let status_bytes = std::fs::read(&status_path).map_err(|e| {
+        ManifestVerifyError::ProcReadFailed {
+            pid,
+            what: "status",
+            reason: e.to_string(),
+        }
+    })?;
+    let status = std::str::from_utf8(&status_bytes).map_err(|e| {
+        ManifestVerifyError::ProcReadFailed {
+            pid,
+            what: "status",
+            reason: format!("not utf8: {e}"),
+        }
+    })?;
+    let tracer_pid =
+        parse_tracer_pid(status).ok_or_else(|| ManifestVerifyError::ProcReadFailed {
+            pid,
+            what: "status",
+            reason: "missing TracerPid line".to_string(),
+        })?;
+    if tracer_pid != 0 {
+        return Err(ManifestVerifyError::TracerAttached { pid, tracer_pid });
+    }
+
+    // (2) Resolve /proc/<pid>/exe to the running binary's path.
+    let exe_link = format!("/proc/{pid}/exe");
+    let exe_path = std::fs::read_link(&exe_link).map_err(|e| {
+        ManifestVerifyError::ProcReadFailed {
+            pid,
+            what: "exe",
+            reason: e.to_string(),
+        }
+    })?;
+
+    // (3) Hash the on-disk bytes.
+    let bytes =
+        std::fs::read(&exe_path).map_err(|e| ManifestVerifyError::BinaryHashFailed {
+            pid,
+            path: exe_path.clone(),
+            reason: e.to_string(),
+        })?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&bytes);
+    let computed = hex::encode(hasher.finalize().as_bytes());
+
+    // (4) Look up by hash.
+    let entry = manifest
+        .entries
+        .iter()
+        .find(|e| {
+            e.content_hash
+                .strip_prefix("blake3:")
+                .unwrap_or(&e.content_hash)
+                == computed
+        })
+        .ok_or_else(|| ManifestVerifyError::HashNotInManifest {
+            pid,
+            hash: format!("blake3:{computed}"),
+        })?;
+
+    // (5) Cross-check path. The manifest's absolute_path is also pinned —
+    // a hash match against a binary on an unexpected path is suspicious
+    // (the operator may have unpacked a manifest-vetted binary into a
+    // different location, in which case the manifest is stale).
+    if entry.absolute_path != exe_path {
+        return Err(ManifestVerifyError::PathNotInManifest {
+            pid,
+            actual: exe_path,
+            expected: entry.absolute_path.clone(),
+        });
+    }
+
+    Ok(entry)
+}
+
+/// Non-Linux stub. `/proc` is Linux-specific; macOS would need a
+/// `proc_pidpath(3)` + `csops`/`csops_audittoken` audit instead. The
+/// broker handlers' `cfg(target_os = "linux")` wrapper invokes this
+/// function only on Linux; on other targets the caller skips the
+/// check entirely with a `tracing::debug!`. Returning a typed error
+/// rather than a silent `Ok(…)` keeps the function fail-closed if
+/// it were ever called by mistake on a non-Linux build.
+#[cfg(not(target_os = "linux"))]
+pub fn verify_peer_binary(
+    pid: i32,
+    _manifest: &BinaryManifest,
+) -> Result<&BinaryManifestEntry, ManifestVerifyError> {
+    Err(ManifestVerifyError::ProcReadFailed {
+        pid,
+        what: "exe",
+        reason: "/proc is not available on this target — caller must gate on cfg(target_os = \"linux\")".to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,17 +586,21 @@ publisher = "did:emberlink"
     }
 
     #[test]
-    fn cohort_a_constructs_covers_seven_tools() {
-        // Acceptance per task brief: cohort A is gh, git, kubectl, npm,
-        // docker, wrangler, pulumi (7 tools).
-        assert_eq!(COHORT_A_CONSTRUCTS.len(), 7);
+    fn cohort_a_constructs_covers_v030_friendly_drop_tools() {
+        // Per implementation-note-84 (Cluster A 3d, design review
+        // 20260513-122447): v0.3.0 ships 3 tools (gh/git/kubectl) — the
+        // 3 with daemon-side classifiers. npm/docker/wrangler/pulumi
+        // defer to v0.3.1 (with proper classifiers per
+        // F-S4-V030-CONSOLIDATE-CLASSIFIER) or v0.4. design §8 Touch-1
+        // prompt names git push only — friendly drop covered.
+        assert_eq!(COHORT_A_CONSTRUCTS.len(), 3);
         assert!(is_cohort_a_construct("ember-gh"));
         assert!(is_cohort_a_construct("ember-git"));
         assert!(is_cohort_a_construct("ember-kubectl"));
-        assert!(is_cohort_a_construct("ember-npm"));
-        assert!(is_cohort_a_construct("ember-docker"));
-        assert!(is_cohort_a_construct("ember-wrangler"));
-        assert!(is_cohort_a_construct("ember-pulumi"));
+        assert!(!is_cohort_a_construct("ember-npm"));
+        assert!(!is_cohort_a_construct("ember-docker"));
+        assert!(!is_cohort_a_construct("ember-wrangler"));
+        assert!(!is_cohort_a_construct("ember-pulumi"));
         assert!(!is_cohort_a_construct("ember-rogue"));
     }
 
@@ -470,5 +667,179 @@ publisher = "did:emberlink"
             bundled_install_dir(),
             PathBuf::from("/usr/local/lib/ember/binaries")
         );
+    }
+
+    // -----------------------------------------------------------------
+    // implementation-note-83 — peer binary
+    // pinning gate. The broker handlers refuse a request whose peer
+    // binary (resolved via /proc/<pid>/exe + blake3) is not in the
+    // signed manifest, or whose process is being traced.
+    // -----------------------------------------------------------------
+
+    /// `parse_tracer_pid` correctly extracts the value from a typical
+    /// `/proc/<pid>/status` snippet. Production-shape input is tab-
+    /// separated; the parser must accept it.
+    #[test]
+    fn parse_tracer_pid_zero_when_untraced() {
+        let sample = "Name:\tbash\nState:\tS (sleeping)\nTracerPid:\t0\nUid:\t1000\t1000\t1000\t1000\n";
+        assert_eq!(parse_tracer_pid(sample), Some(0));
+    }
+
+    /// `parse_tracer_pid` returns the non-zero tracer pid when a
+    /// debugger is attached. Broker handler maps this to `-32008`.
+    #[test]
+    fn parse_tracer_pid_nonzero_when_traced() {
+        let sample = "Name:\ttarget\nTracerPid:\t12345\nUid:\t1000\t1000\t1000\t1000\n";
+        assert_eq!(parse_tracer_pid(sample), Some(12345));
+    }
+
+    /// `parse_tracer_pid` returns `None` when the input has no
+    /// `TracerPid:` line at all — caller treats this as a
+    /// `ProcReadFailed` rather than a "no tracer" success.
+    #[test]
+    fn parse_tracer_pid_returns_none_when_line_missing() {
+        let sample = "Name:\tbash\nState:\tS (sleeping)\n";
+        assert_eq!(parse_tracer_pid(sample), None);
+    }
+
+    /// Failing-test contract from the brief —
+    /// `verify_peer_binary_refuses_unmanifested_hash`. The peer pid
+    /// resolves to a real binary on disk but the manifest contains
+    /// no entry for its hash; `verify_peer_binary` must refuse.
+    ///
+    /// Uses `/proc/self` so the lookup against /proc itself
+    /// succeeds; the manifest is intentionally empty so the
+    /// hash-not-in-manifest branch fires.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verify_peer_binary_refuses_unmanifested_hash() {
+        let my_pid = std::process::id() as i32;
+        let manifest = BinaryManifest::default();
+        let err = verify_peer_binary(my_pid, &manifest).expect_err("must refuse");
+        match err {
+            ManifestVerifyError::HashNotInManifest { pid, hash } => {
+                assert_eq!(pid, my_pid);
+                assert!(
+                    hash.starts_with("blake3:"),
+                    "hash must be blake3-prefixed, got: {hash}"
+                );
+            }
+            other => panic!("expected HashNotInManifest, got {other:?}"),
+        }
+    }
+
+    /// Companion: manifest contains the peer binary's hash but
+    /// its `absolute_path` disagrees with what `/proc/<pid>/exe`
+    /// resolves to. The peer binary's path is also pinned, so this
+    /// path-mismatch surfaces as `PathNotInManifest` rather than a
+    /// happy-path Ok.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verify_peer_binary_refuses_unmanifested_path() {
+        let my_pid = std::process::id() as i32;
+        // Hash the running test binary so the hash lookup succeeds.
+        let exe_path = std::fs::read_link(format!("/proc/{my_pid}/exe"))
+            .expect("/proc/self/exe must resolve");
+        let bytes = std::fs::read(&exe_path).expect("read test binary");
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&bytes);
+        let hash = format!("blake3:{}", hex::encode(hasher.finalize().as_bytes()));
+
+        // Intentional path lie: same hash, wrong absolute_path. The
+        // path-cross-check must catch this.
+        let manifest = BinaryManifest {
+            entries: vec![BinaryManifestEntry {
+                tool_name: "ember-test".to_string(),
+                version: "0.0.0".to_string(),
+                content_hash: hash,
+                absolute_path: PathBuf::from("/nonexistent/decoy-path"),
+                installed_at: 0,
+                publisher: "did:emberlink".to_string(),
+                channel: BinaryDistributionChannel::Bundled,
+            }],
+        };
+
+        let err = verify_peer_binary(my_pid, &manifest).expect_err("must refuse");
+        match err {
+            ManifestVerifyError::PathNotInManifest {
+                pid,
+                actual,
+                expected,
+            } => {
+                assert_eq!(pid, my_pid);
+                assert_eq!(actual, exe_path);
+                assert_eq!(expected, PathBuf::from("/nonexistent/decoy-path"));
+            }
+            other => panic!("expected PathNotInManifest, got {other:?}"),
+        }
+    }
+
+    /// Happy path: manifest contains the peer binary's hash AND the
+    /// resolved `/proc/<pid>/exe` path matches. `verify_peer_binary`
+    /// returns the matched entry.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verify_peer_binary_accepts_manifested_binary() {
+        let my_pid = std::process::id() as i32;
+        let exe_path = std::fs::read_link(format!("/proc/{my_pid}/exe"))
+            .expect("/proc/self/exe must resolve");
+        let bytes = std::fs::read(&exe_path).expect("read test binary");
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&bytes);
+        let hash = format!("blake3:{}", hex::encode(hasher.finalize().as_bytes()));
+
+        let manifest = BinaryManifest {
+            entries: vec![BinaryManifestEntry {
+                tool_name: "ember-test".to_string(),
+                version: "0.0.0".to_string(),
+                content_hash: hash,
+                absolute_path: exe_path.clone(),
+                installed_at: 0,
+                publisher: "did:emberlink".to_string(),
+                channel: BinaryDistributionChannel::Bundled,
+            }],
+        };
+
+        let entry = verify_peer_binary(my_pid, &manifest).expect("happy path");
+        assert_eq!(entry.tool_name, "ember-test");
+        assert_eq!(entry.absolute_path, exe_path);
+    }
+
+    /// Failing-test contract from the brief —
+    /// `verify_peer_binary_refuses_traced_process`. The brief notes
+    /// this is hard to exercise end-to-end without a debugger, so we
+    /// drive the parse logic directly (`parse_tracer_pid`) which is
+    /// the load-bearing branch inside `verify_peer_binary`.
+    #[test]
+    fn verify_peer_binary_refuses_traced_process() {
+        // The TracerPid parse path is exactly what `verify_peer_binary`
+        // calls; a non-zero return becomes `ManifestVerifyError::TracerAttached`.
+        let traced_status =
+            "Name:\ttarget\nState:\tt (tracing stop)\nTracerPid:\t12345\nUid:\t1000\t1000\t1000\t1000\n";
+        let untraced_status =
+            "Name:\tbash\nState:\tS (sleeping)\nTracerPid:\t0\nUid:\t1000\t1000\t1000\t1000\n";
+        assert_eq!(parse_tracer_pid(traced_status), Some(12345));
+        assert_eq!(parse_tracer_pid(untraced_status), Some(0));
+    }
+
+    /// `verify_peer_binary` against a clearly-impossible pid (no such
+    /// process) surfaces a structured `ProcReadFailed` rather than
+    /// panicking. Fail-closed posture — kernel-level oddities must
+    /// never silently bypass the pin check.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verify_peer_binary_fail_closed_on_missing_proc_entry() {
+        // PID 2^31 - 1 is far beyond /proc/sys/kernel/pid_max in
+        // practice; no process has this pid.
+        let bogus_pid = i32::MAX;
+        let manifest = BinaryManifest::default();
+        let err = verify_peer_binary(bogus_pid, &manifest).expect_err("must fail");
+        match err {
+            ManifestVerifyError::ProcReadFailed { pid, what, .. } => {
+                assert_eq!(pid, bogus_pid);
+                assert_eq!(what, "status");
+            }
+            other => panic!("expected ProcReadFailed, got {other:?}"),
+        }
     }
 }

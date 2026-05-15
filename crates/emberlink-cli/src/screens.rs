@@ -6,7 +6,8 @@ use core_identity::disclosure_view;
 use core_sync::{check_relay_admission, wrap_for_relay};
 use core_trust::queries;
 use core_trust::{derive_score, derive_score_for_recipient, explain};
-use core_types::{EventType, RelayAdmission, RelayMode, TrustThreshold};
+use core_event_types::{EventType};
+use core_principals::{RelayAdmission, RelayMode, TrustThreshold};
 
 use super::*;
 

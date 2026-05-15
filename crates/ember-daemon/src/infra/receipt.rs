@@ -27,7 +27,7 @@
 //! `GET /daemon/identity.json` as hex so external verifiers can compare
 //! against their trust anchor.
 
-// implementation-note-118: Receipt v2 issuance helper for cohort-A
+// implementation-note-204: Receipt v2 issuance helper for cohort-A
 // `session.claude_code` Receipts. Lives in the `receipt/` sibling
 // directory; this `pub mod` declaration wires it under the existing
 // `receipt` module path so callers see `ember_daemon::receipt::issue`.
@@ -36,14 +36,17 @@ pub mod issue;
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
-use core_types::grant_receipt::{
+use core_broker::{BrokerRequest, BrokeredCredential};
+use core_events::receipt::envelope::{ReceiptEnvelope, ReceiptVersion, TerminationAuthority};
+use core_grant_types::grant_receipt::{
     ApprovalActor, ApprovalEvent, ApprovalOutcome, AuditEntry as ReceiptAuditEntry,
     BrokerReceipt, BudgetAxis, Evidence, GrantReceipt, KmsReceipt, Lifecycle, ReceiptKind,
     ReceiptSummary, RevokeActor, TerminalReason, VaultReceipt,
 };
-use core_types::{AttestationBinding, StatementId, Usage};
+use core_grant_types::{AttestationBinding, StatementId, Usage};
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use once_cell::sync::OnceCell;
 use zeroize::{ZeroizeOnDrop, Zeroizing};
@@ -263,7 +266,7 @@ pub fn canonical_hash_receipt(receipt: &GrantReceipt) -> [u8; 32] {
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-16 — kms receipt canonical-encoding + signing helpers
+// implementation-note-36 — kms receipt canonical-encoding + signing helpers
 // ---------------------------------------------------------------------------
 
 /// Canonical-encoding prefix for kms receipts. Distinct from
@@ -307,7 +310,7 @@ pub fn sign_kms_receipt(receipt: &mut KmsReceipt, identity: &DaemonPersona) {
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-119 — broker receipt canonical-encoding + signing helpers
+// implementation-note-205 — broker receipt canonical-encoding + signing helpers
 // ---------------------------------------------------------------------------
 
 /// Canonical-encoding prefix for broker receipts. Distinct from
@@ -348,6 +351,101 @@ pub fn sign_broker_receipt(receipt: &mut BrokerReceipt, identity: &DaemonPersona
         signer_pubkey: identity.pubkey_hex(),
         canonical_version: CANONICAL_VERSION,
     };
+}
+
+// ---------------------------------------------------------------------------
+// v2 broker envelope builders — Phase A substrate for implementation-note-101-
+// implementation-note-206. Per design §Envelope + design §receipt-kind
+// catalog ("broker.materialization", "broker.revocation").
+//
+// Returned envelopes are unsigned: callers wrap a Signer (e.g.
+// `session::lifecycle::DaemonPersonaSigner`) and call
+// `core_events::receipt::sign::sign_receipt_v2` to populate `receipt_id`
+// + `signature`. Call-site migration is Phase B.
+// ---------------------------------------------------------------------------
+
+/// v2 kind discriminator — broker materialization. Per design.
+pub const RECEIPT_KIND_BROKER_MATERIALIZATION: &str = "broker.materialization";
+/// v2 kind discriminator — broker revocation. Per design.
+pub const RECEIPT_KIND_BROKER_REVOCATION: &str = "broker.revocation";
+
+/// Build an unsigned v2 [`ReceiptEnvelope`] for a broker materialization
+/// event. `termination_authority` is `DaemonPersona` (daemon-emitted per
+/// design §F5).
+pub fn build_broker_materialization_envelope(
+    req: &BrokerRequest,
+    cred: &BrokeredCredential,
+    daemon_root_id: &str,
+) -> ReceiptEnvelope {
+    let now_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let expires_epoch = cred
+        .expires_at
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .ok();
+    let body = serde_json::json!({
+        "provider": req.provider.as_str(),
+        "materialization_id": cred.materialization_id,
+        "requested_scope": req.scope,
+        "granted_scope": req.scope,
+        "ttl_seconds": req.ttl.as_secs(),
+        "materialized_at_epoch_secs": now_epoch,
+        "expires_at_epoch_secs": expires_epoch,
+        "caller_persona": req.caller_persona,
+        "grants_file_rev": req.grants_file_rev,
+        "credential_name": req.grants_file_credential_name,
+        "reason": req.reason,
+    });
+    ReceiptEnvelope {
+        version: ReceiptVersion::default(),
+        kind: RECEIPT_KIND_BROKER_MATERIALIZATION.to_string(),
+        receipt_id: String::new(),
+        daemon_root_id: daemon_root_id.to_string(),
+        traceparent: None,
+        termination_authority: TerminationAuthority::DaemonPersona,
+        presence_kind: None,
+        body,
+        signature: None,
+    }
+}
+
+/// Build an unsigned v2 [`ReceiptEnvelope`] for a broker revocation event.
+/// `summary` is optional so the envelope can still be emitted when the
+/// materialization is unknown to the daemon (matches v1's `Option`
+/// posture in [`crate::broker::handler::emit_revocation_receipt`]).
+pub fn build_broker_revocation_envelope(
+    materialization_id: &str,
+    summary: Option<&crate::broker::handler::MaterializationSummary>,
+    daemon_root_id: &str,
+) -> ReceiptEnvelope {
+    let now_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let provider = summary
+        .map(|s| s.provider.as_str().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let reason = summary.map(|s| s.reason.clone()).unwrap_or_default();
+    let body = serde_json::json!({
+        "provider": provider,
+        "materialization_id": materialization_id,
+        "revoked_at_epoch_secs": now_epoch,
+        "reason": reason,
+    });
+    ReceiptEnvelope {
+        version: ReceiptVersion::default(),
+        kind: RECEIPT_KIND_BROKER_REVOCATION.to_string(),
+        receipt_id: String::new(),
+        daemon_root_id: daemon_root_id.to_string(),
+        traceparent: None,
+        termination_authority: TerminationAuthority::DaemonPersona,
+        presence_kind: None,
+        body,
+        signature: None,
+    }
 }
 
 /// Verify an Ed25519 signature against a pubkey (both hex) over the
@@ -402,7 +500,7 @@ pub fn verify_broker_receipt(
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-120 — vault receipt canonical-encoding + signing helpers
+// implementation-note-207 — vault receipt canonical-encoding + signing helpers
 // ---------------------------------------------------------------------------
 
 /// Canonical-encoding prefix for vault receipts. Distinct from
@@ -576,6 +674,89 @@ pub enum ReceiptVerifyError {
 }
 
 // ---------------------------------------------------------------------------
+// implementation-note-208 — append-only receipts journal
+// ---------------------------------------------------------------------------
+
+/// Errors specific to the `receipts.log` journal append path.
+#[derive(Debug, thiserror::Error)]
+pub enum JournalError {
+    /// The journal file's mode bits drifted from `0o600`. Refuse to write
+    /// so an attacker who's already widened the file can't observe newly-
+    /// written receipts in cleartext. Operator must reinstall to restore.
+    #[error("receipts.log permissions drifted (mode {mode:#o}); refusing to write")]
+    InsecureMode { mode: u32 },
+    /// Underlying filesystem I/O failure (open, write, stat).
+    #[error("receipts.log I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    /// JSON serialization of the receipt body failed.
+    #[error("receipts.log serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
+}
+
+/// Append a single receipt line to the append-only `receipts.log` journal
+/// at `<data_dir>/receipts.log`. Format is one JCS-canonical JSON object
+/// per line terminated by `\n`; the file is opened `O_APPEND | O_CREAT`
+/// with mode `0o600` so the daemon's uid owns it and group/other have no
+/// access. Pre-write the function checks the file's mode bits and refuses
+/// to write if any group or world permission is set — defense-in-depth
+/// against later chmod drift between install time and runtime.
+///
+/// Used by the daemon's per-receipt hot path (operator-initiated revoke
+/// receipts, KMS receipts, broker receipts) and by the periodic
+/// `daemon.receipt_root` envelope writer (subtask follow-up). The journal
+/// is the redundant store that lets the verifier (subtask C) detect SQLite
+/// tampering by cross-checking the SQL chain against the file's contents.
+///
+/// # target_state_anchor
+///
+/// `fn append_receipts_journal`
+pub fn append_receipts_journal<T: serde::Serialize>(
+    data_dir: &Path,
+    receipt: &T,
+) -> Result<(), JournalError> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let path = data_dir.join("receipts.log");
+
+    // Pre-write mode check (defense-in-depth). Only applied on existing
+    // files; the create path below opens with mode 0o600.
+    #[cfg(unix)]
+    if path.exists() {
+        let meta = std::fs::metadata(&path)?;
+        let mode = meta.permissions().mode();
+        if mode & 0o077 != 0 {
+            tracing::warn!(
+                path = %path.display(),
+                mode = format!("{mode:#o}"),
+                "receipts.log has group/other permissions — refusing to write"
+            );
+            return Err(JournalError::InsecureMode { mode });
+        }
+    }
+
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+
+    let mut file = opts.open(&path)?;
+
+    // JCS-style canonicalization is hard in the general case; serde_json
+    // with serde's default Serializer is deterministic for BTreeMap +
+    // primitive types per current crate semantics. The verifier (subtask
+    // C) reads each line back via serde_json::from_str and reconstructs
+    // the Merkle leaf from the parsed Value, so any small key-order drift
+    // between writer and reader gets normalized at parse time.
+    let line = serde_json::to_string(receipt)?;
+    writeln!(file, "{}", line)?;
+    file.sync_data()?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Emission
 // ---------------------------------------------------------------------------
 
@@ -621,7 +802,7 @@ pub fn trigger_receipt_if_terminal(
 /// Derive a terminal reason from grant status alone.
 ///
 /// For `exhausted_by_budget`, the axis is read from the `budget.exhausted`
-/// audit row (T-implementation-note-121) instead of guessed from which
+/// audit row (T-implementation-note-209) instead of guessed from which
 /// axes the grant's budget configures. The audit row carries the
 /// authoritative axis that actually tripped the cap.
 fn derive_reason(store: &DaemonStore, info: &GrantInfo) -> TerminalReason {
@@ -651,7 +832,7 @@ fn derive_reason(store: &DaemonStore, info: &GrantInfo) -> TerminalReason {
 }
 
 /// Read the exhaustion axis from the `budget.exhausted` audit row for this
-/// grant (T-implementation-note-121).
+/// grant (T-implementation-note-209).
 ///
 /// `budget.exhausted` rows are emitted by the proxy meter when a Statement
 /// usage tally crosses a budget cap. The row's `details` column carries the
@@ -737,7 +918,7 @@ fn build_receipt_body(
     now_epoch_secs: u64,
 ) -> GrantReceipt {
     // 1. Pull the canonical composite chain + envelope-level attestation.
-    //    AUDIT Decision 2 #4 (T-implementation-note-122): the
+    //    AUDIT Decision 2 #4 (T-implementation-note-210): the
     //    AccessGrant envelope carries the live attestation posture
     //    (sandbox / spiffe / tee status). Capture it here alongside the
     //    chain so step 7 can pass it through into the signed receipt
@@ -748,7 +929,7 @@ fn build_receipt_body(
     };
 
     // 2. Per-statement usage tallies from the block-0 statements.
-    // implementation-note-83: derive wall_clock_secs at receipt-build
+    // implementation-note-159: derive wall_clock_secs at receipt-build
     // time so signed receipts record actual time used rather than the stored 0.
     let created_at_secs = parse_rfc3339_epoch(&info.created_at);
     let expires_at_secs = info
@@ -882,7 +1063,7 @@ fn build_receipt_body(
         .first()
         .map(|sb| sb.block.issued_at)
         .unwrap_or_else(|| parse_rfc3339_epoch(&info.created_at));
-    // Per AUDIT Decision 2 #5 (T-implementation-note-123):
+    // Per AUDIT Decision 2 #5 (T-implementation-note-211):
     // last_used_at reflects the most recent moment ANY statement was
     // touched. Aggregate Usage.last_updated was a stand-in that swallowed
     // per-statement granularity in the audit trail. Source of truth is the
@@ -911,7 +1092,7 @@ fn build_receipt_body(
     };
 
     // 7. Attestation — passes through from the live grant. Per AUDIT
-    //    Decision 2 #4 (T-implementation-note-122): the previous
+    //    Decision 2 #4 (T-implementation-note-210): the previous
     //    `chain.first().and_then(|_| None).unwrap_or_default()` was a
     //    dead-code default that erased sandbox/spiffe/tee status from the
     //    grant before signing. Source of truth is the AccessGrant
@@ -1000,18 +1181,18 @@ pub struct ReceiptFilter {
     pub since_iso: Option<String>,
     /// Maximum rows to return. Defaults to 100 when `None`.
     pub limit: Option<u64>,
-    /// EMBER-implementation-note-94 — kind discriminator (`grant`, `kms_wrap`,
+    /// EMBER-implementation-note-172 — kind discriminator (`grant`, `kms_wrap`,
     /// `kms_unwrap`). Mapped 1:1 to the `kind` column.
     pub kind: Option<String>,
-    /// EMBER-implementation-note-94 — restrict to receipts whose `grant_id` matches.
+    /// EMBER-implementation-note-172 — restrict to receipts whose `grant_id` matches.
     pub grant_id: Option<String>,
-    /// EMBER-implementation-note-94 — substring filter on the receipt's `summary.resource`
+    /// EMBER-implementation-note-172 — substring filter on the receipt's `summary.resource`
     /// (grant receipts) or top-level `key_name` (kms receipts). Applied
     /// post-fetch so the JSON1 index can still serve exact-match callers.
     pub resource: Option<String>,
 }
 
-/// EMBER-implementation-note-94 — flat audit row returned by [`DaemonStore::list_receipt_rows`].
+/// EMBER-implementation-note-172 — flat audit row returned by [`DaemonStore::list_receipt_rows`].
 ///
 /// Joins receipt fields with [`crate::trust::grant::GrantInfo`] when the row is a
 /// grant receipt so callers see `requested_scope` / `granted_scope` without
@@ -1092,14 +1273,17 @@ impl DaemonStore {
             ReceiptKind::KmsUnwrap => "kms_unwrap",
             // Non-kms variants must never reach this sink — they have
             // their own (planned) typed-Receipt persistence paths per
-            // RECEIPT-COVERAGE-FIX-implementation-note-19 and
-            // RECEIPT-COVERAGE-FIX-implementation-note-20. Reject explicitly so a
+            // RECEIPT-COVERAGE-FIX-implementation-note-33 and
+            // RECEIPT-COVERAGE-FIX-implementation-note-34. Reject explicitly so a
             // mis-routed call surfaces immediately rather than landing
             // a non-kms row in the kms-shaped storage path.
             ReceiptKind::Grant
             | ReceiptKind::VaultRetrieval
             | ReceiptKind::BrokerMaterialization
-            | ReceiptKind::BrokerRevocation => {
+            | ReceiptKind::BrokerRevocation
+            | ReceiptKind::PeerEnroll
+            | ReceiptKind::PeerInstall
+            | ReceiptKind::PeerRevoke => {
                 return Err(StoreError::InvalidInput(format!(
                     "store_kms_receipt called with non-kms ReceiptKind::{:?} — \
                      use the typed sink for this kind",
@@ -1178,6 +1362,96 @@ impl DaemonStore {
             ],
         )?;
         Ok(())
+    }
+
+    /// Persist a v2 broker [`ReceiptEnvelope`] (kinds `broker.materialization`
+    /// or `broker.revocation`). Companion to [`Self::store_broker_receipt`]
+    /// (v1). Rejects envelopes whose `kind` does not start with `"broker."`.
+    ///
+    /// Reuses the unified `receipts` table. The v2 row is distinguishable from
+    /// v1 by the dotted-kind discriminator (`broker.materialization` vs the
+    /// underscore-form `broker_materialization` used by v1) — both shapes
+    /// coexist for the dual-emit transition (Phase A) until Phase B retires
+    /// the v1 path.
+    ///
+    /// Verification: the envelope is the canonical signing artifact. The row's
+    /// `signer_pubkey` column is left empty for v2 — callers verify via
+    /// [`core_events::receipt::sign::verify_receipt_v2`] using a
+    /// caller-supplied pubkey (typically `current_identity().pubkey_hex()`).
+    pub fn store_broker_receipt_v2(
+        &self,
+        envelope: &ReceiptEnvelope,
+    ) -> Result<(), StoreError> {
+        if !envelope.kind.starts_with("broker.") {
+            return Err(StoreError::InvalidInput(format!(
+                "store_broker_receipt_v2 called with non-broker kind '{}' — \
+                 expected 'broker.materialization' or 'broker.revocation'",
+                envelope.kind
+            )));
+        }
+        if envelope.receipt_id.is_empty() {
+            return Err(StoreError::InvalidInput(
+                "store_broker_receipt_v2 called with empty receipt_id — \
+                 caller must invoke sign_receipt_v2 before persistence"
+                    .to_string(),
+            ));
+        }
+        let envelope_json = serde_json::to_string(envelope).map_err(|e| {
+            StoreError::InvalidInput(format!("serialize broker receipt envelope: {e}"))
+        })?;
+        let now = Utc::now().to_rfc3339();
+        let caller_persona = envelope
+            .body
+            .get("caller_persona")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let provider = envelope
+            .body
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        // Reuse existing columns:
+        //   - grant_id is empty (broker receipts are not tied to a grant)
+        //   - persona_id stores the caller persona (extracted from body)
+        //   - terminal_reason stores the provider name
+        //   - signer_pubkey is empty for v2 — the envelope's signature is the
+        //     canonical artifact and the pubkey is per-daemon, looked up at
+        //     verification time via current_identity().
+        self.conn().execute(
+            "INSERT OR REPLACE INTO receipts \
+             (id, grant_id, persona_id, terminal_reason, created_at, receipt_json, signer_pubkey, kind) \
+             VALUES (?1, '', ?2, ?3, ?4, ?5, '', ?6)",
+            rusqlite::params![
+                envelope.receipt_id,
+                caller_persona,
+                provider,
+                now,
+                envelope_json,
+                envelope.kind,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Load the raw `receipt_json` column for a v2 broker envelope row.
+    /// Companion to [`Self::store_broker_receipt_v2`] — returns the
+    /// serialized [`ReceiptEnvelope`] JSON for callers (tests, verifiers)
+    /// that need to round-trip the persisted envelope through
+    /// `verify_receipt_v2`. Filters on `kind LIKE 'broker.%'` so v1 rows
+    /// (`broker_materialization` / `broker_revocation`, underscore form)
+    /// are not returned by this path.
+    pub fn get_receipt_v2_envelope_json(&self, id: &str) -> Result<String, StoreError> {
+        use rusqlite::OptionalExtension;
+        let raw: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT receipt_json FROM receipts \
+                 WHERE id = ?1 AND kind LIKE 'broker.%'",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        raw.ok_or(StoreError::NotFound)
     }
 
     /// Load a broker receipt by id. Returns `NotFound` if the row is not a
@@ -1394,7 +1668,7 @@ impl DaemonStore {
         Ok(out)
     }
 
-    /// EMBER-implementation-note-94 — flat audit-row listing for the `ember audit`
+    /// EMBER-implementation-note-172 — flat audit-row listing for the `ember audit`
     /// query CLI. Joins the receipts table with `grants` so the row carries
     /// both the receipt fields and the parent grant's scope.
     ///
@@ -1625,6 +1899,52 @@ mod tests {
         current_identity().expect("identity was just initialised")
     }
 
+    /// implementation-note-208 — journal append + mode-drift refusal.
+    #[test]
+    fn receipts_journal_appends_line_at_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let receipt = serde_json::json!({
+            "kind": "test.receipt",
+            "id": "01J0000000000000000000000B",
+            "ts": "2026-05-13T23:59:00Z",
+        });
+
+        append_receipts_journal(dir.path(), &receipt).expect("first append");
+
+        let path = dir.path().join("receipts.log");
+        let meta = std::fs::metadata(&path).expect("metadata");
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "receipts.log must be mode 0600, got {:#o}", mode);
+
+        let body = std::fs::read_to_string(&path).expect("read");
+        assert!(body.ends_with('\n'), "line terminator must be \\n");
+        let parsed: serde_json::Value = serde_json::from_str(body.trim_end()).expect("parse");
+        assert_eq!(parsed["kind"], "test.receipt");
+
+        // Second append must not truncate the first.
+        let receipt2 = serde_json::json!({"kind": "test.receipt", "id": "02"});
+        append_receipts_journal(dir.path(), &receipt2).expect("second append");
+        let body2 = std::fs::read_to_string(&path).expect("read 2");
+        assert_eq!(
+            body2.lines().count(),
+            2,
+            "second append should result in 2 lines, got {}",
+            body2.lines().count()
+        );
+
+        // Drift the mode to 0644 and confirm the next write refuses.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod 0644");
+        match append_receipts_journal(dir.path(), &serde_json::json!({"kind": "x"})) {
+            Err(JournalError::InsecureMode { mode }) => {
+                assert_eq!(mode & 0o777, 0o644, "expected 0644 in error, got {:#o}", mode);
+            }
+            other => panic!("expected InsecureMode error, got {:?}", other),
+        }
+    }
+
     #[test]
     fn identity_round_trips_through_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -1748,9 +2068,7 @@ mod tests {
 
     #[test]
     fn three_statement_receipt_preserves_per_statement_usage() {
-        use core_types::{
-            Block, Budget, ResourceSelector, ResourceType, SignedBlock, Statement,
-        };
+        use core_grant_types::{Block, Budget, ResourceSelector, ResourceType, SignedBlock, Statement};
 
         let identity = ensure_identity();
         let store = DaemonStore::open_in_memory().unwrap();
@@ -1807,15 +2125,15 @@ mod tests {
         // "unsigned-test" placeholder.
         let root = store.persona_root_keypair(&persona.id).unwrap();
         let signed = crate::trust::grant::sign_block_zero_with(&root, &block).unwrap();
-        let composed = core_types::AccessGrant {
+        let composed = core_grant_types::AccessGrant {
             id: grant.id.clone(),
             version: 1,
             issuing_persona_id: persona.id.clone(),
-            recipient_kind: core_types::PresentationAudienceKind::Service,
+            recipient_kind: core_event_types::PresentationAudienceKind::Service,
             recipient_id: "composite".into(),
-            recipient_profile: core_types::RecipientProfile::Agent,
-            status: core_types::GrantStatus::Active,
-            mode: core_types::GrantMode::OneShot,
+            recipient_profile: core_grant_types::RecipientProfile::Agent,
+            status: core_grant_types::GrantStatus::Active,
+            mode: core_grant_types::GrantMode::OneShot,
             blocks: vec![signed],
             attestation: AttestationBinding::default(),
             created_at: now,
@@ -1862,7 +2180,7 @@ mod tests {
     #[test]
     fn emit_receipt_populates_approval_chain_from_audit() {
         use crate::trust::approval::ApprovalOutcome as StoreApprovalOutcome;
-        use core_types::grant_receipt::{ApprovalActor, ApprovalOutcome};
+        use core_grant_types::grant_receipt::{ApprovalActor, ApprovalOutcome};
 
         let identity = ensure_identity();
         let store = DaemonStore::open_in_memory().unwrap();
@@ -1898,7 +2216,7 @@ mod tests {
     /// of the audit log's descending query order.
     #[test]
     fn emit_receipt_approval_chain_ordered_by_time() {
-        use core_types::grant_receipt::ApprovalActor;
+        use core_grant_types::grant_receipt::ApprovalActor;
 
         let identity = ensure_identity();
         let store = DaemonStore::open_in_memory().unwrap();
@@ -2021,7 +2339,7 @@ mod tests {
 
     #[test]
     fn generate_receipt_populates_per_statement_usage() {
-        use core_types::{Block, Budget, ResourceSelector, ResourceType, Statement};
+        use core_grant_types::{Block, Budget, ResourceSelector, ResourceType, Statement};
 
         let _identity = ensure_identity();
         let store = DaemonStore::open_in_memory().unwrap();
@@ -2067,15 +2385,15 @@ mod tests {
         };
         let root = store.persona_root_keypair(&persona.id).unwrap();
         let signed = crate::trust::grant::sign_block_zero_with(&root, &block).unwrap();
-        let composed = core_types::AccessGrant {
+        let composed = core_grant_types::AccessGrant {
             id: grant.id.clone(),
             version: 1,
             issuing_persona_id: persona.id.clone(),
-            recipient_kind: core_types::PresentationAudienceKind::Service,
+            recipient_kind: core_event_types::PresentationAudienceKind::Service,
             recipient_id: "composite-usage".into(),
-            recipient_profile: core_types::RecipientProfile::Agent,
-            status: core_types::GrantStatus::Active,
-            mode: core_types::GrantMode::OneShot,
+            recipient_profile: core_grant_types::RecipientProfile::Agent,
+            status: core_grant_types::GrantStatus::Active,
+            mode: core_grant_types::GrantMode::OneShot,
             blocks: vec![signed],
             attestation: AttestationBinding::default(),
             created_at: now_secs,
@@ -2432,6 +2750,137 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod broker_v2_tests {
+    //! Phase A substrate tests for v2 broker envelope builders +
+    //! `store_broker_receipt_v2` (implementation-note-212).
+
+    use super::*;
+    use crate::infra::store::DaemonStore;
+    use core_broker::{BrokerProvider, BrokerRequest, BrokeredCredential};
+    use core_crypto::{FixtureSigner, FixtureVerifier, Signer as _};
+    use core_events::receipt::sign::{sign_receipt_v2, verify_receipt_v2};
+    use secrecy::SecretString;
+    use std::time::{Duration, SystemTime};
+
+    fn fixture_request() -> BrokerRequest {
+        BrokerRequest {
+            provider: BrokerProvider::Anthropic,
+            scope: serde_json::json!({"tier": "free"}),
+            ttl: Duration::from_secs(3600),
+            reason: "round-trip".to_string(),
+            caller_persona: Some("persona-fixture".to_string()),
+            grants_file_rev: Some("rev-abc".to_string()),
+            grants_file_credential_name: Some("anthropic-default".to_string()),
+        }
+    }
+
+    fn fixture_credential() -> BrokeredCredential {
+        BrokeredCredential {
+            token: SecretString::from("ignored-by-receipt".to_string()),
+            expires_at: SystemTime::now() + Duration::from_secs(3600),
+            materialization_id: "mat-fixture-1".to_string(),
+        }
+    }
+
+    #[test]
+    fn build_materialization_envelope_has_v2_shape() {
+        let req = fixture_request();
+        let cred = fixture_credential();
+        let env = build_broker_materialization_envelope(&req, &cred, "daemon-root-test");
+        assert_eq!(env.kind, RECEIPT_KIND_BROKER_MATERIALIZATION);
+        assert_eq!(env.kind, "broker.materialization");
+        assert_eq!(env.version.0, "2");
+        assert_eq!(env.daemon_root_id, "daemon-root-test");
+        assert!(env.receipt_id.is_empty(), "unsigned envelope has empty receipt_id");
+        assert!(env.signature.is_none(), "unsigned envelope has no signature");
+        assert!(matches!(env.termination_authority, TerminationAuthority::DaemonPersona));
+        // Body shape — discriminator fields present.
+        assert_eq!(
+            env.body.get("provider").and_then(|v| v.as_str()),
+            Some(BrokerProvider::Anthropic.as_str())
+        );
+        assert_eq!(
+            env.body.get("materialization_id").and_then(|v| v.as_str()),
+            Some("mat-fixture-1")
+        );
+        assert_eq!(env.body.get("ttl_seconds").and_then(|v| v.as_u64()), Some(3600));
+        assert_eq!(
+            env.body.get("caller_persona").and_then(|v| v.as_str()),
+            Some("persona-fixture")
+        );
+    }
+
+    #[test]
+    fn build_revocation_envelope_has_v2_shape() {
+        let env = build_broker_revocation_envelope("mat-revoked-1", None, "daemon-root-test");
+        assert_eq!(env.kind, RECEIPT_KIND_BROKER_REVOCATION);
+        assert_eq!(env.kind, "broker.revocation");
+        assert_eq!(env.daemon_root_id, "daemon-root-test");
+        assert!(matches!(env.termination_authority, TerminationAuthority::DaemonPersona));
+        // Body shape — unknown-summary path defaults to provider="unknown".
+        assert_eq!(env.body.get("provider").and_then(|v| v.as_str()), Some("unknown"));
+        assert_eq!(
+            env.body.get("materialization_id").and_then(|v| v.as_str()),
+            Some("mat-revoked-1")
+        );
+    }
+
+    #[test]
+    fn build_sign_store_verify_round_trip() {
+        let signer = FixtureSigner::new("broker-v2-substrate");
+        let pk = signer.public_key();
+        let req = fixture_request();
+        let cred = fixture_credential();
+
+        let mut env = build_broker_materialization_envelope(&req, &cred, "daemon-root-rt");
+        sign_receipt_v2(&mut env, &signer).expect("sign v2 envelope");
+        assert!(!env.receipt_id.is_empty(), "sign populates receipt_id");
+        assert!(env.signature.is_some(), "sign populates signature");
+
+        let store = DaemonStore::open_in_memory().expect("in-memory store");
+        store.store_broker_receipt_v2(&env).expect("store v2 envelope");
+
+        // Verify the in-memory envelope round-trips through verification.
+        verify_receipt_v2(&env, &pk, &FixtureVerifier).expect("envelope verifies");
+    }
+
+    #[test]
+    fn store_rejects_non_broker_kind() {
+        let store = DaemonStore::open_in_memory().expect("in-memory store");
+        let bad = ReceiptEnvelope {
+            version: ReceiptVersion::default(),
+            kind: "session.claude_code".to_string(),
+            receipt_id: "deadbeef".repeat(8),
+            daemon_root_id: "daemon-root".into(),
+            traceparent: None,
+            termination_authority: TerminationAuthority::DaemonPersona,
+            presence_kind: None,
+            body: serde_json::json!({}),
+            signature: Some("ed25519sig:00".to_string()),
+        };
+        let r = store.store_broker_receipt_v2(&bad);
+        assert!(
+            matches!(r, Err(StoreError::InvalidInput(_))),
+            "non-broker kind must be rejected: {r:?}"
+        );
+    }
+
+    #[test]
+    fn store_rejects_unsigned_envelope() {
+        let store = DaemonStore::open_in_memory().expect("in-memory store");
+        let req = fixture_request();
+        let cred = fixture_credential();
+        // Built but not signed — receipt_id is empty.
+        let env = build_broker_materialization_envelope(&req, &cred, "daemon-root");
+        let r = store.store_broker_receipt_v2(&env);
+        assert!(
+            matches!(r, Err(StoreError::InvalidInput(_))),
+            "unsigned envelope must be rejected: {r:?}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Public re-exports
 // ---------------------------------------------------------------------------
@@ -2537,7 +2986,7 @@ pub fn trigger_receipt_if_terminal_current(
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-16 — kms receipt sink wiring
+// implementation-note-36 — kms receipt sink wiring
 // ---------------------------------------------------------------------------
 //
 // `core_kms::ReceiptSink` requires `Send + Sync`, but `DaemonStore` is
@@ -2617,7 +3066,7 @@ pub async fn drain_kms_receipts(
 #[cfg(test)]
 mod kms_tests {
     use super::*;
-    use core_types::grant_receipt::{
+    use core_grant_types::grant_receipt::{
         GrantEvaluation, GrantEvaluationOutcome, KmsReceipt, ReceiptKind, ReceiptOutcome,
         VaultReceipt,
     };
@@ -2635,6 +3084,7 @@ mod kms_tests {
                 grant_id: Some("grant-test-1".into()),
             },
             outcome: ReceiptOutcome::Success,
+            peer_identity: None,
             evidence: Evidence::default(),
         }
     }
@@ -2758,7 +3208,7 @@ mod kms_tests {
         current_identity().expect("identity was just initialised")
     }
 
-    /// EMBER-implementation-note-94 — mixed-kind audit query. Seed two kms receipts for
+    /// EMBER-implementation-note-172 — mixed-kind audit query. Seed two kms receipts for
     /// the same persona (one wrap, one unwrap) plus one for a different
     /// persona; the actor filter must return only the matching pair, and
     /// the rows must be sorted `materialized_at DESC`.
@@ -2803,7 +3253,7 @@ mod kms_tests {
         );
     }
 
-    /// EMBER-implementation-note-94 — kind filter narrows to a single discriminator.
+    /// EMBER-implementation-note-172 — kind filter narrows to a single discriminator.
     #[test]
     fn list_receipt_rows_filters_by_kind() {
         let _ = ensure_identity_for_kms_test();
@@ -2825,7 +3275,7 @@ mod kms_tests {
         assert_eq!(wraps[0].resource, "k1");
     }
 
-    /// EMBER-implementation-note-94 — resource substring filter (post-fetch) narrows
+    /// EMBER-implementation-note-172 — resource substring filter (post-fetch) narrows
     /// matches without forcing exact equality.
     #[test]
     fn list_receipt_rows_filters_by_resource_substring() {
@@ -2849,7 +3299,7 @@ mod kms_tests {
         assert!(rows.iter().all(|r| r.resource.contains("tokens")));
     }
 
-    /// EMBER-implementation-note-94 — index existence sanity check. Inspect the
+    /// EMBER-implementation-note-172 — index existence sanity check. Inspect the
     /// sqlite_master catalog and confirm the new audit-CLI indexes were
     /// created by the migration.
     #[test]

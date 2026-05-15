@@ -1,4 +1,4 @@
-//! implementation-note-65 regression: when the configured
+//! implementation-note-139 regression: when the configured
 //! dashboard port is already bound by another process, the daemon must
 //! report the failure truthfully via `runtime.dashboard_actual_addr`
 //! (== `None`) and via `/api/status`'s `dashboard_addr_bound` field
@@ -54,7 +54,7 @@ fn runtime_dashboard_actual_addr_is_none_when_bind_fails() {
         dashboard_addr: Some(blocked_addr),
         // Leave git_proxy disabled — only the dashboard bind is under test.
         git_proxy_addr: None,
-        ..Default::default()
+        ..DaemonConfig::for_test(tmp.path())
     };
 
     // `Arc<DaemonRuntime>` so the runtime survives the daemon-driver future

@@ -104,7 +104,7 @@ key = "wrangler.pages.deploy"
 default = "permit"
 biometric = "required"
 
-# --- Gap-fill from construct-coverage-audit (implementation-note-29) ---
+# --- Gap-fill from construct-coverage-audit (implementation-note-64) ---
 # wrangler.secret.bulk: bulk-import secrets from JSON; same threat model as secret.put
 # wrangler.r2.bucket.create: persistent R2 bucket creation
 # wrangler.d1.create: persistent D1 database creation

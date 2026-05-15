@@ -2,11 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use core_events::{EventEnvelope, EventRef};
 use core_trust::derive_public_statements;
-use core_types::{
-    grant_conditions::{GrantCondition, MAX_CONDITION_DEPTH},
-    EndpointDescriptor, EventBody, EventRefRelation, FileManifest, TrustAttestation, Validate,
-    ValidationError,
-};
+use core_grant_types::grant_conditions::{GrantCondition, MAX_CONDITION_DEPTH};
+use core_event_types::{EventBody, EventRefRelation, FileManifest};
+use core_principals::{EndpointDescriptor, TrustAttestation};
+use core_types::{Validate, ValidationError};
 
 use crate::{
     BadgeDisputeRecord, BadgeRecord, CredentialDepositRecord, CredentialDepositStatus,
@@ -98,7 +97,7 @@ pub fn advance_chain_head(state: &mut MaterializedState, event: &EventEnvelope) 
 /// `Object` layer adds 1 to the deepest child. Used by `apply_event` to
 /// reject signed-payload JSON whose nesting exceeds [`MAX_CONDITION_DEPTH`]
 /// before any structured deserialization (which itself recurses) is attempted.
-/// security check: defence in depth alongside `GrantCondition::validate_depth`.
+/// Defence in depth alongside `GrantCondition::validate_depth`.
 pub(crate) fn json_max_depth(v: &serde_json::Value) -> u32 {
     match v {
         serde_json::Value::Array(arr) => arr
@@ -676,15 +675,15 @@ pub fn apply_event(
         EventBody::DisclosureRevoked(_) => {}
         EventBody::RelayShutdownNotice(_) => {}
         EventBody::GrantOfferCreated(body) => {
-            // security check: validate conditions_json depth before materializing.
-            // The per-field size cap (MAX_CONDITIONS_JSON_BYTES = 8 KiB) is
+            // Validate conditions_json depth before materializing. The
+            // per-field size cap (MAX_CONDITIONS_JSON_BYTES = 8 KiB) is
             // enforced by GrantOfferCreatedEvent::validate() at event ingress,
-            // which is stricter than the 100 KiB target from SEC-5b.
-            // TODO(SEC-5b): if conditions_json is ever moved to a separate
+            // which is stricter than the 100 KiB target.
+            // TODO: if conditions_json is ever moved to a separate
             // storage path that bypasses event validation, add an explicit
             // 100 KiB byte-length check here.
             if !body.conditions_json.is_empty() {
-                // security check: traverse the raw JSON once before structured
+                // Traverse the raw JSON once before structured
                 // deserialization to reject deeply-nested payloads early.
                 // `serde_json::from_str::<Vec<GrantCondition>>` itself recurses
                 // and could blow the stack on adversarial input; a flat
@@ -699,7 +698,7 @@ pub fn apply_event(
                 let depth = json_max_depth(&raw_value);
                 if depth > MAX_CONDITION_DEPTH {
                     return Err(ValidationError::invalid_format(format!(
-                        "grant offer conditions_json rejected (security check): JSON nesting depth \
+                        "grant offer conditions_json rejected: JSON nesting depth \
                          {depth} exceeds maximum of {MAX_CONDITION_DEPTH}"
                     )));
                 }
@@ -712,7 +711,7 @@ pub fn apply_event(
                 for condition in &conditions {
                     condition.validate_depth().map_err(|e| {
                         ValidationError::invalid_format(format!(
-                            "grant offer conditions_json rejected (security check): {e}"
+                            "grant offer conditions_json rejected: {e}"
                         ))
                     })?;
                 }
@@ -898,10 +897,8 @@ mod tests {
     use super::*;
     use core_crypto::FixtureSigner;
     use core_events::{EventEnvelope, EventRef as CrateEventRef};
-    use core_types::{
-        DeviceReplacedEvent, EventBody, KeyAlgorithm, PublicKeyMaterial, RecoveryRequestedEvent,
-        RootCreatedEvent, SignerBinding,
-    };
+    use core_event_types::{DeviceReplacedEvent, EventBody, RecoveryRequestedEvent, RootCreatedEvent, SignerBinding};
+    use core_principals::{KeyAlgorithm, PublicKeyMaterial};
 
     fn make_key(key_id: &str) -> PublicKeyMaterial {
         PublicKeyMaterial {
@@ -1166,7 +1163,7 @@ mod tests {
         assert_eq!(state.recovery_requests_current.len(), 2);
     }
 
-    // ── security check: race-prone RecoveryApproved must not double-materialize ──
+    // ── Race-prone RecoveryApproved must not double-materialize ──
 
     #[test]
     fn recovery_approved_duplicate_from_same_guardian_is_idempotent() {
@@ -1204,16 +1201,16 @@ mod tests {
         // First approval — should flip status to Approved.
         let approve1 = make_event(
             "evt-approve-1",
-            EventBody::RecoveryApproved(core_types::RecoveryApprovedEvent {
+            EventBody::RecoveryApproved(core_event_types::RecoveryApprovedEvent {
                 request_id: "req-1".into(),
                 guardian_id: "guardian-1".into(),
             }),
             SignerBinding {
-                signer: core_types::EventSubject::new(
-                    core_types::SubjectKind::Guardian,
+                signer: core_event_types::EventSubject::new(
+                    core_event_types::SubjectKind::Guardian,
                     "guardian-1",
                 ),
-                role: core_types::KeyRole::Guardian,
+                role: core_event_types::KeyRole::Guardian,
                 key_id: "key-g1".into(),
             },
         );
@@ -1233,16 +1230,16 @@ mod tests {
         // otherwise corrupt state (BTreeSet insert is idempotent).
         let approve2 = make_event(
             "evt-approve-2",
-            EventBody::RecoveryApproved(core_types::RecoveryApprovedEvent {
+            EventBody::RecoveryApproved(core_event_types::RecoveryApprovedEvent {
                 request_id: "req-1".into(),
                 guardian_id: "guardian-1".into(),
             }),
             SignerBinding {
-                signer: core_types::EventSubject::new(
-                    core_types::SubjectKind::Guardian,
+                signer: core_event_types::EventSubject::new(
+                    core_event_types::SubjectKind::Guardian,
                     "guardian-1",
                 ),
-                role: core_types::KeyRole::Guardian,
+                role: core_event_types::KeyRole::Guardian,
                 key_id: "key-g1".into(),
             },
         );
@@ -1264,7 +1261,7 @@ mod tests {
         assert!(req_after_second.cooldown_until.is_none());
     }
 
-    // ── security check: prev_event_id + monotonic sequence chaining ──
+    // ── prev_event_id + monotonic sequence chaining ──
 
     fn make_event_with_refs(
         event_id: &str,
@@ -1301,7 +1298,7 @@ mod tests {
         let state = state_with_chain_head("evt-1", 1);
         let event = make_event_with_refs(
             "evt-bad",
-            EventBody::DeviceAdded(core_types::DeviceAddedEvent {
+            EventBody::DeviceAdded(core_event_types::DeviceAddedEvent {
                 root_id: "root-a".into(),
                 device_id: "device-x".into(),
                 label: "X".into(),
@@ -1326,7 +1323,7 @@ mod tests {
         let state = state_with_chain_head("evt-1", 1);
         let event = make_event_with_refs(
             "evt-skip",
-            EventBody::DeviceAdded(core_types::DeviceAddedEvent {
+            EventBody::DeviceAdded(core_event_types::DeviceAddedEvent {
                 root_id: "root-a".into(),
                 device_id: "device-skip".into(),
                 label: "Skip".into(),
@@ -1347,7 +1344,7 @@ mod tests {
         let state = state_with_chain_head("evt-1", 1);
         let event = make_event_with_refs(
             "evt-fork",
-            EventBody::DeviceAdded(core_types::DeviceAddedEvent {
+            EventBody::DeviceAdded(core_event_types::DeviceAddedEvent {
                 root_id: "root-a".into(),
                 device_id: "device-fork".into(),
                 label: "Fork".into(),
@@ -1370,7 +1367,7 @@ mod tests {
         let state = state_with_chain_head("evt-1", 1);
         let event = make_event_with_refs(
             "evt-2",
-            EventBody::DeviceAdded(core_types::DeviceAddedEvent {
+            EventBody::DeviceAdded(core_event_types::DeviceAddedEvent {
                 root_id: "root-a".into(),
                 device_id: "device-a".into(),
                 label: "A".into(),

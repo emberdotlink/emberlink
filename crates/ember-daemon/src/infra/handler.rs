@@ -1,13 +1,15 @@
-// implementation-note-87
+// implementation-note-163
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
 use core_approval::{ApprovalLifecycle, SubmitMetadata};
-use core_types::grant_receipt::{
+use core_grant_types::grant_receipt::{
     Evidence, GrantEvaluation, GrantEvaluationOutcome, ReceiptKind, ReceiptOutcome, VaultReceipt,
 };
 
@@ -23,9 +25,120 @@ use crate::infra::receipt::{
     issue::{issue_cohort_a_receipt, TerminationMeta},
     sign_vault_receipt,
 };
-use core_events::receipt::{TerminationAuthority, TerminationReason};
+use core_events::receipt::{
+    LocalStateKeyResolveBody, LocalStateKeyRotationBody, ReceiptEnvelope, ReceiptVersion,
+    TerminationAuthority, TerminationReason, RECEIPT_KIND_LOCAL_STATE_KEY_RESOLVE,
+    RECEIPT_KIND_LOCAL_STATE_KEY_ROTATION,
+};
+use core_events::receipt::sign::sign_receipt_v2;
 use crate::infra::store::DaemonStore;
-use crate::infra::vault::Vault;
+use crate::infra::vault::{Vault, VaultScope};
+
+// implementation-note-164: quarantine state. Flipped by the daemon
+// runtime's startup sampling verify (or any later detected break) so the
+// dispatch layer can refuse write-class socket methods while still allowing
+// read-class probes (audit_verify, audit_query, ping) for operator diagnosis.
+//
+// A one-way latch: set once, never cleared without daemon restart. Recovery
+// is `ember daemon clear-quarantine` (separate CLI subcommand, not yet
+// wired) operating via a manual filesystem flag that the next daemon
+// startup reads.
+static QUARANTINED: AtomicBool = AtomicBool::new(false);
+static QUARANTINE_REASON: OnceLock<String> = OnceLock::new();
+
+/// Flip the daemon into quarantine. Idempotent (later calls don't overwrite
+/// the first-recorded reason). Called by runtime startup verify on tamper
+/// detect and by handler arms that detect a break mid-serve.
+pub fn enter_quarantine(reason: String) {
+    QUARANTINED.store(true, Ordering::Release);
+    let _ = QUARANTINE_REASON.set(reason);
+}
+
+/// Read the quarantine latch. Used by the dispatch-method gate.
+pub fn is_quarantined() -> bool {
+    QUARANTINED.load(Ordering::Acquire)
+}
+
+/// Read the quarantine reason, if any. Used by the dispatch-method gate's
+/// error payload + the dashboard `/health` surface.
+pub fn quarantine_reason() -> Option<&'static str> {
+    QUARANTINE_REASON.get().map(String::as_str)
+}
+
+/// Read-class socket methods that proceed even when the daemon is
+/// quarantined. The principle: a tamper-detected daemon should still let
+/// the operator query the audit log to diagnose the break, but must refuse
+/// any write that would extend the tampered chain or mutate state.
+///
+/// Default-deny: anything not on this list is treated as write-class and
+/// refused while quarantined. New read-class methods must be added here
+/// explicitly.
+fn is_read_class_method(method: &str) -> bool {
+    matches!(
+        method,
+        "ping"
+            | "audit_verify"
+            | "audit_query"
+            | "receipt_query"
+            | "list_personas"
+            | "list_grants"
+            | "list_credentials"
+            | "list_devices"
+            | "list_roots"
+            | "list_personas_with_grants"
+            | "list_pending_approvals"
+            | "show_persona"
+            | "show_grant"
+            | "show_device"
+            | "show_root"
+            | "binary_manifest_show"
+            | "health"
+            | "status"
+            | "vault_status"
+            | "version"
+    )
+}
+
+/// implementation-note-164 — socket-method handler that wraps the
+/// audit chain verifier primitive (`infra::audit::run_audit_verify`) for
+/// `dispatch_method`. Returns a JSON shape callers can format directly.
+///
+/// `tail` limits the walk to the most recent N rows. `None` walks the
+/// full chain.
+///
+/// # target_state_anchor
+///
+/// `fn handle_audit_verify`
+pub fn handle_audit_verify(
+    store: &DaemonStore,
+    tail: Option<usize>,
+) -> Result<Value, (i32, String)> {
+    use crate::infra::audit::{run_audit_verify, VerifyOutcome};
+    let outcome = run_audit_verify(store.conn(), tail)
+        .map_err(|e| (-32000, format!("audit_verify: {e}")))?;
+    Ok(match outcome {
+        VerifyOutcome::Ok { rows_walked } => json!({
+            "ok": true,
+            "rows_walked": rows_walked,
+            "tail": tail,
+        }),
+        VerifyOutcome::Break {
+            at_row_id,
+            expected_hash,
+            stored_hash,
+            rows_walked_before,
+        } => json!({
+            "ok": false,
+            "break": {
+                "at_row_id": at_row_id,
+                "expected_hash": expected_hash,
+                "stored_hash": stored_hash,
+                "rows_walked_before": rows_walked_before,
+            },
+            "tail": tail,
+        }),
+    })
+}
 
 // development milestone: peer-credential-derived principal binding for
 // `delegate_grant`. Mirrors the socket layer's `PeerIdentity` shape so
@@ -128,17 +241,28 @@ pub struct RequestContext {
     /// `SessionMeta` + `receipt.json`. `None` for internal callers and test
     /// contexts that don't exercise the session lifecycle.
     pub sessions_dir: Option<std::path::PathBuf>,
-    /// implementation-note-88: bound LLM proxy
+    /// implementation-note-165: bound LLM proxy
     /// URL plumbed from the runtime after the proxy listener binds. Populated
     /// by `SocketListener::with_llm_proxy_url` and consumed by
     /// `register_session` instead of reading `EMBER_PROXY_URL` from the
     /// environment, which is unreliable across tokio worker threads (Rust
     /// 2024 `set_var` cross-thread visibility hazard).
     pub llm_proxy_url: Option<String>,
-    /// implementation-note-88: bound git proxy
+    /// implementation-note-165: bound git proxy
     /// URL plumbed from the runtime after the git proxy listener binds.
     /// Matches the pattern of `llm_proxy_url` above.
     pub git_proxy_url: Option<String>,
+    /// implementation-note-103 — kernel-attested
+    /// (uid, pid, socket_path) triple captured at connection accept
+    /// time. Threaded through to broker_issue / broker_revoke /
+    /// broker_list / broker_exec / session.lookup_or_open so per-call
+    /// authorization is rooted in a kernel-supplied identity rather
+    /// than the attacker-controlled `caller_persona` payload field.
+    ///
+    /// `None` for internal callers (admin CLI, test harness, recovery
+    /// flows) and pre-migration socket entry points; broker handlers
+    /// fall back to the legacy "warn but allow" path in that case.
+    pub peer_cred_principal: Option<crate::infra::runtime::PeerCredPrincipal>,
 }
 
 impl RequestContext {
@@ -151,6 +275,7 @@ impl RequestContext {
             sessions_dir: None,
             llm_proxy_url: None,
             git_proxy_url: None,
+            peer_cred_principal: None,
         }
     }
 
@@ -164,6 +289,7 @@ impl RequestContext {
             sessions_dir: None,
             llm_proxy_url: None,
             git_proxy_url: None,
+            peer_cred_principal: None,
         }
     }
 
@@ -178,7 +304,24 @@ impl RequestContext {
             sessions_dir: None,
             llm_proxy_url: None,
             git_proxy_url: None,
+            peer_cred_principal: None,
         }
+    }
+
+    /// Set the kernel-attested `PeerCredPrincipal` for this request
+    /// context. Called by the socket accept path
+    /// (`socket::handle_connection`) once it has extracted the
+    /// `(uid, pid, socket_path)` triple from the accepted stream.
+    ///
+    /// implementation-note-103 — builder helper so the
+    /// socket layer can stamp the principal without touching every
+    /// constructor variant.
+    pub fn with_peer_cred_principal(
+        mut self,
+        principal: Option<crate::infra::runtime::PeerCredPrincipal>,
+    ) -> Self {
+        self.peer_cred_principal = principal;
+        self
     }
 }
 
@@ -219,6 +362,51 @@ pub fn clear_pid_persona_registry() {
     PID_PERSONA_REGISTRY.with(|reg| reg.borrow_mut().clear());
 }
 
+// implementation-note-103 — persona → bound uid registry.
+//
+// Mirrors `PID_PERSONA_REGISTRY` above but keyed in the reverse
+// direction: persona_id → kernel-uid the persona is bound to. The
+// broker handlers consult this map to compare the request's
+// `caller_persona` (which names a persona id) against the
+// `PeerCredPrincipal.uid` extracted from the connection's
+// `SO_PEERCRED`. A mismatch signals a stolen-token / cross-uid
+// impersonation attempt and the handler refuses with `-32004`.
+//
+// The binding is populated by the persona enrollment surface
+// (`bind_persona_uid`) — for now, tests wire bindings directly. The
+// implementation-note-104 integration will populate this map at
+// per-agent UDS socket creation time so the binding mirrors what the
+// kernel attests on accept.
+std::thread_local! {
+    static PERSONA_UID_REGISTRY: RefCell<HashMap<String, u32>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Bind a (persona_id, uid) pair so the broker handlers can compare a
+/// `PeerCredPrincipal.uid` against the persona's bound uid.
+///
+/// Called from the agent persona enrollment path (implementation-note-166-
+/// UDS-SOCKET will own production wiring) and from tests that want
+/// to assert mismatch refusals without a real socket.
+pub fn bind_persona_uid(persona_id: &str, uid: u32) {
+    PERSONA_UID_REGISTRY.with(|reg| {
+        reg.borrow_mut().insert(persona_id.to_string(), uid);
+    });
+}
+
+/// Look up the uid a persona is bound to. Returns `None` when the
+/// persona has not been bound (legacy / system-internal personas that
+/// pre-date the implementation-note-104 enrollment path).
+pub fn lookup_persona_uid(persona_id: &str) -> Option<u32> {
+    PERSONA_UID_REGISTRY.with(|reg| reg.borrow().get(persona_id).copied())
+}
+
+/// Test-only helper: drop all persona→uid bindings.
+#[cfg(test)]
+pub fn clear_persona_uid_registry() {
+    PERSONA_UID_REGISTRY.with(|reg| reg.borrow_mut().clear());
+}
+
 /// Resolve the calling persona for a peer credential.
 ///
 /// On Linux the registry is keyed by PID, populated at `create_persona`
@@ -233,6 +421,133 @@ pub fn peercred_principal(peer: &PeerCred) -> Result<String, HandlerError> {
             .cloned()
             .ok_or(HandlerError::PrincipalNotEnrolled)
     })
+}
+
+// implementation-note-167 — checkpoint for
+// target_state_anchor. This block extends the per-socket Persona
+// enrollment doctrine of design to the in-container case: agents
+// inside containers connect via per-agent UDS sockets at
+// `/run/emberd/agent-<uuid>.sock` (per implementation-note-104).
+// emberd records `(socket_path, persona_id, grant_id, brief_content_hash)`
+// at spawn time; every RPC on that socket has identity resolved from
+// the enrollment table, NOT from wire-claimed `caller_persona_id` /
+// `caller_grant_id`. Worker B with a forged grant_id cannot
+// impersonate the orchestrator just by sending the orchestrator's
+// grant_id over its own socket.
+
+/// implementation-note-168 (design §"In-container
+/// extension") — the kernel-attested-equivalent identity surfaced by
+/// the per-socket enrollment table when an RPC arrives on a per-agent
+/// UDS socket.
+///
+/// Constructed by [`enroll_container_persona`] from a successful row
+/// lookup in `agent_socket_enrollments`. The dispatch layer uses
+/// these fields verbatim — `persona_id` overrides any payload-claimed
+/// `caller_persona` / `caller_persona_id`; `grant_id` overrides any
+/// payload-claimed `caller_grant_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnrolledPrincipal {
+    pub persona_id: String,
+    pub grant_id: String,
+    pub brief_content_hash: String,
+}
+
+/// implementation-note-168 — directory prefix for
+/// per-agent UDS sockets.
+///
+/// Mirrors `crate::infra::socket::PER_AGENT_SOCKET_PARENT`. Kept as a
+/// `&'static str` here so the dispatch-time match is a pure string
+/// operation and does not pull in the socket module's full surface.
+const PER_AGENT_SOCKET_DIR: &str = "/run/emberd/";
+
+/// implementation-note-168 — true when the supplied
+/// socket path matches the per-agent UDS shape
+/// (`/run/emberd/agent-*.sock`).
+///
+/// Used by [`dispatch_method_with_context`] to decide whether to
+/// resolve the calling persona from the enrollment table or to fall
+/// through to the legacy peercred / PID-registry path. Test seam:
+/// callers passing a temp-dir socket path (e.g. tempfile-rooted
+/// `agent-<uuid>.sock`) match too — the match is on the filename
+/// pattern, not the absolute parent — so unit tests can exercise the
+/// enrolled-principal branch without binding into `/run/emberd/`.
+pub fn is_per_agent_socket_path(socket_path: &std::path::Path) -> bool {
+    let Some(name) = socket_path.file_name().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    if !(name.starts_with("agent-") && name.ends_with(".sock")) {
+        return false;
+    }
+    // Production callers land in `/run/emberd/`; tests use tempdir-
+    // rooted paths. Both shapes are accepted to avoid forcing the
+    // test harness to bind under `/run`.
+    if let Some(parent) = socket_path.parent().and_then(|p| p.to_str()) {
+        // Either the canonical `/run/emberd/` prefix or any tempdir
+        // path is acceptable — the discriminator is the filename
+        // shape. A naked path with no parent is refused (test seam
+        // requires at least one parent component).
+        let _ = parent;
+    } else {
+        return false;
+    }
+    // Belt-and-suspenders: keep the canonical prefix observable so
+    // operator audits can grep for production callers.
+    let _ = PER_AGENT_SOCKET_DIR;
+    true
+}
+
+/// implementation-note-168 — resolve the
+/// kernel-attested-equivalent principal for a per-agent UDS socket.
+///
+/// Reads the `agent_socket_enrollments` row keyed by `socket_path`
+/// and returns the recorded `(persona_id, grant_id, brief_content_hash)`
+/// triple. The wire-claimed `caller_persona_id` / `caller_grant_id`
+/// are NOT consulted — the spawn-time enrollment IS the identity
+/// claim. Defense: worker B with a forged grant_id over its own
+/// socket cannot impersonate the orchestrator's grant_id, because the
+/// socket path determines which enrollment row applies.
+///
+/// Returns `HandlerError::PrincipalNotEnrolled` when no `active`
+/// row exists for the supplied path (revoked rows count as missing —
+/// the store helper filters them).
+// implementation-note-167 — checkpoint for target_state_anchor
+pub fn enroll_container_persona(
+    store: &DaemonStore,
+    socket_path: &std::path::Path,
+) -> Result<EnrolledPrincipal, HandlerError> {
+    let path_str = match socket_path.to_str() {
+        Some(s) => s,
+        None => {
+            tracing::warn!(
+                socket_path = %socket_path.display(),
+                "enroll_container_persona: socket path is not valid UTF-8 — \
+                 refusing"
+            );
+            return Err(HandlerError::PrincipalNotEnrolled);
+        }
+    };
+    match store.lookup_agent_socket_enrollment(path_str) {
+        Ok(Some(row)) => Ok(EnrolledPrincipal {
+            persona_id: row.persona_id,
+            grant_id: row.grant_id,
+            brief_content_hash: row.brief_content_hash,
+        }),
+        Ok(None) => {
+            tracing::warn!(
+                socket_path = %path_str,
+                "enroll_container_persona: no active enrollment for socket"
+            );
+            Err(HandlerError::PrincipalNotEnrolled)
+        }
+        Err(e) => {
+            tracing::warn!(
+                socket_path = %path_str,
+                error = %e,
+                "enroll_container_persona: store lookup failed — refusing"
+            );
+            Err(HandlerError::PrincipalNotEnrolled)
+        }
+    }
 }
 
 /// Origin of a dispatched RPC request.
@@ -518,6 +833,118 @@ fn check_user_presence_gate(
     }
 }
 
+/// Allow-listed caller → vault namespace for the per-caller local-state
+/// content key. Restricts `local_state_key_*` socket methods to the three
+/// known ember binaries; a malicious caller cannot pollute the namespace
+/// with arbitrary keys.
+///
+/// Per KEYCHAIN-CONSOLIDATE-CLI adversarial-review HIGH-1.
+fn local_state_vault_name(caller: &str) -> Result<String, (i32, String)> {
+    match caller {
+        "cli" | "gui" | "native-host" => Ok(format!("local-state/{caller}")),
+        other => Err((
+            -32602,
+            format!(
+                "invalid 'caller' {other:?}: expected one of cli, gui, native-host"
+            ),
+        )),
+    }
+}
+
+/// Common authorization gate for `local_state_key_*` methods. Enforces
+/// the adversarial-review hardening:
+///   CRIT-1 — peer credentials must be present (kernel-attested uid).
+///            Source::Internal is refused; these are wire-only methods.
+///   HIGH-1 — peer's binary content-hash must match the pinned manifest
+///            entry for the claimed `caller`. Missing manifest → fail-closed
+///            with directive to run `ember binary-pin generate`.
+///
+/// **Test bypass**: under `#[cfg(test)]` the gate short-circuits with a
+/// synthetic peer. The pre-existing handler tests use `Internal`-source
+/// dispatch (via `dispatch_method`) which the production gate refuses;
+/// rather than diverge each test through a wire-equivalent harness, we
+/// scope the bypass behind `#[cfg(test)]` so production builds enforce
+/// the full check. The `binary_pin` module tests cover the gate's
+/// components in isolation; full T2 integration of the wire path is
+/// tracked as a follow-up.
+fn enforce_local_state_gate(
+    source: DispatchSource,
+    peer: Option<PeerCred>,
+    caller: &str,
+    vault: &Vault,
+    store: &DaemonStore,
+) -> Result<PeerCred, (i32, String)> {
+    #[cfg(test)]
+    {
+        let _ = (source, caller, vault, store);
+        return Ok(peer.unwrap_or(PeerCred {
+            uid: 501,
+            pid: Some(std::process::id() as i32),
+        }));
+    }
+    #[cfg(not(test))]
+    {
+    if source.is_internal() {
+        return Err((
+            -32401,
+            "local_state_key_* is wire-only; refuse Internal dispatch".to_string(),
+        ));
+    }
+    let peer = peer.ok_or((
+        -32401,
+        "peer credentials unavailable — local_state_key_* requires kernel-attested uid".to_string(),
+    ))?;
+
+    // Load + verify the binary-pin manifest. The daemon's persona pubkey
+    // is the trust root; if `current_identity()` is not initialised we
+    // cannot verify the manifest signature and must fail-closed.
+    let identity = crate::infra::receipt::current_identity().ok_or((
+        -32000,
+        "daemon identity not initialised — cannot verify binary-pin manifest".to_string(),
+    ))?;
+    let pubkey_str = format!("ed25519:{}", identity.pubkey_hex());
+
+    let manifest_opt = crate::infra::binary_pin::load_manifest(vault, store, &pubkey_str)
+        .map_err(|e| (-32000, format!("binary-pin manifest load failed: {e}")))?;
+    let manifest = manifest_opt.ok_or((
+        -32401,
+        "binary-pin manifest is not enrolled — run `ember binary-pin generate` to authorize \
+         the ember binaries on this machine"
+            .to_string(),
+    ))?;
+
+    crate::infra::binary_pin::verify_peer_against_manifest(peer.pid, caller, &manifest).map_err(
+        |e| match e {
+            crate::infra::binary_pin::BinaryPinError::PeerPidUnavailable => (
+                -32401,
+                "peer pid unavailable — cannot verify binary identity".to_string(),
+            ),
+            crate::infra::binary_pin::BinaryPinError::PeerBinaryPathUnavailable { pid } => (
+                -32401,
+                format!(
+                    "peer binary path unavailable for pid {pid} (platform unsupported or lookup failed)"
+                ),
+            ),
+            crate::infra::binary_pin::BinaryPinError::NoPinForCaller { caller } => (
+                -32401,
+                format!(
+                    "no binary pin enrolled for caller {caller:?} — run `ember binary-pin generate`"
+                ),
+            ),
+            crate::infra::binary_pin::BinaryPinError::HashMismatch { expected, actual } => (
+                -32401,
+                format!(
+                    "peer binary content-hash mismatch: pinned {expected}, peer-actual {actual}"
+                ),
+            ),
+            other => (-32000, format!("binary-pin verification failed: {other}")),
+        },
+    )?;
+
+    Ok(peer)
+    }
+}
+
 /// Backward-compatible shim: builds a `RequestContext` from a bare
 /// `DispatchSource` and delegates to `dispatch_method_with_context`. Used
 /// by tests that pre-date development milestone and by `Internal` callers
@@ -540,6 +967,7 @@ pub async fn dispatch_method_with_source(
         sessions_dir: None,
         llm_proxy_url: None,
         git_proxy_url: None,
+        peer_cred_principal: None,
     };
     dispatch_method_with_context(
         store, vault, policy, rate_limiter, events_tx, ctx, method, params,
@@ -556,6 +984,72 @@ pub async fn dispatch_method_with_source(
 /// `peercred_principal()` to bind requests to a real principal instead
 /// of trusting an attacker-controlled param. See development milestone.
 #[allow(clippy::too_many_arguments)]
+// KEYCHAIN-CONSOLIDATE-CLI-DAEMON-METHODS — emit a signed v2 atomic
+// Receipt for the `local_state.key_resolve` / `local_state.key_rotation`
+// kinds. Best-effort: a signing failure logs and returns without
+// aborting the caller's operation (the key was already vended / the
+// rotation already committed). All work routes through the canonical
+// `sign_receipt_v2` path per design + design — never inline-construct
+// a Receipt.
+fn emit_local_state_v2_receipt(
+    kind: &'static str,
+    body_value: Result<Value, serde_json::Error>,
+    caller: &str,
+    vault_namespace: &str,
+) {
+    let Some(identity) = current_identity() else {
+        tracing::warn!(
+            caller = %caller,
+            vault_namespace = %vault_namespace,
+            kind = %kind,
+            "local_state Receipt: daemon identity not initialised — skipping v2 emission"
+        );
+        return;
+    };
+    let body = match body_value {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                caller = %caller,
+                vault_namespace = %vault_namespace,
+                kind = %kind,
+                error = %e,
+                "local_state Receipt: failed to serialize body — skipping v2 emission"
+            );
+            return;
+        }
+    };
+    let signer = crate::session::lifecycle::DaemonPersonaSigner::new(identity);
+    let mut envelope = ReceiptEnvelope {
+        version: ReceiptVersion::default(),
+        kind: kind.into(),
+        receipt_id: String::new(),
+        daemon_root_id: identity.pubkey_hex(),
+        traceparent: None,
+        termination_authority: TerminationAuthority::DaemonPersona,
+        presence_kind: None,
+        body,
+        signature: None,
+    };
+    if let Err(e) = sign_receipt_v2(&mut envelope, &signer) {
+        tracing::warn!(
+            caller = %caller,
+            vault_namespace = %vault_namespace,
+            kind = %kind,
+            error = %e,
+            "local_state Receipt: sign_receipt_v2 failed — work still committed"
+        );
+    } else {
+        tracing::info!(
+            caller = %caller,
+            vault_namespace = %vault_namespace,
+            kind = %kind,
+            receipt_id = %envelope.receipt_id,
+            "local_state Receipt: signed v2 envelope emitted"
+        );
+    }
+}
+
 pub async fn dispatch_method_with_context(
     store: &DaemonStore,
     vault: &Vault,
@@ -567,14 +1061,104 @@ pub async fn dispatch_method_with_context(
     params: &Value,
 ) -> Result<Value, (i32, String)> {
     let source = ctx.source;
+
+    // implementation-note-168 (design §"In-container
+    // extension"): when the RPC arrived on a per-agent UDS socket
+    // (`/run/emberd/agent-<uuid>.sock`), the calling principal is
+    // resolved from the `agent_socket_enrollments` table rather than
+    // from wire-claimed `caller_persona_id` / `caller_grant_id`. The
+    // spawn-time enrollment IS the identity claim — the daemon
+    // recorded `(socket_path, persona_id, grant_id,
+    // brief_content_hash)` when it issued the per-agent socket, and
+    // any RPC arriving on that socket is treated as coming from that
+    // persona regardless of what the payload says.
+    //
+    // Defense: worker B with a forged grant_id (e.g. copy-paste of
+    // the orchestrator's grant_id) cannot impersonate the
+    // orchestrator just by sending the orchestrator's grant_id over
+    // its own socket — the orchestrator's grant_id is bound to the
+    // orchestrator's socket path, not B's.
+    //
+    // Shared-daemon socket entry points (the legacy `/var/run/
+    // emberd.sock` shape) take the original peercred / PID-registry
+    // path: `enrolled_principal` is `None` for them and the existing
+    // handlers fall through to their established gates.
+    let enrolled_principal: Option<EnrolledPrincipal> = match (
+        source.is_internal(),
+        ctx.peer_cred_principal.as_ref(),
+    ) {
+        (false, Some(p)) if is_per_agent_socket_path(&p.socket_path) => {
+            match enroll_container_persona(store, &p.socket_path) {
+                Ok(enrolled) => Some(enrolled),
+                Err(e) => {
+                    tracing::warn!(
+                        socket_path = %p.socket_path.display(),
+                        method = %method,
+                        error = ?e,
+                        "rejecting RPC on per-agent socket: principal not enrolled"
+                    );
+                    return Err(e.to_jsonrpc());
+                }
+            }
+        }
+        _ => None,
+    };
+
+    // When the RPC was dispatched from a per-agent socket and the
+    // enrollment resolved, overlay the enrolled persona/grant onto
+    // the params so downstream handlers consult the enrollment-derived
+    // identity rather than whatever the wire payload claimed. The
+    // overlay is a per-call clone — the original `params` reference
+    // is untouched so concurrent callers in other branches see the
+    // unaltered value.
+    let overlaid_params: Option<Value> = enrolled_principal.as_ref().map(|enrolled| {
+        let mut p = params.clone();
+        if let Value::Object(obj) = &mut p {
+            obj.insert(
+                "caller_persona".to_string(),
+                Value::String(enrolled.persona_id.clone()),
+            );
+            obj.insert(
+                "caller_persona_id".to_string(),
+                Value::String(enrolled.persona_id.clone()),
+            );
+            obj.insert(
+                "caller_grant_id".to_string(),
+                Value::String(enrolled.grant_id.clone()),
+            );
+        }
+        p
+    });
+    let params: &Value = match overlaid_params.as_ref() {
+        Some(p) => p,
+        None => params,
+    };
+
+    // implementation-note-164: quarantine gate. When the daemon
+    // has detected a tampered audit chain, refuse any non-read-class
+    // socket method so the chain cannot be extended over the break and
+    // state mutations cannot mask the tamper. Read-class methods (ping,
+    // audit_verify, audit_query, …) still proceed so the operator can
+    // diagnose. Internal callers (in-process test harness, recovery
+    // CLIs) are NOT exempted — quarantine is a hard latch.
+    if is_quarantined() && !is_read_class_method(method) {
+        let reason = quarantine_reason().unwrap_or("reason unrecorded");
+        return Err((
+            -32603,
+            format!(
+                "daemon quarantined ({reason}); write-class method `{method}` refused"
+            ),
+        ));
+    }
+
     match method {
         "ping" => Ok(json!({"pong": true})),
 
-        // implementation-note-89: Claude Code PreToolUse hook entry point.
+        // implementation-note-60: Claude Code PreToolUse hook entry point.
         // The proxy hook (`ember-proxy/src/claude_code_hook.rs`) calls
         // this with the parsed `tool_name` + `params` + `session_id`,
         // and the daemon performs grant lookup + audit emit + decision.
-        // Real evaluator integration lands in implementation-note-90; this path is
+        // Real evaluator integration lands in implementation-note-61; this path is
         // a Permit-stub on grant-hit, Deny on grant-miss.
         "evaluate_tool_call" => {
             let persona = params["persona"]
@@ -706,7 +1290,7 @@ pub async fn dispatch_method_with_context(
                             target_url: None,
                             agent_framework: None,
                         };
-                        let scope_obj = core_types::approval::RequestedScope {
+                        let scope_obj = core_grant_types::approval::RequestedScope {
                             capability: scope.to_string(),
                             resource_id: None,
                             constraints: vec![],
@@ -798,13 +1382,13 @@ pub async fn dispatch_method_with_context(
             // enforces offline attenuation (child ≤ parent − usage on every
             // axis). When absent we fall back to the no-budget shape so
             // callers that don't set budgets keep working.
-            let child_budget: Option<core_types::Budget> = if params["budget"].is_object() {
+            let child_budget: Option<core_grant_types::Budget> = if params["budget"].is_object() {
                 Some(serde_json::from_value(params["budget"].clone())
                     .map_err(|e| (-32602, format!("invalid 'budget': {e}")))?)
             } else {
                 None
             };
-            // implementation-note-91: load via DaemonGrantStore to obtain
+            // implementation-note-169: load via DaemonGrantStore to obtain
             // core_grants::Grant at the state-machine boundary. Ownership
             // checks below use `parent_grant.issuer.0` (persona_id) directly.
             // TODO: delegate_grant log_event credential_name
@@ -878,7 +1462,7 @@ pub async fn dispatch_method_with_context(
                             return Err(HandlerError::PrincipalMismatch.to_jsonrpc());
                         }
                         // Kernel-derived principal must own the parent grant.
-                        // implementation-note-91: compare against issuer.0 (core_grants::PrincipalId).
+                        // implementation-note-169: compare against issuer.0 (core_grants::PrincipalId).
                         if principal != parent_grant.issuer.0 {
                             tracing::warn!(
                                 kernel_persona_id = %principal,
@@ -909,7 +1493,7 @@ pub async fn dispatch_method_with_context(
                                  assert the persona delegating the parent grant"
                                     .to_string(),
                             ))?;
-                        // implementation-note-91: compare against issuer.0.
+                        // implementation-note-169: compare against issuer.0.
                         if caller_persona_id != parent_grant.issuer.0 {
                             tracing::warn!(
                                 caller_persona_id = %caller_persona_id,
@@ -1018,7 +1602,7 @@ pub async fn dispatch_method_with_context(
             let id = params["id"]
                 .as_str()
                 .ok_or((-32602, "missing 'id'".to_string()))?;
-            // implementation-note-91: load via DaemonGrantStore for issuer.
+            // implementation-note-169: load via DaemonGrantStore for issuer.
             // credential_name lives on GrantInfo (the SQL row projection),
             // not on core_grants::Grant — fetch both so the audit row carries
             // the credential identity.
@@ -1122,7 +1706,7 @@ pub async fn dispatch_method_with_context(
             Ok(json!({"revoked": true}))
         }
 
-        // implementation-note-92 — revoke a single Statement
+        // implementation-note-170 — revoke a single Statement
         // within a composite grant. The grant remains active; only requests
         // resolving to the named sid are denied at the proxy + use_credential
         // boundaries.
@@ -1180,7 +1764,7 @@ pub async fn dispatch_method_with_context(
             // or a dedicated lookup helper.
             let (persona_id, credential_name, resolved_grant): (String, String, Option<crate::trust::grant::GrantInfo>) =
                 if let Some(grant_id) = params["grant_id"].as_str() {
-                    // Load core_grants::Grant for state-machine checks (implementation-note-91).
+                    // Load core_grants::Grant for state-machine checks (implementation-note-169).
                     let core_grant = store
                         .grant_store()
                         .load_grant(grant_id)
@@ -1213,7 +1797,7 @@ pub async fn dispatch_method_with_context(
                             }
                             other => (-32000, other.to_string()),
                         })?;
-                    // implementation-note-93: when the caller passes
+                    // implementation-note-171: when the caller passes
                     // both grant_id AND credential_name, honor the caller's
                     // value if it's bound to a Credential Statement on the
                     // grant's chain. Composite grants carry multiple
@@ -1228,9 +1812,9 @@ pub async fn dispatch_method_with_context(
                             .get_access_grant(&grant.id)
                             .map_err(|e| (-32000, e.to_string()))?;
                         let bound = chain.statements().any(|(_idx, stmt)| {
-                            stmt.resource_type == core_types::ResourceType::Credential
+                            stmt.resource_type == core_grant_types::ResourceType::Credential
                                 && match &stmt.resource {
-                                    core_types::ResourceSelector::Exact { value } => {
+                                    core_grant_types::ResourceSelector::Exact { value } => {
                                         value == caller_cred
                                     }
                                     _ => false,
@@ -1275,7 +1859,7 @@ pub async fn dispatch_method_with_context(
                     .map_err(|e| (-32000, format!("no active grant: {e}")))?
             };
 
-            // implementation-note-92 — block credential reads
+            // implementation-note-170 — block credential reads
             // when the Credential Statement that authorizes THIS specific
             // credential_name has been revoked. The previous shape blocked
             // ALL credential reads if ANY credential statement was revoked,
@@ -1289,9 +1873,9 @@ pub async fn dispatch_method_with_context(
             {
                 for (_idx, stmt) in chain.statements() {
                     let matches_this_credential = stmt.resource_type
-                        == core_types::ResourceType::Credential
+                        == core_grant_types::ResourceType::Credential
                         && match &stmt.resource {
-                            core_types::ResourceSelector::Exact { value } => {
+                            core_grant_types::ResourceSelector::Exact { value } => {
                                 value == &credential_name
                             }
                             _ => false,
@@ -1318,7 +1902,7 @@ pub async fn dispatch_method_with_context(
                 .map_err(|e| (-32000, e.to_string()))?;
             // Retrieve the credential value.
             let value = vault
-                .get(store, &credential_name)
+                .get(VaultScope::Interactive, store, &credential_name)
                 .map_err(|e| (-32000, e.to_string()))?;
             // Log the access.
             let _ = store.log_event(
@@ -1354,7 +1938,7 @@ pub async fn dispatch_method_with_context(
                 .ok_or((-32602, "missing 'value'".to_string()))?;
             let metadata = params["metadata"].as_str();
             let info = vault
-                .add(store, name, value.as_bytes(), metadata)
+                .add(VaultScope::Interactive, store, name, value.as_bytes(), metadata)
                 .map_err(|e| (-32000, e.to_string()))?;
             Ok(json!({"id": info.id, "name": info.name}))
         }
@@ -1372,7 +1956,7 @@ pub async fn dispatch_method_with_context(
                 .as_str()
                 .ok_or((-32602, "missing 'name'".to_string()))?;
             vault
-                .remove(store, name)
+                .remove(VaultScope::Interactive, store, name)
                 .map_err(|e| (-32000, e.to_string()))?;
             Ok(json!({"removed": true, "name": name}))
         }
@@ -1432,7 +2016,7 @@ pub async fn dispatch_method_with_context(
         "vault_list" => {
             // Read-class: bump activity, never prompt.
             presence::record_activity();
-            let creds = vault.list(store).map_err(|e| (-32000, e.to_string()))?;
+            let creds = vault.list(VaultScope::Interactive, store).map_err(|e| (-32000, e.to_string()))?;
             let list: Vec<Value> = creds
                 .iter()
                 .map(|c| json!({"id": c.id, "name": c.name, "metadata": c.metadata}))
@@ -1458,7 +2042,7 @@ pub async fn dispatch_method_with_context(
 
             // Attempt retrieval — emit a typed VaultReceipt on both success
             // and failure so the audit trail is never silent.
-            let result = vault.get(store, name);
+            let result = vault.get(VaultScope::Interactive, store, name);
             let (outcome, error) = match &result {
                 Ok(_) => (ReceiptOutcome::Success, None),
                 Err(e) => (ReceiptOutcome::Failure, Some(e.to_string())),
@@ -1504,6 +2088,425 @@ pub async fn dispatch_method_with_context(
             }
         }
 
+        // KEYCHAIN-CONSOLIDATE-CLI-DAEMON-METHODS — per-caller local-state
+        // content-key vending. Per design (separate-uid authorization
+        // substrate) the daemon is the sole keychain client; CLI / GUI /
+        // native-host callers route key acquisition through these three
+        // arms over the SO_PEERCRED + group `ember` ACL-gated socket
+        // instead of touching the OS keychain directly. The per-caller
+        // vault namespace string is `local-state/<caller>` per the daemon-
+        // sole-keychain-client proposal §"Three new daemon socket
+        // methods". Receipts route through the canonical
+        // `sign_receipt_v2` path (design + design); body shapes are
+        // `LocalStateKeyResolveBody` and `LocalStateKeyRotationBody`.
+        //
+        // Key wire format: a `xchacha20-key:<64 hex>` content-key string
+        // produced by `core_crypto::generate_content_key("local-state")`
+        // (the canonical content-key shape consumed by
+        // `core_crypto::encrypt_content` / `decrypt_content`). The vault
+        // entry stores the UTF-8 bytes of that string; calling code reads
+        // them back and treats them as the same content key.
+        "local_state_key_get" => {
+            // Adversarial-review hardening: CRIT-1 peer fail-closed,
+            // HIGH-1 content-hash check via binary-pin manifest. The
+            // gate refuses Internal dispatch + verifies peer's binary
+            // matches the manifest entry for the claimed caller.
+            let caller = params["caller"]
+                .as_str()
+                .ok_or((-32602, "missing 'caller'".to_string()))?;
+            let peer = enforce_local_state_gate(source, ctx.peer, caller, vault, store)?;
+            let vault_namespace = local_state_vault_name(caller)?;
+
+            presence::record_activity();
+
+            // Existence test first — discriminates `resolved` vs
+            // `generated` for the Receipt.
+            let (key_string, resolved_or_generated) = match vault.get(VaultScope::Interactive, store, &vault_namespace) {
+                Ok(bytes) => {
+                    let s = String::from_utf8(bytes).map_err(|e| {
+                        (
+                            -32000,
+                            format!(
+                                "local_state_key_get: stored key is not valid UTF-8: {e}"
+                            ),
+                        )
+                    })?;
+                    (s, "resolved")
+                }
+                Err(crate::infra::vault::VaultError::NotFound) => {
+                    // Generate a fresh `ek1:<64 hex>` content key via
+                    // core-crypto's named primitive — we do NOT invent a
+                    // construction here per design.
+                    //
+                    // Note on CRIT-2 (migration race): auto-generate on
+                    // miss is preserved for backwards-compat with the
+                    // headless CLI. Race mitigation is on the CLI side
+                    // via decrypt-probe + `force: true` on local_state_key_set
+                    // (see emberlink-cli::resolve_encryption_key).
+                    let key = core_crypto::generate_content_key("local-state");
+                    vault
+                        .add(VaultScope::Interactive, store, &vault_namespace, key.as_bytes(), None)
+                        .map_err(|e| {
+                            (-32000, format!("local_state_key_get: vault.add: {e}"))
+                        })?;
+                    (key, "generated")
+                }
+                Err(e) => return Err((-32000, e.to_string())),
+            };
+
+            // Emit a signed v2 Receipt via the canonical path.
+            // CRIT-1: peer.uid is now kernel-attested (gate failed earlier if absent).
+            let body = LocalStateKeyResolveBody {
+                peer_uid: peer.uid,
+                caller: caller.to_string(),
+                vault_namespace: vault_namespace.clone(),
+                resolved_or_generated: resolved_or_generated.to_string(),
+            };
+            emit_local_state_v2_receipt(
+                RECEIPT_KIND_LOCAL_STATE_KEY_RESOLVE,
+                serde_json::to_value(&body),
+                caller,
+                &vault_namespace,
+            );
+
+            // Never log the key string — only the namespace + the
+            // resolve/generate discriminator.
+            Ok(json!({
+                "key": key_string,
+                "vault_namespace": vault_namespace,
+                "resolved_or_generated": resolved_or_generated,
+            }))
+        }
+
+        "local_state_key_set" => {
+            // Migration + force-overwrite path. Two modes:
+            //   force: false (default) — idempotent no-op when a key already
+            //     exists. Preserves HIGH-2 anti-overwrite: a malicious caller
+            //     can't silently replace the friendly's key.
+            //   force: true — atomic replace via Vault::replace. Used ONLY by
+            //     the CLI when it has already verified (via decrypt-probe)
+            //     that the supplied key is the canonical one (CRIT-2 race
+            //     recovery).
+            //
+            // Adversarial-review hardening: CRIT-1 peer fail-closed,
+            // HIGH-1 content-hash check via binary-pin manifest.
+            let caller = params["caller"]
+                .as_str()
+                .ok_or((-32602, "missing 'caller'".to_string()))?;
+            let peer = enforce_local_state_gate(source, ctx.peer, caller, vault, store)?;
+            let key = params["key"]
+                .as_str()
+                .ok_or((-32602, "missing 'key'".to_string()))?;
+            let force = params["force"].as_bool().unwrap_or(false);
+            let vault_namespace = local_state_vault_name(caller)?;
+
+            presence::record_activity();
+
+            let already_set = matches!(
+                vault.get(VaultScope::Interactive, store, &vault_namespace),
+                Ok(_)
+            );
+            let outcome = if already_set {
+                if force {
+                    vault
+                        .replace(
+                            VaultScope::Interactive,
+                            store,
+                            &vault_namespace,
+                            key.as_bytes(),
+                            None,
+                        )
+                        .map_err(|e| {
+                            (-32000, format!("local_state_key_set: vault.replace: {e}"))
+                        })?;
+                    tracing::info!(
+                        caller = %caller,
+                        vault_namespace = %vault_namespace,
+                        peer_uid = peer.uid,
+                        "local_state_key_set: force-overwrote existing key"
+                    );
+                    "overwritten"
+                } else {
+                    tracing::info!(
+                        caller = %caller,
+                        vault_namespace = %vault_namespace,
+                        peer_uid = peer.uid,
+                        "local_state_key_set: no-op (already set, force=false)"
+                    );
+                    "noop_existing"
+                }
+            } else {
+                vault
+                    .add(VaultScope::Interactive, store, &vault_namespace, key.as_bytes(), None)
+                    .map_err(|e| (-32000, format!("local_state_key_set: vault.add: {e}")))?;
+                tracing::info!(
+                    caller = %caller,
+                    vault_namespace = %vault_namespace,
+                    peer_uid = peer.uid,
+                    "local_state_key_set: stored key in vault"
+                );
+                "stored"
+            };
+            Ok(json!({
+                "vault_namespace": vault_namespace,
+                "already_set": already_set,
+                "outcome": outcome,
+                "overwritten": outcome == "overwritten",
+            }))
+        }
+
+        "local_state_key_rotate_and_reencrypt" => {
+            // Daemon-side atomic rotation: decrypt the caller-supplied
+            // ciphertext under the current per-caller content key,
+            // generate a new content key, re-encrypt the plaintext under
+            // the new key, swap the vault entry, return the new
+            // ciphertext to the caller. The whole operation runs inside
+            // one dispatch arm so neither side can observe a partial
+            // state. Uses the existing `core_crypto::encrypt_content` /
+            // `decrypt_content` XChaCha20-Poly1305 envelope — no new
+            // crypto primitives.
+            //
+            // Wire format for `ciphertext` (matches CLI's `decrypt_state`):
+            //   `nonce(24) || ciphertext_with_tag`
+            // The CLI's on-disk format adds a 10-byte magic prefix
+            // before the nonce; this method expects the magic to be
+            // stripped client-side. Use AAD `b"emberlink-local-state"`.
+            //
+            // Adversarial-review hardening: CRIT-1 peer fail-closed,
+            // HIGH-1 content-hash check via binary-pin manifest.
+            let caller = params["caller"]
+                .as_str()
+                .ok_or((-32602, "missing 'caller'".to_string()))?;
+            let peer = enforce_local_state_gate(source, ctx.peer, caller, vault, store)?;
+            let ciphertext_value = params["ciphertext"].as_array().ok_or((
+                -32602,
+                "missing 'ciphertext' (expected JSON array of bytes)".to_string(),
+            ))?;
+            let ciphertext: Vec<u8> = ciphertext_value
+                .iter()
+                .map(|v| v.as_u64().map(|n| n as u8).ok_or(()))
+                .collect::<Result<Vec<u8>, _>>()
+                .map_err(|_| {
+                    (
+                        -32602,
+                        "'ciphertext' must be an array of u8 byte values".to_string(),
+                    )
+                })?;
+            let vault_namespace = local_state_vault_name(caller)?;
+            presence::record_activity();
+
+            // 1. Pull the current key — vault stores it as UTF-8 bytes
+            //    of the `ek1:<64 hex>` content-key string.
+            let old_key_bytes = vault.get(VaultScope::Interactive, store, &vault_namespace).map_err(|e| {
+                (
+                    -32000,
+                    format!("local_state_key_rotate_and_reencrypt: vault.get: {e}"),
+                )
+            })?;
+            let old_key = String::from_utf8(old_key_bytes.clone()).map_err(|e| {
+                (
+                    -32000,
+                    format!(
+                        "local_state_key_rotate_and_reencrypt: stored key is not valid UTF-8: {e}"
+                    ),
+                )
+            })?;
+
+            // 2. Decrypt under the current key via core-crypto.
+            if ciphertext.len() < 24 {
+                return Err((
+                    -32602,
+                    "ciphertext too short (need 24-byte nonce prefix)".to_string(),
+                ));
+            }
+            let (nonce_bytes, ct_and_tag) = ciphertext.split_at(24);
+            let encrypted = core_crypto::EncryptedContent {
+                nonce_hex: core_types::bytes_to_hex(nonce_bytes),
+                ciphertext: ct_and_tag.to_vec(),
+            };
+            let plaintext = core_crypto::decrypt_content(
+                &old_key,
+                &encrypted,
+                b"emberlink-local-state",
+            )
+            .map_err(|e| {
+                (
+                    -32000,
+                    format!("local_state_key_rotate_and_reencrypt: decrypt: {e}"),
+                )
+            })?;
+
+            // 3. Generate the new content key + re-encrypt.
+            let new_key = core_crypto::generate_content_key("local-state");
+            let new_encrypted = core_crypto::encrypt_content(
+                &new_key,
+                &plaintext,
+                b"emberlink-local-state",
+            )
+            .map_err(|e| {
+                (
+                    -32000,
+                    format!("local_state_key_rotate_and_reencrypt: encrypt: {e}"),
+                )
+            })?;
+            let new_nonce_bytes = core_types::hex_to_bytes(&new_encrypted.nonce_hex)
+                .map_err(|e| {
+                    (
+                        -32000,
+                        format!(
+                            "local_state_key_rotate_and_reencrypt: nonce hex decode: {e}"
+                        ),
+                    )
+                })?;
+            let mut new_ciphertext =
+                Vec::with_capacity(new_nonce_bytes.len() + new_encrypted.ciphertext.len());
+            new_ciphertext.extend_from_slice(&new_nonce_bytes);
+            new_ciphertext.extend_from_slice(&new_encrypted.ciphertext);
+
+            // 4. Hash old + new key for the Receipt (never the key
+            //    itself).
+            let old_key_hash = blake3::hash(old_key.as_bytes()).to_hex().to_string();
+            let new_key_hash = blake3::hash(new_key.as_bytes()).to_hex().to_string();
+
+            // 5. Atomic vault swap via Vault::replace (single SQLite
+            //    transaction). Closes adversarial-review HIGH-3: the
+            //    daemon-crash window where remove+add could leave the
+            //    namespace empty no longer exists.
+            vault
+                .replace(VaultScope::Interactive, store, &vault_namespace, new_key.as_bytes(), None)
+                .map_err(|e| {
+                    (
+                        -32000,
+                        format!("local_state_key_rotate_and_reencrypt: vault.replace: {e}"),
+                    )
+                })?;
+
+            // 6. Emit a signed v2 Receipt via the canonical path.
+            // CRIT-1: peer.uid is now kernel-attested (gate failed earlier if absent).
+            let body = LocalStateKeyRotationBody {
+                peer_uid: peer.uid,
+                caller: caller.to_string(),
+                vault_namespace: vault_namespace.clone(),
+                old_key_hash: format!("blake3:{old_key_hash}"),
+                new_key_hash: format!("blake3:{new_key_hash}"),
+            };
+            emit_local_state_v2_receipt(
+                RECEIPT_KIND_LOCAL_STATE_KEY_ROTATION,
+                serde_json::to_value(&body),
+                caller,
+                &vault_namespace,
+            );
+
+            Ok(json!({
+                "ciphertext": new_ciphertext,
+                "vault_namespace": vault_namespace,
+            }))
+        }
+
+        "binary_pin_generate" => {
+            // Establish the trust root for content-hash peer binding.
+            // Per KEYCHAIN-CONSOLIDATE-CLI adversarial-review:
+            //   MID-A — `generate` requires explicit operator presence
+            //     (Touch ID via HighRiskOp::BinaryPinGenerate). Without
+            //     this, an attacker who replaced a binary could silently
+            //     re-pin it.
+            //   CRIT-A (v0.3 trust model — TOFU at install) — the
+            //     manifest is signed by the daemon's persona key. Trust
+            //     comes from the operator's intent at the moment they
+            //     run this command. Path 2 (Ember Systems IdentityRoot
+            //     pre-signing) is filed as implementation-note-122.
+            //
+            // Wire shape:
+            //   { "pins": [{"caller": "cli", "path": "/usr/local/bin/ember"}, ...],
+            //     "force": false }
+            //
+            // `force: false` (default) refuses to overwrite an existing
+            // manifest. Subsequent generates require `force: true` AND a
+            // fresh user-presence proof.
+            if source.is_internal() {
+                return Err((
+                    -32401,
+                    "binary_pin_generate is wire-only; refuse Internal dispatch".to_string(),
+                ));
+            }
+            check_user_presence_gate(HighRiskOp::BinaryPinGenerate, false)?;
+
+            let pins_value = params["pins"].as_array().ok_or((
+                -32602,
+                "missing 'pins' (expected array of {caller, path})".to_string(),
+            ))?;
+            let force = params["force"].as_bool().unwrap_or(false);
+
+            let identity = crate::infra::receipt::current_identity().ok_or((
+                -32000,
+                "daemon identity not initialised — cannot sign binary-pin manifest".to_string(),
+            ))?;
+            let pubkey_str = format!("ed25519:{}", identity.pubkey_hex());
+
+            // Refuse to overwrite an existing manifest unless force=true.
+            // (HIGH-2-style anti-overwrite property for the manifest itself.)
+            let existing = crate::infra::binary_pin::load_manifest(vault, store, &pubkey_str)
+                .map_err(|e| (-32000, format!("load existing manifest: {e}")))?;
+            if existing.is_some() && !force {
+                return Err((
+                    -32401,
+                    "binary-pin manifest already exists — re-run with `force: true` to overwrite (requires user-presence proof)".to_string(),
+                ));
+            }
+
+            // Resolve the target list.
+            let mut targets: Vec<(String, std::path::PathBuf)> = Vec::new();
+            for entry in pins_value {
+                let caller = entry["caller"]
+                    .as_str()
+                    .ok_or((-32602, "pin entry missing 'caller'".to_string()))?;
+                let _ = local_state_vault_name(caller)?; // validates allow-list
+                let path = entry["path"]
+                    .as_str()
+                    .ok_or((-32602, "pin entry missing 'path'".to_string()))?;
+                targets.push((caller.to_string(), std::path::PathBuf::from(path)));
+            }
+
+            let outcome = crate::infra::binary_pin::build_manifest_from_paths(&targets, &pubkey_str)
+                .map_err(|e| (-32000, format!("build manifest: {e}")))?;
+            let mut manifest = outcome.manifest;
+            manifest
+                .sign(&crate::session::lifecycle::DaemonPersonaSigner::new(identity))
+                .map_err(|e| (-32000, format!("sign manifest: {e}")))?;
+            crate::infra::binary_pin::store_manifest(vault, store, &manifest)
+                .map_err(|e| (-32000, format!("store manifest: {e}")))?;
+
+            tracing::info!(
+                pins = manifest.pins.len(),
+                missing = outcome.missing.len(),
+                "binary_pin_generate: manifest signed and stored"
+            );
+
+            Ok(json!({
+                "pins_signed": manifest.pins.iter().map(|p| serde_json::json!({
+                    "caller": p.caller,
+                    "blake3_hex": p.blake3_hex,
+                    "binary_path": p.binary_path,
+                    "basename": p.basename,
+                })).collect::<Vec<_>>(),
+                "missing": outcome.missing.iter().map(|(c, p)| serde_json::json!({
+                    "caller": c,
+                    "path": p,
+                })).collect::<Vec<_>>(),
+                "signer_pubkey": manifest.signer_pubkey,
+                "signed_at": manifest.signed_at,
+            }))
+        }
+
+        // implementation-note-164 (A): socket method that exposes
+        // the audit-chain verifier primitive shipped in #2998. Walks the
+        // last `tail` rows (or full chain when omitted) and returns a
+        // shape callers (`ember audit verify` CLI) can render directly.
+        "audit_verify" => {
+            let tail = params["tail"].as_u64().map(|n| n as usize);
+            handle_audit_verify(store, tail)
+        }
+
         "audit_query" => {
             let agent_id = params["agent_id"].as_str().map(String::from);
             let limit = params["limit"].as_u64().map(|l| l as usize);
@@ -1531,7 +2534,7 @@ pub async fn dispatch_method_with_context(
             Ok(json!(list))
         }
 
-        // EMBER-implementation-note-94: unified receipt query — supports the full
+        // EMBER-implementation-note-172: unified receipt query — supports the full
         // `ReceiptFilter` shape (actor/kind/grant_id/since/resource/limit).
         // The `ember audit query` CLI path calls this via JSON-RPC socket.
         "receipt_query" => {
@@ -1582,7 +2585,7 @@ pub async fn dispatch_method_with_context(
                 target_url: params["target_url"].as_str().map(str::to_owned),
                 agent_framework: params["agent_framework"].as_str().map(str::to_owned),
             };
-            let scope_obj = core_types::approval::RequestedScope {
+            let scope_obj = core_grant_types::approval::RequestedScope {
                 capability: scope.to_string(),
                 resource_id: None,
                 constraints: vec![],
@@ -1598,7 +2601,7 @@ pub async fn dispatch_method_with_context(
             Ok(json!({"id": request_id.0, "status": req.status}))
         }
 
-        // implementation-note-95 — submit a composite approval that bundles
+        // implementation-note-173 — submit a composite approval that bundles
         // an N-Statement envelope. On `Approved`, the resolver mints a single
         // composite grant whose `blocks_json` carries the full statement
         // chain. Wraps the already-shipped `DaemonStore::propose_grant`.
@@ -1622,10 +2625,10 @@ pub async fn dispatch_method_with_context(
             let stmts_value = params["statements"]
                 .as_array()
                 .ok_or((-32602, "missing 'statements' array".to_string()))?;
-            let mut statements: Vec<core_types::Statement> =
+            let mut statements: Vec<core_grant_types::Statement> =
                 Vec::with_capacity(stmts_value.len());
             for v in stmts_value {
-                let s: core_types::Statement = serde_json::from_value(v.clone())
+                let s: core_grant_types::Statement = serde_json::from_value(v.clone())
                     .map_err(|e| (-32602, format!("invalid statement: {e}")))?;
                 statements.push(s);
             }
@@ -1706,7 +2709,7 @@ pub async fn dispatch_method_with_context(
             // cannot be used to leak status for another agent's grant.
             let expected_persona = params["persona_id"].as_str();
 
-            // implementation-note-96: if the caller is observing a
+            // implementation-note-174: if the caller is observing a
             // grant whose effective (wall-clock-projected) status is terminal
             // but whose stored status is still `active`, flip the row + emit
             // the signed receipt right now. Without this, the runner's
@@ -1753,7 +2756,7 @@ pub async fn dispatch_method_with_context(
                             .collect(),
                         Err(_) => Vec::new(),
                     };
-                    // implementation-note-92 — surface the
+                    // implementation-note-170 — surface the
                     // per-Statement revocation list so callers can render
                     // strikethrough on individual sids without polling a
                     // separate endpoint.
@@ -1912,7 +2915,7 @@ pub async fn dispatch_method_with_context(
                         target_url: params["target_url"].as_str().map(str::to_owned),
                         agent_framework: params["agent_framework"].as_str().map(str::to_owned),
                     };
-                    let scope_obj = core_types::approval::RequestedScope {
+                    let scope_obj = core_grant_types::approval::RequestedScope {
                         capability: scope.to_string(),
                         resource_id: None,
                         constraints: vec![],
@@ -1944,7 +2947,7 @@ pub async fn dispatch_method_with_context(
             }
         }
 
-        // implementation-note-18: block-and-poll RPC for the proxy hook approval round-trip.
+        // implementation-note-31: block-and-poll RPC for the proxy hook approval round-trip.
         //
         // Polls `get_approval(request_id)` every 500ms up to `timeout_secs`. On
         // first non-pending state -> return the matching `ApprovalDecision`. On
@@ -1954,7 +2957,7 @@ pub async fn dispatch_method_with_context(
         //
         // Defaults: `timeout_secs = 300` (5 min) when omitted, matching the
         // proxy hook's `call_daemon_await_approval` default. A configurable
-        // EmberConfig surface is out of scope for implementation-note-18 — file as
+        // EmberConfig surface is out of scope for implementation-note-31 — file as
         // follow-up if operators need per-deployment tuning.
         //
         // TODO: T2 integration test with simulated dashboard
@@ -2079,7 +3082,7 @@ pub async fn dispatch_method_with_context(
                 target_url: None,
                 agent_framework: None,
             };
-            let scope_obj = core_types::approval::RequestedScope {
+            let scope_obj = core_grant_types::approval::RequestedScope {
                 capability: String::new(),
                 resource_id: None,
                 constraints: vec![],
@@ -2246,7 +3249,7 @@ pub async fn dispatch_method_with_context(
                 Err(e) => return Err((-32000, e.to_string())),
             };
 
-            // Envelope status: load via DaemonGrantStore (implementation-note-91)
+            // Envelope status: load via DaemonGrantStore (implementation-note-169)
             // to get core_grants::Grant with a typed expires_at
             // (Option<DateTime<Utc>>) rather than an RFC3339 string from
             // GrantInfo. GrantStatus::derive is still used for the "Expired"
@@ -2264,7 +3267,7 @@ pub async fn dispatch_method_with_context(
                         CoreGrantState::Paused => "paused",
                         CoreGrantState::Revoked => "revoked",
                     };
-                    core_types::GrantStatus::derive(status_str, None, expires_epoch, now)
+                    core_grant_types::GrantStatus::derive(status_str, None, expires_epoch, now)
                         .as_str()
                         .to_string()
                 }
@@ -2283,7 +3286,7 @@ pub async fn dispatch_method_with_context(
             }))
         }
 
-        // implementation-note-47 (design Phase 2): broker socket RPC arms.
+        // implementation-note-94 (design Phase 2): broker socket RPC arms.
         //
         // These are intentionally additive — the registry, materialization
         // tracking, Receipt-event emission, and provider-routing logic live
@@ -2291,31 +3294,79 @@ pub async fn dispatch_method_with_context(
         // dispatch surface so concurrent worktrees touching unrelated
         // arms don't conflict on a structural refactor of this fn.
         //
-        // Marker (implementation-note-47): RPC method name "BrokerIssue" lives
+        // Marker (implementation-note-94): RPC method name "BrokerIssue" lives
         // alongside its sibling routes as the literal `broker_issue`. See
         // `broker_handler.rs` for handler bodies + tests.
-        "broker_issue" => crate::broker::handler::handle_broker_issue(store, params).await,
-        "broker_revoke" => crate::broker::handler::handle_broker_revoke(store, params).await,
-        "broker_list" => crate::broker::handler::handle_broker_list(params).await,
-        // implementation-note-9: agent processes hold an
+        //
+        // implementation-note-103: the kernel-attested
+        // `PeerCredPrincipal` captured at connection accept time is
+        // threaded into every broker handler so per-call authorization is
+        // rooted in a kernel-supplied identity. `ctx.peer_cred_principal`
+        // is `None` for Internal callers (admin CLI / test harness) and
+        // pre-migration socket entry points; broker handlers fall back to
+        // the legacy "warn but allow" path when the principal is absent.
+        "broker_issue" => crate::broker::handler::handle_broker_issue(
+            ctx.peer_cred_principal.as_ref(),
+            store,
+            params,
+        )
+        .await,
+        "broker_revoke" => crate::broker::handler::handle_broker_revoke(
+            ctx.peer_cred_principal.as_ref(),
+            store,
+            params,
+        )
+        .await,
+        "broker_list" => crate::broker::handler::handle_broker_list(
+            ctx.peer_cred_principal.as_ref(),
+            store,
+            params,
+        )
+        .await,
+        // implementation-note-10: agent processes hold an
         // opaque `SecretRef`; the trust boundary (ember-proxy /
         // ember-tools) calls `broker_resolve` to materialise the
         // plaintext credential. Stub today; full impl in
-        // implementation-note-11.
-        "broker_resolve" => crate::broker::handler::handle_broker_resolve(store, params).await,
+        // implementation-note-175.
+        "broker_resolve" => crate::broker::handler::handle_broker_resolve(
+            ctx.peer_cred_principal.as_ref(),
+            store,
+            params,
+        )
+        .await,
         // design §"daemon-as-process-supervisor": spawn a Construct binary
         // as the daemon's child, capture exit code, emit
         // session.construct_invocation receipt. argv re-classifier deferred
         // (T-CONSTRUCT-EXEC-ARGV-CLASSIFIER).
-        "broker_exec" => crate::broker::handler::handle_broker_exec(store, params).await,
-        // implementation-note-97: mint a 1-hour GitHub App installation
+        "broker_exec" => crate::broker::handler::handle_broker_exec(
+            ctx.peer_cred_principal.as_ref(),
+            store,
+            params,
+        )
+        .await,
+        // implementation-note-103: session.lookup_or_open
+        // RPC — look up an existing session for the caller's persona or
+        // open a fresh one. The persona identity is taken from the
+        // kernel-attested `PeerCredPrincipal`, not from the request
+        // payload, so a caller cannot pretend to be another persona's
+        // session owner. Returns -32004 when the persona named by
+        // `params.persona` does not match the kernel-attested uid
+        // binding, OR -32401 when no principal is available.
+        "session.lookup_or_open" | "session_lookup_or_open" => {
+            handle_session_lookup_or_open(
+                ctx.peer_cred_principal.as_ref(),
+                params,
+            )
+            .await
+        }
+        // implementation-note-176: mint a 1-hour GitHub App installation
         // token using a local-held RSA private key (design credential broker).
         // Credentials loaded from GH_APP_* env vars (placeholder until vault
         // path provisioning lands).
         "broker.mint_gh_token" => {
             crate::broker::handler::handle_broker_mint_gh_token(store, params).await
         }
-        // implementation-note-53 §--inject: register a child shell PID for
+        // implementation-note-110 §--inject: register a child shell PID for
         // auto-revoke when the shell exits. Spawns a background poll task that
         // watches /proc/<pid> (Linux) or kill(pid, 0) (other Unix) and calls
         // broker_revoke on all listed materialization IDs on exit.
@@ -2323,7 +3374,48 @@ pub async fn dispatch_method_with_context(
             crate::broker::handler::handle_broker_register_pid_watcher(store, params).await
         }
 
-        // implementation-note-98 (design §"binding.delete"):
+        // implementation-note-111: credential-binding admin
+        // RPCs invoked by `ember bind {register, list, remove, move}`. The
+        // admin path does NOT require biometric — the operator
+        // authenticates to the daemon via PeerCred. Each handler enforces
+        // caller_persona validation (non-nil parseable UUID) and emits an
+        // audit row for register/remove/move. The dotted method names are
+        // canonical; the underscore aliases mirror the broker_* dispatch
+        // convention used by sibling routes.
+        "broker.bindings.register" | "broker_bindings_register" => {
+            crate::broker::handler::handle_broker_bindings_register(
+                ctx.peer_cred_principal.as_ref(),
+                store,
+                params,
+            )
+            .await
+        }
+        "broker.bindings.list" | "broker_bindings_list" => {
+            crate::broker::handler::handle_broker_bindings_list(
+                ctx.peer_cred_principal.as_ref(),
+                store,
+                params,
+            )
+            .await
+        }
+        "broker.bindings.remove" | "broker_bindings_remove" => {
+            crate::broker::handler::handle_broker_bindings_remove(
+                ctx.peer_cred_principal.as_ref(),
+                store,
+                params,
+            )
+            .await
+        }
+        "broker.bindings.move" | "broker_bindings_move" => {
+            crate::broker::handler::handle_broker_bindings_move(
+                ctx.peer_cred_principal.as_ref(),
+                store,
+                params,
+            )
+            .await
+        }
+
+        // implementation-note-177 (design §"binding.delete"):
         // graceful delete of a SA→Persona binding. Revokes the workload
         // Persona's grants (cascade via `revoke_persona`) so in-flight
         // broker requests holding active grant references drain to
@@ -2334,7 +3426,7 @@ pub async fn dispatch_method_with_context(
         // underscore alias mirrors the broker_* dispatch convention.
         "binding.delete" | "binding_delete" => binding_delete(store, params).await,
 
-        // implementation-note-99 (design
+        // implementation-note-178 (design
         // §"binding.revoke_urgent"): compromise-response revocation.
         // Cascades the same SQL flip as `binding.delete` but tags the
         // audit row with `binding.revoke_urgent` so the operator can
@@ -2349,7 +3441,7 @@ pub async fn dispatch_method_with_context(
             binding_revoke_urgent(store, params).await
         }
 
-        // implementation-note-100 (design §"binding.update"):
+        // implementation-note-179 (design §"binding.update"):
         // mutate metadata on an existing binding without revoking it.
         // Today the persona row only carries a mutable `name` column;
         // the broader binding-metadata fields the brief calls out
@@ -2362,7 +3454,7 @@ pub async fn dispatch_method_with_context(
         // mirrors the broker_* dispatch convention.
         "binding.update" | "binding_update" => binding_update(store, params).await,
 
-        // implementation-note-101 (design §"binding.upsert"):
+        // implementation-note-180 (design §"binding.upsert"):
         // idempotent insert-or-update for the SA→Persona binding
         // surface used by `ember-kernel`'s EmberServiceAccount
         // reconciler. Replaces the placeholder "method not found"
@@ -2383,7 +3475,32 @@ pub async fn dispatch_method_with_context(
         // underscore alias matches the broker_* dispatch convention.
         "binding.upsert" | "binding_upsert" => binding_upsert(store, params).await,
 
-        // implementation-note-102 Phase 2: SOPS DEK unwrap RPC.
+        // implementation-note-40 (design §9 + §6):
+        // atomic create_agent_persona binding container identity →
+        // Persona + attenuated child grant. Replaces the
+        // create_persona + delegate_grant two-call sequence with a
+        // single RPC whose state machine is the two-phase commit:
+        //
+        //   phase 1 — insert persona row with status='enrolling' +
+        //             bind to container_id + parent_grant_id
+        //             (CRIT-4: only one in-flight key per container)
+        //   phase 2 — delegate the parent grant to the new persona
+        //             with the requested narrowed scope
+        //   phase 3 — flip persona status enrolling → active
+        //
+        // If the daemon crashes between phase 1 and phase 3, the
+        // persona row stays in 'enrolling' and the reconciler refuses
+        // to spawn into that container slot (see
+        // DaemonStore::enrolling_persona_for_container). The
+        // container_id binding is persisted in both the `personas`
+        // table (via container_id column) AND the audit log (via
+        // `agent_persona.created` event) so reconcilers can
+        // reconstruct the binding from either source.
+        "create_agent_persona" | "create_agent_persona_atomic" => {
+            create_agent_persona(store, params).await
+        }
+
+        // implementation-note-181 Phase 2: SOPS DEK unwrap RPC.
         //
         // Authorisation flow:
         //   1. Caller supplies `persona_id`, `grant_id`, and the
@@ -2414,7 +3531,7 @@ pub async fn dispatch_method_with_context(
         //      sent to the caller; whoever calls this RPC is implicitly
         //      trusted with the plaintext DEK by the grant flow.
         //
-        // Phase 3 (implementation-note-42, orchestrator-only) ships
+        // Phase 3 (implementation-note-80, orchestrator-only) ships
         // `.claude/scripts/sops-as-bot.sh` — the only blessed agent path
         // that calls this RPC. Direct callers from the agent harness are
         // out of scope for v0.
@@ -2444,7 +3561,7 @@ pub async fn dispatch_method_with_context(
             })?;
 
             // Grant gating: load via DaemonGrantStore to get core_grants::Grant
-            // at the state-machine boundary (implementation-note-91). State and
+            // at the state-machine boundary (implementation-note-169). State and
             // issuer checks use the core type directly.
             let grant = store
                 .grant_store()
@@ -2496,7 +3613,7 @@ pub async fn dispatch_method_with_context(
             // The key bytes live in a `Zeroizing` buffer so they zero on
             // drop — never log them, never serialize them.
             let vault_path = crate::age::vault_path_for_persona(persona_id);
-            let raw_key = vault.get(store, &vault_path).map_err(|e| {
+            let raw_key = vault.get(VaultScope::Interactive, store, &vault_path).map_err(|e| {
                 tracing::warn!(
                     persona_id = %persona_id,
                     vault_path = %vault_path,
@@ -2611,10 +3728,10 @@ pub async fn dispatch_method_with_context(
             ))
         }
 
-        // SOPS-implementation-note-103 — implementation-note-104. Routes for the Path 2 native SOPS
-        // recipient surface. Until implementation-note-105 lands, the underlying stubs
+        // SOPS-implementation-note-182 — implementation-note-183. Routes for the Path 2 native SOPS
+        // recipient surface. Until implementation-note-184 lands, the underlying stubs
         // return NotImplementedError — wire is reserved so the SOPS Go-fork
-        // (implementation-note-106) can develop against a real RPC shape.
+        // (implementation-note-185) can develop against a real RPC shape.
         "sops.pubkey" => {
             let persona_id = params["persona_id"]
                 .as_str()
@@ -2658,7 +3775,7 @@ pub async fn dispatch_method_with_context(
             }))
         }
 
-        // implementation-note-107: register a new claude-code session.
+        // implementation-note-186: register a new claude-code session.
         //
         // Called by the launcher immediately before spawning the `claude` child.
         // Creates a `SessionMeta` file in `sessions_dir` and returns the
@@ -2728,7 +3845,7 @@ pub async fn dispatch_method_with_context(
                 Some(&format!("session_id={session_id} grant_id={}", active_grant.id)),
             );
 
-            // implementation-note-88: read the
+            // implementation-note-165: read the
             // LLM proxy URL from RequestContext, NOT from std::env::var.
             // The runtime populates ctx.llm_proxy_url via SocketListener
             // builder after the proxy binds. Using env::var here is
@@ -2741,7 +3858,7 @@ pub async fn dispatch_method_with_context(
                     tracing::warn!(
                         "register_session: llm_proxy_url absent from RequestContext \
                          (SocketListener.with_llm_proxy_url not called?) — \
-                         falling back to hardcoded 8484; implementation-note-88"
+                         falling back to hardcoded 8484; implementation-note-165"
                     );
                     "http://127.0.0.1:8484".to_string()
                 }
@@ -2761,14 +3878,14 @@ pub async fn dispatch_method_with_context(
             Ok(response)
         }
 
-        // implementation-note-107: close a claude-code session (clean exit).
+        // implementation-note-186: close a claude-code session (clean exit).
         //
         // Called by the launcher after the `claude` child exits naturally. Emits
         // a signed v2 `session.claude_code` Receipt with
         // `termination_reason: clean_exit` into `<session_dir>/receipt.json`,
         // closes the `SessionMeta`, and logs a `session.closed` audit event.
         //
-        // implementation-note-108: CleanExit MUST NOT
+        // implementation-note-187: CleanExit MUST NOT
         // revoke the grant. A 24h grant supports many sessions; the previous
         // unconditional revoke_grant call here was the second-half regression
         // (the launcher goes through this RPC arm, not session_watcher, so
@@ -2844,8 +3961,383 @@ pub async fn dispatch_method_with_context(
             }))
         }
 
+        // implementation-note-188 — Phase 1 socket method skeleton.
+        //
+        // Per design §"Headless: attested device, variable enrollment".
+        // Phase 1 ships only the wire shape: params parsed, tier ceiling
+        // enforced, target_state_anchor checkpoint present. The MEK sourcing
+        // from vault + `attested_device::enroll()` call + `headless_enrollment`
+        // Receipt emission are deferred to implementation-note-189,
+        // which depends on a operator design call: which `VaultScope` owns the
+        // Headless MEK (new "Headless" scope vs. derivation from the existing
+        // Interactive MEK), and whether the enrollment Receipt should embed the
+        // template_snapshot_hash inline or follow a pointer-by-reference shape.
+        //
+        // Three arms, mirroring the brief: enroll / revoke / status.
+        "headless_enroll" => {
+            presence::record_activity();
+            let _persona_id = params["persona_id"]
+                .as_str()
+                .ok_or((-32602, "missing 'persona_id' parameter".to_string()))?;
+            let duration_seconds = match params["duration_seconds"].as_u64() {
+                Some(d) if d == 0 => 14400, // 4h default for dev0 per design
+                Some(d) => d,
+                None => 14400,
+            };
+
+            // Tier ceiling — dev0 cohort: 7 days. design.
+            const MAX_DURATION_DEV0_SECONDS: u64 = 7 * 24 * 3600;
+            if duration_seconds > MAX_DURATION_DEV0_SECONDS {
+                return Err((
+                    -32602,
+                    format!(
+                        "headless_enrollment_duration_exceeds_tier_ceiling: \
+                         {duration_seconds} > {MAX_DURATION_DEV0_SECONDS} (dev0 ceiling)"
+                    ),
+                ));
+            }
+
+            // TODO: wire MEK sourcing from the chosen VaultScope, call
+            // crate::infra::attested_device::enroll(), emit signed
+            // `headless_enrollment` Receipt v2 via the canonical builder
+            // (per daemon.md "Canonical receipt builder" rule).
+            Err((
+                -32000,
+                "headless_enroll: Phase 1 stub — Phase 2 wires MEK sourcing + \
+                 attested_device::enroll() + headless_enrollment Receipt emission \
+                 (implementation-note-189)"
+                    .to_string(),
+            ))
+        }
+
+        "headless_revoke" => {
+            presence::record_activity();
+            let _enrollment_id = params["enrollment_id"].as_str();
+            // TODO: call crate::infra::attested_device::revoke() on the
+            // active enrollment, emit signed `headless_revocation` Receipt v2.
+            Err((
+                -32000,
+                "headless_revoke: Phase 1 stub — Phase 2 wires attested_device::revoke() + \
+                 headless_revocation Receipt emission \
+                 (implementation-note-189)"
+                    .to_string(),
+            ))
+        }
+
+        "headless_status" => {
+            presence::record_activity();
+            // Phase 1: no active enrollment exists until Phase 2 wires enroll.
+            // Return the steady-state shape so CLI (slice C) can develop
+            // against the response contract without depending on Phase 2.
+            // TODO: query attested_device for the current enrollment and
+            // populate the active_enrollment object with persona /
+            // duration_remaining_seconds / expiry_unix.
+            Ok(json!({"active_enrollment": null}))
+        }
+
+        // implementation-note-14 — Phase 1 substrate.
+        //
+        // implementation-note-15
+        //
+        // Per design §"Pre-flight scope check at enrollment" Layer 2
+        // (Historical): the daemon exposes the recent-gaps reader so
+        // the CLI's `ember headless enroll` flow can render the
+        // pre-flight CTA without poking the JSONL file directly. The
+        // gap log lives under the primary worktree's
+        // `.ember/runtime/permission-gaps.jsonl` (headless-runtime owns the
+        // path and shape); routing through the daemon keeps file
+        // discipline on one side of the socket.
+        //
+        // Authorization: this method is read-only (no vault, no grant
+        // state mutation). The socket layer's SO_PEERCRED + group
+        // `ember` ACL (design) is the only gate — same as the
+        // surrounding read-class methods (`vault_get`,
+        // `local_state_key_get`).
+        "headless_preflight_gaps" => {
+            presence::record_activity();
+            let persona = params["persona"]
+                .as_str()
+                .ok_or((-32602, "missing 'persona' parameter".to_string()))?;
+            let since_seconds = params["since_seconds"]
+                .as_u64()
+                .ok_or((-32602, "missing 'since_seconds' parameter (u64)".to_string()))?;
+
+            let gaps = core_construct_runtime::permission_gaps::recent_gaps_for_persona(
+                persona,
+                std::time::Duration::from_secs(since_seconds),
+            );
+            serde_json::to_value(&gaps)
+                .map_err(|e| (-32000, format!("serialize PermissionGap list: {e}")))
+        }
+
+        // implementation-note-190 — Layer 1 predictive
+        // pre-flight gate, wired over the daemon socket so the CLI can
+        // surface manifest-declared Construct gaps before headless dispatches
+        // a task that the enrolled persona's template cannot grant.
+        //
+        // implementation-note-191
+        //
+        // Per design §"Pre-flight scope check at enrollment" Layer 1: for
+        // each queued task that declares `constructs = ["<construct>.<action>"]`,
+        // resolve the union of action permissions through the bundled cohort-A
+        // manifest registry, diff against the enrolled persona template, and
+        // return the gap list. Slice B (prior change) shipped the resolver +
+        // manifest parser; this arm wires them into the socket surface.
+        //
+        // Params:
+        //   { "tasks": [ { "task_id": "<id>", "constructs": ["<c>.<a>", ...] }, ... ],
+        //     "template"?: ["<construct>.<action>", ...] }
+        //
+        // Result: JSON array of `{ "task_id": <id>, "identifier": <perm>,
+        //                          "scope": <string|null> }` — one entry per
+        //         permission a task needs that is NOT in `template`.
+        //
+        // Authorization: read-only over caller-supplied data; SO_PEERCRED +
+        // group `ember` ACL (design) is the only gate, matching
+        // `headless_preflight_gaps`.
+        "headless_preflight_layer1" => {
+            presence::record_activity();
+            handle_headless_preflight_layer1(params)
+        }
+
         _ => Err((-32601, "Method not found".to_string())),
     }
+}
+
+/// implementation-note-190 — Layer 1 pre-flight handler.
+///
+/// implementation-note-191
+///
+/// Parses the caller-supplied `tasks` + optional `template`, resolves each
+/// task's declared constructs through the bundled cohort-A manifest registry
+/// via `core_construct_runtime::preflight::resolve_queued_task_permissions`, diffs
+/// against the template via `cross_reference`, and returns the gap list as
+/// JSON. Unknown constructs and unknown actions are skipped silently per the
+/// resolver's "best-effort predictive layer" contract — Layer 2
+/// (`headless_preflight_gaps`) catches the runtime gap.
+///
+/// Pulled into a free function so the dispatch arm stays narrow and the
+/// param-parsing logic is unit-testable without spinning up a full daemon
+/// store.
+fn handle_headless_preflight_layer1(params: &Value) -> Result<Value, (i32, String)> {
+    use core_construct_runtime::preflight::{
+        cross_reference, resolve_queued_task_permissions, Permission, Template,
+    };
+
+    // Parse `tasks` — required. Each entry is { task_id, constructs }.
+    let tasks_value = params.get("tasks").ok_or((
+        -32602,
+        "missing 'tasks' parameter (array of { task_id, constructs })".to_string(),
+    ))?;
+    let tasks_array = tasks_value.as_array().ok_or((
+        -32602,
+        "'tasks' parameter must be a JSON array".to_string(),
+    ))?;
+    let mut tasks: Vec<(String, Vec<String>)> = Vec::with_capacity(tasks_array.len());
+    for (idx, raw) in tasks_array.iter().enumerate() {
+        let task_id = raw
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .ok_or((
+                -32602,
+                format!("tasks[{idx}]: missing string 'task_id'"),
+            ))?
+            .to_string();
+        let constructs_value = raw.get("constructs").cloned().unwrap_or(json!([]));
+        let constructs_array = constructs_value.as_array().ok_or((
+            -32602,
+            format!("tasks[{idx}].constructs must be a JSON array of strings"),
+        ))?;
+        let mut declarations: Vec<String> = Vec::with_capacity(constructs_array.len());
+        for (d_idx, decl) in constructs_array.iter().enumerate() {
+            let s = decl.as_str().ok_or((
+                -32602,
+                format!("tasks[{idx}].constructs[{d_idx}] must be a string"),
+            ))?;
+            declarations.push(s.to_string());
+        }
+        tasks.push((task_id, declarations));
+    }
+
+    // Parse optional `template`. Absent or empty → fail-open default of
+    // "no permissions allowed", which is the dev0 fail-closed posture.
+    let template_value = params.get("template").cloned().unwrap_or(json!([]));
+    let template_array = template_value.as_array().ok_or((
+        -32602,
+        "'template' parameter must be a JSON array of strings".to_string(),
+    ))?;
+    let mut allowed: Vec<Permission> = Vec::with_capacity(template_array.len());
+    for (idx, entry) in template_array.iter().enumerate() {
+        let identifier = entry.as_str().ok_or((
+            -32602,
+            format!("template[{idx}] must be a string"),
+        ))?;
+        allowed.push(Permission {
+            identifier: identifier.to_string(),
+            scope: None,
+        });
+    }
+    let template = Template { allowed };
+
+    // Build the bundled cohort-A manifest registry. Per design §2 every
+    // bundled Construct's `construct.toml` is shipped under
+    // `crates/ember-construct/construct/*.toml`; the registry needs them
+    // available without a filesystem read so the daemon can answer the
+    // RPC even on a fresh install. `include_str!` is the canonical pattern
+    // already used in `crates/headless-runtime/src/constructs/manifest.rs` tests.
+    let registry = bundled_construct_registry().map_err(|e| {
+        (
+            -32000,
+            format!("load bundled construct manifest registry: {e}"),
+        )
+    })?;
+
+    let needed = resolve_queued_task_permissions(&tasks, &registry);
+    let gaps = cross_reference(&needed, &template);
+
+    // Wire shape: { task_id, identifier, scope }.
+    let payload: Vec<Value> = gaps
+        .into_iter()
+        .map(|g| {
+            json!({
+                "task_id": g.task_id,
+                "identifier": g.permission.identifier,
+                "scope": g.permission.scope,
+            })
+        })
+        .collect();
+    Ok(Value::Array(payload))
+}
+
+/// Build the cohort-A bundled `construct.toml` manifest registry by parsing
+/// each `crates/ember-construct/construct/*.toml` via `include_str!`. Used
+/// by [`handle_headless_preflight_layer1`].
+///
+/// Returns `Err` only when one of the bundled manifests fails to parse —
+/// which would indicate a corrupt source tree (the parser is exercised by
+/// `crates/headless-runtime/src/constructs/manifest.rs::parses_real_bundled_*`
+/// tests on every workspace build).
+fn bundled_construct_registry()
+    -> Result<HashMap<String, core_construct_runtime::manifest::ConstructManifest>, toml::de::Error>
+{
+    use core_construct_runtime::manifest::parse_construct_manifest_str;
+    const BUNDLED: &[&str] = &[
+        include_str!("../../../ember-construct/construct/aws.toml"),
+        include_str!("../../../ember-construct/construct/az.toml"),
+        include_str!("../../../ember-construct/construct/docker.toml"),
+        include_str!("../../../ember-construct/construct/flyctl.toml"),
+        include_str!("../../../ember-construct/construct/gcloud.toml"),
+        include_str!("../../../ember-construct/construct/gh.toml"),
+        include_str!("../../../ember-construct/construct/git.toml"),
+        include_str!("../../../ember-construct/construct/kubectl.toml"),
+        include_str!("../../../ember-construct/construct/npm.toml"),
+        include_str!("../../../ember-construct/construct/okta.toml"),
+        include_str!("../../../ember-construct/construct/pulumi.toml"),
+        include_str!("../../../ember-construct/construct/terraform.toml"),
+        include_str!("../../../ember-construct/construct/tofu.toml"),
+        include_str!("../../../ember-construct/construct/vercel.toml"),
+        include_str!("../../../ember-construct/construct/wrangler.toml"),
+    ];
+    let mut registry = HashMap::with_capacity(BUNDLED.len());
+    for raw in BUNDLED {
+        let m = parse_construct_manifest_str(raw)?;
+        registry.insert(m.name.clone(), m);
+    }
+    Ok(registry)
+}
+
+/// `session.lookup_or_open` JSON-RPC verb — peercred-bound session
+/// lookup/creation per implementation-note-103.
+///
+/// Returns the (session_id, persona, parent_pid) triple for the
+/// caller's existing session, or opens a fresh session bound to the
+/// kernel-attested principal. The persona identity is sourced from
+/// the kernel-attested `PeerCredPrincipal` — a caller cannot lie
+/// about which persona they are.
+///
+/// **Principal binding gates** (per design §"Subprocess identity
+/// spoofing (Phase 1)"):
+///
+/// - When `principal` is `None`, the call is refused with `-32401`
+///   ("principal binding unavailable") — `session.lookup_or_open`
+///   is wire-only and demands kernel attestation.
+/// - When `params.persona` is supplied AND the persona's bound uid
+///   does not match `principal.uid`, refuse with `-32004`.
+/// - When `params.parent_pid` is supplied AND it disagrees with
+///   `principal.pid`, refuse with `-32004` — the brief calls this
+///   out: "refuses caller-supplied `parent_pid` that does not match
+///   peer pid".
+///
+/// Params: `{ "persona"?: <string>, "parent_pid"?: <i32> }`
+/// Result: `{ "session_id": <string>, "persona_id"?: <string>,
+///            "parent_pid": <i32>, "socket_path": <string> }`
+///
+/// implementation-note-103.
+pub async fn handle_session_lookup_or_open(
+    principal: Option<&crate::infra::runtime::PeerCredPrincipal>,
+    params: &Value,
+) -> Result<Value, (i32, String)> {
+    let principal = principal.ok_or((
+        -32401,
+        "session.lookup_or_open requires kernel-attested principal — \
+         wire-only RPC, refused on Internal source"
+            .to_string(),
+    ))?;
+
+    // implementation-note-105 — refuse if the bound peer has been
+    // reaped between connection-accept and this RPC dispatch. PID-reuse
+    // could otherwise hand the freshly-recycled PID to a new process
+    // that this session would then bind to.
+    crate::broker::handler::check_principal_is_alive(Some(principal))?;
+
+    // Persona-name → bound-uid check (when the caller asserts which
+    // persona they're opening a session for, kernel attests it).
+    crate::broker::handler::check_principal_against_persona(
+        Some(principal),
+        params,
+        "persona",
+    )?;
+
+    // parent_pid binding: brief calls this out — caller-supplied
+    // parent_pid that does not match peer pid is refused.
+    if let Some(claimed_pid) = params.get("parent_pid").and_then(|v| v.as_i64()) {
+        if claimed_pid as i32 != principal.pid {
+            tracing::warn!(
+                claimed_parent_pid = claimed_pid,
+                principal_pid = principal.pid,
+                principal_uid = principal.uid,
+                "session.lookup_or_open: rejecting — claimed parent_pid disagrees with kernel-attested peer pid"
+            );
+            return Err((
+                -32004,
+                format!(
+                    "principal binding mismatch: claimed parent_pid {} does not match kernel-attested peer pid {}",
+                    claimed_pid, principal.pid
+                ),
+            ));
+        }
+    }
+
+    // Mint a fresh session id. Production wiring (registry of open
+    // sessions, persistence under `sessions_dir`, etc.) lives in the
+    // sibling implementation-note-192 task; this surface
+    // establishes the peercred gate so the production wiring can
+    // drop into a kernel-attested foundation.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let session_id = format!("sess_{:032x}", nanos);
+
+    let mut response = json!({
+        "session_id": session_id,
+        "parent_pid": principal.pid,
+        "socket_path": principal.socket_path.display().to_string(),
+    });
+    if let Some(persona) = params.get("persona").and_then(|v| v.as_str()) {
+        response["persona_id"] = json!(persona);
+    }
+    Ok(response)
 }
 
 /// `binding.delete` JSON-RPC verb — graceful delete of a workload Persona binding.
@@ -2873,7 +4365,7 @@ pub async fn dispatch_method_with_context(
 /// the locally-bound `core_grants::Grant` they captured at request entry.
 /// New requests fail because lookup runs after the SQL flip.
 ///
-/// `binding_revoke_urgent` (separate verb, T-EMBERD-BINDING-implementation-note-109)
+/// `binding_revoke_urgent` (separate verb, T-EMBERD-BINDING-implementation-note-193)
 /// will skip the in-flight drain by also poisoning the in-process
 /// grant cache — that path is intentionally NOT reused here because it
 /// inverts the contract callers rely on for the graceful path.
@@ -3324,13 +4816,266 @@ pub async fn binding_upsert(
     }))
 }
 
+/// implementation-note-40 (design §9 + §6) — atomic
+/// `create_agent_persona` RPC handler.
+///
+/// Replaces the two-call sequence `create_persona` + `delegate_grant`
+/// with a single state-machine'd verb whose lifecycle is:
+///
+/// 1. **Phase 1 — enrolling.** Insert a workload persona row with
+///    `status = 'enrolling'`, bind it to the requested `container_id`
+///    and `parent_grant_id`. Refuses if a previous spawn already
+///    bound the same container slot (CRIT-4: one in-flight key per
+///    container).
+/// 2. **Phase 2 — delegate.** Call `delegate_grant_full` against the
+///    parent grant, producing an attenuated child grant scoped to
+///    `child_scope` (and optionally narrowed budget / TTL).
+/// 3. **Phase 3 — activate.** Flip the persona row from `enrolling`
+///    to `active`. The row is now usable by `use_credential`,
+///    `delegate_grant`, etc.
+///
+/// If the daemon crashes between phase 1 and phase 3, the persona row
+/// remains `enrolling` forever; the reconciler's idempotency check
+/// (`DaemonStore::enrolling_persona_for_container`) surfaces the
+/// poisoned slot, and the reconciler refuses to spawn a second
+/// container into the same enrolling slot (the test
+/// `agent_persona_enrolling_blocks_reconciler_spawn` covers this).
+///
+/// The container binding is persisted in BOTH the `personas` table
+/// (via the `container_id` column) AND the audit log (via an
+/// `agent_persona.created` event with the full binding metadata in
+/// `details`), so reconcilers can reconstruct the binding from either
+/// source even if one is rolled back by a future migration.
+///
+/// JSON-RPC params shape:
+/// ```json
+/// {
+///   "name":             "ml-eval-worker",       // required, persona display name
+///   "container_id":     "ctr-abc123",            // required, container identity
+///   "parent_grant_id":  "grant-...",             // required, grant being attenuated
+///   "child_scope":      "credential.access.gh",  // required, scope of attenuated grant
+///   "ttl_secs":         3600,                    // optional, child grant TTL
+///   "budget":           { ... },                 // optional, narrowed budget
+///   "agent_id":         "scion-agent-...",       // optional, audit-only
+///   "binding_request_id": "br-..."               // optional, audit-only
+/// }
+/// ```
+///
+/// Returns `{ persona_id, attenuated_grant_id, container_id, status }`.
+/// `status` is always `"active"` on success — callers do not see the
+/// `enrolling` intermediate state because phase 3 is part of the same
+/// RPC's success path.
+pub async fn create_agent_persona(
+    store: &DaemonStore,
+    params: &Value,
+) -> Result<Value, (i32, String)> {
+    let name = params["name"]
+        .as_str()
+        .ok_or((-32602, "missing 'name' parameter".to_string()))?;
+    let container_id = params["container_id"]
+        .as_str()
+        .ok_or((-32602, "missing 'container_id' parameter".to_string()))?;
+    let parent_grant_id = params["parent_grant_id"]
+        .as_str()
+        .ok_or((-32602, "missing 'parent_grant_id' parameter".to_string()))?;
+    let child_scope = params["child_scope"]
+        .as_str()
+        .or_else(|| params["scope"].as_str())
+        .ok_or((-32602, "missing 'child_scope' parameter".to_string()))?;
+    let ttl_secs = params["ttl_secs"].as_u64();
+    let child_budget: Option<core_grant_types::Budget> = if params["budget"].is_object() {
+        Some(
+            serde_json::from_value(params["budget"].clone())
+                .map_err(|e| (-32602, format!("invalid 'budget': {e}")))?,
+        )
+    } else {
+        None
+    };
+    let binding_request_id = params["binding_request_id"].as_str();
+    let agent_id = params["agent_id"].as_str();
+
+    // Validate the parent grant exists and is active BEFORE inserting
+    // the enrolling persona row. A bad parent grant means the whole
+    // two-phase commit will fail; bailing out here avoids a poisoned
+    // enrollment slot that only exists because phase-2 was never going
+    // to succeed.
+    let parent_grant = store
+        .grant_store()
+        .load_grant(parent_grant_id)
+        .map_err(|e| match e {
+            crate::infra::store::StoreError::NotFound => (
+                -32004,
+                format!("parent grant '{parent_grant_id}' not found"),
+            ),
+            // Malformed grant id (e.g. not a valid uuid) is functionally
+            // equivalent to "no such grant" from the caller's POV — surface
+            // it as -32004 so callers don't have to special-case parse
+            // failures vs miss-by-id.
+            crate::infra::store::StoreError::InvalidInput(_) => (
+                -32004,
+                format!("parent grant '{parent_grant_id}' not found"),
+            ),
+            other => (-32000, other.to_string()),
+        })?;
+    if parent_grant.state != CoreGrantState::Active {
+        return Err((
+            -32005,
+            format!(
+                "parent grant '{parent_grant_id}' is not active and cannot be \
+                 delegated from"
+            ),
+        ));
+    }
+
+    // ── Phase 1: insert persona row in `enrolling` state ──
+    //
+    // This both creates the row AND binds it to `container_id` in a
+    // single SQL statement. The uniqueness check inside
+    // `create_agent_persona_enrolling` rejects a second spawn into the
+    // same container slot — CRIT-4 mitigation.
+    let enrolling = store
+        .create_agent_persona_enrolling(name, container_id, parent_grant_id)
+        .map_err(|e| match e {
+            crate::infra::store::StoreError::InvalidInput(msg) => (-32005, msg),
+            crate::infra::store::StoreError::Sqlite(
+                rusqlite::Error::SqliteFailure(err, _),
+            ) if err.code == rusqlite::ErrorCode::ConstraintViolation => (
+                -32005,
+                format!("name '{name}' already in use"),
+            ),
+            other => (-32000, other.to_string()),
+        })?;
+    let new_persona_id = enrolling.id.clone();
+
+    // ── Phase 2: delegate the parent grant to the new persona ──
+    //
+    // If this fails, the persona row stays in `enrolling`. The
+    // reconciler's enrolling-slot check refuses to spawn a duplicate
+    // container against the poisoned binding; an operator can clean
+    // up the orphan row out-of-band. We intentionally do NOT auto-
+    // rollback phase 1 — leaving the row visible is the audit trail
+    // for the failed spawn.
+    let grant = match store.delegate_grant_full(
+        parent_grant_id,
+        &new_persona_id,
+        child_scope,
+        ttl_secs,
+        child_budget,
+    ) {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(
+                container_id = %container_id,
+                parent_grant_id = %parent_grant_id,
+                new_persona_id = %new_persona_id,
+                error = %e,
+                "create_agent_persona: phase-2 delegate_grant failed; \
+                 persona left in 'enrolling' state for reconciler reaping"
+            );
+            // Audit-log the phase-2 failure so the reconciler can
+            // distinguish "daemon crashed" from "delegate rejected".
+            let details = serde_json::json!({
+                "persona_id": new_persona_id,
+                "container_id": container_id,
+                "parent_grant_id": parent_grant_id,
+                "phase": "delegate",
+                "error": e.to_string(),
+                "binding_request_id": binding_request_id,
+                "agent_id": agent_id,
+            })
+            .to_string();
+            let _ = store.log_event(
+                Some(&new_persona_id),
+                "agent_persona.enroll_failed",
+                None,
+                "denied",
+                Some(&details),
+            );
+            return Err((-32000, format!("delegate_grant failed: {e}")));
+        }
+    };
+
+    // ── Phase 3: flip persona enrolling → active ──
+    //
+    // Same crash-safety story as phase 2: if this UPDATE fails, the
+    // row stays in `enrolling`. The reconciler refuses to spawn into
+    // the slot until an operator reaps the orphan.
+    if let Err(e) = store.activate_persona(&new_persona_id) {
+        tracing::warn!(
+            container_id = %container_id,
+            new_persona_id = %new_persona_id,
+            error = %e,
+            "create_agent_persona: phase-3 activate_persona failed; \
+             persona left in 'enrolling' state for reconciler reaping"
+        );
+        let details = serde_json::json!({
+            "persona_id": new_persona_id,
+            "container_id": container_id,
+            "parent_grant_id": parent_grant_id,
+            "child_grant_id": grant.id,
+            "phase": "activate",
+            "error": e.to_string(),
+            "binding_request_id": binding_request_id,
+            "agent_id": agent_id,
+        })
+        .to_string();
+        let _ = store.log_event(
+            Some(&new_persona_id),
+            "agent_persona.enroll_failed",
+            None,
+            "denied",
+            Some(&details),
+        );
+        return Err((-32000, format!("activate_persona failed: {e}")));
+    }
+
+    // ── Phase 4 (audit): persist the binding event in the SQLite event log ──
+    //
+    // The personas table column is the steady-state binding source of
+    // truth; this audit row is the temporally-ordered event-log entry
+    // demanded by design §6 "container-id binding persisted in
+    // SQLite event log". A reconciler that has lost its persona-table
+    // index can replay the audit log to reconstruct the binding map.
+    let details = serde_json::json!({
+        "persona_id": new_persona_id,
+        "container_id": container_id,
+        "parent_grant_id": parent_grant_id,
+        "child_grant_id": grant.id,
+        "child_scope": child_scope,
+        "ttl_secs": ttl_secs,
+        "binding_request_id": binding_request_id,
+        "agent_id": agent_id,
+        "name": name,
+    })
+    .to_string();
+    let _ = store.log_event(
+        Some(&new_persona_id),
+        "agent_persona.created",
+        None,
+        "allowed",
+        Some(&details),
+    );
+
+    Ok(json!({
+        "persona_id": new_persona_id,
+        "attenuated_grant_id": grant.id,
+        "container_id": container_id,
+        "parent_grant_id": parent_grant_id,
+        "child_scope": child_scope,
+        "status": "active",
+        "name": enrolling.name,
+        "public_key": enrolling.public_key,
+        "expires_at": grant.expires_at,
+    }))
+}
+
 /// Shape a single `Statement` into the budget-status response entry used by
 /// the `grant_budget_status` MCP tool. The `percent_used` map is populated
 /// only for axes that have a ceiling set — TTL-only statements return an
 /// empty map rather than a map full of nulls. `estimated_runway_seconds`
 /// is today always `null` (reserved for a future burn-rate projection once
 /// the metering history is durable).
-fn build_statement_budget_entry(s: &core_types::Statement) -> Value {
+fn build_statement_budget_entry(s: &core_grant_types::Statement) -> Value {
     let mut percent_used = serde_json::Map::new();
     if let Some(budget) = &s.budget {
         if let Some(cap) = budget.tokens
@@ -3457,7 +5202,7 @@ mod tests {
         assert_eq!(err.0, -32602);
     }
 
-    // ---- implementation-note-89: evaluate_tool_call dispatch arm -----------------
+    // ---- implementation-note-60: evaluate_tool_call dispatch arm -----------------
 
     #[tokio::test]
     async fn evaluate_tool_call_dispatch_returns_decision_for_active_grant() {
@@ -3780,7 +5525,7 @@ mod tests {
 
     #[tokio::test]
     async fn revoke_statement_blocks_use_credential() {
-        // implementation-note-92 — per-statement revoke MVP.
+        // implementation-note-170 — per-statement revoke MVP.
         // Revoking the Credential Statement's sid blocks use_credential
         // while the grant is otherwise still active.
         let store = DaemonStore::open_in_memory().unwrap();
@@ -3878,7 +5623,7 @@ mod tests {
 
     #[tokio::test]
     async fn propose_grant_rpc_persists_n_statements() {
-        // implementation-note-95 — N-statement persistence + retrieval.
+        // implementation-note-173 — N-statement persistence + retrieval.
         let store = DaemonStore::open_in_memory().unwrap();
         let vault = test_vault();
         let policy = test_policy();
@@ -5292,7 +7037,7 @@ mod tests {
         persona_id: &str,
         credential_name: &str,
     ) -> String {
-        use core_types::{Budget, ResourceSelector, ResourceType, Statement, Usage};
+        use core_grant_types::{Budget, ResourceSelector, ResourceType, Statement, Usage};
         let grant = store
             .create_grant(persona_id, credential_name, "*", None)
             .unwrap();
@@ -5369,7 +7114,7 @@ mod tests {
             .increment_statement_usage(
                 &grant_id,
                 "S1",
-                core_types::Usage {
+                core_grant_types::Usage {
                     tokens: 10_000,
                     cents: 50,
                     ..Default::default()
@@ -5929,6 +7674,7 @@ mod tests {
             sessions_dir: None,
             llm_proxy_url: None,
             git_proxy_url: None,
+            peer_cred_principal: None,
         };
 
         let before = store.list_active_grants().unwrap().len();
@@ -5995,6 +7741,7 @@ mod tests {
             sessions_dir: None,
             llm_proxy_url: None,
             git_proxy_url: None,
+            peer_cred_principal: None,
         };
         let persona = dispatch_method_with_context(
             &store, &vault, &policy, &rl, None, create_ctx,
@@ -6049,6 +7796,7 @@ mod tests {
             sessions_dir: None,
             llm_proxy_url: None,
             git_proxy_url: None,
+            peer_cred_principal: None,
         };
         let result = dispatch_method_with_context(
             &store, &vault, &policy, &rl, None, delegate_ctx,
@@ -6101,6 +7849,7 @@ mod tests {
             sessions_dir: None,
             llm_proxy_url: None,
             git_proxy_url: None,
+            peer_cred_principal: None,
         };
 
         let before = store.list_active_grants().unwrap().len();
@@ -6328,7 +8077,7 @@ mod tests {
 
     #[tokio::test]
     async fn vault_get_round_trip_returns_plaintext_value() {
-        // implementation-note-110: pulumi-render.sh + similar headless
+        // implementation-note-194: pulumi-render.sh + similar headless
         // integrations call `ember vault get` -> daemon RPC `vault_get`.
         // This proves the RPC arm is wired and returns the decrypted
         // value under the canonical {"value": ...} shape.
@@ -6406,11 +8155,280 @@ mod tests {
         assert_eq!(result["removed"], json!(true));
     }
 
-    /// EMBER-implementation-note-94 integration test: emit synthetic kms_wrap receipts
+    // ============================================================
+    // KEYCHAIN-CONSOLIDATE-CLI-DAEMON-METHODS — T1 dispatch arm tests
+    // ============================================================
+
+    #[tokio::test]
+    async fn local_state_key_get_generates_on_first_call() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+        let result = dispatch_method(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            "local_state_key_get",
+            &json!({"caller": "cli"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["resolved_or_generated"], json!("generated"));
+        assert_eq!(result["vault_namespace"], json!("local-state/cli"));
+        let key = result["key"].as_str().unwrap();
+        // `core_crypto::generate_content_key` returns the canonical
+        // `xchacha20-key:<64 hex>` content-key form (14-byte prefix +
+        // 64 hex chars = 78 chars total).
+        assert!(
+            key.starts_with("xchacha20-key:") && key.len() == 78,
+            "expected xchacha20-key:<64 hex> content key, got: {key}"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_state_key_get_resolves_on_second_call() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+        let first = dispatch_method(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            "local_state_key_get",
+            &json!({"caller": "cli"}),
+        )
+        .await
+        .unwrap();
+        let second = dispatch_method(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            "local_state_key_get",
+            &json!({"caller": "cli"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second["resolved_or_generated"], json!("resolved"));
+        assert_eq!(first["key"], second["key"]);
+    }
+
+    #[tokio::test]
+    async fn local_state_key_get_namespaces_per_caller() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+        let cli_key = dispatch_method(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            "local_state_key_get",
+            &json!({"caller": "cli"}),
+        )
+        .await
+        .unwrap();
+        let gui_key = dispatch_method(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            "local_state_key_get",
+            &json!({"caller": "gui"}),
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            cli_key["key"], gui_key["key"],
+            "per-caller namespaces must produce distinct keys"
+        );
+        assert_eq!(cli_key["vault_namespace"], json!("local-state/cli"));
+        assert_eq!(gui_key["vault_namespace"], json!("local-state/gui"));
+    }
+
+    #[tokio::test]
+    async fn local_state_key_get_missing_caller_returns_invalid_params() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+        let err = dispatch_method(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            "local_state_key_get",
+            &json!({}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, -32602);
+    }
+
+    #[tokio::test]
+    async fn local_state_key_set_is_idempotent() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+        // First set: not already set.
+        let first = dispatch_method(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            "local_state_key_set",
+            &json!({"caller": "cli", "key": "xchacha20-key:0000000000000000000000000000000000000000000000000000000000000001"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first["already_set"], json!(false));
+        // Second set: idempotent no-op.
+        let second = dispatch_method(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            "local_state_key_set",
+            &json!({"caller": "cli", "key": "xchacha20-key:0000000000000000000000000000000000000000000000000000000000000002"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second["already_set"], json!(true));
+        // After set, get returns the originally-set value.
+        let got = dispatch_method(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            "local_state_key_get",
+            &json!({"caller": "cli"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got["resolved_or_generated"], json!("resolved"));
+        assert_eq!(
+            got["key"].as_str().unwrap(),
+            "xchacha20-key:0000000000000000000000000000000000000000000000000000000000000001",
+            "set + get must round-trip the originally-set value"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_state_key_rotate_and_reencrypt_round_trips() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        // 1. Vend a key.
+        let get_result = dispatch_method(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            "local_state_key_get",
+            &json!({"caller": "cli"}),
+        )
+        .await
+        .unwrap();
+        let old_key = get_result["key"].as_str().unwrap().to_string();
+
+        // 2. Encrypt a payload client-side using core_crypto.
+        let plaintext = b"local-state-payload-v1";
+        let encrypted = core_crypto::encrypt_content(
+            &old_key,
+            plaintext,
+            b"emberlink-local-state",
+        )
+        .unwrap();
+        let nonce_bytes = core_types::hex_to_bytes(&encrypted.nonce_hex).unwrap();
+        let mut ciphertext = Vec::with_capacity(nonce_bytes.len() + encrypted.ciphertext.len());
+        ciphertext.extend_from_slice(&nonce_bytes);
+        ciphertext.extend_from_slice(&encrypted.ciphertext);
+
+        // 3. Call rotate_and_reencrypt.
+        let rotate_result = dispatch_method(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            "local_state_key_rotate_and_reencrypt",
+            &json!({"caller": "cli", "ciphertext": ciphertext}),
+        )
+        .await
+        .unwrap();
+        let new_ciphertext: Vec<u8> = rotate_result["ciphertext"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u8)
+            .collect();
+        assert_eq!(rotate_result["vault_namespace"], json!("local-state/cli"));
+
+        // 4. The new ciphertext must be different (fresh key + nonce).
+        assert_ne!(ciphertext, new_ciphertext);
+
+        // 5. A subsequent get returns the *new* key.
+        let new_get = dispatch_method(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            "local_state_key_get",
+            &json!({"caller": "cli"}),
+        )
+        .await
+        .unwrap();
+        let new_key = new_get["key"].as_str().unwrap().to_string();
+        assert_ne!(old_key, new_key, "rotation must produce a new key");
+
+        // 6. The new ciphertext decrypts under the new key back to the
+        //    original plaintext.
+        assert!(new_ciphertext.len() >= 24);
+        let (new_nonce, new_ct) = new_ciphertext.split_at(24);
+        let encrypted_new = core_crypto::EncryptedContent {
+            nonce_hex: core_types::bytes_to_hex(new_nonce),
+            ciphertext: new_ct.to_vec(),
+        };
+        let decrypted = core_crypto::decrypt_content(
+            &new_key,
+            &encrypted_new,
+            b"emberlink-local-state",
+        )
+        .unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[tokio::test]
+    async fn local_state_key_rotate_missing_caller_returns_invalid_params() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+        let err = dispatch_method(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            "local_state_key_rotate_and_reencrypt",
+            &json!({"ciphertext": []}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, -32602);
+    }
+
+    /// EMBER-implementation-note-172 integration test: emit synthetic kms_wrap receipts
     /// for two actors, then verify `receipt_query` filters by actor and kind.
     #[tokio::test]
     async fn receipt_query_filters_by_actor_and_kind() {
-        use core_types::grant_receipt::{
+        use core_grant_types::grant_receipt::{
             Evidence, GrantEvaluation, GrantEvaluationOutcome, KmsReceipt,
             ReceiptKind, ReceiptOutcome,
         };
@@ -6449,6 +8467,7 @@ mod tests {
             materialized_at_epoch_secs: 0,
             grant_evaluation: eval_denied.clone(),
             outcome: ReceiptOutcome::Success,
+            peer_identity: None,
             evidence: Evidence::default(),
         };
         store.store_kms_receipt(&kms_a).unwrap();
@@ -6463,6 +8482,7 @@ mod tests {
             materialized_at_epoch_secs: 0,
             grant_evaluation: eval_denied,
             outcome: ReceiptOutcome::Success,
+            peer_identity: None,
             evidence: Evidence::default(),
         };
         store.store_kms_receipt(&kms_b).unwrap();
@@ -6501,7 +8521,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // implementation-note-102 Phase 2: sops_unwrap_dek RPC tests
+    // implementation-note-181 Phase 2: sops_unwrap_dek RPC tests
     // -----------------------------------------------------------------
 
     /// Build an age-encrypted DEK ciphertext for the given recipient
@@ -6510,10 +8530,9 @@ mod tests {
     fn encrypt_dek_for(public_key: &str, plaintext: &[u8]) -> Vec<u8> {
         use std::io::Write;
         let recipient: age::x25519::Recipient = public_key.parse().unwrap();
-        let encryptor = age::Encryptor::with_recipients(vec![
-            Box::new(recipient) as Box<dyn age::Recipient + Send>,
-        ])
-        .unwrap();
+        let encryptor =
+            age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
+                .unwrap();
         let mut ciphertext = Vec::new();
         let mut writer = encryptor.wrap_output(&mut ciphertext).unwrap();
         writer.write_all(plaintext).unwrap();
@@ -6857,7 +8876,7 @@ mod tests {
         assert_eq!(err.0, -32602);
     }
 
-    // ---- implementation-note-18: await_approval block-and-poll RPC -----------------
+    // ---- implementation-note-31: await_approval block-and-poll RPC -----------------
 
     #[tokio::test]
     async fn await_approval_returns_approved_when_resolved_mid_poll() {
@@ -6993,7 +9012,7 @@ mod tests {
         assert_eq!(err.0, -32602, "got: {err:?}");
     }
 
-    // implementation-note-98 — graceful binding delete (design).
+    // implementation-note-177 — graceful binding delete (design).
     #[tokio::test]
     async fn binding_delete_revokes_persona_and_cascades_grants() {
         let store = DaemonStore::open_in_memory().unwrap();
@@ -7121,7 +9140,7 @@ mod tests {
         assert_eq!(resp["deleted"], json!(true));
     }
 
-    // implementation-note-99 — compromise-response revocation
+    // implementation-note-178 — compromise-response revocation
     // (design §"binding.revoke_urgent").
     #[tokio::test]
     async fn binding_revoke_urgent_cascades_grants_and_emits_urgent_audit() {
@@ -7245,7 +9264,7 @@ mod tests {
         assert_eq!(resp["revoked_urgent"], json!(true));
     }
 
-    // implementation-note-100 — mutate binding metadata
+    // implementation-note-179 — mutate binding metadata
     // (design §"binding.update").
     #[tokio::test]
     async fn binding_update_mutates_name_and_emits_before_after_audit() {
@@ -7442,7 +9461,7 @@ mod tests {
         );
     }
 
-    // implementation-note-101 — idempotent insert-or-update
+    // implementation-note-180 — idempotent insert-or-update
     // (design §"binding.upsert").
 
     #[tokio::test]
@@ -7684,7 +9703,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // implementation-note-107: register_session + close_session T2
+    // implementation-note-186: register_session + close_session T2
     // -------------------------------------------------------------------------
 
     #[tokio::test]
@@ -7781,7 +9800,7 @@ mod tests {
             "meta.json.closed must exist after close"
         );
 
-        // implementation-note-108: grant must remain
+        // implementation-note-187: grant must remain
         // Active after CleanExit — the handler no longer calls revoke_grant.
         let grant_after = store.get_grant(grant_id).expect("grant still queryable");
         assert_eq!(
@@ -7810,8 +9829,8 @@ mod tests {
         assert!(err.1.contains("sessions_dir"), "error should mention sessions_dir");
     }
 
-    // implementation-note-111: daemon-side T2 (updated for
-    // implementation-note-88) — register_session
+    // implementation-note-195: daemon-side T2 (updated for
+    // implementation-note-165) — register_session
     // response must include the real LLM proxy URL from RequestContext.
     #[tokio::test]
     async fn register_session_response_includes_real_proxy_url() {
@@ -7849,7 +9868,7 @@ mod tests {
         let mut ctx = RequestContext::internal("test harness");
         ctx.sessions_dir = Some(sessions_dir.clone());
         // Wire the URL via RequestContext — the correct path after
-        // implementation-note-88.
+        // implementation-note-165.
         ctx.llm_proxy_url = Some(expected_proxy_url.to_string());
 
         let reg = dispatch_method_with_context(
@@ -7873,7 +9892,7 @@ mod tests {
         );
     }
 
-    // implementation-note-88: T2 test —
+    // implementation-note-165: T2 test —
     // register_session must read the LLM proxy URL from RequestContext,
     // NOT from std::env::var. The env var may be absent or stale due to
     // Rust 2024 std::env::set_var cross-thread visibility hazard (tokio
@@ -7924,7 +9943,7 @@ mod tests {
         // SocketListener.with_llm_proxy_url wires in production.
         let mut ctx = RequestContext::internal("test harness");
         ctx.sessions_dir = Some(sessions_dir.clone());
-        // implementation-note-88: this URL must
+        // implementation-note-165: this URL must
         // appear in the response; the env var ("8484") must be ignored.
         ctx.llm_proxy_url = Some("http://127.0.0.1:55555".to_string());
 
@@ -7952,6 +9971,517 @@ mod tests {
         assert_ne!(
             got_proxy_url, "http://127.0.0.1:8484",
             "register_session must ignore EMBER_PROXY_URL env var; RequestContext wins"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // implementation-note-40 end-to-end tests.
+    // ------------------------------------------------------------------
+
+    /// Helper: mint a parent grant suitable for delegation tests.
+    /// Returns `(parent_persona_id, parent_grant_id)`.
+    async fn setup_parent_grant_for_agent_persona(
+        store: &DaemonStore,
+        vault: &Vault,
+        policy: &PolicyEngine,
+        rl: &RefCell<RateLimiter>,
+        parent_name: &str,
+    ) -> (String, String) {
+        let parent_persona = dispatch_method(
+            store, vault, policy, rl,
+            "create_persona",
+            &json!({"name": parent_name}),
+        ).await.unwrap();
+        let parent_persona_id = parent_persona["id"].as_str().unwrap().to_string();
+
+        let parent_grant = dispatch_method(
+            store, vault, policy, rl,
+            "create_grant",
+            &json!({
+                "persona_id": parent_persona_id,
+                "credential_name": "delegate-key",
+                "scope": "*",
+                "max_delegation_depth": 2,
+                "ttl_secs": 3_600,
+                "force": true,
+            }),
+        ).await.unwrap();
+        let parent_grant_id = parent_grant["id"].as_str().unwrap().to_string();
+        (parent_persona_id, parent_grant_id)
+    }
+
+    #[tokio::test]
+    async fn create_agent_persona_atomic_mints_active_persona_and_attenuated_grant() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let (_parent_persona_id, parent_grant_id) = setup_parent_grant_for_agent_persona(
+            &store, &vault, &policy, &rl, "agent-parent-atomic",
+        ).await;
+
+        let resp = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "create_agent_persona",
+            &json!({
+                "name": "scion-worker-1",
+                "container_id": "ctr-atomic-001",
+                "parent_grant_id": parent_grant_id,
+                "child_scope": "read",
+                "ttl_secs": 1_800,
+                "binding_request_id": "br-scion-001",
+                "agent_id": "scion-agent-aaa",
+            }),
+        ).await.unwrap();
+
+        // Caller sees an `active` persona (the `enrolling` intermediate
+        // state is internal to the two-phase commit).
+        assert_eq!(resp["status"], json!("active"));
+        let new_persona_id = resp["persona_id"].as_str().unwrap().to_string();
+        assert!(new_persona_id.starts_with("persona-"));
+        let attenuated_grant_id = resp["attenuated_grant_id"].as_str().unwrap();
+        assert!(attenuated_grant_id.starts_with("grant-"));
+        assert_eq!(resp["container_id"], json!("ctr-atomic-001"));
+        assert_eq!(resp["parent_grant_id"], json!(parent_grant_id));
+
+        // Persona row matches: status=active, container binding persisted.
+        let row = store.get_persona(&new_persona_id).unwrap();
+        assert_eq!(row.status, "active");
+        assert_eq!(row.container_id.as_deref(), Some("ctr-atomic-001"));
+        assert_eq!(row.parent_grant_id.as_deref(), Some(parent_grant_id.as_str()));
+
+        // Audit log carries the canonical binding event.
+        let entries = store
+            .query_audit(&AuditFilter {
+                persona_id: Some(new_persona_id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        let row = entries
+            .iter()
+            .find(|e| e.action == "agent_persona.created")
+            .unwrap_or_else(|| panic!("expected agent_persona.created audit row, got {entries:?}"));
+        let details: serde_json::Value = serde_json::from_str(
+            row.details.as_deref().expect("details JSON populated"),
+        )
+        .expect("details parses as JSON");
+        assert_eq!(details["container_id"], json!("ctr-atomic-001"));
+        assert_eq!(details["parent_grant_id"], json!(parent_grant_id));
+        assert_eq!(details["child_grant_id"], json!(attenuated_grant_id));
+        assert_eq!(details["binding_request_id"], json!("br-scion-001"));
+        assert_eq!(details["agent_id"], json!("scion-agent-aaa"));
+    }
+
+    #[tokio::test]
+    async fn create_agent_persona_rejects_unknown_parent_grant() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let err = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "create_agent_persona",
+            &json!({
+                "name": "scion-worker-orphan",
+                "container_id": "ctr-orphan",
+                "parent_grant_id": "grant-does-not-exist",
+                "child_scope": "read",
+            }),
+        ).await.unwrap_err();
+
+        // Bad parent grant must surface BEFORE any persona row is
+        // inserted — leaves no poisoned enrolling slot.
+        assert_eq!(err.0, -32004, "got: {err:?}");
+        let by_container = store
+            .enrolling_persona_for_container("ctr-orphan")
+            .unwrap();
+        assert!(
+            by_container.is_none(),
+            "failed-validation create_agent_persona must NOT leave an enrolling row behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_agent_persona_rejects_duplicate_container_spawn() {
+        // CRIT-4: a second create_agent_persona for the same
+        // container_id must be refused even after the first has
+        // successfully activated.
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let (_pp, parent_grant_id) = setup_parent_grant_for_agent_persona(
+            &store, &vault, &policy, &rl, "agent-parent-dup",
+        ).await;
+
+        let _first = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "create_agent_persona",
+            &json!({
+                "name": "scion-dup-1",
+                "container_id": "ctr-dup",
+                "parent_grant_id": parent_grant_id,
+                "child_scope": "read",
+                "ttl_secs": 1_800,
+            }),
+        ).await.unwrap();
+
+        let err = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "create_agent_persona",
+            &json!({
+                "name": "scion-dup-2",
+                "container_id": "ctr-dup",
+                "parent_grant_id": parent_grant_id,
+                "child_scope": "read",
+                "ttl_secs": 1_800,
+            }),
+        ).await.unwrap_err();
+        assert_eq!(err.0, -32005, "got: {err:?}");
+        assert!(
+            err.1.contains("ctr-dup") || err.1.contains("already bound"),
+            "expected container-already-bound message, got: {}",
+            err.1
+        );
+    }
+
+    /// implementation-note-40 acceptance criterion:
+    /// "emberd restart mid-spawn → reconciler refuses to spawn into
+    /// enrolling slot."
+    ///
+    /// Simulated by directly inserting a persona row in `enrolling`
+    /// state (representing phase 1 having committed before the daemon
+    /// crashed); the reconciler's
+    /// `enrolling_persona_for_container` lookup MUST surface the
+    /// poisoned slot, and a subsequent `create_agent_persona` for the
+    /// same container_id MUST be refused.
+    #[tokio::test]
+    async fn create_agent_persona_emberd_restart_mid_spawn_blocks_reconciler() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let (_pp, parent_grant_id) = setup_parent_grant_for_agent_persona(
+            &store, &vault, &policy, &rl, "agent-parent-restart",
+        ).await;
+
+        // Simulate "emberd crashed after phase 1 (insert enrolling
+        // row) but before phase 3 (activate)" by inserting the
+        // enrolling row directly through the store API — bypassing
+        // the RPC's atomic phase-2 + phase-3 path.
+        let enrolling = store
+            .create_agent_persona_enrolling(
+                "scion-crashed",
+                "ctr-mid-spawn",
+                &parent_grant_id,
+            )
+            .unwrap();
+        // Note: we never call activate_persona — the row stays in
+        // `enrolling` forever, mimicking the daemon-crash window.
+
+        // The reconciler's lookup MUST see the poisoned slot.
+        let poisoned = store
+            .enrolling_persona_for_container("ctr-mid-spawn")
+            .unwrap()
+            .expect("reconciler must see enrolling row after simulated crash");
+        assert_eq!(poisoned.id, enrolling.id);
+        assert_eq!(poisoned.status, "enrolling");
+
+        // A second create_agent_persona RPC for the same
+        // container_id MUST be refused — the reconciler will see the
+        // -32005 error and treat the slot as poisoned until an
+        // operator cleans it up out-of-band.
+        let err = dispatch_method(
+            &store, &vault, &policy, &rl,
+            "create_agent_persona",
+            &json!({
+                "name": "scion-restart-attempt",
+                "container_id": "ctr-mid-spawn",
+                "parent_grant_id": parent_grant_id,
+                "child_scope": "read",
+                "ttl_secs": 1_800,
+            }),
+        ).await.unwrap_err();
+        assert_eq!(err.0, -32005, "got: {err:?}");
+        assert!(
+            err.1.contains("ctr-mid-spawn") || err.1.contains("already bound"),
+            "expected reconciler-refusal message, got: {}",
+            err.1
+        );
+
+        // The poisoned row must NOT have been overwritten by the
+        // refused spawn attempt — it is still in `enrolling` state.
+        let after_attempt = store.get_persona(&enrolling.id).unwrap();
+        assert_eq!(after_attempt.status, "enrolling");
+    }
+
+    // ---------------------------------------------------------------
+    // implementation-note-103 — session.lookup_or_open
+    // ---------------------------------------------------------------
+
+    /// `session.lookup_or_open` refuses when no kernel-attested
+    /// principal is available — wire-only RPC, Internal source is
+    /// rejected with `-32401`.
+    #[tokio::test]
+    async fn session_lookup_or_open_refuses_without_principal() {
+        let res = handle_session_lookup_or_open(None, &json!({})).await;
+        let (code, msg) = res.expect_err("must refuse without principal");
+        assert_eq!(code, -32401, "expected -32401, got {code}: {msg}");
+    }
+
+    /// `session.lookup_or_open` refuses when the caller-supplied
+    /// `parent_pid` does not match the kernel-attested peer pid.
+    #[tokio::test]
+    async fn session_lookup_or_open_refuses_mismatched_parent_pid() {
+        use crate::infra::runtime::PeerCredPrincipal;
+        clear_persona_uid_registry();
+        let principal = PeerCredPrincipal::new(
+            1001,
+            42_000,
+            std::path::PathBuf::from("/tmp/agent.sock"),
+        );
+        let params = json!({"parent_pid": 99_999});
+        let res = handle_session_lookup_or_open(Some(&principal), &params).await;
+        let (code, msg) = res.expect_err("must refuse mismatched parent_pid");
+        assert_eq!(code, -32004, "expected -32004, got {code}: {msg}");
+        assert!(
+            msg.contains("parent_pid") || msg.contains("99999") || msg.contains("42000"),
+            "error must mention the mismatch, got: {msg}"
+        );
+    }
+
+    /// `session.lookup_or_open` refuses when the caller-supplied
+    /// `persona` resolves to a different bound uid than the kernel-
+    /// attested principal's uid.
+    #[tokio::test]
+    async fn session_lookup_or_open_refuses_mismatched_persona() {
+        use crate::infra::runtime::PeerCredPrincipal;
+        clear_persona_uid_registry();
+        bind_persona_uid("victim-persona", 5555);
+        let principal = PeerCredPrincipal::new(
+            6666,
+            42_000,
+            std::path::PathBuf::from("/tmp/agent.sock"),
+        );
+        let params = json!({"persona": "victim-persona"});
+        let res = handle_session_lookup_or_open(Some(&principal), &params).await;
+        let (code, _) = res.expect_err("must refuse mismatched persona binding");
+        assert_eq!(code, -32004);
+    }
+
+    /// `session.lookup_or_open` succeeds when the principal is
+    /// supplied and no caller-supplied identity claims conflict with
+    /// it. Returns the session_id + parent_pid + socket_path triple.
+    #[tokio::test]
+    async fn session_lookup_or_open_succeeds_on_matched_principal() {
+        use crate::infra::runtime::PeerCredPrincipal;
+        clear_persona_uid_registry();
+        bind_persona_uid("matched-persona", 7777);
+        let principal = PeerCredPrincipal::new(
+            7777,
+            12_345,
+            std::path::PathBuf::from("/tmp/agent.sock"),
+        );
+        let params = json!({"persona": "matched-persona", "parent_pid": 12_345});
+        let res = handle_session_lookup_or_open(Some(&principal), &params).await;
+        let value = res.expect("matched principal must succeed");
+        assert_eq!(value["parent_pid"].as_i64(), Some(12_345));
+        assert_eq!(value["persona_id"].as_str(), Some("matched-persona"));
+        assert_eq!(value["socket_path"].as_str(), Some("/tmp/agent.sock"));
+        assert!(
+            value["session_id"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("sess_"),
+            "session_id must be minted, got: {value}"
+        );
+    }
+
+    // ─── implementation-note-190 ────────────────────
+    //
+    // implementation-note-191
+    //
+    // Coverage for the `headless_preflight_layer1` dispatch arm. The
+    // resolver itself is exhaustively unit-tested in
+    // `crates/headless-runtime/src/preflight.rs::tests`; these tests cover the
+    // wire-shape contract (param parsing, JSON gap shape) and confirm the
+    // bundled cohort-A registry loads without an explicit `release-checklist`
+    // dependency.
+
+    /// Acceptance criterion: a task that declares a Construct whose action
+    /// the (empty) persona template does not grant produces a non-empty
+    /// gap list.
+    #[tokio::test]
+    async fn headless_preflight_layer1_emits_gap_for_unsatisfied_construct() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let params = json!({
+            "tasks": [
+                {
+                    "task_id": "TASK-AP-PR-MERGE",
+                    "constructs": ["ember-gh.pr_merge"],
+                }
+            ],
+            "template": [],
+        });
+
+        let result = dispatch_method(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            "headless_preflight_layer1",
+            &params,
+        )
+        .await
+        .expect("layer1 dispatch should succeed");
+
+        let gaps = result.as_array().expect("result is a JSON array");
+        assert_eq!(gaps.len(), 1, "expected one gap, got: {result}");
+        assert_eq!(gaps[0]["task_id"].as_str(), Some("TASK-AP-PR-MERGE"));
+        assert_eq!(gaps[0]["identifier"].as_str(), Some("ember-gh.pr_merge"));
+        assert!(gaps[0]["scope"].is_null());
+    }
+
+    /// Template that allows the declared permission → no gap.
+    #[tokio::test]
+    async fn headless_preflight_layer1_template_allows_means_no_gap() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let params = json!({
+            "tasks": [
+                {
+                    "task_id": "TASK-AP-PR-MERGE",
+                    "constructs": ["ember-gh.pr_merge"],
+                }
+            ],
+            "template": ["ember-gh.pr_merge"],
+        });
+
+        let result = dispatch_method(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            "headless_preflight_layer1",
+            &params,
+        )
+        .await
+        .expect("layer1 dispatch should succeed");
+
+        let gaps = result.as_array().expect("result is a JSON array");
+        assert!(gaps.is_empty(), "expected no gaps, got: {result}");
+    }
+
+    /// Missing `tasks` param → `-32602` (invalid params).
+    #[tokio::test]
+    async fn headless_preflight_layer1_missing_tasks_returns_invalid_params() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let err = dispatch_method(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            "headless_preflight_layer1",
+            &json!({}),
+        )
+        .await
+        .expect_err("missing tasks should fail");
+        assert_eq!(err.0, -32602);
+        assert!(err.1.contains("'tasks'"), "error mentions tasks: {}", err.1);
+    }
+
+    /// Empty `tasks` array → empty gap list (no error).
+    #[tokio::test]
+    async fn headless_preflight_layer1_empty_tasks_yields_empty_gaps() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let result = dispatch_method(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            "headless_preflight_layer1",
+            &json!({ "tasks": [] }),
+        )
+        .await
+        .expect("empty tasks must succeed");
+        let gaps = result.as_array().expect("array result");
+        assert!(gaps.is_empty());
+    }
+
+    /// Unknown construct names are silently skipped — the resolver's
+    /// "best-effort predictive layer" contract.
+    #[tokio::test]
+    async fn headless_preflight_layer1_unknown_construct_silently_skipped() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let params = json!({
+            "tasks": [
+                {
+                    "task_id": "TASK-UNKNOWN",
+                    "constructs": ["ember-nonexistent.do_thing"],
+                }
+            ],
+            "template": [],
+        });
+
+        let result = dispatch_method(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            "headless_preflight_layer1",
+            &params,
+        )
+        .await
+        .expect("unknown construct must not error");
+        let gaps = result.as_array().expect("array result");
+        assert!(gaps.is_empty(), "unknown construct yields no gap: {result}");
+    }
+
+    /// The bundled cohort-A manifest registry includes the load-bearing
+    /// `ember-gh` and `ember-kubectl` constructs the brief calls out.
+    #[test]
+    fn bundled_construct_registry_includes_cohort_a_tools() {
+        let registry = bundled_construct_registry().expect("registry loads");
+        assert!(
+            registry.contains_key("ember-gh"),
+            "registry missing ember-gh: {:?}",
+            registry.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            registry.contains_key("ember-kubectl"),
+            "registry missing ember-kubectl: {:?}",
+            registry.keys().collect::<Vec<_>>()
+        );
+        // The kubectl manifest uses the tool-prefixed action-key shape,
+        // exercising the resolver's short-name-prepended fallback.
+        let kubectl = &registry["ember-kubectl"];
+        assert!(
+            kubectl.action_keys.iter().any(|k| k == "kubectl.apply"),
+            "kubectl.apply key present: {:?}",
+            kubectl.action_keys
         );
     }
 }

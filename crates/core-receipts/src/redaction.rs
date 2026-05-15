@@ -1,4 +1,4 @@
-//! Receipt redaction rule engine (implementation-note-17).
+//! Receipt redaction rule engine (implementation-note-44).
 //!
 //! Receipts contain raw tool outputs that may include secrets, PII, or PHI;
 //! redaction is applied before a receipt is exported (e.g. to a third party

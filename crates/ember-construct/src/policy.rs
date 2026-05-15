@@ -172,10 +172,25 @@ pub fn credential_policy(action_key: &str) -> Option<CredentialPolicy> {
         }),
 
         // ───── git — GitHub App installation token, delivered via URL rewrite ─────
-        "git.push" | "git.fetch" | "git.clone" | "git.pull" => Some(CredentialPolicy {
+        // git.push mutates remote refs; needs contents:write.
+        "git.push" => Some(CredentialPolicy {
             provider: BrokerProvider::Github,
             scope: serde_json::json!({
                 "permissions": [["contents", "write"]],
+            }),
+            injection: CredentialInjection::GitHttpRewrite {
+                hosts: &["github.com"],
+            },
+        }),
+
+        // git.fetch / git.clone / git.pull are read-only against the remote;
+        // they need an installation token for private-repo auth but
+        // principle-of-least-privilege wants contents:read, not write.
+        // Anchor: fetch_pull_clone_use_read_scope
+        "git.fetch" | "git.clone" | "git.pull" => Some(CredentialPolicy {
+            provider: BrokerProvider::Github,
+            scope: serde_json::json!({
+                "permissions": [["contents", "read"]],
             }),
             injection: CredentialInjection::GitHttpRewrite {
                 hosts: &["github.com"],
@@ -227,16 +242,43 @@ mod tests {
     }
 
     #[test]
-    fn git_fetch_clone_pull_share_policy_with_push() {
+    fn git_push_has_write_scope() {
+        let policy = credential_policy("git.push").expect("git.push must have policy");
+        let perms = policy.scope.get("permissions").expect("permissions present");
+        let perms = perms.as_array().expect("permissions is array");
+        let first = perms.first().expect("at least one permission");
+        let pair = first.as_array().expect("permission entry is array");
+        assert_eq!(pair[0].as_str(), Some("contents"));
+        assert_eq!(
+            pair[1].as_str(),
+            Some("write"),
+            "git.push must request contents:write"
+        );
+    }
+
+    #[test]
+    fn git_fetch_clone_pull_have_read_scope() {
+        // fetch_pull_clone_use_read_scope: read-only verbs must NOT mint
+        // contents:write — principle of least privilege.
         for verb in ["git.fetch", "git.clone", "git.pull"] {
             let policy = credential_policy(verb)
                 .unwrap_or_else(|| panic!("{verb} must have policy"));
-            match policy.injection {
+            match &policy.injection {
                 CredentialInjection::GitHttpRewrite { hosts } => {
-                    assert_eq!(hosts, &["github.com"], "{verb} hosts");
+                    assert_eq!(*hosts, &["github.com"], "{verb} hosts");
                 }
                 other => panic!("{verb} expected GitHttpRewrite, got {other:?}"),
             }
+            let perms = policy.scope.get("permissions").expect("permissions present");
+            let perms = perms.as_array().expect("permissions is array");
+            let first = perms.first().expect("at least one permission");
+            let pair = first.as_array().expect("permission entry is array");
+            assert_eq!(pair[0].as_str(), Some("contents"), "{verb}");
+            assert_eq!(
+                pair[1].as_str(),
+                Some("read"),
+                "{verb} must request contents:read, not write"
+            );
         }
     }
 

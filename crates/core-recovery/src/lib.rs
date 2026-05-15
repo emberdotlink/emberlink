@@ -1,9 +1,5 @@
-use core_types::{
-    EventBody, GuardianEnrolledEvent, GuardianKeyRotatedEvent, RecoveryApproval,
-    RecoveryApprovedEvent, RecoveryContestedEvent, RecoveryExecutedEvent, RecoveryExecution,
-    RecoveryPolicy, RecoveryPolicyCreatedEvent, RecoveryRejectedEvent, RecoveryRequest,
-    RecoveryRequestedEvent, RecoveryScope,
-};
+use core_event_types::{EventBody, GuardianEnrolledEvent, GuardianKeyRotatedEvent, RecoveryApprovedEvent, RecoveryContestedEvent, RecoveryExecutedEvent, RecoveryPolicyCreatedEvent, RecoveryRejectedEvent, RecoveryRequestedEvent};
+use core_principals::{RecoveryApproval, RecoveryExecution, RecoveryPolicy, RecoveryRequest, RecoveryScope};
 
 pub fn create_policy(
     root_id: impl Into<String>,
@@ -144,7 +140,7 @@ pub fn execute(request_id: impl Into<String>, executed_scope: RecoveryScope) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_types::EventType;
+    use core_event_types::EventType;
 
     #[test]
     fn recovery_event_builders_emit_typed_events() {

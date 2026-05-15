@@ -66,8 +66,8 @@ impl DemoApp {
             Ok(persona) => persona,
             Err(err) => return format!("Failed to resolve claim persona: {}\n", err),
         };
-        let namespace = core_types::VaultNamespace {
-            owner_kind: core_types::VaultOwnerKind::Persona,
+        let namespace = core_event_types::VaultNamespace {
+            owner_kind: core_event_types::VaultOwnerKind::Persona,
             owner_id: persona.id.clone(),
         };
         let catalog = match self.app_runtime.store.local_vault_catalog(&namespace) {
@@ -89,7 +89,7 @@ impl DemoApp {
             .objects
             .iter()
             .filter(|object| {
-                object.class == core_types::VaultObjectClass::PersonaCredential && !object.deleted
+                object.class == core_event_types::VaultObjectClass::PersonaCredential && !object.deleted
             })
             .collect::<Vec<_>>();
         if claims.is_empty() {
@@ -155,8 +155,8 @@ impl DemoApp {
             Ok(persona) => persona,
             Err(err) => return format!("Failed to resolve claim persona: {}\n", err),
         };
-        let namespace = core_types::VaultNamespace {
-            owner_kind: core_types::VaultOwnerKind::Persona,
+        let namespace = core_event_types::VaultNamespace {
+            owner_kind: core_event_types::VaultOwnerKind::Persona,
             owner_id: persona.id.clone(),
         };
         let catalog = match self.app_runtime.store.local_vault_catalog(&namespace) {
@@ -167,7 +167,7 @@ impl DemoApp {
         let Some(object) = catalog.objects.iter().find(|object| object.id == object_id) else {
             return format!("Claim unavailable: unknown object: {object_id}\n");
         };
-        if object.class != core_types::VaultObjectClass::PersonaCredential {
+        if object.class != core_event_types::VaultObjectClass::PersonaCredential {
             return format!("Claim unavailable: object is not a persona credential: {object_id}\n");
         }
         if object.deleted {
@@ -218,7 +218,7 @@ impl DemoApp {
         let mut persona_ref = None;
         let mut object_id = None;
         let mut schema_id = None;
-        let mut claim_type = Some(core_types::ClaimType::SelfAsserted);
+        let mut claim_type = Some(core_event_types::ClaimType::SelfAsserted);
         let mut issuer_ref = None;
         let mut subject_ref = None;
         let mut expires_at = None;
@@ -242,7 +242,7 @@ impl DemoApp {
                     i += 2;
                 }
                 "--type" if i + 1 < tokens.len() => {
-                    claim_type = core_types::ClaimType::parse(tokens[i + 1]);
+                    claim_type = core_event_types::ClaimType::parse(tokens[i + 1]);
                     i += 2;
                 }
                 "--issuer" if i + 1 < tokens.len() => {
@@ -300,8 +300,8 @@ impl DemoApp {
             Ok(persona) => persona,
             Err(err) => return format!("Failed to resolve claim persona: {}\n", err),
         };
-        let namespace = core_types::VaultNamespace {
-            owner_kind: core_types::VaultOwnerKind::Persona,
+        let namespace = core_event_types::VaultNamespace {
+            owner_kind: core_event_types::VaultOwnerKind::Persona,
             owner_id: persona.id.clone(),
         };
         let recipients = match self.manifest_key_recipients_for_namespace(&namespace) {
@@ -338,7 +338,7 @@ impl DemoApp {
                 .unwrap_or_else(|| subject_ref.clone()),
             None => namespace.owner_id.clone(),
         };
-        let claim = core_types::ClaimMeta {
+        let claim = core_event_types::ClaimMeta {
             claim_type,
             issuer_persona_id,
             subject_persona_id,
@@ -357,16 +357,16 @@ impl DemoApp {
             &catalog_manifest_id,
             created_at,
             &created_by_device_id,
-            core_types::StructuredRecordMeta {
+            core_event_types::StructuredRecordMeta {
                 schema_id: schema_id.clone(),
                 schema_version: claim_schema_version(&schema_id),
-                encoding: core_types::StructuredEncoding::Json,
+                encoding: core_event_types::StructuredEncoding::Json,
                 app_namespace: claim_app_namespace(&schema_id),
             },
             claim,
             &payload,
-            core_types::DurabilityPolicy::ReplicatedToApprovedPeers,
-            core_types::RetentionPolicy::KeepLatest,
+            core_event_types::DurabilityPolicy::ReplicatedToApprovedPeers,
+            core_event_types::RetentionPolicy::KeepLatest,
             recipients,
         ) {
             Ok(revision) => {
@@ -439,8 +439,8 @@ impl DemoApp {
             Ok(persona) => persona,
             Err(err) => return format!("Failed to resolve claim persona: {}\n", err),
         };
-        let namespace = core_types::VaultNamespace {
-            owner_kind: core_types::VaultOwnerKind::Persona,
+        let namespace = core_event_types::VaultNamespace {
+            owner_kind: core_event_types::VaultOwnerKind::Persona,
             owner_id: persona.id.clone(),
         };
         let catalog = match self.app_runtime.store.local_vault_catalog(&namespace) {
@@ -453,7 +453,7 @@ impl DemoApp {
         let Some(object) = catalog.objects.iter().find(|object| object.id == object_id) else {
             return format!("Failed to disclose claim: unknown object: {object_id}\n");
         };
-        if object.class != core_types::VaultObjectClass::PersonaCredential {
+        if object.class != core_event_types::VaultObjectClass::PersonaCredential {
             return format!(
                 "Failed to disclose claim: object is not a persona credential: {object_id}\n"
             );
@@ -804,15 +804,15 @@ impl DemoApp {
             &catalog_manifest_id,
             created_at,
             &created_by_device_id,
-            core_types::StructuredRecordMeta {
+            core_event_types::StructuredRecordMeta {
                 schema_id: schema_id.clone(),
                 schema_version: schema_version.clone(),
-                encoding: core_types::StructuredEncoding::Json,
+                encoding: core_event_types::StructuredEncoding::Json,
                 app_namespace: app_namespace.clone(),
             },
             &payload,
-            core_types::DurabilityPolicy::ReplicatedToApprovedPeers,
-            core_types::RetentionPolicy::KeepLatest,
+            core_event_types::DurabilityPolicy::ReplicatedToApprovedPeers,
+            core_event_types::RetentionPolicy::KeepLatest,
             recipients,
         ) {
             Ok(revision) => {
@@ -905,7 +905,7 @@ impl DemoApp {
                     i += 2;
                 }
                 "--audience" if i + 1 < tokens.len() => {
-                    audience_kind = core_types::PresentationAudienceKind::parse(tokens[i + 1]);
+                    audience_kind = core_event_types::PresentationAudienceKind::parse(tokens[i + 1]);
                     i += 2;
                 }
                 "--namespace" if i + 1 < tokens.len() => {
@@ -1165,7 +1165,7 @@ impl DemoApp {
             }
             Err(err) => return format!("Failed to load disclosure artifacts: {}\n", err),
         };
-        if record.artifact.recipient_kind != core_types::PresentationAudienceKind::Peer {
+        if record.artifact.recipient_kind != core_event_types::PresentationAudienceKind::Peer {
             return format!(
                 "Failed to send disclosure artifact: artifact {} is not peer-targeted\n",
                 record.artifact.id
@@ -1382,7 +1382,7 @@ impl DemoApp {
         else {
             return format!("Unknown disclosure message: {message_ref}\n");
         };
-        if envelope.artifact.recipient_kind != core_types::PresentationAudienceKind::Peer {
+        if envelope.artifact.recipient_kind != core_event_types::PresentationAudienceKind::Peer {
             return "Failed to import disclosure message: disclosure message is not peer-targeted\n"
                 .to_string();
         }
@@ -1421,7 +1421,7 @@ impl DemoApp {
         let cursor = self.disclosure_import_cursor;
         let new_messages: Vec<_> = self
             .app_runtime.store
-            .events_of_type(core_types::EventType::MessageSent)
+            .events_of_type(core_event_types::EventType::MessageSent)
             .skip(cursor)
             .collect();
         let scanned = new_messages.len();
@@ -1433,7 +1433,7 @@ impl DemoApp {
                     let envelope =
                         core_storage::decode_presentation_artifact_envelope(&bytes).ok()?;
                     if envelope.artifact.recipient_kind
-                        != core_types::PresentationAudienceKind::Peer
+                        != core_event_types::PresentationAudienceKind::Peer
                     {
                         return None;
                     }
@@ -1487,7 +1487,7 @@ impl DemoApp {
     ) -> Option<(String, String, core_storage::PresentationArtifactEnvelope)> {
         for event in self
             .app_runtime.store
-            .events_of_type_rev(core_types::EventType::MessageSent)
+            .events_of_type_rev(core_event_types::EventType::MessageSent)
         {
             if let EventBody::MessageSent(body) = &event.body {
                 if body.message_id != message_ref && event.event_id != message_ref {
@@ -1508,7 +1508,7 @@ impl DemoApp {
 
     pub(crate) fn presentation_artifact_status_label(
         &self,
-        artifact: &core_types::PresentationArtifact,
+        artifact: &core_event_types::PresentationArtifact,
     ) -> &'static str {
         match artifact.expires_at {
             Some(expires_at) if expires_at <= now_epoch_secs() => "expired",
@@ -1753,9 +1753,9 @@ impl DemoApp {
         let object_id = object_id.unwrap_or_else(|| generate_random_identifier("vault-file"));
 
         let object_class = match class_arg.as_deref() {
-            Some("document") | None => core_types::VaultObjectClass::PersonaDocument,
-            Some("attachment") => core_types::VaultObjectClass::PersonaAttachment,
-            Some("secret") => core_types::VaultObjectClass::PersonaSecret,
+            Some("document") | None => core_event_types::VaultObjectClass::PersonaDocument,
+            Some("attachment") => core_event_types::VaultObjectClass::PersonaAttachment,
+            Some("secret") => core_event_types::VaultObjectClass::PersonaSecret,
             Some(other) => return format!("Unknown vault object class: {other}\n{usage}"),
         };
 
@@ -1803,8 +1803,8 @@ impl DemoApp {
             &content_type,
             &file_bytes,
             object_class,
-            core_types::DurabilityPolicy::ReplicatedToApprovedPeers,
-            core_types::RetentionPolicy::KeepLatest,
+            core_event_types::DurabilityPolicy::ReplicatedToApprovedPeers,
+            core_event_types::RetentionPolicy::KeepLatest,
             recipients,
         ) {
             Ok(_revision) => {
@@ -1886,7 +1886,7 @@ impl DemoApp {
         };
 
         // For file payloads, skip the header chunk (first chunk is metadata)
-        let file_bytes = if revision.payload_kind == core_types::PayloadKind::BinaryBlob {
+        let file_bytes = if revision.payload_kind == core_event_types::PayloadKind::BinaryBlob {
             // The payload is [header_chunk, file_content_chunk...]
             // Header format: "emberlink-file-header\nfilename=...\n"
             // We need to split on the header boundary
@@ -1979,10 +1979,10 @@ impl DemoApp {
         };
 
         let binding_id = generate_random_identifier("svc-binding");
-        let binding = core_types::ServiceBinding {
+        let binding = core_event_types::ServiceBinding {
             id: binding_id.clone(),
             persona_id: persona_id.clone(),
-            descriptor: core_types::ServiceDescriptor {
+            descriptor: core_event_types::ServiceDescriptor {
                 adapter_kind: adapter_kind.clone(),
                 service_label: service_label.clone(),
                 endpoint,
@@ -2135,8 +2135,8 @@ impl DemoApp {
             Ok(p) => p.id.clone(),
             Err(err) => return format!("Failed to resolve persona: {}\n", err),
         };
-        let namespace = core_types::VaultNamespace {
-            owner_kind: core_types::VaultOwnerKind::Persona,
+        let namespace = core_event_types::VaultNamespace {
+            owner_kind: core_event_types::VaultOwnerKind::Persona,
             owner_id: persona_id.clone(),
         };
         let recipients = match self.manifest_key_recipients_for_namespace(&namespace) {
@@ -2148,10 +2148,10 @@ impl DemoApp {
         };
         let created_by_device_id = recipients[0].device_id.clone();
 
-        let binding = core_types::ServiceBinding {
+        let binding = core_event_types::ServiceBinding {
             id: generate_random_identifier("svc-binding"),
             persona_id: persona_id.clone(),
-            descriptor: core_types::ServiceDescriptor {
+            descriptor: core_event_types::ServiceDescriptor {
                 adapter_kind: "password".into(),
                 service_label: format_str.clone(),
                 endpoint: format!("file://{file_path}"),
@@ -2162,7 +2162,7 @@ impl DemoApp {
 
         let adapter = core_state::PasswordImportAdapter::new(import_format, csv_text);
 
-        use core_types::ServiceAdapter;
+        use core_event_types::ServiceAdapter;
         let imported_claims = match adapter.import(&binding) {
             Ok(claims) => claims,
             Err(err) => return format!("Failed to parse import file: {}\n", err),
@@ -2194,11 +2194,11 @@ impl DemoApp {
             let payload_manifest_id = generate_random_identifier("claim-manifest");
             let catalog_manifest_id = generate_random_identifier("vault-catalog");
 
-            let claim_type = core_types::ClaimType::parse(&claim.claim_type)
-                .unwrap_or(core_types::ClaimType::SelfAsserted);
+            let claim_type = core_event_types::ClaimType::parse(&claim.claim_type)
+                .unwrap_or(core_event_types::ClaimType::SelfAsserted);
             let schema_id = "emberlink:claim:password:1.0";
 
-            let claim_meta = core_types::ClaimMeta {
+            let claim_meta = core_event_types::ClaimMeta {
                 claim_type,
                 issuer_persona_id: persona_id.clone(),
                 subject_persona_id: persona_id.clone(),
@@ -2217,16 +2217,16 @@ impl DemoApp {
                 &catalog_manifest_id,
                 now,
                 &created_by_device_id,
-                core_types::StructuredRecordMeta {
+                core_event_types::StructuredRecordMeta {
                     schema_id: schema_id.to_string(),
                     schema_version: claim_schema_version(schema_id),
-                    encoding: core_types::StructuredEncoding::Json,
+                    encoding: core_event_types::StructuredEncoding::Json,
                     app_namespace: claim_app_namespace(schema_id),
                 },
                 claim_meta,
                 claim.payload_json.as_bytes(),
-                core_types::DurabilityPolicy::LocalOnly,
-                core_types::RetentionPolicy::KeepLatest,
+                core_event_types::DurabilityPolicy::LocalOnly,
+                core_event_types::RetentionPolicy::KeepLatest,
                 recipients.clone(),
             ) {
                 Ok(_) => stored += 1,
@@ -2344,10 +2344,10 @@ impl DemoApp {
 
         // Store as a service binding.
         let binding_id = generate_random_identifier("svc-binding");
-        let binding = core_types::ServiceBinding {
+        let binding = core_event_types::ServiceBinding {
             id: binding_id.clone(),
             persona_id: persona.id.clone(),
-            descriptor: core_types::ServiceDescriptor {
+            descriptor: core_event_types::ServiceDescriptor {
                 adapter_kind: "passkey".into(),
                 service_label: rp_name.clone(),
                 endpoint: origin.clone(),
@@ -2557,7 +2557,7 @@ impl DemoApp {
         };
 
         // Update the binding with incremented sign count.
-        let updated_binding = core_types::ServiceBinding {
+        let updated_binding = core_event_types::ServiceBinding {
             external_account_id: serde_json::to_string(&meta).unwrap_or_default(),
             ..binding
         };
@@ -2632,7 +2632,7 @@ impl DemoApp {
     }
 }
 
-fn adapter_public_key(persona: &core_types::Persona) -> Option<[u8; 32]> {
+fn adapter_public_key(persona: &core_principals::Persona) -> Option<[u8; 32]> {
     core_crypto::public_key_raw_bytes(&core_crypto::PublicKey(
         persona.active_key.public_key.clone(),
     ))

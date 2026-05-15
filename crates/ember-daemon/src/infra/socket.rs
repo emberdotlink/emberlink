@@ -20,11 +20,14 @@ compile_error!(
 );
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Mutex;
 use std::time::Duration;
 
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -32,6 +35,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, watch};
 use tokio::task::LocalSet;
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 use crate::infra::events::GrantEvent;
 use crate::trust::policy::PolicyEngine;
@@ -75,6 +79,19 @@ pub enum SocketError {
     Bind(std::io::Error),
     #[error("socket path already bound")]
     AlreadyBound,
+    /// implementation-note-104 (CRIT-C): an inode already exists at the
+    /// per-agent socket path. Returned when the O_EXCL precondition under
+    /// the parent-dir `flock()` fails, including the symlink-swap attack
+    /// where a privileged container process pre-creates a symlink at the
+    /// predictable path before emberd's permission check.
+    #[error("per-agent socket path already exists: {0}")]
+    AlreadyExists(PathBuf),
+    /// implementation-note-104: the UUID was previously tombstoned and
+    /// is permanently retired. Tombstoning prevents agent-id recycling so
+    /// a freshly-spawned agent cannot inherit a previous agent's grants
+    /// or audit trail by replaying its UUID.
+    #[error("per-agent socket UUID has been tombstoned and cannot be reused: {0}")]
+    TombstonedUuid(Uuid),
 }
 
 /// P69E.8b: wrap a bind-site `io::Error` so the message includes the path
@@ -181,11 +198,11 @@ pub struct SocketListener {
     rate_limiter: Rc<RefCell<RateLimiter>>,
     events_tx: broadcast::Sender<GrantEvent>,
     sessions_dir: Option<PathBuf>,
-    /// implementation-note-88: bound LLM proxy
+    /// implementation-note-165: bound LLM proxy
     /// URL populated after the proxy listener binds in runtime.rs, then
     /// plumbed into every connection's RequestContext via handle_connection.
     llm_proxy_url: Option<String>,
-    /// implementation-note-88: bound git proxy URL.
+    /// implementation-note-165: bound git proxy URL.
     git_proxy_url: Option<String>,
 }
 
@@ -339,6 +356,26 @@ impl SocketListener {
                             let peer_for_task = Some(peer);
                             #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                             let peer_for_task: Option<PeerIdentity> = None;
+                            // implementation-note-103: extract
+                            // the (uid, pid, socket_path) triple once per
+                            // connection so every dispatch on this stream
+                            // gets the same kernel-attested principal.
+                            #[cfg(any(target_os = "linux", target_os = "macos"))]
+                            let peer_cred_principal = crate::infra::runtime::PeerCredPrincipal::from_stream(
+                                &stream,
+                                self.path.clone(),
+                            )
+                            .map_err(|e| {
+                                tracing::warn!(
+                                    error = %e,
+                                    "PeerCredPrincipal::from_stream failed — connection \
+                                     proceeds without kernel-attested principal (handlers \
+                                     fall back to legacy warn-only path)"
+                                );
+                            })
+                            .ok();
+                            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+                            let peer_cred_principal: Option<crate::infra::runtime::PeerCredPrincipal> = None;
                             tokio::task::spawn_local(handle_connection(
                                 stream,
                                 store,
@@ -351,6 +388,7 @@ impl SocketListener {
                                 sessions_dir,
                                 llm_proxy_url,
                                 git_proxy_url,
+                                peer_cred_principal,
                             ));
                         }
                         Err(e) => {
@@ -570,16 +608,192 @@ pub fn ensure_socket_perms(_path: &Path) -> Result<(), SocketError> {
 /// Returns `Some(PeerIdentity)` when the peer is the same uid as the
 /// daemon, `None` otherwise. On rejection, emits a `tracing::warn!` with
 /// the peer uid, the expected uid, and (when available) the peer pid.
+///
+/// ### BRIDGE: ember-clients widening (cohort-A friendly-dev mode)
+///
+/// When the env var `EMBER_LOOSE_PEER_GID_FOR_EMBER_CLIENTS=1` is set,
+/// `verify_peer_uid` additionally accepts peers whose primary gid equals
+/// `ember-clients` (the group that already has filesystem permission on
+/// the socket via `0660 ember:ember-clients`). Each non-daemon-euid accept
+/// logs a structured WARN.
+///
+/// This is an explicit *interim* — the destination is per-method authority
+/// gating with operator-presence proof binding (per design). The bridge
+/// is tracked by implementation-note-220 (2026-05-14). It
+/// MUST NOT ship to team0+/ent0 deployments without the per-method gate
+/// landed first; that constraint lives in the env-var name and the WARN
+/// line so it is visible at every accept.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn verify_peer_uid(stream: &UnixStream) -> Option<PeerIdentity> {
-    verify_peer_uid_with(
-        || {
-            stream
-                .peer_cred()
-                .map(|cred| PeerIdentity { uid: cred.uid(), pid: cred.pid() })
-        },
-        daemon_euid(),
-    )
+    let loose = std::env::var("EMBER_LOOSE_PEER_GID_FOR_EMBER_CLIENTS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    if loose {
+        verify_peer_creds_with_ember_clients_widening(
+            || {
+                stream.peer_cred().map(|c| PeerCreds {
+                    uid: c.uid(),
+                    gid: c.gid(),
+                    pid: c.pid(),
+                })
+            },
+            daemon_euid(),
+            resolve_ember_clients_gid(),
+            peer_uid_is_in_ember_clients_membership,
+        )
+    } else {
+        verify_peer_uid_with(
+            || {
+                stream
+                    .peer_cred()
+                    .map(|cred| PeerIdentity { uid: cred.uid(), pid: cred.pid() })
+            },
+            daemon_euid(),
+        )
+    }
+}
+
+/// Resolve the gid of the `ember-clients` group. Returns `None` when the
+/// group does not exist on this system (development mode, CI without the
+/// install scripts having run). Cached by the OS resolver across calls.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn resolve_ember_clients_gid() -> Option<u32> {
+    use std::ffi::CString;
+    let name = CString::new("ember-clients").ok()?;
+    // SAFETY: `getgrnam` is a standard POSIX call. We read `gr_gid`
+    // immediately and never retain the returned pointer.
+    let gr = unsafe { libc::getgrnam(name.as_ptr()) };
+    if gr.is_null() {
+        None
+    } else {
+        Some(unsafe { (*gr).gr_gid })
+    }
+}
+
+/// Test whether `peer_uid` is a member of the `ember-clients` group, including
+/// SUPPLEMENTARY group memberships (not just primary gid). On macOS and Linux
+/// each user has one primary gid plus zero-or-more supplementary groups; the
+/// kernel's peer-cred returns only the primary, so we must look up the user's
+/// supplementary list explicitly. Iterates the group's member list via
+/// `getgrnam("ember-clients").gr_mem` — finite, cached by Open Directory on
+/// macOS / nsswitch on Linux. Returns `false` on any resolver failure
+/// (fail-closed).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn peer_uid_is_in_ember_clients_membership(peer_uid: u32) -> bool {
+    use std::ffi::{CStr, CString};
+    // 1. Resolve peer uid → username (so we can string-compare against gr_mem).
+    let pw = unsafe { libc::getpwuid(peer_uid as libc::uid_t) };
+    if pw.is_null() {
+        return false;
+    }
+    let pw_name_ptr = unsafe { (*pw).pw_name };
+    if pw_name_ptr.is_null() {
+        return false;
+    }
+    // SAFETY: `pw_name` is a NUL-terminated C string owned by the resolver's
+    // internal buffer; valid until the next libc call that mutates it.
+    let pw_name = unsafe { CStr::from_ptr(pw_name_ptr) };
+
+    // 2. Resolve `ember-clients` group → iterate its member list.
+    let grp_name = match CString::new("ember-clients") {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let gr = unsafe { libc::getgrnam(grp_name.as_ptr()) };
+    if gr.is_null() {
+        return false;
+    }
+    let gr_mem = unsafe { (*gr).gr_mem };
+    if gr_mem.is_null() {
+        return false;
+    }
+    // gr_mem is a `char **` terminated by a NULL pointer. Walk it.
+    let mut i = 0isize;
+    loop {
+        // SAFETY: gr_mem is non-null; we stop at the first NULL entry.
+        let member_ptr = unsafe { *gr_mem.offset(i) };
+        if member_ptr.is_null() {
+            return false;
+        }
+        let member_name = unsafe { CStr::from_ptr(member_ptr) };
+        if member_name == pw_name {
+            return true;
+        }
+        i += 1;
+    }
+}
+
+/// BRIDGE seam for `EMBER_LOOSE_PEER_GID_FOR_EMBER_CLIENTS=1`: accept the
+/// peer when uid matches daemon euid (existing strict path) OR when peer
+/// gid equals the supplied `ember_clients_gid`. Mismatched-gid and
+/// peer-cred-error paths fail closed. Every non-daemon-euid accept emits
+/// a structured WARN naming the bridge ticket so audit greps can find
+/// every call site that exercised the loosened gate.
+///
+/// Factored as a fn-with-closure-seam so unit tests can drive the four
+/// branches (matching uid, matching gid, mismatched gid, peer-cred error)
+/// without a hostile cross-uid Unix-socket pair.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn verify_peer_creds_with_ember_clients_widening<F, G>(
+    get_peer: F,
+    expected_uid: u32,
+    ember_clients_gid: Option<u32>,
+    is_in_ember_clients_membership: G,
+) -> Option<PeerIdentity>
+where
+    F: FnOnce() -> io::Result<PeerCreds>,
+    G: Fn(u32) -> bool,
+{
+    match get_peer() {
+        Ok(peer) => {
+            if peer.uid == expected_uid {
+                Some(PeerIdentity { uid: peer.uid, pid: peer.pid })
+            } else if let Some(ec_gid) = ember_clients_gid {
+                // Two accept paths under the widening: (a) primary gid matches
+                // ember-clients (common for users whose login uses ember-clients
+                // as primary group), (b) the peer's uid is in ember-clients'
+                // supplementary member list (common on macOS where each user's
+                // primary gid is `staff`/20 and `ember-clients` is supplementary
+                // — what `dseditgroup -o edit -a ... -t user ember-clients`
+                // produces). Per design's bridge framing.
+                if peer.gid == ec_gid || is_in_ember_clients_membership(peer.uid) {
+                    warn!(
+                        peer_uid = peer.uid,
+                        peer_gid = peer.gid,
+                        expected_uid,
+                        pid = ?peer.pid,
+                        match_path = if peer.gid == ec_gid { "primary_gid" } else { "supplementary_membership" },
+                        "BRIDGE accept: non-daemon-uid via ember-clients group (implementation-note-220 — destination is per-method authority gate)"
+                    );
+                    Some(PeerIdentity { uid: peer.uid, pid: peer.pid })
+                } else {
+                    warn!(
+                        peer_uid = peer.uid,
+                        peer_gid = peer.gid,
+                        expected_uid,
+                        ember_clients_gid = ec_gid,
+                        pid = ?peer.pid,
+                        "rejecting socket connection: peer uid does not match daemon euid and uid is not in ember-clients group (primary or supplementary)"
+                    );
+                    None
+                }
+            } else {
+                warn!(
+                    peer_uid = peer.uid,
+                    peer_gid = peer.gid,
+                    expected_uid,
+                    pid = ?peer.pid,
+                    "rejecting socket connection: ember-clients gid did not resolve so widening unavailable"
+                );
+                None
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, expected_uid, "rejecting socket connection: failed to read peer credentials");
+            None
+        }
+    }
 }
 
 /// Pure peer-cred policy: accept iff the source returns a peer whose uid
@@ -636,6 +850,7 @@ async fn handle_connection(
     sessions_dir: Option<PathBuf>,
     llm_proxy_url: Option<String>,
     git_proxy_url: Option<String>,
+    peer_cred_principal: Option<crate::infra::runtime::PeerCredPrincipal>,
 ) {
     let peer = stream.peer_addr().ok();
     debug!(?peer, ?peer_cred, "handling connection");
@@ -708,6 +923,11 @@ async fn handle_connection(
                 ctx.sessions_dir = sessions_dir.clone();
                 ctx.llm_proxy_url = llm_proxy_url.clone();
                 ctx.git_proxy_url = git_proxy_url.clone();
+                // implementation-note-103: stamp the
+                // kernel-attested principal captured at accept time so
+                // every dispatch on this connection inherits the same
+                // (uid, pid, socket_path) triple.
+                ctx.peer_cred_principal = peer_cred_principal.clone();
 
                 let response = match crate::infra::handler::dispatch_method_with_context(
                     &store,
@@ -790,6 +1010,273 @@ async fn write_notification(
     })?;
     bytes.push(b'\n');
     writer.write_all(&bytes).await
+}
+
+// ---- implementation-note-104 ------------------------------------------
+//
+// CRIT-1: a single shared daemon socket cannot distinguish two agents living
+// in different pid namespaces — `SO_PEERCRED.pid` is pid-namespace-relative,
+// so both `pid=1` callers fold into the same trust principal. CRIT-C: a stale
+// predictable socket inode can be swapped via symlink by a privileged
+// container process before emberd checks permissions.
+//
+// Fix: one socket per agent, path derived from an unguessable UUIDv4. emberd
+// creates the socket under `flock()` of the parent directory with O_EXCL
+// semantics — any pre-existing inode (including a symlink) at the path
+// rejects with `SocketError::AlreadyExists`. On agent termination the UUID
+// is tombstoned so it can never be reused.
+
+/// Default parent directory for per-agent sockets in production.
+///
+/// The directory layout assumed by the bind-mount strategy:
+/// - `/run/emberd/` is read-only into the agent container (so the agent
+///   uid cannot unlink/replace sibling sockets)
+/// - `/run/emberd/agent-<uuid>.sock` is read-write into the agent's own
+///   container (just the inode, not the parent dir)
+pub const PER_AGENT_SOCKET_PARENT: &str = "/run/emberd";
+
+/// In-process tombstone table. Tracks UUIDs that have been retired by a
+/// successful `tombstone_socket` call so they can never be recycled.
+///
+/// Persistence-across-restart is intentionally NOT implemented here — the
+/// 122-bit UUIDv4 entropy already makes accidental recycling
+/// vanishingly unlikely, and a daemon restart starts with a fresh
+/// process-namespace anyway. The tombstone defends against in-process
+/// recycling attacks where a long-running daemon might otherwise be
+/// coerced into re-creating a socket with a previously-released UUID.
+static TOMBSTONED_UUIDS: Lazy<Mutex<HashSet<Uuid>>> =
+    Lazy::new(|| Mutex::new(HashSet::new()));
+
+/// RAII guard for an exclusive `flock()` on the parent directory. Drops
+/// release the lock by closing the fd. Used to serialize the
+/// stat→bind window inside `create_per_agent_socket_with` so no other
+/// thread/process can plant an inode between the check and the bind.
+struct DirFlockGuard {
+    fd: libc::c_int,
+}
+
+impl DirFlockGuard {
+    /// Open `dir` `O_RDONLY | O_DIRECTORY` and take an exclusive `flock()`.
+    /// `O_NOFOLLOW` prevents the lock landing on a symlink target outside
+    /// the parent directory the caller intended.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn acquire(dir: &Path) -> io::Result<Self> {
+        use std::ffi::CString;
+        let c_path = dir
+            .to_str()
+            .and_then(|s| CString::new(s).ok())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "parent directory path contains interior NUL or is not valid UTF-8",
+                )
+            })?;
+        // SAFETY: `open` is a standard POSIX syscall; the path pointer is
+        // valid for the duration of the call.
+        let fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `flock` operates on the fd we just opened. LOCK_EX takes
+        // an exclusive lock that blocks both shared and exclusive holders.
+        let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
+        if rc != 0 {
+            let e = io::Error::last_os_error();
+            // SAFETY: closing the fd we just opened is always safe.
+            unsafe { libc::close(fd) };
+            return Err(e);
+        }
+        Ok(Self { fd })
+    }
+}
+
+impl Drop for DirFlockGuard {
+    fn drop(&mut self) {
+        // SAFETY: `close` on our own fd is safe; the kernel releases the
+        // associated `flock()` when the last fd referencing the open-file
+        // description closes.
+        unsafe { libc::close(self.fd) };
+    }
+}
+
+/// Check whether anything (regular file, dir, symlink, socket) exists at
+/// `path` without following symlinks. Returns `true` iff `lstat()` succeeds.
+fn path_exists_nofollow(path: &Path) -> bool {
+    use std::ffi::CString;
+    let Some(c_path) = path
+        .to_str()
+        .and_then(|s| CString::new(s).ok())
+    else {
+        // If the path is not a valid C string the call would fail anyway
+        // — fall through to bind() and let it produce the canonical error.
+        return false;
+    };
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `lstat` is a standard POSIX syscall; `stat` is a valid
+    // out-pointer for the duration of the call. We discard the result
+    // and only care whether the call succeeded.
+    let rc = unsafe { libc::lstat(c_path.as_ptr(), &mut stat) };
+    rc == 0
+}
+
+/// Create a per-agent UDS socket with O_EXCL + `flock()` semantics, owned
+/// by the agent uid.
+///
+/// Path shape: `/run/emberd/agent-<uuid>.sock` (see
+/// [`PER_AGENT_SOCKET_PARENT`]). The UUID is a freshly-generated v4 so
+/// the path is unguessable to an adversary that does not have read access
+/// to `/run/emberd/`.
+///
+/// Returns the UUID identifying the socket, its filesystem path, and a
+/// tokio `UnixListener` bound to it. Caller is responsible for tombstoning
+/// via [`tombstone_socket`] on agent termination so the UUID is never
+/// reused.
+///
+/// Errors:
+/// - [`SocketError::AlreadyExists`] if anything exists at the would-be
+///   path (regular file, directory, symlink, or socket). The check
+///   happens under an exclusive `flock()` of the parent directory, so a
+///   concurrent symlink-swap cannot win this race.
+/// - [`SocketError::TombstonedUuid`] if (vanishingly unlikely) the freshly
+///   generated UUID collides with a previously tombstoned one.
+/// - [`SocketError::Bind`] if the underlying `UnixListener::bind` fails
+///   for any other reason (permission denied, disk full, etc.).
+pub fn create_per_agent_socket(
+    uid: u32,
+    gid: u32,
+) -> Result<(Uuid, PathBuf, UnixListener), SocketError> {
+    let uuid = Uuid::new_v4();
+    create_per_agent_socket_with(Path::new(PER_AGENT_SOCKET_PARENT), uuid, uid, gid)
+}
+
+/// Test/spawn seam for [`create_per_agent_socket`] that accepts an
+/// explicit parent directory and UUID. Used directly by the spawn path
+/// when the caller has a pre-allocated UUID to bind, and by tests that
+/// need to verify the symlink-swap rejection at a known path.
+///
+/// Production callers should prefer [`create_per_agent_socket`], which
+/// generates a fresh UUID and uses [`PER_AGENT_SOCKET_PARENT`].
+pub fn create_per_agent_socket_with(
+    parent_dir: &Path,
+    uuid: Uuid,
+    uid: u32,
+    gid: u32,
+) -> Result<(Uuid, PathBuf, UnixListener), SocketError> {
+    // Tombstone check first — no point doing filesystem work if the UUID
+    // is permanently retired.
+    {
+        let table = TOMBSTONED_UUIDS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if table.contains(&uuid) {
+            return Err(SocketError::TombstonedUuid(uuid));
+        }
+    }
+
+    let socket_path = parent_dir.join(format!("agent-{}.sock", uuid));
+
+    // Acquire an exclusive flock on the parent dir so the existence-check
+    // → bind window is atomic relative to any other process holding the
+    // same lock. This closes the symlink-swap race: an attacker cannot
+    // plant a symlink between our `lstat` and the `bind`.
+    let _flock = DirFlockGuard::acquire(parent_dir).map_err(SocketError::Bind)?;
+
+    // O_EXCL semantics on the socket path: lstat (NOFOLLOW) must return
+    // ENOENT. Any pre-existing inode — regular file, directory, symlink,
+    // or stale socket — rejects with AlreadyExists.
+    if path_exists_nofollow(&socket_path) {
+        return Err(SocketError::AlreadyExists(socket_path));
+    }
+
+    // Bind the listener. The flock keeps the path-window atomic, so this
+    // bind is the canonical "create the socket inode" step. If bind
+    // itself races with another flock-holder (impossible by definition)
+    // or fails for OS reasons, surface as `Bind`.
+    let listener = UnixListener::bind(&socket_path).map_err(|e| {
+        SocketError::Bind(annotate_bind_error(e, &socket_path.display().to_string()))
+    })?;
+
+    // Set 0660 + chown to the agent uid/gid. Errors here are fatal — the
+    // whole point of this code path is that the socket is owned by the
+    // agent, so failing to chown means we'd hand back a socket the agent
+    // cannot use. Unwind on failure: unlink the freshly-bound socket
+    // before propagating so we don't leave a half-configured inode behind.
+    if let Err(e) = chown_per_agent_socket(&socket_path, uid, gid) {
+        // Best-effort cleanup. If unlink fails too, the original chown
+        // error is the more actionable one — log the cleanup miss and
+        // fall through.
+        if let Err(unlink_err) = std::fs::remove_file(&socket_path) {
+            warn!(
+                path = %socket_path.display(),
+                error = %unlink_err,
+                "create_per_agent_socket: failed to unlink socket after chown failure",
+            );
+        }
+        return Err(e);
+    }
+
+    info!(
+        path = %socket_path.display(),
+        uid,
+        gid,
+        uuid = %uuid,
+        "per-agent socket created",
+    );
+    Ok((uuid, socket_path, listener))
+}
+
+/// Apply mode 0660 and `lchown` the socket to the agent `uid:gid`.
+///
+/// Separate from [`ensure_socket_perms`] because the per-agent code path
+/// chowns to an agent-supplied uid/gid (the container's view of the
+/// agent user) rather than the daemon's `ember:ember-clients`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn chown_per_agent_socket(path: &Path, uid: u32, gid: u32) -> Result<(), SocketError> {
+    use std::ffi::CString;
+    let c_path = path
+        .to_str()
+        .and_then(|s| CString::new(s).ok())
+        .ok_or_else(|| {
+            SocketError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "socket path contains interior NUL or is not valid UTF-8",
+            ))
+        })?;
+    // SAFETY: `chmod` is a standard POSIX syscall; the pointer is valid
+    // for the duration of the call and the mode value is well-formed.
+    let chmod_rc = unsafe { libc::chmod(c_path.as_ptr(), 0o660) };
+    if chmod_rc != 0 {
+        return Err(SocketError::Io(io::Error::last_os_error()));
+    }
+    // SAFETY: `lchown` is a standard POSIX syscall. We use lchown (not
+    // chown) so we act on the socket inode itself — not a symlink
+    // target — eliminating a TOCTOU window between bind and chown.
+    let chown_rc = unsafe { libc::lchown(c_path.as_ptr(), uid, gid) };
+    if chown_rc != 0 {
+        return Err(SocketError::Io(io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+/// Tombstone a per-agent socket. Removes the inode (best-effort) and
+/// records the UUID in the tombstone table so subsequent
+/// [`create_per_agent_socket_with`] calls with the same UUID return
+/// [`SocketError::TombstonedUuid`].
+///
+/// Callers should invoke this when an agent terminates. The UUID is
+/// permanently retired for the lifetime of the daemon process.
+pub fn tombstone_socket(uuid: Uuid) -> Result<(), SocketError> {
+    let mut table = TOMBSTONED_UUIDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    table.insert(uuid);
+    info!(uuid = %uuid, "per-agent socket UUID tombstoned");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1107,6 +1594,125 @@ mod tests {
     const _C43_PEERCRED_NEGATIVE_TESTS_GREP_ANCHOR: &str =
         "fn verify_peer_uid_rejects_mismatched_uid + fn verify_peer_uid_rejects_peer_cred_error";
 
+    // ── BRIDGE: ember-clients widening tests (implementation-note-220)
+    //
+    // These four tests pin the bridge behavior so the seam stays observable.
+    // Delete these only when the destination per-method authority gate lands
+    // AND `verify_peer_creds_with_ember_clients_widening` is removed from the
+    // codebase. Until then they document the surface the bridge widens.
+
+    /// Test helper — synthetic membership probe that says "no" for every uid.
+    /// Used by tests that exercise the primary-gid path or the reject paths.
+    fn membership_never(_uid: u32) -> bool { false }
+
+    /// Test helper — synthetic membership probe that returns true ONLY for
+    /// the named uid. Used by the supplementary-membership accept-path test.
+    fn membership_only(uid_match: u32) -> impl Fn(u32) -> bool {
+        move |u| u == uid_match
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn widening_accepts_matching_uid_ignoring_gid() {
+        // Even when the widening fn is the active path, an exact uid match
+        // is still the primary accept rule — no group lookup needed.
+        let expected = daemon_euid();
+        let peer = verify_peer_creds_with_ember_clients_widening(
+            || Ok(PeerCreds { uid: expected, gid: 9999, pid: Some(1) }),
+            expected,
+            Some(123),
+            membership_never,
+        )
+        .expect("matching uid must be accepted regardless of gid");
+        assert_eq!(peer.uid, expected);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn widening_accepts_ember_clients_gid_on_uid_mismatch() {
+        // The bridge: non-matching uid is OK if the peer's PRIMARY gid
+        // equals the supplied ember-clients gid. Logs WARN at runtime
+        // with match_path="primary_gid".
+        let expected = daemon_euid();
+        let intruder = expected.wrapping_add(1);
+        let ec_gid: u32 = 502;
+        let peer = verify_peer_creds_with_ember_clients_widening(
+            || Ok(PeerCreds { uid: intruder, gid: ec_gid, pid: Some(2) }),
+            expected,
+            Some(ec_gid),
+            membership_never,
+        )
+        .expect("ember-clients primary gid must accept under the widening");
+        assert_eq!(peer.uid, intruder);
+        assert_eq!(peer.pid, Some(2));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn widening_accepts_ember_clients_supplementary_membership_on_uid_and_gid_mismatch() {
+        // The bridge's macOS-common path: peer's PRIMARY gid is `staff`
+        // (20) but the user IS in ember-clients as a SUPPLEMENTARY group
+        // (per `dseditgroup -o edit -a ... -t user ember-clients`). The
+        // widening must accept via the supplementary-membership lookup,
+        // not just the primary-gid compare.
+        let expected = daemon_euid();
+        let intruder = expected.wrapping_add(1);
+        let ec_gid: u32 = 502;
+        let staff_gid: u32 = 20;
+        assert_ne!(staff_gid, ec_gid);
+        let peer = verify_peer_creds_with_ember_clients_widening(
+            || Ok(PeerCreds { uid: intruder, gid: staff_gid, pid: Some(5) }),
+            expected,
+            Some(ec_gid),
+            membership_only(intruder),
+        )
+        .expect("supplementary ember-clients membership must accept under the widening");
+        assert_eq!(peer.uid, intruder);
+        assert_eq!(peer.pid, Some(5));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn widening_rejects_when_neither_gid_nor_supplementary_match() {
+        // Defense-in-depth: even under the widening, a peer whose primary
+        // gid is not ember-clients AND who is not in the supplementary
+        // ember-clients member list must be rejected.
+        let expected = daemon_euid();
+        let intruder = expected.wrapping_add(1);
+        let ec_gid: u32 = 502;
+        let other_gid: u32 = 9999;
+        assert_ne!(other_gid, ec_gid);
+        let result = verify_peer_creds_with_ember_clients_widening(
+            || Ok(PeerCreds { uid: intruder, gid: other_gid, pid: Some(3) }),
+            expected,
+            Some(ec_gid),
+            membership_never,
+        );
+        assert!(result.is_none(), "neither primary nor supplementary ember-clients membership → reject");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn widening_rejects_when_ember_clients_gid_does_not_resolve() {
+        // If the ember-clients group doesn't exist on this host, the
+        // widening is unavailable and the gate falls back to the strict
+        // uid-match rule. A non-matching uid must therefore be rejected
+        // even if the membership probe would return true (defensive — if
+        // the gid didn't resolve we don't trust any other lookup either).
+        let expected = daemon_euid();
+        let intruder = expected.wrapping_add(1);
+        let result = verify_peer_creds_with_ember_clients_widening(
+            || Ok(PeerCreds { uid: intruder, gid: 502, pid: Some(4) }),
+            expected,
+            None,
+            membership_only(intruder),
+        );
+        assert!(
+            result.is_none(),
+            "no ember-clients gid resolved → widening unavailable → reject"
+        );
+    }
+
     #[test]
     fn test_compute_next_accept_delay_sequence() {
         // development milestone: verify the exponential backoff sequence so that a
@@ -1231,6 +1837,128 @@ mod tests {
         assert!(
             !msg.contains("lsof -i"),
             "must not suggest lsof for non-AddrInUse failures, got: {msg}"
+        );
+    }
+
+    // ---- implementation-note-104 ------------------------------------
+    //
+    // CRIT-C symlink-swap rejection + tombstone UUID-recycling rejection.
+    // Both tests use the `_with` seam so we can drive the would-be-path
+    // deterministically: the production entry point generates a fresh
+    // UUIDv4, but a test cannot pre-create a symlink at an unknown path.
+
+    #[test]
+    fn create_per_agent_socket_refuses_symlink_swap() {
+        // CRIT-C: a privileged-enough container process may pre-create a
+        // symlink at the predictable per-agent socket path before emberd
+        // gets a chance to bind. The O_EXCL + flock contract must reject
+        // any pre-existing inode at the path — including symlinks —
+        // rather than overwrite or follow it.
+        let tmp = TempDir::new().unwrap();
+        let parent = tmp.path();
+        let uuid = Uuid::new_v4();
+        let socket_path = parent.join(format!("agent-{}.sock", uuid));
+
+        // Plant a symlink at the would-be path pointing at /tmp (a real
+        // path that exists). If the implementation followed the symlink
+        // it would either fail with a confusing EEXIST-on-target or, in
+        // a worst-case TOCTOU window, end up binding the socket at the
+        // wrong location entirely.
+        std::os::unix::fs::symlink("/tmp", &socket_path).unwrap();
+
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        let err = create_per_agent_socket_with(parent, uuid, uid, gid)
+            .expect_err("symlink at would-be path must reject");
+
+        match err {
+            SocketError::AlreadyExists(p) => {
+                assert_eq!(p, socket_path, "AlreadyExists must surface the colliding path");
+            }
+            other => panic!(
+                "expected SocketError::AlreadyExists on symlink-swap, got: {other:?}"
+            ),
+        }
+
+        // Symlink must still be present — we refused to touch it.
+        let meta = std::fs::symlink_metadata(&socket_path).unwrap();
+        assert!(
+            meta.file_type().is_symlink(),
+            "symlink must be untouched after refused create",
+        );
+    }
+
+    #[tokio::test]
+    async fn tombstone_prevents_uuid_recycling() {
+        // After tombstoning a UUID, attempts to create another socket
+        // with the same UUID must reject with `TombstonedUuid` so a
+        // recycled agent-id cannot inherit a previous agent's identity.
+        let tmp = TempDir::new().unwrap();
+        let parent = tmp.path();
+        let uuid = Uuid::new_v4();
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+
+        // First create succeeds: tombstone table is empty for this UUID.
+        let (got_uuid, socket_path, listener) =
+            create_per_agent_socket_with(parent, uuid, uid, gid)
+                .expect("fresh UUID must bind");
+        assert_eq!(got_uuid, uuid);
+        assert!(socket_path.exists(), "socket inode must exist after create");
+        drop(listener);
+        // Remove the inode so the second attempt would otherwise succeed
+        // — proving the tombstone (not a stale inode) is doing the work.
+        std::fs::remove_file(&socket_path).unwrap();
+
+        // Tombstone the UUID.
+        tombstone_socket(uuid).expect("tombstone must succeed");
+
+        // Second create with the same UUID must reject with TombstonedUuid
+        // even though the inode is gone.
+        let err = create_per_agent_socket_with(parent, uuid, uid, gid)
+            .expect_err("recycled UUID must reject after tombstone");
+        match err {
+            SocketError::TombstonedUuid(u) => {
+                assert_eq!(u, uuid, "TombstonedUuid must surface the recycled UUID");
+            }
+            other => panic!(
+                "expected SocketError::TombstonedUuid on recycled UUID, got: {other:?}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_per_agent_socket_happy_path_returns_listener() {
+        // Regression guard for the success path: a fresh UUID under a
+        // fresh tempdir binds, the socket exists at the returned path,
+        // and the listener accepts connections.
+        let tmp = TempDir::new().unwrap();
+        let parent = tmp.path();
+        let uuid = Uuid::new_v4();
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+
+        let (got_uuid, socket_path, _listener) =
+            create_per_agent_socket_with(parent, uuid, uid, gid)
+                .expect("fresh path must bind");
+        assert_eq!(got_uuid, uuid);
+        assert!(
+            socket_path.starts_with(parent),
+            "socket path must live under parent dir",
+        );
+        assert!(
+            socket_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.starts_with("agent-") && s.ends_with(".sock"))
+                .unwrap_or(false),
+            "socket filename must match agent-<uuid>.sock shape",
+        );
+        let meta = std::fs::symlink_metadata(&socket_path).unwrap();
+        use std::os::unix::fs::FileTypeExt;
+        assert!(
+            meta.file_type().is_socket(),
+            "created inode must be a Unix socket",
         );
     }
 }

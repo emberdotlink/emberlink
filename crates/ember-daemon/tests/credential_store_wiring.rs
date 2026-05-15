@@ -1,4 +1,4 @@
-//! implementation-note-125 (design sub-piece D) — T2 wiring test.
+//! implementation-note-215 (design sub-piece D) — T2 wiring test.
 //!
 //! This test pins the daemon-startup contract for the pluggable
 //! `CredentialStore` backend selector. Sub-pieces A, B, C all shipped on
@@ -144,15 +144,16 @@ fn resolve_at_ref_reads_token_from_file_in_runtime_shape() {
 /// truth, the trait surface must not error on a cold store.
 ///
 /// Mirrors the exact construction `runtime.rs` performs for the local
-/// arm: `LocalEncryptedStore::new(Arc<Vault>, Rc<DaemonStore>)`. If this
-/// assertion holds, the daemon's startup loop will fall back to the env
-/// file for every provider without surfacing a synthetic error.
+/// arm: `LocalEncryptedStore::new(Rc<Vault>, Rc<DaemonStore>)` (the
+/// `Arc<Vault>` predecessor was retired in implementation-note-137).
+/// If this assertion holds, the daemon's startup loop will fall back to
+/// the env file for every provider without surfacing a synthetic error.
 #[tokio::test(flavor = "current_thread")]
 async fn local_backend_empty_store_yields_none_for_provider_lookup() {
     let store = Rc::new(DaemonStore::open_in_memory().expect("open in-memory store"));
-    let vault = Arc::new(Vault::new([0xEFu8; 32]));
+    let vault = Rc::new(Vault::new([0xEFu8; 32]));
     let cs: Arc<dyn CredentialStore> =
-        Arc::new(LocalEncryptedStore::new(Arc::clone(&vault), Rc::clone(&store)));
+        Arc::new(LocalEncryptedStore::new(Rc::clone(&vault), Rc::clone(&store)));
 
     let resolved = azure_config_from_store(&*cs)
         .await

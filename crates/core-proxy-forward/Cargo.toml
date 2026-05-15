@@ -1,0 +1,21 @@
+[package]
+name = "core-proxy-forward"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "core-proxy-forward — HTTP CONNECT / forward-proxy primitives for the Ember trust layer."
+repository = "https://github.com/emberdotlink/emberlink"
+publish = false
+
+[dependencies]
+async-trait = "0.1"
+http = "1"
+percent-encoding = "2"
+thiserror = "2"
+zeroize = { version = "1", features = ["derive"] }
+core-types = { path = "../core-types" }
+core-grant-types = { path = "../core-grant-types" }
+
+[dev-dependencies]
+proptest = "1"
+tokio = { version = "1", features = ["macros", "rt"] }

@@ -3,8 +3,8 @@
 //! Each channel implementation is currently a stub — it logs the
 //! outbound request and returns `ApprovalDecision::TimedOut`. The
 //! trait shape is what policy and the kernel commit to; real wire
-//! ships per-channel in `implementation-note-26` /
-//! `implementation-note-25` / `implementation-note-24`.
+//! ships per-channel in `implementation-note-49` /
+//! `implementation-note-48` / `implementation-note-47`.
 //!
 //! TODO: wire `preferred_channels:
 //! Option<Vec<String>>` into the persona policy schema in

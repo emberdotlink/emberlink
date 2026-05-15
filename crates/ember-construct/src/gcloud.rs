@@ -858,7 +858,7 @@ mod tests {
     // contract slice this Construct depends on: the broker registry can
     // hold a `MockBroker::new(BrokerProvider::Gcp)`, and a request that
     // declares `provider = Gcp` round-trips through issue → revoke
-    // without panicking. Real GCP impl is implementation-note-34 (separate task).
+    // without panicking. Real GCP impl is implementation-note-69 (separate task).
 
     use core_broker::{Broker, BrokerError, BrokerProvider, BrokerRequest, MockBroker};
     use std::time::Duration;

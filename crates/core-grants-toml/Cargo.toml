@@ -13,4 +13,4 @@ schema = ["dep:schemars"]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml.workspace = true
-schemars = { version = "0.8", optional = true }
+schemars = { version = "0.9", optional = true }

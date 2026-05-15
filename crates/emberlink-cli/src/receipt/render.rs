@@ -1,4 +1,4 @@
-use core_types::grant_receipt::{
+use core_grant_types::grant_receipt::{
     ApprovalActor, ApprovalEvent, AuditEntry, BudgetAxis, GrantReceipt, RevokeActor, TerminalReason,
 };
 
@@ -78,7 +78,7 @@ fn render_actions_observed(entries: &[AuditEntry]) -> String {
 /// Per design §7: output targets <80 lines for a typical receipt.
 ///
 /// The `raw` parameter is reserved for design v2 sidecar compatibility and is
-/// a no-op today. When the v2 schema lands (implementation-note-12), `raw = true` will
+/// a no-op today. When the v2 schema lands (implementation-note-28), `raw = true` will
 /// include the full sidecar tier-mapping and tool-aware redaction fields.
 pub fn render_receipt_markdown(receipt: &GrantReceipt, _raw: bool) -> String {
     let mut out = String::new();
@@ -167,11 +167,11 @@ pub fn render_receipt_markdown(receipt: &GrantReceipt, _raw: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_types::grant_receipt::{
+    use core_grant_types::grant_receipt::{
         ApprovalActor, ApprovalEvent, ApprovalOutcome, AuditEntry, Evidence, GrantReceipt,
         Lifecycle, ReceiptSummary, TerminalReason,
     };
-    use core_types::{AttestationBinding, StatementId};
+    use core_grant_types::{AttestationBinding, StatementId};
 
     fn fixture() -> GrantReceipt {
         GrantReceipt {
@@ -246,7 +246,7 @@ mod tests {
 
     #[test]
     fn raw_flag_currently_noop() {
-        // design v2 sidecar lands in implementation-note-12; today the flag is parsed
+        // design v2 sidecar lands in implementation-note-28; today the flag is parsed
         // but the rendering is identical regardless of value.
         let md_default = render_receipt_markdown(&fixture(), false);
         let md_raw = render_receipt_markdown(&fixture(), true);

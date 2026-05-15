@@ -21,7 +21,12 @@ path = "src/main.rs"
 name = "ember"
 path = "src/bin/ember.rs"
 
+[[bin]]
+name = "ember-claude-hook"
+path = "src/bin/ember-proxy.rs"
+
 [dependencies]
+ember-claude-hook = { path = "../ember-claude-hook" }
 core-crypto = { path = "../core-crypto" }
 core-events = { path = "../core-events" }
 core-identity = { path = "../core-identity" }
@@ -36,6 +41,9 @@ core-storage = { path = "../core-storage" }
 core-grants-toml = { path = "../core-grants-toml" }
 core-trust = { path = "../core-trust" }
 core-types = { path = "../core-types" }
+core-principals = { path = "../core-principals" }
+core-event-types = { path = "../core-event-types" }
+core-grant-types = { path = "../core-grant-types" }
 blake3.workspace = true
 sha2.workspace = true
 chrono = { version = "0.4", features = ["serde"] }
@@ -47,6 +55,7 @@ toml.workspace = true
 clap_complete = "4"
 dirs-next = "2"
 ember-daemon = { path = "../ember-daemon" }
+core-construct-runtime = { path = "../core-construct-runtime" }
 keyring = { version = "3", features = ["apple-native"] }
 rusqlite = { version = "0.39", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -63,6 +72,9 @@ rpassword = "7"
 # 0.9/0.10 API reorg moved `sample_iter`/`fill_bytes` behind extension traits;
 # going through `getrandom` avoids that surface entirely.
 getrandom = "0.4"
+pem = "3"
+uuid = { version = "1", features = ["v4"] }
+x509-parser = "0.16"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

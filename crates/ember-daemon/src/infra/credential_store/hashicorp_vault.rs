@@ -24,14 +24,14 @@
 //!   the SigV4 signature against AWS's public-key infrastructure and
 //!   returns a Vault client_token. This is the no-static-credentials
 //!   path for daemons running on AWS infrastructure
-//!   (implementation-note-39).
+//!   (implementation-note-75).
 //! - [`HashiVaultAuth::HcpServicePrincipal`] — HashiCorp Cloud Platform
 //!   (HCP) Vault uses a different auth flow than self-hosted Vault.
 //!   The daemon exchanges `(client_id, client_secret)` for an HCP
 //!   access_token via the standard OAuth2 client_credentials grant at
 //!   `https://auth.idp.hashicorp.com/oauth2/token`, then submits the
 //!   returned access_token as `Authorization: Bearer` against the
-//!   HCP-hosted Vault cluster's `addr` (implementation-note-60).
+//!   HCP-hosted Vault cluster's `addr` (implementation-note-127).
 //! - [`HashiVaultAuth::JwtOidc`] — generic JWT/OIDC login at
 //!   `POST <addr>/v1/<mount_path>/login` with `{ role, jwt }`. Vault
 //!   validates the JWT against the configured OIDC provider and returns
@@ -40,7 +40,7 @@
 //!   env var like GitHub Actions' `ACTIONS_ID_TOKEN_REQUEST_TOKEN`, or
 //!   any other OIDC-aware compute platform). `mount_path` is `"auth/jwt"`
 //!   or `"auth/oidc"` depending on Vault config (the two mounts are the
-//!   same primitive with different opinionation) (implementation-note-62).
+//!   same primitive with different opinionation) (implementation-note-134).
 //! - [`HashiVaultAuth::Kubernetes`] — Kubernetes service-account login
 //!   at `POST <addr>/v1/auth/kubernetes/login` with `{ role, jwt }`,
 //!   where the JWT is the pod's projected service-account token. The
@@ -49,10 +49,10 @@
 //!   on every login + re-login, so the kubelet's token rotation is
 //!   transparent. This is functionally a specialization of `JwtOidc`
 //!   pinned to `auth/kubernetes` with the JWT sourced from a file
-//!   (implementation-note-63).
+//!   (implementation-note-135).
 //!
 //! Other auth methods (cert) are out of scope; file as
-//! `implementation-note-61-<METHOD>` follow-ups.
+//! `implementation-note-128-<METHOD>` follow-ups.
 //!
 //! # KV v2 wire surface
 //!
@@ -233,7 +233,7 @@ pub enum HashiVaultAuth {
     /// via the HCP-IdP-minted access_token instead. The access_token
     /// has a TTL (typically 24h); v1 follows the AppRole/AWS pattern of
     /// single login at startup + re-login-on-401 retry. Background
-    /// renewal is a follow-up (implementation-note-60).
+    /// renewal is a follow-up (implementation-note-127).
     HcpServicePrincipal {
         client_id: String,
         client_secret: SecretString,
@@ -707,7 +707,7 @@ struct ApproleAuthBlock {
 }
 
 // ---------------------------------------------------------------------------
-// AWS IAM login (implementation-note-39)
+// AWS IAM login (implementation-note-75)
 // ---------------------------------------------------------------------------
 
 /// Vault `auth/aws/login` response — same envelope shape as the
@@ -887,7 +887,7 @@ fn encode_headers_for_vault(headers: &[(String, String)]) -> String {
 }
 
 /// Authenticate to Vault via the AWS IAM auth method
-/// (implementation-note-39).
+/// (implementation-note-75).
 ///
 /// 1. Read the daemon's surrounding AWS IAM identity from the env-var
 ///    chain (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
@@ -901,7 +901,7 @@ fn encode_headers_for_vault(headers: &[(String, String)]) -> String {
 ///    infrastructure to verify the signature, then returns a Vault
 ///    client_token bound to `role`.
 ///
-/// The literal name `vault_aws_login` is the implementation-note-39
+/// The literal name `vault_aws_login` is the implementation-note-75
 /// target_state_anchor checkpoint — do not rename without also updating
 /// the task brief.
 pub async fn vault_aws_login(
@@ -995,7 +995,7 @@ pub async fn vault_aws_login(
 }
 
 // ---------------------------------------------------------------------------
-// HCP service-principal login (implementation-note-60)
+// HCP service-principal login (implementation-note-127)
 // ---------------------------------------------------------------------------
 
 /// HCP IdP `oauth2/token` response — standard OAuth2 client_credentials
@@ -1026,7 +1026,7 @@ const HCP_IDP_TOKEN_URL: &str = "https://auth.idp.hashicorp.com/oauth2/token";
 const HCP_API_AUDIENCE: &str = "https://api.hashicorp.cloud";
 
 /// Authenticate to HCP via the service-principal `client_credentials`
-/// grant (implementation-note-60).
+/// grant (implementation-note-127).
 ///
 /// 1. POST `https://auth.idp.hashicorp.com/oauth2/token` with form body
 ///    `grant_type=client_credentials&client_id=...&client_secret=...&audience=https://api.hashicorp.cloud`.
@@ -1040,7 +1040,7 @@ const HCP_API_AUDIENCE: &str = "https://api.hashicorp.cloud";
 /// - 400 / 401 / 403 → `StoreError::AuthFailed("HCP credentials invalid")`.
 /// - 5xx → `StoreError::Unavailable("HCP IdP unreachable")`.
 ///
-/// The literal name `hcp_vault_login` is the implementation-note-60
+/// The literal name `hcp_vault_login` is the implementation-note-127
 /// target_state_anchor checkpoint — do not rename without also updating
 /// the task brief.
 pub async fn hcp_vault_login(
@@ -1098,7 +1098,7 @@ pub async fn hcp_vault_login(
 }
 
 // ---------------------------------------------------------------------------
-// JWT/OIDC login (implementation-note-62)
+// JWT/OIDC login (implementation-note-134)
 // ---------------------------------------------------------------------------
 
 /// Vault `<mount_path>/login` response — same envelope shape as the
@@ -1122,7 +1122,7 @@ struct JwtAuthBlock {
 }
 
 /// Authenticate to Vault via the JWT/OIDC auth method
-/// (implementation-note-62).
+/// (implementation-note-134).
 ///
 /// 1. POST `<addr>/v1/<mount_path>/login` with JSON body
 ///    `{ "role": "<role>", "jwt": "<jwt>" }`.
@@ -1144,7 +1144,7 @@ struct JwtAuthBlock {
 /// - 403 → `AuthFailed` (role lacks the policy Vault expects).
 /// - 5xx → `Unavailable` (Vault upstream).
 ///
-/// The literal name `vault_jwt_login` is the implementation-note-62
+/// The literal name `vault_jwt_login` is the implementation-note-134
 /// `target_state_anchor` checkpoint — do not rename without also updating
 /// the task brief.
 pub async fn vault_jwt_login(
@@ -1225,7 +1225,7 @@ pub async fn vault_jwt_login(
 }
 
 // ---------------------------------------------------------------------------
-// Kubernetes service-account login (implementation-note-63)
+// Kubernetes service-account login (implementation-note-135)
 // ---------------------------------------------------------------------------
 
 /// Standard kubelet projected service-account token mount path. Pods
@@ -1235,7 +1235,7 @@ pub const KUBERNETES_SA_TOKEN_PATH: &str =
     "/var/run/secrets/kubernetes.io/serviceaccount/token";
 
 /// Authenticate to Vault via the Kubernetes auth method
-/// (implementation-note-63).
+/// (implementation-note-135).
 ///
 /// 1. Read the projected SA JWT from `token_path` (typically
 ///    [`KUBERNETES_SA_TOKEN_PATH`]). Empty file or missing-file maps
@@ -1253,7 +1253,7 @@ pub const KUBERNETES_SA_TOKEN_PATH: &str =
 /// = "auth/kubernetes"` after reading the file — keeps the Vault wire
 /// + status-mapping logic single-sourced.
 ///
-/// The literal name `vault_kubernetes_login` is the implementation-note-63
+/// The literal name `vault_kubernetes_login` is the implementation-note-135
 /// `target_state_anchor` checkpoint — do not rename without also updating
 /// the task brief.
 pub async fn vault_kubernetes_login(
@@ -2041,7 +2041,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // implementation-note-39 — `vault_aws_login` unit tests
+    // implementation-note-75 — `vault_aws_login` unit tests
     // -----------------------------------------------------------------
 
     /// Serialize tests that mutate `AWS_*` env vars. `std::env::set_var`
@@ -2351,7 +2351,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // implementation-note-60 — `hcp_vault_login` unit tests
+    // implementation-note-127 — `hcp_vault_login` unit tests
     // -----------------------------------------------------------------
 
     fn hcp_token_ok_body(access_token: &str) -> String {
@@ -2575,7 +2575,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // implementation-note-62 — `vault_jwt_login` unit tests
+    // implementation-note-134 — `vault_jwt_login` unit tests
     // -----------------------------------------------------------------
 
     fn jwt_login_ok_body(client_token: &str) -> String {
@@ -2759,7 +2759,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // implementation-note-63 — `vault_kubernetes_login` unit tests
+    // implementation-note-135 — `vault_kubernetes_login` unit tests
     // -----------------------------------------------------------------
     //
     // Reuses the JWT-shaped `jwt_login_ok_body` helper above — the

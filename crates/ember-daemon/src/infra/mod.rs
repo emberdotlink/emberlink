@@ -1,3 +1,4 @@
+pub mod binary_pin;
 pub mod vault;
 pub mod config;
 pub mod credential_store;
@@ -13,6 +14,8 @@ pub mod outbound_leak;
 pub mod persona;
 pub mod pid;
 pub mod image_registry;
+pub mod kms;
+pub mod kms_edge;
 pub mod runtime;
 pub mod sandbox;
 pub mod dashboard;
@@ -20,6 +23,12 @@ pub mod proxy;
 pub mod receipt;
 pub mod events;
 pub mod handler;
+pub mod unlock_pin;
+pub mod template_snapshot;
+pub mod attested_device;
 
 #[cfg(target_os = "macos")]
 pub mod vault_macos;
+
+#[cfg(target_os = "macos")]
+pub mod vault_macos_se;

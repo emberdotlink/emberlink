@@ -8,9 +8,14 @@ publish = false
 [dependencies]
 core-crypto = { path = "../core-crypto" }
 core-types = { path = "../core-types" }
+core-principals = { path = "../core-principals" }
+core-event-types = { path = "../core-event-types" }
 blake3 = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-toml = { version = "0.8", default-features = false, features = ["parse"] }
+toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+
+[dev-dependencies]
+core-receipts = { path = "../core-receipts" }
 

@@ -1,7 +1,8 @@
 use std::fmt::Write as _;
 
 use core_storage::{PresentationArtifactEnvelope, decode_presentation_artifact_envelope};
-use core_types::{EventBody, EventType, ValidationError};
+use core_event_types::{EventBody, EventType};
+use core_types::{ValidationError};
 
 use crate::{DemoApp, parse_content_visibility_arg};
 

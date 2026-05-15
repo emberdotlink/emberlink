@@ -24,7 +24,7 @@ use ember_daemon::infra::dashboard::render_approval_page;
 use ember_daemon::infra::store::DaemonStore;
 use ember_daemon::trust::approval::ApprovalRequestInfo;
 
-use core_types::{GrantProposal, ResourceSelector, ResourceType, StatementProposal};
+use core_grant_types::{GrantProposal, ResourceSelector, ResourceType, StatementProposal};
 
 use std::rc::Rc;
 

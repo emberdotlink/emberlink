@@ -6,7 +6,8 @@ use core_sync::{
     plan_pull_batch, relevant_event_ids_for_context,
 };
 use core_trust::derive_score;
-use core_types::{EventBody, RelayAdmission, RelayMode, SyncProfile, TrustThreshold};
+use core_event_types::{EventBody};
+use core_principals::{RelayAdmission, RelayMode, SyncProfile, TrustThreshold};
 
 use crate::{DemoApp, relay_admission_label};
 
@@ -897,7 +898,7 @@ impl DemoApp {
         let local_cursor =
             self.app_runtime.store
                 .peer_cursor(&peer_id)
-                .unwrap_or(core_types::PeerCursor {
+                .unwrap_or(core_principals::PeerCursor {
                     peer_id: peer_id.clone(),
                     last_event_id: None,
                 });
@@ -916,7 +917,7 @@ impl DemoApp {
             other
                 .app_runtime.store
                 .peer_cursor(&reverse_peer_id)
-                .unwrap_or(core_types::PeerCursor {
+                .unwrap_or(core_principals::PeerCursor {
                     peer_id: reverse_peer_id.clone(),
                     last_event_id: None,
                 });

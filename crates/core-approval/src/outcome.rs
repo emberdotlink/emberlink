@@ -1,4 +1,4 @@
-use core_types::approval::RequestedScope;
+use core_grant_types::approval::RequestedScope;
 use serde::{Deserialize, Serialize};
 
 /// Outcome an approver chooses when deciding a pending request.

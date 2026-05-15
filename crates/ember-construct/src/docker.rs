@@ -311,7 +311,7 @@ mod tests {
         assert!(classify_docker_argv(&[]).is_none());
     }
 
-    // T1: container lifecycle verbs (implementation-note-32)
+    // T1: container lifecycle verbs (implementation-note-67)
 
     #[test]
     fn stop_classified() {

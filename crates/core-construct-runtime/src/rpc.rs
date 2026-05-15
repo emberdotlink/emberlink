@@ -11,6 +11,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde_json::{json, Value};
 
 // ---------------------------------------------------------------------------
@@ -111,4 +113,62 @@ pub fn call_daemon_rpc(
     }
 
     Ok(response.get("result").cloned().unwrap_or(Value::Null))
+}
+
+// ---------------------------------------------------------------------------
+// `broker_exec` client helper — base64-encodes construct_toml bytes so the
+// daemon can enforce action-level policy per design.
+// ---------------------------------------------------------------------------
+
+/// Dispatch a `broker_exec` RPC carrying the caller's persona, the
+/// credential reference, an `action_key` identifying which Construct
+/// action is being invoked, and the raw bytes of the Construct's
+/// `construct.toml` manifest (base64-encoded for JSON safety).
+///
+/// Per design §"action-level policy gating" the daemon parses the
+/// manifest server-side, derives the action namespace from
+/// `[meta] name`, and refuses any `action_key` not declared in the
+/// manifest's `[actions.*]` blocks with JSON-RPC error code `-32009`.
+///
+/// Wire shape sent to the daemon:
+/// ```json
+/// {
+///   "persona_id": "<persona>",
+///   "credential_name": "<credential>",
+///   "action_key": "<action>",
+///   "construct_toml_bytes": "<base64>"
+/// }
+/// ```
+pub fn broker_exec(
+    persona_id: &str,
+    credential_name: &str,
+    action_key: &str,
+    construct_toml_bytes: &[u8],
+) -> Result<Value, RpcError> {
+    let socket_path = daemon_socket_path();
+    let params = json!({
+        "persona_id": persona_id,
+        "credential_name": credential_name,
+        "action_key": action_key,
+        "construct_toml_bytes": BASE64_STANDARD.encode(construct_toml_bytes),
+    });
+    call_daemon_rpc(&socket_path, "broker_exec", &params)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The construct_toml_bytes field is base64-encoded so the JSON wire
+    /// can carry arbitrary TOML bytes (including UTF-8 multi-byte
+    /// sequences) without escaping pitfalls. Round-tripping the encode
+    /// here pins the contract: the daemon decodes via the standard
+    /// alphabet from the same `base64` crate.
+    #[test]
+    fn broker_exec_base64_encodes_manifest_bytes() {
+        let manifest = b"schema_version = \"1\"\n[meta]\nname = \"ember-gh\"\n";
+        let encoded = BASE64_STANDARD.encode(manifest);
+        let decoded = BASE64_STANDARD.decode(&encoded).expect("base64 decode");
+        assert_eq!(decoded, manifest);
+    }
 }

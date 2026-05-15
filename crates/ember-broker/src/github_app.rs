@@ -332,34 +332,7 @@ mod tests {
 
     // RSA private key fixture generated with `openssl genrsa 2048` (PKCS#8 output).
     // Safe to embed — used only to verify JWT construction; not a real credential.
-    const FIXTURE_RSA_PEM: &str = "\x2d----BEGIN PRIVATE KEY-----\n\
-        MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQD1K64WSvEo+7zd\n\
-        kxJ7BgiSw+lW2KP6u++JuE4iwip73SQc9/OmZK2aHjeBo8+4gAOMyTsUZb01b3Fp\n\
-        awm2wORt5fDil72t3EdxZxiCC+nCJmZhRA7KPlTzzWHllVZPb9rjqORnyejIBc5i\n\
-        pMGTdd3nxRuait4lbdqwn5D3mCKsH+ziLk9UJ3AZscEUGwb6/mVdzxxmDLWdtHio\n\
-        jC4spDa3ABUJIfSbLdW+5F2MsJQQ/CxORVuAP6XHYqK9WB8e/pKIbBWMT+KtKP73\n\
-        LzOybKow4P/Louos9DGAGjiqmSUXN91j7S+6hV7LM+AdipaaVK+J9EZxfC+VxcV7\n\
-        juP260jRAgMBAAECggEADVMr7LgMmZK6n5V91Ip6tQG8pCs1fyWiuoRci5gSkTvV\n\
-        Wbu1Ytt0i5YaPZhtH25zT74KHeAvsE1K+sgSzy6pqG1t/t3xAbEhf7QMowv86Iy7\n\
-        IlmXSJeqeO7plxd1CVYF4NS0YUDm8j20JPlZls2gdP3QZvRZzlGSDrWfCxqzwh4F\n\
-        pYQIyYxYqzRcIYkAZNYcuJDHYV52jX9nbAu/jZfQP7CqkQHeLbOk5H8bAISzZOVO\n\
-        NP720ldXRR2muWs70WE24uAIERFYbQ7c3+HAhkg1+U0Nfc2Q2Ys/JBLL1nVxUXW7\n\
-        FqrEkyuPM64ea1xLUq8VgZ2HSbXWVSDyC+ccpXYUdwKBgQD9y/3XTXiqCQ1rOW43\n\
-        c88uaEhPl6xIXyYtyVjlhjZTMqYnXdjOTP5IimW390ouCfsbBO7TKWCTdUL8J0wS\n\
-        9LXfJ23BKn4L1cQkwz6y1X5W1HRY1nGGLt3VNPLN9MO2eT55MxYfdgRl4XElp71Z\n\
-        V+X7gyovKs4Uw/XXhosN5zQtCwKBgQD3TITArOI7jqrAPw5U02zw805FA/JeMn3e\n\
-        TH9yRKDqKF5lDqGwgKq2IDv1BZAXJ9IilCbCFoF3CazlvBsuWoWg+v++E6auQVHA\n\
-        8aZ16/MZ4I0yPcH6eD9+arXO8E2EX1siK2cMZBbG0M/+9Jb2grFFhD0zUymTzcKe\n\
-        4zNym3BzEwKBgQDir1lC/QdRmFRL+Tfgf6gFo08zCB3xZksLilPEbmQHW63ca45C\n\
-        dbKJyFOiRVYUWQXX1Egcg1CnZI03+0GPjNMFRopZhkKe/4f57goKYXY+x/RDhQZQ\n\
-        +3tX+7sDCiPkz9ZlGqQf5aF3/iy5nWEac9APHdCH4IvBMGZc4udAu8l2kQKBgEYF\n\
-        /60DBwgwLH9FG4y/VSCg9C+sn2s2xtc0N/4mGp5TEe9xhi0RMcViOTf2/EbiOqkZ\n\
-        5COe9ce8EJ34doXYke/0QogSzmaXDkwg4K6RQgO4xqJMRGnktK3aD2LqPjjWO1rg\n\
-        iUxD5wMiy1J49WoVtZZmjGHFEYfNgmc1FDNGej/LAoGAGSmHZlLs1wGSAx4LMtbJ\n\
-        E0wjpNL7h2RbLOLDG/zftxny+3bE20PUi+xWQ1dYFvy66etJVxM6Xv/pK1CmaPR0\n\
-        NxoLOtrjuytHHZvofQ8oHwvMe8S34U8+/G6NKyNocyfu+CqqUI4xedXJUyerN8p7\n\
-        CCLSxCxNhsab6ORMb8ZOf5E=\n\
-        -----END PRIVATE KEY-----";
+    const FIXTURE_RSA_PEM: &str = include_str!("../tests/fixtures/rsa_pem.pem");
 
     fn fixture_rsa_pem() -> String {
         FIXTURE_RSA_PEM.to_string()

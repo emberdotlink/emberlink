@@ -5,7 +5,7 @@
 *Keep the keys. Grant the action.*
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Build](https://github.com/emberdotlink/emberlink/actions/workflows/check.yml/badge.svg)](https://github.com/emberdotlink/emberlink/actions)
+[![Install v0.3.0-rc.1](https://img.shields.io/badge/install-v0.3.0--rc.1-8e44ad.svg)](https://emberlink.sh)
 
 ## The problem
 
@@ -26,11 +26,22 @@ The **Ember Warden** runs on your machine. It holds the credentials. Agents neve
 - **Hardened sandbox** — Docker containers with non-root, `no-new-privileges`, read-only rootfs, `cap-drop=ALL`. Credentials are the isolation boundary, not the network.
 - **Runtime-neutral** — MCP protocol surface works with Claude Code, OpenClaw, IronClaw, gbrain, Claude Desktop, Cursor. One Warden, many frameworks.
 
+## v0.3.0 cohort
+
+Three tools are wired end-to-end as Constructs: **ember-gh**, **ember-git**, **ember-kubectl**. Four more (npm, docker, wrangler, pulumi) land in v0.3.1 once the classifier surface hardens. See release-notes Tier B for the full scope decisions; design has the v0.3.0 / v0.3.1 boundary.
+
 ## Quick demo
 
 ```bash
-# Install and initialize
+# Recommended — signed binary via install script
+curl -fsSL https://emberlink.sh | sh
+
+# Fallback — build from source via cargo
+cargo install --git https://github.com/emberdotlink/emberlink emberlink-cli --bin ember
+
+# Dev / from-clone
 cargo install --path crates/emberlink-cli --bin ember
+
 ember init --name "your-name"
 ember daemon start
 

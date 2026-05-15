@@ -1,7 +1,7 @@
 //! T2 integration tests for `ember claude-code` launcher wiring.
 //!
 //!
-//! Verifies implementation-note-179 acceptance criteria:
+//! Verifies implementation-note-316 acceptance criteria:
 //! - `EMBER_SESSION_ID` is injected into the child env from the daemon RPC response.
 //! - Child `PATH` starts with the shadow directory.
 //! - `close_session` is called with the same session_id on child exit.

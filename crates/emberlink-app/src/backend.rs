@@ -1,9 +1,8 @@
 use core_crypto::{generate_random_identifier, LocalKeyPair};
 use core_eventlog::{BadgeRecord, EventLog};
-use core_types::{
-    AccessGrant, AccessGrantDetail, AccessGrantSummary, RecipientProfile, ValidationError,
-    VaultObjectClass,
-};
+use core_grant_types::{AccessGrant, AccessGrantDetail, AccessGrantSummary, RecipientProfile};
+use core_event_types::{VaultObjectClass};
+use core_types::{ValidationError};
 
 use crate::snapshot::{CredentialView, ServiceBindingView};
 
@@ -66,7 +65,7 @@ pub trait AppBackend: EventLog {
         note: Option<&str>,
     ) -> Result<(), ValidationError>;
 
-    /// Create a single persona credential. `claim_type` is a [`core_types::ClaimType`]
+    /// Create a single persona credential. `claim_type` is a [`core_event_types::ClaimType`]
     /// string (e.g. `"self-asserted"`). `payload_json` must be a JSON object with a
     /// top-level `"schema"` string field. `device_id` is the device creating the record.
     /// Returns the new `object_id`. No-op stub for non-persistent backends.
@@ -185,7 +184,7 @@ impl AppBackend for core_state::EventStore {
         let namespaces = core_state::EventStore::local_vault_namespaces(self)?;
         let mut views = Vec::new();
         for ns in &namespaces {
-            if ns.owner_kind != core_types::VaultOwnerKind::Persona || ns.owner_id != persona_id {
+            if ns.owner_kind != core_event_types::VaultOwnerKind::Persona || ns.owner_id != persona_id {
                 continue;
             }
             let Some(catalog) = core_state::EventStore::local_vault_catalog(self, ns)? else {

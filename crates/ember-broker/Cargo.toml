@@ -6,6 +6,22 @@ license.workspace = true
 description = "Approval delivery channels + grant-request routing for ember-broker."
 publish = false
 
+[features]
+# implementation-note-45-: gates the real Secure-Enclave wrap/unwrap
+# code path in `secure_enclave.rs`. Without this feature the `#[cfg(feature =
+# "se-real")]` blocks are excluded and `se_wrap` / `se_unwrap` fall through to
+# the stub-key registry path used by unit tests. With it enabled (on macOS
+# targets), the SecKey lookup-by-label + SecKey::encrypt_data /
+# decrypt_data ECIES path is live so the daemon's separate-uid posture
+# (design) can wrap the vault MEK against an SE-resident key.
+#
+# The dependency itself is target-gated to macOS below; on Linux the feature
+# is inert (the entire `secure_enclave.rs` module is `#![cfg(target_os =
+# "macos")]`), so enabling `se-real` on a Linux build is a no-op rather than
+# an error.
+se-real = []
+se-stub = []
+
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
@@ -15,10 +31,11 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 core-broker = { path = "../core-broker" }
 ed25519-dalek = "2.1.1"
-getrandom = "0.3"
+getrandom = "0.4"
+sha2 = { workspace = true }
 http = "1"
-jsonwebtoken = "9"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -26,6 +43,23 @@ thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 zeroize = { version = "1", features = ["derive"] }
+
+# Secure-Enclave bindings live in `secure_enclave.rs` which is gated
+# `#![cfg(target_os = "macos")]`. Linking is unconditional on macOS so the
+# real ECIES wrap/unwrap path (`SecKey::encrypt_data` / `decrypt_data`) is
+# available when the `se-real` feature is on; the binary linker dead-strips
+# the unused symbols when `se-real` is off.
+[target.'cfg(target_os = "macos")'.dependencies]
+# `OSX_10_15` exposes `Location::DataProtectionKeychain` — the only macOS
+# keychain Apple's `SecKeyCreateRandomKey` will accept for SE-token keys.
+# An attempt to store SE keys in the legacy file-based System.keychain
+# (via `kSecUseKeychain`) was rejected at parameter validation with
+# `OSStatus -50 errSecParam` ("inconsistent private key parameters"): SE
+# token + file keychain is not a supported combination. DPK is keyed by
+# `(uid, kSecAttrAccessGroup)`, not by security session, so the install
+# (fork+exec'd into the ember uid) and the daemon (also ember, via
+# launchd) share the same DPK identity.
+security-framework = { version = "3.7", features = ["OSX_10_15"] }
 
 [dev-dependencies]
 tempfile = "3"

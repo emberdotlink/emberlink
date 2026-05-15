@@ -7,7 +7,7 @@
 //!      Ed25519 seed with info "ember-seal-v1") using XChaCha20-Poly1305.
 //!   3. Described by a signed [`SnapshotManifest`] chained via `prev_snapshot_id`.
 //!
-//! **Snapshot scope** (per implementation-note-21, design §Decision):
+//! **Snapshot scope** (per implementation-note-35, design §Decision):
 //!   - `credentials` table rows (vault-sealed blobs)
 //!   - `vault.salt` file bytes (critical: without it the MEK cannot be rebuilt)
 //!   - `personas` table rows
@@ -29,10 +29,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use core_crypto::{derive_snapshot_encryption_key, encrypt_content, decrypt_content, EncryptedContent};
-use core_types::grant_receipt::{Evidence, SnapshotManifest};
+use core_grant_types::grant_receipt::{Evidence, SnapshotManifest};
 
 use crate::infra::receipt::{DaemonPersona, CANONICAL_VERSION};
 use crate::infra::store::{DaemonStore, StoreError};
+use crate::infra::vault::VaultScope;
 
 // ---------------------------------------------------------------------------
 // Canonical encoding prefix — cross-protocol signature reuse prevention.
@@ -731,7 +732,7 @@ pub async fn pull_cluster_snapshot(
         snapshot_id.clone()
     };
     let meta_key = snapshot_meta_key(cluster_id, &id_prefix);
-    if vault.get(store, &meta_key).is_ok() {
+    if vault.get(VaultScope::Interactive, store, &meta_key).is_ok() {
         tracing::debug!(
             snapshot_id = %snapshot_id,
             "pull: snapshot already in local vault, skipping"
@@ -783,7 +784,7 @@ pub async fn pull_cluster_snapshot(
         .map_err(|e| PullError::Deserialize(e.to_string()))?;
 
     // Store blob — ignore duplicate-name errors (idempotent on retry).
-    match vault.add(store, &blob_key, &blob_bytes, Some("cluster-snapshot-blob")) {
+    match vault.add(VaultScope::Interactive, store, &blob_key, &blob_bytes, Some("cluster-snapshot-blob")) {
         Ok(_) => {}
         Err(crate::infra::vault::VaultError::Store(StoreError::Sqlite(e)))
             if e.to_string().contains("UNIQUE constraint") =>
@@ -794,7 +795,7 @@ pub async fn pull_cluster_snapshot(
     }
 
     // Store manifest JSON — ignore duplicate-name errors (idempotent on retry).
-    match vault.add(store, &meta_key, &manifest_json, Some("cluster-snapshot-manifest")) {
+    match vault.add(VaultScope::Interactive, store, &meta_key, &manifest_json, Some("cluster-snapshot-manifest")) {
         Ok(_) => {}
         Err(crate::infra::vault::VaultError::Store(StoreError::Sqlite(e)))
             if e.to_string().contains("UNIQUE constraint") =>
@@ -818,7 +819,7 @@ pub async fn pull_cluster_snapshot(
 ///
 /// Call [`SnapshotPuller::maybe_pull`] on a Tokio interval at daemon startup.
 /// Only active when `snapshot_pull_endpoint` is configured (per design
-/// implementation-note-59).
+/// implementation-note-125).
 pub struct SnapshotPuller {
     interval_secs: u64,
     last_pulled_at: Mutex<Option<Instant>>,
@@ -896,7 +897,7 @@ pub fn list_local_snapshots(
     store: &DaemonStore,
     cluster_id_filter: Option<&str>,
 ) -> Vec<LocalSnapshotEntry> {
-    let all_creds = match vault.list(store) {
+    let all_creds = match vault.list(VaultScope::Interactive, store) {
         Ok(c) => c,
         Err(_) => return vec![],
     };
@@ -924,13 +925,13 @@ pub fn list_local_snapshots(
             let cluster_id = segments.get(1)?.to_string();
 
             // Fetch the manifest JSON from the vault.
-            let manifest_bytes = vault.get(store, &c.name).ok()?;
+            let manifest_bytes = vault.get(VaultScope::Interactive, store, &c.name).ok()?;
             let manifest: SnapshotManifest = serde_json::from_slice(&manifest_bytes).ok()?;
 
             // Fetch the blob to get size_bytes.
             let id_prefix = segments.get(2)?.strip_prefix("meta-").unwrap_or("");
             let blob_key = snapshot_blob_key(&cluster_id, id_prefix);
-            let size_bytes = vault.get(store, &blob_key).map(|b| b.len()).unwrap_or(0);
+            let size_bytes = vault.get(VaultScope::Interactive, store, &blob_key).map(|b| b.len()).unwrap_or(0);
 
             Some(LocalSnapshotEntry {
                 snapshot_id: manifest.snapshot_id,
@@ -1279,7 +1280,7 @@ mod tests {
         let store = DaemonStore::open_in_memory().unwrap();
         let config = crate::infra::config::DaemonConfig {
             data_dir: tmp.path().to_path_buf(),
-            ..Default::default()
+            ..crate::infra::config::DaemonConfig::for_test(tmp.path())
         };
         let vault = Vault::open_from_config(&config).expect("vault open");
 
@@ -1294,7 +1295,7 @@ mod tests {
         );
 
         // Vault must be empty — no writes on signature failure.
-        let creds = vault.list(&store).unwrap_or_default();
+        let creds = vault.list(VaultScope::Interactive, &store).unwrap_or_default();
         assert!(
             creds.iter().all(|c| !c.name.starts_with("cluster-snapshot")),
             "vault must not contain cluster-snapshot entries after signature failure"
@@ -1382,7 +1383,7 @@ mod tests {
         let store = DaemonStore::open_in_memory().unwrap();
         let config = crate::infra::config::DaemonConfig {
             data_dir: tmp.path().to_path_buf(),
-            ..Default::default()
+            ..crate::infra::config::DaemonConfig::for_test(tmp.path())
         };
         let vault = Vault::open_from_config(&config).expect("vault open");
 
@@ -1395,7 +1396,7 @@ mod tests {
         assert_eq!(returned_id, Some(snapshot_id.clone()), "should return the pulled snapshot_id");
 
         // Vault must contain blob + manifest entries.
-        let creds = vault.list(&store).unwrap_or_default();
+        let creds = vault.list(VaultScope::Interactive, &store).unwrap_or_default();
         let has_blob = creds.iter().any(|c| c.name.contains("snap-"));
         let has_meta = creds.iter().any(|c| c.name.contains("meta-"));
         assert!(has_blob, "vault must contain blob entry");

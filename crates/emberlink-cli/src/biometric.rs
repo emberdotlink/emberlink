@@ -1,4 +1,4 @@
-//! implementation-note-81 — biometric (Touch ID / device passcode) gate for high-risk
+//! implementation-note-156 — biometric (Touch ID / device passcode) gate for high-risk
 //! CLI operations like `ember approval approve <id>`.
 //!
 //! ## Goal
@@ -28,7 +28,7 @@
 //! - `--no-biometric` flag on the CLI command itself
 //! - `EMBER_DISABLE_BIO=1` environment variable
 //! - `cfg!(test)` or `is_cargo_test_binary()` (cargo-built test binaries
-//!   detected via `current_exe`) — mirrors the security check vault gate so
+//!   detected via `current_exe`) — mirrors the vault user-presence gate so
 //!   `cargo test` never fires a real LocalAuthentication prompt
 //!
 //! Any one of these returning true makes [`require_biometric`] short-circuit

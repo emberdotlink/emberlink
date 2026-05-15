@@ -1,4 +1,4 @@
-//! security check — Live macOS Keychain integration test for the user-presence gate.
+//! Live macOS Keychain integration test for the user-presence gate.
 //!
 //! These tests touch the real macOS Keychain and require physical user
 //! interaction (Touch ID or device passcode) on the first read of the test
@@ -60,7 +60,7 @@ fn sec7_set_then_get_round_trips_under_user_presence() {
     // Clear the in-process cache to simulate a fresh daemon process. The next
     // read will fall through to the real Keychain and (per SAC) prompt the
     // operator. This is the path the daemon takes on every cold start.
-    vault_macos::clear_session_cache_for_tests();
+    vault_macos::clear_session_cache();
     let got2 = vault_macos::get_password_user_presence(PROD_SERVICE, &account)
         .expect("second get (post-cache-clear)");
     assert_eq!(

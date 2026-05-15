@@ -1,6 +1,6 @@
 //! SOPS DEK-unwrap (Path 1, -B-collapsed).
 //!
-//! Phase 1 of implementation-note-102 — pure DEK-unwrap function. The age private
+//! Phase 1 of implementation-note-181 — pure DEK-unwrap function. The age private
 //! key is consumed inside this function (Zeroizing buffer); never crosses
 //! the IPC boundary in plaintext form. Phase 2 wires the daemon RPC +
 //! receipt emission + rate-limit; Phase 3 ships the orch-only
@@ -36,13 +36,7 @@ pub fn unwrap_dek_userspace(
         .map_err(|e: &'static str| anyhow::anyhow!("parse age identity: {e}"))?;
     let decryptor = age::Decryptor::new(encrypted_dek_blob)
         .context("create age decryptor")?;
-    let recipients_decryptor = match decryptor {
-        age::Decryptor::Recipients(d) => d,
-        age::Decryptor::Passphrase(_) => {
-            anyhow::bail!("encrypted blob uses passphrase mode; expected recipients mode")
-        }
-    };
-    let mut reader = recipients_decryptor
+    let mut reader = decryptor
         .decrypt(std::iter::once(&identity as &dyn age::Identity))
         .context("decrypt DEK with persona key")?;
     let mut plaintext: Vec<u8> = Vec::new();
@@ -60,43 +54,43 @@ pub fn unwrap_dek_userspace(
     anyhow::bail!("age feature not enabled; build with --features age")
 }
 
-// SOPS-MODULE-SCAFFOLD — implementation-note-135. Real impl lands in implementation-note-105.
+// SOPS-MODULE-SCAFFOLD — implementation-note-243. Real impl lands in implementation-note-184.
 //
-// These three stubs reserve the public surface that implementation-note-136
-// will route to and that implementation-note-137 will implement. Until
+// These three stubs reserve the public surface that implementation-note-244
+// will route to and that implementation-note-245 will implement. Until
 // then, every call returns NotImplementedError so the SOPS Go-fork
-// (implementation-note-106) can develop against the real RPC shape.
+// (implementation-note-185) can develop against the real RPC shape.
 
 use crate::infra::store::StoreError;
 
 /// Stub — returns the persona's age public key as an `age1...` recipient string.
-/// Real impl in implementation-note-105.
+/// Real impl in implementation-note-184.
 pub fn sops_pubkey(persona_id: &str) -> Result<String, StoreError> {
     let _ = persona_id;
     Err(StoreError::InvalidInput(
-        "sops_pubkey: not implemented (implementation-note-105)".into(),
+        "sops_pubkey: not implemented (implementation-note-184)".into(),
     ))
 }
 
 /// Stub — wraps a DEK to a persona's public key (no private key required).
-/// Real impl in implementation-note-105.
+/// Real impl in implementation-note-184.
 pub fn sops_wrap_dek(persona_id: &str, dek: &[u8]) -> Result<Vec<u8>, StoreError> {
     let _ = (persona_id, dek);
     Err(StoreError::InvalidInput(
-        "sops_wrap_dek: not implemented (implementation-note-105)".into(),
+        "sops_wrap_dek: not implemented (implementation-note-184)".into(),
     ))
 }
 
 /// Stub — unwraps an encrypted DEK using the persona's age private key
 /// fetched from vault internally. Private key never leaves vault process.
-/// Real impl in implementation-note-105.
+/// Real impl in implementation-note-184.
 pub fn sops_unwrap_in_vault(
     persona_id: &str,
     encrypted_dek: &[u8],
 ) -> Result<Vec<u8>, StoreError> {
     let _ = (persona_id, encrypted_dek);
     Err(StoreError::InvalidInput(
-        "sops_unwrap_in_vault: not implemented (implementation-note-105)".into(),
+        "sops_unwrap_in_vault: not implemented (implementation-note-184)".into(),
     ))
 }
 
@@ -113,10 +107,9 @@ mod tests {
         let pub_key: age::x25519::Recipient = keypair.public_key.parse().unwrap();
 
         let plaintext = b"super-secret-dek-bytes-1234567890";
-        let encryptor = age::Encryptor::with_recipients(vec![
-            Box::new(pub_key) as Box<dyn age::Recipient + Send>,
-        ])
-        .unwrap();
+        let encryptor =
+            age::Encryptor::with_recipients(std::iter::once(&pub_key as &dyn age::Recipient))
+                .unwrap();
         let mut ciphertext = Vec::new();
         let mut writer = encryptor.wrap_output(&mut ciphertext).unwrap();
         writer.write_all(plaintext).unwrap();
@@ -134,10 +127,9 @@ mod tests {
         let key_a = crate::age::generate_age_keypair().unwrap();
         let pub_a: age::x25519::Recipient = key_a.public_key.parse().unwrap();
 
-        let encryptor = age::Encryptor::with_recipients(vec![
-            Box::new(pub_a) as Box<dyn age::Recipient + Send>,
-        ])
-        .unwrap();
+        let encryptor =
+            age::Encryptor::with_recipients(std::iter::once(&pub_a as &dyn age::Recipient))
+                .unwrap();
         let mut ciphertext = Vec::new();
         let mut writer = encryptor.wrap_output(&mut ciphertext).unwrap();
         writer.write_all(b"payload").unwrap();

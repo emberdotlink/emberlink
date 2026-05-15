@@ -20,6 +20,13 @@ pub const RECEIPT_KIND_SNAPSHOT_EMITTED: &str = "snapshot.emitted";
 pub const RECEIPT_KIND_IDENTITY_ROTATED: &str = "identity.rotated";
 pub const RECEIPT_KIND_LOCAL_STATE_KEY_RESOLVE: &str = "local_state.key_resolve";
 pub const RECEIPT_KIND_LOCAL_STATE_KEY_ROTATION: &str = "local_state.key_rotation";
+/// implementation-note-26 — emberd emits this kind on every
+/// `ExecFrame::Exit` arriving from the in-container `ember-exec`
+/// sidecar. The body shape ([`ExecCompletionBody`]) carries the seven
+/// fields design §"Body shape per kind" pins for the in-container
+/// exec audit trail: `persona_id`, `grant_id`, `binary_path`,
+/// `binary_blake3`, `target_uid`, `exit_code`, `materialized_at`.
+pub const RECEIPT_KIND_EXEC_COMPLETION: &str = "exec.completion";
 
 // ===== Body structs =====
 
@@ -109,6 +116,45 @@ pub struct LocalStateKeyRotationBody {
     pub new_key_hash: String,
 }
 
+/// Body for `exec.completion` — emberd-side Receipt v2 emission on every
+/// `ExecFrame::Exit` arriving from the in-container `ember-exec` sidecar.
+///
+/// Per implementation-note-26 and the parent
+/// implementation-note-27 acceptance — emberd (not ember-exec) is
+/// the receipt signer; the in-container sidecar reports the child's
+/// exit code over the UDS frame protocol, and emberd composes the
+/// signed v2 envelope.
+///
+/// Field provenance:
+///
+/// - `persona_id` — the persona under which `broker.resolve` issued the
+///   spawn handle (the caller persona that authorised this exec).
+/// - `grant_id` — the standing parent grant that authorised the exec.
+/// - `binary_path` — absolute path inside the container of the binary
+///   that was just executed.
+/// - `binary_blake3` — the hex-encoded blake3 content hash emberd
+///   verified BEFORE sending the `SpawnDirective` to the in-container
+///   sidecar. Recorded as the receipt's authoritative hash so audit
+///   chains preserve "the bytes the daemon actually approved", not a
+///   recomputation by an untrusted post-execve verifier.
+/// - `target_uid` — the unprivileged uid the in-container sidecar
+///   dropped to before `execve` (subtask B's `drop_privileges`).
+/// - `exit_code` — the child's exit status as reported by
+///   `ExecFrame::Exit { code }`.
+/// - `materialized_at` — RFC3339 wall-clock at which emberd composed
+///   the receipt (i.e. when the Exit frame arrived, NOT the in-container
+///   child's own clock — ember-exec is not a trust root for time).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecCompletionBody {
+    pub persona_id: String,
+    pub grant_id: String,
+    pub binary_path: String,
+    pub binary_blake3: String,
+    pub target_uid: u32,
+    pub exit_code: i32,
+    pub materialized_at: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,6 +176,24 @@ mod tests {
         assert_eq!(RECEIPT_KIND_IDENTITY_ROTATED, "identity.rotated");
         assert_eq!(RECEIPT_KIND_LOCAL_STATE_KEY_RESOLVE, "local_state.key_resolve");
         assert_eq!(RECEIPT_KIND_LOCAL_STATE_KEY_ROTATION, "local_state.key_rotation");
+        assert_eq!(RECEIPT_KIND_EXEC_COMPLETION, "exec.completion");
+    }
+
+    #[test]
+    fn exec_completion_body_round_trips() {
+        let body = ExecCompletionBody {
+            persona_id: "11111111-1111-1111-1111-111111111111".into(),
+            grant_id: "22222222-2222-2222-2222-222222222222".into(),
+            binary_path: "/usr/local/bin/scion-test-binary".into(),
+            binary_blake3:
+                "deadbeefcafef00ddeadbeefcafef00ddeadbeefcafef00ddeadbeefcafef00d".into(),
+            target_uid: 1234,
+            exit_code: 0,
+            materialized_at: "2026-05-12T18:00:00Z".into(),
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        let back: ExecCompletionBody = serde_json::from_value(v).unwrap();
+        assert_eq!(body, back);
     }
 
     #[test]
@@ -259,6 +323,7 @@ mod tests {
             daemon_root_id: "daemon-fixture".into(),
             traceparent: None,
             termination_authority: TerminationAuthority::UserSession,
+            presence_kind: None,
             body: serde_json::to_value(&body).unwrap(),
             signature: None,
         };

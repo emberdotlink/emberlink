@@ -2,7 +2,7 @@
 //!
 //! design permits additive body fields per `kind`. Cohort A adds `audit_gaps[]`
 //! to the generic `ReceiptBody` so a session-end receipt can record contiguous
-//! daemon-unreachable windows captured by implementation-note-10's fail-open path.
+//! daemon-unreachable windows captured by implementation-note-11's fail-open path.
 //! See design §7 ("Audit gaps") for the wedge-claim rationale: a gap is
 //! *named, timestamped, and signed* so "every action is auditable" remains a
 //! property of the receipt rather than a false-positive.
@@ -13,7 +13,7 @@ use super::body::ReceiptBody;
 
 /// Audit gap window — one entry per contiguous daemon-unreachable window.
 /// Populated from `~/.ember/sessions/<id>/audit-gaps.jsonl`, which is written
-/// by the implementation-note-10 fail-open path each time the launcher hook can't reach
+/// by the implementation-note-11 fail-open path each time the launcher hook can't reach
 /// emberd. See design §"Failure modes" row 1.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditGap {
@@ -42,7 +42,7 @@ pub enum TerminationReason {
     /// Launcher sent `session.close` cleanly.
     CleanExit,
     /// Daemon detected the launcher's heartbeat lost (>90s without a fresh
-    /// heartbeat AND PID no longer alive). implementation-note-13.
+    /// heartbeat AND PID no longer alive). implementation-note-29.
     HeartbeatLost,
     /// Grant TTL elapsed before the launcher closed the session.
     TtlExpired,
@@ -55,7 +55,7 @@ pub enum TerminationReason {
 /// — flow through unchanged) and adds the cohort-A-specific extensions
 /// permitted by design: `audit_gaps[]` for daemon-unreachable windows, and
 /// the termination-reason triple (`termination_reason`, `last_heartbeat_at`,
-/// `pid_alive_at_check`) for implementation-note-13's H1 invariant.
+/// `pid_alive_at_check`) for implementation-note-29's H1 invariant.
 ///
 /// `#[serde(flatten)]` on `base` ensures the wire shape is one flat object
 /// (matching design §"Body" and design §7), not a nested `{ base: { ... } }`.
@@ -69,7 +69,7 @@ pub struct ClaudeCodeBody {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub audit_gaps: Vec<AuditGap>,
     /// Termination reason. `None` for receipts predating
-    /// implementation-note-13; required for receipts emitted by
+    /// implementation-note-29; required for receipts emitted by
     /// the daemon-driven dirty-exit path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub termination_reason: Option<TerminationReason>,
@@ -221,7 +221,7 @@ mod tests {
     fn termination_reason_fields_omit_when_none() {
         // Backward-compat: a body without termination metadata must not
         // emit the new fields onto the wire — receipts predating
-        // implementation-note-13 still parse and round-trip.
+        // implementation-note-29 still parse and round-trip.
         let body = ClaudeCodeBody::default();
         let json = serde_json::to_string(&body).unwrap();
         assert!(!json.contains("termination_reason"));

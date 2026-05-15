@@ -10,6 +10,7 @@ core-crypto = { path = "../core-crypto" }
 core-sync = { path = "../core-sync" }
 core-trust = { path = "../core-trust" }
 core-types = { path = "../core-types" }
+core-principals = { path = "../core-principals" }
 hex = "0.4"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 rustls-pemfile = "2"

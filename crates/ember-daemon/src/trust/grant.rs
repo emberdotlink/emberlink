@@ -2,11 +2,8 @@ use chrono::{DateTime, Duration, Timelike, Utc};
 use core_crypto::grant_chain::{
     self, verify_chain, RootKeyPair, root_pubkey_bytes_from_ed25519_hex,
 };
-use core_types::{
-    AccessGrant, AttestationBinding, Block, Budget, GrantMode, GrantStatus,
-    PresentationAudienceKind, RecipientProfile, ResourceSelector, ResourceType,
-    SignedBlock, Statement, Usage,
-};
+use core_grant_types::{AccessGrant, AttestationBinding, Block, Budget, GrantMode, GrantStatus, RecipientProfile, ResourceSelector, ResourceType, SignedBlock, Statement, Usage};
+use core_event_types::{PresentationAudienceKind};
 use rusqlite::OptionalExtension;
 use serde::Serialize;
 use uuid::Uuid;
@@ -20,9 +17,9 @@ use core_grants::scope::{
 };
 use crate::infra::store::{DaemonStore, StoreError};
 
-// implementation-note-139 — final phase cleanup pass completed (design phase C-FINAL)
-// implementation-note-140 — internal grant.rs sites walk AccessGrant.blocks[] (design phase C-2)
-// implementation-note-141 — legacy entry points delegate through DaemonGrantStore (design phase C-1)
+// implementation-note-249 — final phase cleanup pass completed (design phase C-FINAL)
+// implementation-note-250 — internal grant.rs sites walk AccessGrant.blocks[] (design phase C-2)
+// implementation-note-251 — legacy entry points delegate through DaemonGrantStore (design phase C-1)
 // --- Phase B: DaemonGrantStore adapter (design §2.3) ---
 // TODO: GrantInfo struct is retained as a daemon-internal DB projection
 // because receipt.rs, dashboard.rs, tailnet.rs, and handler.rs all depend on fields not present
@@ -91,6 +88,7 @@ pub(crate) fn grant_info_to_core(g: &GrantInfo) -> core_grants::Grant {
         usage: core_grants::Usage {
             used: g.usage.tokens,
         },
+        schema_version: core_grants::GRANT_SCHEMA_VERSION_PIN,
     }
 }
 
@@ -130,7 +128,7 @@ impl<'a> DaemonGrantStore<'a> {
     /// Load a `core_grants::Grant` by its daemon-format string ID ("grant-{uuid}").
     ///
     /// Thin convenience bridge for handler.rs sites migrated in
-    /// implementation-note-91. Returns the state-machine type so callers can
+    /// implementation-note-169. Returns the state-machine type so callers can
     /// use `grant.state` / `grant.issuer` / `grant.expires_at` directly
     /// without going through the `GrantInfo` projection.
     pub fn load_grant(&self, id: &str) -> Result<core_grants::Grant, StoreError> {
@@ -232,7 +230,7 @@ impl<'a> DaemonGrantStore<'a> {
         child_persona_id: &str,
         narrowed_scope: &str,
         ttl_secs: Option<u64>,
-        child_budget: Option<core_types::Budget>,
+        child_budget: Option<core_grant_types::Budget>,
     ) -> Result<GrantInfo, StoreError> {
         let uuid = Self::parse_grant_id(parent_grant_id)?;
         let grant = GrantStore::load(self, uuid)?;
@@ -308,7 +306,7 @@ impl GrantStore for DaemonGrantStore<'_> {
 /// usage, paused, is_standing, allowed_targets, etc.
 ///
 /// Per design the canonical representation is the composite
-/// [`core_types::AccessGrant`] chain in `access_grant`. The scalar fields
+/// [`core_grant_types::AccessGrant`] chain in `access_grant`. The scalar fields
 /// on `GrantInfo` (scope, budget, usage, etc.) are **projections** over the
 /// first-statement in the chain. Full deletion requires migrating all callers
 /// above to walk `access_grant.blocks[].statements[]` natively.
@@ -528,7 +526,7 @@ pub fn build_fq_action_key(publisher_did: &str, tool: &str, action: &str) -> Str
 /// maps [`core_grants::chain::ChainBuildError`] onto `StoreError::InvalidInput`
 /// so daemon callers don't have to juggle two error enums.
 ///
-/// Logic lives in `core_grants::chain::sign_block_zero_with` (implementation-note-14).
+/// Logic lives in `core_grants::chain::sign_block_zero_with` (implementation-note-37).
 pub(crate) fn sign_block_zero_with(
     root: &RootKeyPair,
     block: &Block,
@@ -548,13 +546,13 @@ fn parse_epoch(s: Option<&str>) -> Option<u64> {
 /// per call), so the stored value is always 0. This derivation computes the
 /// actual time the grant has been in force at the moment of the query.
 ///
-/// Rules (per implementation-note-83):
+/// Rules (per implementation-note-159):
 /// - If the grant has already expired (`expires_at` set and `now > expires_at`),
 ///   return `min(expires_at, now) - created_at` clamped to `[0, budget_cap]`.
 /// - Otherwise return `now - created_at` clamped to `[0, budget_cap]`.
 /// - `budget_cap = None` means no wall-clock budget; elapsed time is still
 ///   derived (for audit accuracy) but is not clamped.
-// implementation-note-83: shipped
+// implementation-note-159: shipped
 pub(crate) fn derive_wall_clock_secs(
     now_secs: u64,
     created_at_secs: u64,
@@ -622,7 +620,7 @@ fn row_to_grant(row: &rusqlite::Row<'_>) -> rusqlite::Result<GrantInfo> {
         None => (flat_budget, flat_usage),
     };
 
-    // implementation-note-83: derive wall_clock_secs at read time.
+    // implementation-note-159: derive wall_clock_secs at read time.
     // The proxy never increments this field; compute elapsed seconds from
     // created_at/expires_at so signed receipts record actual time used.
     let now_secs = std::time::SystemTime::now()
@@ -639,7 +637,7 @@ fn row_to_grant(row: &rusqlite::Row<'_>) -> rusqlite::Result<GrantInfo> {
     // Terminal states persisted in the column (revoked, expired, exhausted_by_budget,
     // expired_by_budget, parent_cascade_revoked) are kept as-is.  For non-terminal
     // stored states (active, paused) we additionally derive time-based expiry from
-    // `expires_at`, reusing `GrantStatus::derive` (see prior change / implementation-note-142).
+    // `expires_at`, reusing `GrantStatus::derive` (see prior change / implementation-note-252).
     let effective_status = if matches!(
         status.as_str(),
         "revoked" | "expired" | "exhausted_by_budget" | "expired_by_budget" | "parent_cascade_revoked"
@@ -691,7 +689,7 @@ pub(crate) fn access_grant_blocks_to_json(g: &AccessGrant) -> Result<String, Sto
 ///
 /// Daemon-layer wrapper that maps [`core_grants::chain::ChainBuildError`] onto
 /// `StoreError::InvalidInput`. Logic lives in
-/// `core_grants::chain::access_grant_from_statements` (implementation-note-14).
+/// `core_grants::chain::access_grant_from_statements` (implementation-note-37).
 pub fn access_grant_from_statements(
     id: &str,
     persona_id: &str,
@@ -714,7 +712,7 @@ pub fn access_grant_from_statements(
 /// derived from the store rather than threaded in from the outside.
 /// Existing callers of [`access_grant_from_statements`] continue to
 /// compile unchanged; migrate them to this form incrementally
-/// (TODO P69K-C28-implementation-note-143 caller migration).
+/// (TODO P69K-C28-implementation-note-253 caller migration).
 ///
 /// Returns the same value as calling `access_grant_from_statements` with
 /// the result of `store.persona_root_keypair(persona_id)`.
@@ -996,7 +994,7 @@ impl DaemonStore {
     }
 
     pub fn list_active_grants(&self) -> Result<Vec<GrantInfo>, StoreError> {
-        // implementation-note-67 — `paused` is a reversible state; the operator
+        // implementation-note-141 — `paused` is a reversible state; the operator
         // who pauses a grant must still be able to find and resume it
         // without flipping the "show terminated" toggle (which is for
         // *terminal* states: revoked / expired / exhausted_by_budget).
@@ -1735,7 +1733,7 @@ impl DaemonStore {
         })
     }
 
-    /// implementation-note-92 — read the per-Statement
+    /// implementation-note-170 — read the per-Statement
     /// revocation list for a grant. Returns the deserialized vector of
     /// revoked sids ("S0", "S1", ...). Missing or NULL column is treated
     /// as empty (legacy rows that predate the migration). Malformed JSON
@@ -1771,7 +1769,7 @@ impl DaemonStore {
         self.grant_store().revoke_grant_statement(grant_id, sid)
     }
 
-    /// implementation-note-92 — append `sid` to the per-Statement
+    /// implementation-note-170 — append `sid` to the per-Statement
     /// revocation list for a grant. Idempotent: appending an already-revoked
     /// sid is a no-op. Emits a `grant.statement_revoked` audit event with
     /// the grant_id and statement sid.
@@ -1833,31 +1831,75 @@ impl DaemonStore {
     }
 
     pub(crate) fn revoke_grant_sql(&self, id: &str) -> Result<(), StoreError> {
-        let n = self.conn().execute(
-            "UPDATE grants SET status = 'revoked' WHERE id = ?1",
-            rusqlite::params![id],
-        )?;
-        if n == 0 {
-            return Err(StoreError::NotFound);
+        // implementation-note-120 (F-S5-008 + F-S5-005): wrap the revoke +
+        // audit chain emission + grant-receipt emission in a single
+        // BEGIN IMMEDIATE transaction so partial failure can't leave a
+        // revoked grant without its audit / receipt trail (or vice versa).
+        // Cascade-revoke of children runs OUTSIDE this transaction —
+        // recursive calls would otherwise nest BEGIN IMMEDIATE.
+        let conn = self.conn();
+        conn.execute("BEGIN IMMEDIATE", [])?;
+
+        let txn_result: Result<(), StoreError> = (|| {
+            let n = conn.execute(
+                "UPDATE grants SET status = 'revoked' WHERE id = ?1",
+                rusqlite::params![id],
+            )?;
+            if n == 0 {
+                return Err(StoreError::NotFound);
+            }
+
+            // F-S5-005: emit a chained grant.revoked audit event for the
+            // operator-initiated revocation. The in-tx variant skips the
+            // outer transaction management since we're already inside one.
+            crate::infra::audit::append_audit_event_with_chain_in_tx(
+                conn,
+                None,
+                "grant.revoked",
+                None,
+                "ok",
+                Some(
+                    &serde_json::json!({
+                        "grant_id": id,
+                        "revoke_actor": "operator",
+                    })
+                    .to_string(),
+                ),
+            )?;
+
+            // Emit Grant Receipt for the operator-initiated revocation.
+            if crate::infra::receipt::trigger_receipt_if_terminal_current(
+                self,
+                id,
+                Some(core_grant_types::grant_receipt::TerminalReason::Revoked {
+                    by: core_grant_types::grant_receipt::RevokeActor::Operator,
+                    reason: String::new(),
+                }),
+            )
+            .is_none()
+            {
+                tracing::warn!(
+                    grant_id = %id,
+                    terminal_reason = "revoked",
+                    "receipt did not emit for revoked grant — see prior log line"
+                );
+            }
+            Ok(())
+        })();
+
+        match txn_result {
+            Ok(()) => {
+                conn.execute("COMMIT", [])?;
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", []);
+                return Err(e);
+            }
         }
-        // Emit Grant Receipt for the operator-initiated revocation.
-        if crate::infra::receipt::trigger_receipt_if_terminal_current(
-            self,
-            id,
-            Some(core_types::grant_receipt::TerminalReason::Revoked {
-                by: core_types::grant_receipt::RevokeActor::Operator,
-                reason: String::new(),
-            }),
-        )
-        .is_none()
-        {
-            tracing::warn!(
-                grant_id = %id,
-                terminal_reason = "revoked",
-                "receipt did not emit for revoked grant — see prior log line"
-            );
-        }
-        // Cascade to child delegated grants
+
+        // Cascade to child delegated grants — outside the transaction so
+        // recursive cascade calls can each open their own BEGIN IMMEDIATE
+        // via the same revoke_grant_sql path.
         self.cascade_revoke_children(id, id)?;
         Ok(())
     }
@@ -1885,7 +1927,7 @@ impl DaemonStore {
             if crate::infra::receipt::trigger_receipt_if_terminal_current(
                 self,
                 &child_id,
-                Some(core_types::grant_receipt::TerminalReason::ParentCascadeRevoked {
+                Some(core_grant_types::grant_receipt::TerminalReason::ParentCascadeRevoked {
                     parent_grant_id: root_revoked_id.to_string(),
                 }),
             )
@@ -1928,7 +1970,7 @@ impl DaemonStore {
             if crate::infra::receipt::trigger_receipt_if_terminal_current(
                 self,
                 gid,
-                Some(core_types::grant_receipt::TerminalReason::Expired),
+                Some(core_grant_types::grant_receipt::TerminalReason::Expired),
             )
             .is_none()
             {
@@ -2003,9 +2045,9 @@ impl DaemonStore {
                 if crate::infra::receipt::trigger_receipt_if_terminal_current(
                     self,
                     &ag.id,
-                    Some(core_types::grant_receipt::TerminalReason::ExhaustedByBudget {
+                    Some(core_grant_types::grant_receipt::TerminalReason::ExhaustedByBudget {
                         statement_sid: "S0".into(),
-                        axis: core_types::grant_receipt::BudgetAxis::WallClockSecs,
+                        axis: core_grant_types::grant_receipt::BudgetAxis::WallClockSecs,
                     }),
                 )
                 .is_none()
@@ -2040,7 +2082,7 @@ impl DaemonStore {
         Ok((exhausted, warned))
     }
 
-    /// implementation-note-96: per-grant version of the
+    /// implementation-note-174: per-grant version of the
     /// background sweeps (`expire_stale_grants` + `expire_grants_by_wall_clock`)
     /// run synchronously on observation. `get_grant` already projects an
     /// `effective_status` from `expires_at` vs `now`, so callers can
@@ -2091,7 +2133,7 @@ impl DaemonStore {
             if crate::infra::receipt::trigger_receipt_if_terminal_current(
                 self,
                 grant_id,
-                Some(core_types::grant_receipt::TerminalReason::Expired),
+                Some(core_grant_types::grant_receipt::TerminalReason::Expired),
             )
             .is_none()
             {
@@ -2138,9 +2180,9 @@ impl DaemonStore {
             if crate::infra::receipt::trigger_receipt_if_terminal_current(
                 self,
                 grant_id,
-                Some(core_types::grant_receipt::TerminalReason::ExhaustedByBudget {
+                Some(core_grant_types::grant_receipt::TerminalReason::ExhaustedByBudget {
                     statement_sid: "S0".into(),
-                    axis: core_types::grant_receipt::BudgetAxis::WallClockSecs,
+                    axis: core_grant_types::grant_receipt::BudgetAxis::WallClockSecs,
                 }),
             )
             .is_none()
@@ -2544,7 +2586,7 @@ impl DaemonStore {
                 if stmt.sid == statement_sid {
                     let before = stmt.usage.clone();
                     stmt.usage.tokens = stmt.usage.tokens.saturating_add(delta.tokens);
-                    // implementation-note-22: accumulate micro-cents
+                    // implementation-note-32: accumulate micro-cents
                     // (sub-cent precision) and DERIVE the integer `cents`
                     // display value from it. Adding `delta.cents` directly
                     // would lose every sub-cent call to integer truncation,
@@ -2744,7 +2786,7 @@ impl DaemonStore {
         Ok(())
     }
 
-    /// implementation-note-89: evaluate a Claude Code PreToolUse request against the
+    /// implementation-note-60: evaluate a Claude Code PreToolUse request against the
     /// active grant for the supplied persona, emit a `tool_call_attempt`
     /// audit event, and return a `ToolCallDecision`.
     ///
@@ -2755,7 +2797,7 @@ impl DaemonStore {
     ///     and find its first active grant.
     ///
     /// On hit: returns `ToolCallDecision { permit: true, reason: None, .. }`
-    /// (Permit-stub — the real evaluator is implementation-note-90 future work).
+    /// (Permit-stub — the real evaluator is implementation-note-61 future work).
     /// On miss: returns `ToolCallDecision { permit: false, reason: Some(..), .. }`.
     ///
     /// Either way, an audit row is written to the `audit_log` table keyed
@@ -2813,7 +2855,7 @@ impl DaemonStore {
                 ToolCallDecision {
                     permit: false,
                     reason: Some(format!(
-                        "no active grant for persona '{persona}' (implementation-note-89 stub evaluator)"
+                        "no active grant for persona '{persona}' (implementation-note-60 stub evaluator)"
                     )),
                     grant_id: None,
                     emitted_event_id: String::new(),
@@ -2845,13 +2887,13 @@ impl DaemonStore {
     }
 }
 
-/// implementation-note-89: decision returned by [`DaemonStore::evaluate_tool_call`].
+/// implementation-note-60: decision returned by [`DaemonStore::evaluate_tool_call`].
 ///
 /// Wire-compatible with the proxy hook's `HookResponse` shape: `permit`
 /// maps to `allow`, `reason` to `reason` (a `None` reason on the permit
-/// path becomes the canned "permit (implementation-note-89 stub)" string in the
+/// path becomes the canned "permit (implementation-note-60 stub)" string in the
 /// proxy). `grant_id` and `emitted_event_id` are surfaced so future
-/// receipt-termination work (implementation-note-12) can correlate the hook
+/// receipt-termination work (implementation-note-28) can correlate the hook
 /// invocation back to the grant + audit row without a second RPC.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct ToolCallDecision {
@@ -2980,7 +3022,7 @@ mod tests {
         assert!(matches!(result, Err(StoreError::NotFound)));
     }
 
-    // implementation-note-92 — per-statement revoke unit tests.
+    // implementation-note-170 — per-statement revoke unit tests.
 
     #[test]
     fn revoke_grant_statement_appends_sid() {
@@ -3543,7 +3585,7 @@ mod tests {
     }
 
     /// `access_grant_from_statements_for_persona` returns the same `AccessGrant`
-    /// as the explicit-root form when both use the same persona (P69K-C28-implementation-note-143).
+    /// as the explicit-root form when both use the same persona (P69K-C28-implementation-note-253).
     #[test]
     fn access_grant_from_statements_for_persona_matches_explicit_root() {
         let store = setup();
@@ -3652,7 +3694,7 @@ mod tests {
     #[test]
     fn get_access_grant_valid_ed25519_chain_returns_ok() {
         use core_crypto::grant_chain::{RootKeyPair, sign_block_zero};
-        use core_types::{Block, ResourceSelector, ResourceType, Statement, Usage};
+        use core_grant_types::{Block, ResourceSelector, ResourceType, Statement, Usage};
 
         let store = setup();
 
@@ -3712,7 +3754,7 @@ mod tests {
     #[test]
     fn get_access_grant_tampered_signature_returns_err() {
         use core_crypto::grant_chain::{RootKeyPair, sign_block_zero};
-        use core_types::{Block, ResourceSelector, ResourceType, Statement, Usage};
+        use core_grant_types::{Block, ResourceSelector, ResourceType, Statement, Usage};
 
         let store = setup();
 
@@ -3762,7 +3804,7 @@ mod tests {
 
     /// Build a placeholder `SignedBlock` with `issued_by = persona_id`.
     fn placeholder_block_for(persona_id: &str, sid: &str) -> SignedBlock {
-        use core_types::{Block, ResourceSelector, ResourceType, Statement, Usage};
+        use core_grant_types::{Block, ResourceSelector, ResourceType, Statement, Usage};
         SignedBlock {
             block: Block {
                 statements: vec![Statement {
@@ -3986,7 +4028,7 @@ mod tests {
         // now be rejected by verify_and_return. Only unsigned-phase1
         // placeholder grants pass through without a persona row.
         use core_crypto::grant_chain::{RootKeyPair, sign_block_zero};
-        use core_types::{Block, ResourceSelector, ResourceType, Statement, Usage};
+        use core_grant_types::{Block, ResourceSelector, ResourceType, Statement, Usage};
 
         let store = setup();
 
@@ -4333,7 +4375,7 @@ mod tests {
 
     #[test]
     fn list_active_grants_includes_paused() {
-        // implementation-note-67 — paused grants are reversible; the operator
+        // implementation-note-141 — paused grants are reversible; the operator
         // who pauses a grant must still see it on the Active list to be
         // able to resume it. Terminal states (revoked / expired /
         // exhausted_by_budget) belong behind the "show terminated"
@@ -5987,7 +6029,7 @@ mod tests {
         assert_eq!(store.get_grant(&child.id).unwrap().status, "revoked");
     }
 
-    // ---- implementation-note-89: evaluate_tool_call -----------------------------
+    // ---- implementation-note-60: evaluate_tool_call -----------------------------
 
     #[test]
     fn evaluate_tool_call_persona_with_active_grant_permits() {
@@ -6131,7 +6173,7 @@ mod tests {
         assert_eq!(back, d);
     }
 
-    // --- implementation-note-83: derive_wall_clock_secs unit tests ---
+    // --- implementation-note-159: derive_wall_clock_secs unit tests ---
 
     #[test]
     fn wall_clock_derive_mid_grant() {

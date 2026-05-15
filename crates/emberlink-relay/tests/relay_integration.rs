@@ -17,7 +17,8 @@ fn test_admitted(persona: &str, scope: &str) -> AdmittedRequest {
 }
 use core_crypto::{FixtureSigner, Signer as CryptoSigner};
 use core_sync::wrap_for_relay;
-use core_types::{AdmissionToken, RelayMode, TrustThreshold};
+use core_principals::{RelayMode, TrustThreshold};
+use core_principals::{AdmissionToken};
 
 fn signed_admission_token(
     signer: &FixtureSigner,

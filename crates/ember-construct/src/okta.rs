@@ -730,7 +730,7 @@ mod tests {
     // contract slice this Construct depends on: the broker registry can
     // hold a `MockBroker::new(BrokerProvider::Okta)`, and a request that
     // declares `provider = Okta` round-trips through issue → revoke
-    // without panicking. Real Okta broker impl is implementation-note-35
+    // without panicking. Real Okta broker impl is implementation-note-71
     // (separate task).
 
     use core_broker::{Broker, BrokerError, BrokerProvider, BrokerRequest, MockBroker};

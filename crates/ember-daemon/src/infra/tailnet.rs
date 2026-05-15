@@ -12,7 +12,7 @@
 //! which mints a short-lived grant against the
 //! existing vault, packages the credential plaintext + expiry into a
 //! [`LeaseHandle`], and lets the existing TTL-expiry sweep emit a
-//! [`core_types::grant_receipt::GrantReceipt`] when the lease expires.
+//! [`core_grant_types::grant_receipt::GrantReceipt`] when the lease expires.
 //! Everything past the daemon socket — the JWT verification, the OIDC
 //! discovery cache, the HTTP server binding to the Tailscale interface,
 //! the init container's `tmpfs` write — is out of scope for this task
@@ -62,7 +62,7 @@ use std::time::Duration;
 // is updated to return core_grants::Grant or a dedicated LeaseResult type.
 use crate::trust::grant::GrantInfo;
 use crate::infra::store::{DaemonStore, StoreError};
-use crate::infra::vault::VaultError;
+use crate::infra::vault::{VaultError, VaultScope};
 
 /// Tailnet ACL tag the daemon will accept lease requests from. Bound to
 /// the Team Zero homelab tag from `infra/tailnet/acl.json`. Anything
@@ -89,7 +89,7 @@ pub const MAX_LEASE_TTL_SECS: u64 = 15 * 60;
 #[derive(Debug, Clone)]
 pub struct LeaseHandle {
     /// Daemon grant id. Becomes the correlation handle on the eventual
-    /// [`core_types::grant_receipt::GrantReceipt`] emitted at expiry.
+    /// [`core_grant_types::grant_receipt::GrantReceipt`] emitted at expiry.
     pub grant_id: String,
     /// Persona that issued the grant.
     pub persona_id: String,
@@ -195,7 +195,7 @@ pub fn lease_credential(
             "lease_credential: daemon vault is not attached".to_string(),
         )
     })?;
-    let credential = vault.get(store, credential_name).map_err(map_vault_err)?;
+    let credential = vault.get(VaultScope::Interactive, store, credential_name).map_err(map_vault_err)?;
 
     // Mint a single-statement composite grant scoped to this resource.
     // Reuses the existing `create_grant` machinery so the receipt-emit
@@ -274,7 +274,7 @@ mod tests {
         let persona = store.create_persona("agent-tailnet").expect("persona");
         let vault = store.vault().expect("vault");
         vault
-            .add(&store, "github-pat", b"ghp_test", None)
+            .add(VaultScope::Interactive, &store, "github-pat", b"ghp_test", None)
             .expect("seed credential");
 
         let err = lease_credential(
@@ -294,7 +294,7 @@ mod tests {
         let persona = store.create_persona("agent-zero-ttl").expect("persona");
         let vault = store.vault().expect("vault");
         vault
-            .add(&store, "github-pat", b"ghp_test", None)
+            .add(VaultScope::Interactive, &store, "github-pat", b"ghp_test", None)
             .expect("seed credential");
 
         let err = lease_credential(
@@ -314,7 +314,7 @@ mod tests {
         let persona = store.create_persona("agent-cap").expect("persona");
         let vault = store.vault().expect("vault");
         vault
-            .add(&store, "github-pat", b"ghp_test", None)
+            .add(VaultScope::Interactive, &store, "github-pat", b"ghp_test", None)
             .expect("seed credential");
 
         let err = lease_credential(
@@ -357,7 +357,7 @@ mod tests {
 
         let vault = store.vault().expect("vault");
         vault
-            .add(&store, "github-pat", b"ghp_secret_value", None)
+            .add(VaultScope::Interactive, &store, "github-pat", b"ghp_secret_value", None)
             .expect("seed credential");
 
         let lease = lease_credential(

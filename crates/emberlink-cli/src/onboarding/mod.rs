@@ -5,7 +5,7 @@
 //! create, settings.json patch, optional GH PAT capture). The
 //! `settings_patch` submodule holds the lower-level JSON-patch primitives
 //! that both `init --for claude-code` and `uninstall --for claude-code`
-//! call into. The `github_app` submodule (implementation-note-174)
+//! call into. The `github_app` submodule (implementation-note-308)
 //! exposes the public GitHub App manifest doc and install URL for adopters
 //! who want to install Emberlink against a real GitHub account or org.
 

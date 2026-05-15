@@ -1,7 +1,7 @@
 //! crates/core-approval/src/lifecycle.rs
 
 use core_grants::Grant;
-use core_types::approval::RequestedScope;
+use core_grant_types::approval::RequestedScope;
 use serde::{Deserialize, Serialize};
 
 use crate::outcome::ApprovalOutcome;
@@ -86,7 +86,7 @@ pub trait ApprovalLifecycle: Send + Sync {
     /// Decided`, `LifecycleError::ScopeNotNarrowing` (Narrowed-outcome with
     /// a wider scope than requested), `LifecycleError::GrantMintFailed`.
     ///
-    /// implementation-note-5: returns `core_grants::Grant`
+    /// implementation-note-6: returns `core_grants::Grant`
     /// (design approval → grant boundary; design phase C).
     async fn decide(
         &self,
@@ -106,7 +106,7 @@ pub trait ApprovalLifecycle: Send + Sync {
     /// Idempotent across identical patterns within the same persona —
     /// re-applying refreshes the TTL rather than minting a new Grant.
     ///
-    /// implementation-note-5: returns `core_grants::Grant`
+    /// implementation-note-6: returns `core_grants::Grant`
     /// (design approval → grant boundary; design phase C).
     async fn apply_standing(
         &self,

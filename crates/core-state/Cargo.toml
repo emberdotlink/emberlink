@@ -11,6 +11,9 @@ core-eventlog = { path = "../core-eventlog" }
 core-events = { path = "../core-events" }
 core-storage = { path = "../core-storage" }
 core-types = { path = "../core-types" }
+core-principals = { path = "../core-principals" }
+core-event-types = { path = "../core-event-types" }
+core-grant-types = { path = "../core-grant-types" }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 ciborium = "0.2"

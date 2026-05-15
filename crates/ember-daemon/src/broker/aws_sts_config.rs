@@ -62,7 +62,7 @@ const KEY_DEFAULT_ROLE_ARN: &str = "AWS_DEFAULT_ROLE_ARN";
 /// don't have a federated identity.
 ///
 /// Precedence rule (when daemon-side wireup lands; see
-/// implementation-note-44 follow-up):
+/// implementation-note-86 follow-up):
 ///
 /// 1. `AWS_OIDC_TOKEN_PATH` set + readable file → WebIdentity mode
 /// 2. `AWS_LONG_LIVED_KEY_ID` + secret + region present → AssumeRole
@@ -72,7 +72,7 @@ const KEY_DEFAULT_ROLE_ARN: &str = "AWS_DEFAULT_ROLE_ARN";
 ///
 /// The receiving field is reserved here; load_from_dir() does not
 /// yet read it (the broker accepts an already-loaded
-/// `SecretString` per the implementation-note-23 brief).
+/// `SecretString` per the implementation-note-46 brief).
 #[allow(dead_code)]
 const KEY_OIDC_TOKEN_PATH: &str = "AWS_OIDC_TOKEN_PATH";
 

@@ -1,0 +1,381 @@
+//! Pre-flight scope check at headless enrollment — Layer 1 (manifest-declared).
+//!
+//! Per design §"Pre-flight scope check at enrollment" Layer 1: for each
+//! queued task that declares which Constructs (per design) it invokes,
+//! resolve the union of action permissions those Constructs require,
+//! cross-reference against the enrolled persona template, and report any
+//! gaps. Surface BEFORE automation runs the task, not after — predictive
+//! layer atop the historical Layer 2 reader (already shipped at
+//! `crate::permission_gaps::recent_gaps_for_persona`).
+//!
+//! ## Phase 2 slice B (this slice) — manifest-backed resolver
+//!
+//! [`resolve_queued_task_permissions`] now consumes each task's
+//! `constructs` field (implementation-note-17) and a
+//! registry of parsed `construct.toml` manifests
+//! ([`crate::manifest::ConstructManifest`]). For every
+//! `"<construct>.<action>"` declaration the task carries, the resolver
+//! looks up the construct in the registry, verifies the action key is
+//! declared in the manifest, and emits a [`Permission`]. Unknown
+//! constructs and unknown actions are skipped silently — pre-flight is a
+//! best-effort predictive layer; a task that declares an unknown
+//! Construct is still allowed to run (Layer 2 catches the gap from
+//! runtime).
+//!
+//! Convention compatibility: task brief `constructs` entries are written
+//! `<construct>.<action>` where `<construct>` is the manifest's
+//! `[meta] name` (e.g. `ember-gh`, `ember-kubectl`). The resolver tries
+//! the action suffix both verbatim (`pr_merge` matches `gh.toml`'s
+//! `key = "pr_merge"`) and with the tool short-name re-prepended (`apply`
+//! matches `kubectl.toml`'s `key = "kubectl.apply"` when the construct
+//! is `ember-kubectl`).
+//!
+//! implementation-note-18 — checkpoint for stale_check; do not remove.
+//!
+
+use std::collections::HashMap;
+
+use crate::manifest::{lookup, ConstructManifest};
+
+/// A permission a Construct requires to perform an action.
+///
+/// String-based for cohort A; the construct.toml parser (Phase 2) will
+/// promote this to a structured enum once the manifest format is locked.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Permission {
+    /// Identifier matching the Construct's manifest action surface
+    /// (e.g. `"ember-gh.pr.merge"`, `"ember-kubectl.apply"`).
+    pub identifier: String,
+    /// Optional scope qualifier (e.g. `"forks/*"`, `"staging/*"`) — None
+    /// when the permission applies broadly.
+    pub scope: Option<String>,
+}
+
+/// A gap between a queued task's required permissions and the enrolled
+/// persona template.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionGap {
+    pub task_id: String,
+    pub permission: Permission,
+}
+
+/// A persona template's allow-list of permissions.
+///
+/// Phase 1 stub: a flat list. Phase 2 (and the broker layer) wire this to
+/// the real persona template store.
+#[derive(Debug, Clone, Default)]
+pub struct Template {
+    pub allowed: Vec<Permission>,
+}
+
+/// Identifier alias for the Ranker's `Pick.id` / `Task.id`. Matches the
+/// schema's mixed-case task-id grammar (`^[A-Z][A-Za-z0-9_.-]+$`).
+pub type TaskId = String;
+
+/// Resolve, for each task, the union of permissions implied by the
+/// Constructs that task declares it invokes.
+///
+/// **Pre:** every entry in `tasks` is a `(task_id, task.constructs)` pair
+/// where each construct declaration is the
+/// implementation-note-17 shape
+/// `"<construct>.<action>"` (e.g. `"ember-gh.pr_merge"`,
+/// `"ember-kubectl.apply"`). `registry` maps a manifest's `[meta] name`
+/// (e.g. `"ember-gh"`) to its parsed [`ConstructManifest`].
+///
+/// **Post:** the returned map has one entry per task in `tasks` (even
+/// when the task declares no constructs — value is an empty `Vec`).
+/// For each declaration the resolver finds in the registry, the returned
+/// `Vec<Permission>` carries one [`Permission`] with `identifier` set to
+/// the verbatim declaration. Declarations whose construct is not in the
+/// registry, or whose action key is not declared in the manifest, are
+/// skipped without error — pre-flight is a best-effort predictive layer.
+///
+/// Action-key matching tries two shapes for backwards compatibility with
+/// the two action-key conventions in the cohort-A bundled manifests:
+///   1. The suffix verbatim (`pr_merge` matches `gh.toml`'s
+///      `key = "pr_merge"`).
+///   2. The construct's short-name prepended (`apply` matches
+///      `kubectl.toml`'s `key = "kubectl.apply"` when the construct is
+///      `ember-kubectl`).
+pub fn resolve_queued_task_permissions(
+    tasks: &[(TaskId, Vec<String>)],
+    registry: &HashMap<String, ConstructManifest>,
+) -> HashMap<TaskId, Vec<Permission>> {
+    let mut out = HashMap::with_capacity(tasks.len());
+    for (task_id, declarations) in tasks {
+        let mut perms = Vec::new();
+        for decl in declarations {
+            let Some((construct_name, action_suffix)) = decl.split_once('.') else {
+                // Malformed declaration (no `.` separator) — skip silently.
+                continue;
+            };
+            let Some(manifest) = lookup(registry, construct_name) else {
+                // Unknown construct — Layer 2 will surface the gap at runtime.
+                continue;
+            };
+            if action_key_present(manifest, action_suffix) {
+                perms.push(Permission {
+                    identifier: decl.clone(),
+                    scope: None,
+                });
+            }
+        }
+        out.insert(task_id.clone(), perms);
+    }
+    out
+}
+
+/// True when `action_suffix` resolves to a declared action key in
+/// `manifest`, trying the suffix verbatim and the short-name-prepended
+/// variant. See [`resolve_queued_task_permissions`] for the convention
+/// rationale.
+fn action_key_present(manifest: &ConstructManifest, action_suffix: &str) -> bool {
+    if manifest.action_keys.iter().any(|k| k == action_suffix) {
+        return true;
+    }
+    let short = manifest.name.strip_prefix("ember-").unwrap_or(&manifest.name);
+    let prefixed = format!("{short}.{action_suffix}");
+    manifest.action_keys.contains(&prefixed)
+}
+
+/// Diff a set of needed permissions against an enrolled persona template,
+/// returning the gaps (permissions needed but not in the template's
+/// allow-list).
+///
+/// Implementation is unchanged from Phase 1 — the resolver's output
+/// shape is the same; only its content gained substance in Phase 2.
+pub fn cross_reference(
+    needed: &HashMap<TaskId, Vec<Permission>>,
+    template: &Template,
+) -> Vec<PermissionGap> {
+    let mut gaps = Vec::new();
+    for (task_id, perms) in needed {
+        for perm in perms {
+            if !template.allowed.contains(perm) {
+                gaps.push(PermissionGap {
+                    task_id: task_id.clone(),
+                    permission: perm.clone(),
+                });
+            }
+        }
+    }
+    gaps
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manifest::parse_construct_manifest_str;
+
+    const GH_MANIFEST: &str = r#"
+[meta]
+name = "ember-gh"
+
+default = "deny"
+
+[[actions]]
+key = "pr_create"
+
+[[actions]]
+key = "pr_merge"
+"#;
+
+    const KUBECTL_MANIFEST: &str = r#"
+[meta]
+name = "ember-kubectl"
+
+default = "deny"
+
+[[actions]]
+key = "kubectl.apply"
+
+[[actions]]
+key = "kubectl.delete"
+"#;
+
+    fn registry_with(manifests: &[&str]) -> HashMap<String, ConstructManifest> {
+        let mut r = HashMap::new();
+        for s in manifests {
+            let m = parse_construct_manifest_str(s).expect("manifest parses");
+            r.insert(m.name.clone(), m);
+        }
+        r
+    }
+
+    #[test]
+    fn empty_tasks_yields_empty_map() {
+        let registry = registry_with(&[GH_MANIFEST]);
+        let result = resolve_queued_task_permissions(&[], &registry);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn task_without_constructs_yields_empty_perms() {
+        let registry = registry_with(&[GH_MANIFEST]);
+        let tasks = vec![("AP-FOO".into(), vec![])];
+        let result = resolve_queued_task_permissions(&tasks, &registry);
+        assert_eq!(result.len(), 1);
+        assert!(result.get("AP-FOO").unwrap().is_empty());
+    }
+
+    /// Resolver round-trip — the load-bearing test for Phase 2 slice B.
+    ///
+    /// Parse a real `construct.toml` shape, register it, declare a task
+    /// that references it, and assert the resolver emits a `Permission`
+    /// keyed by the declaration verbatim.
+    #[test]
+    fn resolver_round_trip_bare_action_key() {
+        let registry = registry_with(&[GH_MANIFEST]);
+        let tasks = vec![(
+            "TASK-A".to_string(),
+            vec!["ember-gh.pr_merge".to_string()],
+        )];
+        let result = resolve_queued_task_permissions(&tasks, &registry);
+        let perms = result.get("TASK-A").expect("task entry present");
+        assert_eq!(perms.len(), 1);
+        assert_eq!(perms[0].identifier, "ember-gh.pr_merge");
+        assert!(perms[0].scope.is_none());
+    }
+
+    /// Round-trip for the kubectl-style tool-prefixed action keys.
+    ///
+    /// Task brief writes `ember-kubectl.apply`; manifest declares
+    /// `kubectl.apply`. The resolver matches via the short-name-prepended
+    /// fallback shape.
+    #[test]
+    fn resolver_round_trip_tool_prefixed_action_key() {
+        let registry = registry_with(&[KUBECTL_MANIFEST]);
+        let tasks = vec![(
+            "TASK-B".to_string(),
+            vec!["ember-kubectl.apply".to_string()],
+        )];
+        let result = resolve_queued_task_permissions(&tasks, &registry);
+        let perms = result.get("TASK-B").expect("task entry present");
+        assert_eq!(perms.len(), 1);
+        assert_eq!(perms[0].identifier, "ember-kubectl.apply");
+    }
+
+    #[test]
+    fn unknown_construct_is_skipped() {
+        let registry = registry_with(&[GH_MANIFEST]);
+        let tasks = vec![(
+            "TASK-C".to_string(),
+            vec!["ember-unknown.do_thing".to_string()],
+        )];
+        let result = resolve_queued_task_permissions(&tasks, &registry);
+        assert!(result.get("TASK-C").unwrap().is_empty());
+    }
+
+    #[test]
+    fn unknown_action_is_skipped() {
+        let registry = registry_with(&[GH_MANIFEST]);
+        let tasks = vec![(
+            "TASK-D".to_string(),
+            vec!["ember-gh.unknown_action".to_string()],
+        )];
+        let result = resolve_queued_task_permissions(&tasks, &registry);
+        assert!(result.get("TASK-D").unwrap().is_empty());
+    }
+
+    #[test]
+    fn malformed_declaration_without_dot_is_skipped() {
+        let registry = registry_with(&[GH_MANIFEST]);
+        let tasks = vec![("TASK-E".to_string(), vec!["nodothere".to_string()])];
+        let result = resolve_queued_task_permissions(&tasks, &registry);
+        assert!(result.get("TASK-E").unwrap().is_empty());
+    }
+
+    #[test]
+    fn multiple_tasks_multiple_constructs() {
+        let registry = registry_with(&[GH_MANIFEST, KUBECTL_MANIFEST]);
+        let tasks = vec![
+            (
+                "TASK-F".to_string(),
+                vec![
+                    "ember-gh.pr_create".to_string(),
+                    "ember-kubectl.apply".to_string(),
+                ],
+            ),
+            (
+                "TASK-G".to_string(),
+                vec!["ember-gh.pr_merge".to_string()],
+            ),
+        ];
+        let result = resolve_queued_task_permissions(&tasks, &registry);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result.get("TASK-F").unwrap().len(), 2);
+        assert_eq!(result.get("TASK-G").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cross_reference_empty_input_yields_no_gaps() {
+        let template = Template::default();
+        let gaps = cross_reference(&HashMap::new(), &template);
+        assert!(gaps.is_empty());
+    }
+
+    #[test]
+    fn cross_reference_detects_missing_permission() {
+        let template = Template {
+            allowed: vec![Permission {
+                identifier: "ember-gh.pr_create".into(),
+                scope: None,
+            }],
+        };
+        let needed = HashMap::from([(
+            "TASK-X".into(),
+            vec![Permission {
+                identifier: "ember-gh.pr_merge".into(),
+                scope: None,
+            }],
+        )]);
+        let gaps = cross_reference(&needed, &template);
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].task_id, "TASK-X");
+        assert_eq!(gaps[0].permission.identifier, "ember-gh.pr_merge");
+    }
+
+    #[test]
+    fn cross_reference_finds_present_permission_no_gap() {
+        let permission = Permission {
+            identifier: "ember-kubectl.apply".into(),
+            scope: Some("staging/*".into()),
+        };
+        let template = Template {
+            allowed: vec![permission.clone()],
+        };
+        let needed = HashMap::from([("TASK-Y".into(), vec![permission])]);
+        let gaps = cross_reference(&needed, &template);
+        assert!(gaps.is_empty(), "exact match → no gap");
+    }
+
+    #[test]
+    fn permission_equality_includes_scope() {
+        let a = Permission {
+            identifier: "x".into(),
+            scope: Some("a/*".into()),
+        };
+        let b = Permission {
+            identifier: "x".into(),
+            scope: Some("b/*".into()),
+        };
+        assert_ne!(a, b, "different scope → different permission");
+    }
+
+    /// End-to-end: parse manifest → register → resolve → cross-reference
+    /// against an empty template → gap reported.
+    #[test]
+    fn resolver_to_cross_reference_pipeline() {
+        let registry = registry_with(&[GH_MANIFEST]);
+        let tasks = vec![(
+            "TASK-PIPELINE".to_string(),
+            vec!["ember-gh.pr_merge".to_string()],
+        )];
+        let needed = resolve_queued_task_permissions(&tasks, &registry);
+        let template = Template::default();
+        let gaps = cross_reference(&needed, &template);
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].task_id, "TASK-PIPELINE");
+        assert_eq!(gaps[0].permission.identifier, "ember-gh.pr_merge");
+    }
+}

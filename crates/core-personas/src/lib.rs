@@ -1,7 +1,5 @@
-use core_types::{
-    EventBody, Persona, PersonaCreatedEvent, PersonaKeyRotatedEvent, PersonaRevokedEvent,
-    PublicKeyMaterial, SurvivalMode,
-};
+use core_event_types::{EventBody, PersonaCreatedEvent, PersonaKeyRotatedEvent, PersonaRevokedEvent};
+use core_principals::{Persona, PublicKeyMaterial, SurvivalMode};
 
 pub fn create_persona(
     id: impl Into<String>,
@@ -19,6 +17,64 @@ pub fn create_persona(
         survival_mode,
         active_key,
     }
+}
+
+/// implementation-note-40 (design §9 + §6) — factory for
+/// a workload Persona bound to a SCION agent's container identity.
+///
+/// Returns the persona alongside the container_id + parent_grant_id
+/// binding it was minted under. The caller (daemon `create_agent_persona`
+/// RPC handler) persists the binding into BOTH the `personas` SQLite
+/// row AND a timestamped audit-log row so the reconciler can
+/// reconstruct the binding from either source.
+///
+/// This is the pure factory — it does not touch the event store or
+/// the SQLite layer. The two-phase commit (`enrolling -> active`)
+/// + container-id uniqueness enforcement happens at the daemon
+/// boundary, where the SQLite transaction lives.
+#[allow(clippy::too_many_arguments)]
+pub fn create_agent_persona(
+    id: impl Into<String>,
+    root_id: impl Into<String>,
+    label: impl Into<String>,
+    container_id: impl Into<String>,
+    parent_grant_id: impl Into<String>,
+    disclosure_profile: Option<String>,
+    survival_mode: SurvivalMode,
+    active_key: PublicKeyMaterial,
+) -> AgentPersona {
+    AgentPersona {
+        persona: Persona {
+            id: id.into(),
+            root_id: root_id.into(),
+            label: label.into(),
+            disclosure_profile,
+            survival_mode,
+            active_key,
+        },
+        container_id: container_id.into(),
+        parent_grant_id: parent_grant_id.into(),
+    }
+}
+
+/// implementation-note-40 — workload Persona + container
+/// binding metadata. Returned by [`create_agent_persona`] so the
+/// daemon can persist the binding atomically with the persona row.
+///
+/// The struct deliberately wraps the base [`Persona`] rather than
+/// extending it so the protocol-level Persona type stays unchanged
+/// (no new variant in `core-types`, no migration of the canonical
+/// event encoding).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentPersona {
+    pub persona: Persona,
+    /// Container identity this persona was minted for. Used by the
+    /// reconciler to refuse a duplicate spawn into the same slot.
+    pub container_id: String,
+    /// Parent grant whose authority is being attenuated to this
+    /// persona's child grant. Lets the reconciler + receipt pipeline
+    /// correlate the agent's grant lineage without walking the chain.
+    pub parent_grant_id: String,
 }
 
 pub fn persona_created_event(
@@ -75,7 +131,8 @@ pub fn revoke_persona(personas: &mut Vec<Persona>, persona_id: &str) -> Option<P
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_types::{EventType, KeyAlgorithm};
+    use core_event_types::{EventType};
+    use core_principals::{KeyAlgorithm};
 
     #[test]
     fn revoke_persona_removes_matching_entry() {
@@ -88,7 +145,7 @@ mod tests {
                 SurvivalMode::Strict,
                 PublicKeyMaterial {
                     key_id: "key-1".into(),
-                    algorithm: core_types::KeyAlgorithm::DevEd25519Like,
+                    algorithm: core_principals::KeyAlgorithm::DevEd25519Like,
                     public_key: "devpub:1".into(),
                 },
             ),
@@ -100,7 +157,7 @@ mod tests {
                 SurvivalMode::Strict,
                 PublicKeyMaterial {
                     key_id: "key-2".into(),
-                    algorithm: core_types::KeyAlgorithm::DevEd25519Like,
+                    algorithm: core_principals::KeyAlgorithm::DevEd25519Like,
                     public_key: "devpub:2".into(),
                 },
             ),
@@ -215,5 +272,67 @@ mod tests {
 
         assert!(revoke_persona(&mut personas, "persona-nonexistent").is_none());
         assert_eq!(personas.len(), 1);
+    }
+
+    // implementation-note-40 tests.
+
+    #[test]
+    fn create_agent_persona_carries_container_binding() {
+        let ap = create_agent_persona(
+            "persona-agent-1",
+            "root-1",
+            "scion-ml-eval",
+            "ctr-abc123",
+            "grant-parent-001",
+            Some("agent.ml-eval".into()),
+            SurvivalMode::Strict,
+            PublicKeyMaterial {
+                key_id: "key-agent-1".into(),
+                algorithm: KeyAlgorithm::Ed25519,
+                public_key: "ed25519:agent-pubkey".into(),
+            },
+        );
+
+        assert_eq!(ap.persona.id, "persona-agent-1");
+        assert_eq!(ap.persona.root_id, "root-1");
+        assert_eq!(ap.persona.label, "scion-ml-eval");
+        assert_eq!(ap.container_id, "ctr-abc123");
+        assert_eq!(ap.parent_grant_id, "grant-parent-001");
+        assert_eq!(
+            ap.persona.disclosure_profile.as_deref(),
+            Some("agent.ml-eval")
+        );
+    }
+
+    #[test]
+    fn create_agent_persona_inner_persona_matches_create_persona() {
+        // The factory's inner Persona must be wire-compatible with
+        // the legacy `create_persona` shape — the daemon's `personas`
+        // table row reads the same fields regardless of which factory
+        // built it.
+        let active_key = PublicKeyMaterial {
+            key_id: "key-2".into(),
+            algorithm: KeyAlgorithm::Ed25519,
+            public_key: "ed25519:pubkey-2".into(),
+        };
+        let legacy = create_persona(
+            "persona-2",
+            "root-2",
+            "label",
+            None,
+            SurvivalMode::Strict,
+            active_key.clone(),
+        );
+        let agent = create_agent_persona(
+            "persona-2",
+            "root-2",
+            "label",
+            "ctr-xyz",
+            "grant-xyz",
+            None,
+            SurvivalMode::Strict,
+            active_key,
+        );
+        assert_eq!(legacy, agent.persona);
     }
 }

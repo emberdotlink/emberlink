@@ -17,10 +17,35 @@
 //! `presence::mark_unlocked()` after a successful Tier 1 unlock so
 //! subsequent high-risk ops don't double-prompt within the idle window.
 
-use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce, aead::Aead};
+use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce, aead::Aead, aead::Payload};
 use rusqlite::{OptionalExtension, params};
 use tracing::{info, warn};
 use uuid::Uuid;
+
+/// implementation-note-23 C5 — AAD domain-separator prefix byte. AEAD
+/// associated data for every C5+-sealed credential row is the byte
+/// sequence `[AAD_VERSION_BYTE] || uuid_bytes_of_row_id` (17 bytes).
+/// The literal `0x01` future-proofs the format: if we ever rotate the
+/// AAD shape (e.g. add an explicit version field, switch to a longer
+/// identity hash), `0x02` slots in without breaking the existing
+/// fallback chain.
+const AAD_VERSION_BYTE: u8 = 0x01;
+
+/// Compute the per-row AEAD AAD from a credential row id. The id is the
+/// `"cred-<uuid>"` string we mint in `Vault::add`; we extract the
+/// trailing UUID and prefix with the AAD version byte. Returns `None`
+/// when the id does not match the expected shape — callers MUST treat
+/// `None` as "use the legacy no-AAD path" rather than a panic, so a
+/// pre-C5 row whose id was minted under a different scheme still
+/// decrypts.
+fn aad_for_row_id(row_id: &str) -> Option<[u8; 17]> {
+    let uuid_str = row_id.strip_prefix("cred-")?;
+    let uuid = Uuid::parse_str(uuid_str).ok()?;
+    let mut out = [0u8; 17];
+    out[0] = AAD_VERSION_BYTE;
+    out[1..].copy_from_slice(uuid.as_bytes());
+    Some(out)
+}
 
 use crate::infra::config::DaemonConfig;
 use crate::infra::store::{DaemonStore, StoreError};
@@ -29,6 +54,35 @@ use crate::infra::store::{DaemonStore, StoreError};
 pub const DEFAULT_KEYRING_SERVICE: &str = "ember-daemon";
 /// Compile-time default keyring account name.
 pub const DEFAULT_KEYRING_ACCOUNT: &str = "vault";
+
+// implementation-note-23 C4 — Argon2id KDF parameter pins. The MEK is
+// derived by `Vault::from_passphrase` via Argon2id; pinning the cost
+// parameters here (and writing them to `vault.params` next to
+// `vault.salt`) lets `Vault::open_from_config` refuse to unlock a vault
+// sealed under different parameters. Concretely: if a future
+// param-rotation campaign bumps `VAULT_ARGON2_M_KIB` to 32 MiB, vaults
+// sealed under 19 MiB will fail to open with a clear `argon2 params
+// mismatch` error rather than silently producing a wrong key. The pinned
+// values match the OWASP recommendation (and `Argon2::default()` in
+// argon2 v0.5), so existing vaults sealed under
+// `Argon2::default()` continue to decrypt without rotation.
+//
+// On open: compares against `<data_dir>/vault.params`. Legacy vaults
+// without the file get a one-time write with current params + a `warn!`
+// log line so subsequent opens are protected.
+/// Argon2id memory cost in KiB. Matches OWASP recommendation /
+/// `Argon2::default()` in argon2 v0.5.
+pub const VAULT_ARGON2_M_KIB: u32 = 19456;
+/// Argon2id time cost (iterations).
+pub const VAULT_ARGON2_T_COST: u32 = 2;
+/// Argon2id parallelism factor.
+pub const VAULT_ARGON2_P_COST: u32 = 1;
+/// Argon2id output length in bytes (32 = XChaCha20-Poly1305 key size).
+pub const VAULT_ARGON2_OUTPUT_LEN: usize = 32;
+/// Argon2id algorithm tag — pinned for the `vault.params` file.
+pub const VAULT_ARGON2_ALG: &str = "Argon2id";
+/// Argon2id version tag — pinned for the `vault.params` file.
+pub const VAULT_ARGON2_VER: &str = "V0x13";
 
 #[derive(Debug)]
 pub enum VaultError {
@@ -49,13 +103,14 @@ pub enum VaultError {
 
 /// Reasons a credential name fails the design path grammar.
 ///
-/// Grammar (per task brief implementation-note-130):
+/// Grammar (per task brief implementation-note-225):
 ///   - Lowercase ASCII letters `a-z`
 ///   - Digits `0-9`
 ///   - Hyphens `-`
 ///   - Forward slashes `/` for path segments
 ///   - Each segment: `^[a-z][a-z0-9-]*$`
-///   - 1..=4 path segments
+///   - 1..=7 path segments (hard cap; design §5.1 advises warning at 5+
+///     operator-side, but the validator only enforces the hard cap here)
 ///   - 1..=128 total chars
 ///
 /// Existing entries in the vault that don't conform stay untouched (no
@@ -74,7 +129,7 @@ pub enum VaultNameError {
     BadSegment(String),
     /// Path has zero segments after splitting on `/`.
     TooFewSegments,
-    /// Path has more than 4 segments.
+    /// Path has more than 7 segments (design §5.1 hard cap).
     TooManySegments { count: usize },
 }
 
@@ -103,7 +158,7 @@ impl std::fmt::Display for VaultNameError {
             ),
             VaultNameError::TooManySegments { count } => write!(
                 f,
-                "credential name has {count} segments (max depth 4)"
+                "credential name has {count} segments (max depth 7)"
             ),
         }
     }
@@ -146,7 +201,7 @@ pub fn validate_credential_name(name: &str) -> Result<(), VaultNameError> {
         // so this branch is unreachable in practice. Kept for symmetry.
         return Err(VaultNameError::TooFewSegments);
     }
-    if segments.len() > 4 {
+    if segments.len() > 7 {
         return Err(VaultNameError::TooManySegments {
             count: segments.len(),
         });
@@ -209,6 +264,29 @@ pub struct CredentialInfo {
     pub name: String,
     pub created_at: String,
     pub metadata: Option<String>,
+}
+
+/// Which user-presence policy lane is calling into the vault.
+///
+/// Phase 1 (implementation-note-226): the parameter is plumbed through the four
+/// public CRUD entry points (`add`, `list`, `get`, `remove`) but is **not yet
+/// load-bearing** — method bodies behave identically for both variants.
+///
+/// Phase 2 will branch on `scope` to route to a per-scope MEK derivation and a
+/// per-scope `credentials` table prefix so that interactive (Touch-ID-gated)
+/// and headless (CI / agent / unattended) credentials cannot read each other's
+/// ciphertext even if one keyring entry is compromised.
+///
+/// Existing callsites all pass `Interactive` so behaviour is preserved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VaultScope {
+    /// Touch-ID / biometric-gated lane. The historical default for all
+    /// `vault.add` / `vault.get` calls today.
+    Interactive,
+    /// Headless / unattended lane. Reserved for CI runners, automation agents,
+    /// and any path that cannot present a biometric prompt. No callers in
+    /// Phase 1 — wired up in Phase 2 along with the per-scope MEK split.
+    Headless,
 }
 
 /// Newtype wrapper around the 16-byte Argon2id salt used to derive the vault
@@ -276,7 +354,27 @@ pub enum VaultKeyStore {
     EnvPassphrase,
 }
 
-#[derive(Clone)]
+/// MEK holder for the daemon's sealed-credentials store.
+///
+/// **implementation-note-23 C1**: `Vault` is `ZeroizeOnDrop` so the
+/// in-memory MEK is wiped on Drop (explicit lock, daemon shutdown, the
+/// final `Rc<Vault>` / `Arc<Vault>` reference going away).
+///
+/// implementation-note-137 (F-S1-001 HIGH + F-S1-008 LOW): `Clone` is
+/// REMOVED. Prior to this commit `Vault` derived `Clone` so the in-memory
+/// MEK byte-array could be by-value-copied across LocalSet spawn boundaries
+/// (runtime.rs spawned each proxy + dashboard task with a fresh
+/// `(*shared_rc).clone()`). That made accidental copy proliferation easy
+/// — every code path that wanted to hand a sub-task a vault produced a
+/// new 32-byte memory block holding the MEK, multiplying the secret's
+/// in-memory footprint and the per-copy `Drop` zeroization budget.
+///
+/// After C1: sharing is `Rc<Vault>` ONLY. `ProxyState.vault` is
+/// `Rc<Vault>`, `run_dashboard`'s `vault` parameter is `Option<Rc<Vault>>`,
+/// and `runtime.rs` uses `Rc::clone(&vault)` (cheap ref-count bump) on
+/// the spawn boundary. The single underlying MEK byte-array gets zeroized
+/// exactly once — when the last reference drops.
+#[derive(zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct Vault {
     vault_key: [u8; 32],
 }
@@ -286,10 +384,26 @@ impl Vault {
         Vault { vault_key }
     }
 
-    /// Derive a vault key from a passphrase using Argon2id.
+    /// Derive a vault key from a passphrase using Argon2id with the
+    /// compile-time-pinned parameters (`VAULT_ARGON2_*` constants).
+    /// Matches `Argon2::default()` in argon2 v0.5 — existing vaults
+    /// sealed under the default continue to decrypt without rotation
+    /// (implementation-note-23 C4).
     pub fn from_passphrase(passphrase: &str, salt: &[u8; 16]) -> Self {
+        let params = argon2::Params::new(
+            VAULT_ARGON2_M_KIB,
+            VAULT_ARGON2_T_COST,
+            VAULT_ARGON2_P_COST,
+            Some(VAULT_ARGON2_OUTPUT_LEN),
+        )
+        .expect("Argon2 params are compile-time-pinned to a valid combination");
+        let argon2 = argon2::Argon2::new(
+            argon2::Algorithm::Argon2id,
+            argon2::Version::V0x13,
+            params,
+        );
         let mut key = [0u8; 32];
-        argon2::Argon2::default()
+        argon2
             .hash_password_into(passphrase.as_bytes(), salt, &mut key)
             .expect("Argon2 key derivation failed");
         Self { vault_key: key }
@@ -306,17 +420,50 @@ impl Vault {
     ///
     /// Passphrase source order (first match wins):
     /// 1. `EMBER_VAULT_PASSPHRASE` environment variable (CI / automation)
-    /// 2. System keyring — service/account resolved in order:
+    /// 2. *macOS, separate-uid posture only* — Secure-Enclave-wrapped MEK
+    ///    blob read via `vault_macos_se::get_mek_passphrase`. Detected when
+    ///    the daemon's effective home directory resolves to `/var/empty`
+    ///    (per design — the system uid that the LaunchDaemon install
+    ///    lane runs under has no login keychain, so the keyring branch
+    ///    below is unreachable). Missing `vault-mek.bin` here returns a
+    ///    `VaultError::Io` whose message tells the operator to run
+    ///    `ember daemon install`.
+    /// 3. System keyring — service/account resolved in order:
     ///    a. `config.keyring.service` / `config.keyring.account` (if `Some`)
     ///    b. `EMBER_KEYRING_SERVICE` / `EMBER_KEYRING_ACCOUNT` env var (debug backdoor)
     ///    c. Compile-time defaults (`DEFAULT_KEYRING_SERVICE` / `DEFAULT_KEYRING_ACCOUNT`)
-    /// 3. Auto-generated random passphrase stored in keyring on first run
+    /// 4. Auto-generated random passphrase stored in keyring on first run
     ///
     /// Salt is read from `<data_dir>/vault.salt`; created on first call.
     pub fn open_from_config(config: &DaemonConfig) -> Result<Vault, VaultError> {
         let salt = vault_salt(config)?;
+        // implementation-note-23 C4: refuse to unlock if vault.params
+        // disagrees with the compile-time Argon2 pin. Runs BEFORE any
+        // keyring access so a param mismatch aborts before a (potentially
+        // user-presence-gated) Keychain prompt fires.
+        check_or_write_vault_params(config)?;
         let service = resolve_keyring_service(&config.keyring);
         let account = resolve_keyring_account(&config.keyring);
+
+        // implementation-note-227 — macOS separate-uid posture (design).
+        // The system-uid LaunchDaemon install lane has no login keychain
+        // and cannot reach the operator's SE-wrapped keychain entry, so we
+        // route through the on-disk SE-wrapped MEK blob laid down at
+        // install time. The env-var override (precedence rule 1) must
+        // still win: when `EMBER_VAULT_PASSPHRASE` is set we fall through
+        // to `resolve_passphrase` below so the env value is consumed +
+        // zeroized exactly once. Skipped under cargo-test binaries
+        // (`is_cargo_test_binary`) so tests never reach the real SE.
+        #[cfg(target_os = "macos")]
+        if !is_cargo_test_binary()
+            && std::env::var("EMBER_VAULT_PASSPHRASE").is_err()
+            && is_separate_uid_posture()
+        {
+            let passphrase =
+                crate::infra::vault_macos_se::get_mek_passphrase(&config.data_dir)?;
+            crate::trust::presence::mark_unlocked();
+            return Ok(Vault::from_passphrase(&passphrase, &salt));
+        }
 
         // Belt-and-suspenders: refuse to open the production keyring service
         // unless the operator has explicitly opted in with
@@ -362,6 +509,11 @@ impl Vault {
         config: &DaemonConfig,
         key_store: &VaultKeyStore,
     ) -> Result<Vault, VaultError> {
+        // implementation-note-23 C4: same params gate as
+        // `open_from_config` — runs before any keyring access so a
+        // mismatch aborts before a (potentially user-presence-gated)
+        // Keychain prompt fires.
+        check_or_write_vault_params(config)?;
         match key_store {
             VaultKeyStore::Passphrase(salt) => {
                 // Same resolution + checkpoint + presence-mark sequence as
@@ -463,25 +615,43 @@ impl Vault {
 
     pub fn add(
         &self,
+        scope: VaultScope,
         store: &DaemonStore,
         name: &str,
         value: &[u8],
         metadata: Option<&str>,
     ) -> Result<CredentialInfo, VaultError> {
+        // Phase 1 (implementation-note-226): scope is plumbed but not yet
+        // load-bearing. Phase 2 will branch on `scope` to route to a per-scope
+        // MEK + per-scope credentials-table prefix.
+        let _ = scope;
+
         // design path-grammar gate — applies to NEW entries only.
         // Existing rows with non-conformant names continue to function via
         // `get`/`list`/`remove`; this check fires only on insert.
         validate_credential_name(name).map_err(VaultError::InvalidName)?;
+
+        // implementation-note-23 C5: mint the row id BEFORE encrypting
+        // so the AEAD AAD can be bound to the row's UUID. AAD format is
+        // `[0x01, row_uuid_bytes...]` (17 bytes). Decrypt-side (Vault::get)
+        // tries this AAD first, falling back to no-AAD for legacy rows.
+        let id = format!("cred-{}", Uuid::new_v4());
+        let aad = aad_for_row_id(&id).expect("freshly-minted cred-<uuid> id parses");
 
         let cipher = XChaCha20Poly1305::new_from_slice(&self.vault_key).unwrap();
         let mut nonce_bytes = [0u8; 24];
         getrandom::fill(&mut nonce_bytes).expect("OS entropy failure");
         let nonce = XNonce::from_slice(&nonce_bytes);
         let ciphertext = cipher
-            .encrypt(nonce, value)
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: value,
+                    aad: &aad,
+                },
+            )
             .map_err(|e| VaultError::Crypto(e.to_string()))?;
 
-        let id = format!("cred-{}", Uuid::new_v4());
         let created_at = chrono::Utc::now().to_rfc3339();
 
         store
@@ -501,7 +671,16 @@ impl Vault {
         })
     }
 
-    pub fn list(&self, store: &DaemonStore) -> Result<Vec<CredentialInfo>, VaultError> {
+    pub fn list(
+        &self,
+        scope: VaultScope,
+        store: &DaemonStore,
+    ) -> Result<Vec<CredentialInfo>, VaultError> {
+        // Phase 1 (implementation-note-226): scope is plumbed but not yet
+        // load-bearing. Phase 2 will branch on `scope` to route to a per-scope
+        // credentials-table prefix.
+        let _ = scope;
+
         let mut stmt = store
             .conn()
             .prepare("SELECT id, name, created_at, metadata FROM credentials ORDER BY created_at")
@@ -525,29 +704,84 @@ impl Vault {
         Ok(result)
     }
 
-    pub fn get(&self, store: &DaemonStore, name: &str) -> Result<Vec<u8>, VaultError> {
-        let result: Option<(Vec<u8>, Vec<u8>)> = store
+    pub fn get(
+        &self,
+        scope: VaultScope,
+        store: &DaemonStore,
+        name: &str,
+    ) -> Result<Vec<u8>, VaultError> {
+        // Phase 1 (implementation-note-226): scope is plumbed but not yet
+        // load-bearing. Phase 2 will branch on `scope` to route to a per-scope
+        // MEK + per-scope credentials-table prefix.
+        let _ = scope;
+
+        // implementation-note-23 C5: select the row id alongside
+        // nonce/ciphertext so the AAD-aware decrypt can bind to it.
+        // Legacy rows whose id parses cleanly still flow through the
+        // AAD-aware path first; the fallback path below catches any
+        // ciphertext that was sealed without AAD.
+        let result: Option<(String, Vec<u8>, Vec<u8>)> = store
             .conn()
             .query_row(
-                "SELECT nonce, ciphertext FROM credentials WHERE name = ?1",
+                "SELECT id, nonce, ciphertext FROM credentials WHERE name = ?1",
                 params![name],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?;
 
-        let (nonce_bytes, ciphertext) = result.ok_or(VaultError::NotFound)?;
+        let (id, nonce_bytes, ciphertext) = result.ok_or(VaultError::NotFound)?;
 
         let cipher = XChaCha20Poly1305::new_from_slice(&self.vault_key).unwrap();
         let nonce = XNonce::from_slice(&nonce_bytes);
-        let plaintext = cipher
-            .decrypt(nonce, ciphertext.as_slice())
-            .map_err(|e| VaultError::Crypto(e.to_string()))?;
 
-        Ok(plaintext)
+        // Try the AAD-aware path first when we can compute the AAD.
+        if let Some(aad) = aad_for_row_id(&id) {
+            match cipher.decrypt(
+                nonce,
+                Payload {
+                    msg: ciphertext.as_slice(),
+                    aad: &aad,
+                },
+            ) {
+                Ok(plaintext) => return Ok(plaintext),
+                Err(_aad_err) => {
+                    // Fall through to the legacy no-AAD path.
+                }
+            }
+        }
+
+        // Legacy fallback — no-AAD decrypt. Older daemons (pre-C5)
+        // wrote ciphertext without AAD, so a successful no-AAD open is
+        // the deterministic signal that the row needs re-sealing on the
+        // next write. We log a `warn!` so the operator can see the
+        // legacy rows; the next `Vault::add` for this name will write
+        // a fresh AAD-bound row, healing the gap.
+        match cipher.decrypt(nonce, ciphertext.as_slice()) {
+            Ok(plaintext) => {
+                warn!(
+                    credential_id = %id,
+                    credential_name = %name,
+                    "vault: legacy no-AAD ciphertext decrypted via fallback path; \
+                     next write to this credential will re-seal with per-row AAD"
+                );
+                Ok(plaintext)
+            }
+            Err(e) => Err(VaultError::Crypto(e.to_string())),
+        }
     }
 
-    pub fn remove(&self, store: &DaemonStore, name: &str) -> Result<(), VaultError> {
+    pub fn remove(
+        &self,
+        scope: VaultScope,
+        store: &DaemonStore,
+        name: &str,
+    ) -> Result<(), VaultError> {
+        // Phase 1 (implementation-note-226): scope is plumbed but not yet
+        // load-bearing. Phase 2 will branch on `scope` to route to a per-scope
+        // credentials-table prefix.
+        let _ = scope;
+
         let rows_affected = store
             .conn()
             .execute("DELETE FROM credentials WHERE name = ?1", params![name])
@@ -557,6 +791,96 @@ impl Vault {
             return Err(VaultError::NotFound);
         }
         Ok(())
+    }
+
+    /// Zero the in-memory MEK for `scope` — Phase 1 stub.
+    ///
+    /// Per design ("Interactive: demand-pinned"), the idle-zero handler in
+    /// `UnlockPinTracker` calls into this method when the grace window
+    /// expires with no live pins. Phase 1 logs the request but does not
+    /// actually zero the MEK reference — the real implementation lands in
+    /// **Phase 2** (`implementation-note-224`) alongside the
+    /// session-lifecycle wiring that calls it. The Phase 1 stub exists so
+    /// the substrate (the pin tracker + the API hook on Vault) can land in
+    /// isolation without the multi-file lifecycle changes.
+    ///
+    /// Phase 2 will (a) take `&mut self` (or move out of an `Rc<RefCell>>`)
+    /// to actually drop the `vault_key` bytes, (b) NOT modify the keyring
+    /// or persist anything — re-unlock at the next session-open re-derives
+    /// from the keyring-stored passphrase, and (c) emit a signed
+    /// `vault_zero` Receipt per design.
+    pub fn zero_scope(&self, scope: VaultScope) -> Result<(), VaultError> {
+        info!(
+            scope = ?scope,
+            "vault: zero_scope (Phase 1 stub — no-op; Phase 2 wires lifecycle release)"
+        );
+        Ok(())
+    }
+
+    /// Atomic swap: DELETE existing `name` (if any) + INSERT new value,
+    /// wrapped in one SQLite transaction. Closes the rotation-race
+    /// window where a concurrent `get` could observe "no key" between a
+    /// `remove` and a subsequent `add`, AND the crash-durability gap
+    /// where a daemon crash between remove and add would leave the
+    /// namespace empty.
+    ///
+    /// Per KEYCHAIN-CONSOLIDATE-CLI adversarial-review HIGH-3.
+    pub fn replace(
+        &self,
+        scope: VaultScope,
+        store: &DaemonStore,
+        name: &str,
+        value: &[u8],
+        metadata: Option<&str>,
+    ) -> Result<CredentialInfo, VaultError> {
+        // Phase 1 (implementation-note-226): scope plumbed; Phase 2 will
+        // branch routing.
+        let _ = scope;
+
+        validate_credential_name(name).map_err(VaultError::InvalidName)?;
+
+        // implementation-note-23 C5: mint id first, bind AAD to the
+        // new row's UUID. Same pattern as `Vault::add`.
+        let id = format!("cred-{}", Uuid::new_v4());
+        let aad = aad_for_row_id(&id).expect("freshly-minted cred-<uuid> id parses");
+
+        let cipher = XChaCha20Poly1305::new_from_slice(&self.vault_key).unwrap();
+        let mut nonce_bytes = [0u8; 24];
+        getrandom::fill(&mut nonce_bytes).expect("OS entropy failure");
+        let nonce = XNonce::from_slice(&nonce_bytes);
+        let ciphertext = cipher
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: value,
+                    aad: &aad,
+                },
+            )
+            .map_err(|e| VaultError::Crypto(e.to_string()))?;
+
+        let created_at = chrono::Utc::now().to_rfc3339();
+
+        let conn = store.conn();
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?;
+        tx.execute("DELETE FROM credentials WHERE name = ?1", params![name])
+            .map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?;
+        tx.execute(
+            "INSERT INTO credentials (id, name, nonce, ciphertext, created_at, metadata) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, name, nonce_bytes.as_slice(), ciphertext, created_at, metadata],
+        )
+        .map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?;
+        tx.commit()
+            .map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?;
+
+        Ok(CredentialInfo {
+            id,
+            name: name.to_string(),
+            created_at,
+            metadata: metadata.map(str::to_string),
+        })
     }
 }
 
@@ -597,7 +921,7 @@ pub enum AutoUnsealOutcome {
 ///   each re-implementing keyring lookup.
 ///
 /// Always-attempted: there is no relay/hosted/first-party mode flag in
-/// `DaemonConfig` today (implementation-note-124 task instructions explicitly note this).
+/// `DaemonConfig` today (implementation-note-214 task instructions explicitly note this).
 /// If one is added later, gate auto-unseal on first-party mode here.
 pub fn try_auto_unseal_from_keyring(config: &DaemonConfig) -> AutoUnsealOutcome {
     let service = resolve_keyring_service(&config.keyring);
@@ -627,6 +951,13 @@ pub fn try_auto_unseal_from_keyring(config: &DaemonConfig) -> AutoUnsealOutcome 
         Ok(s) => s,
         Err(e) => return AutoUnsealOutcome::Error(e),
     };
+
+    // implementation-note-23 C4: refuse to auto-unseal if the
+    // vault.params sidecar disagrees with the compile-time Argon2 pin.
+    // Same enforcement as `open_from_config`.
+    if let Err(e) = check_or_write_vault_params(config) {
+        return AutoUnsealOutcome::Error(e);
+    }
 
     // Resolve the passphrase WITHOUT auto-generating one. Distinguishes
     // "keyring miss" (NoKeyringEntry) from "platform error" (Error).
@@ -811,7 +1142,7 @@ pub struct MigrateMekAclResult {
 /// (biometric on macOS via `kSecAttrAccessControl`).
 ///
 /// This migrates a pre-existing MEK entry created before
-/// implementation-note-40 shipped so subsequent vault operations
+/// implementation-note-78 shipped so subsequent vault operations
 /// use Touch ID instead of the plain keychain password.
 ///
 /// Safety contract:
@@ -968,6 +1299,60 @@ pub fn is_cargo_test_binary() -> bool {
     }
 }
 
+/// True when the daemon is running under the design separate-uid posture
+/// (the system-uid LaunchDaemon install lane). The signal is that the
+/// effective home directory resolves to `/var/empty` — macOS reserves that
+/// path as the home of system service users like `_ember`, and the
+/// `install-system-daemon` step provisions the daemon's user record with
+/// exactly that home. Under this posture there is no login keychain to
+/// read, so `Vault::open_from_config` routes through the SE-wrapped MEK
+/// blob at `<data_dir>/vault-mek.bin` instead.
+///
+/// Operator-uid LaunchAgent installs (the `install-agent` posture) keep
+/// their normal `/Users/<operator>` home and fall through to the existing
+/// login-keychain path.
+///
+/// Returns `false` when the home directory is unresolvable — the
+/// production-checkpoint branch below will produce the better error message
+/// in that case.
+///
+/// macOS-only: the SE-wrapped MEK lane only exists on macOS; Linux daemons
+/// always fall through to the system keyring branch.
+#[cfg(target_os = "macos")]
+fn is_separate_uid_posture() -> bool {
+    // Read the daemon's effective uid's passwd entry directly, NOT the
+    // `HOME` env var. The launchd plist injects HOME=<operator_home>
+    // (see install.rs::render_launchd_plist_body), so any env-var-based
+    // home resolution would see the operator's home and miss the
+    // /var/empty checkpoint that signals the design separate-uid posture.
+    // Per adversarial review implementation-note-45-(-B).
+    //
+    // The Ok(None) and Err(e) arms both return false but log distinctly
+    // so an operator debugging "why did the daemon land on the keychain
+    // branch instead of SE?" can tell apart a provisioning race (uid
+    // exists in kernel but passwd entry not yet written) from a real
+    // passwd-database I/O failure. Per self-review 
+    // (implementation-note-228).
+    match nix::unistd::User::from_uid(nix::unistd::geteuid()) {
+        Ok(Some(user)) => user.dir == std::path::Path::new("/var/empty"),
+        Ok(None) => {
+            tracing::warn!(
+                uid = nix::unistd::geteuid().as_raw(),
+                "is_separate_uid_posture: effective uid has no passwd entry (provisioning race?); falling through to non-SE branch"
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!(
+                uid = nix::unistd::geteuid().as_raw(),
+                error = %e,
+                "is_separate_uid_posture: passwd lookup failed; falling through to non-SE branch"
+            );
+            false
+        }
+    }
+}
+
 /// True when raw keyring writes must be suppressed: a cargo test binary is
 /// running, or the `EMBER_VAULT_MOCK` opt-out is set. Downstream callers
 /// (e.g., `ember init` in `emberlink-cli`) must consult this before
@@ -1108,6 +1493,138 @@ fn vault_salt(config: &DaemonConfig) -> Result<[u8; 16], VaultError> {
     }
 }
 
+/// implementation-note-23 C4: enforce Argon2 parameter pinning via a
+/// `<data_dir>/vault.params` sidecar file.
+///
+/// - If the file exists, parse it and refuse to proceed if any value
+///   does not match the compile-time `VAULT_ARGON2_*` constants — the
+///   error is `VaultError::Crypto("argon2 params mismatch …")` so the
+///   operator sees the dimension that drifted.
+/// - If the file does not exist (legacy vault sealed before C4 shipped),
+///   write the current pinned params with `warn!` so subsequent opens
+///   are protected.
+///
+/// Called once per `Vault::open_from_config` / `open_with_key_store` /
+/// `try_auto_unseal_from_keyring` invocation, BEFORE any Argon2
+/// derivation runs. A mismatch aborts the unlock before the MEK is
+/// computed.
+fn check_or_write_vault_params(config: &DaemonConfig) -> Result<(), VaultError> {
+    let params_path = config.data_dir.join("vault.params");
+    if params_path.exists() {
+        let contents = std::fs::read_to_string(&params_path)
+            .map_err(|e| VaultError::Io(format!("vault.params read: {e}")))?;
+        let parsed: toml::Value = toml::from_str(&contents).map_err(|e| {
+            VaultError::Crypto(format!("argon2 params mismatch: vault.params parse error: {e}"))
+        })?;
+        let argon2_tbl = parsed.get("argon2").and_then(|v| v.as_table()).ok_or_else(|| {
+            VaultError::Crypto(
+                "argon2 params mismatch: vault.params missing [argon2] table".to_string(),
+            )
+        })?;
+
+        let m = argon2_tbl
+            .get("m")
+            .and_then(|v| v.as_integer())
+            .ok_or_else(|| {
+                VaultError::Crypto(
+                    "argon2 params mismatch: vault.params [argon2].m missing or wrong type"
+                        .to_string(),
+                )
+            })?;
+        let t = argon2_tbl
+            .get("t")
+            .and_then(|v| v.as_integer())
+            .ok_or_else(|| {
+                VaultError::Crypto(
+                    "argon2 params mismatch: vault.params [argon2].t missing or wrong type"
+                        .to_string(),
+                )
+            })?;
+        let p = argon2_tbl
+            .get("p")
+            .and_then(|v| v.as_integer())
+            .ok_or_else(|| {
+                VaultError::Crypto(
+                    "argon2 params mismatch: vault.params [argon2].p missing or wrong type"
+                        .to_string(),
+                )
+            })?;
+        let alg = argon2_tbl.get("alg").and_then(|v| v.as_str()).ok_or_else(|| {
+            VaultError::Crypto(
+                "argon2 params mismatch: vault.params [argon2].alg missing or wrong type"
+                    .to_string(),
+            )
+        })?;
+        let ver = argon2_tbl.get("ver").and_then(|v| v.as_str()).ok_or_else(|| {
+            VaultError::Crypto(
+                "argon2 params mismatch: vault.params [argon2].ver missing or wrong type"
+                    .to_string(),
+            )
+        })?;
+
+        if m != VAULT_ARGON2_M_KIB as i64
+            || t != VAULT_ARGON2_T_COST as i64
+            || p != VAULT_ARGON2_P_COST as i64
+            || alg != VAULT_ARGON2_ALG
+            || ver != VAULT_ARGON2_VER
+        {
+            return Err(VaultError::Crypto(format!(
+                "argon2 params mismatch: vault.params has \
+                 (m={m}, t={t}, p={p}, alg={alg}, ver={ver}) but daemon is pinned to \
+                 (m={pin_m}, t={pin_t}, p={pin_p}, alg={pin_alg}, ver={pin_ver}); \
+                 either restore the original vault.params or run a key-rotation \
+                 campaign that re-seals the vault under the new parameters",
+                pin_m = VAULT_ARGON2_M_KIB,
+                pin_t = VAULT_ARGON2_T_COST,
+                pin_p = VAULT_ARGON2_P_COST,
+                pin_alg = VAULT_ARGON2_ALG,
+                pin_ver = VAULT_ARGON2_VER,
+            )));
+        }
+        Ok(())
+    } else {
+        // Legacy vault — write the current pinned params and warn so
+        // subsequent opens are protected.
+        let contents = format!(
+            "[argon2]\nm = {m}\nt = {t}\np = {p}\nalg = \"{alg}\"\nver = \"{ver}\"\n",
+            m = VAULT_ARGON2_M_KIB,
+            t = VAULT_ARGON2_T_COST,
+            p = VAULT_ARGON2_P_COST,
+            alg = VAULT_ARGON2_ALG,
+            ver = VAULT_ARGON2_VER,
+        );
+        #[cfg(unix)]
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&params_path)
+                .map_err(|e| VaultError::Io(format!("vault.params open: {e}")))?;
+            f.write_all(contents.as_bytes())
+                .map_err(|e| VaultError::Io(format!("vault.params write: {e}")))?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&params_path, contents.as_bytes())
+                .map_err(|e| VaultError::Io(format!("vault.params write: {e}")))?;
+        }
+        warn!(
+            path = %params_path.display(),
+            m = VAULT_ARGON2_M_KIB,
+            t = VAULT_ARGON2_T_COST,
+            p = VAULT_ARGON2_P_COST,
+            alg = VAULT_ARGON2_ALG,
+            ver = VAULT_ARGON2_VER,
+            "vault.params absent (legacy vault); writing current pinned params"
+        );
+        Ok(())
+    }
+}
+
 fn generate_passphrase() -> String {
     // 32 chars from an alphanumeric alphabet (62 chars) → ~190 bits of entropy.
     // Sampled by rejection from OS entropy to avoid modulo bias.
@@ -1145,22 +1662,267 @@ mod tests {
         [99u8; 32]
     }
 
+    /// implementation-note-23 C5: a roundtrip through `add` → `get`
+    /// succeeds when the row carries per-row AAD bound to the row's
+    /// UUID. The shape of the test is intentionally minimal — the
+    /// existing `add_list_get_roundtrip` test exercises the happy path
+    /// for any AAD scheme; this one names the property explicitly so
+    /// the wire format is locked.
+    #[test]
+    fn aad_roundtrip() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = Vault::new(test_key());
+
+        let info = vault
+            .add(
+                VaultScope::Interactive,
+                &store,
+                "aad-test/key",
+                b"some-secret-value",
+                None,
+            )
+            .unwrap();
+        assert!(info.id.starts_with("cred-"));
+
+        // Same Vault decrypts cleanly via the AAD-aware get path.
+        let value = vault
+            .get(VaultScope::Interactive, &store, "aad-test/key")
+            .unwrap();
+        assert_eq!(value, b"some-secret-value");
+    }
+
+    /// implementation-note-23 C5: a credentials row whose ciphertext
+    /// was written WITHOUT AAD (legacy daemon before C5 shipped) must
+    /// still decrypt through `Vault::get` via the no-AAD fallback path.
+    /// The test synthesises a legacy row directly via SQL so the
+    /// fallback branch is exercised deterministically.
+    #[test]
+    fn legacy_no_aad_decrypts() {
+        use chacha20poly1305::aead::Aead;
+
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = Vault::new(test_key());
+
+        // Hand-roll a no-AAD ciphertext for the row, then INSERT it
+        // directly. Mirrors what an old daemon's `add` would have done.
+        let cipher =
+            chacha20poly1305::XChaCha20Poly1305::new_from_slice(&vault.vault_key).unwrap();
+        let mut nonce_bytes = [0u8; 24];
+        getrandom::fill(&mut nonce_bytes).unwrap();
+        let nonce = chacha20poly1305::XNonce::from_slice(&nonce_bytes);
+        let ciphertext = cipher.encrypt(nonce, b"legacy-plaintext".as_ref()).unwrap();
+
+        let id = format!("cred-{}", uuid::Uuid::new_v4());
+        let created_at = chrono::Utc::now().to_rfc3339();
+        store
+            .conn()
+            .execute(
+                "INSERT INTO credentials (id, name, nonce, ciphertext, created_at, metadata) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+                rusqlite::params![
+                    id,
+                    "legacy-row",
+                    nonce_bytes.as_slice(),
+                    ciphertext.as_slice(),
+                    created_at,
+                ],
+            )
+            .unwrap();
+
+        // Reading via the AAD-aware get must fall back to no-AAD and
+        // recover the plaintext (rather than failing with a crypto
+        // error).
+        let value = vault
+            .get(VaultScope::Interactive, &store, "legacy-row")
+            .unwrap();
+        assert_eq!(value, b"legacy-plaintext");
+    }
+
+    /// implementation-note-23 C4: when `vault.params` contains values
+    /// that do not match the compile-time-pinned Argon2 parameters,
+    /// `Vault::open_from_config` refuses to proceed with
+    /// `VaultError::Crypto("argon2 params mismatch...")`. The file is
+    /// the trust anchor for "this vault was sealed under the pinned
+    /// KDF" — a mismatch means either a future param-rotation campaign
+    /// is needed or the file was tampered with.
+    #[test]
+    fn vault_refuses_open_on_argon2_params_mismatch() {
+        // Hold the process-wide test lock — env::set_var on a process-
+        // global env var races with peer tests under cargo's parallel
+        // runner. The lock serializes them.
+        let _guard = crate::PROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::tempdir().unwrap();
+        // SAFETY: test-only — env mutation gated by PROCESS_TEST_LOCK.
+        unsafe { std::env::set_var("EMBER_VAULT_PASSPHRASE", "c4-mismatch-test") };
+
+        let mut config = DaemonConfig::for_test(tmp.path());
+
+        // Write a vault.params with the wrong t-cost (1 instead of 2).
+        let bad_params = r#"[argon2]
+m = 19456
+t = 1
+p = 1
+alg = "Argon2id"
+ver = "V0x13"
+"#;
+        std::fs::write(tmp.path().join("vault.params"), bad_params).unwrap();
+
+        let result = Vault::open_from_config(&config);
+        // SAFETY: test-only.
+        unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
+
+        match result {
+            Err(VaultError::Crypto(msg)) => {
+                assert!(
+                    msg.contains("argon2 params mismatch"),
+                    "expected 'argon2 params mismatch' in error, got: {msg}"
+                );
+            }
+            other => panic!(
+                "expected VaultError::Crypto with 'argon2 params mismatch', got: {other:?}",
+                other = other.map(|_| "Ok(Vault)").map_err(|e| e.to_string())
+            ),
+        }
+    }
+
+    /// implementation-note-23 C4 partner: a fresh vault (no
+    /// `vault.params` on disk) lays one down on first open with the
+    /// pinned params, and a subsequent open against the same data_dir
+    /// succeeds (the params file now exists and matches).
+    #[test]
+    fn vault_writes_params_file_on_first_open() {
+        let _guard = crate::PROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("EMBER_VAULT_PASSPHRASE", "c4-first-open") };
+
+        let mut config = DaemonConfig::for_test(tmp.path());
+
+        // No vault.params exists yet.
+        let params_path = tmp.path().join("vault.params");
+        assert!(!params_path.exists(), "precondition: vault.params absent");
+
+        // First open: provisions both salt and params.
+        let _v = Vault::open_from_config(&config).expect("first open should succeed");
+        assert!(
+            params_path.exists(),
+            "first open must write vault.params alongside vault.salt"
+        );
+
+        // SAFETY: test-only.
+        unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
+
+        // The file content must parse and match the pinned params.
+        let contents = std::fs::read_to_string(&params_path).unwrap();
+        assert!(contents.contains("m = 19456"));
+        assert!(contents.contains("t = 2"));
+        assert!(contents.contains("p = 1"));
+        assert!(contents.contains("Argon2id"));
+        assert!(contents.contains("V0x13"));
+    }
+
+    /// implementation-note-23 C1: `Vault` must implement
+    /// `ZeroizeOnDrop` so the MEK is wiped from memory when the Vault is
+    /// dropped (explicit lock, daemon shutdown, or any Rc going to zero
+    /// references). Compile-time trait assertion: the function body
+    /// compiles iff `Vault: ZeroizeOnDrop`.
+    #[test]
+    fn vault_is_zeroize() {
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<Vault>();
+    }
+
+    /// Vault::replace per KEYCHAIN-CONSOLIDATE-CLI adversarial-review
+    /// HIGH-3: atomic swap via a single SQLite transaction; no
+    /// observable "no key" window between DELETE and INSERT.
+    #[test]
+    fn replace_overwrites_existing_atomically() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = Vault::new(test_key());
+        vault
+            .add(VaultScope::Interactive, &store, "rotation-target", b"old", None)
+            .unwrap();
+        assert_eq!(
+            vault
+                .get(VaultScope::Interactive, &store, "rotation-target")
+                .unwrap(),
+            b"old"
+        );
+        assert!(vault
+            .replace(VaultScope::Interactive, &store, "rotation-target", b"new", None)
+            .is_ok());
+        assert_eq!(
+            vault
+                .get(VaultScope::Interactive, &store, "rotation-target")
+                .unwrap(),
+            b"new"
+        );
+        // List should still show exactly one row (replace, not append).
+        let names: Vec<String> = vault
+            .list(VaultScope::Interactive, &store)
+            .unwrap()
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        assert_eq!(names, vec!["rotation-target".to_string()]);
+    }
+
+    #[test]
+    fn replace_succeeds_on_absent_name() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = Vault::new(test_key());
+        assert!(vault
+            .replace(VaultScope::Interactive, &store, "fresh-name", b"value", None)
+            .is_ok());
+        assert_eq!(
+            vault
+                .get(VaultScope::Interactive, &store, "fresh-name")
+                .unwrap(),
+            b"value"
+        );
+    }
+
+    #[test]
+    fn replace_validates_name_grammar() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = Vault::new(test_key());
+        let outcome = vault.replace(
+            VaultScope::Interactive,
+            &store,
+            "Invalid-Name",
+            b"x",
+            None,
+        );
+        match outcome {
+            Err(VaultError::InvalidName(_)) => (),
+            other => panic!(
+                "expected VaultError::InvalidName for uppercase name, got {other:?}",
+                other = other.err()
+            ),
+        }
+    }
+
     #[test]
     fn add_list_get_roundtrip() {
         let store = DaemonStore::open_in_memory().unwrap();
         let vault = Vault::new(test_key());
 
         let info = vault
-            .add(&store, "my-api-key", b"supersecret", None)
+            .add(VaultScope::Interactive, &store, "my-api-key", b"supersecret", None)
             .unwrap();
         assert_eq!(info.name, "my-api-key");
         assert!(info.id.starts_with("cred-"));
 
-        let list = vault.list(&store).unwrap();
+        let list = vault.list(VaultScope::Interactive, &store).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "my-api-key");
 
-        let value = vault.get(&store, "my-api-key").unwrap();
+        let value = vault.get(VaultScope::Interactive, &store, "my-api-key").unwrap();
         assert_eq!(value, b"supersecret");
     }
 
@@ -1169,8 +1931,8 @@ mod tests {
         let store = DaemonStore::open_in_memory().unwrap();
         let vault = Vault::new(test_key());
 
-        vault.add(&store, "token", b"value1", None).unwrap();
-        let result = vault.add(&store, "token", b"value2", None);
+        vault.add(VaultScope::Interactive, &store, "token", b"value1", None).unwrap();
+        let result = vault.add(VaultScope::Interactive, &store, "token", b"value2", None);
         assert!(result.is_err());
     }
 
@@ -1179,7 +1941,7 @@ mod tests {
         let store = DaemonStore::open_in_memory().unwrap();
         let vault = Vault::new(test_key());
 
-        let result = vault.get(&store, "does-not-exist");
+        let result = vault.get(VaultScope::Interactive, &store, "does-not-exist");
         assert!(matches!(result, Err(VaultError::NotFound)));
     }
 
@@ -1188,10 +1950,10 @@ mod tests {
         let store = DaemonStore::open_in_memory().unwrap();
         let vault = Vault::new(test_key());
 
-        vault.add(&store, "ephemeral", b"data", None).unwrap();
-        vault.remove(&store, "ephemeral").unwrap();
+        vault.add(VaultScope::Interactive, &store, "ephemeral", b"data", None).unwrap();
+        vault.remove(VaultScope::Interactive, &store, "ephemeral").unwrap();
 
-        let result = vault.get(&store, "ephemeral");
+        let result = vault.get(VaultScope::Interactive, &store, "ephemeral");
         assert!(matches!(result, Err(VaultError::NotFound)));
     }
 
@@ -1200,10 +1962,10 @@ mod tests {
         let store = DaemonStore::open_in_memory().unwrap();
         let vault = Vault::new(test_key());
 
-        vault.add(&store, "secret", b"confidential", None).unwrap();
+        vault.add(VaultScope::Interactive, &store, "secret", b"confidential", None).unwrap();
 
         let wrong_vault = Vault::new(other_key());
-        let result = wrong_vault.get(&store, "secret");
+        let result = wrong_vault.get(VaultScope::Interactive, &store, "secret");
         assert!(matches!(result, Err(VaultError::Crypto(_))));
     }
 
@@ -1213,11 +1975,11 @@ mod tests {
         let vault = Vault::new(test_key());
 
         vault
-            .add(&store, "key1", b"secret1", Some("tag=prod"))
+            .add(VaultScope::Interactive, &store, "key1", b"secret1", Some("tag=prod"))
             .unwrap();
-        vault.add(&store, "key2", b"secret2", None).unwrap();
+        vault.add(VaultScope::Interactive, &store, "key2", b"secret2", None).unwrap();
 
-        let list = vault.list(&store).unwrap();
+        let list = vault.list(VaultScope::Interactive, &store).unwrap();
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].metadata.as_deref(), Some("tag=prod"));
         assert_eq!(list[1].metadata, None);
@@ -1236,15 +1998,14 @@ mod tests {
         // SAFETY: test-only — process-global env mutation gated by PROCESS_TEST_LOCK above.
         unsafe { std::env::set_var("EMBER_VAULT_PASSPHRASE", "test-roundtrip-passphrase") };
 
-        let mut config = DaemonConfig::default();
-        config.data_dir = tmp.path().to_path_buf();
+        let mut config = DaemonConfig::for_test(tmp.path());
 
         let store = DaemonStore::open_in_memory().unwrap();
 
         // First vault: write a credential.
         let vault1 = Vault::open_from_config(&config).expect("open vault 1");
         vault1
-            .add(&store, "round-trip-key", b"secret-value", None)
+            .add(VaultScope::Interactive, &store, "round-trip-key", b"secret-value", None)
             .unwrap();
 
         // Re-set the env var: open_from_config removes it after first read.
@@ -1255,10 +2016,10 @@ mod tests {
 
         // Second vault from same config: must decrypt successfully.
         let vault2 = Vault::open_from_config(&config).expect("open vault 2");
-        let value = vault2.get(&store, "round-trip-key").unwrap();
+        let value = vault2.get(VaultScope::Interactive, &store, "round-trip-key").unwrap();
         assert_eq!(value, b"secret-value");
 
-        let list = vault2.list(&store).unwrap();
+        let list = vault2.list(VaultScope::Interactive, &store).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "round-trip-key");
 
@@ -1329,8 +2090,7 @@ mod tests {
     fn startup_banner_logs_keyring_identity() {
         // Smoke test: log_vault_identity must not panic with a typical config.
         let tmp = tempfile::tempdir().unwrap();
-        let mut config = DaemonConfig::default();
-        config.data_dir = tmp.path().to_path_buf();
+        let mut config = DaemonConfig::for_test(tmp.path());
         config.keyring = KeyringConfig {
             service: Some("test-service".to_string()),
             account: Some("test-account".to_string()),
@@ -1350,8 +2110,7 @@ mod tests {
         let custom_config = tmp.path().join("custom.toml");
         std::fs::write(&custom_config, "").unwrap();
 
-        let mut config = DaemonConfig::default();
-        config.data_dir = tmp.path().to_path_buf();
+        let mut config = DaemonConfig::for_test(tmp.path());
         config.keyring = KeyringConfig::default(); // no service override
 
         unsafe {
@@ -1365,9 +2124,8 @@ mod tests {
     #[test]
     fn startup_banner_does_not_warn_on_default_config() {
         // When the config path IS the default path, no WARN should fire.
-        let mut config = DaemonConfig::default();
         let tmp = tempfile::tempdir().unwrap();
-        config.data_dir = tmp.path().to_path_buf();
+        let mut config = DaemonConfig::for_test(tmp.path());
         config.keyring = KeyringConfig::default();
 
         unsafe {
@@ -1445,8 +2203,7 @@ mod tests {
         // SAFETY: test-only — env mutation gated by PROCESS_TEST_LOCK above.
         unsafe { std::env::set_var("EMBER_VAULT_PASSPHRASE", "sec14-test-passphrase") };
 
-        let mut config = DaemonConfig::default();
-        config.data_dir = tmp.path().to_path_buf();
+        let mut config = DaemonConfig::for_test(tmp.path());
 
         let _vault = Vault::open_from_config(&config).expect("open vault");
 
@@ -1536,8 +2293,7 @@ mod tests {
         // SAFETY: test-only — env mutation gated by PROCESS_TEST_LOCK above.
         unsafe { std::env::set_var("EMBER_VAULT_PASSPHRASE", "sec17-perms-test") };
 
-        let mut config = DaemonConfig::default();
-        config.data_dir = tmp.path().to_path_buf();
+        let mut config = DaemonConfig::for_test(tmp.path());
 
         // vault_salt is called internally by open_from_config; this triggers the
         // salt-file creation path.
@@ -1559,7 +2315,7 @@ mod tests {
         unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
     }
 
-    // --- implementation-note-131: migrate_mek_acl ---
+    // --- implementation-note-229: migrate_mek_acl ---
 
     // Serial lock: tests that mutate EMBER_VAULT_TEST_KEYRING_PRESENT must not
     // run concurrently — cargo test threads share the process environment.
@@ -1663,12 +2419,41 @@ mod name_validation_tests {
 
     #[test]
     fn rejects_too_deep() {
-        assert!(validate_credential_name("a/b/c/d/e").is_err());
+        // 8 segments — exceeds the design §5.1 hard cap of 7.
+        assert!(validate_credential_name("a/b/c/d/e/f/g/h").is_err());
     }
 
     #[test]
     fn accepts_max_depth() {
-        assert!(validate_credential_name("a/b/c/d").is_ok());
+        // 7 segments — at the design §5.1 hard cap.
+        assert!(validate_credential_name("a/b/c/d/e/f/g").is_ok());
+    }
+
+    /// implementation-note-230 Phase 1 — the v2 path grammar
+    /// (design §5.3) introduces credential-type intermediate segments like
+    /// `github/apps/<slug>/install-<id>/private-key` which are 5 segments
+    /// deep. The previous `> 4` cap rejected these; the lifted `> 7` cap
+    /// admits the v2 shapes used by `ember broker register github`.
+    #[test]
+    fn validate_credential_name_accepts_five_segment_v2_path() {
+        assert!(
+            validate_credential_name("github/apps/test-slug/install-12345/private-key")
+                .is_ok(),
+            "5-segment v2 path should be accepted under design §5.3"
+        );
+    }
+
+    /// Partner test — 8 segments must still be rejected at the new hard cap.
+    #[test]
+    fn validate_credential_name_rejects_eight_segment_path() {
+        let outcome =
+            validate_credential_name("a/b/c/d/e/f/g/h");
+        match outcome {
+            Err(VaultNameError::TooManySegments { count }) => assert_eq!(count, 8),
+            other => panic!(
+                "expected TooManySegments {{ count: 8 }}, got {other:?}"
+            ),
+        }
     }
 
     #[test]
@@ -1715,8 +2500,7 @@ mod name_validation_tests {
         // return a clear "not yet implemented" error pointing at the
         // follow-up task so callers know which lane to use today.
         let tmp = tempfile::tempdir().unwrap();
-        let mut config = DaemonConfig::default();
-        config.data_dir = tmp.path().to_path_buf();
+        let mut config = DaemonConfig::for_test(tmp.path());
 
         let key_store = VaultKeyStore::SecureEnclave(SEWrappedKey {
             key_label: "ember-vault-mek-stub".to_string(),

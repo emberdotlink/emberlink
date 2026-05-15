@@ -11,7 +11,7 @@ use core_grants::{
     Grant, GrantSpec, GrantState, GrantStore, PrincipalId, Scope, StoreError, can_transition,
     create as create_grant,
 };
-use core_types::grant_receipt::RevokeActor;
+use core_grant_types::grant_receipt::RevokeActor;
 
 #[derive(Default)]
 struct MockGrantStore {

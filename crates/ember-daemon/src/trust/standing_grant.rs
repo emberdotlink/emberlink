@@ -1,6 +1,7 @@
 use uuid::Uuid;
 
-use crate::infra::proxy::host_matches_domain;
+use core_proxy_forward::r#match::host_matches_domain;
+
 use crate::infra::store::{DaemonStore, StoreError};
 
 /// Per-Statement standing grant match (design). Returned when an active

@@ -9,10 +9,10 @@ use core_events::EventEnvelope;
 use core_identity::{create_root, device_revoked_event, root_created_event, root_revoked_event};
 use core_personas::{create_persona, persona_created_event, persona_revoked_event};
 use core_state::IdentityAuthorizer;
-use core_types::{
-    GrantLink, PublicKeyMaterial, SignerBinding, SurvivalMode, ValidationError,
-    decode_sealed_offer, encode_sealed_offer, qr_encoding::SealedOffer,
-};
+use core_grant_types::{GrantLink, decode_sealed_offer, encode_sealed_offer, qr_encoding::SealedOffer};
+use core_event_types::{SignerBinding};
+use core_principals::{PublicKeyMaterial, SurvivalMode};
+use core_types::{ValidationError};
 
 use crate::backend::AppBackend;
 use crate::commands::UiAction;
@@ -517,10 +517,8 @@ impl<S: AppBackend> AppRuntime<S> {
         not_before: Option<u64>,
         expires_at: Option<u64>,
     ) -> Result<serde_json::Value, String> {
-        use core_types::{
-            AccessGrant, AttestationBinding, Block, GrantMode, GrantStatus,
-            PresentationAudienceKind, RecipientProfile,
-        };
+        use core_grant_types::{AccessGrant, AttestationBinding, Block, GrantMode, GrantStatus, RecipientProfile};
+        use core_event_types::{PresentationAudienceKind};
 
         let recipient_kind = PresentationAudienceKind::parse(recipient_kind)
             .ok_or_else(|| format!("invalid recipient_kind: {recipient_kind}"))?;
@@ -656,9 +654,11 @@ impl<S: AppBackend> AppRuntime<S> {
         statement_specs: &[String],
         expires_in_secs: Option<u64>,
         relay_hint: Option<String>,
-        conditions: &[core_types::grant_conditions::GrantCondition],
+        conditions: &[core_grant_types::grant_conditions::GrantCondition],
     ) -> Result<serde_json::Value, String> {
-        use core_types::{GrantLink, GrantMode, GrantOfferCreatedEvent};
+        use core_grant_types::GrantLink;
+        use core_grant_types::{GrantMode};
+        use core_event_types::{GrantOfferCreatedEvent};
 
         // Validate persona exists
         if !self
@@ -675,7 +675,7 @@ impl<S: AppBackend> AppRuntime<S> {
             .ok_or_else(|| format!("invalid mode: {mode}"))?;
 
         // Validate every spec parses into a Statement before minting the offer.
-        let _parsed_stmts: Vec<core_types::Statement> = statement_specs
+        let _parsed_stmts: Vec<core_grant_types::Statement> = statement_specs
             .iter()
             .enumerate()
             .map(|(i, s)| parse_statement_spec(s, i))
@@ -728,7 +728,7 @@ impl<S: AppBackend> AppRuntime<S> {
         // (GL-H1: relay_hint is part of the signed bytes so on-path
         // attackers cannot swap relay endpoints — see security review
         // docs/the security review).
-        // (security check: issuer_persona_id and recipient_pubkey_hex are also bound
+        // (Both issuer_persona_id and recipient_pubkey_hex are also bound
         // so an attacker cannot rewrite either field without breaking the sig.)
         let link_signing_payload = GrantLink::signing_payload(
             &offer_id,
@@ -742,7 +742,7 @@ impl<S: AppBackend> AppRuntime<S> {
 
         // Create the event
         let event_body =
-            core_types::EventBody::GrantOfferCreated(GrantOfferCreatedEvent {
+            core_event_types::EventBody::GrantOfferCreated(GrantOfferCreatedEvent {
                 offer_id: offer_id.clone(),
                 issuer_persona_id: issuing_persona_id.to_string(),
                 ephemeral_public_key_hex: eph.public_key_hex.clone(),
@@ -825,7 +825,7 @@ impl<S: AppBackend> AppRuntime<S> {
     // Grant claim
     // -----------------------------------------------------------------------
 
-    /// Claim a grant offer — (new user) and (existing user).
+    /// Claim a grant offer — new-user and existing-user flows.
     ///
     /// `link_url` may be:
     /// - A native deep link: `emberlink://claim/<offer-id>?ek=...&exp=...&sig=...`
@@ -847,7 +847,7 @@ impl<S: AppBackend> AppRuntime<S> {
         new_user_name: Option<&str>,
     ) -> Result<serde_json::Value, String> {
         use core_crypto::unseal_grant_payload;
-        use core_types::{EventBody, GrantOfferClaimedEvent};
+        use core_event_types::{EventBody, GrantOfferClaimedEvent};
 
         // --- Step 1: parse link / QR string ---
         // QR strings start with "EL1:", URL-based links are parsed via GrantLink.
@@ -905,7 +905,7 @@ impl<S: AppBackend> AppRuntime<S> {
         // verification, the `link.relay_hint` from the parsed `GrantLink` must
         // be threaded in here so the relay binding is checked.
         //
-        // security check: issuer_persona_id is pulled from the materialized offer event
+        // issuer_persona_id is pulled from the materialized offer event
         // so the signed bytes include the bound issuer identity.
         if issuer_signature.is_empty() {
             return Err("offer has empty issuer signature — cannot authenticate".to_string());
@@ -920,7 +920,7 @@ impl<S: AppBackend> AppRuntime<S> {
             .get(&offer_id)
             .cloned();
 
-        // security check: resolve the issuer_persona_id from the stored offer event so it
+        // Resolve the issuer_persona_id from the stored offer event so it
         // is included in the signing payload. Falls back to empty string for
         // cross-device / relay claims where the event is not locally available.
         let stored_issuer_persona_id = offer_event
@@ -1042,7 +1042,7 @@ impl<S: AppBackend> AppRuntime<S> {
 
         // --- Step 5b: evaluate badge-gated conditions ---
         if let Some(ref offer_view) = offer_event {
-            let parsed_conditions: Vec<core_types::grant_conditions::GrantCondition> =
+            let parsed_conditions: Vec<core_grant_types::grant_conditions::GrantCondition> =
                 if offer_view.conditions_json.is_empty() {
                     Vec::new()
                 } else {
@@ -1085,7 +1085,7 @@ impl<S: AppBackend> AppRuntime<S> {
                 }
 
                 // Collect trust edges.
-                let trust_edges: Vec<core_types::TrustAttestation> = self
+                let trust_edges: Vec<core_principals::TrustAttestation> = self
                     .store
                     .materialized()
                     .trust_edges_current
@@ -1269,7 +1269,7 @@ impl<S: AppBackend> AppRuntime<S> {
         evidence_payload_hex: Option<&str>,
         expires_in_secs: Option<u64>,
     ) -> Result<serde_json::Value, String> {
-        use core_types::{BadgeEvidence, BadgeIssuedEvent, EventBody};
+        use core_event_types::{BadgeEvidence, BadgeIssuedEvent, EventBody};
 
         // Validate issuer persona exists
         let issuer_persona = self
@@ -1360,7 +1360,7 @@ impl<S: AppBackend> AppRuntime<S> {
         revoker_persona_id: &str,
         reason: &str,
     ) -> Result<serde_json::Value, String> {
-        use core_types::{BadgeRevokedEvent, EventBody};
+        use core_event_types::{BadgeRevokedEvent, EventBody};
 
         // Validate badge exists and issuer matches revoker
         let badge = self
@@ -1440,7 +1440,7 @@ impl<S: AppBackend> AppRuntime<S> {
         reason: &str,
         evidence: Option<&str>,
     ) -> Result<serde_json::Value, String> {
-        use core_types::{BadgeDisputedEvent, EventBody};
+        use core_event_types::{BadgeDisputedEvent, EventBody};
 
         // Validate badge exists
         if !self
@@ -1644,7 +1644,7 @@ impl<S: AppBackend> AppRuntime<S> {
         };
 
         // Collect trust edges as a flat slice
-        let trust_edges: Vec<core_types::TrustAttestation> = self
+        let trust_edges: Vec<core_principals::TrustAttestation> = self
             .store
             .materialized()
             .trust_edges_current
@@ -1707,8 +1707,8 @@ impl<S: AppBackend> AppRuntime<S> {
 /// `index` is the 0-based position in the caller's Vec, used to assign a
 /// stable `sid` of the form `s<N+1>`. Deterministic per position so tests
 /// can assert on the produced grant shape.
-fn parse_statement_spec(s: &str, index: usize) -> Result<core_types::Statement, String> {
-    use core_types::{Condition, ResourceSelector, ResourceType, Statement, Usage};
+fn parse_statement_spec(s: &str, index: usize) -> Result<core_grant_types::Statement, String> {
+    use core_grant_types::{Condition, ResourceSelector, ResourceType, Statement, Usage};
 
     fn build(sid: String, actions: Vec<String>, resource: String) -> Statement {
         Statement {
@@ -1795,7 +1795,7 @@ fn allocate_subject_id<S: AppBackend>(store: &S, prefix: &str) -> String {
 fn append_event<S: AppBackend>(
     store: &mut S,
     event_id: String,
-    body: core_types::EventBody,
+    body: core_event_types::EventBody,
     signer_binding: SignerBinding,
     signer: &impl Signer,
 ) -> Result<(), ValidationError> {
@@ -2166,10 +2166,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // / — Grant claim tests
+    // Grant claim tests
     // -----------------------------------------------------------------------
 
-    /// : New-user claim flow — start with empty runtime, create offer on
+    /// New-user claim flow — start with empty runtime, create offer on
     /// issuer side, hand the QR string to an empty claimant runtime, and verify
     /// that the claimant auto-creates an identity and claims successfully.
     ///
@@ -2310,7 +2310,7 @@ mod tests {
         assert_eq!(claim["grant_mode"].as_str().unwrap(), "one_shot");
     }
 
-    /// : Existing-user claim flow — claimant already has two personas;
+    /// Existing-user claim flow — claimant already has two personas;
     /// they select one to claim with. Uses cross-runtime scenario.
     #[test]
     fn existing_user_claim_flow_p21_5() {
@@ -2585,7 +2585,7 @@ mod tests {
         // accepts unknown variants would cause this to fail.
         let bad_json = r#"[{"type":"future_variant","value":{}}]"#;
         let parse_result: Result<
-            Vec<core_types::grant_conditions::GrantCondition>,
+            Vec<core_grant_types::grant_conditions::GrantCondition>,
             serde_json::Error,
         > = serde_json::from_str(bad_json);
         assert!(
@@ -2616,7 +2616,7 @@ mod tests {
                 expires_in_secs: Some(86400),
                 relay_hint: None,
                 conditions: vec![
-                    core_types::grant_conditions::GrantCondition::badge("required-badge"),
+                    core_grant_types::grant_conditions::GrantCondition::badge("required-badge"),
                 ],
             })
             .unwrap();
@@ -2703,7 +2703,7 @@ mod tests {
         let ek_hex = "aa".repeat(32); // 64-char hex — valid X25519 length
         let event = EventEnvelope::from_body(
             "evt-gc-h2-test",
-            core_types::EventBody::GrantOfferCreated(core_types::GrantOfferCreatedEvent {
+            core_event_types::EventBody::GrantOfferCreated(core_event_types::GrantOfferCreatedEvent {
                 offer_id: offer_id.into(),
                 issuer_persona_id: "fake-issuer".into(),
                 ephemeral_public_key_hex: ek_hex.clone(),
@@ -2807,7 +2807,7 @@ mod tests {
                 expires_in_secs: Some(86400),
                 relay_hint: None,
                 conditions: vec![
-                    core_types::grant_conditions::GrantCondition::badge("verified-dev"),
+                    core_grant_types::grant_conditions::GrantCondition::badge("verified-dev"),
                 ],
             })
             .unwrap();

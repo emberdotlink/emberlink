@@ -97,15 +97,15 @@ pub enum UiAction {
         statement_specs: Vec<String>,
         expires_in_secs: Option<u64>,
         relay_hint: Option<String>,
-        conditions: Vec<core_types::grant_conditions::GrantCondition>,
+        conditions: Vec<core_grant_types::grant_conditions::GrantCondition>,
     },
 
     /// Claim a grant offer from a link URL or QR string.
     ///
     /// If `claiming_persona_id` is `None` and no identity exists, a new identity
-    /// is created automatically (new-user flow, ). If `claiming_persona_id`
+    /// is created automatically (new-user flow). If `claiming_persona_id`
     /// is provided (or an existing persona is found), that persona claims the
-    /// offer (existing-user flow, ).
+    /// offer (existing-user flow).
     ///
     /// `link_url`: the grant link URL (emberlink:// or https://ember.link/...)
     ///   or an EL1:... QR string from `grant offer qr`.

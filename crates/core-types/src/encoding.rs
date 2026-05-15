@@ -1,27 +1,15 @@
-use crate::{KeyAlgorithm, PublicKeyMaterial, ValidationError};
+use crate::ValidationError;
 
-pub(crate) fn validate_non_empty(value: &str, label: &str) -> Result<(), ValidationError> {
+pub fn validate_non_empty(value: &str, label: &str) -> Result<(), ValidationError> {
     if value.trim().is_empty() {
         return Err(ValidationError::empty_field(label));
     }
     Ok(())
 }
 
-pub(crate) fn parse_public_key_material(
-    fields: &std::collections::BTreeMap<String, String>,
-    key_id_field: &str,
-    algorithm_field: &str,
-    public_key_field: &str,
-) -> Result<PublicKeyMaterial, ValidationError> {
-    Ok(PublicKeyMaterial {
-        key_id: required_field(fields, key_id_field)?,
-        algorithm: KeyAlgorithm::parse(&required_field(fields, algorithm_field)?)
-            .ok_or_else(|| ValidationError::invalid_format("invalid key algorithm"))?,
-        public_key: required_field(fields, public_key_field)?,
-    })
-}
+// `parse_public_key_material` migrated to `core_principals::parse` per design.
 
-pub(crate) fn required_field(
+pub fn required_field(
     fields: &std::collections::BTreeMap<String, String>,
     name: &str,
 ) -> Result<String, ValidationError> {
@@ -31,7 +19,7 @@ pub(crate) fn required_field(
         .ok_or_else(|| ValidationError::empty_field(name))
 }
 
-pub(crate) fn optional_non_empty_field(
+pub fn optional_non_empty_field(
     fields: &std::collections::BTreeMap<String, String>,
     name: &str,
 ) -> Option<String> {
@@ -44,7 +32,7 @@ pub(crate) fn optional_non_empty_field(
     })
 }
 
-pub(crate) fn parse_bool_field(
+pub fn parse_bool_field(
     fields: &std::collections::BTreeMap<String, String>,
     name: &str,
 ) -> Result<bool, ValidationError> {
@@ -57,7 +45,7 @@ pub(crate) fn parse_bool_field(
     }
 }
 
-pub(crate) fn canonical_record(record_type: &str, fields: &[(&str, String)]) -> Vec<u8> {
+pub fn canonical_record(record_type: &str, fields: &[(&str, String)]) -> Vec<u8> {
     let capacity = 5
         + record_type.len()
         + 1
@@ -78,7 +66,7 @@ pub(crate) fn canonical_record(record_type: &str, fields: &[(&str, String)]) -> 
     out.into_bytes()
 }
 
-pub(crate) fn parse_canonical_record(
+pub fn parse_canonical_record(
     payload: &[u8],
 ) -> Result<(String, std::collections::BTreeMap<String, String>), ValidationError> {
     let payload = std::str::from_utf8(payload).map_err(|err| {
@@ -105,7 +93,7 @@ pub(crate) fn parse_canonical_record(
     Ok((record_type.to_string(), fields))
 }
 
-pub(crate) fn escape_canonical(value: &str) -> String {
+pub fn escape_canonical(value: &str) -> String {
     let mut out = String::new();
     for ch in value.chars() {
         match ch {
@@ -119,7 +107,7 @@ pub(crate) fn escape_canonical(value: &str) -> String {
     out
 }
 
-pub(crate) fn unescape_canonical(value: &str) -> Result<String, ValidationError> {
+pub fn unescape_canonical(value: &str) -> Result<String, ValidationError> {
     let mut out = String::new();
     let mut chars = value.chars();
     while let Some(ch) = chars.next() {
@@ -154,7 +142,7 @@ pub fn hex_to_bytes(value: &str) -> Result<Vec<u8>, ValidationError> {
     hex::decode(value).map_err(|err| ValidationError::invalid_format(format!("invalid hex: {err}")))
 }
 
-pub(crate) fn split_canonical_field(line: &str) -> Option<(&str, &str)> {
+pub fn split_canonical_field(line: &str) -> Option<(&str, &str)> {
     let bytes = line.as_bytes();
     let mut escaped = false;
     for (index, byte) in bytes.iter().enumerate() {

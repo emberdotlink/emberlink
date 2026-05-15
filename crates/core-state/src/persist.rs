@@ -3,12 +3,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use core_crypto::{EncryptedContent, LocalKeyPair, PublicKey, Signature, decrypt_content, encrypt_content};
 use core_events::{EventEnvelope, EventRef};
 use core_storage::{EncryptedBlock, PresentationArtifactEnvelope};
-use core_types::{
-    CanonicalEncode, ChunkReference, EventRefRelation, EventSubject, EventType, FileManifest,
-    KeyRole, ManifestDeviceAccess, PresentationArtifact, PresentationTemplate, SchemaVersion,
-    SignerBinding, SubjectKind, Validate, ValidationError, VaultNamespace, VaultOwnerKind,
-    bytes_to_hex, hex_to_bytes,
-};
+use core_event_types::{ChunkReference, EventRefRelation, EventSubject, EventType, FileManifest, KeyRole, ManifestDeviceAccess, PresentationArtifact, PresentationTemplate, SignerBinding, SubjectKind, VaultNamespace, VaultOwnerKind};
+use core_types::{CanonicalEncode, SchemaVersion, Validate, ValidationError, bytes_to_hex, hex_to_bytes};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 const COLUMN_ENC_TAG: &str = "ENC1:";
@@ -984,7 +980,7 @@ pub(crate) fn load_local_device_encryption_key(
         params![device_id],
         |row| {
             let algorithm = row.get::<_, String>(1)?;
-            let algorithm = core_types::KeyAlgorithm::parse(&algorithm).ok_or_else(|| {
+            let algorithm = core_principals::KeyAlgorithm::parse(&algorithm).ok_or_else(|| {
                 rusqlite::Error::FromSqlConversionFailure(
                     1,
                     rusqlite::types::Type::Text,
@@ -2092,7 +2088,7 @@ pub(crate) fn recovery_request_status_name(status: &RecoveryRequestStatus) -> &'
 
 pub(crate) fn write_service_binding(
     conn: &Connection,
-    binding: &core_types::ServiceBinding,
+    binding: &core_event_types::ServiceBinding,
 ) -> Result<(), ValidationError> {
     conn.execute(
         "INSERT INTO service_bindings (
@@ -2123,7 +2119,7 @@ pub(crate) fn write_service_binding(
 pub(crate) fn load_service_bindings_for_persona(
     conn: &Connection,
     persona_id: &str,
-) -> Result<Vec<core_types::ServiceBinding>, ValidationError> {
+) -> Result<Vec<core_event_types::ServiceBinding>, ValidationError> {
     let mut stmt = conn
         .prepare(
             "SELECT binding_id, persona_id, adapter_kind, service_label,
@@ -2134,10 +2130,10 @@ pub(crate) fn load_service_bindings_for_persona(
 
     let rows = stmt
         .query_map(params![persona_id], |row| {
-            Ok(core_types::ServiceBinding {
+            Ok(core_event_types::ServiceBinding {
                 id: row.get(0)?,
                 persona_id: row.get(1)?,
-                descriptor: core_types::ServiceDescriptor {
+                descriptor: core_event_types::ServiceDescriptor {
                     adapter_kind: row.get(2)?,
                     service_label: row.get(3)?,
                     endpoint: row.get(4)?,
@@ -2159,7 +2155,7 @@ pub(crate) fn load_service_bindings_for_persona(
 
 pub(crate) fn load_all_service_bindings(
     conn: &Connection,
-) -> Result<Vec<core_types::ServiceBinding>, ValidationError> {
+) -> Result<Vec<core_event_types::ServiceBinding>, ValidationError> {
     let mut stmt = conn
         .prepare(
             "SELECT binding_id, persona_id, adapter_kind, service_label,
@@ -2172,10 +2168,10 @@ pub(crate) fn load_all_service_bindings(
 
     let rows = stmt
         .query_map([], |row| {
-            Ok(core_types::ServiceBinding {
+            Ok(core_event_types::ServiceBinding {
                 id: row.get(0)?,
                 persona_id: row.get(1)?,
-                descriptor: core_types::ServiceDescriptor {
+                descriptor: core_event_types::ServiceDescriptor {
                     adapter_kind: row.get(2)?,
                     service_label: row.get(3)?,
                     endpoint: row.get(4)?,
@@ -2219,28 +2215,28 @@ pub(crate) fn delete_service_binding(
 // Authoritative on-wire format will move to biscuit-auth tokens once
 // core-crypto wires it in; until then blocks_json is the durable store.
 
-fn blocks_to_json(blocks: &[core_types::SignedBlock]) -> Result<String, ValidationError> {
+fn blocks_to_json(blocks: &[core_grant_types::SignedBlock]) -> Result<String, ValidationError> {
     serde_json::to_string(blocks)
         .map_err(|err| ValidationError::new(format!("serialize grant blocks: {err}")))
 }
 
-fn blocks_from_json(json: &str) -> Result<Vec<core_types::SignedBlock>, ValidationError> {
+fn blocks_from_json(json: &str) -> Result<Vec<core_grant_types::SignedBlock>, ValidationError> {
     serde_json::from_str(json)
         .map_err(|err| ValidationError::new(format!("deserialize grant blocks: {err}")))
 }
 
 pub(crate) fn write_access_grant(
     conn: &Connection,
-    grant: &core_types::AccessGrant,
+    grant: &core_grant_types::AccessGrant,
 ) -> Result<(), ValidationError> {
     let blocks_json = blocks_to_json(&grant.blocks)?;
     // Only persist terminal-ish stored statuses. Derived `Expired` / `Pending`
     // are never written; `ExhaustedByBudget` + `Paused` are distinct persisted
     // terminals / pauses.
     let stored_status = match grant.status {
-        core_types::GrantStatus::Revoked => "revoked",
-        core_types::GrantStatus::ExhaustedByBudget => "exhausted_by_budget",
-        core_types::GrantStatus::Paused => "paused",
+        core_grant_types::GrantStatus::Revoked => "revoked",
+        core_grant_types::GrantStatus::ExhaustedByBudget => "exhausted_by_budget",
+        core_grant_types::GrantStatus::Paused => "paused",
         _ => "active",
     };
     let attestation_json = serde_json::to_string(&grant.attestation)
@@ -2303,7 +2299,7 @@ pub(crate) fn write_access_grant(
 
 pub(crate) fn write_access_grant_history(
     conn: &Connection,
-    entry: &core_types::AccessGrantHistoryEntry,
+    entry: &core_grant_types::AccessGrantHistoryEntry,
 ) -> Result<(), ValidationError> {
     conn.execute(
         "INSERT INTO access_grant_history (
@@ -2326,7 +2322,7 @@ pub(crate) fn write_access_grant_history(
 fn row_to_access_grant(
     row: &rusqlite::Row,
     now: u64,
-) -> rusqlite::Result<core_types::AccessGrant> {
+) -> rusqlite::Result<core_grant_types::AccessGrant> {
     let grant_id: String = row.get(0)?;
     let version: i64 = row.get(1)?;
     let issuing_persona_id: String = row.get(2)?;
@@ -2346,20 +2342,20 @@ fn row_to_access_grant(
     // resource_types_csv (col 16) is a projection for indexing; not used on read
     let attestation_json: String = row.get(17)?;
 
-    let recipient_kind = core_types::PresentationAudienceKind::parse(&recipient_kind_str)
-        .unwrap_or(core_types::PresentationAudienceKind::Service);
-    let recipient_profile = core_types::RecipientProfile::parse(&recipient_profile_str)
-        .unwrap_or(core_types::RecipientProfile::Human);
-    let mode = core_types::GrantMode::parse(&mode_str).unwrap_or(core_types::GrantMode::OneShot);
+    let recipient_kind = core_event_types::PresentationAudienceKind::parse(&recipient_kind_str)
+        .unwrap_or(core_event_types::PresentationAudienceKind::Service);
+    let recipient_profile = core_grant_types::RecipientProfile::parse(&recipient_profile_str)
+        .unwrap_or(core_grant_types::RecipientProfile::Human);
+    let mode = core_grant_types::GrantMode::parse(&mode_str).unwrap_or(core_grant_types::GrantMode::OneShot);
     let blocks = blocks_from_json(&blocks_json).unwrap_or_default();
     let exp = expires_at.map(|v| v as u64);
     // Derive nbf from blocks for the status computation.
     let nb = blocks.iter().filter_map(|sb| sb.block.nbf).max();
-    let status = core_types::GrantStatus::derive(&stored_status, nb, exp, now);
-    let attestation = serde_json::from_str::<core_types::AttestationBinding>(&attestation_json)
+    let status = core_grant_types::GrantStatus::derive(&stored_status, nb, exp, now);
+    let attestation = serde_json::from_str::<core_grant_types::AttestationBinding>(&attestation_json)
         .unwrap_or_default();
 
-    Ok(core_types::AccessGrant {
+    Ok(core_grant_types::AccessGrant {
         id: grant_id,
         version: version as u32,
         issuing_persona_id,
@@ -2390,7 +2386,7 @@ pub(crate) fn load_access_grant(
     conn: &Connection,
     grant_id: &str,
     now: u64,
-) -> Result<Option<core_types::AccessGrant>, ValidationError> {
+) -> Result<Option<core_grant_types::AccessGrant>, ValidationError> {
     let sql = format!(
         "SELECT {ACCESS_GRANT_COLUMNS} FROM access_grants WHERE grant_id = ?1"
     );
@@ -2402,10 +2398,10 @@ pub(crate) fn load_access_grant(
 pub(crate) fn load_access_grants_by_persona(
     conn: &Connection,
     persona_id: Option<&str>,
-    recipient_profile: Option<core_types::RecipientProfile>,
+    recipient_profile: Option<core_grant_types::RecipientProfile>,
     status_filter: Option<&str>,
     now: u64,
-) -> Result<Vec<core_types::AccessGrant>, ValidationError> {
+) -> Result<Vec<core_grant_types::AccessGrant>, ValidationError> {
     let mut conditions = Vec::new();
     let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
@@ -2452,10 +2448,10 @@ pub(crate) fn load_access_grants_by_persona(
 
 pub(crate) fn load_access_grants_for_recipient(
     conn: &Connection,
-    recipient_kind: core_types::PresentationAudienceKind,
+    recipient_kind: core_event_types::PresentationAudienceKind,
     recipient_id: &str,
     now: u64,
-) -> Result<Vec<core_types::AccessGrant>, ValidationError> {
+) -> Result<Vec<core_grant_types::AccessGrant>, ValidationError> {
     let sql = format!(
         "SELECT {ACCESS_GRANT_COLUMNS} FROM access_grants
          WHERE recipient_kind = ?1 AND recipient_id = ?2
@@ -2484,7 +2480,7 @@ pub(crate) fn load_access_grants_for_recipient(
 pub(crate) fn load_access_grant_history(
     conn: &Connection,
     grant_id: &str,
-) -> Result<Vec<core_types::AccessGrantHistoryEntry>, ValidationError> {
+) -> Result<Vec<core_grant_types::AccessGrantHistoryEntry>, ValidationError> {
     let mut stmt = conn
         .prepare(
             "SELECT history_id, grant_id, version, action, timestamp, blocks_snapshot, note
@@ -2494,7 +2490,7 @@ pub(crate) fn load_access_grant_history(
 
     let rows = stmt
         .query_map(params![grant_id], |row| {
-            Ok(core_types::AccessGrantHistoryEntry {
+            Ok(core_grant_types::AccessGrantHistoryEntry {
                 history_id: row.get(0)?,
                 grant_id: row.get(1)?,
                 version: row.get::<_, i64>(2)? as u32,
@@ -2520,7 +2516,7 @@ pub(crate) fn load_grant_history_timeline(
     persona_id: Option<&str>,
     limit: usize,
     before: Option<u64>,
-) -> Result<Vec<core_types::AccessGrantHistoryEntry>, ValidationError> {
+) -> Result<Vec<core_grant_types::AccessGrantHistoryEntry>, ValidationError> {
     let (sql, param_values): (String, Vec<Box<dyn rusqlite::types::ToSql>>) =
         match (persona_id, before) {
             (Some(pid), Some(ts)) => (
@@ -2581,7 +2577,7 @@ pub(crate) fn load_grant_history_timeline(
 
     let rows = stmt
         .query_map(params.as_slice(), |row| {
-            Ok(core_types::AccessGrantHistoryEntry {
+            Ok(core_grant_types::AccessGrantHistoryEntry {
                 history_id: row.get(0)?,
                 grant_id: row.get(1)?,
                 version: row.get::<_, i64>(2)? as u32,
@@ -2810,7 +2806,7 @@ pub(crate) fn load_badges(
         let (badge_id, issuer, recipient, btype, dname, ev_type, ev_payload, issued_at, expires_at, status_str, revoked_reason) =
             row.map_err(|err| ValidationError::new(format!("read badge row: {err}")))?;
         let evidence = match (ev_type, ev_payload) {
-            (Some(et), Some(ph)) if !et.is_empty() => Some(core_types::BadgeEvidence {
+            (Some(et), Some(ph)) if !et.is_empty() => Some(core_event_types::BadgeEvidence {
                 evidence_type: et,
                 payload_hex: ph,
             }),
@@ -2900,7 +2896,7 @@ pub(crate) fn load_badge_gallery(
         let (badge_id, issuer, recipient, btype, dname, ev_type, ev_payload, issued_at, expires_at, status_str, revoked_reason, visible_int) =
             row.map_err(|err| ValidationError::new(format!("read gallery row: {err}")))?;
         let evidence = match (ev_type, ev_payload) {
-            (Some(et), Some(ph)) if !et.is_empty() => Some(core_types::BadgeEvidence {
+            (Some(et), Some(ph)) if !et.is_empty() => Some(core_event_types::BadgeEvidence {
                 evidence_type: et,
                 payload_hex: ph,
             }),

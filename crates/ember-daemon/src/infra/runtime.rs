@@ -39,6 +39,19 @@ pub enum DaemonError {
     NotRunning,
     #[error("signal error: {0}")]
     Signal(std::io::Error),
+    /// implementation-note-164 (D): startup sampling verify
+    /// detected a chain break. The daemon refused normal-serve and
+    /// entered quarantine. Recovery requires operator intervention.
+    #[error("audit chain break detected at startup: {0}")]
+    AuditChainBreak(String),
+    /// implementation-note-164 (E) / F-S5-013 HIGH: the
+    /// daemon's long-lived identity key could not be initialised, so
+    /// the daemon refuses startup (fail-closed). Receipts are
+    /// load-bearing for the audit chain and the broker; running
+    /// without a signing identity would silently produce unverifiable
+    /// state.
+    #[error("identity init failed: {0}")]
+    IdentityInitFailed(String),
 }
 
 /// Internal status of the vault auto-unseal step at daemon startup. Used to
@@ -71,7 +84,7 @@ pub enum DashboardBind {
     Timeout,
 }
 
-/// implementation-note-57: outcome of the git-echo credential-injection proxy bind.
+/// implementation-note-123: outcome of the git-echo credential-injection proxy bind.
 /// Mirrors `DashboardBind` semantics. Sent to `run()`'s `start_notify`
 /// callback so the CLI can print `EMBER_PROXY_URL=…` for qember.sh +
 /// ember-git.sh consumers.
@@ -87,7 +100,7 @@ pub enum GitProxyBind {
     Timeout,
 }
 
-/// implementation-note-58: outcome of the general LLM/HTTP credential-
+/// implementation-note-124: outcome of the general LLM/HTTP credential-
 /// injection proxy bind. Mirrors `GitProxyBind` semantics. The LLM proxy
 /// (`run_proxy` / `handle_request`) is what the Anthropic SDK demo path
 /// posts to; its bound URL is exposed via `EMBER_PROXY_URL` and the
@@ -107,12 +120,12 @@ pub enum LlmProxyBind {
 /// Aggregate bind report passed to `run()`'s `start_notify` callback. Carries
 /// every listener that may have raced to bind during startup so the CLI can
 /// render a consolidated banner. New listeners get a new field here rather
-/// than a parallel callback. implementation-note-57.
+/// than a parallel callback. implementation-note-123.
 #[derive(Debug, Clone)]
 pub struct StartupBinds {
     pub dashboard: DashboardBind,
     pub git_proxy: GitProxyBind,
-    /// implementation-note-58: bind outcome for the LLM proxy.
+    /// implementation-note-124: bind outcome for the LLM proxy.
     pub llm_proxy: LlmProxyBind,
     /// Daemon's Ed25519 signing-identity pubkey (64-hex). Empty string if
     /// identity initialisation failed at startup. Used by the CLI to render
@@ -120,7 +133,7 @@ pub struct StartupBinds {
     pub identity_pubkey: String,
 }
 
-/// implementation-note-68 — render a 64-hex Ed25519 pubkey as a
+/// implementation-note-142 — render a 64-hex Ed25519 pubkey as a
 /// short SSH-style fingerprint (`4a5d:a587:dd36:53b2`) using the first
 /// 8 bytes / 16 hex chars. The dashboard, the receipt detail page, and
 /// the demo teardown printout all use the same shape so a viewer can
@@ -182,6 +195,325 @@ pub fn authenticate_peer_creds(
         std::io::ErrorKind::Unsupported,
         "peer credential auth is only supported on Linux and macOS",
     ))
+}
+
+// ---------------------------------------------------------------------------
+// PeerCredPrincipal — kernel-attested per-call identity
+// (implementation-note-103, design + design §"Decision §2")
+// ---------------------------------------------------------------------------
+
+/// Kernel-attested identity of the caller on the other end of a Unix
+/// domain socket. Extracted at connection accept time from
+/// `UnixStream::peer_cred()` and carried through the dispatcher to
+/// every broker handler so authorization decisions are bound to a
+/// kernel-supplied identity rather than the attacker-controlled
+/// `caller_persona` field in the request payload.
+///
+/// The principal triple `(uid, pid, socket_path)`:
+///
+/// - `uid`         — peer's effective uid. The primary check for
+///   broker handlers: a caller whose kernel uid does not match the
+///   persona's bound uid is refused with `-32004`.
+/// - `pid`         — pid-namespace-scoped peer pid. Diagnostics only:
+///   the bare PID is reuse-prone (see sibling implementation-note-105
+///   for the pidfd-based reuse-immune surface).
+/// - `socket_path` — per-agent UDS path the connection accepted on.
+///   Per implementation-note-104 each agent gets its own socket;
+///   the path is the cohesive identity binding the OS uid to a
+///   specific persona. For Phase 1 (this task) the daemon's single
+///   socket path is used uniformly.
+/// Linux-only RAII wrapper around a pidfd. Closes the fd on drop.
+///
+/// Wrapping the fd in its own struct + holding it as `Arc<PidFdOwner>` on
+/// `PeerCredPrincipal` lets the principal be `Clone`able (it is cloned per
+/// dispatch in `socket::handle_connection`) while keeping single-owner
+/// `close(2)` semantics: the kernel only sees one close, on the last clone
+/// drop. Using `Arc` rather than `dup(2)`-on-clone keeps the fd count
+/// constant and avoids leaking fds across the per-RPC clone path.
+///
+/// implementation-note-105.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+pub struct PidFdOwner {
+    fd: std::os::unix::io::RawFd,
+}
+
+#[cfg(target_os = "linux")]
+impl PidFdOwner {
+    /// Borrow the underlying raw fd. The fd remains owned by this
+    /// `PidFdOwner` — callers MUST NOT close it.
+    pub fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.fd
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for PidFdOwner {
+    fn drop(&mut self) {
+        // SAFETY: `self.fd` was obtained from `pidfd_open` (a real
+        // kernel-issued descriptor) and is owned by this struct. After
+        // close, no other reference to it exists because the `PidFdOwner`
+        // is being dropped here.
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}
+
+/// `pidfd_open(pid, 0)` — open a process file descriptor for `pid`.
+/// Returns `Some(fd)` when the syscall succeeds; `None` when it fails
+/// (most commonly `ENOSYS` on pre-5.3 kernels, or `ESRCH` if the pid
+/// is already reaped between accept() and pidfd_open()).
+///
+/// The returned fd is reuse-immune: even if the kernel later reaps the
+/// process and reassigns its PID, the pidfd continues to refer to the
+/// original process. A subsequent `poll(POLLIN)` will report POLLIN |
+/// POLLHUP once the original process exits.
+#[cfg(target_os = "linux")]
+fn pidfd_open(pid: i32) -> Option<std::os::unix::io::RawFd> {
+    // SAFETY: `SYS_pidfd_open` takes (pid, flags). We pass flags=0
+    // (PIDFD_NONBLOCK is not required — `poll()` with timeout 0 is
+    // already non-blocking). The return value is a new fd (>= 0) or
+    // -1 on error; we check for the error case.
+    let ret = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if ret < 0 {
+        let err = std::io::Error::last_os_error();
+        tracing::debug!(
+            pid,
+            error = %err,
+            "pidfd_open failed — principal proceeds without reuse-immune binding"
+        );
+        None
+    } else {
+        Some(ret as std::os::unix::io::RawFd)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PeerCredPrincipal {
+    pub uid: u32,
+    /// Pid-namespace-scoped peer pid. On Linux, prefer `is_alive()` (which
+    /// consults the bound pidfd) over inspecting this field directly — the
+    /// bare PID is reuse-prone, and the pidfd is the reuse-immune anchor.
+    pub pid: i32,
+    /// Per-agent UDS socket path. Per implementation-note-104 each
+    /// agent gets its own socket; for Phase 1 the daemon's single
+    /// socket path is used uniformly.
+    pub socket_path: PathBuf,
+    /// implementation-note-105 — pidfd opened at accept time against the
+    /// peer's PID. `Some(_)` when `pidfd_open(2)` succeeded; `None` when
+    /// the syscall is unavailable (pre-5.3 kernel) or the process exited
+    /// between `accept()` and `pidfd_open()`. `Arc`-wrapped so the
+    /// principal can be cloned per-dispatch without re-issuing `dup(2)`
+    /// or risking double-close: `Drop` only fires on the last clone.
+    ///
+    /// Not on the wire — local kernel resource only. Skipped in
+    /// `PartialEq` because two clones share the same Arc but the
+    /// abstract identity of the principal is uid + pid + socket_path.
+    #[cfg(target_os = "linux")]
+    pub pidfd: Option<std::sync::Arc<PidFdOwner>>,
+}
+
+impl PartialEq for PeerCredPrincipal {
+    fn eq(&self, other: &Self) -> bool {
+        // pidfd is a local kernel resource — two principals describing
+        // the same peer share identity even when one was constructed
+        // with a pidfd (production) and the other without (tests, or
+        // pre-5.3 kernels).
+        self.uid == other.uid
+            && self.pid == other.pid
+            && self.socket_path == other.socket_path
+    }
+}
+
+impl Eq for PeerCredPrincipal {}
+
+impl PeerCredPrincipal {
+    /// Construct a `PeerCredPrincipal` from an accepted `UnixStream` and
+    /// the per-agent socket path the connection landed on.
+    ///
+    /// `socket_path` is the listener path the connection accepted on
+    /// (per implementation-note-104) — passed in so the constructor
+    /// is independent of the listener's address API which is not always
+    /// usable on a connected stream.
+    ///
+    /// On Linux this also issues `pidfd_open(pid, 0)` to bind a
+    /// reuse-immune handle to the peer process (implementation-note-213-
+    /// BINDING). The pidfd is `None` on legacy kernels — broker handlers
+    /// fall back to the bare-PID surface in that case.
+    ///
+    /// Returns `Err` when the kernel does not surface peer credentials
+    /// (a fail-closed posture mirroring `authenticate_peer_creds`).
+    #[cfg(target_os = "linux")]
+    pub fn from_stream(
+        stream: &tokio::net::UnixStream,
+        socket_path: PathBuf,
+    ) -> std::io::Result<Self> {
+        let cred = stream.peer_cred()?;
+        let pid = cred.pid().ok_or_else(|| {
+            std::io::Error::other(
+                "peer pid unavailable — fail-closed (no kernel-attested principal)",
+            )
+        })?;
+        let pidfd = pidfd_open(pid).map(|fd| std::sync::Arc::new(PidFdOwner { fd }));
+        Ok(Self {
+            uid: cred.uid(),
+            pid,
+            socket_path,
+            pidfd,
+        })
+    }
+
+    /// macOS path — pidfd is a Linux-only surface. The principal is
+    /// still constructed (so the peercred-binding gate runs), but
+    /// `is_alive()` cannot consult a pidfd; it returns `true`
+    /// unconditionally.
+    #[cfg(target_os = "macos")]
+    pub fn from_stream(
+        stream: &tokio::net::UnixStream,
+        socket_path: PathBuf,
+    ) -> std::io::Result<Self> {
+        let cred = stream.peer_cred()?;
+        let pid = cred.pid().ok_or_else(|| {
+            std::io::Error::other(
+                "peer pid unavailable — fail-closed (no kernel-attested principal)",
+            )
+        })?;
+        tracing::debug!(
+            pid,
+            "PeerCredPrincipal::from_stream: macOS lacks pidfd — using bare PID without reuse protection"
+        );
+        Ok(Self {
+            uid: cred.uid(),
+            pid,
+            socket_path,
+        })
+    }
+
+    /// Non-Linux/macOS stub — peer-cred binding is unsupported.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub fn from_stream(
+        _stream: &tokio::net::UnixStream,
+        _socket_path: PathBuf,
+    ) -> std::io::Result<Self> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "PeerCredPrincipal::from_stream is only supported on Linux and macOS",
+        ))
+    }
+
+    /// Construct a `PeerCredPrincipal` directly from raw fields. Used by
+    /// tests and by the daemon-internal `Internal` dispatch path that
+    /// needs to thread a synthetic principal through the broker
+    /// handlers without a real Unix socket. No pidfd is opened — the
+    /// resulting principal is treated as legacy-kernel-equivalent
+    /// (`is_alive()` returns `true`).
+    pub fn new(uid: u32, pid: i32, socket_path: PathBuf) -> Self {
+        Self {
+            uid,
+            pid,
+            socket_path,
+            #[cfg(target_os = "linux")]
+            pidfd: None,
+        }
+    }
+
+    /// Test-only constructor: build a principal with a synthetic pidfd
+    /// for the given pid. Performs an actual `pidfd_open(pid, 0)` —
+    /// the caller is responsible for ensuring the pid refers to a
+    /// process whose lifecycle they control.
+    ///
+    /// Returns `None` when `pidfd_open` fails (pre-5.3 kernel, ESRCH,
+    /// etc.). Tests that depend on pidfd behaviour should skip on a
+    /// `None` return rather than panic.
+    ///
+    /// implementation-note-105 — test seam so the dead-pid rejection
+    /// test can build a principal with a real pidfd against an already-
+    /// exited child.
+    #[cfg(target_os = "linux")]
+    pub fn new_with_pidfd_for_test(uid: u32, pid: i32, socket_path: PathBuf) -> Option<Self> {
+        let fd = pidfd_open(pid)?;
+        Some(Self {
+            uid,
+            pid,
+            socket_path,
+            pidfd: Some(std::sync::Arc::new(PidFdOwner { fd })),
+        })
+    }
+
+    /// Verify the peer process bound to this principal is still alive.
+    ///
+    /// On Linux: when a pidfd was successfully opened at accept time,
+    /// `poll(pidfd, POLLIN, 0)` is consulted. POLLIN on a pidfd fires
+    /// once the kernel has reaped the process, so a `revents` with
+    /// `POLLIN` set is the signal that the bound process is dead. A
+    /// dead-or-reaped principal returns `false` — broker handlers refuse
+    /// the call with the dedicated error code.
+    ///
+    /// Falls back to `true` when no pidfd is bound (pre-5.3 kernel,
+    /// pidfd_open failed at accept time, or this principal was built
+    /// via `new()` for tests / Internal dispatch). In that case the
+    /// daemon retains only the bare-PID guarantee — reuse-immunity is
+    /// not available, matching the legacy posture.
+    ///
+    /// On macOS and other non-Linux targets: always returns `true`. The
+    /// peercred-binding gate (uid match) still runs; the pidfd-backed
+    /// reuse-immunity surface is Linux-only.
+    #[cfg(target_os = "linux")]
+    pub fn is_alive(&self) -> bool {
+        let Some(owner) = self.pidfd.as_ref() else {
+            // No pidfd bound — caller gets only the bare-PID guarantee.
+            return true;
+        };
+        let mut pfd = libc::pollfd {
+            fd: owner.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `poll` reads/writes the single pollfd we pass in;
+        // `nfds = 1` matches the slice we provide; `timeout = 0` makes
+        // the call non-blocking. The fd is owned by `self` for the
+        // duration of the call.
+        let n = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, 0) };
+        if n < 0 {
+            // poll() itself failed — fail-closed: treat the principal
+            // as not-alive so the broker refuses the call rather than
+            // honoring a request whose liveness we cannot verify.
+            let err = std::io::Error::last_os_error();
+            tracing::warn!(
+                pid = self.pid,
+                error = %err,
+                "PeerCredPrincipal::is_alive: poll() failed — treating principal as dead"
+            );
+            return false;
+        }
+        if n == 0 {
+            // Timeout (with 0ms): no events ready, process still alive.
+            return true;
+        }
+        // n > 0 — some event fired. POLLIN on a pidfd is the
+        // "process has exited" signal; POLLHUP / POLLERR also indicate
+        // a dead pidfd. Any revents bit on a pidfd means the bound
+        // process is no longer live.
+        let dead = pfd.revents
+            & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)
+            != 0;
+        if dead {
+            tracing::warn!(
+                pid = self.pid,
+                uid = self.uid,
+                revents = pfd.revents,
+                "PeerCredPrincipal::is_alive: pidfd signals reaped/dead process — refusing"
+            );
+        }
+        !dead
+    }
+
+    /// Non-Linux stub — no reuse protection available.
+    #[cfg(not(target_os = "linux"))]
+    pub fn is_alive(&self) -> bool {
+        true
+    }
 }
 
 /// Return the daemon's effective uid. Separate from `socket::daemon_euid`
@@ -292,7 +624,7 @@ pub struct DaemonRuntime {
     /// Path the config was loaded from — used for the vault identity warning in `run()`.
     /// `None` when config came from defaults (no file on disk).
     config_path: Option<std::path::PathBuf>,
-    /// implementation-note-65: actual address the dashboard
+    /// implementation-note-139: actual address the dashboard
     /// listener bound to (`Some(addr)`) or absent when the dashboard is
     /// disabled / failed to bind / timed out (`None`). Populated from inside
     /// `run()` after the bind result arrives. `Mutex` (not `RefCell`)
@@ -335,7 +667,7 @@ impl DaemonRuntime {
         self.config.ensure_dirs()?;
         self.pid_file.write()?;
 
-        // implementation-note-58 fix: install the rustls process-wide
+        // implementation-note-124 fix: install the rustls process-wide
         // CryptoProvider once at daemon startup. Both the LLM proxy
         // (`run_proxy`) and the git-echo proxy (`run_git_echo_proxy`) call
         // `HttpsConnectorBuilder::with_webpki_roots()` which panics on the
@@ -351,7 +683,7 @@ impl DaemonRuntime {
         info!(pid = std::process::id(), socket = %socket_path.display(), "ember daemon starting");
         // CLI-VERSION-FLAG: log the binary's compile-time version + git SHA +
         // build timestamp at INFO so a stale binary running against a newer
-        // codebase (the implementation-note-41 root cause) is
+        // codebase (the implementation-note-79 root cause) is
         // identifiable in seconds via `tail daemon.log`. Also surfaces the
         // `(no-git)` fallback if the build script ran without a working repo.
         info!(
@@ -385,7 +717,60 @@ impl DaemonRuntime {
         let db_path = self.config.data_dir.join("daemon.db");
         let store = Rc::new(DaemonStore::open(&db_path)?);
 
+        // implementation-note-164 (D): startup sampling verify.
+        // Walk the last 1000 rows of the audit chain. On Break, flip the
+        // process-global quarantine latch and refuse to enter normal-serve.
+        // The quarantine latch causes every write-class socket method to
+        // return a `Quarantined` error while read-class methods (audit
+        // queries, ping, health) still proceed — operators can diagnose
+        // without extending the tampered chain.
+        //
+        // A verifier-internal error (SQL failure, empty DB before migration
+        // landed) is NOT a chain break — log a warning and continue. The
+        // verifier only quarantines on a confirmed `VerifyOutcome::Break`.
+        match crate::infra::audit::run_audit_verify(store.conn(), Some(1000)) {
+            Ok(crate::infra::audit::VerifyOutcome::Ok { rows_walked }) => {
+                tracing::info!(
+                    rows_walked,
+                    "implementation-note-164: audit chain startup sample verify ok"
+                );
+            }
+            Ok(crate::infra::audit::VerifyOutcome::Break {
+                at_row_id,
+                expected_hash,
+                stored_hash,
+                rows_walked_before,
+            }) => {
+                let reason = format!(
+                    "audit chain break at row {at_row_id} (walked {rows_walked_before} before): \
+                     expected {expected_hash}, stored {stored_hash:?}"
+                );
+                tracing::error!(
+                    at_row_id,
+                    expected_hash = %expected_hash,
+                    ?stored_hash,
+                    rows_walked_before,
+                    "implementation-note-164: audit-chain TAMPER DETECTED at startup; \
+                     entering quarantine and refusing normal-serve"
+                );
+                crate::infra::handler::enter_quarantine(reason.clone());
+                return Err(DaemonError::AuditChainBreak(reason));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "implementation-note-164: audit chain startup verify could not \
+                     run (pre-migration DB or SQL failure); skipping (NOT entering quarantine)"
+                );
+            }
+        }
+
         // PATH-PINNING-STARTUP-VERIFY: daemon refuses startup on manifest sig mismatch.
+        // implementation-note-83: the loaded
+        // manifest is also installed into the process-global
+        // `broker::handler::MANIFEST` so every per-connection broker
+        // handler can verify the peer binary against it without
+        // re-reading the TOML.
         {
             let manifest_path = std::env::var("HOME")
                 .map(|home| {
@@ -424,10 +809,41 @@ impl DaemonRuntime {
                         std::process::exit(2);
                     }
                 }
+
+                // Signature verified — load + install the manifest so the
+                // broker handlers' peer-binary pin gate
+                // (`check_peer_binary_pinned`) can consult it. A parse
+                // failure here is non-fatal: the signature gate above
+                // already proved authenticity, and an empty manifest
+                // simply leaves pin verification "disabled" (Ok(()) for
+                // every peer) for the rest of this daemon run.
+                match crate::binary_manifest::load_manifest(&manifest_path) {
+                    Ok(manifest) => {
+                        let entry_count = manifest.entries.len();
+                        crate::broker::handler::install_manifest(manifest);
+                        tracing::info!(
+                            manifest = %manifest_path.display(),
+                            entries = entry_count,
+                            "binary manifest installed — peer-binary pin gate active"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            manifest = %manifest_path.display(),
+                            error = %e,
+                            "binary manifest: load failed after signature verify — peer-binary pin gate disabled"
+                        );
+                    }
+                }
+            } else {
+                tracing::debug!(
+                    manifest = %manifest_path.display(),
+                    "binary manifest: not present on disk — peer-binary pin gate disabled"
+                );
             }
         }
 
-        // implementation-note-124: auto-unseal the vault from the system keyring. The
+        // implementation-note-214: auto-unseal the vault from the system keyring. The
         // helper's contract: it succeeds only if a keyring entry already
         // exists (or `EMBER_VAULT_PASSPHRASE` is set) — never auto-provisions
         // on daemon start so a wiped keyring can't silently mint a fresh
@@ -464,7 +880,14 @@ impl DaemonRuntime {
         // every persona row is vault-sealed from inception.
         store.set_vault(Rc::clone(&vault));
 
-        // implementation-note-124: emit an audit event for the auto-unseal so operators
+        // implementation-note-23 C2: register the store with the
+        // presence module so an explicit `vault_lock` RPC drops the
+        // attached `Rc<Vault>` (hard-lock semantics — MEK cleared).
+        // Idle auto-lock keeps the vault Rc'd (soft-lock — headless
+        // survives the idle window).
+        crate::trust::presence::register_store(Rc::clone(&store));
+
+        // implementation-note-214: emit an audit event for the auto-unseal so operators
         // running `audit show` see exactly when (and how) the vault came
         // online. Failures here are non-fatal — the audit log is for
         // observability, not correctness.
@@ -500,7 +923,7 @@ impl DaemonRuntime {
                     fingerprint = %fingerprint,
                     "daemon identity key loaded"
                 );
-                // implementation-note-68 — emit a structured
+                // implementation-note-142 — emit a structured
                 // operator-facing log line that the demo teardown
                 // script (and any future tooling) can grep without
                 // re-deriving the fingerprint or hitting an HTTP
@@ -516,14 +939,22 @@ impl DaemonRuntime {
                 );
             }
             Err(e) => {
-                tracing::warn!(
+                // implementation-note-164 (E) / F-S5-013 HIGH:
+                // fail-closed at startup. Receipts are load-bearing for
+                // the audit chain (signed evidence) and the broker
+                // (credential-access proof); a daemon that boots without
+                // a signing identity silently produces state nothing
+                // downstream can verify. Refuse to enter normal-serve.
+                tracing::error!(
                     error = %e,
-                    "daemon identity key unavailable — receipts will not be emitted"
+                    "implementation-note-164 (F-S5-013): daemon identity key \
+                     unavailable; refusing startup (fail-closed)"
                 );
+                return Err(DaemonError::IdentityInitFailed(e.to_string()));
             }
         }
 
-        // implementation-note-125 (design sub-piece D): construct the
+        // implementation-note-215 (design sub-piece D): construct the
         // pluggable `CredentialStore` trait object from the
         // `[credential_store]` config section. Defaults to the
         // `LocalEncryptedStore` (which adapts the existing Vault) when
@@ -534,12 +965,12 @@ impl DaemonRuntime {
         let cred_store: Arc<dyn crate::infra::credential_store::CredentialStore> =
             match &self.config.credential_store {
                 None => Arc::new(crate::infra::credential_store::LocalEncryptedStore::new(
-                    Arc::new((*vault).clone()),
+                    Rc::clone(&vault),
                     Rc::clone(&store),
                 )),
                 Some(cs) if cs.backend == "local" => {
                     Arc::new(crate::infra::credential_store::LocalEncryptedStore::new(
-                        Arc::new((*vault).clone()),
+                        Rc::clone(&vault),
                         Rc::clone(&store),
                     ))
                 }
@@ -599,7 +1030,7 @@ impl DaemonRuntime {
                             }
                         }
                         "aws" => {
-                            // implementation-note-39: AWS IAM auth.
+                            // implementation-note-75: AWS IAM auth.
                             // Daemon proves its surrounding AWS IAM
                             // identity (env vars / instance metadata
                             // / IRSA / ECS task role / Fargate) via a
@@ -616,7 +1047,7 @@ impl DaemonRuntime {
                             HashiVaultAuth::Aws { role }
                         }
                         "hcp-service-principal" => {
-                            // implementation-note-60: HashiCorp Cloud
+                            // implementation-note-127: HashiCorp Cloud
                             // Platform service-principal auth. Exchange
                             // (client_id, client_secret) at HCP IdP's
                             // OAuth2 client_credentials endpoint for an
@@ -713,10 +1144,10 @@ impl DaemonRuntime {
             backend_name
         );
 
-        // implementation-note-47 (design Phase 2): install the credential
+        // implementation-note-94 (design Phase 2): install the credential
         // broker registry. Real provider implementations replace
         // `MockBroker` as their downstream tasks ship — currently the
-        // GitHub App broker is wired (T-CONSTRUCT-DAEMON-GH-implementation-note-126);
+        // GitHub App broker is wired (T-CONSTRUCT-DAEMON-GH-implementation-note-216);
         // Anthropic and Cloudflare follow. Calling `install_registry`
         // multiple times is a no-op after the first call (`OnceCell`).
         {
@@ -727,27 +1158,81 @@ impl DaemonRuntime {
             };
             let mut registry = crate::broker::handler::BrokerRegistry::new();
 
+            // implementation-note-93: precedence-flag for the
+            // file/vault lookup order in each provider block below.
+            //
+            // - `EMBER_VAULT_FIRST=1` → vault-first (try the
+            //   credential store first, fall back to the env-file
+            //   loader on store-miss / store-error). This is the
+            //   eventual steady-state.
+            // - default (unset or any other value) → file-first
+            //   during Phase 1 of the cutover. Operators who have
+            //   not migrated their env files into the vault keep
+            //   working without surprise; the vault still serves as
+            //   the fallback when the env file is absent so the
+            //   migration-in-progress posture is preserved.
+            //
+            // File-fallback (and its inverse, vault-fallback) stays
+            // load-bearing in both orderings — the flag only swaps
+            // which lane gets first attempt.
+            let vault_first = std::env::var("EMBER_VAULT_FIRST")
+                .ok()
+                .as_deref()
+                == Some("1");
+            info!(
+                vault_first = vault_first,
+                "credential precedence: {} (EMBER_VAULT_FIRST={})",
+                if vault_first { "vault-first" } else { "file-first" },
+                if vault_first { "1" } else { "unset/0" },
+            );
+
             // GitHub: real broker when ~/.config/emberlink/ember-engine.{env,pem}
             // exist; MockBroker fallback otherwise so dev hosts without
             // GH App config still answer broker_issue without a panic.
             //
-            // implementation-note-125: try the credential-store path first;
-            // fall back to the env-file loader on store-miss / store-error so
-            // operators who haven't migrated keep working.
-            let github_from_store = crate::broker::github_config::github_config_from_store(
-                &*cred_store,
-            )
-            .await;
-            let github_creds = match github_from_store {
-                Ok(Some(c)) => Ok(Some(c)),
-                Ok(None) => crate::broker::github_config::load_gh_app_credentials(),
-                Err(e) => {
-                    tracing::warn!(
-                        provider = "github",
-                        error = %e,
-                        "broker: github credential-store read failed; falling back to env file"
-                    );
-                    crate::broker::github_config::load_gh_app_credentials()
+            // implementation-note-215 + implementation-note-93:
+            // try the higher-priority lane first (per `vault_first`),
+            // fall back to the other lane so operators who haven't
+            // migrated keep working.
+            let github_creds = if vault_first {
+                let github_from_store =
+                    crate::broker::github_config::github_config_from_store(&*cred_store).await;
+                match github_from_store {
+                    Ok(Some(c)) => Ok(Some(c)),
+                    Ok(None) => crate::broker::github_config::load_gh_app_credentials(),
+                    Err(e) => {
+                        tracing::warn!(
+                            provider = "github",
+                            error = %e,
+                            "broker: github credential-store read failed; falling back to env file"
+                        );
+                        crate::broker::github_config::load_gh_app_credentials()
+                    }
+                }
+            } else {
+                // File-first (Phase 1 default): try the env-file loader
+                // first; if it returns `None`, fall through to the
+                // credential store.
+                match crate::broker::github_config::load_gh_app_credentials() {
+                    Ok(Some(c)) => Ok(Some(c)),
+                    Ok(None) => {
+                        match crate::broker::github_config::github_config_from_store(
+                            &*cred_store,
+                        )
+                        .await
+                        {
+                            Ok(opt) => Ok(opt),
+                            Err(e) => {
+                                tracing::warn!(
+                                    provider = "github",
+                                    error = %e,
+                                    "broker: github credential-store fallback read failed; treating as absent"
+                                );
+                                Ok(None)
+                            }
+                        }
+                    }
+                    Err(e) => Err(e),
                 }
             };
             match github_creds {
@@ -781,21 +1266,39 @@ impl DaemonRuntime {
             // MockBroker fallback otherwise so dev hosts without AWS
             // config still answer broker_issue without a panic.
             //
-            // implementation-note-125: store-first, env-fallback.
-            let aws_creds = match crate::broker::aws_sts_config::aws_sts_config_from_store(
-                &*cred_store,
-            )
-            .await
-            {
-                Ok(Some(c)) => Some(c),
-                Ok(None) => crate::broker::aws_sts_config::load_aws_sts_credentials(),
-                Err(e) => {
-                    tracing::warn!(
-                        provider = "aws_sts",
-                        error = %e,
-                        "broker: aws_sts credential-store read failed; falling back to env file"
-                    );
-                    crate::broker::aws_sts_config::load_aws_sts_credentials()
+            // implementation-note-215 + implementation-note-93:
+            // honor `vault_first` precedence.
+            let aws_creds = if vault_first {
+                match crate::broker::aws_sts_config::aws_sts_config_from_store(&*cred_store).await {
+                    Ok(Some(c)) => Some(c),
+                    Ok(None) => crate::broker::aws_sts_config::load_aws_sts_credentials(),
+                    Err(e) => {
+                        tracing::warn!(
+                            provider = "aws_sts",
+                            error = %e,
+                            "broker: aws_sts credential-store read failed; falling back to env file"
+                        );
+                        crate::broker::aws_sts_config::load_aws_sts_credentials()
+                    }
+                }
+            } else {
+                match crate::broker::aws_sts_config::load_aws_sts_credentials() {
+                    Some(c) => Some(c),
+                    None => match crate::broker::aws_sts_config::aws_sts_config_from_store(
+                        &*cred_store,
+                    )
+                    .await
+                    {
+                        Ok(opt) => opt,
+                        Err(e) => {
+                            tracing::warn!(
+                                provider = "aws_sts",
+                                error = %e,
+                                "broker: aws_sts credential-store fallback read failed; treating as absent"
+                            );
+                            None
+                        }
+                    },
                 }
             };
             match aws_creds {
@@ -820,8 +1323,9 @@ impl DaemonRuntime {
             // MockBroker fallback otherwise so dev hosts without GCP
             // config still answer broker_issue without a panic.
             //
-            // implementation-note-125: store-first, env-fallback.
-            let gcp_creds =
+            // implementation-note-215 + implementation-note-93:
+            // honor `vault_first` precedence.
+            let gcp_creds = if vault_first {
                 match crate::broker::gcp_config::gcp_config_from_store(&*cred_store).await {
                     Ok(Some(c)) => Some(c),
                     Ok(None) => crate::broker::gcp_config::load_gcp_credentials(),
@@ -833,7 +1337,25 @@ impl DaemonRuntime {
                         );
                         crate::broker::gcp_config::load_gcp_credentials()
                     }
-                };
+                }
+            } else {
+                match crate::broker::gcp_config::load_gcp_credentials() {
+                    Some(c) => Some(c),
+                    None => match crate::broker::gcp_config::gcp_config_from_store(&*cred_store)
+                        .await
+                    {
+                        Ok(opt) => opt,
+                        Err(e) => {
+                            tracing::warn!(
+                                provider = "gcp",
+                                error = %e,
+                                "broker: gcp credential-store fallback read failed; treating as absent"
+                            );
+                            None
+                        }
+                    },
+                }
+            };
             match gcp_creds {
                 Some((key, default_target)) => {
                     registry.register(Box::new(GcpBroker::new(key, default_target)));
@@ -857,21 +1379,39 @@ impl DaemonRuntime {
             // so dev hosts without Azure config still answer
             // broker_issue without a panic.
             //
-            // implementation-note-125: store-first, env-fallback.
-            let azure_creds = match crate::broker::azure_config::azure_config_from_store(
-                &*cred_store,
-            )
-            .await
-            {
-                Ok(Some(c)) => Some(c),
-                Ok(None) => crate::broker::azure_config::load_azure_credentials(),
-                Err(e) => {
-                    tracing::warn!(
-                        provider = "azure_cli",
-                        error = %e,
-                        "broker: azure credential-store read failed; falling back to env file"
-                    );
-                    crate::broker::azure_config::load_azure_credentials()
+            // implementation-note-215 + implementation-note-93:
+            // honor `vault_first` precedence.
+            let azure_creds = if vault_first {
+                match crate::broker::azure_config::azure_config_from_store(&*cred_store).await {
+                    Ok(Some(c)) => Some(c),
+                    Ok(None) => crate::broker::azure_config::load_azure_credentials(),
+                    Err(e) => {
+                        tracing::warn!(
+                            provider = "azure_cli",
+                            error = %e,
+                            "broker: azure credential-store read failed; falling back to env file"
+                        );
+                        crate::broker::azure_config::load_azure_credentials()
+                    }
+                }
+            } else {
+                match crate::broker::azure_config::load_azure_credentials() {
+                    Some(c) => Some(c),
+                    None => match crate::broker::azure_config::azure_config_from_store(
+                        &*cred_store,
+                    )
+                    .await
+                    {
+                        Ok(opt) => opt,
+                        Err(e) => {
+                            tracing::warn!(
+                                provider = "azure_cli",
+                                error = %e,
+                                "broker: azure credential-store fallback read failed; treating as absent"
+                            );
+                            None
+                        }
+                    },
                 }
             };
             match azure_creds {
@@ -896,8 +1436,9 @@ impl DaemonRuntime {
             // dev hosts without Fly config still answer broker_issue
             // without a panic.
             //
-            // implementation-note-125: store-first, env-fallback.
-            let fly_creds =
+            // implementation-note-215 + implementation-note-93:
+            // honor `vault_first` precedence.
+            let fly_creds = if vault_first {
                 match crate::broker::fly_config::fly_config_from_store(&*cred_store).await {
                     Ok(Some(c)) => Some(c),
                     Ok(None) => crate::broker::fly_config::load_fly_credentials(),
@@ -909,7 +1450,25 @@ impl DaemonRuntime {
                         );
                         crate::broker::fly_config::load_fly_credentials()
                     }
-                };
+                }
+            } else {
+                match crate::broker::fly_config::load_fly_credentials() {
+                    Some(c) => Some(c),
+                    None => match crate::broker::fly_config::fly_config_from_store(&*cred_store)
+                        .await
+                    {
+                        Ok(opt) => opt,
+                        Err(e) => {
+                            tracing::warn!(
+                                provider = "fly_io",
+                                error = %e,
+                                "broker: fly credential-store fallback read failed; treating as absent"
+                            );
+                            None
+                        }
+                    },
+                }
+            };
             match fly_creds {
                 Some(parent) => {
                     registry.register(Box::new(FlyBroker::new(parent)));
@@ -933,8 +1492,9 @@ impl DaemonRuntime {
             // without Vault config still answer broker_issue without a
             // panic.
             //
-            // implementation-note-125: store-first, env-fallback.
-            let hashivault_creds =
+            // implementation-note-215 + implementation-note-93:
+            // honor `vault_first` precedence.
+            let hashivault_creds = if vault_first {
                 match crate::broker::hashivault_config::hashivault_config_from_store(&*cred_store)
                     .await
                 {
@@ -948,7 +1508,27 @@ impl DaemonRuntime {
                         );
                         crate::broker::hashivault_config::load_hashivault_credentials()
                     }
-                };
+                }
+            } else {
+                match crate::broker::hashivault_config::load_hashivault_credentials() {
+                    Some(c) => Some(c),
+                    None => match crate::broker::hashivault_config::hashivault_config_from_store(
+                        &*cred_store,
+                    )
+                    .await
+                    {
+                        Ok(opt) => opt,
+                        Err(e) => {
+                            tracing::warn!(
+                                provider = "hashi_vault",
+                                error = %e,
+                                "broker: hashivault credential-store fallback read failed; treating as absent"
+                            );
+                            None
+                        }
+                    },
+                }
+            };
             match hashivault_creds {
                 Some(parent) => {
                     registry.register(Box::new(HashiVaultBroker::new(parent)));
@@ -973,8 +1553,9 @@ impl DaemonRuntime {
             // dev hosts without Okta config still answer broker_issue
             // without a panic.
             //
-            // implementation-note-125: store-first, env-fallback.
-            let okta_creds =
+            // implementation-note-215 + implementation-note-93:
+            // honor `vault_first` precedence.
+            let okta_creds = if vault_first {
                 match crate::broker::okta_config::okta_config_from_store(&*cred_store).await {
                     Ok(Some(c)) => Some(c),
                     Ok(None) => crate::broker::okta_config::load_okta_credentials(),
@@ -986,7 +1567,25 @@ impl DaemonRuntime {
                         );
                         crate::broker::okta_config::load_okta_credentials()
                     }
-                };
+                }
+            } else {
+                match crate::broker::okta_config::load_okta_credentials() {
+                    Some(c) => Some(c),
+                    None => match crate::broker::okta_config::okta_config_from_store(&*cred_store)
+                        .await
+                    {
+                        Ok(opt) => opt,
+                        Err(e) => {
+                            tracing::warn!(
+                                provider = "okta",
+                                error = %e,
+                                "broker: okta credential-store fallback read failed; treating as absent"
+                            );
+                            None
+                        }
+                    },
+                }
+            };
             match okta_creds {
                 Some(app) => {
                     registry.register(Box::new(OktaBroker::new(app)));
@@ -1009,8 +1608,9 @@ impl DaemonRuntime {
             // dev hosts without Vercel config still answer broker_issue
             // without a panic.
             //
-            // implementation-note-125: store-first, env-fallback.
-            let vercel_creds =
+            // implementation-note-215 + implementation-note-93:
+            // honor `vault_first` precedence.
+            let vercel_creds = if vault_first {
                 match crate::broker::vercel_config::vercel_config_from_store(&*cred_store).await {
                     Ok(Some(c)) => Some(c),
                     Ok(None) => crate::broker::vercel_config::load_vercel_credentials(),
@@ -1022,7 +1622,27 @@ impl DaemonRuntime {
                         );
                         crate::broker::vercel_config::load_vercel_credentials()
                     }
-                };
+                }
+            } else {
+                match crate::broker::vercel_config::load_vercel_credentials() {
+                    Some(c) => Some(c),
+                    None => match crate::broker::vercel_config::vercel_config_from_store(
+                        &*cred_store,
+                    )
+                    .await
+                    {
+                        Ok(opt) => opt,
+                        Err(e) => {
+                            tracing::warn!(
+                                provider = "vercel",
+                                error = %e,
+                                "broker: vercel credential-store fallback read failed; treating as absent"
+                            );
+                            None
+                        }
+                    },
+                }
+            };
             match vercel_creds {
                 Some(parent) => {
                     registry.register(Box::new(VercelBroker::new(parent)));
@@ -1121,7 +1741,7 @@ impl DaemonRuntime {
             }
         });
 
-        // implementation-note-72 — background sweep marks pending
+        // implementation-note-147 — background sweep marks pending
         // approvals older than `stale_approval_threshold_secs` as `timed_out`.
         // Runs every 60 seconds. Complements the startup sweep (line ~261) which
         // only catches requests left pending from prior sessions. This sweep
@@ -1141,7 +1761,7 @@ impl DaemonRuntime {
             }
         });
 
-        // implementation-note-127 — session heartbeat + TTL watcher.
+        // implementation-note-217 — session heartbeat + TTL watcher.
         // Runs every 60 s. Closes orphaned sessions (launcher PID dead > 5 min)
         // and sessions whose grant is past the 24-hour TTL backstop.
         let session_store_clone = Rc::clone(&store);
@@ -1189,7 +1809,7 @@ impl DaemonRuntime {
             }
         }
 
-        // implementation-note-59 — periodic cluster snapshot pull task.
+        // implementation-note-125 — periodic cluster snapshot pull task.
         // Runs every `snapshot_pull_interval_secs` (default 600, i.e. 10 min).
         // Only active when both `snapshot_pull_endpoint` and
         // `snapshot_pull_cluster_id` are configured. On each tick it calls
@@ -1210,7 +1830,11 @@ impl DaemonRuntime {
                     // the EIC's pubkey here; for the dev0 default we use the same
                     // identity key since both daemons share the same IdentityRoot.
                     let eic_pubkey_hex = identity.pubkey_hex();
-                    let pull_vault: crate::infra::vault::Vault = (*Rc::clone(&vault)).clone();
+                    // implementation-note-137: share Rc<Vault> with the
+                    // snapshot-pull task instead of cloning the MEK byte-array.
+                    // `SnapshotPuller::maybe_pull` takes `&Vault`; the move
+                    // closure below borrows via `&*pull_vault`.
+                    let pull_vault: Rc<crate::infra::vault::Vault> = Rc::clone(&vault);
                     let pull_store_path = self.config.data_dir.join("daemon.db");
                     let puller =
                         Rc::new(crate::snapshot::SnapshotPuller::new(pull_interval));
@@ -1234,7 +1858,7 @@ impl DaemonRuntime {
                                     &pull_endpoint,
                                     &pull_cluster_id,
                                     &eic_pubkey_hex,
-                                    &pull_vault,
+                                    &*pull_vault,
                                     &pull_store,
                                 )
                                 .await
@@ -1281,12 +1905,13 @@ impl DaemonRuntime {
                 let version = env!("CARGO_PKG_VERSION").to_string();
                 let dashboard_shutdown = shutdown_tx.subscribe();
                 let (bind_tx, bind_rx) = oneshot::channel();
-                // implementation-note-38 follow-up: hand the dashboard task its
-                // own clone of the vault so its separate DaemonStore can
-                // decrypt persona secrets when the WebAuthn-attested
-                // approve path mints composite-grant chains. Mirrors the
-                // git-echo proxy pattern below.
-                let dashboard_vault: Vault = (*vault).clone();
+                // implementation-note-74 follow-up + implementation-note-137:
+                // share the Rc<Vault> with the dashboard task (cheap
+                // ref-count bump) instead of cloning the MEK byte-array
+                // by-value. The dashboard's DaemonStore receives the same
+                // Rc<Vault> so decrypt of persona secrets works for the
+                // WebAuthn-attested approve path.
+                let dashboard_vault = std::rc::Rc::clone(&vault);
                 local.spawn_local(run_dashboard(
                     dashboard_addr,
                     db_path,
@@ -1300,7 +1925,7 @@ impl DaemonRuntime {
                 None
             };
 
-        // implementation-note-57: spawn the git-echo credential-injection proxy if
+        // implementation-note-123: spawn the git-echo credential-injection proxy if
         // configured. Bind result is captured via a oneshot channel and
         // driven below alongside the dashboard's. Each proxy task gets its
         // own DaemonStore (rusqlite Connection is !Send) and a clone of the
@@ -1311,8 +1936,13 @@ impl DaemonRuntime {
                 let proxy_db_path = self.config.data_dir.join("daemon.db");
                 let proxy_shutdown = shutdown_tx.subscribe();
                 let (bind_tx, bind_rx) = oneshot::channel::<Result<SocketAddr, std::io::Error>>();
-                let proxy_vault: Vault = (*vault).clone();
-                // implementation-note-57 marker: spawn_local run_git_echo_proxy via this LocalSet.
+                // implementation-note-137: share Rc<Vault> with the
+                // git-proxy task. Previously cloned the Vault by-value AND
+                // again wrapped in Rc::new — three MEK byte-arrays per
+                // proxy spawn. Now one Rc<Vault> handed through both
+                // store.set_vault and ProxyState::new.
+                let proxy_vault = std::rc::Rc::clone(&vault);
+                // implementation-note-123 marker: spawn_local run_git_echo_proxy via this LocalSet.
                 local.spawn_local(async move {
                     let store = match crate::infra::store::DaemonStore::open(&proxy_db_path) {
                         Ok(s) => s,
@@ -1331,13 +1961,12 @@ impl DaemonRuntime {
                     // the Arc is used only within this LocalSet (single-threaded runtime),
                     // mirroring run_proxy / run_git_echo_proxy themselves.
                     //
-                    // implementation-note-22: attach the vault to this fresh
+                    // implementation-note-32: attach the vault to this fresh
                     // store. Without this, increment_statement_usage's re-sign of
                     // block 0 calls persona_root_keypair → self.vault() → None →
                     // "no vault is attached", silently dropping every meter delta
                     // and breaking budget enforcement at the wire.
-                    let proxy_store_vault = Rc::new(proxy_vault.clone());
-                    store.set_vault(Rc::clone(&proxy_store_vault));
+                    store.set_vault(Rc::clone(&proxy_vault));
                     #[allow(clippy::arc_with_non_send_sync)]
                     let state = std::sync::Arc::new(crate::infra::proxy::ProxyState::new(store, proxy_vault));
                     let cfg = crate::infra::proxy::GitEchoConfig {
@@ -1361,7 +1990,7 @@ impl DaemonRuntime {
                 None
             };
 
-        // implementation-note-58: spawn the general LLM/HTTP credential-
+        // implementation-note-124: spawn the general LLM/HTTP credential-
         // injection proxy (`run_proxy` — provider-aware auth, X-Ember-* header
         // protocol). This is the listener the Anthropic SDK demo posts to via
         // `base_url=$EMBER_PROXY_URL`; previously `run_proxy` was defined but
@@ -1373,7 +2002,9 @@ impl DaemonRuntime {
                 let proxy_db_path = self.config.data_dir.join("daemon.db");
                 let proxy_shutdown = shutdown_tx.subscribe();
                 let (bind_tx, bind_rx) = oneshot::channel::<Result<SocketAddr, std::io::Error>>();
-                let proxy_vault: Vault = (*vault).clone();
+                // implementation-note-137: same Rc<Vault> sharing
+                // pattern as the git-proxy spawn block above.
+                let proxy_vault = std::rc::Rc::clone(&vault);
                 local.spawn_local(async move {
                     let store = match crate::infra::store::DaemonStore::open(&proxy_db_path) {
                         Ok(s) => s,
@@ -1385,12 +2016,11 @@ impl DaemonRuntime {
                             return;
                         }
                     };
-                    // implementation-note-22: attach vault to the fresh store
+                    // implementation-note-32: attach vault to the fresh store
                     // so increment_statement_usage's block-0 re-sign can read the
                     // issuing persona's root keypair (vault-sealed). Same fix as
                     // the git-echo proxy spawn block above.
-                    let proxy_store_vault = Rc::new(proxy_vault.clone());
-                    store.set_vault(Rc::clone(&proxy_store_vault));
+                    store.set_vault(Rc::clone(&proxy_vault));
                     #[allow(clippy::arc_with_non_send_sync)]
                     let state = std::sync::Arc::new(crate::infra::proxy::ProxyState::new(store, proxy_vault));
                     let cfg = crate::infra::proxy::ProxyConfig {
@@ -1411,6 +2041,62 @@ impl DaemonRuntime {
             } else {
                 None
             };
+
+        // implementation-note-218: spawn the mTLS edge listener when the edge CA
+        // has been provisioned by `kms init-edge`. The CA is stored at
+        // `<data_dir>/kms/edge-ca/ca.seed` (32-byte raw Ed25519 seed).
+        // When absent, log and degrade gracefully — the loopback path remains
+        // fully operational. The listener binds on an OS-assigned port on the
+        // tailnet interface; the exact bind address will be configurable once
+        // the `kms init-edge` CLI command ships.
+        {
+            let edge_ca_seed_path = self.config.data_dir.join("kms").join("edge-ca").join("ca.seed");
+            if edge_ca_seed_path.exists() {
+                match std::fs::read(&edge_ca_seed_path) {
+                    Ok(bytes) if bytes.len() == 32 => {
+                        let mut seed = [0u8; 32];
+                        seed.copy_from_slice(&bytes);
+                        match core_crypto::ca::generate_edge_ca(Some(seed)) {
+                            Ok(edge_ca) => {
+                                let edge_ca = std::sync::Arc::new(edge_ca);
+                                // Bind on 0.0.0.0:0 for now (ephemeral port).
+                                // Phase 1 will add a config-driven tailnet bind address.
+                                let edge_bind: std::net::SocketAddr = "0.0.0.0:0".parse().expect("valid addr");
+                                tokio::spawn(async move {
+                                    match crate::infra::kms_edge::EdgeListener::spawn(edge_bind, edge_ca).await {
+                                        Ok(handle) => {
+                                            tracing::info!("edge listener spawned");
+                                            let _ = handle.await;
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(error = %e, "edge listener failed to start");
+                                        }
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "edge CA generation failed — edge listener skipped");
+                            }
+                        }
+                    }
+                    Ok(_) => {
+                        tracing::warn!(
+                            path = %edge_ca_seed_path.display(),
+                            "edge CA seed file has unexpected length — edge listener skipped (no edge CA)"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            path = %edge_ca_seed_path.display(),
+                            "failed to read edge CA seed — edge listener skipped (no edge CA)"
+                        );
+                    }
+                }
+            } else {
+                tracing::debug!("edge listener skipped (no edge CA)");
+            }
+        }
 
         // Drive the LocalSet until every startup bind result arrives (or times
         // out). This polls spawned tasks so run_dashboard / run_git_echo_proxy /
@@ -1481,7 +2167,7 @@ impl DaemonRuntime {
                 // launchers (qember.sh demo up) can pick the URL up after
                 // forking the daemon and exiting the parent.
                 //
-                // implementation-note-58: this URL now lives at
+                // implementation-note-124: this URL now lives at
                 // `EMBER_GIT_PROXY_URL` + `<data_dir>/run/git-proxy.url`. The
                 // bare `EMBER_PROXY_URL` and `proxy.url` names are claimed by
                 // the LLM proxy below — that is the listener the Anthropic
@@ -1561,7 +2247,7 @@ impl DaemonRuntime {
             (Some(_), None) => LlmProxyBind::Disabled,
         };
 
-        // implementation-note-88: extract the
+        // implementation-note-165: extract the
         // bound proxy URLs from the bind results and wire them into the
         // SocketListener. This makes the URLs available in RequestContext for
         // every inbound RPC without relying on std::env::var across tokio
@@ -1581,7 +2267,7 @@ impl DaemonRuntime {
             .with_llm_proxy_url(resolved_llm_proxy_url)
             .with_git_proxy_url(resolved_git_proxy_url);
 
-        // implementation-note-65: persist the resolved bind
+        // implementation-note-139: persist the resolved bind
         // address on the runtime so out-of-band readers (tests, future
         // introspection helpers) see the same truth as `/api/status`. Only
         // the `Bound` variant maps to `Some`; `Failed`/`Disabled`/`Timeout`
