@@ -16,8 +16,7 @@ const STATE_AAD: &[u8] = b"emberlink-local-state";
 pub fn encrypt_state(plaintext: &[u8], content_key: &str) -> Result<Vec<u8>, String> {
     let encrypted = core_crypto::encrypt_content(content_key, plaintext, STATE_AAD)
         .map_err(|e| e.to_string())?;
-    let nonce_bytes =
-        core_types::hex_to_bytes(&encrypted.nonce_hex).map_err(|e| e.to_string())?;
+    let nonce_bytes = core_types::hex_to_bytes(&encrypted.nonce_hex).map_err(|e| e.to_string())?;
     let mut out =
         Vec::with_capacity(ENCRYPTED_MAGIC.len() + nonce_bytes.len() + encrypted.ciphertext.len());
     out.extend_from_slice(ENCRYPTED_MAGIC);
@@ -36,7 +35,10 @@ pub fn decrypt_state(data: &[u8], content_key: &str) -> Result<Vec<u8>, String> 
     let nonce_hex =
         core_types::bytes_to_hex(&data[ENCRYPTED_MAGIC.len()..ENCRYPTED_MAGIC.len() + 24]);
     let ciphertext = data[ENCRYPTED_MAGIC.len() + 24..].to_vec();
-    let encrypted = EncryptedContent { nonce_hex, ciphertext };
+    let encrypted = EncryptedContent {
+        nonce_hex,
+        ciphertext,
+    };
     core_crypto::decrypt_content(content_key, &encrypted, STATE_AAD).map_err(|e| e.to_string())
 }
 
@@ -124,8 +126,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir()
-            .join(format!("emberlink-app-atomic-{unique}.enc"));
+        let path = std::env::temp_dir().join(format!("emberlink-app-atomic-{unique}.enc"));
         let name = path.file_name().unwrap().to_str().unwrap().to_string();
 
         atomic_write_bytes(&path, b"first").unwrap();

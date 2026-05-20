@@ -1,5 +1,5 @@
 //! Integration tests for `ember vault list/get/put/export/import`
-//! (implementation-note-276).
+//! (implementation-note-393).
 //!
 //! The argv-parsing surface lives in `bin/ember.rs`; the round-trip
 //! semantics live in `emberlink_cli::vault_io`. These tests exercise:
@@ -26,12 +26,12 @@
 
 use std::rc::Rc;
 
-use core_crypto::{generate_local_encryption_key_pair, LocalKeyPair};
+use core_crypto::{LocalKeyPair, generate_local_encryption_key_pair};
 use ember_daemon::infra::store::DaemonStore;
 use ember_daemon::infra::vault::{Vault, VaultScope};
 use emberlink_cli::vault_io::{
-    decode_import_envelope, encode_export_envelope, mask_credential_for_display,
-    VaultExportEnvelope,
+    VaultExportEnvelope, decode_import_envelope, encode_export_envelope,
+    mask_credential_for_display,
 };
 
 fn fresh_vault_and_store() -> (Vault, Rc<DaemonStore>) {
@@ -68,16 +68,26 @@ fn put_then_list_then_get_round_trip() {
 
     // Put — same path the `ember vault put` dispatch invokes.
     vault
-        .add(VaultScope::Interactive, &store, "azure/tenant-id", b"tnt-123-XYZQ", None)
+        .add(
+            VaultScope::Interactive,
+            &store,
+            "azure/tenant-id",
+            b"tnt-123-XYZQ",
+            None,
+        )
         .expect("put succeeded");
 
     // List should reflect the new entry.
-    let creds = vault.list(VaultScope::Interactive, &store).expect("list succeeded");
+    let creds = vault
+        .list(VaultScope::Interactive, &store)
+        .expect("list succeeded");
     assert_eq!(creds.len(), 1);
     assert_eq!(creds[0].name, "azure/tenant-id");
 
     // Get returns the raw bytes; default CLI behaviour masks them.
-    let raw = vault.get(VaultScope::Interactive, &store, "azure/tenant-id").expect("get succeeded");
+    let raw = vault
+        .get(VaultScope::Interactive, &store, "azure/tenant-id")
+        .expect("get succeeded");
     assert_eq!(raw, b"tnt-123-XYZQ");
     assert_eq!(mask_credential_for_display(&raw), "****XYZQ");
 }
@@ -107,7 +117,12 @@ fn put_refuses_value_argv_form() {
     }
 
     let parsed = Toy::try_parse_from([
-        "test", "put", "--name", "azure/tenant-id", "--value", "leaky",
+        "test",
+        "put",
+        "--name",
+        "azure/tenant-id",
+        "--value",
+        "leaky",
     ])
     .expect("clap should accept --value at parse-time");
 
@@ -132,9 +147,14 @@ fn export_import_round_trip() {
         ("anthropic/api-key", b"sk-anthropic-aaaa-bbbb".to_vec()),
     ];
     for (name, value) in &entries {
-        vault.add(VaultScope::Interactive, &store, name, value, None).expect("put");
+        vault
+            .add(VaultScope::Interactive, &store, name, value, None)
+            .expect("put");
     }
-    assert_eq!(vault.list(VaultScope::Interactive, &store).unwrap().len(), 3);
+    assert_eq!(
+        vault.list(VaultScope::Interactive, &store).unwrap().len(),
+        3
+    );
 
     // Read them back via `vault.list(VaultScope::Interactive, )` + `vault.get(VaultScope::Interactive, )`, exactly the
     // path the binary's `run_vault_export` follows.
@@ -144,9 +164,8 @@ fn export_import_round_trip() {
         let v = vault.get(VaultScope::Interactive, &store, &c.name).unwrap();
         pairs.push((c.name.clone(), v));
     }
-    let envelope =
-        encode_export_envelope(&kp.public_key, &pairs, "2026-05-10T00:00:00Z".into())
-            .expect("encode envelope");
+    let envelope = encode_export_envelope(&kp.public_key, &pairs, "2026-05-10T00:00:00Z".into())
+        .expect("encode envelope");
     assert_eq!(envelope.version, 1);
     assert_eq!(envelope.recipient, kp.public_key);
     assert_eq!(envelope.entries.len(), 3);
@@ -173,15 +192,22 @@ fn export_import_round_trip() {
     for (name, _) in &entries {
         vault.remove(VaultScope::Interactive, &store, name).unwrap();
     }
-    assert!(vault.list(VaultScope::Interactive, &store).unwrap().is_empty());
+    assert!(
+        vault
+            .list(VaultScope::Interactive, &store)
+            .unwrap()
+            .is_empty()
+    );
 
     // Decrypt every entry first (atomic-import contract); only on full
     // success do we `put` them back.
-    let decrypted = decode_import_envelope(&kp.private_key, &parsed)
-        .expect("decode envelope succeeded");
+    let decrypted =
+        decode_import_envelope(&kp.private_key, &parsed).expect("decode envelope succeeded");
     assert_eq!(decrypted.len(), 3);
     for (name, value) in decrypted {
-        vault.add(VaultScope::Interactive, &store, &name, &value, None).expect("re-put");
+        vault
+            .add(VaultScope::Interactive, &store, &name, &value, None)
+            .expect("re-put");
     }
 
     // Verify all three round-tripped byte-for-byte.
@@ -206,14 +232,17 @@ fn import_aborts_atomically_on_decrypt_failure() {
         encode_export_envelope(&kp.public_key, &pairs, "2026-05-10T00:00:00Z".into()).unwrap();
     // Inject a bogus armored entry — the AGE header is plausible but
     // the body is garbage so decrypt fails on this entry's turn.
-    envelope.entries.push(emberlink_cli::vault_io::VaultExportEntry {
-        name: "bad/key".to_string(),
-        value_age_armored: "-----BEGIN AGE ENCRYPTED FILE-----\nINVALID\n-----END AGE ENCRYPTED FILE-----\n".to_string(),
-    });
+    envelope
+        .entries
+        .push(emberlink_cli::vault_io::VaultExportEntry {
+            name: "bad/key".to_string(),
+            value_age_armored:
+                "-----BEGIN AGE ENCRYPTED FILE-----\nINVALID\n-----END AGE ENCRYPTED FILE-----\n"
+                    .to_string(),
+        });
 
-    let err = decode_import_envelope(&kp.private_key, &envelope).expect_err(
-        "tampered armored entry must fail before any plaintext is returned",
-    );
+    let err = decode_import_envelope(&kp.private_key, &envelope)
+        .expect_err("tampered armored entry must fail before any plaintext is returned");
     let msg = err.to_string();
     assert!(
         msg.contains("bad/key"),

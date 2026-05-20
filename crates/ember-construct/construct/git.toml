@@ -1,3 +1,5 @@
+# CLASSIFICATION: PUBLIC
+# construct_silence_override_catalog_v030_landed
 # Construct manifest for ember-git per design §2.
 # Action schema: each [[actions]] declares an allowed action_key, optional
 # budget caps, biometric requirement, and a permit/deny default. The daemon's
@@ -19,6 +21,7 @@ name = "ember-git"
 version = "0.1.0"
 publisher = "did:emberlink"
 description = "Git CLI Construct. Mediates destructive and credential-carrying `git` invocations through ember's broker: push mints a scoped installation token (contents:write); fetch/clone/pull mint a scoped installation token (contents:read) via URL rewrite for private-repo auth; force-push, reset --hard, clean -f, commit --amend, rebase -i, branch -D, and tag -d are gated (some budget-capped at 3/session with biometric confirmation). Read-only local verbs (status, log, diff, show, etc.) and safe local writes (commit, add, checkout, etc.) are passthrough — no broker mediation."
+authority_refs = ["github"]
 
 # Default policy for unlisted action keys.
 default = "deny"
@@ -86,3 +89,9 @@ default = "prompt"         # --aggressive or --prune=now; data loss risk
 [[actions]]
 key = "git.submodule.update"
 default = "permit"
+
+# --- silence-override catalog (design §C8 Knob 10) ---
+
+[actions.git-fetch]
+classify_argv = "fetch *"
+silence_timeout_secs = 300    # large fetches go quiet during pack-resolution

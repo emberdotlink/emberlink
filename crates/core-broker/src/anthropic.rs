@@ -3,7 +3,7 @@
 //! by setting `status=inactive` via `PATCH /v1/organizations/api_keys/<id>`.
 //!
 //! Phase 2 of design + design. The trait shape is async-by-default
-//! (per `implementation-note-7`); the HTTP transport itself is `ureq`
+//! (per `implementation-note-9`); the HTTP transport itself is `ureq`
 //! (sync) — each `issue` / `revoke` call is wrapped so the future
 //! returned by the trait method completes once the blocking call returns.
 //! This is acceptable here because the daemon runs broker calls on a
@@ -21,7 +21,10 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
-use crate::{Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential, BrokerUsage, UsagePeriod};
+use crate::{
+    Broker, BrokerError, BrokerProvider, BrokerRequest, BrokerUsage, BrokeredCredential,
+    UsagePeriod,
+};
 
 const DEFAULT_BASE: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -64,10 +67,17 @@ impl AnthropicBroker {
     /// Trailing slash is normalized off so the URL builder can append
     /// `/v1/...` paths uniformly.
     pub fn with_base_url(admin_token: SecretString, base_url: String) -> Self {
-        let http = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(10))
-            .timeout_read(Duration::from_secs(30))
-            .build();
+        // ureq v3: disable http_status_as_error so 4xx/5xx come back as
+        // Ok(Response) with a non-success status. The body-on-error
+        // surface below relies on reading the body after the call
+        // returns; the legacy v2 `Error::Status(code, r)` arm with
+        // body-read is gone (Error::StatusCode in v3 drops the body).
+        let http: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_connect(Some(Duration::from_secs(10)))
+            .timeout_recv_response(Some(Duration::from_secs(30)))
+            .http_status_as_error(false)
+            .build()
+            .into();
         Self {
             admin_token,
             http,
@@ -169,27 +179,30 @@ impl AnthropicBroker {
 
             let mut request = self.http.get(&url);
             for (k, v) in self.headers() {
-                request = request.set(k, &v);
+                request = request.header(k, &v);
             }
             let resp = request.call();
 
             let body_text = match resp {
-                Ok(r) => r
-                    .into_string()
-                    .map_err(|e| BrokerError::Upstream(format!("read usage body: {e}")))?,
-                Err(ureq::Error::Status(code, r)) => {
-                    let body = r.into_string().unwrap_or_default();
-                    return Err(BrokerError::Upstream(format!(
-                        "anthropic GET /v1/organizations/usage_report/messages returned {code}: {body}"
-                    )));
+                Ok(mut r) => {
+                    let status = r.status();
+                    let body = r
+                        .body_mut()
+                        .read_to_string()
+                        .map_err(|e| BrokerError::Upstream(format!("read usage body: {e}")))?;
+                    if !status.is_success() {
+                        return Err(BrokerError::Upstream(format!(
+                            "anthropic GET /v1/organizations/usage_report/messages returned {}: {body}",
+                            status.as_u16()
+                        )));
+                    }
+                    body
                 }
                 Err(e) => return Err(BrokerError::Upstream(format!("transport: {e}"))),
             };
 
             let page: UsageReportResponse = serde_json::from_str(&body_text).map_err(|e| {
-                BrokerError::Upstream(format!(
-                    "decode usage report: {e}; body={body_text}"
-                ))
+                BrokerError::Upstream(format!("decode usage report: {e}; body={body_text}"))
             })?;
 
             for rec in &page.results {
@@ -210,7 +223,12 @@ impl AnthropicBroker {
             }
         }
 
-        Ok((total_input, total_output, total_cache_read, total_cache_creation))
+        Ok((
+            total_input,
+            total_output,
+            total_cache_read,
+            total_cache_creation,
+        ))
     }
 }
 
@@ -258,25 +276,32 @@ impl Broker for AnthropicBroker {
 
         let mut request = self.http.post(&url);
         for (k, v) in self.headers() {
-            request = request.set(k, &v);
+            request = request.header(k, &v);
         }
         let resp = request.send_json(body);
 
         let body_text = match resp {
-            Ok(r) => r
-                .into_string()
-                .map_err(|e| BrokerError::Upstream(format!("read body: {e}")))?,
-            Err(ureq::Error::Status(code, r)) => {
-                let body = r.into_string().unwrap_or_default();
-                return Err(BrokerError::Upstream(format!(
-                    "anthropic POST /v1/organizations/api_keys returned {code}: {body}"
-                )));
+            Ok(mut r) => {
+                let status = r.status();
+                let body = r
+                    .body_mut()
+                    .read_to_string()
+                    .map_err(|e| BrokerError::Upstream(format!("read body: {e}")))?;
+                if !status.is_success() {
+                    return Err(BrokerError::Upstream(format!(
+                        "anthropic POST /v1/organizations/api_keys returned {}: {body}",
+                        status.as_u16()
+                    )));
+                }
+                body
             }
             Err(e) => return Err(BrokerError::Upstream(format!("transport: {e}"))),
         };
 
         let parsed: WorkspaceKeyResponse = serde_json::from_str(&body_text).map_err(|e| {
-            BrokerError::Upstream(format!("decode workspace-key response: {e}; body={body_text}"))
+            BrokerError::Upstream(format!(
+                "decode workspace-key response: {e}; body={body_text}"
+            ))
         })?;
 
         // Compute `expires_at` for the BrokeredCredential. Prefer the
@@ -306,32 +331,28 @@ impl Broker for AnthropicBroker {
         );
         let body = serde_json::json!({ "status": "inactive" });
 
-        let mut request = self.http.request("PATCH", &url);
+        let mut request = self.http.patch(&url);
         for (k, v) in self.headers() {
-            request = request.set(k, &v);
+            request = request.header(k, &v);
         }
         let resp = request.send_json(body);
 
         match resp {
-            Ok(r) => {
-                let code = r.status();
+            Ok(mut r) => {
+                let code = r.status().as_u16();
                 if code == 200 || code == 204 {
                     Ok(())
+                } else if code == 404 {
+                    Err(BrokerError::UnknownMaterialization(
+                        materialization_id.to_string(),
+                    ))
                 } else {
+                    let body = r.body_mut().read_to_string().unwrap_or_default();
                     Err(BrokerError::Upstream(format!(
-                        "unexpected status {code} from PATCH /v1/organizations/api_keys"
+                        "anthropic PATCH /v1/organizations/api_keys/{materialization_id} \
+                         returned {code}: {body}"
                     )))
                 }
-            }
-            Err(ureq::Error::Status(404, _)) => Err(BrokerError::UnknownMaterialization(
-                materialization_id.to_string(),
-            )),
-            Err(ureq::Error::Status(code, r)) => {
-                let body = r.into_string().unwrap_or_default();
-                Err(BrokerError::Upstream(format!(
-                    "anthropic PATCH /v1/organizations/api_keys/{materialization_id} \
-                     returned {code}: {body}"
-                )))
             }
             Err(e) => Err(BrokerError::Upstream(format!("transport: {e}"))),
         }
@@ -538,14 +559,16 @@ mod tests {
         let captured: Arc<Mutex<Option<CapturedRequest>>> = Arc::new(Mutex::new(None));
         let (base, handle) = spawn_one_shot(canned, captured.clone());
 
-        let broker = AnthropicBroker::with_base_url(
-            SecretString::from("admin-token-123".to_string()),
-            base,
-        );
+        let broker =
+            AnthropicBroker::with_base_url(SecretString::from("admin-token-123".to_string()), base);
         let cred = block_on(broker.issue(anthropic_request("demo-key"))).expect("issue ok");
 
         handle.join().expect("server thread");
-        let req = captured.lock().expect("captured").clone().expect("captured req");
+        let req = captured
+            .lock()
+            .expect("captured")
+            .clone()
+            .expect("captured req");
 
         assert_eq!(req.method, "POST");
         assert_eq!(req.path, "/v1/organizations/api_keys");
@@ -567,8 +590,7 @@ mod tests {
         let captured: Arc<Mutex<Option<CapturedRequest>>> = Arc::new(Mutex::new(None));
         let (base, handle) = spawn_one_shot(canned, captured);
 
-        let broker =
-            AnthropicBroker::with_base_url(SecretString::from("tok".to_string()), base);
+        let broker = AnthropicBroker::with_base_url(SecretString::from("tok".to_string()), base);
         let err = block_on(broker.issue(anthropic_request("bad"))).expect_err("must fail");
         handle.join().expect("server thread");
         match err {
@@ -588,12 +610,15 @@ mod tests {
         let captured: Arc<Mutex<Option<CapturedRequest>>> = Arc::new(Mutex::new(None));
         let (base, handle) = spawn_one_shot(canned, captured.clone());
 
-        let broker =
-            AnthropicBroker::with_base_url(SecretString::from("tok".to_string()), base);
+        let broker = AnthropicBroker::with_base_url(SecretString::from("tok".to_string()), base);
         block_on(broker.revoke("apikey_01ZZZ")).expect("revoke ok");
 
         handle.join().expect("server thread");
-        let req = captured.lock().expect("captured").clone().expect("captured req");
+        let req = captured
+            .lock()
+            .expect("captured")
+            .clone()
+            .expect("captured req");
         assert_eq!(req.method, "PATCH");
         assert_eq!(req.path, "/v1/organizations/api_keys/apikey_01ZZZ");
         assert_eq!(req.api_key.as_deref(), Some("tok"));
@@ -610,8 +635,7 @@ mod tests {
         let captured: Arc<Mutex<Option<CapturedRequest>>> = Arc::new(Mutex::new(None));
         let (base, handle) = spawn_one_shot(canned, captured);
 
-        let broker =
-            AnthropicBroker::with_base_url(SecretString::from("tok".to_string()), base);
+        let broker = AnthropicBroker::with_base_url(SecretString::from("tok".to_string()), base);
         let err = block_on(broker.revoke("apikey_does_not_exist")).expect_err("must fail");
         handle.join().expect("server thread");
         match err {
@@ -624,15 +648,13 @@ mod tests {
 
     #[test]
     fn provider_returns_anthropic() {
-        let broker =
-            AnthropicBroker::new(SecretString::from("admin".to_string()));
+        let broker = AnthropicBroker::new(SecretString::from("admin".to_string()));
         assert_eq!(broker.provider(), BrokerProvider::Anthropic);
     }
 
     #[test]
     fn issue_rejects_request_for_other_provider() {
-        let broker =
-            AnthropicBroker::new(SecretString::from("admin".to_string()));
+        let broker = AnthropicBroker::new(SecretString::from("admin".to_string()));
         let mut req = anthropic_request("demo");
         req.provider = BrokerProvider::Cloudflare;
         let err = block_on(broker.issue(req)).expect_err("must fail");
@@ -643,7 +665,11 @@ mod tests {
     fn anthropic_scope_round_trips_with_optional_expiry() {
         let s = AnthropicScope {
             name: "k".to_string(),
-            expires_at: Some(DateTime::parse_from_rfc3339("2026-12-31T23:59:59Z").unwrap().with_timezone(&Utc)),
+            expires_at: Some(
+                DateTime::parse_from_rfc3339("2026-12-31T23:59:59Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            ),
         };
         let v = serde_json::to_value(&s).unwrap();
         let back: AnthropicScope = serde_json::from_value(v).unwrap();
@@ -666,7 +692,7 @@ mod tests {
         // 2026-04-26T22:15:00Z and 2026-04-26T22:30:00Z as UNIX timestamps.
         UsagePeriod {
             start: UNIX_EPOCH + Duration::from_secs(1_745_705_700),
-            end:   UNIX_EPOCH + Duration::from_secs(1_745_706_600),
+            end: UNIX_EPOCH + Duration::from_secs(1_745_706_600),
         }
     }
 
@@ -698,24 +724,25 @@ mod tests {
         let captured: Arc<Mutex<Option<CapturedRequest>>> = Arc::new(Mutex::new(None));
         let (base, handle) = spawn_one_shot(canned, captured.clone());
 
-        let broker = AnthropicBroker::with_base_url(
-            SecretString::from("admin-tok".to_string()),
-            base,
-        );
-        let usage = block_on(broker.reconcile_usage("apikey_abc", fixed_period()))
-            .expect("reconcile ok");
+        let broker =
+            AnthropicBroker::with_base_url(SecretString::from("admin-tok".to_string()), base);
+        let usage =
+            block_on(broker.reconcile_usage("apikey_abc", fixed_period())).expect("reconcile ok");
 
         handle.join().expect("server thread");
         let req = captured.lock().expect("captured").clone().expect("req");
 
         assert_eq!(req.method, "GET");
         assert!(
-            req.path.starts_with("/v1/organizations/usage_report/messages"),
-            "path={}", req.path
+            req.path
+                .starts_with("/v1/organizations/usage_report/messages"),
+            "path={}",
+            req.path
         );
         assert!(
             req.path.contains("api_key_id=apikey_abc"),
-            "missing api_key_id param in path={}", req.path
+            "missing api_key_id param in path={}",
+            req.path
         );
         assert_eq!(req.api_key.as_deref(), Some("admin-tok"));
         assert_eq!(req.anthropic_version.as_deref(), Some("2023-06-01"));
@@ -732,10 +759,7 @@ mod tests {
         let captured: Arc<Mutex<Option<CapturedRequest>>> = Arc::new(Mutex::new(None));
         let (base, handle) = spawn_one_shot(canned, captured);
 
-        let broker = AnthropicBroker::with_base_url(
-            SecretString::from("tok".to_string()),
-            base,
-        );
+        let broker = AnthropicBroker::with_base_url(SecretString::from("tok".to_string()), base);
         let period = fixed_period();
         let usage = block_on(broker.reconcile_usage("apikey_xyz", period)).expect("ok");
         handle.join().expect("server");
@@ -752,10 +776,7 @@ mod tests {
         let captured: Arc<Mutex<Option<CapturedRequest>>> = Arc::new(Mutex::new(None));
         let (base, handle) = spawn_one_shot(canned, captured);
 
-        let broker = AnthropicBroker::with_base_url(
-            SecretString::from("tok".to_string()),
-            base,
-        );
+        let broker = AnthropicBroker::with_base_url(SecretString::from("tok".to_string()), base);
         let usage = block_on(broker.reconcile_usage("apikey_cost", fixed_period())).expect("ok");
         handle.join().expect("server");
 
@@ -769,10 +790,7 @@ mod tests {
         let captured: Arc<Mutex<Option<CapturedRequest>>> = Arc::new(Mutex::new(None));
         let (base, handle) = spawn_one_shot(canned, captured);
 
-        let broker = AnthropicBroker::with_base_url(
-            SecretString::from("tok".to_string()),
-            base,
-        );
+        let broker = AnthropicBroker::with_base_url(SecretString::from("tok".to_string()), base);
         let usage = block_on(broker.reconcile_usage("apikey_zero", fixed_period())).expect("ok");
         handle.join().expect("server");
 
@@ -790,12 +808,9 @@ mod tests {
         let captured: Arc<Mutex<Option<CapturedRequest>>> = Arc::new(Mutex::new(None));
         let (base, handle) = spawn_one_shot(canned, captured);
 
-        let broker = AnthropicBroker::with_base_url(
-            SecretString::from("tok".to_string()),
-            base,
-        );
-        let err = block_on(broker.reconcile_usage("apikey_err", fixed_period()))
-            .expect_err("must fail");
+        let broker = AnthropicBroker::with_base_url(SecretString::from("tok".to_string()), base);
+        let err =
+            block_on(broker.reconcile_usage("apikey_err", fixed_period())).expect_err("must fail");
         handle.join().expect("server");
 
         match err {
@@ -830,12 +845,8 @@ mod tests {
         let captured: Arc<Mutex<Option<CapturedRequest>>> = Arc::new(Mutex::new(None));
         let (base, handle) = spawn_one_shot(canned, captured);
 
-        let broker = AnthropicBroker::with_base_url(
-            SecretString::from("tok".to_string()),
-            base,
-        );
-        let usage = block_on(broker.reconcile_usage("apikey_partial", fixed_period()))
-            .expect("ok");
+        let broker = AnthropicBroker::with_base_url(SecretString::from("tok".to_string()), base);
+        let usage = block_on(broker.reconcile_usage("apikey_partial", fixed_period())).expect("ok");
         handle.join().expect("server");
 
         assert_eq!(usage.input_tokens, 42);

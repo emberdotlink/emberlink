@@ -1,6 +1,6 @@
 use core_grants::{
-    Grant, GrantError, GrantSpec, GrantState, PrincipalId, Scope, Usage, UsageDelta,
-    TransitionEvent, apply_event, create, delegate, extend, pause, resume, revoke, use_grant,
+    Grant, GrantError, GrantSpec, GrantState, PrincipalId, Scope, TransitionEvent, Usage,
+    UsageDelta, apply_event, create, delegate, extend, pause, resume, revoke, use_grant,
 };
 use proptest::prelude::*;
 
@@ -44,7 +44,9 @@ fn arb_scope() -> impl Strategy<Value = Scope> {
 
 fn arb_non_issuer_principal() -> impl Strategy<Value = PrincipalId> {
     // Generate a principal that is guaranteed different from fixed_issuer().
-    "[a-z]{4,8}".prop_filter("not the issuer", |s| s != "issuer-a").prop_map(PrincipalId)
+    "[a-z]{4,8}"
+        .prop_filter("not the issuer", |s| s != "issuer-a")
+        .prop_map(PrincipalId)
 }
 
 fn arb_duration() -> impl Strategy<Value = chrono::Duration> {

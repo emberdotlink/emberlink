@@ -1,11 +1,11 @@
 use chrono::{TimeZone, Utc};
-use rusqlite::types::Value as SqlValue;
 use rusqlite::params;
+use rusqlite::types::Value as SqlValue;
 use serde::{Deserialize, Serialize};
 
 use crate::infra::store::{DaemonStore, StoreError};
 
-/// implementation-note-118 — convert unix-ms to an RFC3339 string so
+/// implementation-note-166 — convert unix-ms to an RFC3339 string so
 /// the date-range filter compares lexicographically against the existing TEXT
 /// `timestamp` column. Negative or out-of-range values clamp to the unix epoch.
 fn ms_to_rfc3339(ms: i64) -> String {
@@ -30,24 +30,25 @@ pub struct AuditEntry {
 
 #[derive(Debug, Default)]
 pub struct AuditFilter {
+    pub id: Option<i64>,
     pub agent_id: Option<String>,
     pub action: Option<String>,
     pub limit: Option<usize>,
-    /// implementation-note-119 — filter to actions that start with this prefix,
+    /// implementation-note-167 — filter to actions that start with this prefix,
     /// e.g. `"grant."` shows only grant-family events. Rendering-layer only;
     /// applied after the SQL fetch so the limit still governs the fetch window.
     pub action_prefix: Option<String>,
-    /// implementation-note-118 — alias for `agent_id`. Both populate
+    /// implementation-note-166 — alias for `agent_id`. Both populate
     /// the `agent_id = ?` clause; if both are set, `persona_id` wins.
     pub persona_id: Option<String>,
-    /// implementation-note-118 — narrow to rows whose `credential`
+    /// implementation-note-166 — narrow to rows whose `credential`
     /// column starts with this prefix. SQL `LIKE` with appended `%`.
     pub scope: Option<String>,
-    /// implementation-note-118 — inclusive lower bound (unix ms).
+    /// implementation-note-166 — inclusive lower bound (unix ms).
     /// Converted to RFC3339 before binding so it compares against the
     /// existing TEXT timestamp column.
     pub since_ms: Option<i64>,
-    /// implementation-note-118 — inclusive upper bound (unix ms).
+    /// implementation-note-166 — inclusive upper bound (unix ms).
     pub before_ms: Option<i64>,
 }
 
@@ -70,10 +71,10 @@ impl DaemonStore {
     }
 
     pub fn query_audit(&self, filter: &AuditFilter) -> Result<Vec<AuditEntry>, StoreError> {
-        // implementation-note-118 — dynamic positional binding so we
+        // implementation-note-166 — dynamic positional binding so we
         // can compose any combination of {agent_id, action, persona_id, scope,
         // since_ms, before_ms} without the previous hand-numbered ladder.
-        // implementation-note-120: filter out the chain-anchor checkpoint row.
+        // implementation-note-168: filter out the chain-anchor checkpoint row.
         // It's an internal artifact of the tamper-evident chain (see
         // migrate() in store.rs); not a user-visible audit event. The
         // chain verifier (subtask C) reads the table directly and DOES see
@@ -85,11 +86,13 @@ impl DaemonStore {
 
         let mut binds: Vec<SqlValue> = Vec::new();
 
+        if let Some(id) = filter.id {
+            binds.push(SqlValue::Integer(id));
+            query.push_str(&format!(" AND id = ?{}", binds.len()));
+        }
+
         // persona_id and agent_id both target the agent_id column; persona_id wins.
-        let agent_filter = filter
-            .persona_id
-            .as_deref()
-            .or(filter.agent_id.as_deref());
+        let agent_filter = filter.persona_id.as_deref().or(filter.agent_id.as_deref());
         if let Some(aid) = agent_filter {
             binds.push(SqlValue::Text(aid.to_string()));
             query.push_str(&format!(" AND agent_id = ?{}", binds.len()));
@@ -140,7 +143,7 @@ impl DaemonStore {
             .query_map(rusqlite::params_from_iter(binds.iter()), map_row)?
             .collect::<Result<Vec<_>, _>>()?;
 
-        // implementation-note-119 — action_prefix filter applied post-fetch so
+        // implementation-note-167 — action_prefix filter applied post-fetch so
         // the SQL limit governs the fetch window; the prefix narrows what
         // the dashboard displays. Empty/whitespace prefix is a no-op.
         if let Some(ref prefix) = filter.action_prefix {
@@ -153,7 +156,7 @@ impl DaemonStore {
         Ok(entries)
     }
 
-    /// implementation-note-118 — test helper to insert an audit row
+    /// implementation-note-166 — test helper to insert an audit row
     /// with an explicit timestamp string (so date-range tests can pin
     /// timestamps without sleeping).
     #[cfg(test)]
@@ -174,7 +177,7 @@ impl DaemonStore {
     }
 
     pub fn audit_count(&self) -> Result<u64, StoreError> {
-        // implementation-note-120: same internal-checkpoint exclusion as
+        // implementation-note-168: same internal-checkpoint exclusion as
         // query_audit so the user-facing count matches what query_audit
         // returns.
         let count: i64 = self.conn().query_row(
@@ -187,7 +190,7 @@ impl DaemonStore {
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-120 — tamper-evident audit chain
+// implementation-note-168 — tamper-evident audit chain
 // ---------------------------------------------------------------------------
 
 /// Append an audit event to `audit_log` with a blake3 chain hash linking it
@@ -218,9 +221,8 @@ pub fn append_audit_event_with_chain(
 ) -> Result<i64, StoreError> {
     let conn = store.conn();
     conn.execute("BEGIN IMMEDIATE", [])?;
-    let result = append_audit_event_with_chain_in_tx(
-        conn, agent_id, action, credential, outcome, details,
-    );
+    let result =
+        append_audit_event_with_chain_in_tx(conn, agent_id, action, credential, outcome, details);
     match result {
         Ok(id) => {
             conn.execute("COMMIT", [])?;
@@ -256,9 +258,8 @@ pub(crate) fn append_audit_event_with_chain_in_tx(
         .flatten();
 
     let timestamp = Utc::now().to_rfc3339();
-    let canonical = canonical_audit_row_bytes(
-        &timestamp, agent_id, action, credential, outcome, details,
-    );
+    let canonical =
+        canonical_audit_row_bytes(&timestamp, agent_id, action, credential, outcome, details);
 
     let mut hasher = blake3::Hasher::new();
     if let Some(ref p) = prev_hash {
@@ -301,12 +302,15 @@ fn canonical_audit_row_bytes(
     map.insert("credential", opt(credential));
     map.insert("details", opt(details));
     map.insert("outcome", serde_json::Value::String(outcome.to_string()));
-    map.insert("timestamp", serde_json::Value::String(timestamp.to_string()));
+    map.insert(
+        "timestamp",
+        serde_json::Value::String(timestamp.to_string()),
+    );
     serde_json::to_vec(&map).expect("BTreeMap<&str, Value> serialization is infallible")
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-121 — chain verifier
+// implementation-note-169 — chain verifier
 // ---------------------------------------------------------------------------
 
 /// Outcome of a chain-verification walk.
@@ -332,7 +336,7 @@ pub enum VerifyOutcome {
 /// Walk the audit chain forward from the genesis row, recomputing each
 /// row's `blake3(prev_hash || canonical_row_bytes)` and asserting it
 /// matches the stored `row_hash`. Pre-chain rows (NULL `row_hash`,
-/// inserted before the implementation-note-120 migration landed) are
+/// inserted before the implementation-note-168 migration landed) are
 /// skipped — the verifier walks only chained rows.
 ///
 /// `tail` limits the walk to the most recent N rows (for sampling startup
@@ -397,7 +401,7 @@ pub fn run_audit_verify(
         rows.reverse(); // restore chronological order after DESC fetch
     }
 
-    // implementation-note-121 — sampling-mode seed. When `tail` limits
+    // implementation-note-169 — sampling-mode seed. When `tail` limits
     // the walk to the last N rows, the cross-row chain check on the first
     // row of the window has no in-walk predecessor; without seeding, every
     // tail walk would false-positive a Break. Read the row immediately
@@ -416,8 +420,7 @@ pub fn run_audit_verify(
         prior_row_hash = seed;
     }
     let mut walked: u64 = 0;
-    for (id, timestamp, agent_id, action, credential, outcome, details, prev_hash, row_hash) in
-        rows
+    for (id, timestamp, agent_id, action, credential, outcome, details, prev_hash, row_hash) in rows
     {
         // Pre-chain rows have NULL row_hash; treat as "not part of the
         // chain" and skip. The chain anchor (`audit.chain_v1_genesis`)
@@ -482,7 +485,9 @@ pub fn run_audit_verify(
         walked += 1;
     }
 
-    Ok(VerifyOutcome::Ok { rows_walked: walked })
+    Ok(VerifyOutcome::Ok {
+        rows_walked: walked,
+    })
 }
 
 #[cfg(test)]
@@ -534,7 +539,11 @@ mod tests {
             })
             .unwrap();
         assert_eq!(entries.len(), 2);
-        assert!(entries.iter().all(|e| e.agent_id.as_deref() == Some("agent-1")));
+        assert!(
+            entries
+                .iter()
+                .all(|e| e.agent_id.as_deref() == Some("agent-1"))
+        );
     }
 
     #[test]
@@ -589,10 +598,18 @@ mod tests {
     #[test]
     fn action_prefix_filter_returns_only_matching() {
         let store = DaemonStore::open_in_memory().unwrap();
-        store.log_event(None, "grant.create", None, "ok", None).unwrap();
-        store.log_event(None, "grant.revoke", None, "ok", None).unwrap();
-        store.log_event(None, "approval.dismissed", None, "ok", None).unwrap();
-        store.log_event(None, "broker.materialization", None, "ok", None).unwrap();
+        store
+            .log_event(None, "grant.create", None, "ok", None)
+            .unwrap();
+        store
+            .log_event(None, "grant.revoke", None, "ok", None)
+            .unwrap();
+        store
+            .log_event(None, "approval.dismissed", None, "ok", None)
+            .unwrap();
+        store
+            .log_event(None, "broker.materialization", None, "ok", None)
+            .unwrap();
 
         let entries = store
             .query_audit(&AuditFilter {
@@ -606,7 +623,7 @@ mod tests {
 
     #[test]
     fn persona_filter_isolates_rows() {
-        // implementation-note-118 — persona_id targets the agent_id
+        // implementation-note-166 — persona_id targets the agent_id
         // column; a row tagged "persona-x" should not surface when querying
         // for "persona-y".
         let store = DaemonStore::open_in_memory().unwrap();
@@ -629,7 +646,7 @@ mod tests {
 
     #[test]
     fn since_before_bound_timestamps() {
-        // implementation-note-118 — since_ms / before_ms inclusive
+        // implementation-note-166 — since_ms / before_ms inclusive
         // bounds. Insert three rows at t=100/200/300 ms; query [150, 250]
         // expects only the t=200 row.
         let store = DaemonStore::open_in_memory().unwrap();
@@ -653,15 +670,23 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        assert_eq!(entries.len(), 1, "only the t=200 row should match [150,250]");
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the t=200 row should match [150,250]"
+        );
         assert_eq!(entries[0].action, "b");
     }
 
     #[test]
     fn action_prefix_filter_empty_string_is_noop() {
         let store = DaemonStore::open_in_memory().unwrap();
-        store.log_event(None, "grant.create", None, "ok", None).unwrap();
-        store.log_event(None, "approval.dismissed", None, "ok", None).unwrap();
+        store
+            .log_event(None, "grant.create", None, "ok", None)
+            .unwrap();
+        store
+            .log_event(None, "approval.dismissed", None, "ok", None)
+            .unwrap();
 
         let entries = store
             .query_audit(&AuditFilter {
@@ -669,10 +694,14 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        assert_eq!(entries.len(), 2, "empty prefix is a no-op — all events returned");
+        assert_eq!(
+            entries.len(),
+            2,
+            "empty prefix is a no-op — all events returned"
+        );
     }
 
-    /// implementation-note-121 — verifier walks a fresh chain and reports Ok.
+    /// implementation-note-169 — verifier walks a fresh chain and reports Ok.
     #[test]
     fn audit_verify_chain_passes_on_untampered_log() {
         let store = DaemonStore::open_in_memory().unwrap();
@@ -705,16 +734,22 @@ mod tests {
         }
     }
 
-    /// implementation-note-121 — verifier detects a tampered row.
+    /// implementation-note-169 — verifier detects a tampered row.
     /// Seeds 3 chained events, hand-corrupts row 2's `details` column
     /// (bypassing the chain primitive's hash recompute), asserts the
     /// verifier emits `VerifyOutcome::Break` at the corrupted row.
     #[test]
     fn audit_verify_chain_detects_tampered_row() {
         let store = DaemonStore::open_in_memory().unwrap();
-        let id1 =
-            append_audit_event_with_chain(&store, Some("a-1"), "grant.create", None, "ok", Some("orig"))
-                .unwrap();
+        let id1 = append_audit_event_with_chain(
+            &store,
+            Some("a-1"),
+            "grant.create",
+            None,
+            "ok",
+            Some("orig"),
+        )
+        .unwrap();
         append_audit_event_with_chain(&store, Some("a-2"), "grant.revoked", None, "ok", None)
             .unwrap();
         append_audit_event_with_chain(&store, None, "broker.materialization", None, "ok", None)
@@ -748,7 +783,7 @@ mod tests {
         }
     }
 
-    /// implementation-note-121 — sampling mode walks only the last N rows.
+    /// implementation-note-169 — sampling mode walks only the last N rows.
     #[test]
     fn audit_verify_chain_tail_walks_only_last_n() {
         let store = DaemonStore::open_in_memory().unwrap();
@@ -773,7 +808,7 @@ mod tests {
         }
     }
 
-    /// implementation-note-120 — chain advances: every row's `prev_hash`
+    /// implementation-note-168 — chain advances: every row's `prev_hash`
     /// equals the prior row's `row_hash`. Genesis row carries `prev_hash =
     /// NULL`. Two back-to-back appends must produce a row whose `prev_hash`
     /// matches the genesis row's `row_hash`, then another whose `prev_hash`
@@ -784,11 +819,14 @@ mod tests {
 
         // Genesis row was inserted by migrate(); confirm it.
         let (genesis_action, genesis_prev, genesis_hash): (String, Option<String>, Option<String>) =
-            store.conn().query_row(
-                "SELECT action, prev_hash, row_hash FROM audit_log ORDER BY id ASC LIMIT 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            ).expect("genesis row must exist");
+            store
+                .conn()
+                .query_row(
+                    "SELECT action, prev_hash, row_hash FROM audit_log ORDER BY id ASC LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .expect("genesis row must exist");
         assert_eq!(genesis_action, "audit.chain_v1_genesis");
         assert!(genesis_prev.is_none(), "genesis prev_hash must be NULL");
         let genesis_hash = genesis_hash.expect("genesis row_hash must be set");

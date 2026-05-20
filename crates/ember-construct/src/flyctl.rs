@@ -71,9 +71,7 @@ pub(crate) fn strip_global_flags(argv: &[String]) -> Vec<String> {
         // shouldn't have `=value` but accept it tolerantly).
         if let Some(eq) = tok.find('=') {
             let name = &tok[..eq];
-            if VALUE_BEARING_GLOBAL_FLAGS.contains(&name)
-                || BOOLEAN_GLOBAL_FLAGS.contains(&name)
-            {
+            if VALUE_BEARING_GLOBAL_FLAGS.contains(&name) || BOOLEAN_GLOBAL_FLAGS.contains(&name) {
                 i += 1;
                 continue;
             }
@@ -159,8 +157,9 @@ pub fn classify_flyctl_argv(argv: &[String]) -> Option<ActionKey> {
 
         // machine <verb> (singular per spec).
         "machine" => match g1 {
-            "run" | "stop" | "start" | "restart" | "destroy" | "exec" | "clone"
-            | "update" => Some(ActionKey(format!("fly.machine.{g1}"))),
+            "run" | "stop" | "start" | "restart" | "destroy" | "exec" | "clone" | "update" => {
+                Some(ActionKey(format!("fly.machine.{g1}")))
+            }
             _ => None,
         },
 
@@ -174,26 +173,20 @@ pub fn classify_flyctl_argv(argv: &[String]) -> Option<ActionKey> {
 
         // secrets <verb>
         "secrets" => match g1 {
-            "set" | "unset" | "import" | "deploy" => {
-                Some(ActionKey(format!("fly.secrets.{g1}")))
-            }
+            "set" | "unset" | "import" | "deploy" => Some(ActionKey(format!("fly.secrets.{g1}"))),
             _ => None,
         },
 
         // scale <verb> — write subcommands. `show` is read-only and
         // returns None via the second-token read-only check above.
         "scale" => match g1 {
-            "count" | "vm" | "memory" => {
-                Some(ActionKey(format!("fly.scale.{g1}")))
-            }
+            "count" | "vm" | "memory" => Some(ActionKey(format!("fly.scale.{g1}"))),
             _ => None,
         },
 
         // regions <verb> — list is read-only (handled above).
         "regions" => match g1 {
-            "add" | "remove" | "set" | "backup" => {
-                Some(ActionKey(format!("fly.regions.{g1}")))
-            }
+            "add" | "remove" | "set" | "backup" => Some(ActionKey(format!("fly.regions.{g1}"))),
             _ => None,
         },
 
@@ -207,25 +200,19 @@ pub fn classify_flyctl_argv(argv: &[String]) -> Option<ActionKey> {
 
         // redis <verb>
         "redis" => match g1 {
-            "create" | "destroy" | "update" => {
-                Some(ActionKey(format!("fly.redis.{g1}")))
-            }
+            "create" | "destroy" | "update" => Some(ActionKey(format!("fly.redis.{g1}"))),
             _ => None,
         },
 
         // certs <verb>
         "certs" => match g1 {
-            "add" | "remove" | "check" => {
-                Some(ActionKey(format!("fly.certs.{g1}")))
-            }
+            "add" | "remove" | "check" => Some(ActionKey(format!("fly.certs.{g1}"))),
             _ => None,
         },
 
         // ips <verb>
         "ips" => match g1 {
-            "allocate-v4" | "allocate-v6" | "release" => {
-                Some(ActionKey(format!("fly.ips.{g1}")))
-            }
+            "allocate-v4" | "allocate-v6" | "release" => Some(ActionKey(format!("fly.ips.{g1}"))),
             _ => None,
         },
 
@@ -663,38 +650,21 @@ mod tests {
 
     #[test]
     fn app_flag_between_group_and_verb_stripped() {
-        let r = classify_flyctl_argv(&args(&[
-            "machine",
-            "--app",
-            "myapp",
-            "destroy",
-            "id",
-        ]))
-        .unwrap();
+        let r =
+            classify_flyctl_argv(&args(&["machine", "--app", "myapp", "destroy", "id"])).unwrap();
         assert_eq!(r.0, "fly.machine.destroy");
     }
 
     #[test]
     fn config_flag_after_verb_stripped() {
-        let r = classify_flyctl_argv(&args(&[
-            "deploy",
-            "--config",
-            "fly.toml",
-        ]))
-        .unwrap();
+        let r = classify_flyctl_argv(&args(&["deploy", "--config", "fly.toml"])).unwrap();
         assert_eq!(r.0, "fly.deploy");
     }
 
     #[test]
     fn region_flag_stripped() {
-        let r = classify_flyctl_argv(&args(&[
-            "--region",
-            "iad",
-            "machine",
-            "run",
-            "image",
-        ]))
-        .unwrap();
+        let r =
+            classify_flyctl_argv(&args(&["--region", "iad", "machine", "run", "image"])).unwrap();
         assert_eq!(r.0, "fly.machine.run");
     }
 
@@ -706,34 +676,25 @@ mod tests {
 
     #[test]
     fn debug_boolean_flag_stripped() {
-        let r =
-            classify_flyctl_argv(&args(&["--debug", "secrets", "unset", "K"])).unwrap();
+        let r = classify_flyctl_argv(&args(&["--debug", "secrets", "unset", "K"])).unwrap();
         assert_eq!(r.0, "fly.secrets.unset");
     }
 
     #[test]
     fn verbose_boolean_flag_stripped() {
-        let r =
-            classify_flyctl_argv(&args(&["--verbose", "ssh", "console"])).unwrap();
+        let r = classify_flyctl_argv(&args(&["--verbose", "ssh", "console"])).unwrap();
         assert_eq!(r.0, "fly.ssh.console");
     }
 
     #[test]
     fn equals_form_app_flag_stripped() {
-        let r =
-            classify_flyctl_argv(&args(&["--app=myapp", "machine", "destroy", "id"]))
-                .unwrap();
+        let r = classify_flyctl_argv(&args(&["--app=myapp", "machine", "destroy", "id"])).unwrap();
         assert_eq!(r.0, "fly.machine.destroy");
     }
 
     #[test]
     fn equals_form_region_flag_stripped() {
-        let r = classify_flyctl_argv(&args(&[
-            "--region=iad",
-            "ips",
-            "allocate-v4",
-        ]))
-        .unwrap();
+        let r = classify_flyctl_argv(&args(&["--region=iad", "ips", "allocate-v4"])).unwrap();
         assert_eq!(r.0, "fly.ips.allocate-v4");
     }
 
@@ -751,14 +712,7 @@ mod tests {
 
     #[test]
     fn short_app_flag_stripped() {
-        let r = classify_flyctl_argv(&args(&[
-            "-a",
-            "myapp",
-            "machine",
-            "destroy",
-            "id",
-        ]))
-        .unwrap();
+        let r = classify_flyctl_argv(&args(&["-a", "myapp", "machine", "destroy", "id"])).unwrap();
         assert_eq!(r.0, "fly.machine.destroy");
     }
 
@@ -781,18 +735,12 @@ mod tests {
 
     #[test]
     fn flags_reordered_classification_stable() {
-        let a = classify_flyctl_argv(&args(&[
-            "machine", "destroy", "id", "--app", "myapp",
-        ]))
-        .unwrap();
-        let b = classify_flyctl_argv(&args(&[
-            "--app", "myapp", "machine", "destroy", "id",
-        ]))
-        .unwrap();
-        let c = classify_flyctl_argv(&args(&[
-            "machine", "--app", "myapp", "destroy", "id",
-        ]))
-        .unwrap();
+        let a =
+            classify_flyctl_argv(&args(&["machine", "destroy", "id", "--app", "myapp"])).unwrap();
+        let b =
+            classify_flyctl_argv(&args(&["--app", "myapp", "machine", "destroy", "id"])).unwrap();
+        let c =
+            classify_flyctl_argv(&args(&["machine", "--app", "myapp", "destroy", "id"])).unwrap();
         assert_eq!(a.0, b.0);
         assert_eq!(b.0, c.0);
     }
@@ -900,11 +848,9 @@ mod tests {
     // contract slice this Construct depends on: the broker registry can
     // hold a `MockBroker::new(BrokerProvider::FlyIo)`, and a request that
     // declares `provider = FlyIo` round-trips through issue → revoke
-    // without panicking. Real FlyIo impl is implementation-note-68 (separate task).
+    // without panicking. Real FlyIo impl is implementation-note-84 (separate task).
 
-    use core_broker::{
-        Broker, BrokerError, BrokerProvider, BrokerRequest, MockBroker,
-    };
+    use core_broker::{Broker, BrokerError, BrokerProvider, BrokerRequest, MockBroker};
     use std::time::Duration;
 
     fn fly_request(ttl_secs: u64) -> BrokerRequest {

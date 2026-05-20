@@ -131,13 +131,17 @@ pub fn normalize_action(action: &str) -> Result<String, PolicyError> {
     let trimmed = action.trim().to_lowercase();
 
     if trimmed.is_empty() {
-        return Err(PolicyError::InvalidAction("empty action string".to_string()));
+        return Err(PolicyError::InvalidAction(
+            "empty action string".to_string(),
+        ));
     }
 
     let stripped = trimmed.trim_matches('.');
 
     if stripped.is_empty() {
-        return Err(PolicyError::InvalidAction("action contains only dots".to_string()));
+        return Err(PolicyError::InvalidAction(
+            "action contains only dots".to_string(),
+        ));
     }
 
     let segments: Vec<&str> = stripped.split('.').filter(|s| !s.is_empty()).collect();
@@ -147,10 +151,13 @@ pub fn normalize_action(action: &str) -> Result<String, PolicyError> {
     }
 
     for seg in &segments {
-        if !seg.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '*') {
-            return Err(PolicyError::InvalidAction(
-                format!("invalid character in segment '{seg}'"),
-            ));
+        if !seg
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '*')
+        {
+            return Err(PolicyError::InvalidAction(format!(
+                "invalid character in segment '{seg}'"
+            )));
         }
     }
 
@@ -170,7 +177,10 @@ fn matches_glob(pattern: &str, input: &str) -> bool {
     if pat_parts.len() != inp_parts.len() {
         return false;
     }
-    pat_parts.iter().zip(inp_parts.iter()).all(|(p, i)| *p == "*" || *p == *i)
+    pat_parts
+        .iter()
+        .zip(inp_parts.iter())
+        .all(|(p, i)| *p == "*" || *p == *i)
 }
 
 impl PolicyEngine {
@@ -220,12 +230,14 @@ impl PolicyEngine {
                     risk: RiskLevel::Critical,
                     matched_rule: Some("invalid action".to_string()),
                     tier: Tier::Tier2,
-                }
+                };
             }
         };
         for rule in &self.config.rules {
             if matches_glob(&rule.action, &action) {
-                let tier = rule.tier.unwrap_or_else(|| classify_tier(&rule.requirement));
+                let tier = rule
+                    .tier
+                    .unwrap_or_else(|| classify_tier(&rule.requirement));
                 return PolicyEvaluation {
                     requirement: rule.requirement.clone(),
                     risk: rule.risk.clone(),
@@ -530,11 +542,8 @@ requirement = "denied"
         )
         .unwrap();
 
-        let engine = PolicyEngine::load_with_overrides(
-            user_file.path(),
-            Some(project_file.path()),
-        )
-        .unwrap();
+        let engine =
+            PolicyEngine::load_with_overrides(user_file.path(), Some(project_file.path())).unwrap();
 
         let eval = engine.evaluate("deploy.staging");
         assert_eq!(eval.requirement, ApprovalRequirement::Denied);

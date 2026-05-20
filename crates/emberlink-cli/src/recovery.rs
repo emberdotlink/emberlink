@@ -42,7 +42,9 @@ impl DemoApp {
                 let found = mat
                     .personas_current
                     .values()
-                    .find(|p| p.persona_id == *r || p.label.to_lowercase().starts_with(&r.to_lowercase()))
+                    .find(|p| {
+                        p.persona_id == *r || p.label.to_lowercase().starts_with(&r.to_lowercase())
+                    })
                     .map(|p| p.persona_id.clone());
                 match found {
                     Some(id) => id,
@@ -130,7 +132,12 @@ impl DemoApp {
             writeln!(&mut out, "(none enrolled)").unwrap();
         } else {
             for g in &guardians {
-                writeln!(&mut out, "id: {}\tlabel: {}\troot: {}", g.guardian_id, g.label, g.root_id).unwrap();
+                writeln!(
+                    &mut out,
+                    "id: {}\tlabel: {}\troot: {}",
+                    g.guardian_id, g.label, g.root_id
+                )
+                .unwrap();
             }
         }
 

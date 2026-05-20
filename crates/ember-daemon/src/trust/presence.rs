@@ -24,8 +24,9 @@
 //! op (that would either re-prompt every time, breaking UX, or be cached
 //! again). Instead, this module tracks a per-process **session state** that
 //! decays back to `Locked` after an idle timeout, at which point the next
-//! high-risk op forces a fresh Keychain read (which re-prompts, after the
-//! cache is cleared).
+//! high-risk op fails closed until the caller reopens the interactive vault
+//! lane through a shipped reopen seam (`register_session` or explicit
+//! `vault_unlock`).
 //!
 //! ## Read vs write semantics
 //!
@@ -40,9 +41,10 @@
 //! - returns `Locked { reason }` otherwise — the caller (handler) maps this
 //!   to a JSON-RPC error so the CLI/dashboard can surface a re-auth prompt.
 //!
-//! The handler is responsible for re-running the macOS unlock path
-//! (clear `vault_macos::SESSION_CACHE`, then read the entry again) when the
-//! caller responds to the lock — that's outside this module's scope.
+//! The actual reopen path is intentionally outside this module's scope. In
+//! current code it happens through the shared interactive-unlock seam, which
+//! can repopulate the live vault slot on `register_session` or explicit
+//! `vault_unlock`.
 //!
 //! ## Quiet hours
 //!
@@ -57,7 +59,6 @@
 //! prompts would either fail silently or block. The flag is checked on
 //! every gate call (not cached) so test harnesses can flip it at runtime.
 
-use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -81,6 +82,21 @@ pub enum HighRiskOp {
     /// so the generate operation itself requires explicit operator
     /// presence (Touch ID at dev0).
     BinaryPinGenerate,
+    /// Submit an approval request from the socket dispatch path. Per
+    /// adversarial-review 2026-05-19 CRIT-3: the `submit_approval` arm
+    /// was missing the per-op presence gate that `create_grant` already
+    /// applies, letting a socket caller bypass policy evaluation and seed
+    /// arbitrary `pending` approval rows. The submit half of the two-half
+    /// approval gate must be guarded symmetrically with the resolve half.
+    ApprovalSubmit,
+    /// Resolve a pending approval (approve / deny / narrow / always) from
+    /// the socket dispatch path. Per adversarial-review 2026-05-19 CRIT-1:
+    /// the `resolve_approval` arm previously had no authorization gate
+    /// beyond "connection exists," so an agent could self-approve its own
+    /// pending grant request. The resolver socket arm requires operator
+    /// presence proof; the dashboard path (with biometric attestation)
+    /// goes through `resolve_approval_with_biometric` and is unaffected.
+    ApprovalResolve,
 }
 
 impl HighRiskOp {
@@ -92,13 +108,17 @@ impl HighRiskOp {
             HighRiskOp::GrantCreate => "grant_create",
             HighRiskOp::PersonaKeyExport => "persona_key_export",
             HighRiskOp::BinaryPinGenerate => "binary_pin_generate",
+            HighRiskOp::ApprovalSubmit => "approval_submit",
+            HighRiskOp::ApprovalResolve => "approval_resolve",
         }
     }
 
     /// True for operations that may execute even during quiet hours when
     /// the caller passes an explicit `override_quiet_hours: true` flag.
     /// `vault_remove` is treated as "emergency" (revoking access never
-    /// hurts); add + create are explicitly NOT emergencies.
+    /// hurts); add + create are explicitly NOT emergencies. Approval
+    /// submit/resolve are never emergencies — the whole point is operator
+    /// presence at decision time.
     pub fn is_emergency_eligible(&self) -> bool {
         matches!(self, HighRiskOp::VaultRemove)
     }
@@ -180,38 +200,31 @@ impl PresenceManager {
 /// check is also a write (last_activity bump).
 static MANAGER: Lazy<Mutex<PresenceManager>> = Lazy::new(|| Mutex::new(PresenceManager::new()));
 
-thread_local! {
-    /// implementation-note-23 C2: thread-local handle to the daemon's
-    /// `DaemonStore` used by `lock()` to drop the attached `Rc<Vault>`
-    /// on explicit user-initiated lock (hard-lock semantics).
-    ///
-    /// `DaemonStore` wraps a non-`Send + !Sync` `rusqlite::Connection`,
-    /// so we cannot put it inside the process-global `MANAGER` mutex —
-    /// `thread_local` matches the daemon's single-threaded `LocalSet`
-    /// model (the runtime registers the store at startup; the same
-    /// LocalSet thread services every RPC, including `vault_lock`).
-    ///
-    /// `None` when no store has been registered (early daemon startup,
-    /// unit tests that never call `register_store`). Tests that want to
-    /// exercise the drop-vault wiring call `register_store_for_tests`
-    /// at the top of the test, paired with the serial `TEST_GUARD`.
-    static REGISTERED_STORE: RefCell<Option<Rc<DaemonStore>>> =
-        const { RefCell::new(None) };
-}
-
-/// implementation-note-23 C2: register the daemon's `DaemonStore` so
-/// `lock()` can drop the attached `Rc<Vault>` on explicit lock. Called
+/// implementation-note-27 C2: register the daemon's `DaemonStore` so
+/// `lock()` can clear the shared live-vault slot on explicit lock. Called
 /// once at daemon startup from `runtime.rs` after the store is opened.
 ///
 /// Idempotent — replacing an already-registered store is allowed (the
 /// runtime never re-registers in production, but tests do).
 pub fn register_store(store: Rc<DaemonStore>) {
-    REGISTERED_STORE.with(|s| *s.borrow_mut() = Some(store));
+    crate::infra::interactive_unlock::register_store(store);
 }
 
 /// True when dev-mode is active. Read on every gate call so tests can flip
 /// the flag at runtime without a manager-state reset.
-fn dev_mode_enabled() -> bool {
+///
+/// Recognised activators (any one):
+///   - `EMBER_VAULT_DEV_MODE=1`
+///   - any value of `EMBER_VAULT_MOCK` (the vault-mocking signal also
+///     means "dev daemon, not production")
+///   - the running binary is a cargo test artifact
+///
+/// Exposed `pub` so other production-invariant gates (e.g. the binary-
+/// manifest signature check in `runtime.rs` PATH-PINNING-STARTUP-VERIFY)
+/// reuse this single source of truth rather than duplicating an env-var
+/// parser per call site. The production launchd / systemd units set
+/// none of these, so the bypass is unreachable from a production daemon.
+pub fn dev_mode_enabled() -> bool {
     matches!(std::env::var("EMBER_VAULT_DEV_MODE").as_deref(), Ok("1"))
         || std::env::var("EMBER_VAULT_MOCK").is_ok()
         || crate::infra::vault::is_cargo_test_binary()
@@ -254,7 +267,8 @@ pub fn current_config() -> PresenceConfig {
 /// - **Daemon restart**: process exit wipes the in-process `MANAGER`.
 /// - **Idle timeout**: no activity for `idle_timeout` (default 15 min)
 ///   causes the next high-risk op to auto-lock and return
-///   `GateOutcome::Locked`.
+///   `GateOutcome::Locked`, after which the caller must reopen through
+///   `register_session` or `vault_unlock`.
 ///
 /// Quiet hours (when configured) also block high-risk ops regardless of
 /// cache state, treating the entire window as locked.
@@ -272,16 +286,19 @@ pub fn mark_unlocked() {
 /// subcommand; also called from any `lock-on-shutdown` handlers in the
 /// daemon supervisor.
 ///
-/// implementation-note-23 C2 — **hard-lock semantics**:
+/// implementation-note-27 C2 — **hard-lock semantics**:
 ///
 /// - Flips `SessionState` to `Locked`.
-/// - Clears the macOS SE-keyring session cache so the next high-risk op
-///   forces a fresh biometric prompt.
+/// - Clears the macOS SE-keyring session cache so the next interactive
+///   reopen must perform a fresh biometric-gated key read.
 /// - Drops the `Rc<Vault>` from the registered `DaemonStore` so the
 ///   final outstanding `Rc` reference is released — the in-memory MEK
 ///   is wiped via `Vault`'s `ZeroizeOnDrop` derive (C1) once every
-///   clone has dropped. The next vault op MUST re-derive the MEK from
-///   the keyring-stored passphrase.
+///   clone has dropped. A later `register_session` or explicit
+///   `vault_unlock` must re-derive the MEK from the keyring-stored
+///   passphrase before vault-dependent ops can proceed again.
+/// - Clears any tracked interactive session pins; explicit lock is a hard
+///   privilege drop even if a launcher session is still open.
 ///
 /// Idle auto-lock (`require_user_presence_at`'s `idle >= idle_timeout`
 /// branch) deliberately does NOT drop the vault — it retains soft-lock
@@ -299,20 +316,66 @@ pub fn lock() {
     {
         crate::infra::vault_macos::clear_session_cache();
     }
-    // Drop the Rc<Vault> from the registered store (hard-lock).
-    REGISTERED_STORE.with(|s| {
-        if let Some(st) = s.borrow().as_ref() {
-            st.drop_vault();
-        }
-    });
+    // Clear the shared live-vault slot and forget active session pins.
+    crate::infra::interactive_unlock::explicit_lock();
     tracing::info!("vault session re-locked (explicit, hard-lock — MEK cleared)");
+}
+
+/// Boot-time hard-lock after the daemon finishes startup-only vault bootstrap.
+///
+/// This is narrower than design's accepted lazy first-session unlock: the
+/// daemon may still need a temporary vault handle during startup for internal
+/// bootstrap work, but it must not enter the serve loop still looking like an
+/// already-authorized operator session.
+pub fn startup_lock() {
+    let mut m = MANAGER.lock().expect("presence manager poisoned");
+    m.state = SessionState::Locked;
+    #[cfg(target_os = "macos")]
+    {
+        crate::infra::vault_macos::clear_session_cache();
+    }
+    crate::infra::interactive_unlock::explicit_lock();
+    tracing::info!("vault session locked after startup bootstrap (serve loop begins locked)");
+}
+
+/// Hard-lock after the last interactive session pin has been released and the
+/// grace window has elapsed.
+///
+/// This is the shipped Phase 2 bridge for design's demand-pinned session
+/// lifecycle: `register_session` and the session-close paths already drive the
+/// shared pin tracker; this helper turns an expired grace window into the same
+/// hard-lock semantics as an explicit operator lock. The plain non-session
+/// `vault_unlock` path still sits outside this timer-driven seam.
+pub fn grace_lock_if_due() -> bool {
+    grace_lock_if_due_at(Instant::now())
+}
+
+fn grace_lock_if_due_at(now: Instant) -> bool {
+    if !crate::infra::interactive_unlock::grace_zero_due_at(now) {
+        return false;
+    }
+
+    let mut m = MANAGER.lock().expect("presence manager poisoned");
+    m.state = SessionState::Locked;
+    #[cfg(target_os = "macos")]
+    {
+        crate::infra::vault_macos::clear_session_cache();
+    }
+    drop(m);
+    crate::infra::interactive_unlock::explicit_lock();
+    tracing::info!("vault session re-locked (session grace window elapsed)");
+    true
 }
 
 /// Bump `last_activity` on a read-class operation. Read ops never trigger
 /// the gate themselves but they keep the session "warm".
 pub fn record_activity() {
     let mut m = MANAGER.lock().expect("presence manager poisoned");
-    if let SessionState::Unlocked { ref mut last_activity, .. } = m.state {
+    if let SessionState::Unlocked {
+        ref mut last_activity,
+        ..
+    } = m.state
+    {
         *last_activity = Instant::now();
     }
 }
@@ -336,7 +399,8 @@ pub fn snapshot() -> (bool, Option<u64>) {
 ///
 /// On `Allowed`, the session's `last_activity` is bumped. On `Locked`,
 /// nothing changes — the caller is expected to surface the lock to the
-/// user (CLI re-prompt, dashboard banner) and retry after fresh unlock.
+/// user (CLI/dashboard banner) and retry only after a fresh reopen through
+/// `register_session` or `vault_unlock`.
 pub fn require_user_presence(op: HighRiskOp, override_quiet_hours: bool) -> GateOutcome {
     require_user_presence_at(op, override_quiet_hours, Instant::now(), current_utc_hour())
 }
@@ -377,15 +441,17 @@ pub fn require_user_presence_at(
     match m.state {
         SessionState::Locked => GateOutcome::Locked {
             reason: format!(
-                "{} denied: session is locked; run `ember vault unlock` (or any read op \
-                 that triggers the unlock path)",
+                "{} denied: session is locked; reopen with `ember vault unlock` \
+                 or start a new session (`register_session` path). Ordinary lazy \
+                 same-daemon re-auth is not fully wired yet",
                 op.as_str()
             ),
         },
         SessionState::Unlocked { last_activity, .. } => {
             let idle = now.saturating_duration_since(last_activity);
             if idle >= m.config.idle_timeout {
-                // Auto-lock. Subsequent high-risk ops MUST re-prompt.
+                // Auto-lock. Subsequent high-risk ops fail closed until the
+                // caller reopens the interactive vault lane.
                 m.state = SessionState::Locked;
                 #[cfg(target_os = "macos")]
                 {
@@ -405,7 +471,11 @@ pub fn require_user_presence_at(
                 }
             } else {
                 // Allowed — bump activity.
-                if let SessionState::Unlocked { ref mut last_activity, .. } = m.state {
+                if let SessionState::Unlocked {
+                    ref mut last_activity,
+                    ..
+                } = m.state
+                {
                     *last_activity = now;
                 }
                 GateOutcome::Allowed
@@ -445,15 +515,39 @@ fn current_utc_hour() -> u8 {
 pub fn reset_for_tests() {
     let mut m = MANAGER.lock().expect("presence manager poisoned");
     *m = PresenceManager::new();
-    // implementation-note-23 C2: also clear the thread-local store
-    // handle so tests start from a clean "no store registered" state.
-    REGISTERED_STORE.with(|s| *s.borrow_mut() = None);
+    crate::infra::interactive_unlock::reset_for_tests();
+}
+
+/// Test-only helper: acquire the process-global presence-state guard
+/// so a test that pins presence to a specific state (Locked or
+/// Unlocked) doesn't race with parallel tests that flip it. Use:
+///
+/// ```ignore
+/// let _g = presence::test_state_guard();
+/// presence::mark_unlocked();
+/// // dispatch / assert against the unlocked state
+/// ```
+///
+/// Routes through the crate's `PROCESS_TEST_LOCK` so it shares the
+/// same mutex as the vault / install / session_watcher tests that
+/// also mutate the presence MANAGER — without that the per-module
+/// guards would only serialize within their own module and presence
+/// state would still race across the module boundary.
+///
+/// The guard auto-recovers from poison so a panicked sibling test
+/// doesn't taint the whole presence test suite for the rest of the
+/// run. Marked `#[doc(hidden)]` because it has no production callers.
+#[doc(hidden)]
+pub fn test_state_guard() -> std::sync::MutexGuard<'static, ()> {
+    crate::PROCESS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::MutexGuard;
 
     fn fresh() -> Instant {
         // Helper: a stable "now" we can offset from in each test. Using
@@ -468,12 +562,12 @@ mod tests {
     /// handle. Without this, `cargo test` (default 8-way parallel)
     /// causes intermittent failures because state set in one test
     /// leaks into another mid-assertion.
-    static TEST_GUARD: Mutex<()> = Mutex::new(());
-
+    ///
+    /// Routed through the crate-public `super::test_state_guard()` so
+    /// handler-side tests that flip `MANAGER` via `mark_unlocked` /
+    /// `lock` share the same mutex and don't race this module's tests.
     fn lock_test<'a>() -> MutexGuard<'a, ()> {
-        // Recover from a previous panicked test rather than poisoning
-        // the whole presence test suite for the rest of the run.
-        TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner())
+        super::test_state_guard()
     }
 
     fn setup() -> MutexGuard<'static, ()> {
@@ -591,10 +685,14 @@ mod tests {
     #[test]
     fn high_risk_op_emergency_eligibility() {
         // Only `vault_remove` is emergency-eligible. Add + create are not.
+        // Approval submit/resolve are explicitly NOT emergencies — the
+        // whole point of the gate is operator presence at decision time.
         assert!(HighRiskOp::VaultRemove.is_emergency_eligible());
         assert!(!HighRiskOp::VaultAdd.is_emergency_eligible());
         assert!(!HighRiskOp::GrantCreate.is_emergency_eligible());
         assert!(!HighRiskOp::PersonaKeyExport.is_emergency_eligible());
+        assert!(!HighRiskOp::ApprovalSubmit.is_emergency_eligible());
+        assert!(!HighRiskOp::ApprovalResolve.is_emergency_eligible());
     }
 
     #[test]
@@ -636,6 +734,8 @@ mod tests {
         assert_eq!(HighRiskOp::VaultRemove.as_str(), "vault_remove");
         assert_eq!(HighRiskOp::GrantCreate.as_str(), "grant_create");
         assert_eq!(HighRiskOp::PersonaKeyExport.as_str(), "persona_key_export");
+        assert_eq!(HighRiskOp::ApprovalSubmit.as_str(), "approval_submit");
+        assert_eq!(HighRiskOp::ApprovalResolve.as_str(), "approval_resolve");
     }
 
     #[test]
@@ -650,7 +750,99 @@ mod tests {
         assert!(idle.is_none());
     }
 
-    /// implementation-note-23 C2: explicit `lock()` is hard-lock —
+    #[test]
+    fn startup_lock_clears_unlocked_state() {
+        let _g = setup();
+        mark_unlocked();
+        let (unlocked, _) = snapshot();
+        assert!(unlocked);
+
+        startup_lock();
+
+        let (unlocked, idle) = snapshot();
+        assert!(!unlocked);
+        assert!(idle.is_none());
+    }
+
+    #[test]
+    fn grace_lock_if_due_clears_vault_after_last_session_release() {
+        let _g = setup();
+        let store = crate::infra::store::DaemonStore::open_in_memory().unwrap();
+        store.set_vault(Rc::new(crate::infra::vault::Vault::new([0x33u8; 32])));
+        let store_rc = Rc::new(store);
+        register_store(Rc::clone(&store_rc));
+        crate::infra::interactive_unlock::register_store(Rc::clone(&store_rc));
+        crate::infra::interactive_unlock::set_test_grace_window(Duration::from_secs(1));
+
+        mark_unlocked();
+        let t0 = fresh();
+        assert!(crate::infra::interactive_unlock::acquire_session_pin_at(
+            "sess_a", t0
+        ));
+        assert!(crate::infra::interactive_unlock::release_session_pin_at(
+            "sess_a",
+            t0 + Duration::from_millis(100)
+        ));
+
+        assert!(
+            !grace_lock_if_due_at(t0 + Duration::from_millis(900)),
+            "grace lock must not fire before the grace window elapses"
+        );
+        assert!(
+            store_rc.vault().is_some(),
+            "live vault must remain attached until grace-window zero is due"
+        );
+
+        assert!(
+            grace_lock_if_due_at(t0 + Duration::from_millis(1200)),
+            "grace lock must fire once the last session pin's grace window expires"
+        );
+        assert!(
+            store_rc.vault().is_none(),
+            "grace lock must drop the shared live vault slot"
+        );
+        let (unlocked, idle) = snapshot();
+        assert!(!unlocked, "grace lock must return presence state to Locked");
+        assert!(idle.is_none());
+    }
+
+    #[test]
+    fn grace_lock_if_due_clears_vault_after_non_session_unlock_grace() {
+        let _g = setup();
+        let store = crate::infra::store::DaemonStore::open_in_memory().unwrap();
+        store.set_vault(Rc::new(crate::infra::vault::Vault::new([0x44u8; 32])));
+        let store_rc = Rc::new(store);
+        register_store(Rc::clone(&store_rc));
+        crate::infra::interactive_unlock::register_store(Rc::clone(&store_rc));
+        crate::infra::interactive_unlock::set_test_grace_window(Duration::from_secs(1));
+
+        mark_unlocked();
+        let t0 = fresh();
+        crate::infra::interactive_unlock::arm_non_session_grace_window_at(t0);
+
+        assert!(
+            !grace_lock_if_due_at(t0 + Duration::from_millis(900)),
+            "non-session unlock grace must not hard-lock early"
+        );
+        assert!(
+            store_rc.vault().is_some(),
+            "live vault must remain attached during the non-session grace window"
+        );
+
+        assert!(
+            grace_lock_if_due_at(t0 + Duration::from_millis(1200)),
+            "non-session unlock grace must hard-lock once the window expires"
+        );
+        assert!(
+            store_rc.vault().is_none(),
+            "expired non-session unlock grace must drop the shared live vault slot"
+        );
+        let (unlocked, idle) = snapshot();
+        assert!(!unlocked, "grace lock must return presence state to Locked");
+        assert!(idle.is_none());
+    }
+
+    /// implementation-note-27 C2: explicit `lock()` is hard-lock —
     /// the registered `DaemonStore` no longer carries a vault handle
     /// after the call, so the next vault op MUST re-derive the MEK
     /// from the keyring (forces a fresh biometric on macOS).
@@ -680,7 +872,7 @@ mod tests {
         assert!(!unlocked, "explicit lock() must also flip session state");
     }
 
-    /// implementation-note-23 C3: the session-cache value type is
+    /// implementation-note-27 C3: the session-cache value type is
     /// `Zeroizing<String>` so dropping a cache entry overwrites the
     /// passphrase bytes in place. We assert the contract by allocating
     /// a `Zeroizing<String>`, snapshotting the inner pointer, dropping
@@ -718,7 +910,7 @@ mod tests {
         drop(wrapped);
     }
 
-    /// implementation-note-23 C2 partner: idle auto-lock retains
+    /// implementation-note-27 C2 partner: idle auto-lock retains
     /// soft-lock semantics — the vault stays Rc'd so background
     /// headless doesn't have to re-prompt. Only the session presence
     /// state flips.

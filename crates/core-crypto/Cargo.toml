@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 age = { version = "0.11", features = ["armor"] }
+base64 = "0.22"
 core-types = { path = "../core-types" }
 core-principals = { path = "../core-principals" }
 core-grant-types = { path = "../core-grant-types" }

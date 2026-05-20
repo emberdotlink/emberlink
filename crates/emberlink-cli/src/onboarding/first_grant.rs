@@ -1,11 +1,11 @@
 //! First-grant walkthrough — the closing step of `ember init` that converts
 //! every install into a witness of the wedge artifact (Grant Receipt).
 //!
-//! EMBER-INIT-FIRST-implementation-note-307 (v1, tips-only):
+//! EMBER-INIT-FIRST-implementation-note-436 (v1, tips-only):
 //! Prints an educational three-step tutorial pointing the user at daemon
 //! startup, grant issuance, and Receipt inspection.
 //!
-//! EMBER-INIT-FIRST-implementation-note-283 (v2, real signed Receipt):
+//! EMBER-INIT-FIRST-implementation-note-401 (v2, real signed Receipt):
 //! Issues a 60-second illustrative grant from the root persona to a fake
 //! local agent persona ("first-grant-tutorial"), immediately revokes it,
 //! signs the resulting Grant Receipt v2 envelope with the root persona's
@@ -14,7 +14,7 @@
 //!
 //! The checkpoint `init_first_grant_receipt_emit` is embedded as a constant
 //! so the headless ranker can grep for it as the shipped-state indicator
-//! of EMBER-INIT-FIRST-implementation-note-283.
+//! of EMBER-INIT-FIRST-implementation-note-401.
 //!
 //! Idempotency: presence of `<data_dir>/receipts/first.json` suppresses
 //! re-emission on subsequent `ember init` calls — the file-exists check
@@ -27,12 +27,11 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use chrono::Utc;
 use core_crypto::Signer;
-use core_events::receipt::envelope::{ReceiptEnvelope, ReceiptVersion, TerminationAuthority};
-use core_events::receipt::sign::sign_receipt_v2;
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use ember_daemon::infra::init_first_grant::{BuildError, build_first_grant_receipt_file};
+pub use ember_daemon::infra::init_first_grant::{
+    FirstGrantEvidence, FirstGrantIssuer, FirstGrantLifecycle, FirstGrantReceiptFile,
+};
 
 /// Checkpoint filename. Presence in `<data_dir>` means the tips block has
 /// already been shown to this operator on this machine.
@@ -40,62 +39,28 @@ pub const TIPS_SHOWN_SENTINEL: &str = ".first-grant-tips-shown";
 
 /// `init_first_grant_walkthrough` — the literal checkpoint string the
 /// headless ranker greps for to detect the shipped state of
-/// EMBER-INIT-FIRST-implementation-note-307. Embedded as a constant so a code
+/// EMBER-INIT-FIRST-implementation-note-436. Embedded as a constant so a code
 /// reader sees it explicitly and the `target_state_anchor` value in
 /// `release-checklist` matches against the binary's strings.
 pub const INIT_FIRST_GRANT_WALKTHROUGH_SENTINEL: &str = "init_first_grant_walkthrough";
 
 /// `init_first_grant_receipt_emit` — headless ranker checkpoint for
-/// EMBER-INIT-FIRST-implementation-note-283. Presence in this source file
+/// EMBER-INIT-FIRST-implementation-note-401. Presence in this source file
 /// marks the v2 receipt-emit path as shipped.
 pub const INIT_FIRST_GRANT_RECEIPT_EMIT_SENTINEL: &str = "init_first_grant_receipt_emit";
 
 /// Filename of the first-grant Receipt written to `<data_dir>/receipts/`.
 pub const FIRST_RECEIPT_FILENAME: &str = "receipts/first.json";
 
-/// Receipt kind discriminator for the first-grant walkthrough receipt.
-const RECEIPT_KIND_INIT_FIRST_GRANT: &str = "init.first_grant";
-
 /// Errors raised by [`emit_first_grant_receipt`].
 #[derive(Debug, thiserror::Error)]
 pub enum EmitError {
     #[error("create receipts dir: {0}")]
     CreateDir(#[from] std::io::Error),
-    #[error("sign receipt v2: {0}")]
-    Sign(#[from] core_events::receipt::sign::SignError),
+    #[error("build receipt: {0}")]
+    Build(#[from] BuildError),
     #[error("serialize receipt: {0}")]
     Serialize(#[from] serde_json::Error),
-}
-
-/// On-disk envelope written to `<data_dir>/receipts/first.json`.
-///
-/// Wraps the canonical signed `ReceiptEnvelope` (v2, per design) with
-/// human-readable metadata: `issuer.persona`, `evidence.signed`, `evidence.hash`
-/// (sha256 of the serialized receipt), and `lifecycle.issued_at` /
-/// `lifecycle.revoked_at` (RFC3339 UTC timestamps).
-#[derive(Debug, Serialize, Deserialize)]
-pub struct FirstGrantReceiptFile {
-    pub issuer: FirstGrantIssuer,
-    pub evidence: FirstGrantEvidence,
-    pub lifecycle: FirstGrantLifecycle,
-    pub receipt: ReceiptEnvelope,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct FirstGrantIssuer {
-    pub persona: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct FirstGrantEvidence {
-    pub signed: bool,
-    pub hash: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct FirstGrantLifecycle {
-    pub issued_at: String,
-    pub revoked_at: String,
 }
 
 /// Return the path of the first-grant Receipt file under `data_dir`.
@@ -107,6 +72,80 @@ pub fn first_receipt_path(data_dir: &Path) -> PathBuf {
 /// Used by [`emit_first_grant_receipt`] to enforce idempotency.
 pub fn first_receipt_exists(data_dir: &Path) -> bool {
     first_receipt_path(data_dir).exists()
+}
+
+/// Return early when the receipt-emit path should be skipped entirely.
+///
+/// Used by both the direct signer path and the daemon-built receipt path so
+/// they share the same idempotency and CI behavior.
+pub fn short_circuit_first_grant_receipt_emit(data_dir: &Path) -> Option<PathBuf> {
+    let receipt_path = first_receipt_path(data_dir);
+
+    if std::env::var("EMBER_AUTOMATION").as_deref() == Ok("1") {
+        return Some(receipt_path);
+    }
+
+    if receipt_path.exists() {
+        println!(
+            "note: first-grant Receipt already written - see {}",
+            receipt_path.display()
+        );
+        return Some(receipt_path);
+    }
+
+    None
+}
+
+/// Persist a pre-built first-grant receipt file to `<data_dir>/receipts/first.json`
+/// and print the operator-facing summary block.
+pub fn write_first_grant_receipt_file(
+    data_dir: &Path,
+    persona_id: &str,
+    persona_public_key: &str,
+    file: &FirstGrantReceiptFile,
+) -> Result<PathBuf, EmitError> {
+    let receipt_path = first_receipt_path(data_dir);
+
+    if let Some(parent) = receipt_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let sig_prefix = file
+        .receipt
+        .signature
+        .clone()
+        .as_deref()
+        .and_then(|s| s.get(..24))
+        .unwrap_or("")
+        .to_string();
+
+    let file_json = serde_json::to_string_pretty(file)?;
+    fs::write(&receipt_path, file_json.as_bytes())?;
+
+    println!();
+    println!("-- First Grant Receipt --");
+    println!();
+    println!("  Receipt:  {}", receipt_path.display());
+    println!("  Issuer:   did:ember:persona:{persona_id}");
+    println!(
+        "  Pubkey:   {}",
+        &persona_public_key[..persona_public_key.len().min(20)]
+    );
+    println!("  Sig:      {sig_prefix}...");
+    println!(
+        "  Hash:     {}",
+        &file.evidence.hash[..file.evidence.hash.len().min(28)]
+    );
+    println!();
+    println!("Share this with anyone - they can verify your signature offline.");
+    println!(
+        "  ember receipt verify {} --pubkey <your-pubkey-hex>",
+        receipt_path.display()
+    );
+    println!();
+    println!("  ({})", INIT_FIRST_GRANT_RECEIPT_EMIT_SENTINEL);
+
+    Ok(receipt_path)
 }
 
 /// Emit a signed Grant Receipt v2 envelope to `<data_dir>/receipts/first.json`.
@@ -133,109 +172,12 @@ pub fn emit_first_grant_receipt(
     persona_public_key: &str,
     signer: &dyn Signer,
 ) -> Result<PathBuf, EmitError> {
-    let receipt_path = first_receipt_path(data_dir);
-
-    // EMBER_AUTOMATION=1 → non-interactive CI; skip emission.
-    if std::env::var("EMBER_AUTOMATION").as_deref() == Ok("1") {
+    if let Some(receipt_path) = short_circuit_first_grant_receipt_emit(data_dir) {
         return Ok(receipt_path);
     }
 
-    // Idempotency: if the receipt already exists, skip re-signing.
-    if receipt_path.exists() {
-        println!(
-            "note: first-grant Receipt already written — see {}",
-            receipt_path.display()
-        );
-        return Ok(receipt_path);
-    }
-
-    // Ensure receipts/ directory exists.
-    if let Some(parent) = receipt_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let now = Utc::now();
-    let issued_at = now.to_rfc3339();
-    // Illustrative: the 60-second grant is revoked immediately after issuance.
-    let revoked_at = (now + chrono::Duration::seconds(60)).to_rfc3339();
-
-    // Build the ReceiptEnvelope body. The agent is a fake local persona; the
-    // grant is illustrative — no daemon-side grant lifecycle is involved.
-    let body = serde_json::json!({
-        "issuer_persona": persona_id,
-        "agent": "first-grant-tutorial",
-        "scope": "init",
-        "ttl_seconds": 60,
-        "issued_at": issued_at,
-        "revoked_at": revoked_at,
-        "note": "illustrative grant written by ember init — verifiable offline"
-    });
-
-    let mut envelope = ReceiptEnvelope {
-        version: ReceiptVersion::default(),
-        kind: RECEIPT_KIND_INIT_FIRST_GRANT.to_string(),
-        receipt_id: String::new(),
-        daemon_root_id: persona_id.to_string(),
-        traceparent: None,
-        termination_authority: TerminationAuthority::UserSession,
-        presence_kind: None,
-        body,
-        signature: None,
-    };
-
-    // Sign via the canonical design builder. Populates receipt_id (blake3)
-    // and signature (ed25519sig:<hex>).
-    sign_receipt_v2(&mut envelope, signer)?;
-
-    // Compute sha256 of the serialized receipt envelope for the evidence block.
-    let envelope_json = serde_json::to_string(&envelope)?;
-    let hash_bytes = Sha256::digest(envelope_json.as_bytes());
-    let hash = format!("sha256:{}", hex::encode(hash_bytes));
-
-    let sig_prefix = envelope
-        .signature
-        .clone()
-        .as_deref()
-        .and_then(|s| s.get(..24))
-        .unwrap_or("")
-        .to_string();
-
-    let file = FirstGrantReceiptFile {
-        issuer: FirstGrantIssuer {
-            persona: persona_id.to_string(),
-        },
-        evidence: FirstGrantEvidence {
-            signed: true,
-            hash: hash.clone(),
-        },
-        lifecycle: FirstGrantLifecycle {
-            issued_at: issued_at.clone(),
-            revoked_at: revoked_at.clone(),
-        },
-        receipt: envelope,
-    };
-
-    let file_json = serde_json::to_string_pretty(&file)?;
-    fs::write(&receipt_path, file_json.as_bytes())?;
-
-    println!();
-    println!("—— First Grant Receipt ——");
-    println!();
-    println!("  Receipt:  {}", receipt_path.display());
-    println!("  Issuer:   did:ember:persona:{persona_id}");
-    println!("  Pubkey:   {}", &persona_public_key[..persona_public_key.len().min(20)]);
-    println!("  Sig:      {sig_prefix}...");
-    println!("  Hash:     {}", &hash[..hash.len().min(28)]);
-    println!();
-    println!(
-        "Share this with anyone — they can verify your signature offline."
-    );
-    println!("  ember receipt verify {} --pubkey <your-pubkey-hex>", receipt_path.display());
-    println!();
-    // Checkpoint for headless ranker (EMBER-INIT-FIRST-implementation-note-283).
-    println!("  ({})", INIT_FIRST_GRANT_RECEIPT_EMIT_SENTINEL);
-
-    Ok(receipt_path)
+    let file = build_first_grant_receipt_file(persona_id, signer)?;
+    write_first_grant_receipt_file(data_dir, persona_id, persona_public_key, &file)
 }
 
 /// Path to the checkpoint file under the operator's data directory.
@@ -252,10 +194,7 @@ pub fn tips_already_shown(data_dir: &Path) -> bool {
 /// Mark tips as shown by writing the checkpoint file. Best-effort: failure
 /// to write the checkpoint does not block init.
 pub fn mark_tips_shown(data_dir: &Path) -> io::Result<()> {
-    fs::write(
-        sentinel_path(data_dir),
-        b"first-grant-tips-shown\n",
-    )
+    fs::write(sentinel_path(data_dir), b"first-grant-tips-shown\n")
 }
 
 /// Print the first-grant tips block to the writer. The block is the
@@ -266,10 +205,7 @@ pub fn mark_tips_shown(data_dir: &Path) -> io::Result<()> {
 /// persona id (already printed by `cmd_init` above this block); we don't
 /// repeat it. We do reference the data directory so the user knows where
 /// receipts will land.
-pub fn write_first_grant_tips<W: Write>(
-    out: &mut W,
-    data_dir: &Path,
-) -> io::Result<()> {
+pub fn write_first_grant_tips<W: Write>(out: &mut W, data_dir: &Path) -> io::Result<()> {
     let receipts_dir = data_dir.join("receipts");
 
     writeln!(out)?;
@@ -288,18 +224,18 @@ pub fn write_first_grant_tips<W: Write>(
     writeln!(out, "       ember daemon start")?;
     writeln!(out)?;
     writeln!(out, "  2. Issue your first grant (5-minute scope):")?;
-    writeln!(
-        out,
-        "       ember grant create --to test-agent \\"
-    )?;
-    writeln!(
-        out,
-        "         --scope github:repo:read --ttl 5m"
-    )?;
+    writeln!(out, "       ember grant create --to test-agent \\")?;
+    writeln!(out, "         --scope github:repo:read --ttl 5m")?;
     writeln!(out)?;
-    writeln!(out, "  3. When the grant terminates, the daemon writes a Receipt to:")?;
+    writeln!(
+        out,
+        "  3. When the grant terminates, the daemon writes a Receipt to:"
+    )?;
     writeln!(out, "       {}", receipts_dir.display())?;
-    writeln!(out, "     Inspect it: any JSON tool. Verify it: `ember receipt verify <path>`.")?;
+    writeln!(
+        out,
+        "     Inspect it: any JSON tool. Verify it: `ember receipt verify <path>`."
+    )?;
     writeln!(out)?;
     writeln!(
         out,

@@ -1,5 +1,5 @@
 //!
-//! implementation-note-129 subtask A — positive test that
+//! implementation-note-178 subtask A — positive test that
 //! `DaemonConfig::for_test(&tmpdir)` scopes every path-bearing field
 //! under `tmpdir`, so a T3 test cannot accidentally bind the operator's
 //! real `~/.ember/run/daemon.sock`.
@@ -37,7 +37,16 @@ fn for_test_scopes_all_paths_under_tmpdir() {
 fn for_test_disables_dashboard_and_proxies_by_default() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let cfg = DaemonConfig::for_test(tmp.path());
-    assert!(cfg.dashboard_addr.is_none(), "for_test must disable dashboard");
-    assert!(cfg.git_proxy_addr.is_none(), "for_test must disable git proxy");
-    assert!(cfg.llm_proxy_addr.is_none(), "for_test must disable llm proxy");
+    assert!(
+        cfg.dashboard_addr.is_none(),
+        "for_test must disable dashboard"
+    );
+    assert!(
+        cfg.git_proxy_addr.is_none(),
+        "for_test must disable git proxy"
+    );
+    assert!(
+        cfg.llm_proxy_addr.is_none(),
+        "for_test must disable llm proxy"
+    );
 }

@@ -8,11 +8,23 @@ fn test_key() -> [u8; 32] {
     [0x42u8; 32]
 }
 
+/// Install a sinkless `DaemonEventSink` on the given state. Mirrors what
+/// `runtime.rs` does in production for the git-echo proxy spawn (no
+/// broadcast channel attached). Tests that don't care about audit/broadcast
+/// observability still need this so `emit_threshold_crossings` /
+/// `emit_debounced` / `state.sink_log_event(...)` don't panic in the
+/// `ProxyState::sink()` unwrap.
+fn install_sink(state: &Arc<ProxyState>) {
+    let sink = Arc::new(DaemonEventSink::new(state.clone(), None));
+    let _ = state.event_sink.set(sink);
+}
+
 fn make_state() -> Arc<ProxyState> {
     let store = DaemonStore::open_in_memory().unwrap();
-    // implementation-note-137: ProxyState.vault is now Rc<Vault>.
-    let vault = std::rc::Rc::new(Vault::new(test_key()));
-    Arc::new(ProxyState::new(store, vault))
+    store.set_vault(std::rc::Rc::new(Vault::new(test_key())));
+    let state = Arc::new(ProxyState::new(store));
+    install_sink(&state);
+    state
 }
 
 /// Build a `ProxyState` seeded with a persona, a grant authorising
@@ -25,13 +37,19 @@ fn make_git_echo_state(
     token_value: &str,
 ) -> (Arc<ProxyState>, String, String) {
     let store = DaemonStore::open_in_memory().unwrap();
-    // implementation-note-137: ProxyState.vault is now Rc<Vault>.
-    let vault = std::rc::Rc::new(Vault::new(test_key()));
-    let state = Arc::new(ProxyState::new(store, vault));
+    store.set_vault(std::rc::Rc::new(Vault::new(test_key())));
+    let state = Arc::new(ProxyState::new(store));
+    install_sink(&state);
     let persona = state.store.create_persona(persona_name).unwrap();
     state
         .vault
-        .add(VaultScope::Interactive, &state.store, credential_name, token_value.as_bytes(), None)
+        .add(
+            VaultScope::Interactive,
+            &state.store,
+            credential_name,
+            token_value.as_bytes(),
+            None,
+        )
         .unwrap();
     state
         .store
@@ -100,10 +118,7 @@ fn proxy_request_with_method_and_uri(
     builder.body(Empty::new()).unwrap()
 }
 
-async fn call(
-    state: Arc<ProxyState>,
-    req: Request<Empty<Bytes>>,
-) -> Response<ProxyBody> {
+async fn call(state: Arc<ProxyState>, req: Request<Empty<Bytes>>) -> Response<ProxyBody> {
     // Adapt Empty<Bytes> to Incoming-compatible body using map_err
     let (parts, body) = req.into_parts();
     let mapped = body.map_err(|e| -> hyper::Error { panic!("empty body error: {e}") });
@@ -111,8 +126,7 @@ async fn call(
 
     // We need to call handle_request which takes Incoming — but in tests we
     // use a type-erased body.  Use the UnsyncBoxBody approach: box the body.
-    let boxed: Request<UnsyncBoxBody<Bytes, hyper::Error>> = incoming_req
-        .map(UnsyncBoxBody::new);
+    let boxed: Request<UnsyncBoxBody<Bytes, hyper::Error>> = incoming_req.map(UnsyncBoxBody::new);
 
     // handle_request is generic — call a test-only wrapper.
     handle_request_boxed(state, boxed).await.unwrap()
@@ -130,7 +144,10 @@ async fn handle_request_boxed(
         None => return Ok(bad_request("missing X-Ember-Persona header")),
     };
 
-    let credential_name = match headers.get("x-ember-credential").and_then(|v| v.to_str().ok()) {
+    let credential_name = match headers
+        .get("x-ember-credential")
+        .and_then(|v| v.to_str().ok())
+    {
         Some(v) => v.to_string(),
         None => return Ok(bad_request("missing X-Ember-Credential header")),
     };
@@ -147,7 +164,7 @@ async fn handle_request_boxed(
         Err(msg) => return Ok(bad_request(&msg)),
     };
 
-    // implementation-note-197 test parity — pin grant by id
+    // implementation-note-271 test parity — pin grant by id
     // when the header is present (mirrors production handle_request).
     let pinned_grant_id = headers
         .get("x-ember-grant-id")
@@ -312,10 +329,7 @@ async fn handle_request_boxed(
 
     let (_parts, incoming_body) = req.into_parts();
     // Enforce body size cap in the test harness to match production.
-    let body_bytes_in = match Limited::new(incoming_body, MAX_BODY_BYTES)
-        .collect()
-        .await
-    {
+    let body_bytes_in = match Limited::new(incoming_body, MAX_BODY_BYTES).collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(e) if e.downcast_ref::<LengthLimitError>().is_some() => {
             return Ok(payload_too_large("request body exceeds 10 MiB limit"));
@@ -353,20 +367,24 @@ async fn handle_request_boxed(
     }
 
     // Wrap in Zeroizing so the raw key bytes are wiped on drop.
-    let credential_bytes: Zeroizing<Vec<u8>> = match state.vault.get(VaultScope::Interactive, &state.store, &credential_name) {
-        Ok(b) => Zeroizing::new(b),
-        Err(VaultError::NotFound) => {
-            return Ok(internal_error("credential not found in vault"));
-        }
-        Err(e) => return Err(ProxyError::Vault(e)),
-    };
+    let credential_bytes: Zeroizing<Vec<u8>> =
+        match state
+            .vault
+            .get(VaultScope::Interactive, &state.store, &credential_name)
+        {
+            Ok(b) => Zeroizing::new(b),
+            Err(VaultError::NotFound) => {
+                return Ok(internal_error("credential not found in vault"));
+            }
+            Err(e) => return Err(ProxyError::Vault(e)),
+        };
 
     let credential_value: Zeroizing<String> =
         Zeroizing::new(String::from_utf8_lossy(&credential_bytes).into_owned());
 
     // P69L.0a (test harness): mirror the production auth-injection
     // branching so the test wrapper routes the same way as
-    // `handle_request`. implementation-note-124 — this now also
+    // `handle_request`. implementation-note-173 — this now also
     // detects Anthropic and emits `auth_mode = "anthropic"` so tests
     // can assert the FINDING B routing without a real upstream socket.
     let effective_path_and_query_test = effective_uri
@@ -374,8 +392,7 @@ async fn handle_request_boxed(
         .map(|pq| pq.as_str())
         .unwrap_or(effective_uri.path());
     let is_git_transport_test = is_git_smart_http_path(effective_path_and_query_test);
-    let target_host_lower_test: String =
-        extract_host_from_url(&target_url).unwrap_or_default();
+    let target_host_lower_test: String = extract_host_from_url(&target_url).unwrap_or_default();
     let auth_mode = if host_matches_domain(&target_host_lower_test, "anthropic.com") {
         AuthScheme::Anthropic.as_str()
     } else if is_git_transport_test {
@@ -416,7 +433,7 @@ async fn handle_request_boxed(
     // Post-flight meter (test parity with production).
     let target_host: String = extract_host_from_url(&target_url).unwrap_or_default();
     if let Some(mut delta) = meter_response(&target_host, response_body_bytes.as_ref()) {
-        // T-implementation-note-198: production
+        // T-implementation-note-272: production
         // metering folds in `record_upstream_request` to mint the
         // billable request count. The test harness always returns
         // 200, so success is unconditional — match the production
@@ -473,7 +490,13 @@ async fn valid_request_returns_200_proxied() {
     let persona = state.store.create_persona("test-agent").unwrap();
     state
         .vault
-        .add(VaultScope::Interactive, &state.store, "github-token", b"ghp_secret", None)
+        .add(
+            VaultScope::Interactive,
+            &state.store,
+            "github-token",
+            b"ghp_secret",
+            None,
+        )
         .unwrap();
     state
         .store
@@ -499,7 +522,8 @@ async fn valid_request_returns_200_proxied() {
 #[tokio::test]
 async fn missing_persona_header_returns_400() {
     let state = make_state();
-    let req = proxy_request_with_headers(None, Some("github-token"), Some("https://api.github.com"));
+    let req =
+        proxy_request_with_headers(None, Some("github-token"), Some("https://api.github.com"));
     let resp = call(state, req).await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
@@ -527,7 +551,13 @@ async fn no_active_grant_returns_403() {
     let persona = state.store.create_persona("ungrantable-agent").unwrap();
     state
         .vault
-        .add(VaultScope::Interactive, &state.store, "github-token", b"ghp_secret", None)
+        .add(
+            VaultScope::Interactive,
+            &state.store,
+            "github-token",
+            b"ghp_secret",
+            None,
+        )
         .unwrap();
     // No grant created
 
@@ -548,7 +578,13 @@ async fn request_to_disallowed_target_returns_403() {
     let persona = state.store.create_persona("ssrf-test-agent").unwrap();
     state
         .vault
-        .add(VaultScope::Interactive, &state.store, "github-token", b"ghp_secret", None)
+        .add(
+            VaultScope::Interactive,
+            &state.store,
+            "github-token",
+            b"ghp_secret",
+            None,
+        )
         .unwrap();
     let grant = state
         .store
@@ -608,7 +644,13 @@ async fn scope_read_denies_post() {
     let persona = state.store.create_persona("scope-read-post").unwrap();
     state
         .vault
-        .add(VaultScope::Interactive, &state.store, "gh-token", b"ghp_secret", None)
+        .add(
+            VaultScope::Interactive,
+            &state.store,
+            "gh-token",
+            b"ghp_secret",
+            None,
+        )
         .unwrap();
     state
         .store
@@ -663,46 +705,53 @@ async fn scope_read_allows_get() {
 #[tokio::test]
 async fn scope_github_push_specific_repo() {
     // Allowed: push to the exact repo.
-    let ok_uri: hyper::Uri =
-        "https://api.github.com/repos/emberdotlink/emberlink/issues"
-            .parse()
-            .unwrap();
-    assert!(check_scope(
-        "github:push:emberdotlink/emberlink",
-        &hyper::Method::POST,
-        &ok_uri
-    )
-    .is_ok());
+    let ok_uri: hyper::Uri = "https://api.github.com/repos/emberdotlink/emberlink/issues"
+        .parse()
+        .unwrap();
+    assert!(
+        check_scope(
+            "github:push:emberdotlink/emberlink",
+            &hyper::Method::POST,
+            &ok_uri
+        )
+        .is_ok()
+    );
 
     // Denied: push to a different repo.
-    let bad_uri: hyper::Uri =
-        "https://api.github.com/repos/other/repo/issues".parse().unwrap();
-    assert!(check_scope(
-        "github:push:emberdotlink/emberlink",
-        &hyper::Method::POST,
-        &bad_uri
-    )
-    .is_err());
+    let bad_uri: hyper::Uri = "https://api.github.com/repos/other/repo/issues"
+        .parse()
+        .unwrap();
+    assert!(
+        check_scope(
+            "github:push:emberdotlink/emberlink",
+            &hyper::Method::POST,
+            &bad_uri
+        )
+        .is_err()
+    );
 
     // Also denied: the host isn't github.
-    let wrong_host: hyper::Uri =
-        "https://api.example.com/repos/emberdotlink/emberlink/issues"
-            .parse()
-            .unwrap();
-    assert!(check_scope(
-        "github:push:emberdotlink/emberlink",
-        &hyper::Method::POST,
-        &wrong_host
-    )
-    .is_err());
+    let wrong_host: hyper::Uri = "https://api.example.com/repos/emberdotlink/emberlink/issues"
+        .parse()
+        .unwrap();
+    assert!(
+        check_scope(
+            "github:push:emberdotlink/emberlink",
+            &hyper::Method::POST,
+            &wrong_host
+        )
+        .is_err()
+    );
 
     // Also denied: a read-tier method with a push-only scope.
-    assert!(check_scope(
-        "github:push:emberdotlink/emberlink",
-        &hyper::Method::GET,
-        &ok_uri
-    )
-    .is_err());
+    assert!(
+        check_scope(
+            "github:push:emberdotlink/emberlink",
+            &hyper::Method::GET,
+            &ok_uri
+        )
+        .is_err()
+    );
 }
 
 #[tokio::test]
@@ -726,21 +775,13 @@ async fn scope_unknown_format_denies() {
     assert!(check_scope("garbled::::", &hyper::Method::GET, &uri).is_err());
     assert!(check_scope("github::push", &hyper::Method::POST, &uri).is_err());
     // Too many segments.
-    assert!(
-        check_scope("a:b:c:d:e", &hyper::Method::GET, &uri).is_err()
-    );
+    assert!(check_scope("a:b:c:d:e", &hyper::Method::GET, &uri).is_err());
     // Unknown provider.
-    assert!(
-        check_scope("quux:read", &hyper::Method::GET, &uri).is_err()
-    );
+    assert!(check_scope("quux:read", &hyper::Method::GET, &uri).is_err());
     // Unknown action.
-    assert!(
-        check_scope("github:frobnicate", &hyper::Method::POST, &uri).is_err()
-    );
+    assert!(check_scope("github:frobnicate", &hyper::Method::POST, &uri).is_err());
     // Unknown HTTP method (CONNECT/TRACE etc.) fails closed even under "*".
-    assert!(
-        check_scope("*", &hyper::Method::CONNECT, &uri).is_err()
-    );
+    assert!(check_scope("*", &hyper::Method::CONNECT, &uri).is_err());
 }
 
 #[tokio::test]
@@ -775,8 +816,7 @@ async fn scope_read_denies_post_e2e_logs_denial() {
     // Either the legacy scope-violation denial or the composite
     // no-applicable-statement denial satisfies the audit requirement.
     assert!(entries.iter().any(|e| e.action == "credential.access"
-        && (e.outcome == "denied_scope"
-            || e.outcome == "denied_no_applicable_statement")));
+        && (e.outcome == "denied_scope" || e.outcome == "denied_no_applicable_statement")));
 }
 
 #[tokio::test]
@@ -786,7 +826,13 @@ async fn successful_request_logs_audit_event() {
     let persona = state.store.create_persona("audit-agent").unwrap();
     state
         .vault
-        .add(VaultScope::Interactive, &state.store, "audit-token", b"tok_secret", None)
+        .add(
+            VaultScope::Interactive,
+            &state.store,
+            "audit-token",
+            b"tok_secret",
+            None,
+        )
         .unwrap();
     state
         .store
@@ -846,10 +892,9 @@ async fn scope_subtarget_branches_path_glob_mismatch() {
 #[tokio::test]
 async fn scope_subtarget_git_refs_heads_glob_match() {
     // feat/* glob matches feat/anything via /git/refs/heads/.
-    let uri: hyper::Uri =
-        "https://api.github.com/repos/x/y/git/refs/heads/feat/anything"
-            .parse()
-            .unwrap();
+    let uri: hyper::Uri = "https://api.github.com/repos/x/y/git/refs/heads/feat/anything"
+        .parse()
+        .unwrap();
     assert!(
         check_scope("github:push:x/y:feat/*", &hyper::Method::PATCH, &uri).is_ok(),
         "feat/* should match feat/anything via /git/refs/heads/"
@@ -859,9 +904,7 @@ async fn scope_subtarget_git_refs_heads_glob_match() {
 #[tokio::test]
 async fn scope_subtarget_non_branch_path_denied() {
     // Path has no branch in it — should fail closed.
-    let uri: hyper::Uri = "https://api.github.com/repos/x/y/issues"
-        .parse()
-        .unwrap();
+    let uri: hyper::Uri = "https://api.github.com/repos/x/y/issues".parse().unwrap();
     let result = check_scope("github:push:x/y:feat/*", &hyper::Method::POST, &uri);
     assert!(
         result.is_err(),
@@ -916,10 +959,9 @@ async fn scope_subtarget_empty_segment_rejected() {
 #[tokio::test]
 async fn scope_subtarget_protection_subresource() {
     // /branches/{branch}/protection — branch is still the segment after /branches/.
-    let uri: hyper::Uri =
-        "https://api.github.com/repos/x/y/branches/main/protection"
-            .parse()
-            .unwrap();
+    let uri: hyper::Uri = "https://api.github.com/repos/x/y/branches/main/protection"
+        .parse()
+        .unwrap();
     assert!(
         check_scope("github:push:x/y:main", &hyper::Method::PUT, &uri).is_ok(),
         "subtarget 'main' should match /branches/main/protection"
@@ -935,10 +977,9 @@ async fn scope_subtarget_percent_encoded_slash_in_branch() {
     // feat%2Ffoo in the URI path should match the glob feat/* after decoding.
     // hyper parses the raw path; `%2F` is NOT decoded to `/` by `uri.path()`.
     // We must decode it ourselves before matching.
-    let uri: hyper::Uri =
-        "https://api.github.com/repos/x/y/branches/feat%2Ffoo"
-            .parse()
-            .unwrap();
+    let uri: hyper::Uri = "https://api.github.com/repos/x/y/branches/feat%2Ffoo"
+        .parse()
+        .unwrap();
     assert!(
         check_scope("github:push:x/y:feat/*", &hyper::Method::POST, &uri).is_ok(),
         "feat/* should match branch feat/foo delivered as feat%2Ffoo in path"
@@ -948,10 +989,9 @@ async fn scope_subtarget_percent_encoded_slash_in_branch() {
 #[tokio::test]
 async fn scope_subtarget_heavily_percent_encoded_branch() {
     // %66eat%2Fbar decodes to feat/bar, which should match feat/*.
-    let uri: hyper::Uri =
-        "https://api.github.com/repos/x/y/branches/%66eat%2Fbar"
-            .parse()
-            .unwrap();
+    let uri: hyper::Uri = "https://api.github.com/repos/x/y/branches/%66eat%2Fbar"
+        .parse()
+        .unwrap();
     assert!(
         check_scope("github:push:x/y:feat/*", &hyper::Method::POST, &uri).is_ok(),
         "feat/* should match branch feat/bar delivered as %66eat%2Fbar in path"
@@ -965,13 +1005,10 @@ async fn scope_subtarget_heavily_percent_encoded_branch() {
 #[tokio::test]
 async fn subtarget_glob_allows_matching_branch() {
     // feat/* matches feat/foo on POST /branches/feat/foo.
-    let uri: hyper::Uri =
-        "https://api.github.com/repos/owner/repo/branches/feat/foo"
-            .parse()
-            .unwrap();
-    assert!(
-        check_scope("github:push:owner/repo:feat/*", &hyper::Method::POST, &uri).is_ok(),
-    );
+    let uri: hyper::Uri = "https://api.github.com/repos/owner/repo/branches/feat/foo"
+        .parse()
+        .unwrap();
+    assert!(check_scope("github:push:owner/repo:feat/*", &hyper::Method::POST, &uri).is_ok(),);
 }
 
 #[tokio::test]
@@ -980,9 +1017,7 @@ async fn subtarget_glob_denies_main_branch_when_scope_limits_to_feat() {
     let uri: hyper::Uri = "https://api.github.com/repos/owner/repo/branches/main"
         .parse()
         .unwrap();
-    assert!(
-        check_scope("github:push:owner/repo:feat/*", &hyper::Method::POST, &uri).is_err(),
-    );
+    assert!(check_scope("github:push:owner/repo:feat/*", &hyper::Method::POST, &uri).is_err(),);
 }
 
 #[tokio::test]
@@ -1023,18 +1058,15 @@ async fn subtarget_glob_allows_nested_via_double_star() {
 async fn subtarget_no_glob_falls_through_to_target_match() {
     // A scope with no subtarget (three segments) must allow any branch
     // once the target (owner/repo) matches.
-    let uri_main: hyper::Uri =
-        "https://api.github.com/repos/owner/repo/branches/main"
-            .parse()
-            .unwrap();
-    let uri_feat: hyper::Uri =
-        "https://api.github.com/repos/owner/repo/branches/feat/foo"
-            .parse()
-            .unwrap();
-    let uri_issues: hyper::Uri =
-        "https://api.github.com/repos/owner/repo/issues"
-            .parse()
-            .unwrap();
+    let uri_main: hyper::Uri = "https://api.github.com/repos/owner/repo/branches/main"
+        .parse()
+        .unwrap();
+    let uri_feat: hyper::Uri = "https://api.github.com/repos/owner/repo/branches/feat/foo"
+        .parse()
+        .unwrap();
+    let uri_issues: hyper::Uri = "https://api.github.com/repos/owner/repo/issues"
+        .parse()
+        .unwrap();
 
     for uri in [&uri_main, &uri_feat, &uri_issues] {
         assert!(
@@ -1048,10 +1080,9 @@ async fn subtarget_no_glob_falls_through_to_target_match() {
 async fn subtarget_contents_endpoint_uses_ref_query_param() {
     // PUT /repos/owner/repo/contents/file.txt?ref=feat/foo
     // — branch is the ref query param, not anywhere in the path.
-    let uri: hyper::Uri =
-        "https://api.github.com/repos/owner/repo/contents/file.txt?ref=feat/foo"
-            .parse()
-            .unwrap();
+    let uri: hyper::Uri = "https://api.github.com/repos/owner/repo/contents/file.txt?ref=feat/foo"
+        .parse()
+        .unwrap();
     assert!(
         check_scope("github:push:owner/repo:feat/*", &hyper::Method::PUT, &uri).is_ok(),
         "feat/* should match ?ref=feat/foo on /contents/ endpoint"
@@ -1061,10 +1092,9 @@ async fn subtarget_contents_endpoint_uses_ref_query_param() {
 #[tokio::test]
 async fn subtarget_denies_contents_with_main_ref() {
     // Same scope, but ?ref=main — should deny.
-    let uri: hyper::Uri =
-        "https://api.github.com/repos/owner/repo/contents/file.txt?ref=main"
-            .parse()
-            .unwrap();
+    let uri: hyper::Uri = "https://api.github.com/repos/owner/repo/contents/file.txt?ref=main"
+        .parse()
+        .unwrap();
     assert!(
         check_scope("github:push:owner/repo:feat/*", &hyper::Method::PUT, &uri).is_err(),
         "feat/* must not match ?ref=main on /contents/ endpoint"
@@ -1088,10 +1118,9 @@ async fn subtarget_contents_percent_encoded_ref() {
 async fn subtarget_contents_no_ref_query_denies() {
     // /contents/ without ?ref= — we cannot determine which branch is
     // targeted, so fail closed.
-    let uri: hyper::Uri =
-        "https://api.github.com/repos/owner/repo/contents/file.txt"
-            .parse()
-            .unwrap();
+    let uri: hyper::Uri = "https://api.github.com/repos/owner/repo/contents/file.txt"
+        .parse()
+        .unwrap();
     assert!(
         check_scope("github:push:owner/repo:feat/*", &hyper::Method::PUT, &uri).is_err(),
         "missing ?ref= must fail closed when scope has subtarget"
@@ -1100,7 +1129,7 @@ async fn subtarget_contents_no_ref_query_denies() {
 
 // ------------------------------------------------------------------
 // Glob semantics — unit tests now live in
-// `core-proxy-forward::r#match::tests` (implementation-note-43).
+// `core-proxy-forward::r#match::tests` (implementation-note-58).
 // The two end-to-end scope tests below stay here because they exercise
 // `check_scope` against a full `hyper::Uri`, not the matcher alone.
 // ------------------------------------------------------------------
@@ -1114,12 +1143,8 @@ fn subtarget_violation_carries_subtarget_audit_outcome() {
     let uri: hyper::Uri = "https://api.github.com/repos/owner/repo/branches/main"
         .parse()
         .unwrap();
-    let violation = check_scope(
-        "github:push:owner/repo:feat/*",
-        &hyper::Method::POST,
-        &uri,
-    )
-    .unwrap_err();
+    let violation =
+        check_scope("github:push:owner/repo:feat/*", &hyper::Method::POST, &uri).unwrap_err();
     assert_eq!(violation.kind, ScopeViolationKind::Subtarget);
     assert_eq!(violation.audit_outcome(), "denied_subtarget_scope");
 
@@ -1148,8 +1173,11 @@ fn subtarget_violation_carries_subtarget_audit_outcome() {
 // glob against the request URI's branch.
 
 fn grant_with_subtarget_scope(scope: &str) -> core_grant_types::AccessGrant {
-    use core_grant_types::{AccessGrant, AttestationBinding, Block, GrantMode, GrantStatus, RecipientProfile, ResourceSelector, ResourceType, SignedBlock, Statement, Usage};
-    use core_event_types::{PresentationAudienceKind};
+    use core_event_types::PresentationAudienceKind;
+    use core_grant_types::{
+        AccessGrant, AttestationBinding, Block, GrantMode, GrantStatus, RecipientProfile,
+        ResourceSelector, ResourceType, SignedBlock, Statement, Usage,
+    };
     // Mirror what `scope_to_actions_and_selector` produces for the
     // 4-segment shape — a single statement with `GlobWithSubtarget`.
     let parts: Vec<&str> = scope.split(':').collect();
@@ -1207,24 +1235,15 @@ fn subtarget_present_in_scope_routes_to_subtarget_match() {
     // branch — resolver should return `Match`, not `SubtargetMiss`
     // and not `NoApplicable`.
     let grant = grant_with_subtarget_scope("github:push:owner/repo:feat/*");
-    let uri: hyper::Uri =
-        "https://api.github.com/repos/owner/repo/branches/feat/foo"
-            .parse()
-            .unwrap();
-    let outcome = resolve_statement_for_request_with_uri(
-        &grant,
-        "github:push",
-        "owner/repo",
-        &uri,
-    );
+    let uri: hyper::Uri = "https://api.github.com/repos/owner/repo/branches/feat/foo"
+        .parse()
+        .unwrap();
+    let outcome = resolve_statement_for_request_with_uri(&grant, "github:push", "owner/repo", &uri);
     match outcome {
         ResolveOutcome::Match { stmt, .. } => {
             assert_eq!(stmt.sid, "S0");
         }
-        other => panic!(
-            "expected Match for primary+subtarget hit, got {:?}",
-            other
-        ),
+        other => panic!("expected Match for primary+subtarget hit, got {:?}", other),
     }
 }
 
@@ -1237,16 +1256,10 @@ fn subtarget_miss_returns_denied_subtarget_scope_not_no_applicable_statement() {
     // `GlobWithSubtarget` and reports `SubtargetMiss` so the deny
     // path can emit `denied_subtarget_scope`.
     let grant = grant_with_subtarget_scope("github:push:owner/repo:feat/*");
-    let uri: hyper::Uri =
-        "https://api.github.com/repos/owner/repo/branches/main"
-            .parse()
-            .unwrap();
-    let outcome = resolve_statement_for_request_with_uri(
-        &grant,
-        "github:push",
-        "owner/repo",
-        &uri,
-    );
+    let uri: hyper::Uri = "https://api.github.com/repos/owner/repo/branches/main"
+        .parse()
+        .unwrap();
+    let outcome = resolve_statement_for_request_with_uri(&grant, "github:push", "owner/repo", &uri);
     match outcome {
         ResolveOutcome::SubtargetMiss { subtarget_glob } => {
             assert_eq!(subtarget_glob, "feat/*");
@@ -1268,15 +1281,20 @@ fn subtarget_miss_returns_denied_subtarget_scope_not_no_applicable_statement() {
 
 #[test]
 fn resolve_statement_picks_first_applicable() {
-    use core_grant_types::{AccessGrant, AttestationBinding, Block, GrantMode, GrantStatus, RecipientProfile, ResourceSelector, ResourceType, SignedBlock, Statement, Usage};
-    use core_event_types::{PresentationAudienceKind};
+    use core_event_types::PresentationAudienceKind;
+    use core_grant_types::{
+        AccessGrant, AttestationBinding, Block, GrantMode, GrantStatus, RecipientProfile,
+        ResourceSelector, ResourceType, SignedBlock, Statement, Usage,
+    };
     // V0: Statement actions are fully qualified (`provider:action`).
     // Bare-action tolerance was a back-compat wart and is gone.
     let stmt_read = Statement {
         sid: "S0".into(),
         resource_type: ResourceType::Credential,
         actions: vec!["github:read".into()],
-        resource: ResourceSelector::Glob { pattern: "emberdotlink/*".into() },
+        resource: ResourceSelector::Glob {
+            pattern: "emberdotlink/*".into(),
+        },
         budget: None,
         usage: Usage::default(),
         conditions: Vec::new(),
@@ -1285,7 +1303,9 @@ fn resolve_statement_picks_first_applicable() {
         sid: "S1".into(),
         resource_type: ResourceType::Credential,
         actions: vec!["github:push".into()],
-        resource: ResourceSelector::Exact { value: "emberdotlink/widgets".into() },
+        resource: ResourceSelector::Exact {
+            value: "emberdotlink/widgets".into(),
+        },
         budget: None,
         usage: Usage::default(),
         conditions: Vec::new(),
@@ -1326,9 +1346,11 @@ fn resolve_statement_picks_first_applicable() {
     assert!(hit.is_some(), "github:read should match stmt_read");
     assert_eq!(hit.unwrap().1.sid, "S0");
     // github:push on the exact resource matches stmt_push.
-    let hit =
-        resolve_statement_for_request(&grant, "github:push", "emberdotlink/widgets");
-    assert!(hit.is_some(), "github:push on widgets should match stmt_push");
+    let hit = resolve_statement_for_request(&grant, "github:push", "emberdotlink/widgets");
+    assert!(
+        hit.is_some(),
+        "github:push on widgets should match stmt_push"
+    );
     assert_eq!(hit.unwrap().1.sid, "S1");
     // github:push to a different repo matches nothing — read glob is
     // action=read only and push selector is exact.
@@ -1342,7 +1364,10 @@ async fn per_statement_denies_unmatched_action() {
     // read action produces no applicable statement → deny.
     let state = make_state();
     let persona = state.store.create_persona("per-stmt-1").unwrap();
-    state.vault.add(VaultScope::Interactive, &state.store, "tok", b"s", None).unwrap();
+    state
+        .vault
+        .add(VaultScope::Interactive, &state.store, "tok", b"s", None)
+        .unwrap();
     state
         .store
         .create_grant(&persona.id, "tok", "generic:read:/api/foo", None)
@@ -1486,18 +1511,12 @@ fn proxy_llm_request(
 
 /// Call helper that takes a `Full<Bytes>` body — used for tests that
 /// need a non-empty request body (preflight, metering).
-async fn call_full(
-    state: Arc<ProxyState>,
-    req: Request<Full<Bytes>>,
-) -> Response<ProxyBody> {
+async fn call_full(state: Arc<ProxyState>, req: Request<Full<Bytes>>) -> Response<ProxyBody> {
     use http_body_util::combinators::UnsyncBoxBody;
     let (parts, body) = req.into_parts();
-    let mapped = body.map_err(|_| -> hyper::Error {
-        panic!("Full body mapper unused")
-    });
+    let mapped = body.map_err(|_| -> hyper::Error { panic!("Full body mapper unused") });
     let incoming_req = Request::from_parts(parts, mapped);
-    let boxed: Request<UnsyncBoxBody<Bytes, hyper::Error>> =
-        incoming_req.map(UnsyncBoxBody::new);
+    let boxed: Request<UnsyncBoxBody<Bytes, hyper::Error>> = incoming_req.map(UnsyncBoxBody::new);
     handle_request_boxed(state, boxed).await.unwrap()
 }
 
@@ -1507,7 +1526,13 @@ async fn proxy_meter_increments_tokens_on_anthropic_response() {
     let persona = state.store.create_persona("meter-1").unwrap();
     state
         .vault
-        .add(VaultScope::Interactive, &state.store, "anthropic-key", b"sk-test", None)
+        .add(
+            VaultScope::Interactive,
+            &state.store,
+            "anthropic-key",
+            b"sk-test",
+            None,
+        )
         .unwrap();
     // 3-statement grant — Credential + Session(20000 tokens) + Time.
     let grant_id = seed_composite_grant(
@@ -1560,17 +1585,20 @@ async fn proxy_meter_emits_warning_at_80_percent() {
     let persona = state.store.create_persona("meter-80").unwrap();
     state
         .vault
-        .add(VaultScope::Interactive, &state.store, "anthropic-key", b"sk-test", None)
+        .add(
+            VaultScope::Interactive,
+            &state.store,
+            "anthropic-key",
+            b"sk-test",
+            None,
+        )
         .unwrap();
     // Session tokens = 10_000.
     let _grant_id = seed_composite_grant(
         &state,
         &persona.id,
         "anthropic-key",
-        vec![
-            stmt_credential("S0"),
-            stmt_session("S1", 10_000),
-        ],
+        vec![stmt_credential("S0"), stmt_session("S1", 10_000)],
     );
 
     // First call: 7900 tokens total (input 4000 + output 3900).
@@ -1627,7 +1655,13 @@ async fn proxy_preflight_rejects_over_budget() {
     let persona = state.store.create_persona("meter-preflight").unwrap();
     state
         .vault
-        .add(VaultScope::Interactive, &state.store, "anthropic-key", b"sk-test", None)
+        .add(
+            VaultScope::Interactive,
+            &state.store,
+            "anthropic-key",
+            b"sk-test",
+            None,
+        )
         .unwrap();
     // Budget: 10_000 tokens. Pre-seed usage = 9_500 by doing one
     // metered call first.
@@ -1635,10 +1669,7 @@ async fn proxy_preflight_rejects_over_budget() {
         &state,
         &persona.id,
         "anthropic-key",
-        vec![
-            stmt_credential("S0"),
-            stmt_session("S1", 10_000),
-        ],
+        vec![stmt_credential("S0"), stmt_session("S1", 10_000)],
     );
     // Warm usage to 9_500 via a prior successful meter.
     let body_warm = anthropic_body(5_000, 4_500);
@@ -1678,13 +1709,13 @@ async fn proxy_preflight_rejects_over_budget() {
     // uses Empty<Bytes>. Map body errors in the same way.
     use http_body_util::combinators::UnsyncBoxBody;
     let (parts, body) = req_over.into_parts();
-    let mapped = body.map_err(|_| -> hyper::Error {
-        panic!("full body error mapper unused in preflight test")
-    });
+    let mapped = body
+        .map_err(|_| -> hyper::Error { panic!("full body error mapper unused in preflight test") });
     let incoming_req = Request::from_parts(parts, mapped);
-    let boxed: Request<UnsyncBoxBody<Bytes, hyper::Error>> =
-        incoming_req.map(UnsyncBoxBody::new);
-    let resp = handle_request_boxed(Arc::clone(&state), boxed).await.unwrap();
+    let boxed: Request<UnsyncBoxBody<Bytes, hyper::Error>> = incoming_req.map(UnsyncBoxBody::new);
+    let resp = handle_request_boxed(Arc::clone(&state), boxed)
+        .await
+        .unwrap();
     assert_eq!(
         resp.status(),
         StatusCode::TOO_MANY_REQUESTS,
@@ -1729,7 +1760,13 @@ async fn proxy_meter_flips_status_on_exhaustion() {
     let persona = state.store.create_persona("meter-exhaust").unwrap();
     state
         .vault
-        .add(VaultScope::Interactive, &state.store, "anthropic-key", b"sk-test", None)
+        .add(
+            VaultScope::Interactive,
+            &state.store,
+            "anthropic-key",
+            b"sk-test",
+            None,
+        )
         .unwrap();
     let grant_id = seed_composite_grant(
         &state,
@@ -1762,7 +1799,12 @@ async fn proxy_meter_flips_status_on_exhaustion() {
 
     // Session usage exceeds its 2_000 cap.
     let ag = state.store.get_access_grant(&grant_id).unwrap();
-    let s1 = ag.statements().find(|(_, s)| s.sid == "S1").unwrap().1.clone();
+    let s1 = ag
+        .statements()
+        .find(|(_, s)| s.sid == "S1")
+        .unwrap()
+        .1
+        .clone();
     assert!(s1.usage.tokens >= 2_000);
     assert!(
         !s1.has_budget_remaining(),
@@ -1777,16 +1819,19 @@ async fn proxy_meter_flips_status_on_exhaustion() {
     let persona2 = state.store.create_persona("meter-exhaust-2").unwrap();
     state
         .vault
-        .add(VaultScope::Interactive, &state.store, "anthropic-key-2", b"sk-test", None)
+        .add(
+            VaultScope::Interactive,
+            &state.store,
+            "anthropic-key-2",
+            b"sk-test",
+            None,
+        )
         .unwrap();
     let gid2 = seed_composite_grant(
         &state,
         &persona2.id,
         "anthropic-key-2",
-        vec![
-            stmt_credential("S0"),
-            stmt_session("S1", 2_000),
-        ],
+        vec![stmt_credential("S0"), stmt_session("S1", 2_000)],
     );
     let body2 = anthropic_body(1_500, 1_500);
     let req2 = proxy_llm_request(
@@ -1822,7 +1867,13 @@ async fn proxy_non_llm_target_skips_token_meters() {
     let persona = state.store.create_persona("gh-meter").unwrap();
     state
         .vault
-        .add(VaultScope::Interactive, &state.store, "gh-token", b"ghp_secret", None)
+        .add(
+            VaultScope::Interactive,
+            &state.store,
+            "gh-token",
+            b"ghp_secret",
+            None,
+        )
         .unwrap();
     // Single credential statement with allowed POST.
     let stmt = Statement {
@@ -1834,12 +1885,7 @@ async fn proxy_non_llm_target_skips_token_meters() {
         usage: Usage::default(),
         conditions: Vec::new(),
     };
-    let grant_id = seed_composite_grant(
-        &state,
-        &persona.id,
-        "gh-token",
-        vec![stmt],
-    );
+    let grant_id = seed_composite_grant(&state, &persona.id, "gh-token", vec![stmt]);
 
     let req = Request::builder()
         .method("POST")
@@ -1854,7 +1900,12 @@ async fn proxy_non_llm_target_skips_token_meters() {
 
     // No metering — usage still default.
     let ag = state.store.get_access_grant(&grant_id).unwrap();
-    let s0 = ag.statements().find(|(_, s)| s.sid == "S0").unwrap().1.clone();
+    let s0 = ag
+        .statements()
+        .find(|(_, s)| s.sid == "S0")
+        .unwrap()
+        .1
+        .clone();
     assert_eq!(s0.usage.tokens, 0);
     assert_eq!(s0.usage.cents, 0);
     // No warnings/exhausted — statement has no budget.
@@ -1905,7 +1956,8 @@ fn preflight_budget_check_no_budget_always_allowed() {
 
 #[test]
 fn meter_response_anthropic_extracts_tokens() {
-    let body = br#"{"usage": {"input_tokens": 100, "output_tokens": 200}, "model": "claude-opus-4-5"}"#;
+    let body =
+        br#"{"usage": {"input_tokens": 100, "output_tokens": 200}, "model": "claude-opus-4-5"}"#;
     let u = meter_response("api.anthropic.com", body).expect("parsed");
     assert_eq!(u.tokens, 300);
     // 100 input + 200 output at claude-opus-4-5 (1500 / 7500 cents/M).
@@ -1929,10 +1981,7 @@ fn mark_grant_exhausted_stays_active_while_budgets_remain() {
         &state,
         &persona.id,
         "cred",
-        vec![
-            stmt_session("S1", 1_000),
-            stmt_time("S2", 3_600),
-        ],
+        vec![stmt_session("S1", 1_000), stmt_time("S2", 3_600)],
     );
     // Exhaust S1.
     state
@@ -1940,7 +1989,10 @@ fn mark_grant_exhausted_stays_active_while_budgets_remain() {
         .increment_statement_usage(
             &grant_id,
             "S1",
-            Usage { tokens: 1_500, ..Default::default() },
+            Usage {
+                tokens: 1_500,
+                ..Default::default()
+            },
         )
         .unwrap();
     let flipped = state
@@ -1970,7 +2022,10 @@ fn threshold_warning_is_debounced_per_band() {
         .increment_statement_usage(
             &grant_id,
             "S1",
-            Usage { tokens: 8_000, ..Default::default() },
+            Usage {
+                tokens: 8_000,
+                ..Default::default()
+            },
         )
         .unwrap();
     let budget = Budget {
@@ -2021,11 +2076,17 @@ fn threshold_warning_broadcasts_to_subscribers() {
 
     let (events_tx, mut events_rx) = broadcast::channel::<GrantEvent>(16);
     let store = crate::infra::store::DaemonStore::open_in_memory().unwrap();
-    // implementation-note-137: ProxyState.vault is now Rc<Vault>.
-    let vault = std::rc::Rc::new(crate::infra::vault::Vault::new([0x42u8; 32]));
-    let state = Arc::new(
-        ProxyState::new(store, vault).with_events_tx(events_tx.clone()),
-    );
+    store.set_vault(std::rc::Rc::new(crate::infra::vault::Vault::new(
+        [0x42u8; 32],
+    )));
+    let state = Arc::new(ProxyState::new(store));
+    // implementation-note-273: the broadcast channel + threshold
+    // debounce set now live on the sink, not on `ProxyState`. Install
+    // the sink immediately after construction. `OnceLock::set` returns
+    // `Result<(), Arc<DaemonEventSink>>` whose Err variant does not
+    // implement Debug, so we discard the Result rather than `unwrap`.
+    let sink = Arc::new(DaemonEventSink::new(state.clone(), Some(events_tx.clone())));
+    let _ = state.event_sink.set(sink.clone());
     let persona = state.store.create_persona("broadcast").unwrap();
     let grant_id = seed_composite_grant(
         &state,
@@ -2038,7 +2099,10 @@ fn threshold_warning_broadcasts_to_subscribers() {
         .increment_statement_usage(
             &grant_id,
             "S1",
-            Usage { tokens: 8_000, ..Default::default() },
+            Usage {
+                tokens: 8_000,
+                ..Default::default()
+            },
         )
         .unwrap();
     let budget = Budget {
@@ -2103,24 +2167,26 @@ fn threshold_exhausted_broadcasts_budget_exhausted_event() {
 
     let (events_tx, mut events_rx) = broadcast::channel::<GrantEvent>(16);
     let store = crate::infra::store::DaemonStore::open_in_memory().unwrap();
-    // implementation-note-137: ProxyState.vault is now Rc<Vault>.
-    let vault = std::rc::Rc::new(crate::infra::vault::Vault::new([0x42u8; 32]));
-    let state = Arc::new(
-        ProxyState::new(store, vault).with_events_tx(events_tx.clone()),
-    );
+    store.set_vault(std::rc::Rc::new(crate::infra::vault::Vault::new(
+        [0x42u8; 32],
+    )));
+    let state = Arc::new(ProxyState::new(store));
+    // implementation-note-273: see sibling test — sink ownership of
+    // events_tx + threshold_emitted moved out of ProxyState.
+    let sink = Arc::new(DaemonEventSink::new(state.clone(), Some(events_tx.clone())));
+    let _ = state.event_sink.set(sink.clone());
     let persona = state.store.create_persona("exhaust-b").unwrap();
-    let grant_id = seed_composite_grant(
-        &state,
-        &persona.id,
-        "cred",
-        vec![stmt_session("S1", 1_000)],
-    );
+    let grant_id =
+        seed_composite_grant(&state, &persona.id, "cred", vec![stmt_session("S1", 1_000)]);
     let delta = state
         .store
         .increment_statement_usage(
             &grant_id,
             "S1",
-            Usage { tokens: 1_000, ..Default::default() },
+            Usage {
+                tokens: 1_000,
+                ..Default::default()
+            },
         )
         .unwrap();
     let budget = Budget {
@@ -2156,7 +2222,7 @@ fn threshold_exhausted_broadcasts_budget_exhausted_event() {
 }
 
 // P69L spike Day-1 pure-function tests for git echo helpers moved to
-// `core-proxy-forward::r#match::tests` (implementation-note-43).
+// `core-proxy-forward::r#match::tests` (implementation-note-58).
 
 #[test]
 fn base64_std_encode_matches_rfc_vectors() {
@@ -2281,8 +2347,7 @@ async fn git_echo_streams_large_body_without_collect() {
         upstream_host,
     );
 
-    let client: Client<_, Full<Bytes>> =
-        Client::builder(TokioExecutor::new()).build_http();
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
     let req = Request::builder()
         .method("POST")
         .uri(&proxy_url)
@@ -2368,8 +2433,7 @@ async fn passthrough_respects_concurrency_cap() {
                     .serve_connection(
                         io,
                         hyper::service::service_fn(|req: Request<Incoming>| async move {
-                            let body =
-                                req.into_body().collect().await.unwrap().to_bytes();
+                            let body = req.into_body().collect().await.unwrap().to_bytes();
                             Ok::<Response<Full<Bytes>>, hyper::Error>(
                                 Response::builder()
                                     .status(200)
@@ -2415,12 +2479,10 @@ async fn passthrough_respects_concurrency_cap() {
                 let _ = hyper::server::conn::http1::Builder::new()
                     .serve_connection(
                         io,
-                        hyper::service::service_fn(
-                            move |req: Request<Incoming>| {
-                                let cfg = Arc::clone(&cfg);
-                                async move { handle_git_echo(cfg, req).await }
-                            },
-                        ),
+                        hyper::service::service_fn(move |req: Request<Incoming>| {
+                            let cfg = Arc::clone(&cfg);
+                            async move { handle_git_echo(cfg, req).await }
+                        }),
                     )
                     .await;
             });
@@ -2428,8 +2490,7 @@ async fn passthrough_respects_concurrency_cap() {
     });
 
     // ---- Saturate the gate by holding MAX slots directly.
-    let mut held: Vec<StreamingSlot> =
-        Vec::with_capacity(MAX_CONCURRENT_STREAMING);
+    let mut held: Vec<StreamingSlot> = Vec::with_capacity(MAX_CONCURRENT_STREAMING);
     for _ in 0..MAX_CONCURRENT_STREAMING {
         held.push(StreamingSlot::try_acquire().expect("slot under cap"));
     }
@@ -2444,8 +2505,7 @@ async fn passthrough_respects_concurrency_cap() {
     // ---- First call — gate saturated → expect 503 + Retry-After.
     let (status1, retry_after1, body1) = local
         .run_until(async {
-            let client: Client<_, Full<Bytes>> =
-                Client::builder(TokioExecutor::new()).build_http();
+            let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
             let req = Request::builder()
                 .method("POST")
                 .uri(&proxy_url)
@@ -2492,8 +2552,7 @@ async fn passthrough_respects_concurrency_cap() {
 
     let status2 = local
         .run_until(async {
-            let client: Client<_, Full<Bytes>> =
-                Client::builder(TokioExecutor::new()).build_http();
+            let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
             let req = Request::builder()
                 .method("POST")
                 .uri(&proxy_url)
@@ -2552,10 +2611,7 @@ async fn passthrough_drop_emits_complete_outcome_on_eof() {
 
     // Drain to EOF.
     loop {
-        let frame = std::future::poll_fn(|cx| {
-            std::pin::Pin::new(&mut body).poll_frame(cx)
-        })
-        .await;
+        let frame = std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await;
         if frame.is_none() {
             break;
         }
@@ -2596,9 +2652,7 @@ async fn passthrough_drop_emits_partial_outcome_on_mid_stream_drop() {
     // more to send (this is the hostile-client model).
     tx.send(Ok(Frame::data(Bytes::from_static(b"abc"))))
         .unwrap();
-    let frame =
-        std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx))
-            .await;
+    let frame = std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await;
     assert!(
         frame.is_some(),
         "first poll should surface the queued frame"
@@ -2726,8 +2780,7 @@ async fn slow_loris_upstream_times_out_with_504() {
     // the proxy-server + upstream-mock tasks keep progressing.
     let (status, body_bytes) = local
         .run_until(async {
-            let client: Client<_, Full<Bytes>> =
-                Client::builder(TokioExecutor::new()).build_http();
+            let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
             let req = Request::builder()
                 .method("POST")
                 .uri(&proxy_url)
@@ -2771,9 +2824,7 @@ async fn slow_loris_upstream_times_out_with_504() {
     // Upstream must have observed FIN (peer close). Polling this
     // from inside the LocalSet so the upstream task can finish.
     let peer_closed = local
-        .run_until(async {
-            tokio::time::timeout(Duration::from_secs(5), peer_closed_rx).await
-        })
+        .run_until(async { tokio::time::timeout(Duration::from_secs(5), peer_closed_rx).await })
         .await
         .expect("upstream mock must report back within 5s (tokio time)")
         .expect("peer_closed channel must deliver");
@@ -2826,8 +2877,7 @@ async fn frame_idle_watchdog_fires_on_dribble() {
 
     // Upstream sends exactly one data byte then stalls forever —
     // classic dribble pattern (SlowPost / slow-read-variant).
-    tx.send(Ok(Frame::data(Bytes::from_static(b"x"))))
-        .unwrap();
+    tx.send(Ok(Frame::data(Bytes::from_static(b"x")))).unwrap();
 
     // First poll surfaces the single byte.
     let f1 = std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await;
@@ -2839,18 +2889,14 @@ async fn frame_idle_watchdog_fires_on_dribble() {
     // Subsequent polls observe Pending from the (still-open) mock.
     // Advance the paused clock past FRAME_IDLE_DEADLINE; the watchdog
     // must fire and return Ready(None).
-    let watchdog_fut = std::future::poll_fn(|cx| {
-        std::pin::Pin::new(&mut body).poll_frame(cx)
-    });
+    let watchdog_fut = std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx));
     tokio::pin!(watchdog_fut);
 
     // Poll once to arm the sleep, then advance the clock past the
     // deadline, then poll until completion.
-    let poll_now = std::future::poll_fn(|cx| {
-        match watchdog_fut.as_mut().poll(cx) {
-            Poll::Pending => Poll::Ready(()),
-            Poll::Ready(_) => Poll::Ready(()),
-        }
+    let poll_now = std::future::poll_fn(|cx| match watchdog_fut.as_mut().poll(cx) {
+        Poll::Pending => Poll::Ready(()),
+        Poll::Ready(_) => Poll::Ready(()),
     });
     poll_now.await;
     tokio::time::advance(FRAME_IDLE_DEADLINE + Duration::from_secs(1)).await;
@@ -3016,7 +3062,10 @@ fn stream_response_strips_hop_by_hop_case_insensitive() {
     assert!(!headers.contains_key("transfer-encoding"));
     assert!(!headers.contains_key("connection"));
     assert!(!headers.contains_key("x-custom"));
-    assert_eq!(headers.get("x-foo").and_then(|v| v.to_str().ok()), Some("bar"));
+    assert_eq!(
+        headers.get("x-foo").and_then(|v| v.to_str().ok()),
+        Some("bar")
+    );
 }
 
 // ------------------------------------------------------------------
@@ -3167,10 +3216,10 @@ fn filter_drops_proxy_authorization_forwarded_via_te_trailer_connection() {
 }
 
 // development milestone: strict host-suffix matching unit tests moved to
-// `core-proxy-forward::r#match::tests` (implementation-note-43).
+// `core-proxy-forward::r#match::tests` (implementation-note-58).
 
 // ------------------------------------------------------------------
-// implementation-note-124 — FINDING B: provider-aware auth
+// implementation-note-173 — FINDING B: provider-aware auth
 // injection. Mirrors `git_echo_grant_backed_lookup_injects_correct_auth`
 // for the LLM proxy path, but tests the helper directly because
 // `handle_request` consults the target URL for the live TCP connection
@@ -3223,13 +3272,8 @@ fn inject_provider_auth_lookalike_does_not_route_anthropic() {
     // development milestone invariant — `notanthropic.com` MUST NOT match
     // `anthropic.com`. The fallback is Bearer (generic).
     let mut headers = hyper::HeaderMap::new();
-    let scheme = inject_provider_auth(
-        &mut headers,
-        "notanthropic.com",
-        false,
-        "should-be-bearer",
-    )
-    .expect("valid credential");
+    let scheme = inject_provider_auth(&mut headers, "notanthropic.com", false, "should-be-bearer")
+        .expect("valid credential");
     assert_eq!(scheme, AuthScheme::Bearer);
     assert!(
         !headers.contains_key("x-api-key"),
@@ -3253,13 +3297,8 @@ fn inject_provider_auth_strips_client_supplied_credentials() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("authorization", "Bearer client-supplied".parse().unwrap());
     headers.insert("x-api-key", "placeholder".parse().unwrap());
-    let scheme = inject_provider_auth(
-        &mut headers,
-        "api.anthropic.com",
-        false,
-        "sk-ant-real",
-    )
-    .expect("valid credential");
+    let scheme = inject_provider_auth(&mut headers, "api.anthropic.com", false, "sk-ant-real")
+        .expect("valid credential");
     assert_eq!(scheme, AuthScheme::Anthropic);
     // Authorization stripped; only one x-api-key remains; value is ours.
     assert!(!headers.contains_key("authorization"));
@@ -3274,13 +3313,8 @@ fn inject_provider_auth_strips_client_supplied_credentials() {
 #[test]
 fn inject_provider_auth_git_uses_basic() {
     let mut headers = hyper::HeaderMap::new();
-    let scheme = inject_provider_auth(
-        &mut headers,
-        "github.com",
-        true,
-        "ghp_test_pat",
-    )
-    .expect("valid credential");
+    let scheme = inject_provider_auth(&mut headers, "github.com", true, "ghp_test_pat")
+        .expect("valid credential");
     assert_eq!(scheme, AuthScheme::Basic);
     let auth = headers
         .get("authorization")
@@ -3295,13 +3329,8 @@ fn inject_provider_auth_git_uses_basic() {
 #[test]
 fn inject_provider_auth_default_is_bearer() {
     let mut headers = hyper::HeaderMap::new();
-    let scheme = inject_provider_auth(
-        &mut headers,
-        "api.openai.com",
-        false,
-        "sk-openai-test",
-    )
-    .expect("valid credential");
+    let scheme = inject_provider_auth(&mut headers, "api.openai.com", false, "sk-openai-test")
+        .expect("valid credential");
     assert_eq!(scheme, AuthScheme::Bearer);
     assert_eq!(
         headers.get("authorization").and_then(|v| v.to_str().ok()),
@@ -3320,7 +3349,13 @@ async fn proxy_anthropic_target_routes_to_x_api_key_mode() {
     let persona = state.store.create_persona("anthropic-route").unwrap();
     state
         .vault
-        .add(VaultScope::Interactive, &state.store, "anthropic-key", b"sk-ant-test", None)
+        .add(
+            VaultScope::Interactive,
+            &state.store,
+            "anthropic-key",
+            b"sk-ant-test",
+            None,
+        )
         .unwrap();
     state
         .store
@@ -3351,13 +3386,11 @@ fn request_to_action_resource_classifies_github_hosts_only() {
     let uri: hyper::Uri = "https://api.github.com/repos/emberdotlink/emberlink"
         .parse()
         .unwrap();
-    let (action, _resource) =
-        request_to_action_resource(&hyper::Method::GET, &uri).unwrap();
+    let (action, _resource) = request_to_action_resource(&hyper::Method::GET, &uri).unwrap();
     assert_eq!(action, "github:read");
 
     let uri: hyper::Uri = "https://github.com/emberdotlink/emberlink".parse().unwrap();
-    let (action, _resource) =
-        request_to_action_resource(&hyper::Method::POST, &uri).unwrap();
+    let (action, _resource) = request_to_action_resource(&hyper::Method::POST, &uri).unwrap();
     assert_eq!(action, "github:push");
 
     // Look-alike — must classify as `generic`, never `github`.
@@ -3368,8 +3401,7 @@ fn request_to_action_resource_classifies_github_hosts_only() {
         "https://my-github.com/x/y",
     ] {
         let uri: hyper::Uri = attacker_host.parse().unwrap();
-        let (action, _resource) =
-            request_to_action_resource(&hyper::Method::POST, &uri).unwrap();
+        let (action, _resource) = request_to_action_resource(&hyper::Method::POST, &uri).unwrap();
         assert!(
             action.starts_with("generic:"),
             "look-alike host {attacker_host} must not classify as github, got {action}"
@@ -3389,8 +3421,7 @@ fn effective_scope_uri_uses_target_authority_for_host() {
     let req_uri: hyper::Uri = "https://api.github.com/repos/legit/repo/issues"
         .parse()
         .unwrap();
-    let eff =
-        effective_scope_uri("https://evil.attacker.example/exfil", &req_uri).unwrap();
+    let eff = effective_scope_uri("https://evil.attacker.example/exfil", &req_uri).unwrap();
     assert_eq!(eff.host(), Some("evil.attacker.example"));
     // Target has a non-trivial path, so its path wins.
     assert_eq!(eff.path(), "/exfil");
@@ -3429,7 +3460,13 @@ async fn c1_scope_split_attack_denies_exfiltration_to_attacker_host() {
     let persona = state.store.create_persona("c1-split-agent").unwrap();
     state
         .vault
-        .add(VaultScope::Interactive, &state.store, "gh-token", b"ghp_exfil_target", None)
+        .add(
+            VaultScope::Interactive,
+            &state.store,
+            "gh-token",
+            b"ghp_exfil_target",
+            None,
+        )
         .unwrap();
     state
         .store
@@ -3468,7 +3505,13 @@ async fn c1_lookalike_host_with_github_scope_is_denied() {
     let persona = state.store.create_persona("c2-lookalike-agent").unwrap();
     state
         .vault
-        .add(VaultScope::Interactive, &state.store, "gh-token", b"ghp_secret", None)
+        .add(
+            VaultScope::Interactive,
+            &state.store,
+            "gh-token",
+            b"ghp_secret",
+            None,
+        )
         .unwrap();
     state
         .store
@@ -3502,7 +3545,13 @@ async fn finding1_allowed_targets_userinfo_host_exfil_denied() {
     let persona = state.store.create_persona("finding1-agent").unwrap();
     state
         .vault
-        .add(VaultScope::Interactive, &state.store, "gh-token", b"ghp_secret", None)
+        .add(
+            VaultScope::Interactive,
+            &state.store,
+            "gh-token",
+            b"ghp_secret",
+            None,
+        )
         .unwrap();
     // Grant scoped broadly enough that check_scope does NOT deny first —
     // we want allowed_targets to be the gate under test.
@@ -3582,10 +3631,7 @@ fn is_streaming_upstream_detects_event_stream_with_charset() {
 #[test]
 fn is_streaming_upstream_detects_chunked_transfer_encoding() {
     let mut h = hyper::HeaderMap::new();
-    h.insert(
-        hyper::header::TRANSFER_ENCODING,
-        "chunked".parse().unwrap(),
-    );
+    h.insert(hyper::header::TRANSFER_ENCODING, "chunked".parse().unwrap());
     assert!(is_streaming_upstream(&h));
 }
 
@@ -3658,7 +3704,8 @@ async fn tee_body_forwards_chunks_as_they_arrive() {
     let start = std::time::Instant::now();
     let mut arrivals: Vec<(u128, Vec<u8>)> = Vec::new();
     loop {
-        let frame_opt = std::future::poll_fn(|cx| std::pin::Pin::new(&mut tee).poll_frame(cx)).await;
+        let frame_opt =
+            std::future::poll_fn(|cx| std::pin::Pin::new(&mut tee).poll_frame(cx)).await;
         match frame_opt {
             None => break,
             Some(Ok(f)) => {
@@ -3731,9 +3778,11 @@ async fn tee_body_aborts_when_size_cap_exceeded() {
     let mut tee = TeeBody::new(mock, cap, meter);
 
     // First chunk: under cap (32 bytes).
-    tx.send(Ok(Frame::data(Bytes::from(vec![0u8; 32])))).unwrap();
+    tx.send(Ok(Frame::data(Bytes::from(vec![0u8; 32]))))
+        .unwrap();
     // Second chunk: would push total to 96 bytes, > cap.
-    tx.send(Ok(Frame::data(Bytes::from(vec![1u8; 64])))).unwrap();
+    tx.send(Ok(Frame::data(Bytes::from(vec![1u8; 64]))))
+        .unwrap();
     drop(tx);
 
     // First poll yields the under-cap frame.
@@ -3857,9 +3906,8 @@ async fn tee_body_releases_slot_on_clean_eof() {
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mock = ChannelBody { rx };
-    let meter = TeeMeterCallback::new(
-        move |_summary: pricing::UsageSummary, _outcome: StreamOutcome| {},
-    );
+    let meter =
+        TeeMeterCallback::new(move |_summary: pricing::UsageSummary, _outcome: StreamOutcome| {});
     let mut tee = TeeBody::new_with_slot(mock, 1024, meter, Some(slot));
     drop(tx); // clean EOF on next poll
 
@@ -3895,9 +3943,8 @@ async fn tee_body_releases_slot_on_mid_stream_drop() {
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let mock = ChannelBody { rx };
-    let meter = TeeMeterCallback::new(
-        move |_summary: pricing::UsageSummary, _outcome: StreamOutcome| {},
-    );
+    let meter =
+        TeeMeterCallback::new(move |_summary: pricing::UsageSummary, _outcome: StreamOutcome| {});
     let tee = TeeBody::new_with_slot(mock, 1024, meter, Some(slot));
 
     // Keep `tx` alive so upstream would still have more to send.
@@ -3943,7 +3990,11 @@ async fn tee_body_meter_matches_buffered_path() {
     // parse across multiple frames before the meter sees the result.
     let bytes = body.as_bytes();
     let third = bytes.len() / 3;
-    for chunk in [&bytes[..third], &bytes[third..2 * third], &bytes[2 * third..]] {
+    for chunk in [
+        &bytes[..third],
+        &bytes[third..2 * third],
+        &bytes[2 * third..],
+    ] {
         tx.send(Ok(Frame::data(Bytes::copy_from_slice(chunk))))
             .unwrap();
     }
@@ -3984,11 +4035,7 @@ fn sse_frame(event: &str, payload: serde_json::Value) -> String {
 /// Build a plausible Anthropic SSE response: message_start with
 /// input_tokens, two message_delta events advancing output_tokens
 /// cumulatively, and a terminal message_stop.
-fn anthropic_sse_complete(
-    model: &str,
-    input_tokens: u64,
-    delta_outputs: &[u64],
-) -> String {
+fn anthropic_sse_complete(model: &str, input_tokens: u64, delta_outputs: &[u64]) -> String {
     let mut out = String::new();
     out.push_str(&sse_frame(
         "message_start",
@@ -4030,7 +4077,13 @@ async fn test_streaming_response_tees_usage() {
     let persona = state.store.create_persona("sse-happy").unwrap();
     state
         .vault
-        .add(VaultScope::Interactive, &state.store, "anthropic-key", b"sk-secret", None)
+        .add(
+            VaultScope::Interactive,
+            &state.store,
+            "anthropic-key",
+            b"sk-secret",
+            None,
+        )
         .unwrap();
     let grant_id = seed_composite_grant(
         &state,
@@ -4067,8 +4120,7 @@ async fn test_streaming_response_tees_usage() {
     let meter = TeeMeterCallback::new(
         move |summary: pricing::UsageSummary, tee_outcome: StreamOutcome| {
             let outcome = if tee_outcome == StreamOutcome::Complete
-                && pricing::provider_for_host(&meter_host)
-                    == Some(pricing::PROVIDER_ANTHROPIC)
+                && pricing::provider_for_host(&meter_host) == Some(pricing::PROVIDER_ANTHROPIC)
                 && summary.saw_any_usage
                 && !summary.saw_message_stop
             {
@@ -4147,7 +4199,13 @@ async fn test_streaming_response_partial_records_usage() {
     let persona = state.store.create_persona("sse-partial").unwrap();
     state
         .vault
-        .add(VaultScope::Interactive, &state.store, "anthropic-key", b"sk-secret", None)
+        .add(
+            VaultScope::Interactive,
+            &state.store,
+            "anthropic-key",
+            b"sk-secret",
+            None,
+        )
         .unwrap();
     let grant_id = seed_composite_grant(
         &state,
@@ -4197,8 +4255,7 @@ async fn test_streaming_response_partial_records_usage() {
     let meter = TeeMeterCallback::new(
         move |summary: pricing::UsageSummary, tee_outcome: StreamOutcome| {
             let outcome = if tee_outcome == StreamOutcome::Complete
-                && pricing::provider_for_host(&meter_host)
-                    == Some(pricing::PROVIDER_ANTHROPIC)
+                && pricing::provider_for_host(&meter_host) == Some(pricing::PROVIDER_ANTHROPIC)
                 && summary.saw_any_usage
                 && !summary.saw_message_stop
             {
@@ -4267,7 +4324,13 @@ fn test_non_streaming_unchanged() {
     let persona = state.store.create_persona("buffered").unwrap();
     state
         .vault
-        .add(VaultScope::Interactive, &state.store, "anthropic-key", b"sk-secret", None)
+        .add(
+            VaultScope::Interactive,
+            &state.store,
+            "anthropic-key",
+            b"sk-secret",
+            None,
+        )
         .unwrap();
     let grant_id = seed_composite_grant(
         &state,
@@ -4327,7 +4390,7 @@ fn test_non_streaming_unchanged() {
     );
 }
 
-/// C44-implementation-note-199 regression guard — the proxy.meter audit event
+/// C44-implementation-note-274 regression guard — the proxy.meter audit event
 /// must NOT emit the raw credential alias in any field. Readers of the
 /// audit log must not be able to correlate persona → credential by
 /// scanning rows. The raw alias stays in `statement_usage`/grant rows;
@@ -4341,7 +4404,13 @@ fn audit_event_hides_raw_credential_name() {
     let raw_alias = "anthropic-secret-alias-abc123";
     state
         .vault
-        .add(VaultScope::Interactive, &state.store, raw_alias, b"sk-secret", None)
+        .add(
+            VaultScope::Interactive,
+            &state.store,
+            raw_alias,
+            b"sk-secret",
+            None,
+        )
         .unwrap();
     let grant_id = seed_composite_grant(
         &state,
@@ -4412,8 +4481,7 @@ fn audit_event_hides_raw_credential_name() {
 #[test]
 fn anthropic_sse_parser_extracts_cumulative_usage() {
     let body = anthropic_sse_complete("claude-opus-4-5", 100, &[5, 15, 42]);
-    let summary =
-        pricing::parse_anthropic_sse_usage(body.as_bytes()).expect("parsed");
+    let summary = pricing::parse_anthropic_sse_usage(body.as_bytes()).expect("parsed");
     assert_eq!(summary.usage.input_tokens, 100);
     assert_eq!(
         summary.usage.output_tokens, 42,
@@ -4446,8 +4514,7 @@ fn anthropic_sse_parser_missing_message_stop_is_partial() {
             "usage": {"output_tokens": 9},
         }),
     ));
-    let summary =
-        pricing::parse_anthropic_sse_usage(body.as_bytes()).expect("parsed");
+    let summary = pricing::parse_anthropic_sse_usage(body.as_bytes()).expect("parsed");
     assert_eq!(summary.usage.input_tokens, 3);
     assert_eq!(summary.usage.output_tokens, 9);
     assert!(
@@ -4478,7 +4545,13 @@ async fn handle_request_routes_git_to_basic_auth() {
     let persona = state.store.create_persona("git-transport-agent").unwrap();
     state
         .vault
-        .add(VaultScope::Interactive, &state.store, "gh-token", b"ghp_test_secret", None)
+        .add(
+            VaultScope::Interactive,
+            &state.store,
+            "gh-token",
+            b"ghp_test_secret",
+            None,
+        )
         .unwrap();
     // Universal scope so both GET (info/refs discovery) and POST
     // (git-receive-pack) pass scope enforcement. The test only verifies
@@ -4608,10 +4681,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureBuf {
 fn install_capture_subscriber(buf: &CaptureBuf) -> tracing::subscriber::DefaultGuard {
     use tracing_subscriber::prelude::*;
     let subscriber = tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(buf.clone()),
-        );
+        .with(tracing_subscriber::fmt::layer().with_writer(buf.clone()));
     tracing::subscriber::set_default(subscriber)
 }
 
@@ -4694,8 +4764,7 @@ async fn git_echo_emits_credential_access_on_entry() {
         proxy_addr.port(),
         upstream_host,
     );
-    let client: Client<_, Full<Bytes>> =
-        Client::builder(TokioExecutor::new()).build_http();
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
     let req = Request::builder()
         .method("POST")
         .uri(&proxy_url)
@@ -4766,9 +4835,11 @@ async fn git_echo_emits_proxy_stream_on_drop() {
 
     // Poll one frame to advance bytes_forwarded, then drop without EOF.
     let mut body = body;
-    let frame = std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx))
-        .await;
-    assert!(frame.is_some(), "first poll should surface the queued frame");
+    let frame = std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await;
+    assert!(
+        frame.is_some(),
+        "first poll should surface the queued frame"
+    );
 
     // Drop the body — this triggers Drop::drop, which emits proxy.stream.
     drop(body);
@@ -4894,8 +4965,7 @@ async fn git_echo_grant_backed_lookup_injects_correct_auth() {
         proxy_addr.port(),
         upstream_host,
     );
-    let client: Client<_, Full<Bytes>> =
-        Client::builder(TokioExecutor::new()).build_http();
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
     let req = Request::builder()
         .method("POST")
         .uri(&proxy_url)
@@ -4940,9 +5010,10 @@ async fn git_echo_missing_persona_header_returns_401() {
         .method("POST")
         .uri("/github.com/owner/repo.git/git-receive-pack")
         .header("x-ember-credential", cred_name.as_str())
-        .body(http_body_util::Empty::<Bytes>::new().map_err(|e| -> hyper::Error {
-            panic!("empty body: {e}")
-        }))
+        .body(
+            http_body_util::Empty::<Bytes>::new()
+                .map_err(|e| -> hyper::Error { panic!("empty body: {e}") }),
+        )
         .unwrap();
     // Hold the streaming-gate test lock so a peer saturation test
     // doesn't hold all 32 slots while we try to acquire one. Without
@@ -5001,7 +5072,16 @@ async fn git_echo_no_active_grant_returns_403() {
     // State has a persona but NO grant.
     let state = make_state();
     let persona = state.store.create_persona("no-grant-persona").unwrap();
-    state.vault.add(VaultScope::Interactive, &state.store, "no-grant-cred", b"tok", None).unwrap();
+    state
+        .vault
+        .add(
+            VaultScope::Interactive,
+            &state.store,
+            "no-grant-cred",
+            b"tok",
+            None,
+        )
+        .unwrap();
 
     let upstream_host = format!("127.0.0.1:{}", upstream_addr.port());
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5037,8 +5117,7 @@ async fn git_echo_no_active_grant_returns_403() {
         proxy_addr.port(),
         upstream_host,
     );
-    let client: Client<_, Full<Bytes>> =
-        Client::builder(TokioExecutor::new()).build_http();
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
     let req = Request::builder()
         .method("POST")
         .uri(&proxy_url)
@@ -5078,8 +5157,10 @@ async fn passthrough_body_emits_complete_trailer_on_clean_eof() {
     let mut body = PassthroughBody::new(mock, None);
 
     // Push two data frames then signal clean EOF by closing the sender.
-    tx.send(Ok(Frame::data(Bytes::from_static(b"chunk-a")))).unwrap();
-    tx.send(Ok(Frame::data(Bytes::from_static(b"chunk-b")))).unwrap();
+    tx.send(Ok(Frame::data(Bytes::from_static(b"chunk-a"))))
+        .unwrap();
+    tx.send(Ok(Frame::data(Bytes::from_static(b"chunk-b"))))
+        .unwrap();
     // Drop the sender — ChannelBody's `poll_recv` returns None when the
     // channel is closed, modelling upstream EOF.
     drop(tx);
@@ -5087,10 +5168,7 @@ async fn passthrough_body_emits_complete_trailer_on_clean_eof() {
     // Drain all frames.
     let mut trailers_seen: Option<hyper::HeaderMap> = None;
     loop {
-        let frame = std::future::poll_fn(|cx| {
-            std::pin::Pin::new(&mut body).poll_frame(cx)
-        })
-        .await;
+        let frame = std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await;
         match frame {
             None => break,
             Some(Ok(f)) => {
@@ -5164,10 +5242,7 @@ async fn passthrough_body_emits_partial_trailer_on_upstream_error() {
     let mut trailers_seen: Option<hyper::HeaderMap> = None;
     let mut data_bytes: Vec<u8> = Vec::new();
     loop {
-        let frame = std::future::poll_fn(|cx| {
-            std::pin::Pin::new(&mut body).poll_frame(cx)
-        })
-        .await;
+        let frame = std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await;
         match frame {
             None => break,
             Some(Ok(f)) => {
@@ -5211,9 +5286,7 @@ async fn passthrough_body_emits_partial_trailer_on_upstream_error() {
 async fn streaming_response_handles_zero_length_body() {
     // An immediately-closed sender models a 200 with Content-Length: 0
     // or a 204/304 where the body is empty.
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<
-        Result<Frame<Bytes>, hyper::Error>,
-    >();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Frame<Bytes>, hyper::Error>>();
     drop(tx); // Close immediately — zero frames.
     let mock = ChannelBody { rx };
 
@@ -5224,8 +5297,7 @@ async fn streaming_response_handles_zero_length_body() {
         .with_test_sinks(Arc::clone(&outcome_sink), Arc::clone(&bytes_sink));
 
     // First poll must return the outcome trailer (complete), not hang.
-    let frame =
-        std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await;
+    let frame = std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await;
 
     // The trailer frame carries outcome=complete.
     let trailers = frame
@@ -5238,11 +5310,13 @@ async fn streaming_response_handles_zero_length_body() {
         .expect("x-ember-stream-outcome must be present")
         .to_str()
         .expect("header value must be valid UTF-8");
-    assert_eq!(outcome, "complete", "empty body must yield outcome=complete");
+    assert_eq!(
+        outcome, "complete",
+        "empty body must yield outcome=complete"
+    );
 
     // Second poll terminates the body.
-    let done =
-        std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await;
+    let done = std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await;
     assert!(done.is_none(), "body must end after the trailer");
 
     drop(body);
@@ -5282,12 +5356,13 @@ async fn streaming_response_propagates_client_disconnect() {
 
     // Upstream has data queued — keep `tx` alive to model an open
     // upstream TCP connection at the moment the client disconnects.
-    tx.send(Ok(Frame::data(Bytes::from_static(b"first-chunk")))).unwrap();
-    tx.send(Ok(Frame::data(Bytes::from_static(b"second-chunk")))).unwrap();
+    tx.send(Ok(Frame::data(Bytes::from_static(b"first-chunk"))))
+        .unwrap();
+    tx.send(Ok(Frame::data(Bytes::from_static(b"second-chunk"))))
+        .unwrap();
 
     // Client reads exactly one frame then disconnects.
-    let first =
-        std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await;
+    let first = std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await;
     assert!(first.is_some(), "first poll must deliver a frame");
     let chunk = first.unwrap().unwrap().into_data().expect("data frame");
     assert_eq!(&chunk[..], b"first-chunk");
@@ -5335,15 +5410,17 @@ async fn streaming_response_backpressure_slow_consumer() {
     // Read one frame at a time — model a slow downstream consumer.
     let mut total_bytes = 0usize;
     loop {
-        let frame =
-            std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await;
+        let frame = std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await;
         match frame {
             None => break,
             Some(Ok(f)) => {
                 if let Some(d) = f.data_ref() {
                     total_bytes += d.len();
                     // Verify content correctness (not just length).
-                    assert!(d.iter().all(|&b| b == 0xAB), "chunk bytes must match pattern");
+                    assert!(
+                        d.iter().all(|&b| b == 0xAB),
+                        "chunk bytes must match pattern"
+                    );
                 }
                 // Trailers are the terminal frame — don't count bytes.
             }
@@ -5380,7 +5457,13 @@ async fn body_at_limit_passes_through() {
     let persona = state.store.create_persona("sec9-agent").unwrap();
     state
         .vault
-        .add(VaultScope::Interactive, &state.store, "sec9-token", b"tok-sec9", None)
+        .add(
+            VaultScope::Interactive,
+            &state.store,
+            "sec9-token",
+            b"tok-sec9",
+            None,
+        )
         .unwrap();
     state
         .store
@@ -5411,7 +5494,13 @@ async fn body_over_limit_returns_413() {
     let persona = state.store.create_persona("sec9-over-agent").unwrap();
     state
         .vault
-        .add(VaultScope::Interactive, &state.store, "sec9-over-token", b"tok-sec9-over", None)
+        .add(
+            VaultScope::Interactive,
+            &state.store,
+            "sec9-over-token",
+            b"tok-sec9-over",
+            None,
+        )
         .unwrap();
     state
         .store
@@ -5442,7 +5531,7 @@ async fn body_over_limit_returns_413() {
 // -------------------------------------------------------------------------
 
 // -------------------------------------------------------------------------
-// implementation-note-197 — X-Ember-Grant-Id header support
+// implementation-note-271 — X-Ember-Grant-Id header support
 // -------------------------------------------------------------------------
 
 /// Build a request with an explicit X-Ember-Grant-Id header so the test
@@ -5479,18 +5568,27 @@ fn proxy_request_with_grant_id(
 #[tokio::test]
 async fn x_ember_grant_id_header_resolves_composite_grant() {
     let state = make_state();
-    let persona = state
-        .store
-        .create_persona("composite-agent")
-        .unwrap();
+    let persona = state.store.create_persona("composite-agent").unwrap();
     // Two credentials sharing one composite grant.
     state
         .vault
-        .add(VaultScope::Interactive, &state.store, "github-token", b"ghp_secret_a", None)
+        .add(
+            VaultScope::Interactive,
+            &state.store,
+            "github-token",
+            b"ghp_secret_a",
+            None,
+        )
         .unwrap();
     state
         .vault
-        .add(VaultScope::Interactive, &state.store, "anthropic-key", b"sk-ant-secret", None)
+        .add(
+            VaultScope::Interactive,
+            &state.store,
+            "anthropic-key",
+            b"sk-ant-secret",
+            None,
+        )
         .unwrap();
     // Single composite grant carries Statements for both credentials.
     // The grant row's credential_name is github-token (the row's flat
@@ -5581,7 +5679,13 @@ async fn x_ember_grant_id_absent_falls_back_to_evaluate_grant() {
     let persona = state.store.create_persona("legacy-agent").unwrap();
     state
         .vault
-        .add(VaultScope::Interactive, &state.store, "legacy-token", b"v", None)
+        .add(
+            VaultScope::Interactive,
+            &state.store,
+            "legacy-token",
+            b"v",
+            None,
+        )
         .unwrap();
     state
         .store
@@ -5651,7 +5755,7 @@ fn credential_bytes_zeroized_on_drop() {
     unsafe { ManuallyDrop::drop(&mut md) };
 }
 
-/// T-implementation-note-198 regression guard.
+/// T-implementation-note-272 regression guard.
 ///
 /// `usage.requests` must reflect upstream-confirmed responses, not a
 /// pre-flight tally. Driving the post-flight meter once with an
@@ -5664,7 +5768,13 @@ fn usage_requests_counts_only_upstream_confirmed_calls() {
     let persona = state.store.create_persona("audit-usage").unwrap();
     state
         .vault
-        .add(VaultScope::Interactive, &state.store, "anthropic-key", b"sk-secret", None)
+        .add(
+            VaultScope::Interactive,
+            &state.store,
+            "anthropic-key",
+            b"sk-secret",
+            None,
+        )
         .unwrap();
     let grant_id = seed_composite_grant(
         &state,
@@ -5735,28 +5845,16 @@ fn usage_requests_counts_only_upstream_confirmed_calls() {
 #[test]
 fn record_upstream_request_only_credits_on_success() {
     // Happy path.
-    assert_eq!(
-        record_upstream_request("api.anthropic.com", true, true),
-        1,
-    );
+    assert_eq!(record_upstream_request("api.anthropic.com", true, true), 1,);
     // 5xx / non-2xx upstream — failure path, do not credit.
-    assert_eq!(
-        record_upstream_request("api.anthropic.com", false, true),
-        0,
-    );
+    assert_eq!(record_upstream_request("api.anthropic.com", false, true), 0,);
     // No usage parsed — nothing happened we can bill for.
-    assert_eq!(
-        record_upstream_request("api.anthropic.com", true, false),
-        0,
-    );
+    assert_eq!(record_upstream_request("api.anthropic.com", true, false), 0,);
     // Unknown / non-LLM provider — outside the metering contract.
-    assert_eq!(
-        record_upstream_request("api.github.com", true, true),
-        0,
-    );
+    assert_eq!(record_upstream_request("api.github.com", true, true), 0,);
 }
 
-/// BEAT-7-implementation-note-143 — `statement_revoked_response` emits a
+/// BEAT-7-implementation-note-192 — `statement_revoked_response` emits a
 /// structured JSON 403 naming the persona + statement so clients can
 /// distinguish revoke from a generic scope/audit denial. Locks the
 /// public shape `{"error":"statement_revoked","persona_id":..,
@@ -5776,4 +5874,38 @@ async fn statement_revoked_response_emits_structured_json_403() {
     assert_eq!(json["error"], "statement_revoked");
     assert_eq!(json["persona_id"], "agent-worker-a");
     assert_eq!(json["statement_id"], "S1");
+}
+
+// implementation-note-212: DaemonEventSink::record_threshold_crossing
+// dedupes repeated calls on the same (grant_id, statement_sid, axis, band)
+// tuple. Mirrors the existing in-place `ProxyState.threshold_emitted`
+// semantics so the trait-routed code path is independently correct before
+// the call-site migration (Slice B-2).
+#[tokio::test]
+async fn daemon_event_sink_record_threshold_crossing_dedupes() {
+    let state = make_state();
+    let sink = DaemonEventSink::new(state, None);
+
+    let first = sink
+        .record_threshold_crossing("g-1", "S1", ThresholdAxis::Tokens, ThresholdBand::Warning)
+        .await;
+    assert!(first, "first crossing on a fresh tuple is newly inserted");
+
+    let dup = sink
+        .record_threshold_crossing("g-1", "S1", ThresholdAxis::Tokens, ThresholdBand::Warning)
+        .await;
+    assert!(!dup, "repeat call on the same tuple dedupes");
+
+    let different_band = sink
+        .record_threshold_crossing("g-1", "S1", ThresholdAxis::Tokens, ThresholdBand::Exhausted)
+        .await;
+    assert!(
+        different_band,
+        "different band on same axis is a fresh tuple"
+    );
+
+    let different_axis = sink
+        .record_threshold_crossing("g-1", "S1", ThresholdAxis::Cents, ThresholdBand::Warning)
+        .await;
+    assert!(different_axis, "different axis is a fresh tuple");
 }

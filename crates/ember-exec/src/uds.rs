@@ -1,12 +1,12 @@
 //!
-//! UDS frame protocol for `ember-exec` (implementation-note-262).
+//! UDS frame protocol for `ember-exec` (implementation-note-367).
 //!
 //! Wire format: length-prefixed JSON frames. Each frame is a `u32` big-endian
 //! byte length followed by `length` bytes of UTF-8 JSON. The JSON deserialises
 //! into an [`ExecFrame`] enum with a `type` discriminant per `serde(tag)`.
 //!
 //! The hash-verify, setuid-drop, and spawn-integration layers (subtasks B and
-//! C of the implementation-note-27 decomposition) consume these frames
+//! C of the implementation-note-34 decomposition) consume these frames
 //! but do not modify the protocol — the protocol stays stable across the
 //! three-step rollout.
 
@@ -75,7 +75,9 @@ pub enum FrameError {
 /// Read one frame from the stream. Returns `Ok(None)` on clean EOF (no bytes
 /// read before connection close); `Ok(Some(_))` on a complete frame; `Err`
 /// on partial-read, oversized length, or JSON parse failure.
-pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Option<ExecFrame>, FrameError> {
+pub async fn read_frame<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<Option<ExecFrame>, FrameError> {
     let mut len_buf = [0u8; 4];
     match reader.read_exact(&mut len_buf).await {
         Ok(_) => {}
@@ -95,7 +97,10 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Option<E
 
 /// Write one frame to the stream. The length prefix is the byte-length of the
 /// UTF-8 JSON encoding of the frame (NOT the char count).
-pub async fn write_frame<W: AsyncWrite + Unpin>(writer: &mut W, frame: &ExecFrame) -> Result<(), FrameError> {
+pub async fn write_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    frame: &ExecFrame,
+) -> Result<(), FrameError> {
     let json = serde_json::to_vec(frame)?;
     let length = u32::try_from(json.len()).map_err(|_| FrameError::LengthExceeded(u32::MAX))?;
     if length > MAX_FRAME_BYTES {
@@ -137,10 +142,17 @@ mod tests {
     #[tokio::test]
     async fn write_then_read_roundtrips_all_variants() {
         let cases = vec![
-            ExecFrame::StdinBytes { bytes: b"hello\n".to_vec() },
-            ExecFrame::Resize { rows: 42, cols: 100 },
+            ExecFrame::StdinBytes {
+                bytes: b"hello\n".to_vec(),
+            },
+            ExecFrame::Resize {
+                rows: 42,
+                cols: 100,
+            },
             ExecFrame::Signal { signal: 15 },
-            ExecFrame::OutputBytes { bytes: vec![0, 1, 2, 3] },
+            ExecFrame::OutputBytes {
+                bytes: vec![0, 1, 2, 3],
+            },
             ExecFrame::Exit { code: 37 },
             ExecFrame::HashMismatch {
                 expected: "aa".to_string(),

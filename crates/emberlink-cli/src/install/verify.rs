@@ -49,8 +49,11 @@ use std::path::{Path, PathBuf};
 use base64::Engine as _;
 use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+use sigstore::cosign::payload::SimpleSigning;
 
 use core_crypto::canonicalize_jcs;
+use ember_update::in_toto::{self, SignedEnvelope};
 
 /// Schema version this verifier accepts in `BundleManifest::schema_version`.
 ///
@@ -98,12 +101,18 @@ pub enum VerifyError {
         "publisher key for '{publisher_did}' is malformed: {detail}; \
          do NOT run the installer — the trust manifest is corrupt"
     )]
-    BadPublisherKey { publisher_did: String, detail: String },
+    BadPublisherKey {
+        publisher_did: String,
+        detail: String,
+    },
     #[error(
         "bundle signature for '{publisher_did}' is malformed: {detail}; \
          do NOT run the installer — re-download the bundle"
     )]
-    BadSignature { publisher_did: String, detail: String },
+    BadSignature {
+        publisher_did: String,
+        detail: String,
+    },
     #[error(
         "bundle hash mismatch (expected {expected}, got {actual}); \
          the bundle was tampered with — do NOT run the installer"
@@ -119,6 +128,11 @@ pub enum VerifyError {
          do NOT run the installer — the manifest is corrupt"
     )]
     Canonicalize(String),
+    #[error(
+        "in-toto statement envelope verification failed: {0}; \
+         do NOT run the installer — the provenance envelope is invalid"
+    )]
+    InTotoInvalid(String),
 }
 
 /// Sidecar manifest written next to the install bundle by the release
@@ -178,7 +192,7 @@ pub struct TrustedPublisher {
 /// The corresponding Ed25519 secret key is held in the project's hardware
 /// security module — see `docs/install-supply-chain.md` §"Publisher key
 /// custody". The base64 string here is a placeholder that the release
-/// pipeline will overwrite once the production key is provisioned (implementation-note-301
+/// pipeline will overwrite once the production key is provisioned (implementation-note-422
 /// follow-up). Until then, `verify_install_bundle` will fail-closed with
 /// `BadPublisherKey` because the placeholder isn't a valid Ed25519 point.
 pub const EMBERLINK_RELEASE_PUBLISHER_DID: &str = "did:web:ember.link";
@@ -225,8 +239,8 @@ pub fn verify_install_bundle(
         path: manifest_path.clone(),
         source: e,
     })?;
-    let manifest: BundleManifest = serde_json::from_slice(&manifest_bytes)
-        .map_err(VerifyError::ManifestParse)?;
+    let manifest: BundleManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(VerifyError::ManifestParse)?;
 
     if manifest.schema_version != BUNDLE_MANIFEST_SCHEMA_VERSION {
         return Err(VerifyError::UnsupportedSchema {
@@ -256,19 +270,21 @@ pub fn verify_install_bundle(
         });
     }
     let pub_arr: [u8; 32] = pub_bytes[..32].try_into().unwrap();
-    let verifying_key = VerifyingKey::from_bytes(&pub_arr).map_err(|e| {
-        VerifyError::BadPublisherKey {
+    let verifying_key =
+        VerifyingKey::from_bytes(&pub_arr).map_err(|e| VerifyError::BadPublisherKey {
             publisher_did: manifest.publisher_did.clone(),
             detail: format!("invalid Ed25519 point: {e}"),
-        }
-    })?;
+        })?;
 
     // Re-hash the bundle bytes and compare against the manifest's claim.
     let bundle_bytes = std::fs::read(bundle_path).map_err(|e| VerifyError::Io {
         path: bundle_path.to_path_buf(),
         source: e,
     })?;
-    let actual = format!("blake3:{}", hex::encode(blake3::hash(&bundle_bytes).as_bytes()));
+    let actual = format!(
+        "blake3:{}",
+        hex::encode(blake3::hash(&bundle_bytes).as_bytes())
+    );
     if actual != manifest.blake3 {
         return Err(VerifyError::HashMismatch {
             expected: manifest.blake3.clone(),
@@ -287,13 +303,14 @@ pub fn verify_install_bundle(
     let canonical =
         canonicalize_jcs(&payload).map_err(|e| VerifyError::Canonicalize(e.to_string()))?;
 
-    let sig_b64 = manifest
-        .signature
-        .strip_prefix("ed25519:")
-        .ok_or_else(|| VerifyError::BadSignature {
-            publisher_did: manifest.publisher_did.clone(),
-            detail: "missing 'ed25519:' prefix".to_string(),
-        })?;
+    let sig_b64 =
+        manifest
+            .signature
+            .strip_prefix("ed25519:")
+            .ok_or_else(|| VerifyError::BadSignature {
+                publisher_did: manifest.publisher_did.clone(),
+                detail: "missing 'ed25519:' prefix".to_string(),
+            })?;
     let sig_bytes = base64::engine::general_purpose::STANDARD
         .decode(sig_b64)
         .map_err(|e| VerifyError::BadSignature {
@@ -316,6 +333,129 @@ pub fn verify_install_bundle(
         })?;
 
     Ok(manifest)
+}
+
+/// Verify an in-toto Statement v1 envelope wrapping a `BundleManifest` predicate.
+///
+/// The release pipeline produces a sidecar `<bundle>.intoto.json` containing a
+/// [`SignedEnvelope<BundleManifest>`] signed by the publisher key. This function
+/// verifies the envelope's Ed25519 signature via
+/// [`ember_update::in_toto::verify`] before the wizard elevates privileges.
+///
+/// # Errors
+///
+/// Returns [`VerifyError::InTotoInvalid`] if the signature or `_type` field is wrong.
+pub fn verify_bundle_in_toto_envelope(
+    envelope: &SignedEnvelope<BundleManifest>,
+    verifying_key: &VerifyingKey,
+) -> Result<(), VerifyError> {
+    in_toto::verify(envelope, verifying_key).map_err(|e| VerifyError::InTotoInvalid(e.to_string()))
+}
+
+// TODO: integrate ember_update::channel::verify_channel_pointer at
+// install path — before `wizard::batch_sudo_v` elevation, fetch and verify the channel pointer
+// for the install channel, then confirm the manifest_uri / manifest_digest_hex match the
+// bundle being installed.  The `verify_install_bundle` call above handles the Ember-IdentityRoot
+// Ed25519 witness; the channel pointer verification is the discovery / freshness layer on top.
+
+/// Dual-witness verification for image manifests hosted at `manifests.emberlink.dev`.
+///
+/// Each manifest blob served by the R2 + Worker stack
+/// (infra/pulumi/gitops/manifests-emberlink-dev/) carries two independent
+/// signatures that the daemon MUST verify before accepting an image update
+/// (design note §3):
+///
+/// 1. **Sigstore keyless** — produced by `cosign sign-blob` inside
+///    `.github/workflows/release.yml` using GitHub Actions OIDC identity.
+///    The signature is bound to the Rekor public transparency log, so there is
+///    no long-lived cosign signing key. This witness is passed as
+///    `sigstore_sig` (the raw bytes that cosign would verify, i.e. the decoded
+///    `.sig` sidecar). Currently modelled as an opaque byte slice; the full
+///    cosign-verify integration is left for a follow-up task (implementation-note-423).
+///
+/// 2. **Ember-IdentityRoot Ed25519** — the release pipeline signs the manifest
+///    blob with the project's hardware-bound Ed25519 key (see
+///    `docs/install-supply-chain.md` §"Publisher key custody"). This witness is
+///    verified via the same `in_toto::verify` machinery used for install bundles.
+///
+/// # Arguments
+///
+/// - `blob` — the raw manifest JSON bytes fetched from `manifests.emberlink.dev`.
+/// - `sigstore_sig` — raw bytes of the sigstore keyless signature sidecar.
+///   Must be non-empty; deep cosign verification is a follow-up.
+/// - `ember_id_root_sig` — 64-byte Ed25519 signature over `blob`, produced by
+///   the Ember-IdentityRoot signing key.
+/// - `ember_id_root_key` — the Ember-IdentityRoot Ed25519 verifying key.
+///
+/// # Errors
+///
+/// Returns [`VerifyError::InTotoInvalid`] if the Ember-IdentityRoot signature
+/// fails. Returns [`VerifyError::BadSignature`] if the sigstore witness is
+/// absent or the Ed25519 signature bytes are malformed.
+///
+/// # Security note
+///
+/// Both checks are AND-gated: failure of either witness rejects the manifest.
+/// This ensures an attacker who compromises one signing channel cannot serve
+/// a malicious update undetected.
+pub fn verify_manifest_dual_witness(
+    blob: &[u8],
+    sigstore_sig: &[u8],
+    ember_id_root_sig: &[u8],
+    ember_id_root_key: &VerifyingKey,
+) -> Result<(), VerifyError> {
+    // Witness 1: sigstore keyless — parse `sigstore_sig` as a cosign
+    // SimpleSigning envelope (JCS-encoded JSON) and verify its
+    // `critical.image.docker_manifest_digest` matches `sha256(blob)`. This is
+    // implementation-note-424 (anchor:
+    // sigstore_witness_envelope_digest_verified). Fulcio cert chain
+    // verification + Rekor inclusion-proof verification are deferred to
+    // implementation-note-383 and -C — a determined attacker who can
+    // forge a SimpleSigning envelope locally can still pass this slice until
+    // -B and -C land.
+    if sigstore_sig.is_empty() {
+        return Err(VerifyError::BadSignature {
+            publisher_did: "sigstore/keyless".to_string(),
+            detail: "sigstore witness is absent — manifest must be co-signed by release.yml"
+                .to_string(),
+        });
+    }
+    let envelope: SimpleSigning =
+        serde_json::from_slice(sigstore_sig).map_err(|e| VerifyError::BadSignature {
+            publisher_did: "sigstore/keyless".to_string(),
+            detail: format!("envelope parse: {}", e),
+        })?;
+    let blob_digest = format!("sha256:{}", hex::encode(Sha256::digest(blob)));
+    if !envelope.satisfies_manifest_digest(&blob_digest) {
+        return Err(VerifyError::BadSignature {
+            publisher_did: "sigstore/keyless".to_string(),
+            detail: format!(
+                "envelope payload digest mismatches manifest hash (expected {}, envelope carried {})",
+                blob_digest, envelope.critical.image.docker_manifest_digest,
+            ),
+        });
+    }
+
+    // Witness 2: Ember-IdentityRoot Ed25519 — verify raw signature over blob.
+    if ember_id_root_sig.len() != 64 {
+        return Err(VerifyError::BadSignature {
+            publisher_did: EMBERLINK_RELEASE_PUBLISHER_DID.to_string(),
+            detail: format!(
+                "Ember-IdentityRoot sig must be 64 bytes, got {}",
+                ember_id_root_sig.len()
+            ),
+        });
+    }
+    let sig_arr: [u8; 64] = ember_id_root_sig[..64].try_into().unwrap();
+    let signature = Signature::from_bytes(&sig_arr);
+
+    ember_id_root_key
+        .verify(blob, &signature)
+        .map_err(|_| VerifyError::SignatureMismatch {
+            publisher_did: EMBERLINK_RELEASE_PUBLISHER_DID.to_string(),
+        })?;
+
+    Ok(())
 }
 
 /// Resolve the sidecar path for an install bundle.
@@ -367,7 +507,10 @@ mod tests {
     ) -> PathBuf {
         let bundle_path = dir.join("ember-installer-x86_64.tar.gz");
         std::fs::write(&bundle_path, bundle_bytes).unwrap();
-        let blake3 = format!("blake3:{}", hex::encode(blake3::hash(bundle_bytes).as_bytes()));
+        let blake3 = format!(
+            "blake3:{}",
+            hex::encode(blake3::hash(bundle_bytes).as_bytes())
+        );
         let bundle_name = "ember-installer-x86_64.tar.gz";
         let build_ts = "2026-05-08T00:00:00Z";
         let payload = serde_json::json!({
@@ -391,7 +534,11 @@ mod tests {
             signature_alg: "ed25519".to_string(),
         };
         let manifest_path = sidecar_path_for(&bundle_path);
-        std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
         bundle_path
     }
 
@@ -399,13 +546,8 @@ mod tests {
     fn verify_accepts_well_signed_bundle() {
         let dir = tempfile::tempdir().unwrap();
         let (did, signing, trusted) = fixture_publisher();
-        let bundle = write_bundle_and_manifest(
-            dir.path(),
-            b"fake-installer-bytes",
-            &did,
-            &signing,
-            "0.3.1",
-        );
+        let bundle =
+            write_bundle_and_manifest(dir.path(), b"fake-installer-bytes", &did, &signing, "0.3.1");
         let manifest = verify_install_bundle(&bundle, &[trusted]).expect("should verify");
         assert_eq!(manifest.publisher_did, did);
         assert_eq!(manifest.version, "0.3.1");
@@ -415,13 +557,8 @@ mod tests {
     fn verify_rejects_tampered_bundle() {
         let dir = tempfile::tempdir().unwrap();
         let (did, signing, trusted) = fixture_publisher();
-        let bundle = write_bundle_and_manifest(
-            dir.path(),
-            b"fake-installer-bytes",
-            &did,
-            &signing,
-            "0.3.1",
-        );
+        let bundle =
+            write_bundle_and_manifest(dir.path(), b"fake-installer-bytes", &did, &signing, "0.3.1");
         // Tamper with the bundle AFTER the manifest was written.
         std::fs::write(&bundle, b"malicious-replacement").unwrap();
         let err = verify_install_bundle(&bundle, &[trusted]).unwrap_err();
@@ -435,13 +572,8 @@ mod tests {
     fn verify_rejects_untrusted_publisher() {
         let dir = tempfile::tempdir().unwrap();
         let (did, signing, _trusted) = fixture_publisher();
-        let bundle = write_bundle_and_manifest(
-            dir.path(),
-            b"fake-installer-bytes",
-            &did,
-            &signing,
-            "0.3.1",
-        );
+        let bundle =
+            write_bundle_and_manifest(dir.path(), b"fake-installer-bytes", &did, &signing, "0.3.1");
         // Trust list has a DIFFERENT publisher.
         let other = TrustedPublisher {
             publisher_did: "did:web:somebody.else".to_string(),
@@ -512,13 +644,8 @@ mod tests {
     fn verify_rejects_bad_signature() {
         let dir = tempfile::tempdir().unwrap();
         let (did, signing, trusted) = fixture_publisher();
-        let bundle = write_bundle_and_manifest(
-            dir.path(),
-            b"fake-installer-bytes",
-            &did,
-            &signing,
-            "0.3.1",
-        );
+        let bundle =
+            write_bundle_and_manifest(dir.path(), b"fake-installer-bytes", &did, &signing, "0.3.1");
         // Corrupt the signature field in the sidecar.
         let sidecar = sidecar_path_for(&bundle);
         let mut manifest: BundleManifest =
@@ -528,7 +655,10 @@ mod tests {
         std::fs::write(&sidecar, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
         let err = verify_install_bundle(&bundle, &[trusted]).unwrap_err();
         assert!(
-            matches!(err, VerifyError::SignatureMismatch { .. } | VerifyError::BadSignature { .. }),
+            matches!(
+                err,
+                VerifyError::SignatureMismatch { .. } | VerifyError::BadSignature { .. }
+            ),
             "expected SignatureMismatch or BadSignature, got {err:?}"
         );
     }
@@ -536,6 +666,155 @@ mod tests {
     #[test]
     fn default_trust_list_contains_release_publisher() {
         let list = default_trust_list();
-        assert!(list.iter().any(|p| p.publisher_did == EMBERLINK_RELEASE_PUBLISHER_DID));
+        assert!(
+            list.iter()
+                .any(|p| p.publisher_did == EMBERLINK_RELEASE_PUBLISHER_DID)
+        );
+    }
+
+    // ── verify_manifest_dual_witness tests ────────────────────────────────────
+
+    fn dual_witness_fixture() -> (SigningKey, VerifyingKey) {
+        let seed: [u8; 32] = [42u8; 32];
+        let sk = SigningKey::from_bytes(&seed);
+        let vk = sk.verifying_key();
+        (sk, vk)
+    }
+
+    /// Build a cosign `SimpleSigning` envelope whose
+    /// `critical.image.docker-manifest-digest` matches `sha256(blob)`.
+    ///
+    /// Produces the canonical cosign JSON shape (kebab-case keys, type
+    /// `"cosign container image signature"`) so the envelope deserializes
+    /// via `sigstore::cosign::payload::SimpleSigning` deserialization
+    /// inside `verify_manifest_dual_witness`.
+    fn cosign_envelope_for(blob: &[u8]) -> Vec<u8> {
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(blob)));
+        let envelope = serde_json::json!({
+            "critical": {
+                "identity": { "docker-reference": "manifests.emberlink.dev/release" },
+                "image": { "docker-manifest-digest": digest },
+                "type": "cosign container image signature"
+            },
+            "optional": serde_json::Value::Null
+        });
+        serde_json::to_vec(&envelope).expect("envelope JSON is well-formed")
+    }
+
+    #[test]
+    fn dual_witness_accepts_valid_manifest() {
+        let (sk, vk) = dual_witness_fixture();
+        let blob = b"{ \"version\": \"0.4.0\", \"digest\": \"sha256:abc\" }";
+        let sig: ed25519_dalek::Signature = sk.sign(blob);
+        let sigstore_sig = cosign_envelope_for(blob);
+
+        verify_manifest_dual_witness(blob, &sigstore_sig, &sig.to_bytes(), &vk)
+            .expect("valid dual-witness should pass");
+    }
+
+    #[test]
+    fn dual_witness_rejects_tampered_manifest() {
+        let (sk, vk) = dual_witness_fixture();
+        let blob = b"{ \"version\": \"0.4.0\", \"digest\": \"sha256:abc\" }";
+        let sig: ed25519_dalek::Signature = sk.sign(blob);
+
+        // Tamper: verify a DIFFERENT blob against the original signature.
+        // The envelope is built against `tampered` so the sigstore witness
+        // passes, isolating the failure to the Ember-IdentityRoot witness.
+        let tampered = b"{ \"version\": \"0.4.0\", \"digest\": \"sha256:EVIL\" }";
+        let tampered_envelope = cosign_envelope_for(tampered);
+        let err = verify_manifest_dual_witness(tampered, &tampered_envelope, &sig.to_bytes(), &vk)
+            .unwrap_err();
+        assert!(
+            matches!(err, VerifyError::SignatureMismatch { .. }),
+            "expected SignatureMismatch on tampered blob, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn dual_witness_rejects_absent_sigstore_witness() {
+        let (sk, vk) = dual_witness_fixture();
+        let blob = b"{ \"version\": \"0.4.0\" }";
+        let sig: ed25519_dalek::Signature = sk.sign(blob);
+
+        let err = verify_manifest_dual_witness(blob, &[], &sig.to_bytes(), &vk).unwrap_err();
+        assert!(
+            matches!(err, VerifyError::BadSignature { ref publisher_did, .. }
+                if publisher_did == "sigstore/keyless"),
+            "expected BadSignature(sigstore/keyless) for empty sigstore witness, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn dual_witness_rejects_malformed_ember_id_root_sig() {
+        let (_sk, vk) = dual_witness_fixture();
+        let blob = b"{ \"version\": \"0.4.0\" }";
+        let sigstore_sig = cosign_envelope_for(blob);
+
+        // Pass a 32-byte (truncated) signature instead of 64.
+        let short_sig = vec![0u8; 32];
+        let err = verify_manifest_dual_witness(blob, &sigstore_sig, &short_sig, &vk).unwrap_err();
+        assert!(
+            matches!(err, VerifyError::BadSignature { .. }),
+            "expected BadSignature for malformed Ember-IdentityRoot sig, got {err:?}"
+        );
+    }
+
+    /// implementation-note-424 T1: bytes that don't deserialize as
+    /// a cosign SimpleSigning envelope must be rejected before any digest
+    /// comparison — the previous `if sigstore_sig.is_empty()` stub accepted
+    /// arbitrary non-empty bytes; this test pins that the structural-parse
+    /// gate now closes that surface.
+    #[test]
+    fn dual_witness_rejects_non_envelope_bytes() {
+        let (sk, vk) = dual_witness_fixture();
+        let blob = b"{ \"version\": \"0.4.0\" }";
+        let sig: ed25519_dalek::Signature = sk.sign(blob);
+
+        // Pre-slice stub byte string — not JSON, must fail to parse.
+        let bogus = b"cosign-keyless-stub-sig";
+        let err = verify_manifest_dual_witness(blob, bogus, &sig.to_bytes(), &vk).unwrap_err();
+        match err {
+            VerifyError::BadSignature {
+                ref publisher_did,
+                ref detail,
+            } => {
+                assert_eq!(publisher_did, "sigstore/keyless");
+                assert!(
+                    detail.starts_with("envelope parse:"),
+                    "expected `envelope parse:` prefix, got {detail:?}"
+                );
+            }
+            other => panic!("expected BadSignature(envelope parse), got {other:?}"),
+        }
+    }
+
+    /// implementation-note-424 T1: a structurally-valid envelope
+    /// whose `docker-manifest-digest` does not match `sha256(blob)` must be
+    /// rejected — checkpoint `sigstore_witness_envelope_digest_verified`.
+    #[test]
+    fn dual_witness_rejects_envelope_with_digest_mismatch() {
+        let (sk, vk) = dual_witness_fixture();
+        let blob = b"{ \"version\": \"0.4.0\" }";
+        let sig: ed25519_dalek::Signature = sk.sign(blob);
+
+        // Envelope built for a DIFFERENT blob → digest mismatch.
+        let other_blob = b"{ \"version\": \"99.0.0\" }";
+        let envelope_for_other = cosign_envelope_for(other_blob);
+        let err = verify_manifest_dual_witness(blob, &envelope_for_other, &sig.to_bytes(), &vk)
+            .unwrap_err();
+        match err {
+            VerifyError::BadSignature {
+                ref publisher_did,
+                ref detail,
+            } => {
+                assert_eq!(publisher_did, "sigstore/keyless");
+                assert!(
+                    detail.contains("envelope payload digest mismatches manifest hash"),
+                    "expected digest-mismatch detail, got {detail:?}"
+                );
+            }
+            other => panic!("expected BadSignature(digest mismatch), got {other:?}"),
+        }
     }
 }

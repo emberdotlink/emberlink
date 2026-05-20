@@ -24,14 +24,14 @@
 //!   the SigV4 signature against AWS's public-key infrastructure and
 //!   returns a Vault client_token. This is the no-static-credentials
 //!   path for daemons running on AWS infrastructure
-//!   (implementation-note-75).
+//!   (implementation-note-92).
 //! - [`HashiVaultAuth::HcpServicePrincipal`] — HashiCorp Cloud Platform
 //!   (HCP) Vault uses a different auth flow than self-hosted Vault.
 //!   The daemon exchanges `(client_id, client_secret)` for an HCP
 //!   access_token via the standard OAuth2 client_credentials grant at
 //!   `https://auth.idp.hashicorp.com/oauth2/token`, then submits the
 //!   returned access_token as `Authorization: Bearer` against the
-//!   HCP-hosted Vault cluster's `addr` (implementation-note-127).
+//!   HCP-hosted Vault cluster's `addr` (implementation-note-176).
 //! - [`HashiVaultAuth::JwtOidc`] — generic JWT/OIDC login at
 //!   `POST <addr>/v1/<mount_path>/login` with `{ role, jwt }`. Vault
 //!   validates the JWT against the configured OIDC provider and returns
@@ -40,7 +40,7 @@
 //!   env var like GitHub Actions' `ACTIONS_ID_TOKEN_REQUEST_TOKEN`, or
 //!   any other OIDC-aware compute platform). `mount_path` is `"auth/jwt"`
 //!   or `"auth/oidc"` depending on Vault config (the two mounts are the
-//!   same primitive with different opinionation) (implementation-note-134).
+//!   same primitive with different opinionation) (implementation-note-183).
 //! - [`HashiVaultAuth::Kubernetes`] — Kubernetes service-account login
 //!   at `POST <addr>/v1/auth/kubernetes/login` with `{ role, jwt }`,
 //!   where the JWT is the pod's projected service-account token. The
@@ -49,10 +49,10 @@
 //!   on every login + re-login, so the kubelet's token rotation is
 //!   transparent. This is functionally a specialization of `JwtOidc`
 //!   pinned to `auth/kubernetes` with the JWT sourced from a file
-//!   (implementation-note-135).
+//!   (implementation-note-184).
 //!
 //! Other auth methods (cert) are out of scope; file as
-//! `implementation-note-128-<METHOD>` follow-ups.
+//! `implementation-note-177-<METHOD>` follow-ups.
 //!
 //! # KV v2 wire surface
 //!
@@ -233,7 +233,7 @@ pub enum HashiVaultAuth {
     /// via the HCP-IdP-minted access_token instead. The access_token
     /// has a TTL (typically 24h); v1 follows the AppRole/AWS pattern of
     /// single login at startup + re-login-on-401 retry. Background
-    /// renewal is a follow-up (implementation-note-127).
+    /// renewal is a follow-up (implementation-note-176).
     HcpServicePrincipal {
         client_id: String,
         client_secret: SecretString,
@@ -272,10 +272,7 @@ pub enum HashiVaultAuth {
     /// is read fresh on every `login()` and `try_relogin()` so the
     /// kubelet's token rotation (every ~1h on modern clusters) is
     /// transparent to the daemon.
-    Kubernetes {
-        role: String,
-        token_path: PathBuf,
-    },
+    Kubernetes { role: String, token_path: PathBuf },
 }
 
 /// Policy that controls behavior when Vault is unreachable / sealed /
@@ -306,6 +303,7 @@ pub struct HashiVaultStore {
     cached_token: RwLock<Option<SecretString>>,
     /// Optional response cache — populated on every successful `get` and
     /// consulted by `FallBackToCache` when the upstream is unavailable.
+    #[allow(clippy::type_complexity)]
     cache: Option<Arc<RwLock<HashMap<String, (Vec<u8>, Instant)>>>>,
     cache_ttl: Option<Duration>,
     unavailable_policy: UnavailablePolicy,
@@ -359,10 +357,7 @@ impl HashiVaultStore {
     pub async fn login(&mut self) -> Result<(), StoreError> {
         match &self.auth {
             HashiVaultAuth::Token { .. } => Ok(()),
-            HashiVaultAuth::AppRole {
-                role_id,
-                secret_id,
-            } => {
+            HashiVaultAuth::AppRole { role_id, secret_id } => {
                 let token = self
                     .approle_login(role_id, secret_id.expose_secret())
                     .await?;
@@ -370,8 +365,7 @@ impl HashiVaultStore {
                 Ok(())
             }
             HashiVaultAuth::Aws { role } => {
-                let token =
-                    vault_aws_login(self.client.as_ref(), &self.addr, role).await?;
+                let token = vault_aws_login(self.client.as_ref(), &self.addr, role).await?;
                 *self.cached_token.write().await = Some(SecretString::from(token));
                 Ok(())
             }
@@ -410,13 +404,9 @@ impl HashiVaultStore {
                 Ok(())
             }
             HashiVaultAuth::Kubernetes { role, token_path } => {
-                let token = vault_kubernetes_login(
-                    self.client.as_ref(),
-                    &self.addr,
-                    role,
-                    token_path,
-                )
-                .await?;
+                let token =
+                    vault_kubernetes_login(self.client.as_ref(), &self.addr, role, token_path)
+                        .await?;
                 *self.cached_token.write().await = Some(SecretString::from(token));
                 Ok(())
             }
@@ -426,11 +416,7 @@ impl HashiVaultStore {
     /// Internal AppRole login — POSTs `(role_id, secret_id)` to
     /// `/v1/auth/approle/login` and returns the raw `client_token`
     /// string. Used by both `login()` (initial) and the 401-retry path.
-    async fn approle_login(
-        &self,
-        role_id: &str,
-        secret_id: &str,
-    ) -> Result<String, StoreError> {
+    async fn approle_login(&self, role_id: &str, secret_id: &str) -> Result<String, StoreError> {
         let url = format!("{}/v1/auth/approle/login", self.addr.trim_end_matches('/'));
         let body = serde_json::json!({
             "role_id": role_id,
@@ -513,10 +499,7 @@ impl HashiVaultStore {
             HashiVaultAuth::Token { .. } => Err(StoreError::AuthFailed(
                 "static token rejected; operator must rotate".to_string(),
             )),
-            HashiVaultAuth::AppRole {
-                role_id,
-                secret_id,
-            } => {
+            HashiVaultAuth::AppRole { role_id, secret_id } => {
                 let new_token = self
                     .approle_login(role_id, secret_id.expose_secret())
                     .await?;
@@ -524,8 +507,7 @@ impl HashiVaultStore {
                 Ok(())
             }
             HashiVaultAuth::Aws { role } => {
-                let new_token =
-                    vault_aws_login(self.client.as_ref(), &self.addr, role).await?;
+                let new_token = vault_aws_login(self.client.as_ref(), &self.addr, role).await?;
                 *self.cached_token.write().await = Some(SecretString::from(new_token));
                 Ok(())
             }
@@ -568,13 +550,9 @@ impl HashiVaultStore {
                 // kubelet rotates the projected token (~1h cadence) so
                 // the bytes on disk may differ from what we read at
                 // first login().
-                let new_token = vault_kubernetes_login(
-                    self.client.as_ref(),
-                    &self.addr,
-                    role,
-                    token_path,
-                )
-                .await?;
+                let new_token =
+                    vault_kubernetes_login(self.client.as_ref(), &self.addr, role, token_path)
+                        .await?;
                 *self.cached_token.write().await = Some(SecretString::from(new_token));
                 Ok(())
             }
@@ -585,7 +563,10 @@ impl HashiVaultStore {
     /// request. Self-hosted Vault expects `X-Vault-Token`; HCP-hosted
     /// Vault expects an OAuth2 `Authorization: Bearer` carrying the
     /// HCP-IdP-minted access_token.
-    fn auth_header_for_token<'a>(&self, token: &'a str) -> (&'static str, std::borrow::Cow<'a, str>) {
+    fn auth_header_for_token<'a>(
+        &self,
+        token: &'a str,
+    ) -> (&'static str, std::borrow::Cow<'a, str>) {
         match &self.auth {
             HashiVaultAuth::HcpServicePrincipal { .. } => (
                 "Authorization",
@@ -649,11 +630,7 @@ impl HashiVaultStore {
     /// Single GET attempt. Returns `Ok(Some(bytes))` on 2xx, `Ok(None)`
     /// for the auth-retry path (401 → caller re-logs in and retries).
     /// Maps the rest to `StoreError`.
-    async fn try_get_once(
-        &self,
-        key: &str,
-        token: &str,
-    ) -> Result<Option<Vec<u8>>, StoreError> {
+    async fn try_get_once(&self, key: &str, token: &str) -> Result<Option<Vec<u8>>, StoreError> {
         let url = self.data_url(key);
         let (hname, hval) = self.auth_header_for_token(token);
         let resp = self
@@ -707,7 +684,7 @@ struct ApproleAuthBlock {
 }
 
 // ---------------------------------------------------------------------------
-// AWS IAM login (implementation-note-75)
+// AWS IAM login (implementation-note-92)
 // ---------------------------------------------------------------------------
 
 /// Vault `auth/aws/login` response — same envelope shape as the
@@ -780,6 +757,7 @@ fn read_aws_identity_from_env() -> Result<(String, String, Option<String>, Strin
 /// `ember_broker::aws_sts::build_signed_headers` (small deliberate
 /// duplication for v1 — see module docs); a future refactor could
 /// extract a shared `core-aws-sigv4` helper crate.
+#[allow(clippy::type_complexity)]
 fn build_get_caller_identity_signed(
     access_key_id: &str,
     secret_access_key: &str,
@@ -788,7 +766,7 @@ fn build_get_caller_identity_signed(
     now: std::time::SystemTime,
 ) -> Result<(String, Vec<(String, String)>, String), StoreError> {
     use aws_credential_types::Credentials;
-    use aws_sigv4::http_request::{sign, SignableBody, SignableRequest, SigningSettings};
+    use aws_sigv4::http_request::{SignableBody, SignableRequest, SigningSettings, sign};
     use aws_sigv4::sign::v4;
 
     // Vault expects the `iam:GetCallerIdentity` request to be POSTed at
@@ -845,10 +823,7 @@ fn build_get_caller_identity_signed(
         "application/x-www-form-urlencoded".to_string(),
     ));
     headers.push(("Content-Length".to_string(), body.len().to_string()));
-    headers.push((
-        "Host".to_string(),
-        format!("sts.{region}.amazonaws.com"),
-    ));
+    headers.push(("Host".to_string(), format!("sts.{region}.amazonaws.com")));
     if let Some(tok) = session_token {
         // The session token participates in SigV4; the upstream signer
         // emitted X-Amz-Security-Token in `sig_headers` so this is a
@@ -887,7 +862,7 @@ fn encode_headers_for_vault(headers: &[(String, String)]) -> String {
 }
 
 /// Authenticate to Vault via the AWS IAM auth method
-/// (implementation-note-75).
+/// (implementation-note-92).
 ///
 /// 1. Read the daemon's surrounding AWS IAM identity from the env-var
 ///    chain (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
@@ -901,7 +876,7 @@ fn encode_headers_for_vault(headers: &[(String, String)]) -> String {
 ///    infrastructure to verify the signature, then returns a Vault
 ///    client_token bound to `role`.
 ///
-/// The literal name `vault_aws_login` is the implementation-note-75
+/// The literal name `vault_aws_login` is the implementation-note-92
 /// target_state_anchor checkpoint — do not rename without also updating
 /// the task brief.
 pub async fn vault_aws_login(
@@ -911,8 +886,7 @@ pub async fn vault_aws_login(
 ) -> Result<String, StoreError> {
     use base64::Engine;
 
-    let (access_key_id, secret_access_key, session_token, region) =
-        read_aws_identity_from_env()?;
+    let (access_key_id, secret_access_key, session_token, region) = read_aws_identity_from_env()?;
 
     let now = std::time::SystemTime::now();
     let (sts_url, sts_headers, sts_body) = build_get_caller_identity_signed(
@@ -995,7 +969,7 @@ pub async fn vault_aws_login(
 }
 
 // ---------------------------------------------------------------------------
-// HCP service-principal login (implementation-note-127)
+// HCP service-principal login (implementation-note-176)
 // ---------------------------------------------------------------------------
 
 /// HCP IdP `oauth2/token` response — standard OAuth2 client_credentials
@@ -1026,7 +1000,7 @@ const HCP_IDP_TOKEN_URL: &str = "https://auth.idp.hashicorp.com/oauth2/token";
 const HCP_API_AUDIENCE: &str = "https://api.hashicorp.cloud";
 
 /// Authenticate to HCP via the service-principal `client_credentials`
-/// grant (implementation-note-127).
+/// grant (implementation-note-176).
 ///
 /// 1. POST `https://auth.idp.hashicorp.com/oauth2/token` with form body
 ///    `grant_type=client_credentials&client_id=...&client_secret=...&audience=https://api.hashicorp.cloud`.
@@ -1040,7 +1014,7 @@ const HCP_API_AUDIENCE: &str = "https://api.hashicorp.cloud";
 /// - 400 / 401 / 403 → `StoreError::AuthFailed("HCP credentials invalid")`.
 /// - 5xx → `StoreError::Unavailable("HCP IdP unreachable")`.
 ///
-/// The literal name `hcp_vault_login` is the implementation-note-127
+/// The literal name `hcp_vault_login` is the implementation-note-176
 /// target_state_anchor checkpoint — do not rename without also updating
 /// the task brief.
 pub async fn hcp_vault_login(
@@ -1087,9 +1061,7 @@ pub async fn hcp_vault_login(
         400 | 401 | 403 => Err(StoreError::AuthFailed(
             "HCP credentials invalid".to_string(),
         )),
-        500..=599 => Err(StoreError::Unavailable(
-            "HCP IdP unreachable".to_string(),
-        )),
+        500..=599 => Err(StoreError::Unavailable("HCP IdP unreachable".to_string())),
         other => Err(StoreError::Other(format!(
             "hcp/oauth2 unexpected status {other}: {}",
             resp.body
@@ -1098,7 +1070,7 @@ pub async fn hcp_vault_login(
 }
 
 // ---------------------------------------------------------------------------
-// JWT/OIDC login (implementation-note-134)
+// JWT/OIDC login (implementation-note-183)
 // ---------------------------------------------------------------------------
 
 /// Vault `<mount_path>/login` response — same envelope shape as the
@@ -1122,7 +1094,7 @@ struct JwtAuthBlock {
 }
 
 /// Authenticate to Vault via the JWT/OIDC auth method
-/// (implementation-note-134).
+/// (implementation-note-183).
 ///
 /// 1. POST `<addr>/v1/<mount_path>/login` with JSON body
 ///    `{ "role": "<role>", "jwt": "<jwt>" }`.
@@ -1144,7 +1116,7 @@ struct JwtAuthBlock {
 /// - 403 → `AuthFailed` (role lacks the policy Vault expects).
 /// - 5xx → `Unavailable` (Vault upstream).
 ///
-/// The literal name `vault_jwt_login` is the implementation-note-134
+/// The literal name `vault_jwt_login` is the implementation-note-183
 /// `target_state_anchor` checkpoint — do not rename without also updating
 /// the task brief.
 pub async fn vault_jwt_login(
@@ -1155,9 +1127,7 @@ pub async fn vault_jwt_login(
     jwt: &str,
 ) -> Result<String, StoreError> {
     if jwt.is_empty() {
-        return Err(StoreError::AuthFailed(
-            "JWT/OIDC token empty".to_string(),
-        ));
+        return Err(StoreError::AuthFailed("JWT/OIDC token empty".to_string()));
     }
     let url = format!(
         "{}/v1/{}/login",
@@ -1225,17 +1195,16 @@ pub async fn vault_jwt_login(
 }
 
 // ---------------------------------------------------------------------------
-// Kubernetes service-account login (implementation-note-135)
+// Kubernetes service-account login (implementation-note-184)
 // ---------------------------------------------------------------------------
 
 /// Standard kubelet projected service-account token mount path. Pods
 /// running inside Kubernetes find their SA JWT here unless the
 /// operator overrode the projection.
-pub const KUBERNETES_SA_TOKEN_PATH: &str =
-    "/var/run/secrets/kubernetes.io/serviceaccount/token";
+pub const KUBERNETES_SA_TOKEN_PATH: &str = "/var/run/secrets/kubernetes.io/serviceaccount/token";
 
 /// Authenticate to Vault via the Kubernetes auth method
-/// (implementation-note-135).
+/// (implementation-note-184).
 ///
 /// 1. Read the projected SA JWT from `token_path` (typically
 ///    [`KUBERNETES_SA_TOKEN_PATH`]). Empty file or missing-file maps
@@ -1253,7 +1222,7 @@ pub const KUBERNETES_SA_TOKEN_PATH: &str =
 /// = "auth/kubernetes"` after reading the file — keeps the Vault wire
 /// + status-mapping logic single-sourced.
 ///
-/// The literal name `vault_kubernetes_login` is the implementation-note-135
+/// The literal name `vault_kubernetes_login` is the implementation-note-184
 /// `target_state_anchor` checkpoint — do not rename without also updating
 /// the task brief.
 pub async fn vault_kubernetes_login(
@@ -1329,14 +1298,11 @@ const KV_VALUE_FIELD: &str = "value";
 fn parse_kv_v2_value(body: &str) -> Result<Vec<u8>, StoreError> {
     let v: serde_json::Value = serde_json::from_str(body)
         .map_err(|e| StoreError::Other(format!("kv v2 response parse: {e}; body={body}")))?;
-    let inner = v
-        .get("data")
-        .and_then(|d| d.get("data"))
-        .ok_or_else(|| {
-            StoreError::Other(format!(
-                "kv v2 response missing .data.data block: body={body}"
-            ))
-        })?;
+    let inner = v.get("data").and_then(|d| d.get("data")).ok_or_else(|| {
+        StoreError::Other(format!(
+            "kv v2 response missing .data.data block: body={body}"
+        ))
+    })?;
     // Prefer the canonical `"value"` field; fall back to the sole field
     // if the secret was written outside ember.
     let raw = if let Some(v) = inner.get(KV_VALUE_FIELD) {
@@ -1408,22 +1374,20 @@ impl CredentialStore for HashiVaultStore {
                 self.cache_insert(key, &bytes).await;
                 Ok(bytes)
             }
-            Err(StoreError::Unavailable(msg)) => {
-                match self.unavailable_policy {
-                    UnavailablePolicy::FailHard => Err(StoreError::Unavailable(msg)),
-                    UnavailablePolicy::FallBackToCache => {
-                        if let Some(bytes) = self.cache_lookup(key).await {
-                            tracing::warn!(
-                                key = %key,
-                                "HashiVaultStore: upstream unavailable; serving from cache"
-                            );
-                            Ok(bytes)
-                        } else {
-                            Err(StoreError::Unavailable(msg))
-                        }
+            Err(StoreError::Unavailable(msg)) => match self.unavailable_policy {
+                UnavailablePolicy::FailHard => Err(StoreError::Unavailable(msg)),
+                UnavailablePolicy::FallBackToCache => {
+                    if let Some(bytes) = self.cache_lookup(key).await {
+                        tracing::warn!(
+                            key = %key,
+                            "HashiVaultStore: upstream unavailable; serving from cache"
+                        );
+                        Ok(bytes)
+                    } else {
+                        Err(StoreError::Unavailable(msg))
                     }
                 }
-            }
+            },
             Err(other) => Err(other),
         }
     }
@@ -1447,10 +1411,7 @@ impl CredentialStore for HashiVaultStore {
             .request(
                 "POST",
                 &url,
-                &[
-                    (hname, hval.as_ref()),
-                    ("Content-Type", "application/json"),
-                ],
+                &[(hname, hval.as_ref()), ("Content-Type", "application/json")],
                 Some(body.as_bytes()),
             )
             .await
@@ -1701,7 +1662,12 @@ mod test_mock {
                     .collect(),
                 body: body.map(|b| b.to_vec()),
             });
-            if let Some(err) = self.force_transport_error.lock().expect("mock mutex").as_ref() {
+            if let Some(err) = self
+                .force_transport_error
+                .lock()
+                .expect("mock mutex")
+                .as_ref()
+            {
                 return Err(HttpError(err.clone()));
             }
             let mut q = self.responses.lock().expect("mock mutex");
@@ -1710,7 +1676,11 @@ mod test_mock {
                     "MockHttpClient: no response queued for {method} {url}"
                 )));
             }
-            let (status, body) = if q.len() > 1 { q.remove(0) } else { q.last().cloned().unwrap() };
+            let (status, body) = if q.len() > 1 {
+                q.remove(0)
+            } else {
+                q.last().cloned().unwrap()
+            };
             Ok(HttpResponse { status, body })
         }
     }
@@ -1802,20 +1772,19 @@ mod tests {
                 call.url,
                 "https://vault.example.com:8200/v1/secret/data/svc/api-token"
             );
-            assert!(call
-                .headers
-                .iter()
-                .any(|(k, v)| k == "X-Vault-Token" && v == "hvs.static-token"));
+            assert!(
+                call.headers
+                    .iter()
+                    .any(|(k, v)| k == "X-Vault-Token" && v == "hvs.static-token")
+            );
         });
     }
 
     #[test]
     fn token_auth_get_404_returns_not_found() {
         rt().block_on(async {
-            let mock = Arc::new(
-                MockHttpClient::new()
-                    .with_response(404, r#"{"errors":[]}"#.to_string()),
-            );
+            let mock =
+                Arc::new(MockHttpClient::new().with_response(404, r#"{"errors":[]}"#.to_string()));
             let store = HashiVaultStore::new(
                 mock,
                 "https://vault.example.com:8200",
@@ -1859,8 +1828,7 @@ mod tests {
     fn approle_login_happy_path() {
         rt().block_on(async {
             let mock = Arc::new(
-                MockHttpClient::new()
-                    .with_response(200, approle_login_ok_body("hvs.child-token")),
+                MockHttpClient::new().with_response(200, approle_login_ok_body("hvs.child-token")),
             );
             let mut store = HashiVaultStore::new(
                 mock.clone(),
@@ -1876,8 +1844,7 @@ mod tests {
             let call = mock.last_call().expect("a call was made");
             assert_eq!(call.method, "POST");
             assert!(call.url.ends_with("/v1/auth/approle/login"));
-            let body =
-                String::from_utf8(call.body.expect("body sent")).expect("utf8");
+            let body = String::from_utf8(call.body.expect("body sent")).expect("utf8");
             assert!(body.contains("\"role_id\":\"role-id-uuid\""));
             assert!(body.contains("\"secret_id\":\"secret-id-uuid\""));
         });
@@ -1887,10 +1854,8 @@ mod tests {
     fn approle_login_invalid_secret_id() {
         rt().block_on(async {
             let mock = Arc::new(
-                MockHttpClient::new().with_response(
-                    400,
-                    r#"{"errors":["invalid secret id"]}"#.to_string(),
-                ),
+                MockHttpClient::new()
+                    .with_response(400, r#"{"errors":["invalid secret id"]}"#.to_string()),
             );
             let mut store = HashiVaultStore::new(
                 mock,
@@ -1912,8 +1877,7 @@ mod tests {
     fn unavailable_fail_hard_returns_error() {
         rt().block_on(async {
             let mock = Arc::new(
-                MockHttpClient::new()
-                    .with_response(503, r#"{"errors":["sealed"]}"#.to_string()),
+                MockHttpClient::new().with_response(503, r#"{"errors":["sealed"]}"#.to_string()),
             );
             let store = HashiVaultStore::new(
                 mock,
@@ -1963,8 +1927,7 @@ mod tests {
     fn unavailable_fall_back_to_cache_no_cache_returns_unavailable() {
         rt().block_on(async {
             let mock = Arc::new(
-                MockHttpClient::new()
-                    .with_response(503, r#"{"errors":["sealed"]}"#.to_string()),
+                MockHttpClient::new().with_response(503, r#"{"errors":["sealed"]}"#.to_string()),
             );
             let store = HashiVaultStore::new(
                 mock,
@@ -2031,8 +1994,7 @@ mod tests {
                 put_call.url,
                 "https://vault.example.com:8200/v1/secret/data/svc/round-trip"
             );
-            let put_body =
-                String::from_utf8(put_call.body.expect("put body")).expect("utf8");
+            let put_body = String::from_utf8(put_call.body.expect("put body")).expect("utf8");
             assert!(put_body.contains("\"value\":\"round-trip\""));
 
             let got = store.get("svc/round-trip").await.expect("get must succeed");
@@ -2041,7 +2003,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // implementation-note-75 — `vault_aws_login` unit tests
+    // implementation-note-92 — `vault_aws_login` unit tests
     // -----------------------------------------------------------------
 
     /// Serialize tests that mutate `AWS_*` env vars. `std::env::set_var`
@@ -2095,8 +2057,7 @@ mod tests {
             }
             // Anything we didn't explicitly set: clear so a previous
             // test's leak doesn't bleed in.
-            let touched: std::collections::HashSet<&str> =
-                set.iter().map(|(k, _)| *k).collect();
+            let touched: std::collections::HashSet<&str> = set.iter().map(|(k, _)| *k).collect();
             for n in names {
                 if !touched.contains(n) {
                     unsafe { std::env::remove_var(n) };
@@ -2216,12 +2177,10 @@ mod tests {
             ("AWS_DEFAULT_REGION", None),
         ]);
         rt().block_on(async {
-            let mock = Arc::new(
-                MockHttpClient::new().with_response(
-                    403,
-                    r#"{"errors":["permission denied for role ember-daemon"]}"#.to_string(),
-                ),
-            );
+            let mock = Arc::new(MockHttpClient::new().with_response(
+                403,
+                r#"{"errors":["permission denied for role ember-daemon"]}"#.to_string(),
+            ));
             let mut store = HashiVaultStore::new(
                 mock,
                 "https://vault.example.com:8200",
@@ -2249,13 +2208,10 @@ mod tests {
             ("AWS_DEFAULT_REGION", None),
         ]);
         rt().block_on(async {
-            let mock = Arc::new(
-                MockHttpClient::new().with_response(
-                    400,
-                    r#"{"errors":["entry for role \"ember-daemon\" not found"]}"#
-                        .to_string(),
-                ),
-            );
+            let mock = Arc::new(MockHttpClient::new().with_response(
+                400,
+                r#"{"errors":["entry for role \"ember-daemon\" not found"]}"#.to_string(),
+            ));
             let mut store = HashiVaultStore::new(
                 mock,
                 "https://vault.example.com:8200",
@@ -2327,13 +2283,10 @@ mod tests {
             ("AWS_DEFAULT_REGION", None),
         ]);
         rt().block_on(async {
-            let mock = Arc::new(
-                MockHttpClient::new().with_response(
-                    401,
-                    r#"{"errors":["invalid signature; AWS rejected the SigV4 proof"]}"#
-                        .to_string(),
-                ),
-            );
+            let mock = Arc::new(MockHttpClient::new().with_response(
+                401,
+                r#"{"errors":["invalid signature; AWS rejected the SigV4 proof"]}"#.to_string(),
+            ));
             let mut store = HashiVaultStore::new(
                 mock,
                 "https://vault.example.com:8200",
@@ -2351,7 +2304,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // implementation-note-127 — `hcp_vault_login` unit tests
+    // implementation-note-176 — `hcp_vault_login` unit tests
     // -----------------------------------------------------------------
 
     fn hcp_token_ok_body(access_token: &str) -> String {
@@ -2375,8 +2328,7 @@ mod tests {
     fn hcp_login_happy_path() {
         rt().block_on(async {
             let mock = Arc::new(
-                MockHttpClient::new()
-                    .with_response(200, hcp_token_ok_body("hcp.access-token-xyz")),
+                MockHttpClient::new().with_response(200, hcp_token_ok_body("hcp.access-token-xyz")),
             );
             let mut store = HashiVaultStore::new(
                 mock.clone(),
@@ -2575,7 +2527,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // implementation-note-134 — `vault_jwt_login` unit tests
+    // implementation-note-183 — `vault_jwt_login` unit tests
     // -----------------------------------------------------------------
 
     fn jwt_login_ok_body(client_token: &str) -> String {
@@ -2681,12 +2633,10 @@ mod tests {
     #[test]
     fn jwt_login_invalid_jwt() {
         rt().block_on(async {
-            let mock = Arc::new(
-                MockHttpClient::new().with_response(
-                    401,
-                    r#"{"errors":["invalid token: signature is invalid"]}"#.to_string(),
-                ),
-            );
+            let mock = Arc::new(MockHttpClient::new().with_response(
+                401,
+                r#"{"errors":["invalid token: signature is invalid"]}"#.to_string(),
+            ));
             let mut store = HashiVaultStore::new(
                 mock,
                 "https://vault.example.com:8200",
@@ -2706,13 +2656,10 @@ mod tests {
     #[test]
     fn jwt_login_role_not_bound() {
         rt().block_on(async {
-            let mock = Arc::new(
-                MockHttpClient::new().with_response(
-                    400,
-                    r#"{"errors":["role \"ember-daemon\" could not be found"]}"#
-                        .to_string(),
-                ),
-            );
+            let mock = Arc::new(MockHttpClient::new().with_response(
+                400,
+                r#"{"errors":["role \"ember-daemon\" could not be found"]}"#.to_string(),
+            ));
             let mut store = HashiVaultStore::new(
                 mock,
                 "https://vault.example.com:8200",
@@ -2759,7 +2706,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // implementation-note-135 — `vault_kubernetes_login` unit tests
+    // implementation-note-184 — `vault_kubernetes_login` unit tests
     // -----------------------------------------------------------------
     //
     // Reuses the JWT-shaped `jwt_login_ok_body` helper above — the
@@ -2795,10 +2742,8 @@ mod tests {
     #[test]
     fn k8s_login_happy_path() {
         rt().block_on(async {
-            let token_path = write_sa_token_fixture(
-                "happy",
-                "eyJhbGciOiJSUzI1NiJ9.k8s-sa-fixture.signature",
-            );
+            let token_path =
+                write_sa_token_fixture("happy", "eyJhbGciOiJSUzI1NiJ9.k8s-sa-fixture.signature");
             let mock = Arc::new(
                 MockHttpClient::new().with_response(200, jwt_login_ok_body("hvs.k8s-token")),
             );

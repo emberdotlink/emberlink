@@ -53,8 +53,7 @@ fn sec7_set_then_get_round_trips_under_user_presence() {
         .expect("set_password_user_presence");
 
     // First read — session cache pre-populated by the writer; should NOT prompt.
-    let got1 = vault_macos::get_password_user_presence(PROD_SERVICE, &account)
-        .expect("first get");
+    let got1 = vault_macos::get_password_user_presence(PROD_SERVICE, &account).expect("first get");
     assert_eq!(got1.as_deref(), Some(passphrase), "first read must match");
 
     // Clear the in-process cache to simulate a fresh daemon process. The next
@@ -70,8 +69,7 @@ fn sec7_set_then_get_round_trips_under_user_presence() {
     );
 
     // Subsequent read — session cache hit, no prompt.
-    let got3 = vault_macos::get_password_user_presence(PROD_SERVICE, &account)
-        .expect("third get");
+    let got3 = vault_macos::get_password_user_presence(PROD_SERVICE, &account).expect("third get");
     assert_eq!(got3.as_deref(), Some(passphrase), "cached read must match");
 
     // Cleanup.

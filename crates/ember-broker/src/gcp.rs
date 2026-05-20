@@ -67,9 +67,7 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
-use core_broker::{
-    Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential,
-};
+use core_broker::{Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -95,10 +93,11 @@ use serde::{Deserialize, Serialize};
 /// `ServiceAccountKey` remains the default for backward compatibility:
 /// the daemon's `gcp_config.rs` populates that variant, and existing
 /// callers continue to work without re-keying.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub enum GcpAuthMethod {
     /// Long-lived SA private key. JWT-bearer OAuth → impersonation
     /// chain, identical to the historical GCP broker path.
+    #[default]
     ServiceAccountKey,
     /// Workload Identity Federation. `audience` is the full Workload
     /// Identity Pool / Provider resource path (e.g.
@@ -118,12 +117,6 @@ pub enum GcpAuthMethod {
         oidc_token_path: PathBuf,
         service_account_email: Option<String>,
     },
-}
-
-impl Default for GcpAuthMethod {
-    fn default() -> Self {
-        Self::ServiceAccountKey
-    }
 }
 
 /// Service account key material loaded from a downloaded GCP JSON key
@@ -194,11 +187,7 @@ pub trait GcpHttpClient: Send + Sync {
     /// POST a `application/x-www-form-urlencoded` body to `url`. Used
     /// for the JWT-exchange step (the OAuth token endpoint and the
     /// revoke endpoint).
-    async fn post_form(
-        &self,
-        url: &str,
-        body: String,
-    ) -> Result<(u16, String), String>;
+    async fn post_form(&self, url: &str, body: String) -> Result<(u16, String), String>;
 
     /// POST a JSON body to `url` with `Authorization: Bearer <bearer>`.
     /// Used for the IAM Credentials `generateAccessToken` step.
@@ -233,11 +222,7 @@ impl Default for ReqwestGcpClient {
 
 #[async_trait::async_trait]
 impl GcpHttpClient for ReqwestGcpClient {
-    async fn post_form(
-        &self,
-        url: &str,
-        body: String,
-    ) -> Result<(u16, String), String> {
+    async fn post_form(&self, url: &str, body: String) -> Result<(u16, String), String> {
         let resp = self
             .inner
             .post(url)
@@ -445,9 +430,8 @@ async fn call_generate_access_token(
         lifetime: format!("{ttl_seconds}s"),
         delegates: delegates.to_vec(),
     };
-    let body_json = serde_json::to_string(&req_body).map_err(|e| {
-        BrokerError::Other(format!("serialize generateAccessToken request: {e}"))
-    })?;
+    let body_json = serde_json::to_string(&req_body)
+        .map_err(|e| BrokerError::Other(format!("serialize generateAccessToken request: {e}")))?;
 
     let (status, resp_body) = client
         .post_json_bearer(&impersonate_url, bearer, body_json)
@@ -807,13 +791,9 @@ fn map_gcp_error(status: u16, body: &str, step: &str) -> BrokerError {
         }
     }
     if status == 403 {
-        return BrokerError::PolicyRejected(format!(
-            "GCP {step} forbidden (status=403): {body}"
-        ));
+        return BrokerError::PolicyRejected(format!("GCP {step} forbidden (status=403): {body}"));
     }
-    BrokerError::Upstream(format!(
-        "GCP {step} error (status={status}): {body}"
-    ))
+    BrokerError::Upstream(format!("GCP {step} error (status={status}): {body}"))
 }
 
 impl Broker for GcpBroker {
@@ -844,9 +824,7 @@ impl Broker for GcpBroker {
         }
 
         match &self.key.auth_method {
-            GcpAuthMethod::ServiceAccountKey => {
-                self.issue_service_account_key(&scope).await
-            }
+            GcpAuthMethod::ServiceAccountKey => self.issue_service_account_key(&scope).await,
             GcpAuthMethod::WorkloadIdentityFederation {
                 audience,
                 oidc_token_path,
@@ -992,11 +970,7 @@ impl Default for MockGcpClient {
 
 #[async_trait::async_trait]
 impl GcpHttpClient for MockGcpClient {
-    async fn post_form(
-        &self,
-        url: &str,
-        body: String,
-    ) -> Result<(u16, String), String> {
+    async fn post_form(&self, url: &str, body: String) -> Result<(u16, String), String> {
         self.form_calls
             .lock()
             .expect("mock form mutex")
@@ -1007,7 +981,9 @@ impl GcpHttpClient for MockGcpClient {
         } else if let Some(last) = q.last() {
             Ok(last.clone())
         } else {
-            Err(format!("MockGcpClient: no form response queued for {url}; body={body}"))
+            Err(format!(
+                "MockGcpClient: no form response queued for {url}; body={body}"
+            ))
         }
     }
 
@@ -1120,7 +1096,8 @@ mod tests {
         .to_string()
     }
 
-    const FIXTURE_AUDIENCE: &str = "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/p/providers/prov";
+    const FIXTURE_AUDIENCE: &str =
+        "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/p/providers/prov";
 
     fn gcp_request(scope: serde_json::Value, ttl_secs: u64) -> BrokerRequest {
         BrokerRequest {
@@ -1172,11 +1149,7 @@ mod tests {
 
     #[test]
     fn provider_returns_gcp() {
-        let broker = GcpBroker::with_client(
-            fixture_key(),
-            None,
-            Arc::new(MockGcpClient::new()),
-        );
+        let broker = GcpBroker::with_client(fixture_key(), None, Arc::new(MockGcpClient::new()));
         assert_eq!(broker.provider(), BrokerProvider::Gcp);
     }
 
@@ -1206,7 +1179,10 @@ mod tests {
         assert_eq!(claims.aud, "https://oauth2.googleapis.com/token");
         assert_eq!(claims.iat, now);
         assert_eq!(claims.exp, now + 600);
-        assert_eq!(claims.scope, "https://www.googleapis.com/auth/cloud-platform");
+        assert_eq!(
+            claims.scope,
+            "https://www.googleapis.com/auth/cloud-platform"
+        );
     }
 
     #[test]
@@ -1235,14 +1211,17 @@ mod tests {
             }),
             3600,
         );
-        let cred = Broker::issue(&broker, req).await.expect("issue must succeed");
+        let cred = Broker::issue(&broker, req)
+            .await
+            .expect("issue must succeed");
         assert_eq!(
             cred.token.expose_secret(),
             "ya29.impersonated-target-token",
             "token must be the impersonated SA's access token"
         );
         assert!(
-            cred.materialization_id.starts_with("gcp-deployer@target-proj"),
+            cred.materialization_id
+                .starts_with("gcp-deployer@target-proj"),
             "materialization id includes target SA: {}",
             cred.materialization_id
         );
@@ -1271,7 +1250,9 @@ mod tests {
             }),
             1800,
         );
-        let cred = Broker::issue(&broker, req).await.expect("issue must succeed");
+        let cred = Broker::issue(&broker, req)
+            .await
+            .expect("issue must succeed");
         assert!(
             cred.materialization_id.contains("default-deployer@target"),
             "default target wired into materialization_id: {}",
@@ -1330,11 +1311,7 @@ mod tests {
 
     #[tokio::test]
     async fn issue_with_invalid_scope_returns_invalid_scope_error() {
-        let broker = GcpBroker::with_client(
-            fixture_key(),
-            None,
-            Arc::new(MockGcpClient::new()),
-        );
+        let broker = GcpBroker::with_client(fixture_key(), None, Arc::new(MockGcpClient::new()));
         // ttl_seconds = 0 must reject
         let req = gcp_request(
             serde_json::json!({
@@ -1350,11 +1327,7 @@ mod tests {
 
     #[tokio::test]
     async fn issue_with_empty_scopes_returns_invalid_scope_error() {
-        let broker = GcpBroker::with_client(
-            fixture_key(),
-            None,
-            Arc::new(MockGcpClient::new()),
-        );
+        let broker = GcpBroker::with_client(fixture_key(), None, Arc::new(MockGcpClient::new()));
         let req = gcp_request(
             serde_json::json!({
                 "target_service_account": "x@y",
@@ -1369,11 +1342,7 @@ mod tests {
 
     #[tokio::test]
     async fn issue_with_no_target_and_no_default_returns_invalid_scope() {
-        let broker = GcpBroker::with_client(
-            fixture_key(),
-            None,
-            Arc::new(MockGcpClient::new()),
-        );
+        let broker = GcpBroker::with_client(fixture_key(), None, Arc::new(MockGcpClient::new()));
         let req = gcp_request(
             serde_json::json!({
                 "target_service_account": "",
@@ -1388,11 +1357,7 @@ mod tests {
 
     #[tokio::test]
     async fn issue_with_wrong_provider_in_request_is_rejected() {
-        let broker = GcpBroker::with_client(
-            fixture_key(),
-            None,
-            Arc::new(MockGcpClient::new()),
-        );
+        let broker = GcpBroker::with_client(fixture_key(), None, Arc::new(MockGcpClient::new()));
         let mut req = gcp_request(
             serde_json::json!({
                 "target_service_account": "x@y",
@@ -1442,11 +1407,7 @@ mod tests {
 
     #[tokio::test]
     async fn revoke_unknown_id_returns_unknown_materialization() {
-        let broker = GcpBroker::with_client(
-            fixture_key(),
-            None,
-            Arc::new(MockGcpClient::new()),
-        );
+        let broker = GcpBroker::with_client(fixture_key(), None, Arc::new(MockGcpClient::new()));
         let err = Broker::revoke(&broker, "does-not-exist").await.unwrap_err();
         assert!(matches!(err, BrokerError::UnknownMaterialization(_)));
     }
@@ -1516,7 +1477,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Workload Identity Federation tests — implementation-note-50
+    // Workload Identity Federation tests — implementation-note-68
     // ---------------------------------------------------------------
 
     #[test]
@@ -1541,9 +1502,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let token_path = write_oidc_token(tmp.path(), fake_oidc_jwt());
         // Only the STS exchange is queued — no impersonation step.
-        let mock = Arc::new(
-            MockGcpClient::new().with_form(200, sts_ok_body()),
-        );
+        let mock = Arc::new(MockGcpClient::new().with_form(200, sts_ok_body()));
         let broker = GcpBroker::with_client(
             fixture_key_wif(token_path, FIXTURE_AUDIENCE, None),
             None,
@@ -1645,9 +1604,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let token_path = write_oidc_token(tmp.path(), "not-a-valid-jwt");
         // STS rejects the subject_token with 400.
-        let mock = Arc::new(
-            MockGcpClient::new().with_form(400, sts_invalid_subject_body()),
-        );
+        let mock = Arc::new(MockGcpClient::new().with_form(400, sts_invalid_subject_body()));
         let broker = GcpBroker::with_client(
             fixture_key_wif(token_path, FIXTURE_AUDIENCE, None),
             None,
@@ -1663,7 +1620,10 @@ mod tests {
         );
         let err = Broker::issue(&broker, req).await.unwrap_err();
         assert!(
-            matches!(err, BrokerError::Upstream(_) | BrokerError::PolicyRejected(_)),
+            matches!(
+                err,
+                BrokerError::Upstream(_) | BrokerError::PolicyRejected(_)
+            ),
             "invalid OIDC token must surface as Upstream or PolicyRejected, got {err:?}"
         );
     }
@@ -1672,9 +1632,7 @@ mod tests {
     async fn issue_workload_identity_federation_audience_mismatch_returns_policy_rejected() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let token_path = write_oidc_token(tmp.path(), fake_oidc_jwt());
-        let mock = Arc::new(
-            MockGcpClient::new().with_form(403, sts_audience_mismatch_body()),
-        );
+        let mock = Arc::new(MockGcpClient::new().with_form(403, sts_audience_mismatch_body()));
         let broker = GcpBroker::with_client(
             fixture_key_wif(token_path, FIXTURE_AUDIENCE, None),
             None,
@@ -1829,11 +1787,10 @@ mod tests {
             }),
             3600,
         );
-        let cred = Broker::issue(&broker, req).await.expect("issue must succeed");
-        assert_eq!(
-            cred.token.expose_secret(),
-            "ya29.impersonated-target-token"
-        );
+        let cred = Broker::issue(&broker, req)
+            .await
+            .expect("issue must succeed");
+        assert_eq!(cred.token.expose_secret(), "ya29.impersonated-target-token");
         // Form call should hit the OAuth token endpoint, not STS.
         let form_calls = mock.form_calls.lock().expect("mock form mutex").clone();
         assert_eq!(form_calls.len(), 1);

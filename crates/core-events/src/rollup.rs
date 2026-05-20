@@ -13,7 +13,7 @@
 //! [`crate::receipt`]; this module just references them by `(kind, ts, hash)`.
 //!
 //! Tracks **AP-CONSTRUCT-RECEIPT-ROLLUP-VIEW** (/M). v0.1 scaffold here; dashboard
-//! + CLI wire-up land in follow-up PRs once the daemon-supervisor lifecycle is on
+//! and CLI wire-up land in follow-up PRs once the daemon-supervisor lifecycle is on
 //! main (gated on T-CONSTRUCT-DAEMON-EXEC-RPC).
 
 use std::collections::HashMap;
@@ -145,7 +145,9 @@ fn build_rollup<R: RollupReceiptView>(
     let has_invocation = group
         .iter()
         .any(|r| r.kind() == "session.construct_invocation");
-    let denial = group.iter().find_map(|r| r.denied_reason().map(|s| s.to_string()));
+    let denial = group
+        .iter()
+        .find_map(|r| r.denied_reason().map(|s| s.to_string()));
     let exit_code = group
         .iter()
         .find(|r| r.kind() == "session.construct_invocation")
@@ -253,10 +255,46 @@ mod tests {
     #[test]
     fn success_path_produces_one_rollup_with_4_receipts() {
         let receipts = vec![
-            fx("m_abc", "broker.materialization", "2026-05-05T13:01:22Z", "blake3:7c2a", Some("dev"), None, None, None),
-            fx("m_abc", "broker.resolution", "2026-05-05T13:01:22Z", "blake3:9f81", None, None, None, None),
-            fx("m_abc", "session.construct_invocation", "2026-05-05T13:01:24Z", "blake3:b3f9", None, Some("gh.pr_create"), Some(0), None),
-            fx("m_abc", "broker.revocation", "2026-05-05T13:01:24Z", "blake3:e1d8", None, None, None, None),
+            fx(
+                "m_abc",
+                "broker.materialization",
+                "2026-05-05T13:01:22Z",
+                "blake3:7c2a",
+                Some("dev"),
+                None,
+                None,
+                None,
+            ),
+            fx(
+                "m_abc",
+                "broker.resolution",
+                "2026-05-05T13:01:22Z",
+                "blake3:9f81",
+                None,
+                None,
+                None,
+                None,
+            ),
+            fx(
+                "m_abc",
+                "session.construct_invocation",
+                "2026-05-05T13:01:24Z",
+                "blake3:b3f9",
+                None,
+                Some("gh.pr_create"),
+                Some(0),
+                None,
+            ),
+            fx(
+                "m_abc",
+                "broker.revocation",
+                "2026-05-05T13:01:24Z",
+                "blake3:e1d8",
+                None,
+                None,
+                None,
+                None,
+            ),
         ];
         let rollups = compute_rollups(&receipts);
         assert_eq!(rollups.len(), 1);
@@ -274,8 +312,26 @@ mod tests {
     #[test]
     fn denied_path_produces_denied_outcome() {
         let receipts = vec![
-            fx("m_def", "broker.materialization", "2026-05-05T13:02:00Z", "blake3:111", Some("dev"), None, None, None),
-            fx("m_def", "broker.exec.denied_resource_limit", "2026-05-05T13:02:00Z", "blake3:222", None, Some("git.push"), None, Some("rate_limited")),
+            fx(
+                "m_def",
+                "broker.materialization",
+                "2026-05-05T13:02:00Z",
+                "blake3:111",
+                Some("dev"),
+                None,
+                None,
+                None,
+            ),
+            fx(
+                "m_def",
+                "broker.exec.denied_resource_limit",
+                "2026-05-05T13:02:00Z",
+                "blake3:222",
+                None,
+                Some("git.push"),
+                None,
+                Some("rate_limited"),
+            ),
         ];
         let rollups = compute_rollups(&receipts);
         assert_eq!(rollups.len(), 1);
@@ -288,9 +344,36 @@ mod tests {
     #[test]
     fn in_flight_chain_omits_ended_at() {
         let receipts = vec![
-            fx("m_inflight", "broker.materialization", "2026-05-05T13:03:00Z", "blake3:a", Some("dev"), None, None, None),
-            fx("m_inflight", "broker.resolution", "2026-05-05T13:03:00Z", "blake3:b", None, None, None, None),
-            fx("m_inflight", "session.construct_invocation", "2026-05-05T13:03:01Z", "blake3:c", None, Some("kubectl.apply"), None, None),
+            fx(
+                "m_inflight",
+                "broker.materialization",
+                "2026-05-05T13:03:00Z",
+                "blake3:a",
+                Some("dev"),
+                None,
+                None,
+                None,
+            ),
+            fx(
+                "m_inflight",
+                "broker.resolution",
+                "2026-05-05T13:03:00Z",
+                "blake3:b",
+                None,
+                None,
+                None,
+                None,
+            ),
+            fx(
+                "m_inflight",
+                "session.construct_invocation",
+                "2026-05-05T13:03:01Z",
+                "blake3:c",
+                None,
+                Some("kubectl.apply"),
+                None,
+                None,
+            ),
             // No broker.revocation yet.
         ];
         let rollups = compute_rollups(&receipts);
@@ -302,8 +385,26 @@ mod tests {
     #[test]
     fn incomplete_chain_no_invocation() {
         let receipts = vec![
-            fx("m_crash", "broker.materialization", "2026-05-05T13:04:00Z", "blake3:x", Some("dev"), None, None, None),
-            fx("m_crash", "broker.resolution", "2026-05-05T13:04:00Z", "blake3:y", None, None, None, None),
+            fx(
+                "m_crash",
+                "broker.materialization",
+                "2026-05-05T13:04:00Z",
+                "blake3:x",
+                Some("dev"),
+                None,
+                None,
+                None,
+            ),
+            fx(
+                "m_crash",
+                "broker.resolution",
+                "2026-05-05T13:04:00Z",
+                "blake3:y",
+                None,
+                None,
+                None,
+                None,
+            ),
             // Daemon crashed before invocation landed.
         ];
         let rollups = compute_rollups(&receipts);
@@ -314,10 +415,46 @@ mod tests {
     #[test]
     fn errored_path_carries_exit_code() {
         let receipts = vec![
-            fx("m_err", "broker.materialization", "2026-05-05T13:05:00Z", "blake3:p", Some("dev"), None, None, None),
-            fx("m_err", "broker.resolution", "2026-05-05T13:05:00Z", "blake3:q", None, None, None, None),
-            fx("m_err", "session.construct_invocation", "2026-05-05T13:05:02Z", "blake3:r", None, Some("git.push"), Some(128), None),
-            fx("m_err", "broker.revocation", "2026-05-05T13:05:02Z", "blake3:s", None, None, None, None),
+            fx(
+                "m_err",
+                "broker.materialization",
+                "2026-05-05T13:05:00Z",
+                "blake3:p",
+                Some("dev"),
+                None,
+                None,
+                None,
+            ),
+            fx(
+                "m_err",
+                "broker.resolution",
+                "2026-05-05T13:05:00Z",
+                "blake3:q",
+                None,
+                None,
+                None,
+                None,
+            ),
+            fx(
+                "m_err",
+                "session.construct_invocation",
+                "2026-05-05T13:05:02Z",
+                "blake3:r",
+                None,
+                Some("git.push"),
+                Some(128),
+                None,
+            ),
+            fx(
+                "m_err",
+                "broker.revocation",
+                "2026-05-05T13:05:02Z",
+                "blake3:s",
+                None,
+                None,
+                None,
+                None,
+            ),
         ];
         let rollups = compute_rollups(&receipts);
         match &rollups[0].outcome {
@@ -362,14 +499,86 @@ mod tests {
     #[test]
     fn multiple_materialization_ids_produce_separate_rollups() {
         let receipts = vec![
-            fx("m_one", "broker.materialization", "2026-05-05T13:00:00Z", "blake3:a", Some("dev"), None, None, None),
-            fx("m_one", "broker.resolution", "2026-05-05T13:00:00Z", "blake3:b", None, None, None, None),
-            fx("m_one", "session.construct_invocation", "2026-05-05T13:00:01Z", "blake3:c", None, Some("gh.pr_create"), Some(0), None),
-            fx("m_one", "broker.revocation", "2026-05-05T13:00:01Z", "blake3:d", None, None, None, None),
-            fx("m_two", "broker.materialization", "2026-05-05T13:00:05Z", "blake3:e", Some("dev"), None, None, None),
-            fx("m_two", "broker.resolution", "2026-05-05T13:00:05Z", "blake3:f", None, None, None, None),
-            fx("m_two", "session.construct_invocation", "2026-05-05T13:00:06Z", "blake3:g", None, Some("git.push"), Some(0), None),
-            fx("m_two", "broker.revocation", "2026-05-05T13:00:06Z", "blake3:h", None, None, None, None),
+            fx(
+                "m_one",
+                "broker.materialization",
+                "2026-05-05T13:00:00Z",
+                "blake3:a",
+                Some("dev"),
+                None,
+                None,
+                None,
+            ),
+            fx(
+                "m_one",
+                "broker.resolution",
+                "2026-05-05T13:00:00Z",
+                "blake3:b",
+                None,
+                None,
+                None,
+                None,
+            ),
+            fx(
+                "m_one",
+                "session.construct_invocation",
+                "2026-05-05T13:00:01Z",
+                "blake3:c",
+                None,
+                Some("gh.pr_create"),
+                Some(0),
+                None,
+            ),
+            fx(
+                "m_one",
+                "broker.revocation",
+                "2026-05-05T13:00:01Z",
+                "blake3:d",
+                None,
+                None,
+                None,
+                None,
+            ),
+            fx(
+                "m_two",
+                "broker.materialization",
+                "2026-05-05T13:00:05Z",
+                "blake3:e",
+                Some("dev"),
+                None,
+                None,
+                None,
+            ),
+            fx(
+                "m_two",
+                "broker.resolution",
+                "2026-05-05T13:00:05Z",
+                "blake3:f",
+                None,
+                None,
+                None,
+                None,
+            ),
+            fx(
+                "m_two",
+                "session.construct_invocation",
+                "2026-05-05T13:00:06Z",
+                "blake3:g",
+                None,
+                Some("git.push"),
+                Some(0),
+                None,
+            ),
+            fx(
+                "m_two",
+                "broker.revocation",
+                "2026-05-05T13:00:06Z",
+                "blake3:h",
+                None,
+                None,
+                None,
+                None,
+            ),
         ];
         let rollups = compute_rollups(&receipts);
         assert_eq!(rollups.len(), 2);

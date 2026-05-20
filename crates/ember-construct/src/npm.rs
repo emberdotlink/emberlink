@@ -146,12 +146,12 @@ fn registry_from_argv(argv: &[String]) -> Option<String> {
 /// `registry.example.com`, etc. Strips scheme, path, userinfo. Preserves the
 /// `:port` suffix for non-default ports so action keys are precise.
 fn host_from_url(url: &str) -> String {
-    let after_scheme = url
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(url);
+    let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
 
-    let after_userinfo = after_scheme.rsplit_once('@').map(|(_, h)| h).unwrap_or(after_scheme);
+    let after_userinfo = after_scheme
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(after_scheme);
 
     let host_with_port = after_userinfo
         .split(['/', '?', '#'])
@@ -208,22 +208,15 @@ mod tests {
     #[test]
     fn publish_with_registry_flag_joined() {
         clear_registry_env();
-        let r = classify_npm_argv(&args(&[
-            "publish",
-            "--registry=https://npm.pkg.github.com",
-        ]))
-        .unwrap();
+        let r = classify_npm_argv(&args(&["publish", "--registry=https://npm.pkg.github.com"]))
+            .unwrap();
         assert_eq!(r.0, "npm.publish.npm.pkg.github.com");
     }
 
     #[test]
     fn publish_with_port_preserves_port() {
         clear_registry_env();
-        let r = classify_npm_argv(&args(&[
-            "publish",
-            "--registry=http://10.0.0.5:4873/",
-        ]))
-        .unwrap();
+        let r = classify_npm_argv(&args(&["publish", "--registry=http://10.0.0.5:4873/"])).unwrap();
         assert_eq!(r.0, "npm.publish.10.0.0.5:4873");
     }
 
@@ -277,11 +270,8 @@ mod tests {
     #[test]
     fn ci_with_registry_flag() {
         clear_registry_env();
-        let r = classify_npm_argv(&args(&[
-            "ci",
-            "--registry=https://registry.npmjs.org/",
-        ]))
-        .unwrap();
+        let r =
+            classify_npm_argv(&args(&["ci", "--registry=https://registry.npmjs.org/"])).unwrap();
         assert_eq!(r.0, "npm.ci.registry.npmjs.org");
     }
 
@@ -317,12 +307,7 @@ mod tests {
     #[test]
     fn deprecate_classified() {
         clear_registry_env();
-        let r = classify_npm_argv(&args(&[
-            "deprecate",
-            "mypkg@1.0.0",
-            "use mypkg@2",
-        ]))
-        .unwrap();
+        let r = classify_npm_argv(&args(&["deprecate", "mypkg@1.0.0", "use mypkg@2"])).unwrap();
         assert_eq!(r.0, "npm.deprecate.npmjs.org");
     }
 
@@ -379,7 +364,10 @@ mod tests {
 
     #[test]
     fn host_url_with_userinfo_strips_user() {
-        assert_eq!(host_from_url("https://user:pass@npm.example.com/"), "npm.example.com");
+        assert_eq!(
+            host_from_url("https://user:pass@npm.example.com/"),
+            "npm.example.com"
+        );
     }
 
     #[test]

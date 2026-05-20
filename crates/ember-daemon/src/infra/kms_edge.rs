@@ -24,10 +24,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use core_crypto::ca::{EdgeCa, SpiffeIdentity, parse_spiffe_uri};
-use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
-use rustls::server::WebPkiClientVerifier;
 use rustls::RootCertStore;
 use rustls::ServerConfig;
+use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+use rustls::server::WebPkiClientVerifier;
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -113,17 +113,18 @@ fn seed_to_pkcs8_v1_der(seed: &[u8; 32]) -> Vec<u8> {
 /// Returns `Err(EdgeError::SpiffeUriMissing)` when no SAN URI matching the
 /// strict SPIFFE regex is found.
 fn extract_spiffe_from_cert(cert_der: &[u8]) -> Result<SpiffeIdentity, EdgeError> {
-    let (_, cert) =
-        x509_parser::certificate::X509Certificate::from_der(cert_der)
-            .map_err(|_| EdgeError::CertVerifyFailed)?;
+    let (_, cert) = x509_parser::certificate::X509Certificate::from_der(cert_der)
+        .map_err(|_| EdgeError::CertVerifyFailed)?;
 
-    if let Some(san_ext) = cert.subject_alternative_name().map_err(|_| EdgeError::CertVerifyFailed)? {
+    if let Some(san_ext) = cert
+        .subject_alternative_name()
+        .map_err(|_| EdgeError::CertVerifyFailed)?
+    {
         for gn in &san_ext.value.general_names {
-            if let x509_parser::extensions::GeneralName::URI(uri) = gn {
-                if uri.starts_with("spiffe://") {
-                    return parse_spiffe_uri(uri)
-                        .map_err(|_| EdgeError::SpiffeUriMissing);
-                }
+            if let x509_parser::extensions::GeneralName::URI(uri) = gn
+                && uri.starts_with("spiffe://")
+            {
+                return parse_spiffe_uri(uri).map_err(|_| EdgeError::SpiffeUriMissing);
             }
         }
     }

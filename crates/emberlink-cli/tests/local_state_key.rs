@@ -45,7 +45,13 @@ fn permissive_policy() -> PolicyEngine {
 /// Spawn a daemon socket listener on a temp path and return the socket
 /// path plus a shutdown handle. The listener uses an in-memory store and
 /// a fixed vault key so no real keychain is touched.
+///
+/// Also flips the process-global presence manager to Unlocked. The
+/// dispatch gate added in prior change (hard-lock after session grace window)
+/// refuses non-exempt RPC methods when the session is `Locked`; tests
+/// that bypass `register_session` must satisfy the gate explicitly.
 fn spawn_listener(tmp: &TempDir, name: &str) -> (PathBuf, watch::Sender<bool>) {
+    ember_daemon::trust::presence::mark_unlocked();
     let socket_path = tmp.path().join(format!("{name}.sock"));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let path_for_thread = socket_path.clone();
@@ -63,14 +69,10 @@ fn spawn_listener(tmp: &TempDir, name: &str) -> (PathBuf, watch::Sender<bool>) {
             store.set_vault(Rc::clone(&vault));
             let policy = Rc::new(permissive_policy());
             let rate_limiter = Rc::new(RefCell::new(RateLimiter::default()));
-            let listener = SocketListener::new(
-                path_for_thread,
-                shutdown_rx,
-                store,
-                vault,
-                policy,
-                rate_limiter,
-            );
+            let _vault = vault; // hold until end of scope: set_vault is the wire now
+            let listener =
+                SocketListener::new(path_for_thread, shutdown_rx, store, policy, rate_limiter)
+                    .with_test_mode_synthetic_presence_token(true);
             let _ = listener.run().await;
         });
     });
@@ -93,12 +95,43 @@ fn spawn_listener(tmp: &TempDir, name: &str) -> (PathBuf, watch::Sender<bool>) {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Redirect `HOME` (and `USERPROFILE` on Windows builds, for forward
+/// compat) at the given tempdir so `default_data_dir` resolves under
+/// the test fixture instead of the developer's real
+/// `~/.config/emberlink/local-state.enc`. Returns a guard that restores
+/// the previous value on Drop. Caller must hold `ENV_LOCK` while the
+/// guard is live.
+struct HomeOverride {
+    prev_home: Option<std::ffi::OsString>,
+}
+
+impl HomeOverride {
+    fn set(tmp: &TempDir) -> Self {
+        let prev_home = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", tmp.path()) };
+        Self { prev_home }
+    }
+}
+
+impl Drop for HomeOverride {
+    fn drop(&mut self) {
+        match self.prev_home.take() {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+}
+
 #[test]
 fn local_state_key_resolves_via_daemon_socket() {
     let tmp = TempDir::new().unwrap();
     let (socket_path, _shutdown) = spawn_listener(&tmp, "local-state-key");
 
     let _guard = ENV_LOCK.lock().unwrap();
+    // Redirect HOME so `default_data_dir` resolves to a fresh tempdir,
+    // not the developer's real ~/.config/emberlink/local-state.enc
+    // (which would fail decryption against the test daemon's vault key).
+    let _home_guard = HomeOverride::set(&tmp);
     // Point resolve_encryption_key at the test socket.
     unsafe { std::env::set_var("EMBER_SOCKET_PATH", socket_path.as_os_str()) };
     // Ensure EMBERLINK_KEY is unset so we exercise the daemon path.
@@ -129,13 +162,12 @@ fn local_state_key_is_idempotent_across_calls() {
     let (socket_path, _shutdown) = spawn_listener(&tmp, "local-state-key-idem");
 
     let _guard = ENV_LOCK.lock().unwrap();
+    let _home_guard = HomeOverride::set(&tmp);
     unsafe { std::env::set_var("EMBER_SOCKET_PATH", socket_path.as_os_str()) };
     unsafe { std::env::remove_var("EMBERLINK_KEY") };
 
-    let key1 = emberlink_cli::local_state_content_key()
-        .expect("first call should succeed");
-    let key2 = emberlink_cli::local_state_content_key()
-        .expect("second call should succeed");
+    let key1 = emberlink_cli::local_state_content_key().expect("first call should succeed");
+    let key2 = emberlink_cli::local_state_content_key().expect("second call should succeed");
 
     unsafe { std::env::remove_var("EMBER_SOCKET_PATH") };
 

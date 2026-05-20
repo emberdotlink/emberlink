@@ -19,9 +19,9 @@ pub mod rpc;
 pub mod runtime;
 
 pub use runtime::{
-    exec_via_broker, resolve_via_broker, run_construct, run_construct_full,
-    run_construct_with_transport, BrokerTransactionError, BrokerTransport, ConstructSpec,
-    CredentialAuditKind, DaemonRpcTransport, ExecOutcome, SpawnHandle,
+    BrokerTransactionError, BrokerTransport, ConstructSpec, CredentialAuditKind,
+    DaemonRpcTransport, ExecOutcome, SpawnHandle, exec_via_broker, resolve_via_broker,
+    run_construct, run_construct_full, run_construct_with_transport,
 };
 
 /// Stable identifier for a classified Construct action.
@@ -91,7 +91,7 @@ pub trait ConstructConfig: ClassifyArgv {
     /// classify=None bypass) do NOT translate — those branches exit the shim
     /// contract entirely. The fix for emberlink-flag passthrough in those
     /// branches is to eliminate the bypass (e.g. broker.exec default per
-    /// implementation-note-12 step 3), not to add
+    /// implementation-note-14 step 3), not to add
     /// translation here.
     ///
     /// Anchor: `construct_config_translate_argv_hook_landed`.

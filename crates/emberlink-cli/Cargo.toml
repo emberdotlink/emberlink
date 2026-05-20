@@ -54,6 +54,10 @@ hex = "0.4"
 toml.workspace = true
 clap_complete = "4"
 dirs-next = "2"
+# minijinja: Jinja2-compatible template engine for rendering
+# crates/headless-runtime/templates/compose.yml.j2 from cmd_up (implementation-note-382).
+minijinja = "2"
+ember-update = { path = "../ember-update" }
 ember-daemon = { path = "../ember-daemon" }
 core-construct-runtime = { path = "../core-construct-runtime" }
 keyring = { version = "3", features = ["apple-native"] }
@@ -73,12 +77,29 @@ rpassword = "7"
 # going through `getrandom` avoids that surface entirely.
 getrandom = "0.4"
 pem = "3"
+# `sigstore` (cosign feature) parses Sigstore-keyless witness signatures as
+# cosign SimpleSigning envelopes. `verify_manifest_dual_witness` deserializes
+# the on-wire bytes into a `SimpleSigning` struct and checks that
+# `critical.image.docker_manifest_digest` matches `sha256(blob)`. Fulcio cert
+# chain + Rekor inclusion proof verification are deferred to follow-up slices
+# (implementation-note-383/-C). The `cosign` feature drags in
+# `oci-client`, which needs a TLS backend on `reqwest` to build at all; we
+# enable `rustls-tls` (already present in this crate via the `rustls` dep)
+# to satisfy that transitive requirement without adding a second TLS stack.
+sigstore = { version = "0.13", default-features = false, features = ["cosign", "rustls-tls"] }
 uuid = { version = "1", features = ["v4"] }
 x509-parser = "0.16"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 webpki-roots = "1.0"
+# `ureq` is used by `ember broker register github` to call `GET /apps/<slug>`
+# for slug canonicalization (Finding 12 / implementation-note-384).
+# Blocking client — no async runtime required for a one-shot CLI call.
+ureq = { version = "3", default-features = false, features = ["json", "rustls"] }
+# `jsonwebtoken` is used to build the GitHub App RS256 JWT for the slug
+# canonicalization call (same flow as ember-broker::github_app::build_jwt).
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 
 [dev-dependencies]
 tempfile = "3"

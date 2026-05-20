@@ -59,10 +59,12 @@ pub fn bundled_install_dir() -> PathBuf {
 /// arrived through a channel the current daemon doesn't yet trust).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum BinaryDistributionChannel {
     /// Cohort-A: shipped inside the `emberd` release artifact. Signed
     /// by Ember Systems' IdentityRoot. Discovered from
     /// [`bundled_install_dir`] at daemon startup.
+    #[default]
     Bundled,
     /// v0.4: `ember binary install <tool>@<version>` fetches from a
     /// per-publisher GitHub release or an ember-managed mirror. Each
@@ -70,12 +72,6 @@ pub enum BinaryDistributionChannel {
     /// publisher's signature against a per-publisher trust delegation
     /// recorded in the daemon's WoT graph (per design).
     InstallOnDemand,
-}
-
-impl Default for BinaryDistributionChannel {
-    fn default() -> Self {
-        Self::Bundled
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,7 +177,7 @@ pub fn lookup_construct<'a>(
 /// to known artifacts (defense against a stray binary in
 /// [`bundled_install_dir`] being treated as a Construct).
 pub fn is_cohort_a_construct(name: &str) -> bool {
-    COHORT_A_CONSTRUCTS.iter().any(|c| *c == name)
+    COHORT_A_CONSTRUCTS.contains(&name)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -192,6 +188,14 @@ pub enum VerifyError {
     SidecarParse(String),
     #[error("manifest signature mismatch")]
     SignatureMismatch,
+    /// design §Component 1 — defense against an empty trust-root set
+    /// silently accepting every signature (because "no key rejected"
+    /// would otherwise short-circuit to Ok via the for-loop's zero
+    /// iterations). The compiled-in release IdentityRoot is always
+    /// supplied by `infra/runtime.rs` so this is a programmer error,
+    /// not a configuration error — surface it loudly.
+    #[error("trust_roots set is empty — caller must supply at least the compiled-in release root")]
+    TrustRootsEmpty,
     #[error("invalid pubkey: {0}")]
     InvalidPubkey(String),
     #[error("invalid signature bytes: {0}")]
@@ -210,7 +214,7 @@ pub enum VerifyError {
 #[derive(Debug, serde::Deserialize)]
 pub struct ManifestSidecar {
     pub schema_version: u32,
-    pub signature: String,     // "ed25519:base64..." — strip prefix before decode
+    pub signature: String, // "ed25519:base64..." — strip prefix before decode
     pub signature_alg: String, // must be "ed25519"
 }
 
@@ -218,10 +222,42 @@ pub struct ManifestSidecar {
 /// IdentityRoot. Reads `<manifest_path>.sig` for the sidecar JSON,
 /// Ed25519-verifies the signature against `root_pubkey` over the raw
 /// bytes of the manifest TOML.
+///
+/// Single-key convenience wrapper around
+/// [`verify_manifest_signature_with_trust_roots`]. Retained for callers
+/// (and tests) that pre-date design's trust-root set parameterization;
+/// new call sites SHOULD pass a slice through the trust-root API so
+/// dev/prod daemons share one verifier with only the trust-set as input.
 pub fn verify_manifest_signature(
     manifest_path: &Path,
     root_pubkey: &VerifyingKey,
 ) -> Result<(), VerifyError> {
+    verify_manifest_signature_with_trust_roots(manifest_path, std::slice::from_ref(root_pubkey))
+}
+
+/// design §Component 1 — trust-root SET verifier. Reads
+/// `<manifest_path>.sig` for the sidecar JSON, then Ed25519-verifies the
+/// signature against EACH key in `trust_roots` until one matches.
+///
+/// The verifier ALWAYS runs (no dev-mode bypass). What differs between
+/// dev and prod daemons is the SET of acceptable signers, parameterized
+/// via `EMBER_TRUST_ROOTS` (parsed in `infra/config.rs`):
+///
+/// - Prod daemons: trust_roots = [compiled-in release IdentityRoot].
+/// - Dev daemons:  trust_roots = [release IdentityRoot, dev IdentityRoot, …].
+///
+/// Returns `SignatureMismatch` when no key in the set verifies; returns
+/// `TrustRootsEmpty` when the caller passes an empty slice (defense
+/// against an empty-trust-set silently accepting everything via "no key
+/// rejected").
+pub fn verify_manifest_signature_with_trust_roots(
+    manifest_path: &Path,
+    trust_roots: &[VerifyingKey],
+) -> Result<(), VerifyError> {
+    if trust_roots.is_empty() {
+        return Err(VerifyError::TrustRootsEmpty);
+    }
+
     let sidecar_path = manifest_path.with_extension("toml.sig");
     if !sidecar_path.exists() {
         return Err(VerifyError::MissingSidecar(
@@ -256,18 +292,216 @@ pub fn verify_manifest_signature(
     let sig_bytes = base64::engine::general_purpose::STANDARD
         .decode(sig_b64)
         .map_err(|e| VerifyError::Base64(e.to_string()))?;
-    let sig =
-        Signature::from_slice(&sig_bytes).map_err(|e| VerifyError::InvalidSignature(e.to_string()))?;
+    let sig = Signature::from_slice(&sig_bytes)
+        .map_err(|e| VerifyError::InvalidSignature(e.to_string()))?;
 
-    root_pubkey
-        .verify(&manifest_bytes, &sig)
-        .map_err(|_| VerifyError::SignatureMismatch)?;
+    // Try each trust root in turn; accept the first that verifies. Walking
+    // the set is O(n) in the number of trust roots — n is typically 1 (prod)
+    // or 2-3 (dev + org-policy endorsements), so the cost is negligible.
+    for pk in trust_roots {
+        if pk.verify(&manifest_bytes, &sig).is_ok() {
+            return Ok(());
+        }
+    }
+    Err(VerifyError::SignatureMismatch)
+}
 
-    Ok(())
+/// design §Component 5 — process-global flag mirroring the daemon's
+/// dev/prod posture at the trust-set level. Set once at startup by
+/// `infra/runtime.rs` after the trust-root set is resolved; consulted by
+/// the Receipt-builder to stamp `dev_mode_active: <bool>` on every
+/// emitted Receipt.
+///
+/// The flag is `true` iff any non-release root is in the trust set
+/// (i.e. the operator supplied additional signers via
+/// `EMBER_TRUST_ROOTS`). `false` for prod daemons running release-only.
+///
+/// This is the ONLY runtime artifact that distinguishes a dev daemon
+/// from a prod daemon — and it's an audit signal, not a behavior
+/// switch. Per design §Component 5.
+static DEV_MODE_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set the process-global dev-mode flag (design §Component 5).
+/// Idempotent; safe to call once at daemon startup. Consumed by Receipt
+/// emission code via [`dev_mode_active`].
+pub fn set_dev_mode_active(v: bool) {
+    DEV_MODE_ACTIVE.store(v, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Read the process-global dev-mode flag (design §Component 5). Returns
+/// `false` until [`set_dev_mode_active`] is called — the default-prod
+/// posture matches the "no `EMBER_TRUST_ROOTS` supplied" runtime path.
+pub fn dev_mode_active() -> bool {
+    DEV_MODE_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Origin of one entry in the daemon's trust-root set. Operator-supplied
+/// roots come from `EMBER_TRUST_ROOTS` per design; the release root is
+/// the compiled-in production signer.
+///
+/// `serde(rename_all = "snake_case")` so the wire form matches the rest
+/// of the daemon's RPC vocabulary (`"release"` / `"operator"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustRootSource {
+    /// The compiled-in production release signer.
+    Release,
+    /// An operator-supplied additional signer via `EMBER_TRUST_ROOTS`
+    /// (also the trigger for `dev_mode_active = true`).
+    Operator,
+}
+
+/// One row of the daemon's startup trust-root set. Captured at startup
+/// so `ember trust list` (and future `show` / `explain`) can answer
+/// "what is this daemon prepared to verify against?" without re-reading
+/// `EMBER_TRUST_ROOTS` or the binary manifest at query time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustRootRecord {
+    /// Hex-lowercase of the Ed25519 public key bytes (64 chars, 32 bytes).
+    /// Stable across daemon restarts for the same key. Matches the
+    /// fingerprint shape emitted by `verify.rs::query_trust_roots`.
+    pub fingerprint_hex: String,
+    /// Whether this root came from the compiled-in release path or an
+    /// operator override.
+    pub source: TrustRootSource,
+}
+
+/// Snapshot of the trust-root records the daemon assembled at startup.
+/// `OnceLock` because the snapshot writes once (at startup) and reads
+/// many times (every `trust.list` RPC); a `Mutex` over the inner Vec
+/// allows the snapshot to be replaced atomically if a future call site
+/// (e.g. trust rotation) needs to rebuild it. Reads clone the Vec so
+/// callers never hold the lock across an RPC reply.
+static TRUST_ROOTS_SNAPSHOT: std::sync::OnceLock<std::sync::Mutex<Vec<TrustRootRecord>>> =
+    std::sync::OnceLock::new();
+
+/// Replace the process-global trust-root snapshot. Called once by
+/// [`crate::infra::runtime`] at startup after the manifest verifies
+/// against the assembled trust set; idempotent (subsequent calls
+/// overwrite cleanly).
+///
+/// The order in `records` is preserved verbatim — typically [Release,
+/// Operator-1, Operator-2, ...] so display order matches the order in
+/// which the daemon would try each signer.
+pub fn set_trust_roots_snapshot(records: Vec<TrustRootRecord>) {
+    let cell = TRUST_ROOTS_SNAPSHOT.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    let mut guard = cell.lock().expect("trust-roots snapshot mutex poisoned");
+    *guard = records;
+}
+
+/// Read the process-global trust-root snapshot. Returns a clone so the
+/// caller never holds the lock across an await point.
+///
+/// Empty until [`set_trust_roots_snapshot`] is called — the default
+/// matches the "no startup verification ran" posture (in-memory test
+/// stores, single-shot CLI utilities).
+pub fn trust_roots_snapshot() -> Vec<TrustRootRecord> {
+    match TRUST_ROOTS_SNAPSHOT.get() {
+        Some(cell) => cell
+            .lock()
+            .expect("trust-roots snapshot mutex poisoned")
+            .clone(),
+        None => Vec::new(),
+    }
+}
+
+/// Convert a slice of [`VerifyingKey`]s + a count of operator-supplied
+/// roots into [`TrustRootRecord`]s. Convention: the first
+/// `total - operator_count` entries are `Release` (the compiled-in
+/// signer, prepended in [`crate::infra::runtime`]); the remaining
+/// `operator_count` entries are `Operator`.
+///
+/// This is a pure function for test ergonomics — runtime.rs hands in
+/// the assembled Vec and the count it tracked; the function does the
+/// labeling.
+pub fn build_trust_root_records(
+    trust_roots: &[VerifyingKey],
+    operator_count: usize,
+) -> Vec<TrustRootRecord> {
+    let total = trust_roots.len();
+    let release_count = total.saturating_sub(operator_count);
+    trust_roots
+        .iter()
+        .enumerate()
+        .map(|(i, key)| {
+            let fingerprint_hex = hex_lower(&key.to_bytes());
+            let source = if i < release_count {
+                TrustRootSource::Release
+            } else {
+                TrustRootSource::Operator
+            };
+            TrustRootRecord {
+                fingerprint_hex,
+                source,
+            }
+        })
+        .collect()
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
+}
+
+// trust_roots_snapshot_landed
+
+/// design §Component 1 — parse a comma-separated list of trust-root
+/// fingerprints from operator-supplied configuration (typically
+/// `EMBER_TRUST_ROOTS`) into [`VerifyingKey`] values.
+///
+/// Each entry is a 64-char lower-hex Ed25519 public key. The optional
+/// `did:key:` prefix is accepted-and-stripped (so operators can write
+/// either `did:key:<hex>` or just `<hex>`); this matches design's
+/// example format `EMBER_TRUST_ROOTS=did:key:abcd…`.
+///
+/// An empty input string (after whitespace trim) is a legitimate "no
+/// additional roots" signal and yields an empty `Vec` — the daemon's
+/// startup wiring is responsible for prepending the compiled-in release
+/// root before passing the set to the verifier.
+///
+/// Whitespace around commas is tolerated. Empty entries (e.g. trailing
+/// comma) are skipped. Invalid hex / wrong-length entries surface as
+/// `VerifyError::InvalidPubkey` so the operator gets actionable feedback
+/// rather than silent acceptance.
+pub fn parse_trust_roots(raw: &str) -> Result<Vec<VerifyingKey>, VerifyError> {
+    let mut out = Vec::new();
+    for token in raw.split(',') {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Strip the optional `did:key:` prefix. design writes
+        // `EMBER_TRUST_ROOTS=did:key:abcd…`; the canonical did:key
+        // multicodec wire format is out of scope for the v0.3 primitive
+        // (which is what this task lands) — we treat the suffix as raw
+        // lower-hex Ed25519 pubkey bytes. The multicodec walk lands
+        // alongside the per-publisher WoT delegation graph (design).
+        let hex_part = trimmed.strip_prefix("did:key:").unwrap_or(trimmed);
+        if hex_part.len() != 64 {
+            return Err(VerifyError::InvalidPubkey(format!(
+                "trust-root entry {:?} is not 64 hex chars (got {} chars)",
+                trimmed,
+                hex_part.len()
+            )));
+        }
+        let raw_bytes = hex::decode(hex_part)
+            .map_err(|e| VerifyError::InvalidPubkey(format!("hex decode {:?}: {}", trimmed, e)))?;
+        let arr: [u8; 32] = raw_bytes.as_slice().try_into().map_err(|_| {
+            VerifyError::InvalidPubkey(format!("trust-root entry {:?} not 32 bytes", trimmed))
+        })?;
+        let key = VerifyingKey::from_bytes(&arr).map_err(|e| {
+            VerifyError::InvalidPubkey(format!("not a valid Ed25519 pubkey {:?}: {}", trimmed, e))
+        })?;
+        out.push(key);
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-83 — peer binary pinning
+// implementation-note-106 — peer binary pinning
 // ---------------------------------------------------------------------------
 
 /// Error variants surfaced by [`verify_peer_binary`]. Distinct from
@@ -373,20 +607,18 @@ pub fn verify_peer_binary(
 ) -> Result<&BinaryManifestEntry, ManifestVerifyError> {
     // (1) TracerPid gate.
     let status_path = format!("/proc/{pid}/status");
-    let status_bytes = std::fs::read(&status_path).map_err(|e| {
-        ManifestVerifyError::ProcReadFailed {
+    let status_bytes =
+        std::fs::read(&status_path).map_err(|e| ManifestVerifyError::ProcReadFailed {
             pid,
             what: "status",
             reason: e.to_string(),
-        }
-    })?;
-    let status = std::str::from_utf8(&status_bytes).map_err(|e| {
-        ManifestVerifyError::ProcReadFailed {
+        })?;
+    let status =
+        std::str::from_utf8(&status_bytes).map_err(|e| ManifestVerifyError::ProcReadFailed {
             pid,
             what: "status",
             reason: format!("not utf8: {e}"),
-        }
-    })?;
+        })?;
     let tracer_pid =
         parse_tracer_pid(status).ok_or_else(|| ManifestVerifyError::ProcReadFailed {
             pid,
@@ -399,21 +631,19 @@ pub fn verify_peer_binary(
 
     // (2) Resolve /proc/<pid>/exe to the running binary's path.
     let exe_link = format!("/proc/{pid}/exe");
-    let exe_path = std::fs::read_link(&exe_link).map_err(|e| {
-        ManifestVerifyError::ProcReadFailed {
+    let exe_path =
+        std::fs::read_link(&exe_link).map_err(|e| ManifestVerifyError::ProcReadFailed {
             pid,
             what: "exe",
             reason: e.to_string(),
-        }
-    })?;
+        })?;
 
     // (3) Hash the on-disk bytes.
-    let bytes =
-        std::fs::read(&exe_path).map_err(|e| ManifestVerifyError::BinaryHashFailed {
-            pid,
-            path: exe_path.clone(),
-            reason: e.to_string(),
-        })?;
+    let bytes = std::fs::read(&exe_path).map_err(|e| ManifestVerifyError::BinaryHashFailed {
+        pid,
+        path: exe_path.clone(),
+        reason: e.to_string(),
+    })?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(&bytes);
     let computed = hex::encode(hasher.finalize().as_bytes());
@@ -463,7 +693,9 @@ pub fn verify_peer_binary(
     Err(ManifestVerifyError::ProcReadFailed {
         pid,
         what: "exe",
-        reason: "/proc is not available on this target — caller must gate on cfg(target_os = \"linux\")".to_string(),
+        reason:
+            "/proc is not available on this target — caller must gate on cfg(target_os = \"linux\")"
+                .to_string(),
     })
 }
 
@@ -570,6 +802,207 @@ publisher = "did:emberlink"
     }
 
     // -----------------------------------------------------------------
+    // design §Component 1 — trust-root SET parameterization tests.
+    // T1 property-shape (parameterized examples covering the relevant
+    // axis of variation: release-only / release+dev / release+N) and T2
+    // integration coverage via the signed-manifest round-trip.
+    // -----------------------------------------------------------------
+
+    /// Build a signed manifest at `path` using `signing_key`. Returns the
+    /// manifest bytes that were signed; caller can mutate the file after
+    /// to test the tamper path.
+    fn fixture_signed_manifest(
+        path: &std::path::Path,
+        signing_key: &ed25519_dalek::SigningKey,
+        manifest_bytes: &[u8],
+    ) {
+        use ed25519_dalek::Signer;
+        std::fs::write(path, manifest_bytes).expect("write manifest");
+        let sig = signing_key.sign(manifest_bytes);
+        let sidecar = serde_json::json!({
+            "schema_version": 1,
+            "signature": format!(
+                "ed25519:{}",
+                base64::engine::general_purpose::STANDARD.encode(sig.to_bytes())
+            ),
+            "signature_alg": "ed25519",
+        });
+        let sidecar_path = path.with_extension("toml.sig");
+        std::fs::write(&sidecar_path, sidecar.to_string()).expect("write sidecar");
+    }
+
+    #[test]
+    fn verify_with_trust_roots_release_only_accepts_release_signed() {
+        // T1: prod-shape trust set (length 1) — release-signed manifest verifies.
+        use ed25519_dalek::SigningKey;
+        use tempfile::tempdir;
+        let dir = tempdir().expect("temp");
+        let manifest_path = dir.path().join("manifest.toml");
+        let release_sk = SigningKey::from_bytes(&[1u8; 32]);
+        fixture_signed_manifest(&manifest_path, &release_sk, b"[some] = \"manifest\"");
+
+        let trust_roots = vec![release_sk.verifying_key()];
+        verify_manifest_signature_with_trust_roots(&manifest_path, &trust_roots)
+            .expect("release-signed verifies under release-only trust set");
+    }
+
+    #[test]
+    fn verify_with_trust_roots_release_only_rejects_dev_signed() {
+        // T1: prod-shape trust set (length 1) — dev-signed manifest rejected.
+        // This is the load-bearing invariant for design §Component 1:
+        // when `EMBER_TRUST_ROOTS` is unset the daemon trusts ONLY the
+        // compiled-in release root.
+        use ed25519_dalek::SigningKey;
+        use tempfile::tempdir;
+        let dir = tempdir().expect("temp");
+        let manifest_path = dir.path().join("manifest.toml");
+        let release_sk = SigningKey::from_bytes(&[1u8; 32]);
+        let dev_sk = SigningKey::from_bytes(&[2u8; 32]);
+        fixture_signed_manifest(&manifest_path, &dev_sk, b"[some] = \"manifest\"");
+
+        let trust_roots = vec![release_sk.verifying_key()];
+        let result = verify_manifest_signature_with_trust_roots(&manifest_path, &trust_roots);
+        assert!(
+            matches!(result, Err(VerifyError::SignatureMismatch)),
+            "dev-signed manifest must NOT verify under release-only trust set; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn verify_with_trust_roots_release_plus_dev_accepts_dev_signed() {
+        // T1: dev-shape trust set (length 2) — dev-signed manifest verifies
+        // when the dev root is added alongside the release root.
+        use ed25519_dalek::SigningKey;
+        use tempfile::tempdir;
+        let dir = tempdir().expect("temp");
+        let manifest_path = dir.path().join("manifest.toml");
+        let release_sk = SigningKey::from_bytes(&[1u8; 32]);
+        let dev_sk = SigningKey::from_bytes(&[2u8; 32]);
+        fixture_signed_manifest(&manifest_path, &dev_sk, b"[some] = \"manifest\"");
+
+        let trust_roots = vec![release_sk.verifying_key(), dev_sk.verifying_key()];
+        verify_manifest_signature_with_trust_roots(&manifest_path, &trust_roots)
+            .expect("dev-signed verifies when dev root added to trust set");
+    }
+
+    #[test]
+    fn verify_with_trust_roots_release_plus_n_accepts_internal_signed() {
+        // T1: org-policy-shape trust set (length 3) — internal-endorsement
+        // root added without removing release. Reflects design's
+        // `EMBER_TRUST_ROOTS=<dev>,<org-internal>` example.
+        use ed25519_dalek::SigningKey;
+        use tempfile::tempdir;
+        let dir = tempdir().expect("temp");
+        let manifest_path = dir.path().join("manifest.toml");
+        let release_sk = SigningKey::from_bytes(&[1u8; 32]);
+        let dev_sk = SigningKey::from_bytes(&[2u8; 32]);
+        let org_sk = SigningKey::from_bytes(&[3u8; 32]);
+        fixture_signed_manifest(&manifest_path, &org_sk, b"[some] = \"manifest\"");
+
+        let trust_roots = vec![
+            release_sk.verifying_key(),
+            dev_sk.verifying_key(),
+            org_sk.verifying_key(),
+        ];
+        verify_manifest_signature_with_trust_roots(&manifest_path, &trust_roots)
+            .expect("org-internal-signed verifies under release+dev+org trust set");
+    }
+
+    #[test]
+    fn verify_with_trust_roots_empty_set_fails_loud() {
+        // T1: defense — empty trust set is rejected at the API boundary
+        // rather than short-circuiting to Ok via the for-loop's zero
+        // iterations.
+        use tempfile::tempdir;
+        let dir = tempdir().expect("temp");
+        let manifest_path = dir.path().join("manifest.toml");
+        let release_sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+        fixture_signed_manifest(&manifest_path, &release_sk, b"[some] = \"manifest\"");
+
+        let trust_roots: Vec<VerifyingKey> = vec![];
+        let result = verify_manifest_signature_with_trust_roots(&manifest_path, &trust_roots);
+        assert!(
+            matches!(result, Err(VerifyError::TrustRootsEmpty)),
+            "empty trust set must surface TrustRootsEmpty; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_trust_roots_empty_returns_empty_vec() {
+        // The "operator did not set EMBER_TRUST_ROOTS" path. Prod daemons
+        // hit this case; the daemon's startup wiring is responsible for
+        // prepending the compiled-in release root afterwards.
+        let parsed = parse_trust_roots("").expect("empty parses cleanly");
+        assert!(parsed.is_empty());
+        let parsed = parse_trust_roots("   ").expect("whitespace-only parses cleanly");
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn parse_trust_roots_single_hex_entry() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[4u8; 32]);
+        let pk = sk.verifying_key();
+        let hex_str = hex::encode(pk.to_bytes());
+        let parsed = parse_trust_roots(&hex_str).expect("single hex parses");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].to_bytes(), pk.to_bytes());
+    }
+
+    #[test]
+    fn parse_trust_roots_did_key_prefix_stripped() {
+        // design example uses `did:key:<hex>`; the prefix is accepted.
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
+        let pk = sk.verifying_key();
+        let did_str = format!("did:key:{}", hex::encode(pk.to_bytes()));
+        let parsed = parse_trust_roots(&did_str).expect("did:key prefix parses");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].to_bytes(), pk.to_bytes());
+    }
+
+    #[test]
+    fn parse_trust_roots_multi_entry_with_whitespace() {
+        let sk1 = ed25519_dalek::SigningKey::from_bytes(&[6u8; 32]);
+        let sk2 = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let raw = format!(
+            "{} ,  {}",
+            hex::encode(sk1.verifying_key().to_bytes()),
+            hex::encode(sk2.verifying_key().to_bytes())
+        );
+        let parsed = parse_trust_roots(&raw).expect("multi-entry parses");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].to_bytes(), sk1.verifying_key().to_bytes());
+        assert_eq!(parsed[1].to_bytes(), sk2.verifying_key().to_bytes());
+    }
+
+    #[test]
+    fn parse_trust_roots_invalid_hex_surfaces_error() {
+        let result = parse_trust_roots(
+            "nothex01010101010101010101010101010101010101010101010101010101010101",
+        );
+        assert!(
+            matches!(result, Err(VerifyError::InvalidPubkey(_))),
+            "invalid hex must surface InvalidPubkey; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_trust_roots_wrong_length_surfaces_error() {
+        let result = parse_trust_roots("abcd");
+        assert!(
+            matches!(result, Err(VerifyError::InvalidPubkey(_))),
+            "wrong-length entry must surface InvalidPubkey; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn parse_trust_roots_trailing_comma_skipped() {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let raw = format!("{},", hex::encode(sk.verifying_key().to_bytes()));
+        let parsed = parse_trust_roots(&raw).expect("trailing comma parses");
+        assert_eq!(parsed.len(), 1);
+    }
+
+    // -----------------------------------------------------------------
     // T-CONSTRUCT-BINARY-DISTRIBUTION-CHANNEL: lookup + channel tests
     // -----------------------------------------------------------------
 
@@ -587,7 +1020,7 @@ publisher = "did:emberlink"
 
     #[test]
     fn cohort_a_constructs_covers_v030_friendly_drop_tools() {
-        // Per implementation-note-84 (Cluster A 3d, design review
+        // Per implementation-note-107 (Cluster A 3d, design review
         // 20260513-122447): v0.3.0 ships 3 tools (gh/git/kubectl) — the
         // 3 with daemon-side classifiers. npm/docker/wrangler/pulumi
         // defer to v0.3.1 (with proper classifiers per
@@ -630,7 +1063,9 @@ publisher = "did:emberlink"
         // delivers the dynamic-install signing pipeline.
         let mut entry = fixture_bundled_entry("ember-gh");
         entry.channel = BinaryDistributionChannel::InstallOnDemand;
-        let manifest = BinaryManifest { entries: vec![entry] };
+        let manifest = BinaryManifest {
+            entries: vec![entry],
+        };
         let err = lookup_construct(&manifest, "ember-gh").expect_err("rejected");
         assert!(matches!(err, LookupError::UnsupportedChannel { .. }));
     }
@@ -670,7 +1105,7 @@ publisher = "did:emberlink"
     }
 
     // -----------------------------------------------------------------
-    // implementation-note-83 — peer binary
+    // implementation-note-106 — peer binary
     // pinning gate. The broker handlers refuse a request whose peer
     // binary (resolved via /proc/<pid>/exe + blake3) is not in the
     // signed manifest, or whose process is being traced.
@@ -681,7 +1116,8 @@ publisher = "did:emberlink"
     /// separated; the parser must accept it.
     #[test]
     fn parse_tracer_pid_zero_when_untraced() {
-        let sample = "Name:\tbash\nState:\tS (sleeping)\nTracerPid:\t0\nUid:\t1000\t1000\t1000\t1000\n";
+        let sample =
+            "Name:\tbash\nState:\tS (sleeping)\nTracerPid:\t0\nUid:\t1000\t1000\t1000\t1000\n";
         assert_eq!(parse_tracer_pid(sample), Some(0));
     }
 
@@ -738,8 +1174,8 @@ publisher = "did:emberlink"
     fn verify_peer_binary_refuses_unmanifested_path() {
         let my_pid = std::process::id() as i32;
         // Hash the running test binary so the hash lookup succeeds.
-        let exe_path = std::fs::read_link(format!("/proc/{my_pid}/exe"))
-            .expect("/proc/self/exe must resolve");
+        let exe_path =
+            std::fs::read_link(format!("/proc/{my_pid}/exe")).expect("/proc/self/exe must resolve");
         let bytes = std::fs::read(&exe_path).expect("read test binary");
         let mut hasher = blake3::Hasher::new();
         hasher.update(&bytes);
@@ -781,8 +1217,8 @@ publisher = "did:emberlink"
     #[test]
     fn verify_peer_binary_accepts_manifested_binary() {
         let my_pid = std::process::id() as i32;
-        let exe_path = std::fs::read_link(format!("/proc/{my_pid}/exe"))
-            .expect("/proc/self/exe must resolve");
+        let exe_path =
+            std::fs::read_link(format!("/proc/{my_pid}/exe")).expect("/proc/self/exe must resolve");
         let bytes = std::fs::read(&exe_path).expect("read test binary");
         let mut hasher = blake3::Hasher::new();
         hasher.update(&bytes);
@@ -814,8 +1250,7 @@ publisher = "did:emberlink"
     fn verify_peer_binary_refuses_traced_process() {
         // The TracerPid parse path is exactly what `verify_peer_binary`
         // calls; a non-zero return becomes `ManifestVerifyError::TracerAttached`.
-        let traced_status =
-            "Name:\ttarget\nState:\tt (tracing stop)\nTracerPid:\t12345\nUid:\t1000\t1000\t1000\t1000\n";
+        let traced_status = "Name:\ttarget\nState:\tt (tracing stop)\nTracerPid:\t12345\nUid:\t1000\t1000\t1000\t1000\n";
         let untraced_status =
             "Name:\tbash\nState:\tS (sleeping)\nTracerPid:\t0\nUid:\t1000\t1000\t1000\t1000\n";
         assert_eq!(parse_tracer_pid(traced_status), Some(12345));

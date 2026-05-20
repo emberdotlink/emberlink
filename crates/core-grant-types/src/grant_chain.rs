@@ -92,7 +92,12 @@ impl GrantStatus {
     }
 
     /// Derive the effective status from stored status and timestamps.
-    pub fn derive(stored_status: &str, not_before: Option<u64>, expires_at: Option<u64>, now: u64) -> Self {
+    pub fn derive(
+        stored_status: &str,
+        not_before: Option<u64>,
+        expires_at: Option<u64>,
+        now: u64,
+    ) -> Self {
         if stored_status == "revoked" {
             return Self::Revoked;
         }
@@ -208,8 +213,9 @@ impl TryFrom<&str> for ResourceType {
     type Error = ValidationError;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
-        Self::parse(value)
-            .ok_or_else(|| ValidationError::invalid_format(format!("unknown resource_type: {value}")))
+        Self::parse(value).ok_or_else(|| {
+            ValidationError::invalid_format(format!("unknown resource_type: {value}"))
+        })
     }
 }
 
@@ -272,7 +278,7 @@ pub struct Usage {
     /// `emit_threshold_crossings` compare this against the budget cap
     /// scaled to the same unit. Without this, a single Haiku-4.5 call
     /// (~0.1¢ per call) rounds to 0¢ via integer division and the cap
-    /// can never accumulate enough to trip — implementation-note-32.
+    /// can never accumulate enough to trip — implementation-note-45.
     /// Defaults to 0 on legacy grants; the next `increment_statement_usage`
     /// call re-derives the displayed `cents` from this field, so
     /// pre-existing (non-zero `cents`, zero `cents_micro`) grants flush
@@ -387,9 +393,13 @@ pub type Action = String;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ResourceSelector {
-    Exact { value: String },
+    Exact {
+        value: String,
+    },
     /// Shell-style glob, anchored on both ends. `*` matches any run of chars.
-    Glob { pattern: String },
+    Glob {
+        pattern: String,
+    },
     /// Glob with a structured branch-path subtarget. `primary_glob` matches
     /// the resource (`owner/repo`), `subtarget_glob` is a secondary check
     /// applied by the resolver against an out-of-band field (e.g. the branch
@@ -404,7 +414,9 @@ pub enum ResourceSelector {
     },
     /// Regex anchored on both ends. Evaluation stub for now — issuers may
     /// declare but evaluator in core-policy is the authoritative matcher.
-    Regex { pattern: String },
+    Regex {
+        pattern: String,
+    },
     /// Unconstrained. Issuer UI should require explicit confirmation.
     Any,
 }
@@ -421,9 +433,7 @@ impl ResourceSelector {
         match self {
             Self::Exact { value } => value == resource,
             Self::Glob { pattern } => glob_matches(pattern, resource),
-            Self::GlobWithSubtarget { primary_glob, .. } => {
-                glob_matches(primary_glob, resource)
-            }
+            Self::GlobWithSubtarget { primary_glob, .. } => glob_matches(primary_glob, resource),
             Self::Regex { .. } => false, // evaluator lives in core-policy
             Self::Any => true,
         }
@@ -454,15 +464,42 @@ impl ResourceSelector {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Condition {
-    Subpath { field: String, prefix: String },
-    OneOf { field: String, values: Vec<String> },
-    NotOneOf { field: String, values: Vec<String> },
-    Range { field: String, min: Option<i64>, max: Option<i64> },
-    Cidr { field: String, cidrs: Vec<String> },
-    UrlPattern { field: String, pattern: String },
-    Regex { field: String, pattern: String },
-    TimeWindow { start_secs_of_day: u32, end_secs_of_day: u32 },
-    MerchantAllowlist { merchants: Vec<String> },
+    Subpath {
+        field: String,
+        prefix: String,
+    },
+    OneOf {
+        field: String,
+        values: Vec<String>,
+    },
+    NotOneOf {
+        field: String,
+        values: Vec<String>,
+    },
+    Range {
+        field: String,
+        min: Option<i64>,
+        max: Option<i64>,
+    },
+    Cidr {
+        field: String,
+        cidrs: Vec<String>,
+    },
+    UrlPattern {
+        field: String,
+        pattern: String,
+    },
+    Regex {
+        field: String,
+        pattern: String,
+    },
+    TimeWindow {
+        start_secs_of_day: u32,
+        end_secs_of_day: u32,
+    },
+    MerchantAllowlist {
+        merchants: Vec<String>,
+    },
 }
 
 /// HITL handoff shape. When a block carries an `approval` challenge it is in
@@ -522,7 +559,7 @@ impl Statement {
             return false;
         }
         if let Some(cap) = b.cents {
-            // implementation-note-32: budget enforcement runs on the
+            // implementation-note-45: budget enforcement runs on the
             // sub-cent `cents_micro` accumulator. Sub-cent calls (typical for
             // Haiku-4.5 pricing) round the integer `cents` field to 0 per
             // call, so a cents-only check would never trip. Compare against
@@ -733,7 +770,10 @@ impl AccessGrant {
     /// Effective grant expiry = earliest `expires_at` across all blocks.
     /// `None` means no block declared an expiry (open-ended).
     pub fn effective_expires_at(&self) -> Option<u64> {
-        self.blocks.iter().filter_map(|sb| sb.block.expires_at).min()
+        self.blocks
+            .iter()
+            .filter_map(|sb| sb.block.expires_at)
+            .min()
     }
 
     /// Effective not-before = latest `nbf` across all blocks.
@@ -871,7 +911,9 @@ mod composite_grant_tests {
             sid: "GitHubPR".into(),
             resource_type: ResourceType::Credential,
             actions: vec!["github:pull_request:create".into()],
-            resource: ResourceSelector::Glob { pattern: "emberdotlink/*".into() },
+            resource: ResourceSelector::Glob {
+                pattern: "emberdotlink/*".into(),
+            },
             budget: None,
             usage: Usage::default(),
             conditions: Vec::new(),
@@ -883,7 +925,9 @@ mod composite_grant_tests {
             sid: "ClaudeTokens".into(),
             resource_type: ResourceType::Session,
             actions: vec!["llm:generate".into()],
-            resource: ResourceSelector::Glob { pattern: "anthropic/*".into() },
+            resource: ResourceSelector::Glob {
+                pattern: "anthropic/*".into(),
+            },
             budget: Some(Budget {
                 tokens: Some(20_000),
                 ..Budget::default()
@@ -912,7 +956,9 @@ mod composite_grant_tests {
 
     #[test]
     fn resource_selector_glob_covers_expected() {
-        let g = ResourceSelector::Glob { pattern: "emberdotlink/*".into() };
+        let g = ResourceSelector::Glob {
+            pattern: "emberdotlink/*".into(),
+        };
         assert!(g.covers("emberdotlink/sandbox"));
         assert!(g.covers("emberdotlink/anything-here"));
         assert!(!g.covers("other/repo"));
@@ -928,7 +974,9 @@ mod composite_grant_tests {
 
     #[test]
     fn resource_selector_exact_is_exact() {
-        let e = ResourceSelector::Exact { value: "emberdotlink/sandbox".into() };
+        let e = ResourceSelector::Exact {
+            value: "emberdotlink/sandbox".into(),
+        };
         assert!(e.covers("emberdotlink/sandbox"));
         assert!(!e.covers("emberdotlink/sandbox-demo"));
     }
@@ -954,7 +1002,11 @@ mod composite_grant_tests {
     #[test]
     fn composite_grant_bundles_three_resource_types_in_one_envelope() {
         let block = Block {
-            statements: vec![stmt_credential_github(), stmt_session_tokens(), stmt_payment()],
+            statements: vec![
+                stmt_credential_github(),
+                stmt_session_tokens(),
+                stmt_payment(),
+            ],
             nbf: None,
             expires_at: Some(1_800),
             issued_by: "persona_work".into(),
@@ -996,7 +1048,11 @@ mod composite_grant_tests {
     #[test]
     fn block_canonical_encode_is_deterministic_and_round_trips() {
         let block = Block {
-            statements: vec![stmt_credential_github(), stmt_session_tokens(), stmt_payment()],
+            statements: vec![
+                stmt_credential_github(),
+                stmt_session_tokens(),
+                stmt_payment(),
+            ],
             nbf: None,
             expires_at: Some(1_800),
             issued_by: "persona_work".into(),
@@ -1064,7 +1120,9 @@ mod composite_grant_tests {
                 sid: "S0".into(),
                 resource_type: ResourceType::Credential,
                 actions: vec!["credential:read".into()],
-                resource: ResourceSelector::Exact { value: "obj-test".into() },
+                resource: ResourceSelector::Exact {
+                    value: "obj-test".into(),
+                },
                 budget: None,
                 usage: Usage::default(),
                 conditions: vec![],
@@ -1086,15 +1144,17 @@ mod composite_grant_tests {
         // 2. If the change is intentional, bump canonical_version and update this hash
         // 3. If the change is unintentional, REVERT the serde_json upgrade or field change
         assert_eq!(
-            hex,
-            "cd399643d1e04ac2901bce8475557fdc111b947ad2655cacb73508e96293bfe5",
+            hex, "cd399643d1e04ac2901bce8475557fdc111b947ad2655cacb73508e96293bfe5",
             "Block::canonical_encode produced unexpected bytes — see test comment"
         );
     }
 
     #[test]
     fn grant_status_derive_handles_all_persisted_states() {
-        assert_eq!(GrantStatus::derive("revoked", None, None, 100), GrantStatus::Revoked);
+        assert_eq!(
+            GrantStatus::derive("revoked", None, None, 100),
+            GrantStatus::Revoked
+        );
         assert_eq!(
             GrantStatus::derive("exhausted_by_budget", None, None, 100),
             GrantStatus::ExhaustedByBudget
@@ -1103,10 +1163,22 @@ mod composite_grant_tests {
             GrantStatus::derive("expired_by_budget", None, None, 100),
             GrantStatus::ExhaustedByBudget
         );
-        assert_eq!(GrantStatus::derive("paused", None, None, 100), GrantStatus::Paused);
-        assert_eq!(GrantStatus::derive("active", None, Some(50), 100), GrantStatus::Expired);
-        assert_eq!(GrantStatus::derive("active", Some(200), None, 100), GrantStatus::Pending);
-        assert_eq!(GrantStatus::derive("active", None, None, 100), GrantStatus::Active);
+        assert_eq!(
+            GrantStatus::derive("paused", None, None, 100),
+            GrantStatus::Paused
+        );
+        assert_eq!(
+            GrantStatus::derive("active", None, Some(50), 100),
+            GrantStatus::Expired
+        );
+        assert_eq!(
+            GrantStatus::derive("active", Some(200), None, 100),
+            GrantStatus::Pending
+        );
+        assert_eq!(
+            GrantStatus::derive("active", None, None, 100),
+            GrantStatus::Active
+        );
     }
 
     #[test]
@@ -1151,7 +1223,6 @@ mod composite_grant_tests {
     }
 }
 
-
 // --- Validate impls (migrated from storage.rs lines 1905-1998) ---
 
 impl Validate for Statement {
@@ -1172,7 +1243,10 @@ impl Validate for Statement {
             ResourceSelector::Glob { pattern } => {
                 validate_non_empty(pattern, "resource selector glob pattern")?;
             }
-            ResourceSelector::GlobWithSubtarget { primary_glob, subtarget_glob } => {
+            ResourceSelector::GlobWithSubtarget {
+                primary_glob,
+                subtarget_glob,
+            } => {
                 validate_non_empty(primary_glob, "resource selector primary glob pattern")?;
                 validate_non_empty(subtarget_glob, "resource selector subtarget glob pattern")?;
             }
@@ -1199,9 +1273,7 @@ impl Validate for Block {
         if let (Some(nb), Some(exp)) = (self.nbf, self.expires_at)
             && exp <= nb
         {
-            return Err(ValidationError::new(
-                "block expires_at must be after nbf",
-            ));
+            return Err(ValidationError::new("block expires_at must be after nbf"));
         }
         Ok(())
     }
@@ -1248,7 +1320,6 @@ impl Validate for AccessGrant {
     }
 }
 
-
 // --- CanonicalEncode impls (migrated from storage.rs lines 2136-2150) ---
 
 impl CanonicalEncode for Block {
@@ -1265,4 +1336,3 @@ impl CanonicalEncode for Block {
         out
     }
 }
-

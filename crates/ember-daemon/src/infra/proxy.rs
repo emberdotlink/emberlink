@@ -2,16 +2,15 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, Limited};
 use http_body_util::LengthLimitError;
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::{Body, Frame, SizeHint};
-use zeroize::Zeroizing;
 use hyper::{Request, Response, StatusCode, body::Incoming};
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::Client;
@@ -19,20 +18,21 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, oneshot, watch};
 use tokio::time::Sleep;
+use zeroize::Zeroizing;
 
 use async_trait::async_trait;
-use core_proxy_forward::PolicyBackend;
 use core_proxy_forward::r#match::{
-    effective_scope_uri, extract_github_branch, extract_host_from_url, git_echo_owner_repo,
-    github_target_matches, glob_match_branch, host_matches_domain, is_git_smart_http_path,
-    method_tier, request_to_action_resource, wildcard_match, MethodTier,
+    MethodTier, effective_scope_uri, extract_github_branch, extract_host_from_url,
+    git_echo_owner_repo, github_target_matches, glob_match_branch, host_matches_domain,
+    is_git_smart_http_path, method_tier, request_to_action_resource, wildcard_match,
 };
+use core_proxy_forward::{EventError, EventSink, PolicyBackend, ThresholdAxis, ThresholdBand};
 use hyper::http;
 
 use crate::infra::events::GrantEvent;
-use crate::pricing;
 use crate::infra::store::StoreError;
 use crate::infra::vault::{VaultError, VaultScope};
+use crate::pricing;
 
 /// Maximum bytes the proxy will buffer from a single request or non-streaming
 /// response body before returning 413 Payload Too Large.
@@ -333,11 +333,7 @@ impl<B> PassthroughBody<B> {
     /// subscriber. Called once at construction in tests; never in
     /// production (gated by `#[cfg(test)]`).
     #[cfg(test)]
-    fn with_test_sinks(
-        mut self,
-        outcome_sink: Arc<AtomicU8>,
-        bytes_sink: Arc<AtomicU64>,
-    ) -> Self {
+    fn with_test_sinks(mut self, outcome_sink: Arc<AtomicU8>, bytes_sink: Arc<AtomicU64>) -> Self {
         self.test_outcome_sink = Some(outcome_sink);
         self.test_bytes_sink = Some(bytes_sink);
         self
@@ -397,8 +393,7 @@ where
                         Poll::Pending => Poll::Pending,
                         Poll::Ready(()) => {
                             this.frame_idle_fired = true;
-                            this.outcome
-                                .store(PASSTHROUGH_PARTIAL, Ordering::Release);
+                            this.outcome.store(PASSTHROUGH_PARTIAL, Ordering::Release);
                             let bytes = this.bytes_forwarded.load(Ordering::Relaxed);
                             tracing::warn!(
                                 bytes_forwarded = bytes,
@@ -578,7 +573,7 @@ const HOP_BY_HOP_HEADERS: &[&str] = &[
 /// and all legitimate header names are ASCII.
 const ALLOWED_REQUEST_HEADERS: &[&str] = &[
     "accept",
-    // `accept-encoding` deliberately omitted — implementation-note-32.
+    // `accept-encoding` deliberately omitted — implementation-note-45.
     // Passing the client's `Accept-Encoding: gzip` through to upstream
     // returns a gzip-compressed response body, which `parse_usage` cannot
     // recognize as JSON (`looks_like_json` checks for a leading `{` or
@@ -771,6 +766,8 @@ pub enum ProxyError {
     Store(#[from] StoreError),
     #[error("vault error: {0}")]
     Vault(VaultError),
+    #[error("vault unavailable")]
+    VaultUnavailable,
     #[error("policy backend error: {0}")]
     PolicyBackend(core_proxy_forward::PolicyError),
 }
@@ -787,56 +784,105 @@ pub struct ProxyConfig {
 
 pub struct ProxyState {
     pub store: crate::infra::store::DaemonStore,
-    // implementation-note-137: was `Vault` by-value (Clone-copied per
-    // proxy spawn). Now Rc<Vault> so the single MEK byte-array is shared
-    // and zeroized exactly once when the last reference drops.
+    #[cfg(test)]
     pub vault: std::rc::Rc<crate::infra::vault::Vault>,
-    /// In-memory debounce set for threshold-crossing audit events. Entries
-    /// are `(grant_id, statement_sid, axis, band)` — adding to this set
-    /// before emission guarantees `budget.warning` is never logged twice
-    /// for the same threshold. The set resets on daemon restart, which is
-    /// acceptable: a restarted daemon re-emitting a warning is a
-    /// defensive duplicate, not a missed alert.
+    /// Audit-log + broadcast sink, installed once during proxy spawn.
     ///
-    /// The outer `RefCell` is safe because proxy connections run on a
-    /// `LocalSet` (see `run_proxy`) — the single-threaded runtime gives
-    /// us non-Sync interior mutability for free without a Mutex.
-    threshold_emitted: RefCell<HashSet<(String, String, &'static str, &'static str)>>,
-    /// Optional broadcast channel to push `budget.warning` /
-    /// `budget.exhausted` notifications to connected socket clients (agent
-    /// SDKs). `None` in unit tests that only exercise audit-log emission.
-    events_tx: Option<broadcast::Sender<GrantEvent>>,
+    /// implementation-note-273: the threshold-debounce set and the
+    /// broadcast channel both moved INTO `DaemonEventSink`. `ProxyState`
+    /// now holds a `OnceLock` pointer to the sink so the existing
+    /// `state.sink_*` shim methods (and `emit_threshold_crossings` /
+    /// `emit_debounced`) can reach the sink without re-threading every
+    /// helper signature with `&dyn EventSink`. The `OnceLock` is required
+    /// because of the circular construction: `DaemonEventSink::new` takes
+    /// `Arc<ProxyState>`, but `ProxyState` must own a back-pointer to the
+    /// sink. Callers install the sink immediately after construction with
+    /// `state.event_sink.set(...)`.
+    pub event_sink: OnceLock<Arc<DaemonEventSink>>,
 }
 
 impl ProxyState {
-    pub fn new(
-        store: crate::infra::store::DaemonStore,
-        vault: std::rc::Rc<crate::infra::vault::Vault>,
-    ) -> Self {
+    pub fn new(store: crate::infra::store::DaemonStore) -> Self {
         Self {
+            #[cfg(test)]
+            vault: store
+                .vault()
+                .expect("ProxyState::new tests require a live vault attached to the store"),
             store,
-            vault,
-            threshold_emitted: RefCell::new(HashSet::new()),
-            events_tx: None,
+            event_sink: OnceLock::new(),
         }
     }
 
-    /// Attach the daemon's grant-event broadcast sender so threshold
-    /// crossings are pushed to connected MCP / agent-SDK clients in addition
-    /// to being logged to the audit trail.
-    pub fn with_events_tx(mut self, events_tx: broadcast::Sender<GrantEvent>) -> Self {
-        self.events_tx = Some(events_tx);
-        self
+    fn current_vault(&self) -> Result<std::rc::Rc<crate::infra::vault::Vault>, ProxyError> {
+        crate::infra::interactive_unlock::current_live_vault(&self.store)
+            .map_err(|_| ProxyError::VaultUnavailable)
+    }
+
+    /// Borrow the installed `DaemonEventSink`. Panics if the sink has not
+    /// yet been installed — callers must `state.event_sink.set(sink)`
+    /// immediately after `ProxyState::new`. The panic message names the
+    /// invariant so a regression surfaces a structured failure rather
+    /// than a generic `unwrap_or` silently dropping audit writes.
+    pub(crate) fn sink(&self) -> &DaemonEventSink {
+        self.event_sink
+            .get()
+            .expect("ProxyState::sink — event_sink must be installed via OnceLock::set immediately after ProxyState::new")
+    }
+
+    /// Sync shim around `DaemonEventSink::log_event_sync` so the existing
+    /// 8 `state.store.log_event(...)` call sites can route through the
+    /// `EventSink` surface without changing their helper signatures.
+    pub(crate) fn sink_log_event(
+        &self,
+        persona_id: Option<&str>,
+        event_kind: &str,
+        credential_name: Option<&str>,
+        outcome: &str,
+        detail: Option<&str>,
+    ) -> Result<(), EventError> {
+        self.sink()
+            .log_event_sync(persona_id, event_kind, credential_name, outcome, detail)
+    }
+
+    /// Sync shim around `DaemonEventSink::broadcast_sync` so
+    /// `emit_debounced` can push a `GrantEvent` to subscribers without
+    /// touching `state.events_tx` directly (which is now sink-owned).
+    pub(crate) fn sink_broadcast(&self, event: GrantEvent) {
+        self.sink().broadcast_sync(event);
+    }
+
+    /// Sync shim around `DaemonEventSink::record_threshold_crossing_sync`.
+    /// Returns `true` if `(grant_id, statement_sid, axis, band)` was newly
+    /// inserted, `false` if it had already been recorded.
+    ///
+    /// Currently unused by the in-place call sites — they reach for the
+    /// `try_record_threshold_keys` variant which preserves the precise
+    /// `"80"`/`"95"`/`"100"` band sub-labels carried on the wire. Kept
+    /// here as the canonical enum-form shim for Slice C's remote backend
+    /// (which round-trips `ThresholdAxis` / `ThresholdBand` over the UDS
+    /// RPC and would project back to keys on the daemon side).
+    #[allow(dead_code)]
+    pub(crate) fn sink_record_threshold(
+        &self,
+        grant_id: &str,
+        statement_sid: &str,
+        axis: ThresholdAxis,
+        band: ThresholdBand,
+    ) -> bool {
+        self.sink()
+            .record_threshold_crossing_sync(grant_id, statement_sid, axis, band)
     }
 }
 
 /// Production `PolicyBackend` implementation for the ember daemon.
 ///
 /// Wraps an `Arc<ProxyState>` and implements the five trait methods by
-/// delegating to the daemon's `DaemonStore` and `Vault` directly.
+/// delegating to the daemon's `DaemonStore` and resolving the current live
+/// vault at point of use.
 ///
 /// All connections run on a single-threaded `LocalSet` (see `run_proxy`),
-/// which is why `ProxyState` can hold `!Send` types like `RefCell`. The
+/// which is why `ProxyState` can hold the daemon's `!Send` store and reach
+/// the sink's `RefCell` debounce set through `event_sink`. The
 /// `unsafe impl Send + Sync` below acknowledges this invariant and matches
 /// the existing `#[allow(clippy::arc_with_non_send_sync)]` usage throughout
 /// the proxy infrastructure.
@@ -851,10 +897,12 @@ impl DaemonPolicyBackend {
 }
 
 // SAFETY: DaemonPolicyBackend is only ever used on the single-threaded
-// LocalSet that `run_proxy` creates. The ProxyState it wraps contains
-// `RefCell` (for threshold_emitted) which is `!Send`, but no concurrent
-// access ever occurs. This matches the existing `arc_with_non_send_sync`
-// pattern used throughout the proxy infrastructure.
+// LocalSet that `run_proxy` creates. The ProxyState it wraps reaches a
+// `DaemonStore` (`rusqlite::Connection`, `!Send`) and a `DaemonEventSink`
+// carrying a `RefCell` debounce set; neither is safe to share across
+// threads in the general case, but the LocalSet invariant guarantees
+// there is no concurrent access. This matches the existing
+// `arc_with_non_send_sync` pattern used throughout the proxy infrastructure.
 unsafe impl Send for DaemonPolicyBackend {}
 unsafe impl Sync for DaemonPolicyBackend {}
 
@@ -919,60 +967,54 @@ impl PolicyBackend for DaemonPolicyBackend {
         let hyper_method = method
             .parse::<hyper::Method>()
             .unwrap_or(hyper::Method::GET);
-        let hyper_uri: hyper::Uri = effective_uri
-            .to_string()
-            .parse()
-            .map_err(|e: hyper::http::uri::InvalidUri| {
-                PolicyError::Other(format!("invalid URI: {e}"))
-            })?;
+        let hyper_uri: hyper::Uri =
+            effective_uri
+                .to_string()
+                .parse()
+                .map_err(|e: hyper::http::uri::InvalidUri| {
+                    PolicyError::Other(format!("invalid URI: {e}"))
+                })?;
 
-        let (resolved_sid, resolved_stmt) =
-            if let Some((action, resource)) =
-                request_to_action_resource(&hyper_method, &hyper_uri)
-            {
-                match resolve_statement_for_request_with_uri(
-                    &access_grant,
-                    &action,
-                    &resource,
-                    &hyper_uri,
-                ) {
-                    ResolveOutcome::NoApplicable => {
-                        if let Err(e) = self.inner.store.log_event(
-                            Some(persona_id),
-                            "credential.access",
-                            Some(credential_name),
-                            "denied_no_applicable_statement",
-                            Some(&format!("action={action} resource={resource}")),
-                        ) {
-                            tracing::warn!(error = ?e, persona_id, credential = credential_name, "log_event failed in resolve_grant");
-                        }
-                        return Err(PolicyError::Forbidden(
-                            "no_applicable_statement".into(),
-                        ));
+        let (resolved_sid, resolved_stmt) = if let Some((action, resource)) =
+            request_to_action_resource(&hyper_method, &hyper_uri)
+        {
+            match resolve_statement_for_request_with_uri(
+                &access_grant,
+                &action,
+                &resource,
+                &hyper_uri,
+            ) {
+                ResolveOutcome::NoApplicable => {
+                    if let Err(e) = self.inner.store.log_event(
+                        Some(persona_id),
+                        "credential.access",
+                        Some(credential_name),
+                        "denied_no_applicable_statement",
+                        Some(&format!("action={action} resource={resource}")),
+                    ) {
+                        tracing::warn!(error = ?e, persona_id, credential = credential_name, "log_event failed in resolve_grant");
                     }
-                    ResolveOutcome::SubtargetMiss { subtarget_glob } => {
-                        if let Err(e) = self.inner.store.log_event(
-                            Some(persona_id),
-                            "credential.access",
-                            Some(credential_name),
-                            "denied_subtarget_scope",
-                            Some(&format!(
-                                "action={action} resource={resource} subtarget_glob={subtarget_glob}"
-                            )),
-                        ) {
-                            tracing::warn!(error = ?e, persona_id, credential = credential_name, "log_event failed in resolve_grant");
-                        }
-                        return Err(PolicyError::Forbidden(
-                            "denied_subtarget_scope".into(),
-                        ));
-                    }
-                    ResolveOutcome::Match { index: _, stmt } => {
-                        (stmt.sid.clone(), stmt.clone())
-                    }
+                    return Err(PolicyError::Forbidden("no_applicable_statement".into()));
                 }
-            } else {
-                return Err(PolicyError::Forbidden("unsupported HTTP method".into()));
-            };
+                ResolveOutcome::SubtargetMiss { subtarget_glob } => {
+                    if let Err(e) = self.inner.store.log_event(
+                        Some(persona_id),
+                        "credential.access",
+                        Some(credential_name),
+                        "denied_subtarget_scope",
+                        Some(&format!(
+                            "action={action} resource={resource} subtarget_glob={subtarget_glob}"
+                        )),
+                    ) {
+                        tracing::warn!(error = ?e, persona_id, credential = credential_name, "log_event failed in resolve_grant");
+                    }
+                    return Err(PolicyError::Forbidden("denied_subtarget_scope".into()));
+                }
+                ResolveOutcome::Match { index: _, stmt } => (stmt.sid.clone(), stmt.clone()),
+            }
+        } else {
+            return Err(PolicyError::Forbidden("unsupported HTTP method".into()));
+        };
 
         let revoked_sids = self
             .inner
@@ -1027,14 +1069,18 @@ impl PolicyBackend for DaemonPolicyBackend {
         &self,
         credential_name: &str,
     ) -> Result<zeroize::Zeroizing<String>, core_proxy_forward::PolicyError> {
-        match self.inner.vault.get(VaultScope::Interactive, &self.inner.store, credential_name) {
+        let vault = self
+            .inner
+            .current_vault()
+            .map_err(|e| core_proxy_forward::PolicyError::Vault(e.to_string()))?;
+        match vault.get(VaultScope::Interactive, &self.inner.store, credential_name) {
             Ok(bytes) => {
                 let s = String::from_utf8_lossy(&bytes).into_owned();
                 Ok(zeroize::Zeroizing::new(s))
             }
-            Err(VaultError::NotFound) => Err(core_proxy_forward::PolicyError::NotFound(
-                format!("credential not found in vault: {credential_name}"),
-            )),
+            Err(VaultError::NotFound) => Err(core_proxy_forward::PolicyError::NotFound(format!(
+                "credential not found in vault: {credential_name}"
+            ))),
             Err(e) => Err(core_proxy_forward::PolicyError::Vault(e.to_string())),
         }
     }
@@ -1066,11 +1112,11 @@ impl PolicyBackend for DaemonPolicyBackend {
                 "proxy.meter audit log_event failed"
             ),
         }
-        match self
-            .inner
-            .store
-            .increment_statement_usage(&resolved.grant_id, &resolved.statement_sid, delta)
-        {
+        match self.inner.store.increment_statement_usage(
+            &resolved.grant_id,
+            &resolved.statement_sid,
+            delta,
+        ) {
             Ok(usage_delta) => {
                 if let Some(budget) = &resolved.statement.budget {
                     emit_threshold_crossings(
@@ -1101,6 +1147,20 @@ impl PolicyBackend for DaemonPolicyBackend {
         Ok(())
     }
 
+    // implementation-note-212: post_flight_meter is the trait-level entry
+    // point for credential-grant metering after the upstream call completes.
+    // Distinct from `post_flight` at the trait level so Slice C's remote
+    // backend can route the two through different metering paths. The
+    // in-process daemon implementation runs the same audit + increment
+    // logic — they only diverge when Slice E lifts the proxy out-of-process.
+    async fn post_flight_meter(
+        &self,
+        resolved: &core_proxy_forward::ResolvedGrant,
+        usage: Option<core_grant_types::Usage>,
+    ) -> Result<(), core_proxy_forward::PolicyError> {
+        self.post_flight(resolved, usage).await
+    }
+
     async fn log_event(
         &self,
         persona_id: &str,
@@ -1111,9 +1171,203 @@ impl PolicyBackend for DaemonPolicyBackend {
     ) -> Result<(), core_proxy_forward::PolicyError> {
         self.inner
             .store
-            .log_event(Some(persona_id), event_kind, credential_name, outcome, detail)
+            .log_event(
+                Some(persona_id),
+                event_kind,
+                credential_name,
+                outcome,
+                detail,
+            )
             .map(|_| ())
             .map_err(|e| core_proxy_forward::PolicyError::Store(e.to_string()))
+    }
+}
+
+/// `EventSink` implementation for the ember daemon — landed in
+/// implementation-note-212 and finished in B-2.
+///
+/// Wraps the daemon's `ProxyState` so the proxy pipeline can route audit
+/// writes + grant-event broadcasts through the trait surface. This is the
+/// in-process implementation; Slice C lands the remote variant
+/// (`UdsEventSink`) that RPCs to the daemon over a unix socket.
+///
+/// **Migration status (B-2 — this slice):** the in-place
+/// `state.store.log_event` / `state.events_tx.send` /
+/// `state.threshold_emitted.insert` call sites now route through this
+/// sink via `ProxyState`'s sync shim methods (`sink_log_event`,
+/// `sink_broadcast`, `sink_record_threshold`). The fields previously held
+/// directly on `ProxyState` (`threshold_emitted`, `events_tx`) live here
+/// now; `ProxyState` owns a `OnceLock<Arc<DaemonEventSink>>` so the shim
+/// methods can reach the sink without re-threading every helper signature
+/// with `&dyn EventSink`.
+///
+/// SAFETY: like `DaemonPolicyBackend`, `DaemonEventSink` wraps
+/// `Arc<ProxyState>`. `ProxyState` carries the daemon's `!Send` SQLite
+/// store, and this struct itself owns a `RefCell` debounce set. Neither is
+/// safe to share across threads in the general case, but the daemon only
+/// ever uses these on a single-threaded `LocalSet`. The `unsafe impl Send +
+/// Sync` below acknowledges this invariant and matches the existing pattern
+/// on `DaemonPolicyBackend`. If a future refactor moves the proxy off the
+/// LocalSet, this invariant has to be re-proved.
+pub struct DaemonEventSink {
+    inner: Arc<ProxyState>,
+    /// Optional broadcast channel to push `budget.warning` /
+    /// `budget.exhausted` notifications to connected socket clients (agent
+    /// SDKs). `None` in unit tests that only exercise audit-log emission
+    /// and in the git-echo proxy spawn, which does not yet broadcast.
+    ///
+    /// Moved here from `ProxyState` in implementation-note-273 so
+    /// the broadcast path is fully owned by the sink.
+    events_tx: Option<broadcast::Sender<GrantEvent>>,
+    /// In-memory debounce set for threshold-crossing emissions. Entries
+    /// are `(grant_id, statement_sid, axis, band)` — adding to this set
+    /// before emission guarantees `budget.warning` is never logged twice
+    /// for the same threshold. The set resets on daemon restart, which is
+    /// acceptable: a restarted daemon re-emitting a warning is a
+    /// defensive duplicate, not a missed alert.
+    ///
+    /// `RefCell` is safe here because proxy connections run on a
+    /// `LocalSet` (see `run_proxy`) — the single-threaded runtime gives
+    /// non-Sync interior mutability for free without a Mutex. Moved here
+    /// from `ProxyState` in implementation-note-273.
+    threshold_emitted: RefCell<HashSet<(String, String, &'static str, &'static str)>>,
+}
+
+impl DaemonEventSink {
+    pub fn new(state: Arc<ProxyState>, events_tx: Option<broadcast::Sender<GrantEvent>>) -> Self {
+        Self {
+            inner: state,
+            events_tx,
+            threshold_emitted: RefCell::new(HashSet::new()),
+        }
+    }
+
+    /// Sync inherent for audit-log writes — used by `ProxyState::sink_log_event`
+    /// and by the async trait impl below. Keeping the implementation sync
+    /// (the trait surface is async-by-fiat) avoids `block_on` inside the
+    /// LocalSet, which would panic on a current-thread runtime.
+    pub(crate) fn log_event_sync(
+        &self,
+        persona_id: Option<&str>,
+        event_kind: &str,
+        credential_name: Option<&str>,
+        outcome: &str,
+        detail: Option<&str>,
+    ) -> Result<(), EventError> {
+        self.inner
+            .store
+            .log_event(persona_id, event_kind, credential_name, outcome, detail)
+            .map(|_| ())
+            .map_err(|e| EventError::Log(e.to_string()))
+    }
+
+    /// Sync inherent for grant-event broadcast — used by
+    /// `ProxyState::sink_broadcast` and by the async trait impl below.
+    /// `send` returns Err only when there are no active subscribers —
+    /// that's the expected state in unit tests and before any client
+    /// connects; ignore the result.
+    pub(crate) fn broadcast_sync(&self, event: GrantEvent) {
+        if let Some(tx) = self.events_tx.as_ref() {
+            let _ = tx.send(event);
+        }
+    }
+
+    /// Sync inherent for threshold-crossing dedup — used by
+    /// `ProxyState::sink_record_threshold` and by the async trait impl
+    /// below. Returns `true` if the tuple was newly inserted (i.e. this
+    /// is the first crossing for that (grant, sid, axis, band) since the
+    /// daemon started), `false` if it had already been recorded.
+    pub(crate) fn record_threshold_crossing_sync(
+        &self,
+        grant_id: &str,
+        statement_sid: &str,
+        axis: ThresholdAxis,
+        band: ThresholdBand,
+    ) -> bool {
+        let (axis_str, band_str) = threshold_keys(axis, band);
+        let key = (
+            grant_id.to_string(),
+            statement_sid.to_string(),
+            axis_str,
+            band_str,
+        );
+        self.threshold_emitted.borrow_mut().insert(key)
+    }
+
+    /// Direct insert into the debounce set using already-projected
+    /// `(axis, band)` string keys — used by the existing in-place
+    /// `emit_debounced` site which builds the keys from its
+    /// `&'static str` band/axis arguments rather than the
+    /// `ThresholdAxis`/`ThresholdBand` enums.
+    ///
+    /// Returns `true` on a fresh insert. Bypasses the enum projection so
+    /// callers that already have the wire-format keys do not pay the
+    /// round-trip cost.
+    pub(crate) fn try_record_threshold_keys(
+        &self,
+        grant_id: &str,
+        statement_sid: &str,
+        axis: &'static str,
+        band: &'static str,
+    ) -> bool {
+        let key = (grant_id.to_string(), statement_sid.to_string(), axis, band);
+        self.threshold_emitted.borrow_mut().insert(key)
+    }
+}
+
+/// Project the `ThresholdAxis` / `ThresholdBand` enums onto their wire
+/// `&'static str` keys. Extracted as a free function so both the sync
+/// `record_threshold_crossing_sync` and the async trait impl can share
+/// the projection without duplicating the match.
+fn threshold_keys(axis: ThresholdAxis, band: ThresholdBand) -> (&'static str, &'static str) {
+    let axis_str: &'static str = match axis {
+        ThresholdAxis::Tokens => "tokens",
+        ThresholdAxis::Cents => "cents",
+        ThresholdAxis::Requests => "requests",
+        ThresholdAxis::WallSeconds => "wall_seconds",
+    };
+    let band_str: &'static str = match band {
+        ThresholdBand::Warning => "warning",
+        ThresholdBand::Exhausted => "exhausted",
+    };
+    (axis_str, band_str)
+}
+
+// SAFETY: matches the `unsafe impl` pattern on `DaemonPolicyBackend`. The
+// inner `ProxyState` is `!Send` because of its SQLite store, and this
+// struct itself holds a `RefCell<HashSet>` debounce set, but the daemon
+// only ever uses these on a single-threaded `LocalSet`. The trait bound
+// `EventSink: Send + Sync + 'static` is satisfied by promise, not by
+// structural means; if a future refactor moves `DaemonEventSink` off the
+// LocalSet, this invariant has to be re-proved.
+unsafe impl Send for DaemonEventSink {}
+unsafe impl Sync for DaemonEventSink {}
+
+#[async_trait]
+impl EventSink for DaemonEventSink {
+    async fn log_event(
+        &self,
+        persona_id: Option<&str>,
+        event_kind: &str,
+        credential_name: Option<&str>,
+        outcome: &str,
+        detail: Option<&str>,
+    ) -> Result<(), EventError> {
+        self.log_event_sync(persona_id, event_kind, credential_name, outcome, detail)
+    }
+
+    async fn broadcast(&self, event: GrantEvent) {
+        self.broadcast_sync(event);
+    }
+
+    async fn record_threshold_crossing(
+        &self,
+        grant_id: &str,
+        statement_sid: &str,
+        axis: ThresholdAxis,
+        band: ThresholdBand,
+    ) -> bool {
+        self.record_threshold_crossing_sync(grant_id, statement_sid, axis, band)
     }
 }
 
@@ -1127,7 +1381,7 @@ impl PolicyBackend for DaemonPolicyBackend {
 /// `std::io::Error`). Bind success/failure must not depend on whether the
 /// receiver is still listening (silent-ignore on dropped rx).
 ///
-/// implementation-note-124 — added `bind_tx` so the daemon runtime can
+/// implementation-note-173 — added `bind_tx` so the daemon runtime can
 /// wait for bind, log the actual URL, and write the `proxy.url` sidecar
 /// before entering the main accept loop, matching `run_git_echo_proxy`'s
 /// startup discipline.
@@ -1159,8 +1413,9 @@ pub async fn run_proxy(
 
     // Wrap ProxyState in DaemonPolicyBackend so handle_request receives a
     // PolicyBackend rather than the raw state. DaemonPolicyBackend is
-    // !Send (wraps ProxyState which contains RefCell), but is safe to use
-    // on the single-threaded LocalSet below.
+    // !Send (ProxyState carries the daemon store, and reaches the sink's
+    // RefCell debounce set via event_sink), but is safe to use on the
+    // single-threaded LocalSet below.
     #[allow(clippy::arc_with_non_send_sync)]
     let backend = Arc::new(DaemonPolicyBackend::new(state));
 
@@ -1219,7 +1474,10 @@ pub async fn handle_request<B: PolicyBackend>(
         None => return Ok(bad_request("missing X-Ember-Persona header")),
     };
 
-    let credential_name = match headers.get("x-ember-credential").and_then(|v| v.to_str().ok()) {
+    let credential_name = match headers
+        .get("x-ember-credential")
+        .and_then(|v| v.to_str().ok())
+    {
         Some(v) => v.to_string(),
         None => return Ok(bad_request("missing X-Ember-Credential header")),
     };
@@ -1247,7 +1505,7 @@ pub async fn handle_request<B: PolicyBackend>(
         }
     };
 
-    // implementation-note-197 — when the caller pins the grant
+    // implementation-note-271 — when the caller pins the grant
     // by id (composite-grant flow: a single grant authorizes multiple
     // credentials, so the persona+credential pair alone may match more than
     // one grant), look it up directly. The looked-up grant must still match
@@ -1368,10 +1626,7 @@ pub async fn handle_request<B: PolicyBackend>(
     //
     // Wrap in Limited so a single oversized POST cannot OOM the daemon.
     let (parts, incoming_body) = req.into_parts();
-    let body_bytes_in = match Limited::new(incoming_body, MAX_BODY_BYTES)
-        .collect()
-        .await
-    {
+    let body_bytes_in = match Limited::new(incoming_body, MAX_BODY_BYTES).collect().await {
         Ok(collected) => collected.to_bytes(),
         Err(e) if e.downcast_ref::<LengthLimitError>().is_some() => {
             return Ok(payload_too_large("request body exceeds 10 MiB limit"));
@@ -1386,7 +1641,10 @@ pub async fn handle_request<B: PolicyBackend>(
     // `budget.tokens` or `budget.cents` set, estimate the call cost and
     // 429 if it would exceed the remaining allowance. Statements without
     // a budget (TTL-only, credential grants) pass through unchanged.
-    match backend.preflight_budget(&resolved, body_bytes_in.as_ref()).await {
+    match backend
+        .preflight_budget(&resolved, body_bytes_in.as_ref())
+        .await
+    {
         Ok(core_proxy_forward::PreflightDecision::Allowed) => {}
         Ok(core_proxy_forward::PreflightDecision::Rejected { axis, limit, used }) => {
             tracing::warn!(
@@ -1466,8 +1724,7 @@ pub async fn handle_request<B: PolicyBackend>(
         .enable_http2()
         .build();
 
-    let client: Client<_, Full<Bytes>> =
-        Client::builder(TokioExecutor::new()).build(https);
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
 
     // P69L.0a: Detect git smart-HTTP paths and branch to Basic auth.
     //
@@ -1506,7 +1763,7 @@ pub async fn handle_request<B: PolicyBackend>(
     // Three branches, picked by upstream identity:
     //  1. Anthropic (`api.anthropic.com` and any subdomain) requires
     //     `x-api-key: <token>` and rejects `Authorization: Bearer ...` with
-    //     401. implementation-note-124 — FINDING B from the brief: the
+    //     401. implementation-note-173 — FINDING B from the brief: the
     //     prior unconditional Bearer injection broke every Beat 4 Anthropic
     //     SDK call.
     //  2. Git smart-HTTP (`/info/refs?service=git-*-pack`,
@@ -1528,12 +1785,10 @@ pub async fn handle_request<B: PolicyBackend>(
     // alike hosts like `notanthropic.com`.
     let target_host_lower: String = extract_host_from_url(&target_url).unwrap_or_default();
 
-    let mut outgoing_req = outgoing
-        .body(Full::new(body_bytes_in))
-        .map_err(|e| {
-            tracing::warn!(error = %e, "failed to build outgoing request");
-            ProxyError::Http(e)
-        })?;
+    let mut outgoing_req = outgoing.body(Full::new(body_bytes_in)).map_err(|e| {
+        tracing::warn!(error = %e, "failed to build outgoing request");
+        ProxyError::Http(e)
+    })?;
 
     let auth_scheme = match inject_provider_auth(
         outgoing_req.headers_mut(),
@@ -1548,7 +1803,9 @@ pub async fn handle_request<B: PolicyBackend>(
                 credential = %credential_name,
                 "credential is not a valid header value"
             );
-            return Ok(internal_error("credential not representable as a header value"));
+            return Ok(internal_error(
+                "credential not representable as a header value",
+            ));
         }
     };
     tracing::debug!(
@@ -1559,7 +1816,7 @@ pub async fn handle_request<B: PolicyBackend>(
         "auth header injected"
     );
 
-    // implementation-note-32: force uncompressed responses upstream
+    // implementation-note-45: force uncompressed responses upstream
     // so the post-flight meter can parse JSON usage blocks. Anthropic
     // (and OpenAI) default to `gzip` if Accept-Encoding is absent or
     // permissive; identity is the only encoding `parse_usage` understands
@@ -1569,13 +1826,10 @@ pub async fn handle_request<B: PolicyBackend>(
         hyper::header::HeaderValue::from_static("identity"),
     );
 
-    let upstream_resp = client
-        .request(outgoing_req)
-        .await
-        .map_err(|e| {
-            tracing::warn!(error = %e, "upstream request failed");
-            ProxyError::Client(e)
-        })?;
+    let upstream_resp = client.request(outgoing_req).await.map_err(|e| {
+        tracing::warn!(error = %e, "upstream request failed");
+        ProxyError::Client(e)
+    })?;
 
     let status = upstream_resp.status();
     let resp_headers = upstream_resp.headers().clone();
@@ -1659,7 +1913,7 @@ pub async fn handle_request<B: PolicyBackend>(
         let meter_backend = Arc::clone(&backend);
         let meter_resolved = resolved.clone();
         let meter_host = target_host.clone();
-        // T-implementation-note-198: capture the upstream
+        // T-implementation-note-272: capture the upstream
         // status's 2xx-ness for the meter callback. The closure runs
         // post-flight on the tee thread; `status` itself is moved into
         // the response builder below, so we snapshot the bool here.
@@ -1687,8 +1941,7 @@ pub async fn handle_request<B: PolicyBackend>(
                 // downgrade only applies to Anthropic streams; non-SSE
                 // bodies keep the tee-level outcome unchanged.
                 let _outcome = if tee_outcome == StreamOutcome::Complete
-                    && pricing::provider_for_host(&meter_host)
-                        == Some(pricing::PROVIDER_ANTHROPIC)
+                    && pricing::provider_for_host(&meter_host) == Some(pricing::PROVIDER_ANTHROPIC)
                     && summary.saw_any_usage
                     && !summary.saw_message_stop
                 {
@@ -1753,9 +2006,7 @@ pub async fn handle_request<B: PolicyBackend>(
             }
             builder = builder.header(name, value);
         }
-        return Ok(builder
-            .body(ProxyBody::Streaming(tee_body))
-            .unwrap());
+        return Ok(builder.body(ProxyBody::Streaming(tee_body)).unwrap());
     }
 
     // Cap non-streaming response bodies at MAX_BODY_BYTES too.
@@ -1767,7 +2018,9 @@ pub async fn handle_request<B: PolicyBackend>(
     {
         Ok(collected) => collected.to_bytes(),
         Err(e) if e.downcast_ref::<LengthLimitError>().is_some() => {
-            return Ok(payload_too_large("upstream response body exceeds 10 MiB limit"));
+            return Ok(payload_too_large(
+                "upstream response body exceeds 10 MiB limit",
+            ));
         }
         Err(e) => {
             tracing::warn!(error = %e, "upstream response body collection failed");
@@ -1780,7 +2033,7 @@ pub async fn handle_request<B: PolicyBackend>(
     // provider we have pricing for, `meter_response` returns `None` and
     // we skip the increment — the request still forwards unchanged.
     //
-    // T-implementation-note-198: pass `status.is_success()`
+    // T-implementation-note-272: pass `status.is_success()`
     // so the meter only credits a billable request to the grant when
     // the upstream actually returned 2xx. A 5xx with a usage-shaped
     // body (rare) does not count.
@@ -1823,9 +2076,7 @@ pub async fn handle_request<B: PolicyBackend>(
         builder = builder.header(name, value);
     }
 
-    Ok(builder
-        .body(box_full(Full::new(resp_body)))
-        .unwrap())
+    Ok(builder.body(box_full(Full::new(resp_body))).unwrap())
 }
 
 /// True when the upstream response should be forwarded chunk-by-chunk
@@ -1884,7 +2135,7 @@ impl StreamOutcome {
     }
 }
 
-/// C44-implementation-note-199: short, stable hash of a credential alias for
+/// C44-implementation-note-274: short, stable hash of a credential alias for
 /// emission into the audit log's `credential` column.
 ///
 /// Returns `credname-<first 16 hex of sha256>` — enough entropy to avoid
@@ -1915,7 +2166,7 @@ fn hash_credential_name_for_audit(credential_name: &str) -> String {
 /// Receipt ID is a demo-grade short hex derived from a sha256 over the
 /// call's identifying fields. Beat 8 replaces this with a signed Receipt
 /// minted by the receipt subsystem; until then the ID is stable per call
-/// but not cryptographically bound. See implementation-note-200
+/// but not cryptographically bound. See implementation-note-275
 /// (release-checklist) for the follow-up.
 #[allow(clippy::too_many_arguments)]
 fn emit_proxy_call_event(
@@ -1931,8 +2182,8 @@ fn emit_proxy_call_event(
     // Resolve the primary worktree root via headless-runtime's git helper.
     // Fall back to cwd on failure — the daemon is typically launched from
     // the repo root; this is a best-effort observability path.
-    let root = core_construct_runtime::layout::primary_worktree_root()
-        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let root =
+        core_construct_runtime::layout::primary_worktree_root().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let events_path = root.join(core_construct_runtime::layout::ENGINE_EVENTS_FILE);
 
     // Receipt ID: short hex from sha256 of (persona, grant, method, path,
@@ -2001,8 +2252,12 @@ fn emit_proxy_call_event(
 /// `upstream_status_is_success` carries the upstream HTTP response's
 /// 2xx-ness through to the meter so the `usage.requests` counter only
 /// increments on upstream-confirmed responses. See
-/// `record_upstream_request` (T-implementation-note-198).
-#[allow(clippy::too_many_arguments)]
+/// `record_upstream_request` (T-implementation-note-272).
+///
+/// WIP-FOR: T-implementation-note-272 — caller wiring in the
+/// proxy streaming path is in flight; this function is the shared meter
+/// the buffered + SSE-tee paths will both invoke once that task lands.
+#[allow(clippy::too_many_arguments, dead_code)]
 fn run_post_flight_meter(
     state: &ProxyState,
     grant_id: &str,
@@ -2036,7 +2291,7 @@ fn run_post_flight_meter(
         );
         return;
     };
-    // T-implementation-note-198: fold the upstream-confirmed
+    // T-implementation-note-272: fold the upstream-confirmed
     // request count into the delta. `meter_response` no longer hardcodes
     // `requests: 1`; this is the single decision point that mints the
     // billable request against the grant. A successful upstream that
@@ -2053,7 +2308,7 @@ fn run_post_flight_meter(
     // `statement_usage` is identical for both cases; the audit record is
     // where the distinction lives.
     //
-    // C44-implementation-note-199: the `credential` audit column stores a short
+    // C44-implementation-note-274: the `credential` audit column stores a short
     // hash of the credential alias, not the raw alias. Raw aliases would
     // let anyone with audit-log read access correlate persona ↔ credential
     // across rows, breaking persona isolation. The raw alias still lives
@@ -2066,7 +2321,10 @@ fn run_post_flight_meter(
     // audit gap. Surface the error to tracing so the operator at least
     // sees it in the daemon log if the store fails.
     let credential_hash = hash_credential_name_for_audit(credential_name);
-    match state.store.log_event(
+    // implementation-note-273: audit-log emission routes through the
+    // sink shim. The store write itself is identical; only the
+    // ownership of the call boundary moves.
+    if let Err(e) = state.sink_log_event(
         Some(persona_id),
         "proxy.meter",
         Some(&credential_hash),
@@ -2076,13 +2334,12 @@ fn run_post_flight_meter(
             delta.tokens, delta.cents
         )),
     ) {
-        Ok(_) => {}
-        Err(e) => tracing::warn!(
+        tracing::warn!(
             error = ?e,
             grant_id = %grant_id,
             sid = %statement_sid,
             "proxy.meter audit log_event failed"
-        ),
+        );
     }
     match state
         .store
@@ -2133,7 +2390,11 @@ fn run_post_flight_meter(
 /// `record_upstream_request`. SSE responses always start with a 2xx
 /// status (Anthropic doesn't open an event stream on 5xx), but plumbing
 /// the bit explicitly keeps both paths symmetric and audit-ready.
-#[allow(clippy::too_many_arguments)]
+///
+/// WIP-FOR: T-implementation-note-272 — pairs with
+/// `run_post_flight_meter` above; the SSE-tee path will call this once
+/// caller wiring lands.
+#[allow(clippy::too_many_arguments, dead_code)]
 fn run_post_flight_meter_from_summary(
     state: &ProxyState,
     grant_id: &str,
@@ -2169,7 +2430,7 @@ fn run_post_flight_meter_from_summary(
         );
         return;
     };
-    // T-implementation-note-198: same fold as the buffered
+    // T-implementation-note-272: same fold as the buffered
     // path. `usage_from_summary` no longer hardcodes `requests: 1`; we
     // mint the billable request here once the upstream's confirmation
     // is known. A partial stream that observed any usage at all still
@@ -2184,7 +2445,8 @@ fn run_post_flight_meter_from_summary(
     // The audit + increment paths below mirror `run_post_flight_meter`
     // verbatim — keep in sync if either evolves.
     let credential_hash = hash_credential_name_for_audit(credential_name);
-    match state.store.log_event(
+    // implementation-note-273: sink shim — see sibling helper.
+    if let Err(e) = state.sink_log_event(
         Some(persona_id),
         "proxy.meter",
         Some(&credential_hash),
@@ -2194,13 +2456,12 @@ fn run_post_flight_meter_from_summary(
             delta.tokens, delta.cents
         )),
     ) {
-        Ok(_) => {}
-        Err(e) => tracing::warn!(
+        tracing::warn!(
             error = ?e,
             grant_id = %grant_id,
             sid = %statement_sid,
             "proxy.meter audit log_event failed"
-        ),
+        );
     }
     match state
         .store
@@ -2234,12 +2495,11 @@ fn run_post_flight_meter_from_summary(
     }
 }
 
-/// Compute a `core_grant_types::Usage` delta from an incremental `UsageSummary`.
 /// Returns `None` for non-LLM hosts or when the summary saw no usage at
 /// all — matches the byte-slice `meter_response` semantics so the audit
 /// trail and budget machinery behave identically across the two paths.
 ///
-/// T-implementation-note-198: `requests` is left at 0 here.
+/// T-implementation-note-272: `requests` is left at 0 here.
 /// Callers add the upstream-confirmed request count via
 /// `record_upstream_request` so a network failure / 5xx doesn't inflate
 /// the receipt's request tally.
@@ -2253,20 +2513,16 @@ pub fn usage_from_summary(
     }
     let folded = summary.folded_usage();
     let model = summary.model.clone().unwrap_or_default();
-    // implementation-note-32: micro-cent precision. See meter_response
+    // implementation-note-45: micro-cent precision. See meter_response
     // for the full rationale; the SSE path mirrors the buffered path so
     // both metering routes accumulate budget identically.
-    let cents_micro = pricing::cents_micro_for(
-        &model,
-        provider,
-        folded.input_tokens,
-        folded.output_tokens,
-    );
+    let cents_micro =
+        pricing::cents_micro_for(&model, provider, folded.input_tokens, folded.output_tokens);
     Some(core_grant_types::Usage {
         tokens: folded.input_tokens.saturating_add(folded.output_tokens),
         cents: cents_micro / 1_000_000,
         cents_micro,
-        // T-implementation-note-198: filled in by the caller
+        // T-implementation-note-272: filled in by the caller
         // via `record_upstream_request` once upstream confirmation is
         // known. Leaving this at 0 here means a path that observes
         // tokens but not a confirmed upstream response (none of the
@@ -2484,7 +2740,7 @@ where
 /// transport upstream is an integrity failure of the vault, not a request
 /// problem.
 ///
-/// implementation-note-124 — FINDING B from the brief: prior code
+/// implementation-note-173 — FINDING B from the brief: prior code
 /// unconditionally injected `Authorization: Bearer ...`, which broke every
 /// Beat 4 Anthropic SDK call.
 pub(crate) fn inject_provider_auth(
@@ -2626,7 +2882,9 @@ pub fn resolve_statement_for_request<'a>(
         // credential name. This is the canonical shape for
         // credential-type grants whose scope has no `:target` tail.
         match &stmt.resource {
-            ResourceSelector::Exact { value } if !value.contains('/') && !value.starts_with('/') => {
+            ResourceSelector::Exact { value }
+                if !value.contains('/') && !value.starts_with('/') =>
+            {
                 true
             }
             other => other.covers(resource),
@@ -2740,7 +2998,11 @@ pub(crate) fn resolve_statement_for_request_with_uri<'a>(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreflightDecision {
     Allowed,
-    Rejected { axis: &'static str, limit: u64, used: u64 },
+    Rejected {
+        axis: &'static str,
+        limit: u64,
+        used: u64,
+    },
 }
 
 /// Pre-flight budget check for a resolved Statement.
@@ -2759,7 +3021,10 @@ pub enum PreflightDecision {
 /// against the budget.
 ///
 /// Statements without a `budget` (TTL-only) always pass.
-pub fn preflight_budget_check(stmt: &core_grant_types::Statement, request_body: &[u8]) -> PreflightDecision {
+pub fn preflight_budget_check(
+    stmt: &core_grant_types::Statement,
+    request_body: &[u8],
+) -> PreflightDecision {
     let Some(budget) = &stmt.budget else {
         return PreflightDecision::Allowed;
     };
@@ -2778,7 +3043,7 @@ pub fn preflight_budget_check(stmt: &core_grant_types::Statement, request_body: 
     // the cents cap (post-flight cents tick can nudge usage over budget
     // between calls). We don't estimate cents up front — see doc above.
     //
-    // implementation-note-32: compare against the micro-cent
+    // implementation-note-45: compare against the micro-cent
     // accumulator so sub-cent calls aggregate honestly. Fall back to the
     // legacy `cents` axis when cents_micro is unset (zero) so pre-fix
     // grants stored under the old representation still gate correctly.
@@ -2820,8 +3085,8 @@ pub(crate) fn budget_exhausted_response(
         "limit": limit,
         "used": used,
     });
-    let bytes = serde_json::to_vec(&body)
-        .unwrap_or_else(|_| b"{\"error\":\"budget_exhausted\"}".to_vec());
+    let bytes =
+        serde_json::to_vec(&body).unwrap_or_else(|_| b"{\"error\":\"budget_exhausted\"}".to_vec());
     Response::builder()
         .status(StatusCode::TOO_MANY_REQUESTS)
         .header("content-type", "application/json")
@@ -2838,10 +3103,7 @@ pub(crate) fn budget_exhausted_response(
 /// `api.openai.com`); an unknown host returns `None` even if the body
 /// looks like JSON — we only meter providers we have a pricing table
 /// for.
-pub fn meter_response(
-    target_host: &str,
-    response_body: &[u8],
-) -> Option<core_grant_types::Usage> {
+pub fn meter_response(target_host: &str, response_body: &[u8]) -> Option<core_grant_types::Usage> {
     let Some(provider) = pricing::provider_for_host(target_host) else {
         tracing::info!(
             target: "proxy.meter.skip",
@@ -2856,7 +3118,13 @@ pub fn meter_response(
         let head = response_body
             .iter()
             .take(80)
-            .map(|b| if b.is_ascii() && !b.is_ascii_control() { *b as char } else { '.' })
+            .map(|b| {
+                if b.is_ascii() && !b.is_ascii_control() {
+                    *b as char
+                } else {
+                    '.'
+                }
+            })
             .collect::<String>();
         tracing::info!(
             target: "proxy.meter.skip",
@@ -2869,23 +3137,18 @@ pub fn meter_response(
         );
         return None;
     };
-    let model =
-        pricing::extract_model(provider, response_body).unwrap_or_default();
-    // implementation-note-32: compute micro-cents (cents × 10⁶) and
+    let model = pricing::extract_model(provider, response_body).unwrap_or_default();
+    // implementation-note-45: compute micro-cents (cents × 10⁶) and
     // derive whole cents from it. Without micro-cent precision, sub-cent
     // calls (~0.1¢ on Haiku-4.5) round to 0 per call and the budget cap
     // can never accumulate enough to trip.
-    let cents_micro = pricing::cents_micro_for(
-        &model,
-        provider,
-        parsed.input_tokens,
-        parsed.output_tokens,
-    );
+    let cents_micro =
+        pricing::cents_micro_for(&model, provider, parsed.input_tokens, parsed.output_tokens);
     Some(core_grant_types::Usage {
         tokens: parsed.input_tokens.saturating_add(parsed.output_tokens),
         cents: cents_micro / 1_000_000,
         cents_micro,
-        // T-implementation-note-198: leave `requests` at 0
+        // T-implementation-note-272: leave `requests` at 0
         // here. The caller folds in `record_upstream_request` once the
         // upstream's confirmation status is known, so a 5xx body that
         // happens to carry a usage block doesn't get counted as a
@@ -2899,10 +3162,10 @@ pub fn meter_response(
 
 /// Record a single upstream-confirmed request against the proxy meter.
 ///
-/// T-implementation-note-198: `usage.requests` historically
+/// T-implementation-note-272: `usage.requests` historically
 /// incremented by 1 for every proxy invocation that produced a parseable
 /// usage block, regardless of whether the upstream's HTTP response was
-/// itself a success. Per implementation-note-201 Decision 2 #2, the
+/// itself a success. Per implementation-note-276 Decision 2 #2, the
 /// receipt should reflect what actually happened upstream — Anthropic /
 /// OpenAI confirmed receiving the request — not what we tried to send.
 /// A request counted but rejected by the upstream is a false-positive.
@@ -2957,7 +3220,7 @@ pub(crate) fn emit_threshold_crossings(
     prior: &core_grant_types::Usage,
     current: &core_grant_types::Usage,
 ) {
-    // implementation-note-32: cents axis runs on micro-cents internally
+    // implementation-note-45: cents axis runs on micro-cents internally
     // so sub-cent calls accumulate honestly. Both the cap and the
     // before/after counters are scaled to micro-cents; the displayed
     // `used`/`limit` in the emitted audit/push payload are stepped back
@@ -2965,7 +3228,12 @@ pub(crate) fn emit_threshold_crossings(
     let cents_cap_micro = budget.cents.map(|c| c.saturating_mul(1_000_000));
     let axes: [(&'static str, Option<u64>, u64, u64); 2] = [
         ("tokens", budget.tokens, prior.tokens, current.tokens),
-        ("cents", cents_cap_micro, prior.cents_micro, current.cents_micro),
+        (
+            "cents",
+            cents_cap_micro,
+            prior.cents_micro,
+            current.cents_micro,
+        ),
     ];
     for (axis, cap, before, after) in axes.iter() {
         let Some(cap) = cap else { continue };
@@ -3036,16 +3304,18 @@ fn emit_debounced(
     used: Option<u64>,
     budget: Option<u64>,
 ) {
-    let key = (
-        grant_id.to_string(),
-        statement_sid.to_string(),
-        axis,
-        band_label,
-    );
-    if !state.threshold_emitted.borrow_mut().insert(key) {
+    // implementation-note-273: debounce + audit + broadcast now route
+    // through the `DaemonEventSink` reachable via `state.sink()`. The
+    // sink owns the threshold-debounce set and the broadcast channel; the
+    // sync shim methods on `ProxyState` keep this helper's signature
+    // unchanged so callers do not have to thread `&dyn EventSink`.
+    if !state
+        .sink()
+        .try_record_threshold_keys(grant_id, statement_sid, axis, band_label)
+    {
         return;
     }
-    if let Err(e) = state.store.log_event(
+    if let Err(e) = state.sink_log_event(
         Some(persona_id),
         action,
         Some(credential_name),
@@ -3057,10 +3327,9 @@ fn emit_debounced(
 
     // Broadcast the structured event to connected socket clients so MCP/SDK
     // consumers receive `budget.warning`/`budget.exhausted` push
-    // notifications in real time. `send` returns Err only when there are no
-    // active subscribers — that's the expected state in unit tests and
-    // before any client connects; ignore the result.
-    if let (Some(tx), Some(used), Some(budget)) = (state.events_tx.as_ref(), used, budget) {
+    // notifications in real time. The sink's `broadcast_sync` is a no-op
+    // when no `events_tx` was installed (git-echo proxy, unit tests).
+    if let (Some(used), Some(budget)) = (used, budget) {
         let event = if action == "budget.exhausted" {
             GrantEvent::BudgetExhausted {
                 grant_id: grant_id.to_string(),
@@ -3079,7 +3348,7 @@ fn emit_debounced(
                 percent: band_label,
             }
         };
-        let _ = tx.send(event);
+        state.sink_broadcast(event);
     }
 }
 
@@ -3154,7 +3423,9 @@ pub(crate) fn check_scope(
     // (e.g. "::", "github::push") so typos fail closed.
     let parts: Vec<&str> = scope.split(':').collect();
     if parts.iter().any(|p| p.is_empty()) {
-        return Err(ScopeViolation::general(format!("malformed scope: '{scope}'")));
+        return Err(ScopeViolation::general(format!(
+            "malformed scope: '{scope}'"
+        )));
     }
     if parts.len() > 4 {
         return Err(ScopeViolation::general(format!(
@@ -3245,7 +3516,11 @@ pub(crate) fn check_scope(
 ///
 /// For providers other than `github` (including `generic`/`*`) subtarget
 /// enforcement is not defined; we fail closed there too.
-fn subtarget_matches(subtarget_glob: &str, uri: &hyper::Uri, provider: &str) -> Result<(), ScopeViolation> {
+fn subtarget_matches(
+    subtarget_glob: &str,
+    uri: &hyper::Uri,
+    provider: &str,
+) -> Result<(), ScopeViolation> {
     if provider != "github" {
         return Err(ScopeViolation::subtarget(format!(
             "scope subtarget is only supported for provider 'github', not '{provider}'"
@@ -3289,8 +3564,8 @@ fn statement_revoked_response(persona_id: &str, statement_id: &str) -> Response<
         "persona_id": persona_id,
         "statement_id": statement_id,
     });
-    let bytes = serde_json::to_vec(&body)
-        .unwrap_or_else(|_| b"{\"error\":\"statement_revoked\"}".to_vec());
+    let bytes =
+        serde_json::to_vec(&body).unwrap_or_else(|_| b"{\"error\":\"statement_revoked\"}".to_vec());
     Response::builder()
         .status(StatusCode::FORBIDDEN)
         .header("content-type", "application/json")
@@ -3305,7 +3580,8 @@ fn scope_violation_response() -> Response<ProxyBody> {
     let body = serde_json::json!({
         "error": "scope violation",
     });
-    let bytes = serde_json::to_vec(&body).unwrap_or_else(|_| b"{\"error\":\"scope violation\"}".to_vec());
+    let bytes =
+        serde_json::to_vec(&body).unwrap_or_else(|_| b"{\"error\":\"scope violation\"}".to_vec());
     Response::builder()
         .status(StatusCode::FORBIDDEN)
         .header("content-type", "application/json")
@@ -3466,10 +3742,12 @@ const FRAME_IDLE_DEADLINE: Duration = Duration::from_secs(30);
 /// plain HTTP upstreams too (`https_or_http`) so tests can mock without
 /// spinning up a TLS certificate. Connection pooling + keep-alive are
 /// governed by `POOL_IDLE_TIMEOUT` / `POOL_MAX_IDLE_PER_HOST`.
-static GIT_ECHO_CLIENT: OnceLock<Client<
-    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
-    Incoming,
->> = OnceLock::new();
+static GIT_ECHO_CLIENT: OnceLock<
+    Client<
+        hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+        Incoming,
+    >,
+> = OnceLock::new();
 
 /// Return the process-wide git-echo Client, initialising it on first call.
 ///
@@ -3521,7 +3799,10 @@ impl std::str::FromStr for Scheme {
         match s.to_ascii_lowercase().as_str() {
             "http" => Ok(Scheme::Http),
             "https" => Ok(Scheme::Https),
-            other => Err(format!("unknown scheme {:?}; expected \"http\" or \"https\"", other)),
+            other => Err(format!(
+                "unknown scheme {:?}; expected \"http\" or \"https\"",
+                other
+            )),
         }
     }
 }
@@ -3554,7 +3835,7 @@ pub struct GitEchoConfig {
 /// Exposed `pub` so a separate test binary or an `#[ignore]`-d integration
 /// test can spawn it without reaching into daemon state.
 ///
-/// `bind_tx` (implementation-note-123): when `Some`, the bound `SocketAddr` is sent
+/// `bind_tx` (implementation-note-172): when `Some`, the bound `SocketAddr` is sent
 /// exactly once immediately after `TcpListener::bind` succeeds. Bind errors
 /// are sent as `Err` and the function returns. The receiver gets the actual
 /// local addr (so `127.0.0.1:0` callers can read the assigned port). If the
@@ -3681,7 +3962,10 @@ pub async fn handle_git_echo(
         Some(v) => v.to_string(),
         None => return Ok(unauthorized("missing X-Ember-Persona header")),
     };
-    let credential_name = match headers.get("x-ember-credential").and_then(|v| v.to_str().ok()) {
+    let credential_name = match headers
+        .get("x-ember-credential")
+        .and_then(|v| v.to_str().ok())
+    {
         Some(v) => v.to_string(),
         None => return Ok(unauthorized("missing X-Ember-Credential header")),
     };
@@ -3693,10 +3977,7 @@ pub async fn handle_git_echo(
     // The leading segment MUST match `config.upstream_host` — anything else
     // is a routing mistake on the client and we refuse rather than silently
     // forwarding to an unexpected host.
-    let path_and_query = uri
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/");
+    let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
     let expected_prefix = format!("/{}/", config.upstream_host);
     let upstream_path_and_query = match path_and_query.strip_prefix(&expected_prefix) {
         Some(rest) => format!("/{rest}"),
@@ -3734,7 +4015,11 @@ pub async fn handle_git_echo(
     let push_target = git_echo_owner_repo(&upstream_path_and_query)
         .unwrap_or_else(|| upstream_path_and_query.trim_start_matches('/').to_string());
 
-    let grant = match config.state.store.evaluate_grant(&persona_id, &credential_name) {
+    let grant = match config
+        .state
+        .store
+        .evaluate_grant(&persona_id, &credential_name)
+    {
         Ok(g) => g,
         Err(StoreError::NotFound) => {
             tracing::warn!(
@@ -3742,7 +4027,8 @@ pub async fn handle_git_echo(
                 credential = %credential_name,
                 "git echo: no active grant for persona/credential"
             );
-            if let Err(e) = config.state.store.log_event(
+            // implementation-note-273: route through sink shim.
+            if let Err(e) = config.state.sink_log_event(
                 Some(&persona_id),
                 "credential.access",
                 Some(&credential_name),
@@ -3778,7 +4064,8 @@ pub async fn handle_git_echo(
             resource = %resource,
             "git echo: no applicable statement for request — denying"
         );
-        if let Err(e) = config.state.store.log_event(
+        // implementation-note-273: route through sink shim.
+        if let Err(e) = config.state.sink_log_event(
             Some(&persona_id),
             "credential.access",
             Some(&credential_name),
@@ -3792,14 +4079,20 @@ pub async fn handle_git_echo(
 
     // Fetch the raw credential from the vault. Not in vault → 500 + audit.
     // Wrap in Zeroizing so the raw key bytes are wiped on drop.
-    let credential_bytes: Zeroizing<Vec<u8>> = match config.state.vault.get(VaultScope::Interactive, &config.state.store, &credential_name) {
+    let vault = config.state.current_vault()?;
+    let credential_bytes: Zeroizing<Vec<u8>> = match vault.get(
+        VaultScope::Interactive,
+        &config.state.store,
+        &credential_name,
+    ) {
         Ok(b) => Zeroizing::new(b),
         Err(VaultError::NotFound) => {
             tracing::warn!(
                 credential = %credential_name,
                 "git echo: credential not found in vault"
             );
-            if let Err(e) = config.state.store.log_event(
+            // implementation-note-273: route through sink shim.
+            if let Err(e) = config.state.sink_log_event(
                 Some(&persona_id),
                 "credential.access",
                 Some(&credential_name),
@@ -3817,7 +4110,7 @@ pub async fn handle_git_echo(
 
     // P69L.0b--AUDIT: emit `credential.access` so operators can see
     // that a credential substitution occurred and which repo was targeted.
-    // `action` mirrors the shape from C44-implementation-note-199: "github.push.<owner/repo>".
+    // `action` mirrors the shape from C44-implementation-note-274: "github.push.<owner/repo>".
     tracing::info!(
         event = "credential.access",
         allowed = true,
@@ -3827,12 +4120,15 @@ pub async fn handle_git_echo(
         request_id = %request_id,
         "git echo: credential access"
     );
-    if let Err(e) = config.state.store.log_event(
+    // implementation-note-273: route through sink shim.
+    if let Err(e) = config.state.sink_log_event(
         Some(&persona_id),
         "credential.access",
         Some(&credential_name),
         "allowed",
-        Some(&format!("push_target={push_target} request_id={request_id}")),
+        Some(&format!(
+            "push_target={push_target} request_id={request_id}"
+        )),
     ) {
         tracing::warn!(error = ?e, "git echo: log_event(allowed) failed");
     }
@@ -3847,7 +4143,8 @@ pub async fn handle_git_echo(
     // (see `git_echo_client()` / POOL_* constants).
     let client = git_echo_client();
 
-    let target_url = format!("{scheme}://{host}{path}",
+    let target_url = format!(
+        "{scheme}://{host}{path}",
         scheme = config.upstream_scheme,
         host = config.upstream_host,
         path = upstream_path_and_query,
@@ -3883,12 +4180,10 @@ pub async fn handle_git_echo(
 
     // Pass the request body as a stream — `incoming_body` is `Incoming` and
     // implements `Body` directly. No intermediate buffer allocation.
-    let outgoing_req = outgoing
-        .body(incoming_body)
-        .map_err(|e| {
-            tracing::warn!(error = %e, "git echo: failed to build outgoing request");
-            ProxyError::Http(e)
-        })?;
+    let outgoing_req = outgoing.body(incoming_body).map_err(|e| {
+        tracing::warn!(error = %e, "git echo: failed to build outgoing request");
+        ProxyError::Http(e)
+    })?;
 
     tracing::info!(
         method = %method,
@@ -3903,26 +4198,22 @@ pub async fn handle_git_echo(
     // the upstream socket — no leaked futures, no pinned sockets. On
     // timeout we return 504 to the client; `streaming_slot` is dropped at
     // function return so the concurrency counter is released.
-    let upstream_resp = match tokio::time::timeout(
-        HEADERS_DEADLINE,
-        client.request(outgoing_req),
-    )
-    .await
-    {
-        Ok(Ok(resp)) => resp,
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, "git echo: upstream request failed");
-            return Err(ProxyError::Client(e));
-        }
-        Err(_elapsed) => {
-            tracing::warn!(
-                upstream = %target_url,
-                deadline_secs = HEADERS_DEADLINE.as_secs(),
-                "git echo: upstream headers deadline exceeded — returning 504"
-            );
-            return Ok(gateway_timeout("upstream-headers-timeout"));
-        }
-    };
+    let upstream_resp =
+        match tokio::time::timeout(HEADERS_DEADLINE, client.request(outgoing_req)).await {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "git echo: upstream request failed");
+                return Err(ProxyError::Client(e));
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    upstream = %target_url,
+                    deadline_secs = HEADERS_DEADLINE.as_secs(),
+                    "git echo: upstream headers deadline exceeded — returning 504"
+                );
+                return Ok(gateway_timeout("upstream-headers-timeout"));
+            }
+        };
 
     // Stream the upstream response back to the client via `stream_response`.
     // Status, headers, and body frames flow through without accumulation —
@@ -3984,8 +4275,7 @@ fn build_github_basic_auth(token: &str) -> String {
 /// one-off echo prototype; Day 2's production path will either reuse an
 /// existing dep or we'll add one in a scoped PR.
 fn base64_std_encode(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     let mut chunks = input.chunks_exact(3);
     for chunk in &mut chunks {

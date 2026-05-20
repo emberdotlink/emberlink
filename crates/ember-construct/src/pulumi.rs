@@ -123,7 +123,13 @@ mod tests {
 
     #[test]
     fn import_classified() {
-        let r = classify_pulumi_argv(&args(&["import", "aws:s3/bucket:Bucket", "my-bucket", "my-bucket-id"])).unwrap();
+        let r = classify_pulumi_argv(&args(&[
+            "import",
+            "aws:s3/bucket:Bucket",
+            "my-bucket",
+            "my-bucket-id",
+        ]))
+        .unwrap();
         assert_eq!(r.0, "pulumi.import");
     }
 

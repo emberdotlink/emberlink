@@ -1,15 +1,15 @@
 //! `construct.toml` manifest reader — per design §2.
 //!
 //! Minimal in-crate parser scoped to the action surface that
-//! [`crate::preflight`] needs: the `[meta] name` and the union of
-//! `[[actions]] key` strings. The canonical schema validator with all
-//! eight invariants lives in `core-events::construct_toml`; this reader
-//! is the smallest dependency-free surface runtime-layer needs to consume
-//! the legacy `[[actions]]` array-of-tables shape that the bundled
-//! cohort-A manifests in `crates/ember-construct/construct/*.toml` ship
-//! today.
+//! [`crate::preflight`] needs: the `[meta] name`, manifest/action
+//! `authority_refs`, and the union of `[[actions]] key` strings. The
+//! canonical schema validator with all eight invariants lives in
+//! `core-events::construct_toml`; this reader is the smallest
+//! dependency-free surface runtime-layer needs to consume the legacy
+//! `[[actions]]` array-of-tables shape that the bundled cohort-A
+//! manifests in `crates/ember-construct/construct/*.toml` ship today.
 //!
-//! Phase 2 slice B (implementation-note-13): used by
+//! Phase 2 slice B (implementation-note-15): used by
 //! the Layer 1 pre-flight resolver to cross-reference task `constructs`
 //! declarations against the manifest action surface. The fuller
 //! `schema_version = "1"` shape validated by `core-events` is intended for
@@ -49,17 +49,38 @@ pub struct ConstructManifest {
     /// `constructs = ["<construct>.<action>"]` entries (e.g. `"ember-gh"`,
     /// `"ember-kubectl"`).
     pub name: String,
+    /// Manifest-wide default authority families this Construct consumes when
+    /// an action does not override them explicitly. Values use
+    /// [`core_broker::BrokerProvider::as_str`] naming (e.g. `"github"`,
+    /// `"aws_sts"`). Empty means the manifest intentionally makes no claim
+    /// yet; callers must treat that as unresolved rather than guessing.
+    pub authority_refs: Vec<String>,
     /// Action keys declared in `[[actions]] key = "..."` blocks, in the
     /// verbatim order they appear in the file. Cohort-A manifests use
     /// either bare keys (`pr_merge`) or tool-prefixed keys
     /// (`kubectl.apply`); the resolver matches whichever shape the task
     /// brief used.
     pub action_keys: Vec<String>,
+    /// Action metadata in source order. Kept alongside `action_keys` so
+    /// callers that need richer per-action data (for example headless
+    /// authority shaping) can consume the same parsed seam without opening
+    /// the TOML a second time.
+    pub actions: Vec<ConstructAction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstructAction {
+    pub key: String,
+    /// Action-scoped authority families. When empty, callers should fall back
+    /// to the manifest-wide [`ConstructManifest::authority_refs`] list.
+    pub authority_refs: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawManifest {
     meta: RawMeta,
+    #[serde(default)]
+    authority_refs: Vec<String>,
     #[serde(default)]
     actions: Vec<RawAction>,
 }
@@ -67,11 +88,15 @@ struct RawManifest {
 #[derive(Debug, Deserialize)]
 struct RawMeta {
     name: String,
+    #[serde(default)]
+    authority_refs: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawAction {
     key: String,
+    #[serde(default)]
+    authority_refs: Vec<String>,
 }
 
 /// Parse a `construct.toml` manifest from disk.
@@ -82,8 +107,9 @@ struct RawAction {
 /// `crates/ember-vault/construct.toml` as of design §2).
 ///
 /// **Post:** on `Ok`, the returned [`ConstructManifest`] carries the
-/// `[meta] name` and every `[[actions]] key` from the file in source
-/// order; on `Err`, the read or parse failure is named with the file path.
+/// `[meta] name`, any manifest / action `authority_refs`, and every
+/// `[[actions]] key` from the file in source order; on `Err`, the read or
+/// parse failure is named with the file path.
 pub fn parse_construct_manifest(path: &Path) -> Result<ConstructManifest, ManifestError> {
     let text = std::fs::read_to_string(path).map_err(|e| ManifestError::Read {
         path: path.display().to_string(),
@@ -102,9 +128,31 @@ pub fn parse_construct_manifest(path: &Path) -> Result<ConstructManifest, Manife
 /// returned [`ConstructManifest`].
 pub fn parse_construct_manifest_str(text: &str) -> Result<ConstructManifest, toml::de::Error> {
     let raw: RawManifest = toml::from_str(text)?;
+    let RawManifest {
+        meta,
+        authority_refs,
+        actions,
+    } = raw;
+    let actions: Vec<ConstructAction> = actions
+        .into_iter()
+        .map(|a| ConstructAction {
+            key: a.key,
+            authority_refs: a.authority_refs,
+        })
+        .collect();
+    let RawMeta {
+        name,
+        authority_refs: meta_authority_refs,
+    } = meta;
     Ok(ConstructManifest {
-        name: raw.meta.name,
-        action_keys: raw.actions.into_iter().map(|a| a.key).collect(),
+        name,
+        authority_refs: if authority_refs.is_empty() {
+            meta_authority_refs
+        } else {
+            authority_refs
+        },
+        action_keys: actions.iter().map(|a| a.key.clone()).collect(),
+        actions,
     })
 }
 
@@ -132,6 +180,8 @@ name = "ember-gh"
 version = "0.1.0"
 publisher = "did:emberlink"
 description = "GitHub CLI Construct."
+
+authority_refs = ["github"]
 
 default = "deny"
 
@@ -172,6 +222,7 @@ biometric = "required"
     fn parses_meta_name_and_action_keys() {
         let m = parse_construct_manifest_str(GH_MANIFEST).expect("parses");
         assert_eq!(m.name, "ember-gh");
+        assert_eq!(m.authority_refs, vec!["github"]);
         assert_eq!(m.action_keys, vec!["pr_create", "pr_merge", "pr_list"]);
     }
 
@@ -179,6 +230,7 @@ biometric = "required"
     fn preserves_source_order() {
         let m = parse_construct_manifest_str(KUBECTL_MANIFEST).expect("parses");
         assert_eq!(m.name, "ember-kubectl");
+        assert!(m.authority_refs.is_empty());
         assert_eq!(m.action_keys, vec!["kubectl.apply", "kubectl.delete"]);
     }
 
@@ -209,7 +261,25 @@ name = "ember-empty"
 "#;
         let m = parse_construct_manifest_str(s).expect("parses");
         assert_eq!(m.name, "ember-empty");
+        assert!(m.authority_refs.is_empty());
         assert!(m.action_keys.is_empty());
+    }
+
+    #[test]
+    fn parses_action_specific_authority_refs() {
+        let s = r#"
+[meta]
+name = "ember-toy"
+
+[[actions]]
+key = "toy.deploy"
+authority_refs = ["github", "vercel"]
+"#;
+        let m = parse_construct_manifest_str(s).expect("parses");
+        assert!(m.authority_refs.is_empty());
+        assert_eq!(m.actions.len(), 1);
+        assert_eq!(m.actions[0].key, "toy.deploy");
+        assert_eq!(m.actions[0].authority_refs, vec!["github", "vercel"]);
     }
 
     #[test]

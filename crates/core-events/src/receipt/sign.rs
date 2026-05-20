@@ -12,7 +12,19 @@ use core_crypto::{
     CanonicalizeError, PublicKey, Signature, Signer, Verifier, canonicalize_jcs,
     daemon_persona_sign_receipt, daemon_persona_verify_receipt,
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+/// Principal identity (uid/gid/pid) captured at the daemon's accept
+/// gate via SO_PEERCRED / LOCAL_PEERCRED. Carried on Receipt v2 so
+/// audit binding is "uid+gid+pid did X at T" rather than just "uid".
+/// Per design §"Destination".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CallingPrincipal {
+    pub uid: u32,
+    pub gid: u32,
+    pub pid: i32,
+}
 
 // receipt_v2_presence_kind — per design §Amendments + design Topic 6 D5.
 // The discriminator enum lives in `super::envelope::PresenceKind`; the
@@ -165,15 +177,14 @@ pub fn sign_spawn_witness_parent_signature(
     parent_signer: &dyn Signer,
 ) -> Result<(), SignError> {
     if !body.is_object() {
-        return Err(SignError::SpawnWitnessMissingField { field: "<root-object>" });
+        return Err(SignError::SpawnWitnessMissingField {
+            field: "<root-object>",
+        });
     }
     let bytes = spawn_witness_canonical_bytes_for_parent(body)?;
     let sig = parent_signer.sign(&bytes);
     if let serde_json::Value::Object(map) = body {
-        map.insert(
-            "parent_signature".into(),
-            serde_json::Value::String(sig.0),
-        );
+        map.insert("parent_signature".into(), serde_json::Value::String(sig.0));
     }
     Ok(())
 }
@@ -230,6 +241,11 @@ mod tests {
             presence_kind: None,
             body: json!({"tool":"echo","args":{}}),
             signature: None,
+            calling_principal: None,
+            presence_reason: None,
+            handle_id: None,
+            challenge_hash: None,
+            verifier_aaguid: None,
         }
     }
 
@@ -293,5 +309,60 @@ mod tests {
         env.receipt_id = "stale".into();
         let id2 = compute_receipt_id(&env).unwrap();
         assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn calling_principal_roundtrips_through_sign_verify() {
+        let signer = FixtureSigner::new("receipt-v2-sign");
+        let pk = signer.public_key();
+        let mut env = sample_envelope();
+        env.calling_principal = Some(CallingPrincipal {
+            uid: 501,
+            gid: 502,
+            pid: 12345,
+        });
+        sign_receipt_v2(&mut env, &signer).unwrap();
+        // Verify signature holds with calling_principal present.
+        verify_receipt_v2(&env, &pk, &FixtureVerifier).unwrap();
+        // Deserialize round-trip: serialize to JSON then back.
+        let wire = serde_json::to_vec(&env).unwrap();
+        let decoded: ReceiptEnvelope = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(
+            decoded.calling_principal,
+            Some(CallingPrincipal {
+                uid: 501,
+                gid: 502,
+                pid: 12345
+            }),
+            "calling_principal must survive JSON round-trip"
+        );
+        // Signature must still verify after round-trip.
+        verify_receipt_v2(&decoded, &pk, &FixtureVerifier).unwrap();
+    }
+
+    #[test]
+    fn calling_principal_none_omits_from_canonical_bytes() {
+        let signer = FixtureSigner::new("receipt-v2-sign");
+        // Build two envelopes: one with calling_principal: None explicitly,
+        // one default (which also has None via sample_envelope).
+        let mut env_a = sample_envelope(); // calling_principal: None
+        let mut env_b = sample_envelope(); // calling_principal: None (same)
+        // Sign both and collect the JCS bytes used for the receipt_id
+        // by checking that the resulting receipt_ids are identical — they are
+        // computed from JCS bytes and JCS omits the field when None.
+        sign_receipt_v2(&mut env_a, &signer).unwrap();
+        sign_receipt_v2(&mut env_b, &signer).unwrap();
+        assert_eq!(
+            env_a.receipt_id, env_b.receipt_id,
+            "receipt_id must be identical when calling_principal is None on both"
+        );
+        // Also assert the field is absent from the serialized JSON wire form.
+        let wire_a = serde_json::to_value(&env_a).unwrap();
+        assert!(
+            wire_a
+                .as_object()
+                .map_or(true, |m| !m.contains_key("calling_principal")),
+            "calling_principal=None must not appear in serialized JSON"
+        );
     }
 }

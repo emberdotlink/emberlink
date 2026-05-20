@@ -1,7 +1,7 @@
 //! crates/core-approval/src/lifecycle.rs
 
+use core_grant_types::{Budget, approval::RequestedScope};
 use core_grants::Grant;
-use core_grant_types::approval::RequestedScope;
 use serde::{Deserialize, Serialize};
 
 use crate::outcome::ApprovalOutcome;
@@ -22,6 +22,14 @@ pub struct RequestId(pub String);
 /// callers in `handler.rs` can migrate without losing the metadata they
 /// currently set on the returned request struct (`tool_name`, `target_host`,
 /// `target_url`, `agent_framework`).
+///
+/// implementation-note-6: extends the metadata
+/// with the five grant-shaping fields (`max_delegation_depth`,
+/// `max_uses_per_hour`, `allowed_hours_start`, `allowed_hours_end`,
+/// `allowed_targets`) that the `create_grant` socket call previously silently
+/// dropped when policy required approval. The same metadata now also carries
+/// the operator-requested budget and standing-parent fields so approval-path
+/// and auto-approve grants converge on the same post-mint shape.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubmitMetadata {
     /// Logical action verb (e.g. `credential.access`, `tool.invoke`). Used by
@@ -40,6 +48,40 @@ pub struct SubmitMetadata {
     pub target_url: Option<String>,
     /// Agent framework label (`claude-code`, `aider`, `cursor`, etc.).
     pub agent_framework: Option<String>,
+    /// implementation-note-7 — max depth
+    /// the resulting grant may be re-delegated. `None` means the resolver
+    /// defers to the grant default. Stamped on the minted grant row after
+    /// approval-resolution so approval-path grants carry the same delegation
+    /// cap the auto-approve path would have written via `create_grant`.
+    pub max_delegation_depth: Option<u32>,
+    /// implementation-note-7 — rate-limit
+    /// hint on the resulting grant. `None` leaves the grant unbounded on this
+    /// axis. Re-applied to the minted grant row alongside `max_delegation_depth`.
+    pub max_uses_per_hour: Option<u64>,
+    /// implementation-note-7 — lower hour
+    /// bound (UTC, 0..=23) of the allowed-usage window on the resulting grant.
+    /// `None` leaves the grant time-unbounded. Companion to
+    /// `allowed_hours_end`.
+    pub allowed_hours_start: Option<u32>,
+    /// implementation-note-7 — upper hour
+    /// bound (UTC, 0..=23) of the allowed-usage window on the resulting
+    /// grant. `None` mirrors `allowed_hours_start`.
+    pub allowed_hours_end: Option<u32>,
+    /// implementation-note-7 — JSON-array
+    /// string of allowed-target patterns the broker enforces on each grant
+    /// use. `None` means unrestricted targets. Stored as serialised JSON so
+    /// the column shape mirrors the auto-approve path's
+    /// `grants.allowed_targets` write.
+    pub allowed_targets: Option<String>,
+    /// Serialized budget to mint into block-zero when the request is
+    /// ultimately approved. `None` means unbudgeted.
+    pub budget: Option<Budget>,
+    /// Daily child-mint ceiling for a standing parent. `None` means the grant
+    /// remains a normal one-shot grant.
+    pub max_children_per_day: Option<u64>,
+    /// Optional auto-delegation scope template paired with
+    /// `max_children_per_day` when the created grant is marked standing.
+    pub auto_delegate_scope_template: Option<String>,
 }
 
 /// The lifecycle Interface every approval consumer depends on.
@@ -86,7 +128,7 @@ pub trait ApprovalLifecycle: Send + Sync {
     /// Decided`, `LifecycleError::ScopeNotNarrowing` (Narrowed-outcome with
     /// a wider scope than requested), `LifecycleError::GrantMintFailed`.
     ///
-    /// implementation-note-6: returns `core_grants::Grant`
+    /// implementation-note-8: returns `core_grants::Grant`
     /// (design approval → grant boundary; design phase C).
     async fn decide(
         &self,
@@ -106,7 +148,7 @@ pub trait ApprovalLifecycle: Send + Sync {
     /// Idempotent across identical patterns within the same persona —
     /// re-applying refreshes the TTL rather than minting a new Grant.
     ///
-    /// implementation-note-6: returns `core_grants::Grant`
+    /// implementation-note-8: returns `core_grants::Grant`
     /// (design approval → grant boundary; design phase C).
     async fn apply_standing(
         &self,

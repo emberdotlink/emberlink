@@ -1,5 +1,5 @@
 //!
-//! T2 integration tests for the `EdgeListener` mTLS gate (implementation-note-257).
+//! T2 integration tests for the `EdgeListener` mTLS gate (implementation-note-362).
 //!
 //! These tests use fixture-generated CAs and certs — no real network, no real
 //! filesystem state, no keychain. They bind on ephemeral loopback ports
@@ -24,8 +24,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use core_crypto::ca::{
-    ClientCertSpec, Csr, EdgeCa, SignedClientCert, generate_csr_pem,
-    generate_edge_ca, parse_csr_signed_by, sign_client_cert,
+    ClientCertSpec, Csr, EdgeCa, SignedClientCert, generate_csr_pem, generate_edge_ca,
+    parse_csr_signed_by, sign_client_cert,
 };
 use ed25519_dalek::SigningKey;
 use ember_daemon::infra::kms_edge::EdgeListener;
@@ -47,11 +47,9 @@ fn test_signing_key(seed: [u8; 32]) -> SigningKey {
 
 /// Build a verified `Csr` from a signing key and SPIFFE URI.
 fn make_csr(signing_key: &SigningKey, spiffe_uri: &str) -> Csr {
-    let csr_pem = generate_csr_pem(signing_key, spiffe_uri)
-        .expect("generate CSR PEM");
+    let csr_pem = generate_csr_pem(signing_key, spiffe_uri).expect("generate CSR PEM");
     let verifying_key = signing_key.verifying_key();
-    parse_csr_signed_by(&csr_pem, &verifying_key)
-        .expect("parse and verify CSR")
+    parse_csr_signed_by(&csr_pem, &verifying_key).expect("parse and verify CSR")
 }
 
 /// Sign a client cert for `persona` / `peer_hostname` under `ca`.
@@ -232,12 +230,7 @@ async fn attempt_connect(
             // Use a short-timeout read to catch that Alert.
             use tokio::io::AsyncReadExt;
             let mut buf = [0u8; 1];
-            match tokio::time::timeout(
-                Duration::from_millis(50),
-                tls_stream.read(&mut buf),
-            )
-            .await
-            {
+            match tokio::time::timeout(Duration::from_millis(50), tls_stream.read(&mut buf)).await {
                 // Timeout: server didn't send an alert → handshake succeeded and
                 // server is just idle (dropped the stream after accepting it).
                 Err(_timeout) => Ok(()),

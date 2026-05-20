@@ -3,15 +3,16 @@
 //! Wraps the agent protocol as an MCP server using JSON-RPC 2.0 over stdio.
 //! Each tool maps 1:1 to an AgentRuntime method.
 
+pub mod cert_expiry;
 pub mod daemon_transport;
 
 use std::path::PathBuf;
 
 use daemon_transport::{DaemonTransport, DaemonTransportError};
+use emberlink_agent::protocol::AgentRequest;
 use emberlink_agent::protocol::methods::{
     GRANT_STATUS, LIST_GRANTS, REQUEST_GRANT, USE_CREDENTIAL, WHOAMI,
 };
-use emberlink_agent::protocol::AgentRequest;
 use emberlink_agent::runtime::AgentRuntime;
 
 // --- JSON-RPC 2.0 types (shared via core-mcp; DRY-5) ---
@@ -125,7 +126,10 @@ pub struct McpServer {
 
 impl McpServer {
     pub fn new(runtime: AgentRuntime) -> Self {
-        Self { runtime, daemon_transport: None }
+        Self {
+            runtime,
+            daemon_transport: None,
+        }
     }
 
     /// Build a server with daemon-transport observability tools wired.
@@ -134,6 +138,17 @@ impl McpServer {
         Self {
             runtime,
             daemon_transport: Some(DaemonTransport::new(socket)),
+        }
+    }
+
+    /// Build a server with a pre-constructed daemon transport. Used by the
+    /// in-container mTLS bridge path (implementation-note-451)
+    /// where the transport is an `Mtls` variant rather than a UDS path.
+    /// Same observability semantics as [`Self::with_daemon_socket`].
+    pub fn with_daemon_transport(runtime: AgentRuntime, transport: DaemonTransport) -> Self {
+        Self {
+            runtime,
+            daemon_transport: Some(transport),
         }
     }
 
@@ -250,14 +265,10 @@ impl McpServer {
             }
             Err(e) => {
                 let (msg, code) = match e {
-                    DaemonTransportError::Io(io) => {
-                        (format!("daemon unreachable: {io}"), -32000)
-                    }
+                    DaemonTransportError::Io(io) => (format!("daemon unreachable: {io}"), -32000),
                     DaemonTransportError::Protocol(s) => (format!("protocol: {s}"), -32002),
                     DaemonTransportError::DaemonError(s) => (format!("daemon: {s}"), -32004),
-                    DaemonTransportError::UnknownTool(t) => {
-                        (format!("unknown tool: {t}"), -32602)
-                    }
+                    DaemonTransportError::UnknownTool(t) => (format!("unknown tool: {t}"), -32602),
                 };
                 let _ = code;
                 JsonRpcResponse {
@@ -349,8 +360,8 @@ impl McpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::rc::Rc;
     use emberlink_agent::runtime::{AgentConfig, AgentRuntime};
+    use std::rc::Rc;
 
     fn test_server() -> McpServer {
         let store = Rc::new(core_state::EventStore::default());
@@ -457,7 +468,8 @@ mod tests {
         let result = resp.result.unwrap();
         let content = &result["content"][0];
         assert_eq!(content["type"], "text");
-        let text: serde_json::Value = serde_json::from_str(content["text"].as_str().unwrap()).unwrap();
+        let text: serde_json::Value =
+            serde_json::from_str(content["text"].as_str().unwrap()).unwrap();
         assert_eq!(text["persona_id"], "persona-test");
     }
 
@@ -478,9 +490,16 @@ mod tests {
             })),
         };
         let resp = server.handle_request(&req).unwrap();
-        assert!(resp.error.is_none(), "tool calls surface agent errors via isError");
+        assert!(
+            resp.error.is_none(),
+            "tool calls surface agent errors via isError"
+        );
         let result = resp.result.unwrap();
-        assert_eq!(result["isError"], serde_json::json!(true), "expected isError=true for fail-closed");
+        assert_eq!(
+            result["isError"],
+            serde_json::json!(true),
+            "expected isError=true for fail-closed"
+        );
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(
             text.contains("daemon unreachable"),
@@ -510,7 +529,10 @@ mod tests {
             })),
         };
         let resp = server.handle_request(&req).unwrap();
-        assert!(resp.error.is_none(), "tool calls surface agent errors via isError");
+        assert!(
+            resp.error.is_none(),
+            "tool calls surface agent errors via isError"
+        );
         let result = resp.result.unwrap();
         assert_eq!(
             result["isError"], true,
@@ -606,7 +628,9 @@ mod tests {
             "method": "initialize",
             "params": { "protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": { "name": "test", "version": "0.1" } }
         });
-        let resp = server.process_line(&serde_json::to_string(&init_req).unwrap()).unwrap();
+        let resp = server
+            .process_line(&serde_json::to_string(&init_req).unwrap())
+            .unwrap();
         let init_resp: JsonRpcResponse = serde_json::from_str(&resp).unwrap();
         assert!(init_resp.error.is_none());
 
@@ -615,14 +639,20 @@ mod tests {
             "jsonrpc": "2.0",
             "method": "notifications/initialized"
         });
-        assert!(server.process_line(&serde_json::to_string(&notif).unwrap()).is_none());
+        assert!(
+            server
+                .process_line(&serde_json::to_string(&notif).unwrap())
+                .is_none()
+        );
 
         // 3. List tools
         let list_req = serde_json::json!({
             "jsonrpc": "2.0", "id": 2,
             "method": "tools/list"
         });
-        let resp = server.process_line(&serde_json::to_string(&list_req).unwrap()).unwrap();
+        let resp = server
+            .process_line(&serde_json::to_string(&list_req).unwrap())
+            .unwrap();
         let list_resp: JsonRpcResponse = serde_json::from_str(&resp).unwrap();
         let tools = list_resp.result.unwrap()["tools"].as_array().unwrap().len();
         assert_eq!(tools, 8);
@@ -633,7 +663,9 @@ mod tests {
             "method": "tools/call",
             "params": { "name": "whoami", "arguments": {} }
         });
-        let resp = server.process_line(&serde_json::to_string(&call_req).unwrap()).unwrap();
+        let resp = server
+            .process_line(&serde_json::to_string(&call_req).unwrap())
+            .unwrap();
         let call_resp: JsonRpcResponse = serde_json::from_str(&resp).unwrap();
         assert!(call_resp.error.is_none());
         let content = &call_resp.result.unwrap()["content"][0];

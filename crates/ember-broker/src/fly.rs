@@ -39,9 +39,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use core_broker::{
-    Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential,
-};
+use core_broker::{Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
@@ -395,8 +393,7 @@ impl Broker for FlyBroker {
             ));
         }
 
-        let body =
-            build_create_token_body(&scope, self.parent.default_org_slug.as_deref())?;
+        let body = build_create_token_body(&scope, self.parent.default_org_slug.as_deref())?;
 
         let (status, resp_body) = self
             .client
@@ -458,11 +455,7 @@ impl Broker for FlyBroker {
         let now = SystemTime::now();
         let expires_at = now + std::time::Duration::from_secs(scope.expiry_seconds);
 
-        let materialization_id = format!(
-            "fly-{}-{}",
-            token_id,
-            chrono_timestamp(expires_at),
-        );
+        let materialization_id = format!("fly-{}-{}", token_id, chrono_timestamp(expires_at),);
 
         self.state.lock().expect("fly broker state mutex").insert(
             materialization_id.clone(),
@@ -609,11 +602,14 @@ impl FlyHttpClient for MockFlyClient {
         bearer: &str,
         body: String,
     ) -> Result<(u16, String), String> {
-        self.calls.lock().expect("mock fly mutex").push(MockFlyCall {
-            url: url.to_string(),
-            bearer: bearer.to_string(),
-            body: body.clone(),
-        });
+        self.calls
+            .lock()
+            .expect("mock fly mutex")
+            .push(MockFlyCall {
+                url: url.to_string(),
+                bearer: bearer.to_string(),
+                body: body.clone(),
+            });
         let mut q = self.responses.lock().expect("mock fly mutex");
         if q.len() > 1 {
             Ok(q.remove(0))
@@ -717,18 +713,29 @@ mod tests {
             .get("variables")
             .and_then(|v| v.get("input"))
             .expect("variables.input must exist");
-        assert_eq!(input.get("organizationId").and_then(|v| v.as_str()), Some("acme"));
-        assert!(input.get("appId").is_none(), "org-scope must not include appId");
-        assert_eq!(input.get("name").and_then(|v| v.as_str()), Some("ember-broker-acme"));
+        assert_eq!(
+            input.get("organizationId").and_then(|v| v.as_str()),
+            Some("acme")
+        );
+        assert!(
+            input.get("appId").is_none(),
+            "org-scope must not include appId"
+        );
+        assert_eq!(
+            input.get("name").and_then(|v| v.as_str()),
+            Some("ember-broker-acme")
+        );
         assert_eq!(
             input.get("expirySeconds").and_then(|v| v.as_u64()),
             Some(3600)
         );
-        assert!(parsed
-            .get("query")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .contains("createApiToken"));
+        assert!(
+            parsed
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .contains("createApiToken")
+        );
     }
 
     #[test]
@@ -787,10 +794,10 @@ mod tests {
 
     #[tokio::test]
     async fn issue_org_scope_happy_path_returns_token_and_records_state() {
-        let mock = Arc::new(
-            MockFlyClient::new()
-                .with_response(200, create_ok_body("tk_org_1", "ember-acme", "fo1_minted_org_token")),
-        );
+        let mock = Arc::new(MockFlyClient::new().with_response(
+            200,
+            create_ok_body("tk_org_1", "ember-acme", "fo1_minted_org_token"),
+        ));
         let broker = FlyBroker::with_client(fixture_parent(), mock.clone());
         let req = fly_request(
             serde_json::json!({
@@ -801,7 +808,9 @@ mod tests {
             }),
             3600,
         );
-        let cred = Broker::issue(&broker, req).await.expect("issue must succeed");
+        let cred = Broker::issue(&broker, req)
+            .await
+            .expect("issue must succeed");
         assert_eq!(cred.token.expose_secret(), "fo1_minted_org_token");
         assert!(
             cred.materialization_id.starts_with("fly-tk_org_1-"),
@@ -827,10 +836,10 @@ mod tests {
 
     #[tokio::test]
     async fn issue_app_scope_happy_path_uses_app_id_in_body() {
-        let mock = Arc::new(
-            MockFlyClient::new()
-                .with_response(200, create_ok_body("tk_app_1", "ember-app", "fo1_minted_app_token")),
-        );
+        let mock = Arc::new(MockFlyClient::new().with_response(
+            200,
+            create_ok_body("tk_app_1", "ember-app", "fo1_minted_app_token"),
+        ));
         let broker = FlyBroker::with_client(fixture_parent(), mock.clone());
         let req = fly_request(
             serde_json::json!({
@@ -841,7 +850,9 @@ mod tests {
             }),
             1800,
         );
-        let cred = Broker::issue(&broker, req).await.expect("issue must succeed");
+        let cred = Broker::issue(&broker, req)
+            .await
+            .expect("issue must succeed");
         assert_eq!(cred.token.expose_secret(), "fo1_minted_app_token");
         let call = mock.last_call().expect("call recorded");
         assert!(
@@ -870,7 +881,9 @@ mod tests {
             }),
             3600,
         );
-        Broker::issue(&broker, req).await.expect("issue must succeed");
+        Broker::issue(&broker, req)
+            .await
+            .expect("issue must succeed");
         let call = mock.last_call().expect("call recorded");
         assert!(
             call.body.contains("\"organizationId\":\"default-org\""),
@@ -881,9 +894,7 @@ mod tests {
 
     #[tokio::test]
     async fn issue_unauthorized_errors_returns_policy_rejected() {
-        let mock = Arc::new(
-            MockFlyClient::new().with_response(200, unauthorized_errors_body()),
-        );
+        let mock = Arc::new(MockFlyClient::new().with_response(200, unauthorized_errors_body()));
         let broker = FlyBroker::with_client(fixture_parent(), mock);
         let req = fly_request(
             serde_json::json!({
@@ -902,9 +913,7 @@ mod tests {
 
     #[tokio::test]
     async fn issue_not_found_errors_returns_upstream() {
-        let mock = Arc::new(
-            MockFlyClient::new().with_response(200, not_found_errors_body()),
-        );
+        let mock = Arc::new(MockFlyClient::new().with_response(200, not_found_errors_body()));
         let broker = FlyBroker::with_client(fixture_parent(), mock);
         let req = fly_request(
             serde_json::json!({
@@ -962,7 +971,10 @@ mod tests {
     async fn revoke_happy_path_calls_revoke_mutation_and_drops_state() {
         let mock = Arc::new(
             MockFlyClient::new()
-                .with_response(200, create_ok_body("tk_rev_1", "ember-rev", "fo1_rev_token"))
+                .with_response(
+                    200,
+                    create_ok_body("tk_rev_1", "ember-rev", "fo1_rev_token"),
+                )
                 .with_response(200, revoke_ok_body()),
         );
         let broker = FlyBroker::with_client(fixture_parent(), mock.clone());

@@ -1,4 +1,4 @@
-//! Tier-0 daemon-managed ssh-agent (implementation-note-56).
+//! Tier-0 daemon-managed ssh-agent (implementation-note-72).
 //!
 //! Per the 2026-05-05 grill (Angle A1): the daemon IS the ssh-agent for a
 //! session. A fresh ed25519 keypair is minted in the daemon's address space,
@@ -320,11 +320,7 @@ pub trait DeployKeyHttpClient: Send + Sync {
 
     /// DELETE `url` with `Authorization: Bearer <bearer>`.
     /// Returns `(status_code, response_body_string)`.
-    async fn delete_bearer(
-        &self,
-        url: &str,
-        bearer: &str,
-    ) -> Result<(u16, String), SshAgentError>;
+    async fn delete_bearer(&self, url: &str, bearer: &str) -> Result<(u16, String), SshAgentError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -372,15 +368,14 @@ impl DeployKeyHttpClient for ReqwestDeployKeyClient {
             .await
             .map_err(|e| SshAgentError::Http(e.to_string()))?;
         let status = resp.status().as_u16();
-        let text = resp.text().await.map_err(|e| SshAgentError::Http(e.to_string()))?;
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| SshAgentError::Http(e.to_string()))?;
         Ok((status, text))
     }
 
-    async fn delete_bearer(
-        &self,
-        url: &str,
-        bearer: &str,
-    ) -> Result<(u16, String), SshAgentError> {
+    async fn delete_bearer(&self, url: &str, bearer: &str) -> Result<(u16, String), SshAgentError> {
         let resp = self
             .inner
             .delete(url)
@@ -391,7 +386,10 @@ impl DeployKeyHttpClient for ReqwestDeployKeyClient {
             .await
             .map_err(|e| SshAgentError::Http(e.to_string()))?;
         let status = resp.status().as_u16();
-        let text = resp.text().await.map_err(|e| SshAgentError::Http(e.to_string()))?;
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| SshAgentError::Http(e.to_string()))?;
         Ok((status, text))
     }
 }
@@ -552,7 +550,8 @@ impl SshAgentHandle {
             .await
             .map_err(|e| SshAgentError::TokenMint(e.to_string()))?;
 
-        self.register_deploy_key_with_token(owner, repo, &token.token).await
+        self.register_deploy_key_with_token(owner, repo, &token.token)
+            .await
     }
 
     /// Inner implementation that accepts a pre-minted bearer token. Used
@@ -566,7 +565,10 @@ impl SshAgentHandle {
     ) -> Result<DeployKeyHandle, SshAgentError> {
         // Idempotency check.
         {
-            let registry = self.deploy_key_registry.lock().expect("deploy key registry mutex");
+            let registry = self
+                .deploy_key_registry
+                .lock()
+                .expect("deploy key registry mutex");
             if let Some(&key_id) = registry.get(&(owner.to_string(), repo.to_string())) {
                 let key_title = format!("ember session {}", self.session_id);
                 return Ok(DeployKeyHandle {
@@ -614,7 +616,10 @@ impl SshAgentHandle {
 
         // Record in the idempotency registry.
         {
-            let mut registry = self.deploy_key_registry.lock().expect("deploy key registry mutex");
+            let mut registry = self
+                .deploy_key_registry
+                .lock()
+                .expect("deploy key registry mutex");
             registry.insert((owner.to_string(), repo.to_string()), key_id);
         }
 
@@ -751,9 +756,12 @@ impl SshAgentHandle {
 /// The probe key is immediately discarded; it is not stored anywhere.
 #[cfg(target_os = "macos")]
 fn binary_has_se_entitlement() -> bool {
-    use crate::secure_enclave::{generate_secure_enclave_key, SeKeychainTarget};
+    use crate::secure_enclave::{SeKeychainTarget, generate_secure_enclave_key};
     // A unique-enough label that won't collide with real session keys.
-    match generate_secure_enclave_key("ember-se-entitlement-probe", SeKeychainTarget::LoginKeychain) {
+    match generate_secure_enclave_key(
+        "ember-se-entitlement-probe",
+        SeKeychainTarget::LoginKeychain,
+    ) {
         Ok(_key) => {
             // Key was created — SE entitlement confirmed.
             // The key is dropped here and never stored.
@@ -796,7 +804,7 @@ pub fn spawn_session_ssh_agent(session_id: &str) -> Result<SshAgentHandle> {
     #[cfg(target_os = "macos")]
     {
         if binary_has_se_entitlement() {
-            use crate::secure_enclave::{generate_secure_enclave_key, SeKeychainTarget};
+            use crate::secure_enclave::{SeKeychainTarget, generate_secure_enclave_key};
             use crate::ssh_agent_macos::spawn_session_ssh_agent_se;
 
             let label = format!("ember-session-{session_id}");
@@ -823,14 +831,12 @@ pub fn spawn_session_ssh_agent(session_id: &str) -> Result<SshAgentHandle> {
                         // need the pubkey bytes here for the deploy-key title.
                         // Generate a throwaway key for the pubkey bytes only —
                         // it is never used for signing on the Tier-0 path.
-                        let placeholder_key = Arc::new(
-                            SessionKey::generate().unwrap_or_else(|_| SessionKey {
+                        let placeholder_key =
+                            Arc::new(SessionKey::generate().unwrap_or_else(|_| SessionKey {
                                 seed: vec![0u8; 32],
                                 signing_key: SigningKey::from_bytes(&[0u8; 32]),
-                                verifying_key: SigningKey::from_bytes(&[0u8; 32])
-                                    .verifying_key(),
-                            }),
-                        );
+                                verifying_key: SigningKey::from_bytes(&[0u8; 32]).verifying_key(),
+                            }));
                         return Ok(SshAgentHandle {
                             auth_sock_path: se_handle.auth_sock_path.clone(),
                             _task: {
@@ -841,7 +847,8 @@ pub fn spawn_session_ssh_agent(session_id: &str) -> Result<SshAgentHandle> {
                                     let _se = se_handle;
                                     // Yield indefinitely so the SE agent stays alive.
                                     loop {
-                                        tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
+                                        tokio::time::sleep(tokio::time::Duration::from_secs(3600))
+                                            .await;
                                     }
                                 })
                             },
@@ -1031,9 +1038,7 @@ async fn handle_agent_connection(mut stream: UnixStream, session_key: Arc<Sessio
         let body = &msg[1..];
 
         let response = match msg_type {
-            SSH_AGENTC_REQUEST_IDENTITIES => {
-                encode_identities_answer(session_key.pubkey_bytes())
-            }
+            SSH_AGENTC_REQUEST_IDENTITIES => encode_identities_answer(session_key.pubkey_bytes()),
             SSH_AGENTC_SIGN_REQUEST => {
                 let pubkey_blob = session_key.pubkey_blob();
                 match decode_sign_request(body, &pubkey_blob) {
@@ -1098,7 +1103,11 @@ mod tests {
         let frame = encode_identities_answer(&pubkey);
         // First 4 bytes are the message length.
         let msg_len = u32::from_be_bytes(frame[0..4].try_into().unwrap()) as usize;
-        assert_eq!(frame.len(), 4 + msg_len, "frame length prefix must match body");
+        assert_eq!(
+            frame.len(),
+            4 + msg_len,
+            "frame length prefix must match body"
+        );
         // Message type byte.
         assert_eq!(frame[4], SSH_AGENT_IDENTITIES_ANSWER);
         // nkeys = 1
@@ -1153,7 +1162,10 @@ mod tests {
         body.extend_from_slice(&flags.to_be_bytes());
 
         let result = decode_sign_request(&body, correct_blob);
-        assert!(result.is_none(), "must reject sign request for wrong key blob");
+        assert!(
+            result.is_none(),
+            "must reject sign request for wrong key blob"
+        );
     }
 
     // --- Drop-guard / zeroize tests ---
@@ -1210,7 +1222,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Deploy-key T1 tests (implementation-note-57)
+    // Deploy-key T1 tests (implementation-note-73)
     // -----------------------------------------------------------------------
 
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1322,7 +1334,10 @@ mod tests {
             .expect("register_deploy_key must succeed");
 
         // Verify key_id from the mocked response.
-        assert_eq!(deploy_handle.key_id, 42, "key_id must be 42 from mocked response");
+        assert_eq!(
+            deploy_handle.key_id, 42,
+            "key_id must be 42 from mocked response"
+        );
         assert_eq!(deploy_handle.owner, "test-owner");
         assert_eq!(deploy_handle.repo, "test-repo");
         assert_eq!(deploy_handle.key_title, "ember session test-session-1");
@@ -1336,9 +1351,14 @@ mod tests {
         );
 
         // Verify the pubkey appears in the POST body.
-        let body = mock.last_post_body().expect("POST body must have been recorded");
-        let parsed: serde_json::Value = serde_json::from_str(&body).expect("body must be valid JSON");
-        let key_field = parsed["key"].as_str().expect("body must have a 'key' field");
+        let body = mock
+            .last_post_body()
+            .expect("POST body must have been recorded");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).expect("body must be valid JSON");
+        let key_field = parsed["key"]
+            .as_str()
+            .expect("body must have a 'key' field");
         assert!(
             key_field.starts_with("ssh-ed25519 "),
             "key field must be an ssh-ed25519 pubkey wire string, got: {key_field}"
@@ -1490,7 +1510,11 @@ mod tests {
         for _ in 0..4 {
             tokio::task::yield_now().await;
         }
-        assert_eq!(mock.delete_count(), 0, "no DELETE when nothing was retained");
+        assert_eq!(
+            mock.delete_count(),
+            0,
+            "no DELETE when nothing was retained"
+        );
     }
 
     /// T3 — calling register_deploy_key twice with the same (owner, repo) is

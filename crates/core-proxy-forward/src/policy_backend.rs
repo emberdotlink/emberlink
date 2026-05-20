@@ -59,7 +59,11 @@ pub enum PolicyError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreflightDecision {
     Allowed,
-    Rejected { axis: &'static str, limit: u64, used: u64 },
+    Rejected {
+        axis: &'static str,
+        limit: u64,
+        used: u64,
+    },
 }
 
 /// Trait that decouples proxy pipeline logic from its backing store and vault.
@@ -100,16 +104,27 @@ pub trait PolicyBackend: Send + Sync + 'static {
     ///
     /// The returned value is wrapped in `Zeroizing` so the secret bytes are
     /// wiped when the value is dropped.
-    async fn get_credential(
-        &self,
-        credential_name: &str,
-    ) -> Result<Zeroizing<String>, PolicyError>;
+    async fn get_credential(&self, credential_name: &str)
+    -> Result<Zeroizing<String>, PolicyError>;
 
     /// Meter post-flight usage against the resolved grant/statement.
     ///
     /// `usage` is `None` when the upstream response did not include usage
     /// metadata (e.g. non-LLM credential grants).
     async fn post_flight(
+        &self,
+        resolved: &ResolvedGrant,
+        usage: Option<core_grant_types::Usage>,
+    ) -> Result<(), PolicyError>;
+
+    /// Post-flight metering hook for credential grants that need explicit
+    /// budget commit/decrement after the upstream call completes.
+    ///
+    /// Distinct from `post_flight` so the daemon-side implementation can
+    /// route the two through different metering paths — Slice B will land
+    /// the in-process implementation, Slice C the remote one.
+    /// (implementation-note-55.)
+    async fn post_flight_meter(
         &self,
         resolved: &ResolvedGrant,
         usage: Option<core_grant_types::Usage>,
@@ -295,6 +310,14 @@ impl PolicyBackend for ColocatedBackend {
         Ok(())
     }
 
+    async fn post_flight_meter(
+        &self,
+        _resolved: &ResolvedGrant,
+        _usage: Option<core_grant_types::Usage>,
+    ) -> Result<(), PolicyError> {
+        Ok(())
+    }
+
     async fn log_event(
         &self,
         _persona_id: &str,
@@ -384,7 +407,10 @@ mod tests {
         });
         let backend = ColocatedBackend::new(Arc::clone(&state));
         let uri: http::Uri = "https://example.com/".parse().unwrap();
-        let resolved = backend.resolve_grant("p", "c", None, &uri, "GET").await.unwrap();
+        let resolved = backend
+            .resolve_grant("p", "c", None, &uri, "GET")
+            .await
+            .unwrap();
         let decision = backend
             .preflight_budget(&resolved, b"test body")
             .await

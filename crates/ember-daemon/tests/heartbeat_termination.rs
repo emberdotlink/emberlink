@@ -1,4 +1,4 @@
-//! implementation-note-29 T2 — heartbeat-lost dirty-exit.
+//! implementation-note-36 T2 — heartbeat-lost dirty-exit.
 //!
 //! H1 invariant (cohort-A test plan): every grant terminates in a signed
 //! Receipt across all four termination paths. This file pins the
@@ -26,7 +26,7 @@ use std::rc::Rc;
 
 use chrono::{Duration as ChronoDuration, TimeZone, Utc};
 use core_events::receipt::{
-    sign::verify_receipt_v2, ClaudeCodeBody, ReceiptEnvelope, TerminationReason,
+    ClaudeCodeBody, ReceiptEnvelope, TerminationReason, sign::verify_receipt_v2,
 };
 use core_state::sessions::{SessionMeta, SessionStore};
 use ember_daemon::infra::receipt::{current_identity, init_identity};
@@ -75,6 +75,8 @@ fn create_terminating_session(
         grant_id: grant_id.to_string(),
         started_at,
         launcher_pid: FAKE_DEAD_PID,
+        workflow_id: None,
+        workflow_template: None,
     };
     session_store.create(&meta).expect("create session meta");
 
@@ -116,7 +118,10 @@ fn dead_pid_plus_stale_heartbeat_emits_signed_receipt_and_revokes_grant() {
         1,
         "session should be open before tick"
     );
-    let receipt_path = sessions_root.path().join(&session_meta.session_id).join("receipt.json");
+    let receipt_path = sessions_root
+        .path()
+        .join(&session_meta.session_id)
+        .join("receipt.json");
     let pre_contents = std::fs::read(&receipt_path).unwrap_or_default();
     assert!(pre_contents.is_empty(), "receipt.json placeholder is empty");
 
@@ -125,12 +130,7 @@ fn dead_pid_plus_stale_heartbeat_emits_signed_receipt_and_revokes_grant() {
     // (or `tokio::time::advance`) for this T2.
     let now_advanced = Utc::now() + ChronoDuration::seconds(120);
 
-    let transitioned = heartbeat::tick(
-        &store,
-        &session_store,
-        sessions_root.path(),
-        now_advanced,
-    );
+    let transitioned = heartbeat::tick(&store, &session_store, sessions_root.path(), now_advanced);
     assert_eq!(transitioned, 1, "exactly one session should transition");
 
     // --- Receipt assertions ---
@@ -221,7 +221,9 @@ fn live_pid_with_stale_heartbeat_does_not_terminate() {
     let _identity = current_identity().expect("identity loaded");
 
     let store = store_with_vault();
-    let persona = store.create_persona("agent-live-pid").expect("create_persona");
+    let persona = store
+        .create_persona("agent-live-pid")
+        .expect("create_persona");
     let grant = store
         .create_grant(&persona.id, "github-token", "repo:read", Some(3600))
         .expect("create_grant");
@@ -238,6 +240,8 @@ fn live_pid_with_stale_heartbeat_does_not_terminate() {
         grant_id: grant.id.clone(),
         started_at,
         launcher_pid: std::process::id(),
+        workflow_id: None,
+        workflow_template: None,
     };
     session_store.create(&meta).expect("create session meta");
     let session_dir = sessions_root.path().join(&meta.session_id);
@@ -269,7 +273,9 @@ fn fresh_heartbeat_does_not_terminate_even_with_dead_pid() {
     let _identity = current_identity().expect("identity loaded");
 
     let store = store_with_vault();
-    let persona = store.create_persona("agent-fresh-hb").expect("create_persona");
+    let persona = store
+        .create_persona("agent-fresh-hb")
+        .expect("create_persona");
     let grant = store
         .create_grant(&persona.id, "github-token", "repo:read", Some(3600))
         .expect("create_grant");
@@ -283,6 +289,8 @@ fn fresh_heartbeat_does_not_terminate_even_with_dead_pid() {
         grant_id: grant.id.clone(),
         started_at: Utc::now(),
         launcher_pid: FAKE_DEAD_PID,
+        workflow_id: None,
+        workflow_template: None,
     };
     session_store.create(&meta).expect("create session meta");
     let session_dir = sessions_root.path().join(&meta.session_id);
@@ -306,7 +314,9 @@ fn heartbeat_timeout_boundary_is_90_seconds() {
     let _identity = current_identity().expect("identity loaded");
 
     let store = store_with_vault();
-    let persona = store.create_persona("agent-90s-boundary").expect("create_persona");
+    let persona = store
+        .create_persona("agent-90s-boundary")
+        .expect("create_persona");
     let grant = store
         .create_grant(&persona.id, "github-token", "repo:read", Some(3600))
         .expect("create_grant");
@@ -324,6 +334,8 @@ fn heartbeat_timeout_boundary_is_90_seconds() {
         grant_id: grant.id.clone(),
         started_at: t_zero,
         launcher_pid: FAKE_DEAD_PID,
+        workflow_id: None,
+        workflow_template: None,
     };
     session_store.create(&meta).expect("create session meta");
     let session_dir = sessions_root.path().join(&meta.session_id);
@@ -341,7 +353,7 @@ fn heartbeat_timeout_boundary_is_90_seconds() {
 }
 
 #[test]
-#[ignore = "T3 — real launcher under qember.sh; out of scope for implementation-note-29 PR"]
+#[ignore = "T3 — real launcher under qember.sh; out of scope for implementation-note-36 PR"]
 fn t3_real_launcher_sigkill() {
     // T3 placeholder per the brief. Spawn a real launcher under
     // `qember.sh`, send SIGKILL, and verify the daemon emits the

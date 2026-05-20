@@ -101,42 +101,45 @@ pub enum LeakPattern {
 static PATTERNS: Lazy<Vec<(LeakPattern, Regex)>> = Lazy::new(|| {
     let defs: &[(&str, &str)] = &[
         // Most specific patterns first (longest prefixes / most constraints)
-        ("AnthropicApiKey",      r"sk-ant-api\d+-[A-Za-z0-9_-]{80,}"),
+        ("AnthropicApiKey", r"sk-ant-api\d+-[A-Za-z0-9_-]{80,}"),
         ("GitHubPAT_finegrained", r"github_pat_[A-Za-z0-9_]{82}"),
-        ("GitHubPAT",            r"ghp_[A-Za-z0-9]{36}"),
-        ("GitHubOAuth",          r"gho_[A-Za-z0-9]{36}"),
-        ("GitHubApp",            r"(?:ghs_|ghu_)[A-Za-z0-9]{36}"),
-        ("SlackBot",             r"xoxb-[0-9]+-[0-9]+-[0-9]+-[a-zA-Z0-9]+"),
-        ("SlackUser",            r"xoxp-[0-9]+-[0-9]+-[0-9]+-[a-zA-Z0-9]+"),
-        ("SlackApp",             r"xoxa-[0-9]+-[0-9]+-[0-9]+-[a-zA-Z0-9]+"),
+        ("GitHubPAT", r"ghp_[A-Za-z0-9]{36}"),
+        ("GitHubOAuth", r"gho_[A-Za-z0-9]{36}"),
+        ("GitHubApp", r"(?:ghs_|ghu_)[A-Za-z0-9]{36}"),
+        ("SlackBot", r"xoxb-[0-9]+-[0-9]+-[0-9]+-[a-zA-Z0-9]+"),
+        ("SlackUser", r"xoxp-[0-9]+-[0-9]+-[0-9]+-[a-zA-Z0-9]+"),
+        ("SlackApp", r"xoxa-[0-9]+-[0-9]+-[0-9]+-[a-zA-Z0-9]+"),
         // AWS key: exactly 20 chars (AKIA + 16)
-        ("AwsAccessKey",         r"AKIA[A-Z0-9]{16}(?:[^A-Z0-9]|$)"),
+        ("AwsAccessKey", r"AKIA[A-Z0-9]{16}(?:[^A-Z0-9]|$)"),
         // GCP: "private_key_id" JSON field with 40-hex value
-        ("GcpServiceAccountKey", r#""private_key_id"\s*:\s*"[0-9a-f]{40}""#),
+        (
+            "GcpServiceAccountKey",
+            r#""private_key_id"\s*:\s*"[0-9a-f]{40}""#,
+        ),
         // OpenAI: project keys first (more specific), then legacy keys
-        ("OpenAIApiKey_proj",    r"sk-proj-[A-Za-z0-9_-]{40,}"),
-        ("OpenAIApiKey",         r"sk-[A-Za-z0-9_-]{40,}"),
+        ("OpenAIApiKey_proj", r"sk-proj-[A-Za-z0-9_-]{40,}"),
+        ("OpenAIApiKey", r"sk-[A-Za-z0-9_-]{40,}"),
     ];
 
     defs.iter()
         .map(|(tag, src)| {
             let pat = match *tag {
-                "AnthropicApiKey"       => LeakPattern::AnthropicApiKey,
+                "AnthropicApiKey" => LeakPattern::AnthropicApiKey,
                 "GitHubPAT_finegrained" => LeakPattern::GitHubPAT,
-                "GitHubPAT"             => LeakPattern::GitHubPAT,
-                "GitHubOAuth"           => LeakPattern::GitHubOAuth,
-                "GitHubApp"             => LeakPattern::GitHubApp,
-                "SlackBot"              => LeakPattern::SlackBot,
-                "SlackUser"             => LeakPattern::SlackUser,
-                "SlackApp"              => LeakPattern::SlackApp,
-                "AwsAccessKey"          => LeakPattern::AwsAccessKey,
-                "GcpServiceAccountKey"  => LeakPattern::GcpServiceAccountKey,
-                "OpenAIApiKey_proj"     => LeakPattern::OpenAIApiKey,
-                "OpenAIApiKey"          => LeakPattern::OpenAIApiKey,
-                _                       => unreachable!(),
+                "GitHubPAT" => LeakPattern::GitHubPAT,
+                "GitHubOAuth" => LeakPattern::GitHubOAuth,
+                "GitHubApp" => LeakPattern::GitHubApp,
+                "SlackBot" => LeakPattern::SlackBot,
+                "SlackUser" => LeakPattern::SlackUser,
+                "SlackApp" => LeakPattern::SlackApp,
+                "AwsAccessKey" => LeakPattern::AwsAccessKey,
+                "GcpServiceAccountKey" => LeakPattern::GcpServiceAccountKey,
+                "OpenAIApiKey_proj" => LeakPattern::OpenAIApiKey,
+                "OpenAIApiKey" => LeakPattern::OpenAIApiKey,
+                _ => unreachable!(),
             };
-            let re = Regex::new(src)
-                .unwrap_or_else(|e| panic!("bad outbound_leak pattern {tag}: {e}"));
+            let re =
+                Regex::new(src).unwrap_or_else(|e| panic!("bad outbound_leak pattern {tag}: {e}"));
             (pat, re)
         })
         .collect()
@@ -320,7 +323,10 @@ mod tests {
     fn detects_gcp_service_account_key() {
         let body = br#"{"private_key_id": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"}"#;
         let hits = scan_body(body, LeakLocation::RequestBody);
-        assert!(hits.iter().any(|h| h.pattern == LeakPattern::GcpServiceAccountKey));
+        assert!(
+            hits.iter()
+                .any(|h| h.pattern == LeakPattern::GcpServiceAccountKey)
+        );
     }
 
     #[test]
@@ -370,7 +376,10 @@ mod tests {
         let body = format!("sk-proj-{}", "R".repeat(40));
         let hits = scan_response(body.as_bytes());
         assert!(!hits.is_empty());
-        assert!(hits.iter().all(|h| h.location == LeakLocation::ResponseBody));
+        assert!(
+            hits.iter()
+                .all(|h| h.location == LeakLocation::ResponseBody)
+        );
     }
 
     // ---- negative / no false positives ------------------------------------
@@ -423,8 +432,16 @@ mod tests {
             .filter(|h| h.pattern == LeakPattern::OpenAIApiKey)
             .collect();
 
-        assert_eq!(anthropic_hits.len(), 1, "expected exactly one AnthropicApiKey hit");
-        assert_eq!(openai_hits.len(), 0, "OpenAIApiKey must not fire for Anthropic key");
+        assert_eq!(
+            anthropic_hits.len(),
+            1,
+            "expected exactly one AnthropicApiKey hit"
+        );
+        assert_eq!(
+            openai_hits.len(),
+            0,
+            "OpenAIApiKey must not fire for Anthropic key"
+        );
     }
 
     // ---- byte offset correctness ------------------------------------------
@@ -441,7 +458,11 @@ mod tests {
             .expect("expected GitHubPAT hit");
 
         let slice = &content.as_bytes()[gh_hit.offset..gh_hit.offset + gh_hit.length];
-        assert_eq!(slice, key.as_bytes(), "offset+length must reproduce the match");
+        assert_eq!(
+            slice,
+            key.as_bytes(),
+            "offset+length must reproduce the match"
+        );
         assert_eq!(gh_hit.offset, prefix.len(), "offset must point past prefix");
     }
 

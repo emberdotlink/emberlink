@@ -1,4 +1,4 @@
-//! implementation-note-26 — T2 tests for the emberd-side
+//! implementation-note-33 — T2 tests for the emberd-side
 //! `exec.completion` Receipt v2 emission path.
 //!
 //! Two tests:
@@ -32,15 +32,13 @@ use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
 use core_crypto::{FixtureSigner, FixtureVerifier, Signer};
-use core_events::receipt::{
-    verify_receipt_v2, ExecCompletionBody, RECEIPT_KIND_EXEC_COMPLETION,
-};
+use core_events::receipt::{ExecCompletionBody, RECEIPT_KIND_EXEC_COMPLETION, verify_receipt_v2};
 use ember_daemon::infra::audit::AuditFilter;
 use ember_daemon::infra::receipt::{current_identity, init_identity};
 use ember_daemon::infra::store::DaemonStore;
 use ember_daemon::infra::vault::Vault;
 use ember_daemon::spawn::scion::emit_exec_completion_receipt;
-use ember_exec::uds::{read_frame, write_frame, ExecFrame};
+use ember_exec::uds::{ExecFrame, read_frame, write_frame};
 use tempfile::TempDir;
 use tokio::net::UnixListener;
 use uuid::Uuid;
@@ -77,10 +75,8 @@ async fn test_emit_exec_completion_receipt_signs_and_verifies() {
     // Deterministic inputs. Every field is distinct so a serialiser
     // drift in any one is caught by the field-by-field assertions
     // below.
-    let persona_id =
-        Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
-    let grant_id =
-        Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+    let persona_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    let grant_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
     let binary_path = PathBuf::from("/usr/local/bin/scion-test-binary");
     let binary_blake3 =
         "deadbeefcafef00ddeadbeefcafef00ddeadbeefcafef00ddeadbeefcafef00d".to_string();
@@ -203,14 +199,11 @@ async fn test_handle_exit_frame_emits_receipt() {
                         .expect("accept timeout")
                         .expect("accept failed");
 
-                let _frame = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    read_frame(&mut stream),
-                )
-                .await
-                .expect("read_frame timeout")
-                .expect("read_frame io error")
-                .expect("read_frame returned None at EOF");
+                let _frame = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut stream))
+                    .await
+                    .expect("read_frame timeout")
+                    .expect("read_frame io error")
+                    .expect("read_frame returned None at EOF");
 
                 let exit_frame = ExecFrame::Exit { code: 0 };
                 write_frame(&mut stream, &exit_frame)
@@ -218,11 +211,9 @@ async fn test_handle_exit_frame_emits_receipt() {
                     .expect("write Exit frame");
             });
 
-            let resp_value = ember_daemon::broker::handler::handle_broker_exec(
-                None, &store, &req,
-            )
-            .await
-            .expect("handle_broker_exec ok");
+            let resp_value = ember_daemon::broker::handler::handle_broker_exec(None, &store, &req)
+                .await
+                .expect("handle_broker_exec ok");
             // Reap the mock listener — it should have already written
             // the Exit frame and returned.
             mock_handle.await.expect("mock listener task");
@@ -255,20 +246,16 @@ async fn test_handle_exit_frame_emits_receipt() {
                 serde_json::from_str(envelope_json).expect("parse envelope JSON");
             assert_eq!(envelope.kind, RECEIPT_KIND_EXEC_COMPLETION);
             let pubkey = core_crypto::PublicKey(format!("ed25519:{daemon_pubkey}"));
-            verify_receipt_v2(
-                &envelope,
-                &pubkey,
-                &core_crypto::Ed25519Verifier,
-            )
-            .expect("verify_receipt_v2 against daemon pubkey");
+            verify_receipt_v2(&envelope, &pubkey, &core_crypto::Ed25519Verifier)
+                .expect("verify_receipt_v2 against daemon pubkey");
 
             // Body field provenance — at minimum the binary_path +
             // exit_code + target_uid + non-empty binary_blake3 must
             // match what the daemon was supposed to record. Persona
             // and grant resolve to Uuid::nil() for this legacy-style
             // caller (no caller_persona in params).
-            let body: ExecCompletionBody = serde_json::from_value(envelope.body.clone())
-                .expect("body deserialize");
+            let body: ExecCompletionBody =
+                serde_json::from_value(envelope.body.clone()).expect("body deserialize");
             assert_eq!(body.binary_path, "/bin/true");
             assert_eq!(body.exit_code, 0);
             assert_eq!(body.target_uid, 4242);

@@ -36,6 +36,7 @@ use crate::infra::receipt::DaemonPersona;
 use crate::infra::store::StoreError;
 
 /// Outcome of the pre-loaded Daemon Persona detection step.
+#[allow(clippy::large_enum_variant)]
 pub enum PreloadedPersonaOutcome {
     /// A pre-provisioned seed was found and validated. EIC should use the
     /// returned `DaemonPersona` as its canonical identity and write it to
@@ -68,9 +69,7 @@ pub fn detect_preloaded_daemon_persona(
     // Priority 1: hex seed in env.
     if let Ok(hex_seed) = std::env::var("EMBER_DAEMON_PERSONA_SEED_HEX") {
         let seed = parse_hex_seed(&hex_seed).map_err(|e| {
-            BootstrapError::MalformedSeed(format!(
-                "EMBER_DAEMON_PERSONA_SEED_HEX: {e}"
-            ))
+            BootstrapError::MalformedSeed(format!("EMBER_DAEMON_PERSONA_SEED_HEX: {e}"))
         })?;
         let persona = install_preloaded_seed(data_dir, seed)?;
         return Ok(PreloadedPersonaOutcome::Loaded(persona));
@@ -78,11 +77,9 @@ pub fn detect_preloaded_daemon_persona(
 
     // Priority 2: seed file path in env.
     if let Ok(seed_path) = std::env::var("EMBER_DAEMON_PERSONA_SEED_FILE") {
-        let raw = std::fs::read(&seed_path).map_err(|e| {
-            BootstrapError::SeedFileUnreadable {
-                path: seed_path.clone(),
-                error: e.to_string(),
-            }
+        let raw = std::fs::read(&seed_path).map_err(|e| BootstrapError::SeedFileUnreadable {
+            path: seed_path.clone(),
+            error: e.to_string(),
         })?;
         let seed = parse_raw_seed(&raw).map_err(|e| {
             BootstrapError::MalformedSeed(format!(
@@ -105,8 +102,7 @@ fn parse_hex_seed(hex: &str) -> Result<[u8; 32], String> {
             trimmed.len()
         ));
     }
-    let bytes = core_types::hex_to_bytes(trimmed)
-        .map_err(|e| format!("hex decode failed: {e}"))?;
+    let bytes = core_types::hex_to_bytes(trimmed).map_err(|e| format!("hex decode failed: {e}"))?;
     parse_raw_seed(&bytes)
 }
 
@@ -135,22 +131,15 @@ fn install_preloaded_seed(
     data_dir: &Path,
     seed: [u8; 32],
 ) -> Result<DaemonPersona, BootstrapError> {
-    std::fs::create_dir_all(data_dir).map_err(|e| {
-        BootstrapError::Io(format!(
-            "create data_dir {}: {e}",
-            data_dir.display()
-        ))
-    })?;
+    std::fs::create_dir_all(data_dir)
+        .map_err(|e| BootstrapError::Io(format!("create data_dir {}: {e}", data_dir.display())))?;
 
     let key_path = data_dir.join("daemon_persona.key");
 
     // If the key file already exists, check for conflict.
     if key_path.exists() {
-        let existing = std::fs::read(&key_path).map_err(|e| {
-            BootstrapError::Io(format!(
-                "read existing daemon_persona.key: {e}"
-            ))
-        })?;
+        let existing = std::fs::read(&key_path)
+            .map_err(|e| BootstrapError::Io(format!("read existing daemon_persona.key: {e}")))?;
         if existing.len() == 32 {
             let mut existing_seed = [0u8; 32];
             existing_seed.copy_from_slice(&existing);
@@ -158,8 +147,7 @@ fn install_preloaded_seed(
                 return Err(BootstrapError::ConflictingKey);
             }
             // Same seed already installed — idempotent, load normally.
-            return DaemonPersona::load_or_create(data_dir)
-                .map_err(|e| BootstrapError::Store(e));
+            return DaemonPersona::load_or_create(data_dir).map_err(BootstrapError::Store);
         }
         // Malformed existing file — overwrite with the provisioned seed.
     }
@@ -167,7 +155,7 @@ fn install_preloaded_seed(
     // Write the seed file (mode 0600).
     write_seed_file(&key_path, &seed)?;
 
-    DaemonPersona::load_or_create(data_dir).map_err(|e| BootstrapError::Store(e))
+    DaemonPersona::load_or_create(data_dir).map_err(BootstrapError::Store)
 }
 
 /// Write 32-byte seed to path with 0600 permissions.

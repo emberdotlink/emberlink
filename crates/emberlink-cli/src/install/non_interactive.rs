@@ -19,8 +19,8 @@
 use std::process::Command;
 
 use super::wizard::{
-    detect_platform, InstallPrimitives, Platform, RealPrimitives, StepOutcome, WizardContext,
-    WizardError, WIZARD_STEPS,
+    InstallPrimitives, Platform, RealPrimitives, StepOutcome, WIZARD_STEPS, WizardContext,
+    WizardError, detect_platform,
 };
 
 /// Daemon posture selectable from the non-interactive install surface.
@@ -124,9 +124,7 @@ impl PrivilegeProbe for RealPrivilegeProbe {
 /// Wires the production [`RealPrimitives`] + [`RealPrivilegeProbe`]
 /// implementations into [`install_non_interactive_with`]. The CLI dispatcher
 /// calls this directly; tests use the `_with` variant to inject stubs.
-pub fn install_non_interactive(
-    opts: &InstallNonInteractiveOptions,
-) -> Result<(), WizardError> {
+pub fn install_non_interactive(opts: &InstallNonInteractiveOptions) -> Result<(), WizardError> {
     let probe = RealPrivilegeProbe;
     let primitives = RealPrimitives;
     let platform = detect_platform();
@@ -158,11 +156,14 @@ pub fn install_non_interactive_with<P: InstallPrimitives, Q: PrivilegeProbe>(
     primitives: &P,
     platform: Platform,
 ) -> Result<(), WizardError> {
-    emit_phase("start", PhaseResult::Note(format!(
-        "posture={} accept_defaults={}",
-        posture_label(opts.posture),
-        opts.accept_defaults
-    )));
+    emit_phase(
+        "start",
+        PhaseResult::Note(format!(
+            "posture={} accept_defaults={}",
+            posture_label(opts.posture),
+            opts.accept_defaults
+        )),
+    );
 
     if !probe.is_root() && !probe.sudo_cached() {
         emit_phase(
@@ -203,9 +204,9 @@ fn run_steps_with_phase_emission<P: InstallPrimitives>(
     primitives: &P,
 ) -> Result<(), WizardError> {
     use super::wizard::{
-        wizard_step_add_user_to_group, wizard_step_chown_data_dirs,
-        wizard_step_emit_launch_spec, wizard_step_provision_mek,
-        wizard_step_provision_user, wizard_step_verify,
+        wizard_step_add_user_to_group, wizard_step_chown_data_dirs, wizard_step_emit_launch_spec,
+        wizard_step_load_apparmor, wizard_step_provision_mek, wizard_step_provision_user,
+        wizard_step_verify,
     };
 
     for step in WIZARD_STEPS.iter() {
@@ -214,9 +215,12 @@ fn run_steps_with_phase_emission<P: InstallPrimitives>(
             "chown-data-dirs" => wizard_step_chown_data_dirs(ctx, primitives),
             "provision-mek" => wizard_step_provision_mek(ctx, primitives),
             "emit-launch-spec" => wizard_step_emit_launch_spec(ctx, primitives),
+            "load-apparmor" => wizard_step_load_apparmor(ctx, primitives),
             "add-user-to-group" => wizard_step_add_user_to_group(ctx, primitives),
             "verify" => wizard_step_verify(ctx, primitives),
-            other => Err(WizardError::Verify(format!("unknown wizard step '{other}'"))),
+            other => Err(WizardError::Verify(format!(
+                "unknown wizard step '{other}'"
+            ))),
         };
         match result {
             Ok(StepOutcome::Completed { note }) => {
@@ -299,17 +303,11 @@ mod tests {
             self.calls.borrow_mut().push("provision_ember_user");
             Ok(())
         }
-        fn chown_ember_data_dirs(
-            &self,
-            _: &Path,
-        ) -> Result<(), daemon_install::InstallError> {
+        fn chown_ember_data_dirs(&self, _: &Path) -> Result<(), daemon_install::InstallError> {
             self.calls.borrow_mut().push("chown_ember_data_dirs");
             Ok(())
         }
-        fn provision_se_mek(
-            &self,
-            _: &Path,
-        ) -> Result<(), daemon_install::InstallError> {
+        fn provision_se_mek(&self, _: &Path) -> Result<(), daemon_install::InstallError> {
             self.calls.borrow_mut().push("provision_se_mek");
             Ok(())
         }
@@ -331,6 +329,10 @@ mod tests {
         }
         fn socket_responsive(&self, _: &Path) -> Result<(), String> {
             self.calls.borrow_mut().push("socket_responsive");
+            Ok(())
+        }
+        fn load_apparmor_profile(&self) -> Result<(), daemon_install::InstallError> {
+            self.calls.borrow_mut().push("load_apparmor_profile");
             Ok(())
         }
     }
@@ -384,9 +386,18 @@ mod tests {
     /// Posture parser: canonical spelling round-trips.
     #[test]
     fn posture_parse_separate_uid() {
-        assert_eq!(Posture::parse("separate-uid").unwrap(), Posture::SeparateUid);
-        assert_eq!(Posture::parse("SEPARATE-UID").unwrap(), Posture::SeparateUid);
-        assert_eq!(Posture::parse("separate_uid").unwrap(), Posture::SeparateUid);
+        assert_eq!(
+            Posture::parse("separate-uid").unwrap(),
+            Posture::SeparateUid
+        );
+        assert_eq!(
+            Posture::parse("SEPARATE-UID").unwrap(),
+            Posture::SeparateUid
+        );
+        assert_eq!(
+            Posture::parse("separate_uid").unwrap(),
+            Posture::SeparateUid
+        );
     }
 
     /// Posture parser: anything else returns an actionable error.
@@ -435,6 +446,7 @@ mod tests {
                 "chown_ember_data_dirs",
                 "provision_se_mek",
                 "install_launch_spec",
+                "load_apparmor_profile",
                 "add_operator_to_group",
                 "socket_responsive",
             ]
@@ -458,6 +470,7 @@ mod tests {
                 "chown_ember_data_dirs",
                 "provision_se_mek",
                 "install_launch_spec",
+                "load_apparmor_profile",
                 "add_operator_to_group",
                 "socket_responsive",
             ]

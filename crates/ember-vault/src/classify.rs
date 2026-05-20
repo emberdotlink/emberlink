@@ -112,9 +112,7 @@ pub(crate) fn strip_global_flags(argv: &[String]) -> Vec<String> {
         // flags shouldn't have `=value` but we accept it tolerantly).
         if let Some(eq) = tok.find('=') {
             let name = &tok[..eq];
-            if VALUE_BEARING_GLOBAL_FLAGS.contains(&name)
-                || BOOLEAN_GLOBAL_FLAGS.contains(&name)
-            {
+            if VALUE_BEARING_GLOBAL_FLAGS.contains(&name) || BOOLEAN_GLOBAL_FLAGS.contains(&name) {
                 i += 1;
                 continue;
             }
@@ -160,9 +158,14 @@ fn is_strict_read_only(verb: &str) -> bool {
 /// (mount, path) pair from the first non-flag token following the
 /// kv verb. Returns `None` if the path is missing or starts with `-`.
 ///
-/// This is provided for use by daemon-side scope checks; the
-/// classifier itself does not consume the path.
-pub fn extract_kv_path<'a>(argv_after_verb: &'a [String]) -> Option<(&'a str, &'a str)> {
+/// WIP-FOR: daemon-side scope-check consumer (no specific task ID
+/// yet; tracked under the implementation-note-380 + ember-vault Construct
+/// gating series). The classifier itself does not consume the path;
+/// this helper is provided so the future daemon-side authorization
+/// path can validate `kv` operations against the persona's vault scope
+/// without re-implementing argv parsing. Tests below cover the contract.
+#[allow(dead_code)]
+pub fn extract_kv_path(argv_after_verb: &[String]) -> Option<(&str, &str)> {
     for tok in argv_after_verb {
         if tok.starts_with('-') {
             continue;
@@ -229,9 +232,7 @@ pub fn classify_vault_argv(argv: &[String]) -> Option<ActionKey> {
         "auth" => {
             let verb = stripped.get(1).map(|s| s.as_str())?;
             match verb {
-                "enable" | "disable" | "tune" => {
-                    Some(ActionKey(format!("vault.auth.{verb}")))
-                }
+                "enable" | "disable" | "tune" => Some(ActionKey(format!("vault.auth.{verb}"))),
                 // `auth list`, `auth help`, login flows — passthrough.
                 _ => None,
             }
@@ -241,9 +242,7 @@ pub fn classify_vault_argv(argv: &[String]) -> Option<ActionKey> {
         "secrets" => {
             let verb = stripped.get(1).map(|s| s.as_str())?;
             match verb {
-                "enable" | "disable" | "tune" => {
-                    Some(ActionKey(format!("vault.secrets.{verb}")))
-                }
+                "enable" | "disable" | "tune" => Some(ActionKey(format!("vault.secrets.{verb}"))),
                 // `secrets list` — passthrough.
                 _ => None,
             }
@@ -253,9 +252,7 @@ pub fn classify_vault_argv(argv: &[String]) -> Option<ActionKey> {
         "token" => {
             let verb = stripped.get(1).map(|s| s.as_str())?;
             match verb {
-                "create" | "revoke" | "renew" => {
-                    Some(ActionKey(format!("vault.token.{verb}")))
-                }
+                "create" | "revoke" | "renew" => Some(ActionKey(format!("vault.token.{verb}"))),
                 // `token lookup`, `token capabilities` — passthrough.
                 _ => None,
             }
@@ -265,9 +262,7 @@ pub fn classify_vault_argv(argv: &[String]) -> Option<ActionKey> {
         "lease" => {
             let verb = stripped.get(1).map(|s| s.as_str())?;
             match verb {
-                "revoke" | "revoke-prefix" => {
-                    Some(ActionKey(format!("vault.lease.{verb}")))
-                }
+                "revoke" | "revoke-prefix" => Some(ActionKey(format!("vault.lease.{verb}"))),
                 // `lease lookup`, `lease renew` — passthrough.
                 _ => None,
             }
@@ -362,8 +357,8 @@ mod tests {
 
     #[test]
     fn kv_destroy_classified() {
-        let r = classify_vault_argv(&args(&["kv", "destroy", "-versions=1", "secret/foo"]))
-            .unwrap();
+        let r =
+            classify_vault_argv(&args(&["kv", "destroy", "-versions=1", "secret/foo"])).unwrap();
         assert_eq!(r.0, "vault.kv.destroy");
     }
 
@@ -387,9 +382,7 @@ mod tests {
 
     #[test]
     fn kv_metadata_passthrough() {
-        assert!(
-            classify_vault_argv(&args(&["kv", "metadata", "get", "secret/foo"])).is_none()
-        );
+        assert!(classify_vault_argv(&args(&["kv", "metadata", "get", "secret/foo"])).is_none());
     }
 
     // --- policy subsystem ---
@@ -432,9 +425,13 @@ mod tests {
 
     #[test]
     fn auth_tune_classified() {
-        let r =
-            classify_vault_argv(&args(&["auth", "tune", "-default-lease-ttl=1h", "userpass/"]))
-                .unwrap();
+        let r = classify_vault_argv(&args(&[
+            "auth",
+            "tune",
+            "-default-lease-ttl=1h",
+            "userpass/",
+        ]))
+        .unwrap();
         assert_eq!(r.0, "vault.auth.tune");
     }
 
@@ -447,8 +444,7 @@ mod tests {
 
     #[test]
     fn secrets_enable_classified() {
-        let r =
-            classify_vault_argv(&args(&["secrets", "enable", "-path=kv2", "kv-v2"])).unwrap();
+        let r = classify_vault_argv(&args(&["secrets", "enable", "-path=kv2", "kv-v2"])).unwrap();
         assert_eq!(r.0, "vault.secrets.enable");
     }
 
@@ -460,13 +456,8 @@ mod tests {
 
     #[test]
     fn secrets_tune_classified() {
-        let r = classify_vault_argv(&args(&[
-            "secrets",
-            "tune",
-            "-default-lease-ttl=4h",
-            "kv2/",
-        ]))
-        .unwrap();
+        let r = classify_vault_argv(&args(&["secrets", "tune", "-default-lease-ttl=4h", "kv2/"]))
+            .unwrap();
         assert_eq!(r.0, "vault.secrets.tune");
     }
 
@@ -479,8 +470,7 @@ mod tests {
 
     #[test]
     fn token_create_classified() {
-        let r =
-            classify_vault_argv(&args(&["token", "create", "-policy=my-policy"])).unwrap();
+        let r = classify_vault_argv(&args(&["token", "create", "-policy=my-policy"])).unwrap();
         assert_eq!(r.0, "vault.token.create");
     }
 
@@ -511,8 +501,7 @@ mod tests {
 
     #[test]
     fn lease_revoke_prefix_classified() {
-        let r =
-            classify_vault_argv(&args(&["lease", "revoke-prefix", "kv/creds/"])).unwrap();
+        let r = classify_vault_argv(&args(&["lease", "revoke-prefix", "kv/creds/"])).unwrap();
         assert_eq!(r.0, "vault.lease.revoke-prefix");
     }
 
@@ -563,27 +552,20 @@ mod tests {
 
     #[test]
     fn namespace_eq_flag_between_subsystem_and_verb_stripped() {
-        let r = classify_vault_argv(&args(&[
-            "kv",
-            "-namespace=team-a",
-            "put",
-            "secret/foo",
-        ]))
-        .unwrap();
+        let r =
+            classify_vault_argv(&args(&["kv", "-namespace=team-a", "put", "secret/foo"])).unwrap();
         assert_eq!(r.0, "vault.kv.put");
     }
 
     #[test]
     fn format_flag_after_verb_stripped() {
-        let r =
-            classify_vault_argv(&args(&["kv", "get", "-format=json", "secret/foo"])).unwrap();
+        let r = classify_vault_argv(&args(&["kv", "get", "-format=json", "secret/foo"])).unwrap();
         assert_eq!(r.0, "vault.kv.get");
     }
 
     #[test]
     fn tls_skip_verify_boolean_flag_stripped() {
-        let r =
-            classify_vault_argv(&args(&["-tls-skip-verify", "policy", "delete", "p"])).unwrap();
+        let r = classify_vault_argv(&args(&["-tls-skip-verify", "policy", "delete", "p"])).unwrap();
         assert_eq!(r.0, "vault.policy.delete");
     }
 
@@ -638,8 +620,7 @@ mod tests {
 
     #[test]
     fn double_dash_tls_skip_verify_stripped() {
-        let r =
-            classify_vault_argv(&args(&["--tls-skip-verify", "delete", "secret/foo"])).unwrap();
+        let r = classify_vault_argv(&args(&["--tls-skip-verify", "delete", "secret/foo"])).unwrap();
         assert_eq!(r.0, "vault.delete");
     }
 
@@ -661,30 +642,12 @@ mod tests {
 
     #[test]
     fn flags_reordered_classification_stable() {
-        let a = classify_vault_argv(&args(&[
-            "kv",
-            "put",
-            "secret/foo",
-            "-namespace=ns",
-            "k=v",
-        ]))
-        .unwrap();
-        let b = classify_vault_argv(&args(&[
-            "-namespace=ns",
-            "kv",
-            "put",
-            "secret/foo",
-            "k=v",
-        ]))
-        .unwrap();
-        let c = classify_vault_argv(&args(&[
-            "kv",
-            "-namespace=ns",
-            "put",
-            "secret/foo",
-            "k=v",
-        ]))
-        .unwrap();
+        let a = classify_vault_argv(&args(&["kv", "put", "secret/foo", "-namespace=ns", "k=v"]))
+            .unwrap();
+        let b = classify_vault_argv(&args(&["-namespace=ns", "kv", "put", "secret/foo", "k=v"]))
+            .unwrap();
+        let c = classify_vault_argv(&args(&["kv", "-namespace=ns", "put", "secret/foo", "k=v"]))
+            .unwrap();
         assert_eq!(a.0, b.0);
         assert_eq!(b.0, c.0);
     }
@@ -699,8 +662,11 @@ mod tests {
     #[test]
     fn only_global_flags_passthrough() {
         assert!(
-            classify_vault_argv(&args(&["-address=https://vault.example", "-tls-skip-verify"]))
-                .is_none()
+            classify_vault_argv(&args(&[
+                "-address=https://vault.example",
+                "-tls-skip-verify"
+            ]))
+            .is_none()
         );
     }
 
@@ -858,11 +824,9 @@ mod tests {
     // hold a `MockBroker::new(BrokerProvider::HashiVault)`, and a request
     // that declares `provider = HashiVault` round-trips through issue →
     // revoke without panicking. Real HashiVault impl is
-    // implementation-note-269 (separate task).
+    // implementation-note-381 (separate task).
 
-    use core_broker::{
-        Broker, BrokerError, BrokerProvider, BrokerRequest, MockBroker,
-    };
+    use core_broker::{Broker, BrokerError, BrokerProvider, BrokerRequest, MockBroker};
     use std::time::Duration;
 
     fn vault_request(ttl_secs: u64) -> BrokerRequest {

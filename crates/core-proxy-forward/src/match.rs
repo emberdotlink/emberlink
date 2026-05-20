@@ -1,6 +1,6 @@
 //!
 //! Pure URL / scope / glob matching primitives extracted from
-//! `ember-daemon/src/infra/proxy.rs` (implementation-note-43).
+//! `ember-daemon/src/infra/proxy.rs` (implementation-note-58).
 //!
 //! These functions have no daemon-state coupling — no `&self`, no DB, no
 //! Vault, no runtime config. They take plain strings (or byte slices) and
@@ -98,13 +98,10 @@ pub enum MethodTier {
 /// "deny".
 pub fn method_tier(method: &http::Method) -> Option<MethodTier> {
     match *method {
-        http::Method::GET | http::Method::HEAD | http::Method::OPTIONS => {
-            Some(MethodTier::Read)
+        http::Method::GET | http::Method::HEAD | http::Method::OPTIONS => Some(MethodTier::Read),
+        http::Method::POST | http::Method::PUT | http::Method::PATCH | http::Method::DELETE => {
+            Some(MethodTier::Write)
         }
-        http::Method::POST
-        | http::Method::PUT
-        | http::Method::PATCH
-        | http::Method::DELETE => Some(MethodTier::Write),
         _ => None,
     }
 }
@@ -170,7 +167,10 @@ pub fn request_to_action_resource(
     let resource = match (provider, host_slug) {
         ("github", _) => {
             let trimmed = path.strip_prefix('/').unwrap_or(path);
-            trimmed.strip_prefix("repos/").unwrap_or(trimmed).to_string()
+            trimmed
+                .strip_prefix("repos/")
+                .unwrap_or(trimmed)
+                .to_string()
         }
         ("llm", Some(slug)) => {
             let trimmed = path.strip_prefix('/').unwrap_or(path);
@@ -393,7 +393,9 @@ pub fn extract_github_branch(raw_path: &str, query: Option<&str>) -> Option<Stri
     // Decode the whole path once up front.  percent_decode on a plain path
     // (no `%XX` sequences) is a no-op and returns a borrowed Cow, so this is
     // cheap in the common case.
-    let decoded = percent_decode_str(raw_path).decode_utf8_lossy().into_owned();
+    let decoded = percent_decode_str(raw_path)
+        .decode_utf8_lossy()
+        .into_owned();
     let path = decoded.as_str();
 
     // Shape 1: .../branches/{branch}[/sub-resource]
@@ -415,7 +417,11 @@ pub fn extract_github_branch(raw_path: &str, query: Option<&str>) -> Option<Stri
         } else {
             tail
         };
-        return if branch.is_empty() { None } else { Some(branch.to_owned()) };
+        return if branch.is_empty() {
+            None
+        } else {
+            Some(branch.to_owned())
+        };
     }
 
     // Shape 2: .../git/refs/heads/{branch}
@@ -423,7 +429,11 @@ pub fn extract_github_branch(raw_path: &str, query: Option<&str>) -> Option<Stri
     const HEADS: &str = "/git/refs/heads/";
     if let Some(idx) = path.find(HEADS) {
         let tail = path[idx + HEADS.len()..].trim_end_matches('/');
-        return if tail.is_empty() { None } else { Some(tail.to_owned()) };
+        return if tail.is_empty() {
+            None
+        } else {
+            Some(tail.to_owned())
+        };
     }
 
     // Shape 3: .../contents/{file-path}?ref={branch}

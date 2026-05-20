@@ -1,22 +1,25 @@
-pub mod trust;
 pub mod broker;
 pub mod infra;
+pub mod presence;
 pub mod spawn;
+pub mod trust;
 
 pub mod age;
+pub mod auth;
 pub mod binary_manifest;
 pub mod bootstrap;
 pub mod device;
 pub mod install;
+pub mod launcher_watch;
 pub mod pricing;
-pub mod session_watcher;
 pub mod session;
+pub mod session_watcher;
 pub mod signature_verifier;
-pub mod sops;
 pub mod snapshot;
+pub mod sops;
 pub mod trust_graph;
 
-/// implementation-note-74: server-side WebAuthn relying-party that
+/// implementation-note-91: server-side WebAuthn relying-party that
 /// gates dashboard approvals on a verified passkey assertion.
 /// Feature-gated so non-default builds (e.g. embedded test
 /// targets) don't pull in the webauthn-rs dep tree.

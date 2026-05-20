@@ -41,6 +41,72 @@ impl LogLevel {
     }
 }
 
+/// Deployment tier — declares the operational posture of this daemon
+/// instance per `.claude/rules/agent-discipline.md` §"dev0/team0/ent0"
+/// vocabulary.
+///
+/// Default is [`DeploymentTier::Dev0`] — single operator on one machine,
+/// `ember-clients` group has exactly one human, file-ACL connect-eligibility
+/// is the auth boundary. Team0+ deployments have multiple operators
+/// sharing the same daemon and require additional authorization controls
+/// that are NOT yet wired (see the startup `team0_connect_only_per_uid_filter_pending`
+/// WARN in `runtime.rs::run` for the gap and implementation-note-171
+/// for the destination work).
+///
+/// The tier is declared explicitly in `config.toml` (`[daemon].tier`)
+/// rather than auto-inferred from ember-clients member count, because
+/// the count is ambiguous on dev0 (the daemon's own `ember` uid is in
+/// the group, service accounts may be too, etc.). Operators who deploy
+/// to team0 or ent0 MUST set the field; the daemon emits a startup WARN
+/// when they do, naming the unfinished invariants.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeploymentTier {
+    /// Single operator, single machine. Cohort A. File-ACL connect-
+    /// eligibility (`0660 ember:ember-clients`) is the auth boundary.
+    #[default]
+    Dev0,
+    /// Small team sharing one daemon (operator + maintainer, 2-5
+    /// operators). Read-class methods MUST filter results by peer.uid;
+    /// this filtering is NOT yet wired. See
+    /// `team0_connect_only_per_uid_filter_pending`.
+    Team0,
+    /// Enterprise multi-tenant. Same gap as Team0 + retention /
+    /// compliance / SLA requirements per design.
+    Ent0,
+}
+
+impl DeploymentTier {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DeploymentTier::Dev0 => "dev0",
+            DeploymentTier::Team0 => "team0",
+            DeploymentTier::Ent0 => "ent0",
+        }
+    }
+
+    /// design default interactive grace window after the last live session
+    /// pin closes on this tier.
+    pub fn interactive_grace_window(&self) -> std::time::Duration {
+        match self {
+            DeploymentTier::Dev0 => std::time::Duration::from_secs(5 * 60),
+            DeploymentTier::Team0 => std::time::Duration::from_secs(2 * 60),
+            DeploymentTier::Ent0 => std::time::Duration::ZERO,
+        }
+    }
+
+    /// `true` for tiers that require per-uid result filtering on
+    /// read-class ConnectOnly methods. Used by `runtime.rs` to decide
+    /// whether to emit the `team0_connect_only_per_uid_filter_pending`
+    /// startup WARN.
+    pub fn requires_multi_uid_authz(&self) -> bool {
+        match self {
+            DeploymentTier::Dev0 => false,
+            DeploymentTier::Team0 | DeploymentTier::Ent0 => true,
+        }
+    }
+}
+
 /// Raw TOML structure — paths may contain `~` and are expanded on load.
 #[derive(Debug, Deserialize)]
 struct RawDaemonSection {
@@ -53,41 +119,55 @@ struct RawDaemonSection {
     stale_approval_threshold_secs: Option<u64>,
     /// Bind address for the git-echo credential-injection proxy. `None` (key
     /// absent) ⇒ default `127.0.0.1:0` (random port). Empty string ⇒ disabled.
-    /// (implementation-note-123)
+    /// (implementation-note-172)
     git_proxy_addr: Option<String>,
     /// Bind address for the general LLM/HTTP credential-injection proxy
     /// (`run_proxy` / `handle_request` — provider-aware auth, X-Ember-* header
     /// protocol). `None` (key absent) ⇒ default `127.0.0.1:0`. Empty string ⇒
     /// disabled. The Anthropic SDK demo path posts to this listener.
-    /// (implementation-note-124)
+    /// (implementation-note-173)
     llm_proxy_addr: Option<String>,
     /// design: vault snapshot interval. Defaults to 3600 (1 hour). `0` disables.
     snapshot_interval_secs: Option<u64>,
-    /// implementation-note-125: interval in seconds between snapshot pull
+    /// implementation-note-174: interval in seconds between snapshot pull
     /// attempts. Defaults to 600 (10 minutes). `0` disables pulling.
     snapshot_pull_interval_secs: Option<u64>,
-    /// implementation-note-125: base URL of the remote EIC snapshot endpoint.
+    /// implementation-note-174: base URL of the remote EIC snapshot endpoint.
     /// `None` disables pulling. Example: `http://eic.tz-net.ts.net:3141`.
     snapshot_pull_endpoint: Option<String>,
-    /// implementation-note-125: cluster id for keying pulled snapshots in the
+    /// implementation-note-174: cluster id for keying pulled snapshots in the
     /// local vault. Required when `snapshot_pull_endpoint` is set.
     snapshot_pull_cluster_id: Option<String>,
-    /// implementation-note-126: absolute path to the pre-built SCION
+    /// implementation-note-175: absolute path to the pre-built SCION
     /// fork binary the daemon shells out to at agent-spawn time. `None`
     /// (key absent) ⇒ pin verification is disabled (development /
     /// non-SCION installs).
     scion_binary_path: Option<String>,
-    /// implementation-note-126: operator-pinned SHA-256 of the SCION
+    /// implementation-note-175: operator-pinned SHA-256 of the SCION
     /// fork binary (lower-hex, 64 chars). `None` (key absent) ⇒ pin
     /// verification is disabled. When `Some`, the daemon refuses to
     /// fork-exec the binary unless its on-disk bytes hash to this value
     /// (CRIT-B TOCTOU defense).
     scion_binary_sha256: Option<String>,
     /// design Component 1 — bind address for the in-container mTLS bridge.
-    /// `None` (key absent) ⇒ platform-specific default (127.0.0.1 on macOS,
-    /// 0.0.0.0 on Linux). Empty string ⇒ disabled. Env-var override
-    /// `EMBER_BRIDGE_BIND` takes precedence over both.
+    /// `None` (key absent) ⇒ bridge lane disabled until an operator explicitly
+    /// opts in. Empty string ⇒ disabled. Env-var override `EMBER_BRIDGE_BIND`
+    /// takes precedence over both.
     bridge_bind: Option<String>,
+    /// design §Component 1 — additive trust-root fingerprints (hex
+    /// Ed25519 pubkeys, optionally `did:key:`-prefixed, comma-separated).
+    /// `None` / empty ⇒ daemon trusts ONLY the compiled-in release
+    /// `IdentityRoot`. Operators add dev / org-policy / endorsement
+    /// roots here without re-shipping the daemon binary. Env-var
+    /// override `EMBER_TRUST_ROOTS` takes precedence when set.
+    trust_roots: Option<String>,
+    /// Deployment tier — `dev0` (default), `team0`, or `ent0`. See
+    /// [`DeploymentTier`] for the operational-posture semantics. Operators
+    /// who deploy to team0 or ent0 MUST set this field; the daemon emits
+    /// a startup WARN on team0+ naming the
+    /// `team0_connect_only_per_uid_filter_pending` invariant so the
+    /// authorization gap is visible to anyone reading the log.
+    tier: Option<DeploymentTier>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,6 +176,14 @@ struct RawConfig {
     keyring: Option<KeyringConfig>,
     presence: Option<PresenceConfigSection>,
     credential_store: Option<CredentialStoreConfig>,
+    /// implementation-note-140 — top-level `[spawn_pool]`
+    /// table. Holds the pre-provisioned uid pool that
+    /// `handle_broker_exec` checks out a uid from before fork+execve
+    /// to drop privileges into. Absent ⇒ pool is disabled and
+    /// `broker_exec` refuses with `-32011` (forces `ember daemon
+    /// install` to provision the pool; the daemon will not silently
+    /// fall back to spawning children as the daemon's own uid).
+    spawn_pool: Option<crate::broker::uid_alloc::SpawnPoolConfig>,
 }
 
 /// Credential-store backend selector (design — sub-piece D).
@@ -117,7 +205,7 @@ struct RawConfig {
 /// cache_ttl_secs = 60
 /// ```
 ///
-/// For the AWS IAM auth method (implementation-note-75) the wire shape is:
+/// For the AWS IAM auth method (implementation-note-92) the wire shape is:
 ///
 /// ```toml
 /// [credential_store]
@@ -134,7 +222,7 @@ struct RawConfig {
 /// / IRSA / ECS task role / Fargate). Vault re-plays a SigV4-signed
 /// `sts:GetCallerIdentity` request server-side as the proof.
 ///
-/// For HashiCorp Cloud Platform (HCP) Vault — implementation-note-127 —
+/// For HashiCorp Cloud Platform (HCP) Vault — implementation-note-176 —
 /// the wire shape is:
 ///
 /// ```toml
@@ -174,14 +262,14 @@ pub struct CredentialStoreConfig {
     /// or `"hcp-service-principal"`. The `"aws"` variant uses the
     /// daemon's surrounding AWS IAM identity (env vars / instance
     /// metadata) to sign a `sts:GetCallerIdentity` request that Vault
-    /// re-plays as the proof (implementation-note-75). The
+    /// re-plays as the proof (implementation-note-92). The
     /// `"hcp-service-principal"` variant exchanges
     /// `(client_id, client_secret)` at HashiCorp Cloud Platform's
     /// OAuth2 IdP for an access_token, then uses that as
     /// `Authorization: Bearer` against the HCP-hosted Vault cluster
-    /// (implementation-note-127). Other methods (Kubernetes SA, JWT/OIDC,
+    /// (implementation-note-176). Other methods (Kubernetes SA, JWT/OIDC,
     /// cert) are out of scope — file follow-ups as
-    /// `implementation-note-128-<METHOD>`.
+    /// `implementation-note-177-<METHOD>`.
     #[serde(default)]
     pub auth: Option<String>,
 
@@ -203,19 +291,19 @@ pub struct CredentialStoreConfig {
     /// `vault auth/aws/role/<role>`). Only consulted when
     /// `auth = "aws"`. AWS credentials themselves come from the
     /// daemon's surrounding identity (env / IMDS / IRSA / etc.), not
-    /// from this config (implementation-note-75).
+    /// from this config (implementation-note-92).
     #[serde(default)]
     pub role: Option<String>,
 
     /// HCP service-principal auth: client id (always inline —
     /// non-secret). Only consulted when
-    /// `auth = "hcp-service-principal"` (implementation-note-127).
+    /// `auth = "hcp-service-principal"` (implementation-note-176).
     #[serde(default)]
     pub client_id: Option<String>,
 
     /// HCP service-principal auth: client secret. Supports `@<path>`
     /// to read from a file. Only consulted when
-    /// `auth = "hcp-service-principal"` (implementation-note-127).
+    /// `auth = "hcp-service-principal"` (implementation-note-176).
     #[serde(default)]
     pub client_secret: Option<String>,
 
@@ -318,7 +406,7 @@ pub struct PresenceConfigSection {
 /// Daemon-level configuration loaded from `~/.ember/config.toml` (or the path
 /// resolved from `--config` / `EMBER_CONFIG`).
 ///
-/// **No `impl Default`** — per implementation-note-129, every
+/// **No `impl Default`** — per implementation-note-178, every
 /// constructor must be explicit so that test partial-overrides can't silently
 /// pull user-home paths. The type system pins the rule:
 ///
@@ -342,14 +430,14 @@ pub struct DaemonConfig {
     pub dashboard_addr: Option<SocketAddr>,
     /// Bind address for the git-echo credential-injection proxy used by
     /// sandboxed agents (`EMBER_GIT_PROXY_URL`). `None` disables the proxy.
-    /// Defaults to `127.0.0.1:0` (loopback, ephemeral port). implementation-note-123.
+    /// Defaults to `127.0.0.1:0` (loopback, ephemeral port). implementation-note-172.
     pub git_proxy_addr: Option<SocketAddr>,
     /// Bind address for the general LLM/HTTP credential-injection proxy
     /// (`run_proxy` / `handle_request`). Surfaced to clients as
     /// `EMBER_PROXY_URL` and `<data_dir>/run/proxy.url`. Provider-aware auth
     /// (Anthropic `x-api-key`, generic Bearer). `None` disables the listener.
     /// Defaults to `127.0.0.1:0` (loopback, ephemeral port).
-    /// implementation-note-124.
+    /// implementation-note-173.
     pub llm_proxy_addr: Option<SocketAddr>,
     /// Keyring service/account override. `None` fields fall back to env var, then compile-time default.
     pub keyring: KeyringConfig,
@@ -359,13 +447,13 @@ pub struct DaemonConfig {
     /// design — vault snapshot interval in seconds. Default 3600 (1 hour).
     /// Set to 0 to disable periodic snapshots.
     pub snapshot_interval_secs: u64,
-    /// implementation-note-125 — periodic pull interval in seconds. Default
+    /// implementation-note-174 — periodic pull interval in seconds. Default
     /// 600 (10 min). Set to 0 to disable pulling.
     pub snapshot_pull_interval_secs: u64,
-    /// implementation-note-125 — base URL of the remote EIC snapshot endpoint.
+    /// implementation-note-174 — base URL of the remote EIC snapshot endpoint.
     /// `None` means pulling is not configured.
     pub snapshot_pull_endpoint: Option<String>,
-    /// implementation-note-125 — cluster id used to key pulled snapshots in
+    /// implementation-note-174 — cluster id used to key pulled snapshots in
     /// the local vault. Required when `snapshot_pull_endpoint` is `Some`.
     pub snapshot_pull_cluster_id: Option<String>,
     /// Per-op user-presence gate. Loaded from `[presence]`
@@ -375,12 +463,12 @@ pub struct DaemonConfig {
     /// means no `[credential_store]` section was present, which the
     /// daemon treats as `backend = "local"` (the existing vault path).
     pub credential_store: Option<CredentialStoreConfig>,
-    /// implementation-note-126 — absolute path to the pre-built
+    /// implementation-note-175 — absolute path to the pre-built
     /// SCION fork binary the daemon shells out to at agent-spawn time.
     /// `PathBuf::new()` (empty) means pin verification is disabled
     /// (development / non-SCION installs).
     pub scion_binary_path: PathBuf,
-    /// implementation-note-126 — operator-pinned SHA-256 of the
+    /// implementation-note-175 — operator-pinned SHA-256 of the
     /// SCION fork binary (lower-hex, 64 chars). Empty string means
     /// pin verification is disabled. When non-empty, the spawn path
     /// calls [`crate::spawn::scion::verify_scion_binary_hash`] before
@@ -389,16 +477,48 @@ pub struct DaemonConfig {
     /// design Component 1 — bind address for the in-container mTLS
     /// bridge. `None` disables the bridge listener.
     ///
-    /// ember_bridge_bind_platform_defaults: platform-specific defaults
-    /// when neither the config file nor `EMBER_BRIDGE_BIND` env var is
-    /// set — `127.0.0.1` on macOS (loopback; host.docker.internal
-    /// resolves to a virtual address that Docker NATs to the host),
-    /// `0.0.0.0` on Linux (host.docker.internal resolves to the docker0
-    /// bridge IP, which the daemon must bind to receive container-
-    /// originated mTLS connections). Operators on multi-tenant Linux
-    /// hosts SHOULD override via `EMBER_BRIDGE_BIND=<docker0-IP>` for
-    /// surgical scoping; see [design §"Multi-tenant hardening"].
+    /// The lane is currently explicit opt-in: when neither the config file nor
+    /// `EMBER_BRIDGE_BIND` env var is set, startup treats the bridge as
+    /// disabled and skips the Bridge CA private-key bootstrap path.
+    /// Operators who want the bridge lane set this to a concrete bind address;
+    /// see [design §"Multi-tenant hardening"] for Linux scoping guidance.
     pub bridge_bind: Option<SocketAddr>,
+    /// design §Component 1 — comma-separated additive trust-root
+    /// fingerprints (hex Ed25519 pubkeys, optionally `did:key:`-prefixed).
+    /// Empty string ⇒ daemon trusts only the compiled-in release
+    /// `IdentityRoot`. The verifier UNION's this set with the bundled
+    /// release root and tries each on every manifest-signature check —
+    /// the verification code path runs unconditionally; dev/prod
+    /// daemons share one flow parameterized only by the trust-set
+    /// contents.
+    ///
+    /// Resolution order (highest precedence first):
+    ///   1. `EMBER_TRUST_ROOTS` env var (operator override).
+    ///   2. `[daemon].trust_roots` config field.
+    ///   3. Empty (release-only).
+    pub trust_roots: String,
+    /// implementation-note-140 — pre-provisioned uid pool the
+    /// broker_exec spawn paths drop into before execve. `None` ⇒ the
+    /// pool is not configured and `handle_broker_exec` refuses with
+    /// `-32011` ("spawn pool not configured — `ember daemon install`
+    /// must provision the uid pool"). Closes Finding 14 (refuse to
+    /// spawn a child as the daemon's own uid) and the cross-spawn
+    /// `/proc/<pid>/environ` side-channel. See `broker/uid_alloc.rs`
+    /// for the pool primitives; see design (amendment to design)
+    /// for the per-spawn ephemeral-uid allocation strategy.
+    ///
+    /// ```toml
+    /// [spawn_pool]
+    /// uids = [10010, 10011, 10012, 10013, 10014, 10015, 10016, 10017]
+    /// gid = 10010
+    /// ```
+    pub spawn_pool: Option<crate::broker::uid_alloc::SpawnPoolConfig>,
+    /// Deployment tier — see [`DeploymentTier`]. Default [`DeploymentTier::Dev0`].
+    /// Read from `[daemon].tier` in config.toml. The runtime emits a startup
+    /// WARN naming `team0_connect_only_per_uid_filter_pending` when this is
+    /// Team0 or Ent0, surfacing the in-flight ConnectOnly read-class
+    /// per-uid filtering gap.
+    pub tier: DeploymentTier,
 }
 
 fn expand_tilde(path: &str) -> Result<PathBuf, ConfigError> {
@@ -412,30 +532,7 @@ fn expand_tilde(path: &str) -> Result<PathBuf, ConfigError> {
     }
 }
 
-/// ember_bridge_bind_platform_defaults — design Component 1 platform-conditional
-/// default for the mTLS bridge listener. macOS uses loopback (host.docker.internal
-/// NATs to the host); Linux uses 0.0.0.0 because host.docker.internal resolves
-/// to the docker0 bridge IP, which the daemon must bind to receive container-
-/// originated connections. Multi-tenant Linux hosts SHOULD override via
-/// `EMBER_BRIDGE_BIND=<docker0-IP>` (see design §"Multi-tenant hardening").
-/// Port `0` lets the kernel assign; the daemon will advertise the bound port
-/// to clients via bridge-discovery once the listener ships.
-fn default_bridge_bind() -> SocketAddr {
-    #[cfg(target_os = "macos")]
-    {
-        "127.0.0.1:0".parse().expect("valid default bridge_bind")
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        // Linux + every non-macOS target. Container DNS for the host
-        // (host.docker.internal on Docker Desktop, the docker0 bridge IP
-        // for native Docker engine) only reaches a daemon bound to a
-        // routable address; 127.0.0.1 won't work from inside a container.
-        "0.0.0.0:0".parse().expect("valid default bridge_bind")
-    }
-}
-
-// implementation-note-130: `impl Default for DaemonConfig`
+// implementation-note-179: `impl Default for DaemonConfig`
 // is REMOVED. The May-12 25-hour leaked-daemon incident was rooted in
 // `DaemonConfig { data_dir: tmpdir.path()..., ..Default::default() }`
 // partial-overrides silently inheriting user-home paths. The type
@@ -445,24 +542,24 @@ fn default_bridge_bind() -> SocketAddr {
 // from `Self::load_defaults()` (private; see below). See doc-test on
 // the struct above for the compile_fail pin.
 //
-// implementation-note-131
+// implementation-note-180
 
 impl DaemonConfig {
-    /// implementation-note-132 (Phase 1 substrate) — tempdir-scoped
+    /// implementation-note-181 (Phase 1 substrate) — tempdir-scoped
     /// test constructor. Sets every path-bearing field under `tmpdir` so a
     /// T3 test cannot accidentally bind the operator's real
     /// `~/.ember/run/daemon.sock` (the May-12 25-hour leaked-daemon
     /// incident root cause).
     ///
     /// Tests MUST use this instead of `..Default::default()` partial-overrides.
-    /// Subtask B (implementation-note-133) migrates existing
+    /// Subtask B (implementation-note-182) migrates existing
     /// callers off `Default` so the type system enforces the rule by
     /// removing `impl Default` entirely.
     ///
     /// # target_state_anchor
     ///
     /// `DaemonConfig::for_test`
-    /// implementation-note-130: private fallback ctor used by
+    /// implementation-note-179: private fallback ctor used by
     /// `load` when the on-disk TOML omits a field. Replaces the prior
     /// `impl Default` role. Tests that previously asserted on
     /// `DaemonConfig::default()`'s shape now call this method directly via
@@ -489,15 +586,26 @@ impl DaemonConfig {
             snapshot_pull_cluster_id: None,
             presence: PresenceConfigSection::default(),
             credential_store: None,
-            // implementation-note-126: empty defaults mean verification
+            // implementation-note-175: empty defaults mean verification
             // is opt-in — production configs MUST set both.
             scion_binary_path: PathBuf::new(),
             scion_binary_sha256: String::new(),
-            // design Component 1 — platform-specific default. Port 0 → kernel
-            // assigns; the daemon advertises the bound port to clients via the
-            // bridge-discovery flow once that ships. Linux uses 0.0.0.0 so
-            // host.docker.internal (docker0 bridge) can reach the daemon.
-            bridge_bind: Some(default_bridge_bind()),
+            // Bridge lane is explicit opt-in in current shipped posture.
+            bridge_bind: None,
+            // design §Component 1 — empty default means "release-only trust
+            // set"; operators add dev / org roots via `EMBER_TRUST_ROOTS`
+            // or `[daemon].trust_roots` without re-shipping the binary.
+            trust_roots: String::new(),
+            // implementation-note-140 — default is `None`
+            // ("pool not configured"). The installer writes
+            // `[spawn_pool]` into the operator's config.toml when
+            // `ember daemon install` runs; daemons running pre-
+            // installer must surface `-32011` rather than silently
+            // spawning as their own uid.
+            spawn_pool: None,
+            // Default tier is Dev0 — single-operator file-ACL boundary.
+            // Operators deploying team0/ent0 set this in config.toml.
+            tier: DeploymentTier::Dev0,
         }
     }
 
@@ -533,6 +641,20 @@ impl DaemonConfig {
             // Tests disable the bridge by default — explicit opt-in via
             // override matches dashboard_addr / git_proxy_addr / llm_proxy_addr.
             bridge_bind: None,
+            // design §Component 1 — tests default to release-only (the
+            // compiled-in IdentityRoot). Tests that exercise dev-mode
+            // trust-root semantics override explicitly.
+            trust_roots: String::new(),
+            // implementation-note-140 — tests default to
+            // `None`. Broker-exec tests that need a working spawn
+            // path call `uid_alloc::init_uid_pool_for_test()` directly
+            // to install a process-global pool keyed on the current
+            // uid; this field stays `None` so DaemonConfig round-trip
+            // tests stay deterministic.
+            spawn_pool: None,
+            // Tests default to Dev0 (the cohort A posture). Tests that
+            // exercise the team0+ startup-WARN path override explicitly.
+            tier: DeploymentTier::Dev0,
         }
     }
 
@@ -564,6 +686,8 @@ impl DaemonConfig {
             scion_binary_path: None,
             scion_binary_sha256: None,
             bridge_bind: None,
+            trust_roots: None,
+            tier: None,
         });
 
         let socket_dir = match section.socket_dir {
@@ -625,7 +749,7 @@ impl DaemonConfig {
 
         let credential_store = raw.credential_store;
 
-        // implementation-note-126: expand `~` so operators can write
+        // implementation-note-175: expand `~` so operators can write
         // the path naturally; empty/absent fields fall back to defaults
         // (empty path, empty hash) which disable verification — same
         // semantics as not setting the keys at all.
@@ -642,8 +766,7 @@ impl DaemonConfig {
         //   1. `EMBER_BRIDGE_BIND` env var (operator override, highest precedence;
         //      empty string disables, matches dashboard/proxy convention).
         //   2. `[daemon].bridge_bind` config field (empty string disables).
-        //   3. Platform-conditional default (127.0.0.1:0 on macOS, 0.0.0.0:0
-        //      on Linux/other) — see `default_bridge_bind()`.
+        //   3. Absent at both layers ⇒ bridge lane disabled by default.
         let bridge_bind: Option<SocketAddr> = {
             let env_value = std::env::var("EMBER_BRIDGE_BIND").ok();
             match (env_value.as_deref(), section.bridge_bind.as_deref()) {
@@ -660,10 +783,33 @@ impl DaemonConfig {
                 (None, Some(s)) => Some(SocketAddr::from_str(s).map_err(|e| {
                     ConfigError::Validation(format!("invalid bridge_bind '{}': {}", s, e))
                 })?),
-                // Neither override present → platform-specific default.
+                // Neither override present → bridge disabled.
                 (None, None) => defaults.bridge_bind,
             }
         };
+
+        // design §Component 1 — trust-root resolution order:
+        //   1. `EMBER_TRUST_ROOTS` env var (operator override; matches the
+        //      `EMBER_BRIDGE_BIND` precedence convention).
+        //   2. `[daemon].trust_roots` config field.
+        //   3. Empty string (release-only).
+        let trust_roots: String = match std::env::var("EMBER_TRUST_ROOTS").ok() {
+            Some(v) => v,
+            None => section.trust_roots.unwrap_or_default(),
+        };
+
+        // implementation-note-140 — top-level `[spawn_pool]`
+        // table is consumed verbatim. `None` (absent) ⇒ broker_exec
+        // refuses with `-32011`; `Some` ⇒ the pool is installed via
+        // `uid_alloc::init_uid_pool` during runtime startup.
+        let spawn_pool = raw.spawn_pool;
+
+        // Deployment tier — `[daemon].tier`. Absent ⇒ DeploymentTier::Dev0
+        // (single-operator cohort A). The runtime startup path emits a
+        // WARN naming `team0_connect_only_per_uid_filter_pending` when this
+        // resolves to Team0/Ent0, surfacing the in-flight ConnectOnly
+        // read-class per-uid filtering gap.
+        let tier = section.tier.unwrap_or(DeploymentTier::Dev0);
 
         let cfg = DaemonConfig {
             socket_dir,
@@ -685,6 +831,9 @@ impl DaemonConfig {
             scion_binary_path,
             scion_binary_sha256,
             bridge_bind,
+            trust_roots,
+            spawn_pool,
+            tier,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -692,13 +841,19 @@ impl DaemonConfig {
 
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.socket_dir.as_os_str().is_empty() {
-            return Err(ConfigError::Validation("socket_dir cannot be empty".to_string()));
+            return Err(ConfigError::Validation(
+                "socket_dir cannot be empty".to_string(),
+            ));
         }
         if self.data_dir.as_os_str().is_empty() {
-            return Err(ConfigError::Validation("data_dir cannot be empty".to_string()));
+            return Err(ConfigError::Validation(
+                "data_dir cannot be empty".to_string(),
+            ));
         }
         if self.pid_file.as_os_str().is_empty() {
-            return Err(ConfigError::Validation("pid_file cannot be empty".to_string()));
+            return Err(ConfigError::Validation(
+                "pid_file cannot be empty".to_string(),
+            ));
         }
         if self.socket_dir == self.data_dir {
             return Err(ConfigError::Validation(
@@ -732,6 +887,110 @@ mod tests {
         assert!(cfg.data_dir.to_string_lossy().contains(".ember"));
         assert!(cfg.pid_file.to_string_lossy().contains(".ember"));
         assert_eq!(cfg.log_level, LogLevel::Info);
+    }
+
+    // ─── DeploymentTier (MED-2 fix) ─────────────────────────────────────
+
+    #[test]
+    fn deployment_tier_default_is_dev0() {
+        let cfg = DaemonConfig::load_defaults();
+        assert_eq!(cfg.tier, DeploymentTier::Dev0);
+    }
+
+    #[test]
+    fn deployment_tier_dev0_does_not_require_multi_uid_authz() {
+        assert!(!DeploymentTier::Dev0.requires_multi_uid_authz());
+    }
+
+    #[test]
+    fn deployment_tier_team0_requires_multi_uid_authz() {
+        assert!(DeploymentTier::Team0.requires_multi_uid_authz());
+    }
+
+    #[test]
+    fn deployment_tier_ent0_requires_multi_uid_authz() {
+        assert!(DeploymentTier::Ent0.requires_multi_uid_authz());
+    }
+
+    #[test]
+    fn deployment_tier_as_str_matches_serde_lowercase() {
+        // Serde rename_all = "lowercase" must agree with `as_str` so
+        // operator-facing TOML and operator-facing log lines use the
+        // same identifiers. If these drift, `[daemon].tier = "team0"`
+        // in TOML and `tier=Team0` in the log would confuse operators.
+        assert_eq!(DeploymentTier::Dev0.as_str(), "dev0");
+        assert_eq!(DeploymentTier::Team0.as_str(), "team0");
+        assert_eq!(DeploymentTier::Ent0.as_str(), "ent0");
+    }
+
+    #[test]
+    fn config_load_parses_tier_dev0() {
+        let toml_str = "[daemon]\nlog_level = \"info\"\ntier = \"dev0\"\n";
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+        let cfg = DaemonConfig::load(f.path()).unwrap();
+        assert_eq!(cfg.tier, DeploymentTier::Dev0);
+    }
+
+    #[test]
+    fn config_load_parses_tier_team0() {
+        let toml_str = "[daemon]\nlog_level = \"info\"\ntier = \"team0\"\n";
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+        let cfg = DaemonConfig::load(f.path()).unwrap();
+        assert_eq!(cfg.tier, DeploymentTier::Team0);
+        assert!(cfg.tier.requires_multi_uid_authz());
+    }
+
+    #[test]
+    fn config_load_parses_tier_ent0() {
+        let toml_str = "[daemon]\nlog_level = \"info\"\ntier = \"ent0\"\n";
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+        let cfg = DaemonConfig::load(f.path()).unwrap();
+        assert_eq!(cfg.tier, DeploymentTier::Ent0);
+    }
+
+    #[test]
+    fn config_load_absent_tier_defaults_to_dev0() {
+        // No tier line in TOML — falls through to Dev0 default. This is
+        // the dev0 friction-first path: operators don't need to declare
+        // their tier explicitly for cohort A.
+        let toml_str = "[daemon]\nlog_level = \"info\"\n";
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+        let cfg = DaemonConfig::load(f.path()).unwrap();
+        assert_eq!(cfg.tier, DeploymentTier::Dev0);
+    }
+
+    #[test]
+    fn config_load_rejects_unknown_tier() {
+        // Unknown values fail TOML parse (serde enum + lowercase) so
+        // operators can't accidentally ship `tier = "team-0"` or
+        // `tier = "TEAM0"` and silently fall back to dev0.
+        let toml_str = "[daemon]\nlog_level = \"info\"\ntier = \"team-0\"\n";
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+        let err = DaemonConfig::load(f.path()).unwrap_err();
+        assert!(matches!(err, ConfigError::Parse(_)));
+    }
+
+    #[test]
+    fn deployment_tier_interactive_grace_windows_match_adr_139() {
+        use std::time::Duration;
+
+        assert_eq!(
+            DeploymentTier::Dev0.interactive_grace_window(),
+            Duration::from_secs(5 * 60)
+        );
+        assert_eq!(
+            DeploymentTier::Team0.interactive_grace_window(),
+            Duration::from_secs(2 * 60)
+        );
+        assert_eq!(
+            DeploymentTier::Ent0.interactive_grace_window(),
+            Duration::ZERO
+        );
     }
 
     #[test]
@@ -780,6 +1039,9 @@ mod tests {
             scion_binary_path: PathBuf::new(),
             scion_binary_sha256: String::new(),
             bridge_bind: None,
+            trust_roots: String::new(),
+            spawn_pool: None,
+            tier: DeploymentTier::Dev0,
         };
 
         cfg.ensure_dirs().unwrap();
@@ -874,6 +1136,9 @@ mod tests {
             scion_binary_path: PathBuf::new(),
             scion_binary_sha256: String::new(),
             bridge_bind: None,
+            trust_roots: String::new(),
+            spawn_pool: None,
+            tier: DeploymentTier::Dev0,
         };
         let err = cfg.validate().unwrap_err();
         assert!(matches!(err, ConfigError::Validation(ref s) if s.contains("socket_dir")));
@@ -901,6 +1166,9 @@ mod tests {
             scion_binary_path: PathBuf::new(),
             scion_binary_sha256: String::new(),
             bridge_bind: None,
+            trust_roots: String::new(),
+            spawn_pool: None,
+            tier: DeploymentTier::Dev0,
         };
         let err = cfg.validate().unwrap_err();
         assert!(matches!(err, ConfigError::Validation(ref s) if s.contains("must be different")));
@@ -964,7 +1232,8 @@ mod tests {
 
     #[test]
     fn credential_store_section_local_backend() {
-        let toml_str = "[daemon]\nlog_level = \"info\"\n\n[credential_store]\nbackend = \"local\"\n";
+        let toml_str =
+            "[daemon]\nlog_level = \"info\"\n\n[credential_store]\nbackend = \"local\"\n";
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(toml_str.as_bytes()).unwrap();
         let loaded = DaemonConfig::load(f.path()).unwrap();
@@ -1025,7 +1294,7 @@ mod tests {
 
     #[test]
     fn scion_binary_pin_absent_gives_empty_defaults() {
-        // implementation-note-126: when neither key is set the
+        // implementation-note-175: when neither key is set the
         // daemon treats verification as disabled (dev installs).
         let toml_str = "[daemon]\nlog_level = \"info\"\n";
         let mut f = NamedTempFile::new().unwrap();
@@ -1037,7 +1306,7 @@ mod tests {
 
     #[test]
     fn scion_binary_pin_loaded_from_toml() {
-        // implementation-note-126: both fields round-trip through
+        // implementation-note-175: both fields round-trip through
         // TOML so operators can pin the binary in `config.toml`.
         let toml_str = "[daemon]\nlog_level = \"info\"\nscion_binary_path = \"/opt/scion/scion\"\nscion_binary_sha256 = \"abc123\"\n";
         let mut f = NamedTempFile::new().unwrap();
@@ -1045,5 +1314,235 @@ mod tests {
         let loaded = DaemonConfig::load(f.path()).unwrap();
         assert_eq!(loaded.scion_binary_path, PathBuf::from("/opt/scion/scion"));
         assert_eq!(loaded.scion_binary_sha256, "abc123");
+    }
+
+    // -----------------------------------------------------------------
+    // implementation-note-140 — `[spawn_pool]` TOML deserializer.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn spawn_pool_absent_defaults_to_none() {
+        // Default posture: no [spawn_pool] section means the daemon
+        // treats the pool as not-configured and broker_exec refuses
+        // with -32021. The installer must provision the pool to
+        // unblock broker_exec.
+        let toml_str = "[daemon]\nlog_level = \"info\"\n";
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+        let loaded = DaemonConfig::load(f.path()).unwrap();
+        assert!(loaded.spawn_pool.is_none());
+    }
+
+    #[test]
+    fn spawn_pool_loaded_from_toml() {
+        // The installer writes this shape; the daemon parses it on
+        // startup and installs the pool via uid_alloc::init_uid_pool.
+        let toml_str = "[daemon]\nlog_level = \"info\"\n\n[spawn_pool]\nuids = [10010, 10011, 10012]\ngid = 10020\n";
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+        let loaded = DaemonConfig::load(f.path()).unwrap();
+        let pool = loaded.spawn_pool.expect("spawn_pool must round-trip");
+        assert_eq!(pool.uids, vec![10010, 10011, 10012]);
+        assert_eq!(pool.gid, 10020);
+    }
+
+    #[test]
+    fn spawn_pool_accepts_empty_uid_list() {
+        // An empty uids array is semantically "pool configured but
+        // useless"; the daemon surfaces this at checkout time as
+        // -32021 (PoolEmpty). The config parser accepts the shape so
+        // operators can stage installs that provision uids later.
+        let toml_str = "[daemon]\nlog_level = \"info\"\n\n[spawn_pool]\nuids = []\ngid = 10020\n";
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+        let loaded = DaemonConfig::load(f.path()).unwrap();
+        let pool = loaded.spawn_pool.expect("spawn_pool present");
+        assert!(pool.uids.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // implementation-note-163 — design Component 2 subuid range
+    // round-trips through the DaemonConfig parser. The installer writes
+    // this shape on modern-Linux hosts where unprivileged_userns_clone=1.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn spawn_pool_subuid_range_round_trips() {
+        let toml_str = "[daemon]\nlog_level = \"info\"\n\n[spawn_pool]\nsubuid_range_start = 100000\nsubuid_range_slots = 8192\n";
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+        let loaded = DaemonConfig::load(f.path()).unwrap();
+        let pool = loaded.spawn_pool.expect("spawn_pool must round-trip");
+        assert_eq!(pool.subuid_range_start, Some(100_000));
+        assert_eq!(pool.subuid_range_slots, Some(8192));
+        // The legacy uid-list fields default to empty on the subuid path
+        // (the kernel-side range IS the pool — no enumerated uids).
+        assert!(pool.uids.is_empty());
+    }
+
+    #[test]
+    fn spawn_pool_subuid_absent_defaults_to_none() {
+        // Legacy shape (only uids/gid present) — subuid fields default
+        // to None so the installer can detect "this is a system-user
+        // pool, not a subuid range pool" downstream.
+        let toml_str =
+            "[daemon]\nlog_level = \"info\"\n\n[spawn_pool]\nuids = [10010]\ngid = 10020\n";
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+        let loaded = DaemonConfig::load(f.path()).unwrap();
+        let pool = loaded.spawn_pool.expect("spawn_pool present");
+        assert_eq!(pool.subuid_range_start, None);
+        assert_eq!(pool.subuid_range_slots, None);
+        assert_eq!(pool.uids, vec![10010]);
+        assert_eq!(pool.gid, 10020);
+    }
+
+    #[test]
+    fn bridge_bind_absent_defaults_to_disabled() {
+        let toml_str = "[daemon]\nlog_level = \"info\"\n";
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+        let _guard = crate::PROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("EMBER_BRIDGE_BIND").ok();
+        // SAFETY: serialized via PROCESS_TEST_LOCK above.
+        unsafe {
+            std::env::remove_var("EMBER_BRIDGE_BIND");
+        }
+        let loaded = DaemonConfig::load(f.path()).unwrap();
+        assert_eq!(loaded.bridge_bind, None);
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("EMBER_BRIDGE_BIND", v),
+                None => std::env::remove_var("EMBER_BRIDGE_BIND"),
+            }
+        }
+    }
+
+    #[test]
+    fn bridge_bind_from_config_field() {
+        let toml_str = "[daemon]\nlog_level = \"info\"\nbridge_bind = \"127.0.0.1:8443\"\n";
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+        let _guard = crate::PROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("EMBER_BRIDGE_BIND").ok();
+        // SAFETY: serialized via PROCESS_TEST_LOCK above.
+        unsafe {
+            std::env::remove_var("EMBER_BRIDGE_BIND");
+        }
+        let loaded = DaemonConfig::load(f.path()).unwrap();
+        assert_eq!(loaded.bridge_bind, Some("127.0.0.1:8443".parse().unwrap()));
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("EMBER_BRIDGE_BIND", v),
+                None => std::env::remove_var("EMBER_BRIDGE_BIND"),
+            }
+        }
+    }
+
+    #[test]
+    fn bridge_bind_env_overrides_config_field() {
+        let toml_str = "[daemon]\nlog_level = \"info\"\nbridge_bind = \"127.0.0.1:8443\"\n";
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+        let _guard = crate::PROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("EMBER_BRIDGE_BIND").ok();
+        // SAFETY: serialized via PROCESS_TEST_LOCK above.
+        unsafe {
+            std::env::set_var("EMBER_BRIDGE_BIND", "127.0.0.1:9443");
+        }
+        let loaded = DaemonConfig::load(f.path()).unwrap();
+        assert_eq!(loaded.bridge_bind, Some("127.0.0.1:9443".parse().unwrap()));
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("EMBER_BRIDGE_BIND", v),
+                None => std::env::remove_var("EMBER_BRIDGE_BIND"),
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // design §Component 1 — trust-root config parsing tests (T2-shape:
+    // exercise the TOML→DaemonConfig load boundary).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn trust_roots_absent_defaults_to_empty() {
+        // Prod default: no env, no config field → empty trust_roots
+        // (daemon's startup wiring then trusts only the compiled-in
+        // release IdentityRoot).
+        let toml_str = "[daemon]\nlog_level = \"info\"\n";
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+        // Guard against an env-var leak from a parallel test by clearing
+        // EMBER_TRUST_ROOTS for this call. Re-set after to preserve
+        // ambient state.
+        let _guard = crate::PROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("EMBER_TRUST_ROOTS").ok();
+        // SAFETY: serialized via PROCESS_TEST_LOCK above; env mutation
+        // is scoped to this test body and restored before the lock drops.
+        unsafe {
+            std::env::remove_var("EMBER_TRUST_ROOTS");
+        }
+        let loaded = DaemonConfig::load(f.path()).unwrap();
+        assert_eq!(loaded.trust_roots, "");
+        if let Some(v) = prior {
+            unsafe {
+                std::env::set_var("EMBER_TRUST_ROOTS", v);
+            }
+        }
+    }
+
+    #[test]
+    fn trust_roots_from_config_field() {
+        let toml_str = "[daemon]\nlog_level = \"info\"\ntrust_roots = \"did:key:aabb\"\n";
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+        let _guard = crate::PROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("EMBER_TRUST_ROOTS").ok();
+        // SAFETY: serialized via PROCESS_TEST_LOCK above.
+        unsafe {
+            std::env::remove_var("EMBER_TRUST_ROOTS");
+        }
+        let loaded = DaemonConfig::load(f.path()).unwrap();
+        assert_eq!(loaded.trust_roots, "did:key:aabb");
+        if let Some(v) = prior {
+            unsafe {
+                std::env::set_var("EMBER_TRUST_ROOTS", v);
+            }
+        }
+    }
+
+    #[test]
+    fn trust_roots_env_overrides_config_field() {
+        // Env precedence matches the EMBER_BRIDGE_BIND convention.
+        let toml_str = "[daemon]\nlog_level = \"info\"\ntrust_roots = \"did:key:from-toml\"\n";
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(toml_str.as_bytes()).unwrap();
+        let _guard = crate::PROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("EMBER_TRUST_ROOTS").ok();
+        // SAFETY: serialized via PROCESS_TEST_LOCK above.
+        unsafe {
+            std::env::set_var("EMBER_TRUST_ROOTS", "did:key:from-env");
+        }
+        let loaded = DaemonConfig::load(f.path()).unwrap();
+        assert_eq!(loaded.trust_roots, "did:key:from-env");
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("EMBER_TRUST_ROOTS", v),
+                None => std::env::remove_var("EMBER_TRUST_ROOTS"),
+            }
+        }
     }
 }

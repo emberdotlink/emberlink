@@ -1,6 +1,6 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
-use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrustedImage {
@@ -52,23 +52,29 @@ impl ImageRegistry {
                     new_digest = digest,
                     "image digest changed — possible tag mutation"
                 );
-                self.images.insert(name.to_string(), TrustedImage {
-                    name: name.to_string(),
-                    digest: digest.to_string(),
-                    source: source.to_string(),
-                    first_seen: now.clone(),
-                    last_verified: now,
-                });
+                self.images.insert(
+                    name.to_string(),
+                    TrustedImage {
+                        name: name.to_string(),
+                        digest: digest.to_string(),
+                        source: source.to_string(),
+                        first_seen: now.clone(),
+                        last_verified: now,
+                    },
+                );
                 true
             }
             None => {
-                self.images.insert(name.to_string(), TrustedImage {
-                    name: name.to_string(),
-                    digest: digest.to_string(),
-                    source: source.to_string(),
-                    first_seen: now.clone(),
-                    last_verified: now,
-                });
+                self.images.insert(
+                    name.to_string(),
+                    TrustedImage {
+                        name: name.to_string(),
+                        digest: digest.to_string(),
+                        source: source.to_string(),
+                        first_seen: now.clone(),
+                        last_verified: now,
+                    },
+                );
                 true
             }
         }
@@ -76,7 +82,9 @@ impl ImageRegistry {
 
     /// Check if an image name matches a trusted digest
     pub fn verify(&self, name: &str, digest: &str) -> bool {
-        self.images.get(name).is_some_and(|img| img.digest == digest)
+        self.images
+            .get(name)
+            .is_some_and(|img| img.digest == digest)
     }
 }
 

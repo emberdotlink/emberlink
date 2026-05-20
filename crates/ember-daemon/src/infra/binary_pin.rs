@@ -24,7 +24,7 @@
 //!   binary blake3 against the manifest. Mismatch → fail-closed.
 //! - Missing manifest → fail-closed with directive to run generate.
 //!
-//! Path 2 (filed as `implementation-note-122`) replaces the
+//! Path 2 (filed as `implementation-note-170`) replaces the
 //! daemon-self-signing model with Ember Systems IdentityRoot pre-signing
 //! in the release pipeline. Until then, this module's TOFU is the
 //! strongest v0.3-shippable check.
@@ -40,7 +40,9 @@
 
 use std::path::Path;
 
-use core_crypto::{Ed25519Verifier, PublicKey, Signature, Signer, sign_with_context, verify_with_context};
+use core_crypto::{
+    Ed25519Verifier, PublicKey, Signature, Signer, sign_with_context, verify_with_context,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::infra::store::DaemonStore;
@@ -192,9 +194,7 @@ fn peer_binary_path(pid: i32) -> Option<std::path::PathBuf> {
         fn proc_pidpath(pid: c_int, buffer: *mut c_char, buffersize: u32) -> c_int;
     }
     let mut buf = vec![0u8; PROC_PIDPATHINFO_MAXSIZE];
-    let n = unsafe {
-        proc_pidpath(pid, buf.as_mut_ptr() as *mut c_char, buf.len() as u32)
-    };
+    let n = unsafe { proc_pidpath(pid, buf.as_mut_ptr() as *mut c_char, buf.len() as u32) };
     if n <= 0 {
         return None;
     }
@@ -216,8 +216,7 @@ fn peer_binary_path(_pid: i32) -> Option<std::path::PathBuf> {
 /// Compute blake3 of the peer's executable file. Returns hex-encoded
 /// 64-char hash on success, structured error otherwise.
 pub fn peer_binary_blake3(pid: i32) -> Result<String, BinaryPinError> {
-    let path = peer_binary_path(pid)
-        .ok_or(BinaryPinError::PeerBinaryPathUnavailable { pid })?;
+    let path = peer_binary_path(pid).ok_or(BinaryPinError::PeerBinaryPathUnavailable { pid })?;
     hash_file_blake3(&path)
 }
 
@@ -464,9 +463,8 @@ mod tests {
     #[test]
     fn verify_peer_against_manifest_rejects_no_pin() {
         let manifest = BinaryPinManifest::new(vec![], "ed25519:fake");
-        let err =
-            verify_peer_against_manifest(Some(std::process::id() as i32), "cli", &manifest)
-                .unwrap_err();
+        let err = verify_peer_against_manifest(Some(std::process::id() as i32), "cli", &manifest)
+            .unwrap_err();
         assert!(matches!(err, BinaryPinError::NoPinForCaller { .. }));
     }
 

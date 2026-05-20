@@ -1,5 +1,5 @@
 //!
-//! implementation-note-265: integration tests for `handle_spawn_directive`
+//! implementation-note-371: integration tests for `handle_spawn_directive`
 //! routed through the real pty pump (`pump_connection`) instead of a plain
 //! piped `Command`.
 //!
@@ -20,7 +20,7 @@
 #![cfg(unix)]
 
 use ember_exec::spawn::handle_spawn_directive;
-use ember_exec::uds::{read_frame, write_frame, ExecFrame, SpawnDirective};
+use ember_exec::uds::{ExecFrame, SpawnDirective, read_frame, write_frame};
 use tokio::io::duplex;
 
 fn sh_path() -> Option<&'static str> {
@@ -52,7 +52,7 @@ fn build_directive(binary_path: &str, argv: Vec<String>) -> SpawnDirective {
     }
 }
 
-/// implementation-note-265: bash exits 37 via the pty pump; the wire-side
+/// implementation-note-371: bash exits 37 via the pty pump; the wire-side
 /// peer must see `Exit { code: 37 }`.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_exit_code_via_pty() {
@@ -69,9 +69,7 @@ async fn test_exit_code_via_pty() {
     // (peer-emitted frames) and writes to (child output / exit). The peer
     // half is the test driver.
     let (mut peer, mut server) = duplex(64 * 1024);
-    let handle = tokio::spawn(async move {
-        handle_spawn_directive(directive, &mut server).await
-    });
+    let handle = tokio::spawn(async move { handle_spawn_directive(directive, &mut server).await });
 
     // Drain frames from the peer side until we see Exit.
     let mut saw_exit = None;
@@ -81,11 +79,14 @@ async fn test_exit_code_via_pty() {
             break;
         }
     }
-    handle.await.expect("task join").expect("handle_spawn_directive");
+    handle
+        .await
+        .expect("task join")
+        .expect("handle_spawn_directive");
     assert_eq!(saw_exit, Some(37), "expected Exit(37), got {saw_exit:?}");
 }
 
-/// implementation-note-265: stdin bytes the peer sends must route through
+/// implementation-note-371: stdin bytes the peer sends must route through
 /// the pty master to the child; the child's echo must surface as
 /// `OutputBytes` frames.
 #[tokio::test(flavor = "multi_thread")]
@@ -104,9 +105,7 @@ async fn test_stdin_proxied_through_pty() {
     );
 
     let (mut peer, mut server) = duplex(64 * 1024);
-    let handle = tokio::spawn(async move {
-        handle_spawn_directive(directive, &mut server).await
-    });
+    let handle = tokio::spawn(async move { handle_spawn_directive(directive, &mut server).await });
 
     // Send a StdinBytes frame so `read x` completes.
     write_frame(
@@ -131,7 +130,10 @@ async fn test_stdin_proxied_through_pty() {
             _ => {}
         }
     }
-    handle.await.expect("task join").expect("handle_spawn_directive");
+    handle
+        .await
+        .expect("task join")
+        .expect("handle_spawn_directive");
     let text = String::from_utf8_lossy(&collected);
     assert!(saw_exit, "expected Exit frame");
     assert!(
@@ -140,7 +142,7 @@ async fn test_stdin_proxied_through_pty() {
     );
 }
 
-/// implementation-note-265: a `Resize` frame the peer sends must apply
+/// implementation-note-371: a `Resize` frame the peer sends must apply
 /// `TIOCSWINSZ` to the pty master before the child runs `stty size`, so the
 /// child reads the new geometry.
 #[tokio::test(flavor = "multi_thread")]
@@ -160,14 +162,15 @@ async fn test_resize_propagated() {
     );
 
     let (mut peer, mut server) = duplex(64 * 1024);
-    let handle = tokio::spawn(async move {
-        handle_spawn_directive(directive, &mut server).await
-    });
+    let handle = tokio::spawn(async move { handle_spawn_directive(directive, &mut server).await });
 
     // Send Resize first.
     write_frame(
         &mut peer,
-        &ExecFrame::Resize { rows: 42, cols: 100 },
+        &ExecFrame::Resize {
+            rows: 42,
+            cols: 100,
+        },
     )
     .await
     .expect("write Resize");
@@ -196,7 +199,10 @@ async fn test_resize_propagated() {
             _ => {}
         }
     }
-    handle.await.expect("task join").expect("handle_spawn_directive");
+    handle
+        .await
+        .expect("task join")
+        .expect("handle_spawn_directive");
     let text = String::from_utf8_lossy(&collected);
     assert!(saw_exit, "expected Exit frame");
     assert!(

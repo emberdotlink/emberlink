@@ -1,8 +1,8 @@
 mod activity_support;
 pub mod audit;
-mod biometric;
 pub mod binary;
-// implementation-note-111 — `ember bind …` admin path
+mod biometric;
+// implementation-note-149 — `ember bind …` admin path
 // for credential bindings. See `bind.rs` doc-comment.
 pub mod bind;
 pub mod broker;
@@ -10,31 +10,65 @@ pub mod cli;
 pub mod cluster;
 pub mod construct;
 pub mod grants;
-// implementation-note-14 — Phase 1 substrate. The
+// implementation-note-16 — Phase 1 substrate. The
 // `commands.rs` file is a single 300K-line module rather than a
 // `commands/` directory; the `headless` substrate lands as a
 // top-level sibling module per the brief's
 // "(or wherever sibling commands are declared)" clause.
 //
-// implementation-note-15
-pub mod headless;
-pub mod install;
+// implementation-note-17
+pub mod claude_code_launcher;
 mod commands;
 pub mod demo;
+pub mod dev;
+pub mod dev_install;
+pub mod dev_install_slice_c;
+pub mod headless;
+pub mod install;
+pub mod install_paths;
+pub mod kms;
 pub mod launcher;
 pub mod onboarding;
+pub mod orchestrator;
 pub mod output;
 pub mod receipt;
-pub mod session;
 mod recovery;
 mod screens;
+pub mod session;
 mod sync_support;
-mod vault_support;
+pub mod up;
 pub mod vault_io;
-pub mod kms;
-pub mod orchestrator;
+mod vault_support;
 
 pub use cli::{Args, Cmd};
+
+/// Test-only Mutex for serializing tests that mutate the `EMBER_PERSONA`
+/// env var (or any process-global env var read by `resolve_persona_*`
+/// helpers across modules). Without serialization, cargo's parallel test
+/// runner can interleave a `set_var` from one test with a `remove_var`
+/// from another, producing test-order-dependent failures.
+///
+/// Tests acquire via:
+/// ```ignore
+/// let _g = crate::EMBER_PERSONA_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+/// ```
+///
+/// Why this lives in `lib.rs`: `bind.rs::tests` and
+/// `launcher/claude_code.rs::tests` both mutate the same env var; the
+/// Mutex must be the same instance for the serialization to hold across
+/// modules in the same test binary.
+#[cfg(test)]
+pub(crate) static EMBER_PERSONA_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Test-only Mutex for serializing tests that mutate the
+/// `EMBER_DAEMON_AUTOSTART_TIMEOUT_SECS` env var. Two tests in
+/// `onboarding/claude_code.rs::tests` race on this var:
+/// `autostart_liveness_timeout_default_is_10` (remove) and
+/// `autostart_liveness_timeout_honors_env` (set). Same pattern as
+/// `EMBER_PERSONA_TEST_LOCK`.
+#[cfg(test)]
+pub(crate) static EMBER_DAEMON_AUTOSTART_TEST_LOCK: std::sync::Mutex<()> =
+    std::sync::Mutex::new(());
 
 use std::collections::{BTreeSet, HashSet};
 use std::fmt::Write as _;
@@ -53,28 +87,34 @@ use core_crypto::{
     generate_local_encryption_key_pair_version, generate_local_key_pair,
     generate_local_key_pair_version, generate_random_identifier,
 };
+use core_event_types::{
+    ChunkReference, ContentVisibility, DisclosureRevokedEvent, EventBody, SignerBinding,
+    VaultNamespace,
+};
 use core_events::EventEnvelope;
-use core_identity::{create_root, device_revoked_event, local_linkage, root_created_event};
-use core_personas::{create_persona, persona_created_event, persona_revoked_event, revoke_persona};
 use core_grant_types::policy::{
     PersonaTemplate, disclosure_profile_for_template, parse_persona_template,
     persona_template_for_disclosure_profile, persona_template_label,
+};
+use core_identity::{create_root, device_revoked_event, local_linkage, root_created_event};
+use core_personas::{create_persona, persona_created_event, persona_revoked_event, revoke_persona};
+use core_principals::{
+    DeviceMembership, IdentityRoot, KeyAlgorithm, LinkageAssertion, Persona, PublicKeyMaterial,
+    RelayAdmission, SurvivalMode, TrustAttestation,
 };
 use core_recovery::create_policy;
 use core_state::{
     DeviceStatus, EventStore, IdentityAuthorizer, PersonaStatus, RecoveryRequestStatus,
 };
-use emberlink_app::{AppRuntime, LocalState};
-use emberlink_app::local_state::GrantChainSecret;
 use core_storage::{
     create_relationship, encrypt_block, ledger_delta, manifest_chunk, manifest_device_access,
     manifest_key_recipient, plan_restore, publish_manifest, storage_relationship_created_event,
     wrap_manifest_key_access,
 };
 use core_sync::LightSyncContext;
-use core_event_types::{ChunkReference, ContentVisibility, DisclosureRevokedEvent, EventBody, SignerBinding, VaultNamespace};
-use core_principals::{DeviceMembership, IdentityRoot, KeyAlgorithm, LinkageAssertion, Persona, PublicKeyMaterial, RelayAdmission, SurvivalMode, TrustAttestation};
 use core_types::ValidationError;
+use emberlink_app::local_state::GrantChainSecret;
+use emberlink_app::{AppRuntime, LocalState};
 
 #[derive(Debug, Clone)]
 struct LocalKeyRecord {
@@ -217,13 +257,14 @@ impl DemoApp {
         let event_store = match data_file.as_deref() {
             Some(path) => {
                 let master_key = resolve_encryption_key()?;
-                EventStore::open_with_key(sqlite_path_for_local_state(path), master_key)
-                    .map_err(|err| {
+                EventStore::open_with_key(sqlite_path_for_local_state(path), master_key).map_err(
+                    |err| {
                         ValidationError::new(format!(
                             "could not open event store at {}: {err}",
                             path.display()
                         ))
-                    })?
+                    },
+                )?
             }
             None => EventStore::default(),
         };
@@ -520,7 +561,8 @@ impl DemoApp {
                     });
                 }
                 ["manifest_key", manifest_id, content_key] => {
-                    self.app_runtime.store
+                    self.app_runtime
+                        .store
                         .upsert_local_manifest_key(manifest_id, content_key)?;
                 }
                 ["chain_secret", grant_id, public_hex, secret_hex] => {
@@ -651,7 +693,13 @@ impl DemoApp {
             ));
         }
 
-        for device in self.app_runtime.store.materialized().devices_current.values() {
+        for device in self
+            .app_runtime
+            .store
+            .materialized()
+            .devices_current
+            .values()
+        {
             let membership = DeviceMembership {
                 root_id: device.root_id.clone(),
                 device_id: device.device_id.clone(),
@@ -668,7 +716,13 @@ impl DemoApp {
             }
         }
 
-        for persona in self.app_runtime.store.materialized().personas_current.values() {
+        for persona in self
+            .app_runtime
+            .store
+            .materialized()
+            .personas_current
+            .values()
+        {
             let identity = create_persona(
                 &persona.persona_id,
                 &persona.root_id,
@@ -686,7 +740,8 @@ impl DemoApp {
         }
 
         self.trust_attestations.extend(
-            self.app_runtime.store
+            self.app_runtime
+                .store
                 .materialized()
                 .trust_edges_current
                 .values()
@@ -763,15 +818,13 @@ impl DemoApp {
         &self,
         grant_id: &str,
     ) -> Option<core_crypto::grant_chain::PubkeyNextKeyPair> {
-        self.chain_secrets
-            .get(grant_id)
-            .and_then(|entry| {
-                core_crypto::grant_chain::PubkeyNextKeyPair::from_hex(
-                    entry.public_hex.clone(),
-                    entry.secret_hex.clone(),
-                )
-                .ok()
-            })
+        self.chain_secrets.get(grant_id).and_then(|entry| {
+            core_crypto::grant_chain::PubkeyNextKeyPair::from_hex(
+                entry.public_hex.clone(),
+                entry.secret_hex.clone(),
+            )
+            .ok()
+        })
     }
 
     fn local_manifest_key(&self, manifest_id: &str) -> Result<Option<String>, ValidationError> {
@@ -783,7 +836,8 @@ impl DemoApp {
             return Ok(content_key);
         }
         let content_key = generate_content_key("manifest");
-        self.app_runtime.store
+        self.app_runtime
+            .store
             .upsert_local_manifest_key(manifest_id, &content_key)?;
         Ok(content_key)
     }
@@ -794,7 +848,8 @@ impl DemoApp {
         }
 
         let manifest = self
-            .app_runtime.store
+            .app_runtime
+            .store
             .file_manifest(manifest_id)
             .or_else(|| {
                 (self.storage_manifest.id == manifest_id).then(|| self.storage_manifest.clone())
@@ -803,7 +858,8 @@ impl DemoApp {
 
         for access in &manifest.authorized_devices {
             if let Ok(content_key) = self
-                .app_runtime.store
+                .app_runtime
+                .store
                 .unwrap_manifest_key_for_device(manifest_id, &access.device_id)
             {
                 return Ok(content_key);
@@ -893,7 +949,8 @@ impl DemoApp {
         manifest_id: &str,
         device_id: &str,
     ) -> Result<String, ValidationError> {
-        self.app_runtime.store
+        self.app_runtime
+            .store
             .unwrap_manifest_key_for_device(manifest_id, device_id)
     }
 
@@ -949,7 +1006,8 @@ impl DemoApp {
         loop {
             let candidate = format!("evt-{label}-{}", generate_random_identifier("id"));
             if self
-                .app_runtime.store
+                .app_runtime
+                .store
                 .current_event_type_for(&candidate)
                 .is_none()
             {
@@ -1125,7 +1183,11 @@ impl DemoApp {
     }
 
     fn reconcile_recovery_session_from_state(&mut self) {
-        let requests = &self.app_runtime.store.materialized().recovery_requests_current;
+        let requests = &self
+            .app_runtime
+            .store
+            .materialized()
+            .recovery_requests_current;
         if requests.is_empty() {
             self.recovery_session = None;
             return;
@@ -1146,7 +1208,8 @@ impl DemoApp {
         };
 
         let replacement_device_id = self
-            .app_runtime.store
+            .app_runtime
+            .store
             .materialized()
             .devices_current
             .get(&request.target_device_id)
@@ -1156,7 +1219,8 @@ impl DemoApp {
             .as_ref()
             .map(|session| session.notified_devices.clone())
             .unwrap_or_else(|| {
-                self.app_runtime.store
+                self.app_runtime
+                    .store
                     .materialized()
                     .devices_current
                     .values()
@@ -1274,7 +1338,8 @@ impl DemoApp {
                     ValidationError::new(format!("remove sqlite state file: {err}"))
                 })?;
             }
-            self.app_runtime = AppRuntime::new(EventStore::open(&sqlite_file)?, LocalState::default());
+            self.app_runtime =
+                AppRuntime::new(EventStore::open(&sqlite_file)?, LocalState::default());
         } else {
             self.app_runtime = AppRuntime::new(EventStore::default(), LocalState::default());
         }
@@ -1520,6 +1585,197 @@ pub fn local_state_content_key() -> Result<String, ValidationError> {
 
 const ENCRYPTED_MAGIC: &[u8] = b"EMBER_ENC\x01";
 
+#[derive(Debug)]
+pub(crate) enum DaemonRpcError {
+    Unavailable(std::io::Error),
+    Io(std::io::Error),
+    Protocol(String),
+    Rpc { code: i32, message: String },
+}
+
+fn operator_presence_token_slot()
+-> &'static std::sync::Mutex<Option<ember_daemon::auth::presence_token::PresenceToken>> {
+    static SLOT: std::sync::OnceLock<
+        std::sync::Mutex<Option<ember_daemon::auth::presence_token::PresenceToken>>,
+    > = std::sync::OnceLock::new();
+    SLOT.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn cached_operator_presence_token() -> Option<ember_daemon::auth::presence_token::PresenceToken> {
+    operator_presence_token_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+fn set_cached_operator_presence_token(
+    token: Option<ember_daemon::auth::presence_token::PresenceToken>,
+) {
+    *operator_presence_token_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = token;
+}
+
+fn attach_presence_token(
+    params: &serde_json::Value,
+    token: &ember_daemon::auth::presence_token::PresenceToken,
+) -> serde_json::Value {
+    match params {
+        serde_json::Value::Object(map) => {
+            let mut map = map.clone();
+            map.insert(
+                "_presence_token".to_string(),
+                serde_json::to_value(token).expect("serialize presence token"),
+            );
+            serde_json::Value::Object(map)
+        }
+        serde_json::Value::Null => serde_json::json!({
+            "_presence_token": token
+        }),
+        other => other.clone(),
+    }
+}
+
+fn maybe_cache_presence_token_from_result(
+    result: &serde_json::Value,
+) -> Result<(), DaemonRpcError> {
+    let Some(token_value) = result.get("presence_token").cloned() else {
+        return Ok(());
+    };
+    let token = serde_json::from_value(token_value).map_err(|e| {
+        DaemonRpcError::Protocol(format!("invalid daemon presence_token payload: {e}"))
+    })?;
+    set_cached_operator_presence_token(Some(token));
+    Ok(())
+}
+
+fn authority_error_reason(message: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(message)
+        .ok()
+        .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(str::to_string))
+}
+
+fn call_daemon_rpc_once(
+    socket_path: &std::path::Path,
+    method: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, DaemonRpcError> {
+    use std::io::{BufRead, BufReader, Write as _};
+
+    let stream =
+        std::os::unix::net::UnixStream::connect(socket_path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
+                DaemonRpcError::Unavailable(e)
+            }
+            _ => DaemonRpcError::Io(e),
+        })?;
+
+    let mut writer = stream.try_clone().map_err(DaemonRpcError::Io)?;
+    let mut reader = BufReader::new(stream);
+
+    let request_params = match cached_operator_presence_token() {
+        Some(token) => attach_presence_token(params, &token),
+        None => params.clone(),
+    };
+
+    let request = serde_json::json!({
+        "id": "1",
+        "method": method,
+        "params": request_params,
+    });
+    let mut line = serde_json::to_string(&request).expect("serialize daemon request");
+    line.push('\n');
+
+    writer
+        .write_all(line.as_bytes())
+        .map_err(DaemonRpcError::Io)?;
+
+    let mut response_line = String::new();
+    reader
+        .read_line(&mut response_line)
+        .map_err(DaemonRpcError::Io)?;
+
+    let response: serde_json::Value = serde_json::from_str(response_line.trim())
+        .map_err(|e| DaemonRpcError::Protocol(format!("invalid daemon JSON-RPC response: {e}")))?;
+
+    if let Some(err) = response.get("error").filter(|v| !v.is_null()) {
+        let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(-32000) as i32;
+        let message = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown daemon error")
+            .to_string();
+        return Err(DaemonRpcError::Rpc { code, message });
+    }
+
+    Ok(response
+        .get("result")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null))
+}
+
+pub(crate) fn call_daemon_rpc(
+    socket_path: &std::path::Path,
+    method: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, DaemonRpcError> {
+    match call_daemon_rpc_once(socket_path, method, params) {
+        Ok(value) => {
+            maybe_cache_presence_token_from_result(&value)?;
+            if matches!(method, "vault_lock" | "close_session") {
+                set_cached_operator_presence_token(None);
+            }
+            Ok(value)
+        }
+        Err(DaemonRpcError::Rpc { code, message })
+            if should_retry_with_vault_unlock(method, code, &message) =>
+        {
+            set_cached_operator_presence_token(None);
+            let unlock =
+                call_daemon_rpc_once(socket_path, "vault_unlock", &serde_json::Value::Null)?;
+            maybe_cache_presence_token_from_result(&unlock)?;
+            let value = call_daemon_rpc_once(socket_path, method, params)?;
+            maybe_cache_presence_token_from_result(&value)?;
+            Ok(value)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn should_retry_with_vault_unlock(method: &str, code: i32, message: &str) -> bool {
+    if matches!(method, "vault_unlock" | "register_session" | "vault_lock") {
+        return false;
+    }
+
+    if code == -32001
+        && authority_error_reason(message)
+            .as_deref()
+            .is_some_and(|reason| {
+                matches!(
+                    reason,
+                    "missing"
+                        | "expired"
+                        | "uid-mismatch"
+                        | "sig-invalid"
+                        | "scope-mismatch"
+                        | "identity-missing"
+                )
+            })
+    {
+        return true;
+    }
+
+    if code == -32030
+        && (message.contains("session is locked")
+            || message.contains("vault unavailable")
+            || message.contains("session auto-locked"))
+    {
+        return true;
+    }
+
+    code == -32000 && message.contains("no vault is attached")
+}
+
 /// Resolve the daemon Unix-domain socket path.
 ///
 /// Precedence:
@@ -1545,50 +1801,19 @@ pub fn call_daemon_method(
     method: &str,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, ValidationError> {
-    use std::io::{BufRead, BufReader, Write as _};
-
-    let stream = std::os::unix::net::UnixStream::connect(socket_path).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
-            ValidationError::new("daemon unavailable; start with 'ember daemon start'")
+    match call_daemon_rpc(socket_path, method, params) {
+        Ok(result) => Ok(result),
+        Err(DaemonRpcError::Unavailable(_)) => Err(ValidationError::new(
+            "daemon unavailable; start with 'ember daemon start'",
+        )),
+        Err(DaemonRpcError::Io(e)) => {
+            Err(ValidationError::new(format!("daemon socket error: {e}")))
         }
-        _ => ValidationError::new(format!("daemon socket error: {e}")),
-    })?;
-
-    let mut writer = stream
-        .try_clone()
-        .map_err(|e| ValidationError::new(format!("clone daemon socket: {e}")))?;
-    let mut reader = BufReader::new(stream);
-
-    let request = serde_json::json!({
-        "id": "1",
-        "method": method,
-        "params": params,
-    });
-    let mut line = serde_json::to_string(&request).expect("serialize daemon request");
-    line.push('\n');
-
-    writer
-        .write_all(line.as_bytes())
-        .map_err(|e| ValidationError::new(format!("write daemon request: {e}")))?;
-
-    let mut response_line = String::new();
-    reader
-        .read_line(&mut response_line)
-        .map_err(|e| ValidationError::new(format!("read daemon response: {e}")))?;
-
-    let response: serde_json::Value = serde_json::from_str(response_line.trim())
-        .map_err(|e| ValidationError::new(format!("invalid daemon JSON-RPC response: {e}")))?;
-
-    if let Some(err) = response.get("error").filter(|v| !v.is_null()) {
-        let message = err
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("unknown daemon error")
-            .to_string();
-        return Err(ValidationError::new(format!("daemon rpc error: {message}")));
+        Err(DaemonRpcError::Protocol(e)) => Err(ValidationError::new(e)),
+        Err(DaemonRpcError::Rpc { message, .. }) => {
+            Err(ValidationError::new(format!("daemon rpc error: {message}")))
+        }
     }
-
-    Ok(response.get("result").cloned().unwrap_or(serde_json::Value::Null))
 }
 
 /// Return the content key used to encrypt/decrypt local state.
@@ -1640,9 +1865,7 @@ fn resolve_encryption_key() -> Result<String, ValidationError> {
 
         // Peek the legacy keychain (best-effort; may be absent).
         let legacy_entry = keyring::Entry::new(LEGACY_SERVICE, LEGACY_USER).ok();
-        let legacy_key = legacy_entry
-            .as_ref()
-            .and_then(|e| e.get_password().ok());
+        let legacy_key = legacy_entry.as_ref().and_then(|e| e.get_password().ok());
 
         // Fetch daemon's current key (auto-generates if missing).
         let get_params = serde_json::json!({ "caller": "cli" });
@@ -1664,10 +1887,7 @@ fn resolve_encryption_key() -> Result<String, ValidationError> {
             ProbeOutcome::DecryptOk | ProbeOutcome::NoFile => daemon_key,
             ProbeOutcome::DecryptFailed => match legacy_key.as_ref() {
                 Some(legacy)
-                    if matches!(
-                        probe_decrypt(&state_file, legacy),
-                        ProbeOutcome::DecryptOk
-                    ) =>
+                    if matches!(probe_decrypt(&state_file, legacy), ProbeOutcome::DecryptOk) =>
                 {
                     let set_params = serde_json::json!({
                         "caller": "cli",
@@ -1861,6 +2081,278 @@ mod tests {
             .as_nanos();
         let counter = TEMP_STATE_COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("emberlink-relay-{tag}-{timestamp}-{counter}.relay"))
+    }
+
+    fn fake_presence_token_value(uid: u32) -> serde_json::Value {
+        use std::time::Duration;
+        #[derive(serde::Serialize)]
+        struct FakePresenceToken<'a> {
+            uid: u32,
+            scope: &'a str,
+            expiry: SystemTime,
+            signature: Vec<u8>,
+        }
+
+        serde_json::to_value(FakePresenceToken {
+            uid,
+            scope: "*",
+            expiry: SystemTime::now() + Duration::from_secs(60),
+            signature: vec![1, 2, 3, 4],
+        })
+        .expect("presence token value")
+    }
+
+    #[test]
+    fn call_daemon_rpc_unlocks_and_retries_once_for_missing_presence_token() {
+        use std::io::{BufRead, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        set_cached_operator_presence_token(None);
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let socket_path = tmp.path().join("daemon.sock");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn({
+            let socket_path = socket_path.clone();
+            move || {
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+                ready_tx.send(()).expect("signal ready");
+
+                for expected_method in ["create_persona", "vault_unlock", "create_persona"] {
+                    let (mut stream, _) = listener.accept().expect("accept fake daemon client");
+                    let mut reader = std::io::BufReader::new(
+                        stream.try_clone().expect("clone fake daemon stream"),
+                    );
+                    let mut line = String::new();
+                    reader
+                        .read_line(&mut line)
+                        .expect("read fake daemon request");
+                    let request: serde_json::Value =
+                        serde_json::from_str(line.trim()).expect("parse fake daemon request");
+                    assert_eq!(request["method"], serde_json::json!(expected_method));
+
+                    let response = match expected_method {
+                        "create_persona"
+                            if request["params"]["name"]
+                                == serde_json::json!("no-presence-retry") =>
+                        {
+                            if request["params"].get("_presence_token").is_none() {
+                                serde_json::json!({
+                                    "id": request["id"],
+                                    "error": {
+                                        "code": -32001,
+                                        "message": "{\"error\":\"authority_class_not_met\",\"reason\":\"missing\"}",
+                                    }
+                                })
+                            } else {
+                                assert!(
+                                    request["params"].get("_presence_token").is_some(),
+                                    "retry must attach the cached daemon presence token"
+                                );
+                                serde_json::json!({
+                                    "id": request["id"],
+                                    "result": { "id": "persona-123", "name": "no-presence-retry" }
+                                })
+                            }
+                        }
+                        "vault_unlock" => serde_json::json!({
+                            "id": request["id"],
+                            "result": {
+                                "unlocked": true,
+                                "presence_token": fake_presence_token_value(501)
+                            }
+                        }),
+                        other => panic!("unexpected method sequence item: {other}"),
+                    };
+
+                    let mut encoded =
+                        serde_json::to_string(&response).expect("encode fake daemon response");
+                    encoded.push('\n');
+                    stream
+                        .write_all(encoded.as_bytes())
+                        .expect("write fake daemon response");
+                }
+            }
+        });
+
+        ready_rx.recv().expect("wait for fake daemon ready");
+        let result = call_daemon_rpc(
+            &socket_path,
+            "create_persona",
+            &serde_json::json!({"name": "no-presence-retry"}),
+        )
+        .expect("missing presence token should trigger unlock and retry");
+
+        assert_eq!(result["id"], serde_json::json!("persona-123"));
+        assert_eq!(result["name"], serde_json::json!("no-presence-retry"));
+
+        server.join().expect("fake daemon thread");
+    }
+
+    #[test]
+    fn call_daemon_rpc_unlocks_and_retries_once_for_locked_session_error() {
+        use std::io::{BufRead, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        set_cached_operator_presence_token(None);
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let socket_path = tmp.path().join("daemon.sock");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn({
+            let socket_path = socket_path.clone();
+            move || {
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+                ready_tx.send(()).expect("signal ready");
+                let mut create_persona_calls = 0usize;
+
+                for expected_method in ["create_persona", "vault_unlock", "create_persona"] {
+                    let (mut stream, _) = listener.accept().expect("accept fake daemon client");
+                    let mut reader = std::io::BufReader::new(
+                        stream.try_clone().expect("clone fake daemon stream"),
+                    );
+                    let mut line = String::new();
+                    reader
+                        .read_line(&mut line)
+                        .expect("read fake daemon request");
+                    let request: serde_json::Value =
+                        serde_json::from_str(line.trim()).expect("parse fake daemon request");
+                    assert_eq!(request["method"], serde_json::json!(expected_method));
+                    if expected_method == "create_persona" {
+                        create_persona_calls += 1;
+                    }
+
+                    let response = match expected_method {
+                        "create_persona"
+                            if request["params"]["name"] == serde_json::json!("retry-me")
+                                && create_persona_calls == 1 =>
+                        {
+                            serde_json::json!({
+                                "id": request["id"],
+                                "error": {
+                                    "code": -32030,
+                                    "message": "create_persona denied: session is locked; reopen with `ember vault unlock` or start a new session (`register_session` path). Ordinary lazy same-daemon re-auth is not fully wired yet",
+                                }
+                            })
+                        }
+                        "vault_unlock" => serde_json::json!({
+                            "id": request["id"],
+                            "result": {
+                                "unlocked": true,
+                                "presence_token": fake_presence_token_value(501)
+                            }
+                        }),
+                        _ => serde_json::json!({
+                            "id": request["id"],
+                            "result": { "id": "persona-123", "name": "retry-me" }
+                        }),
+                    };
+
+                    let mut encoded =
+                        serde_json::to_string(&response).expect("encode fake daemon response");
+                    encoded.push('\n');
+                    stream
+                        .write_all(encoded.as_bytes())
+                        .expect("write fake daemon response");
+                }
+            }
+        });
+
+        ready_rx.recv().expect("wait for fake daemon ready");
+        let result = call_daemon_rpc(
+            &socket_path,
+            "create_persona",
+            &serde_json::json!({"name": "retry-me"}),
+        )
+        .expect("locked session should unlock and retry once");
+
+        assert_eq!(result["id"], serde_json::json!("persona-123"));
+        assert_eq!(result["name"], serde_json::json!("retry-me"));
+
+        server.join().expect("fake daemon thread");
+    }
+
+    #[test]
+    fn call_daemon_rpc_unlocks_and_retries_once_for_missing_live_vault_error() {
+        use std::io::{BufRead, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        set_cached_operator_presence_token(None);
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let socket_path = tmp.path().join("daemon.sock");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn({
+            let socket_path = socket_path.clone();
+            move || {
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+                ready_tx.send(()).expect("signal ready");
+                let mut create_persona_calls = 0usize;
+
+                for expected_method in ["create_persona", "vault_unlock", "create_persona"] {
+                    let (mut stream, _) = listener.accept().expect("accept fake daemon client");
+                    let mut reader = std::io::BufReader::new(
+                        stream.try_clone().expect("clone fake daemon stream"),
+                    );
+                    let mut line = String::new();
+                    reader
+                        .read_line(&mut line)
+                        .expect("read fake daemon request");
+                    let request: serde_json::Value =
+                        serde_json::from_str(line.trim()).expect("parse fake daemon request");
+                    assert_eq!(request["method"], serde_json::json!(expected_method));
+                    if expected_method == "create_persona" {
+                        create_persona_calls += 1;
+                    }
+
+                    let response = match expected_method {
+                        "create_persona"
+                            if request["params"]["name"] == serde_json::json!("boot-lock")
+                                && create_persona_calls == 1 =>
+                        {
+                            serde_json::json!({
+                                "id": request["id"],
+                                "error": {
+                                    "code": -32000,
+                                    "message": "persona 'persona-boot-lock' secret is vault-sealed but no vault is attached",
+                                }
+                            })
+                        }
+                        "vault_unlock" => serde_json::json!({
+                            "id": request["id"],
+                            "result": {
+                                "unlocked": true,
+                                "presence_token": fake_presence_token_value(501)
+                            }
+                        }),
+                        _ => serde_json::json!({
+                            "id": request["id"],
+                            "result": { "id": "persona-boot", "name": "boot-lock" }
+                        }),
+                    };
+
+                    let mut encoded =
+                        serde_json::to_string(&response).expect("encode fake daemon response");
+                    encoded.push('\n');
+                    stream
+                        .write_all(encoded.as_bytes())
+                        .expect("write fake daemon response");
+                }
+            }
+        });
+
+        ready_rx.recv().expect("wait for fake daemon ready");
+        let result = call_daemon_rpc(
+            &socket_path,
+            "create_persona",
+            &serde_json::json!({"name": "boot-lock"}),
+        )
+        .expect("missing live vault should unlock and retry once");
+
+        assert_eq!(result["id"], serde_json::json!("persona-boot"));
+        assert_eq!(result["name"], serde_json::json!("boot-lock"));
+
+        server.join().expect("fake daemon thread");
     }
 
     #[test]
@@ -2083,7 +2575,8 @@ mod tests {
     fn storage_gc_plan_reports_retained_and_collectable_vault_state() {
         let mut app = DemoApp::ephemeral();
         let gc_plan = app
-            .app_runtime.store
+            .app_runtime
+            .store
             .plan_local_vault_gc(&app.seed_vault_namespace())
             .unwrap()
             .unwrap();
@@ -2141,9 +2634,13 @@ mod tests {
         app.add_root_with_id("root-a", "Primary").unwrap();
         app.add_device_with_id("device-a", "root-a", "Laptop", true)
             .unwrap();
-        app.app_runtime.store.upsert_file_manifest(&manifest).unwrap();
+        app.app_runtime
+            .store
+            .upsert_file_manifest(&manifest)
+            .unwrap();
         for chunk in &manifest.chunks {
-            app.app_runtime.store
+            app.app_runtime
+                .store
                 .upsert_encrypted_block(&core_storage::EncryptedBlock {
                     chunk: chunk.clone(),
                     encrypted: core_crypto::EncryptedContent {
@@ -2153,7 +2650,8 @@ mod tests {
                 })
                 .unwrap();
         }
-        app.app_runtime.store
+        app.app_runtime
+            .store
             .upsert_local_block(&core_state::LocalBlockRecord {
                 chunk_id: "orphan-metadata".into(),
                 ciphertext_bytes: 64,
@@ -2201,7 +2699,11 @@ mod tests {
             "vault issue --template template-professional-card --recipient svc.example",
         );
         let vault = app.handle_command("vault");
-        let artifacts = app.app_runtime.store.local_presentation_artifacts().unwrap();
+        let artifacts = app
+            .app_runtime
+            .store
+            .local_presentation_artifacts()
+            .unwrap();
 
         assert!(output.contains("issued artifact\tartifact-"));
         assert_eq!(artifacts.len(), 1);
@@ -3196,8 +3698,9 @@ mod tests {
         let mut app = DemoApp::ephemeral();
         app.handle_command("root create --name alice");
 
-        let output = app
-            .handle_command("persona create --root alice --label alice@work --template professional");
+        let output = app.handle_command(
+            "persona create --root alice --label alice@work --template professional",
+        );
 
         assert!(output.contains("created persona"));
         assert!(app.render_personas().contains("alice@work"));
@@ -3431,7 +3934,8 @@ mod tests {
             let raw_str = String::from_utf8_lossy(&raw);
             assert!(!raw_str.contains("device-encryption"));
             assert!(
-                app.app_runtime.store
+                app.app_runtime
+                    .store
                     .local_device_encryption_key_pair("device-a")
                     .unwrap()
                     .is_some()
@@ -3440,7 +3944,8 @@ mod tests {
 
         let reopened = DemoApp::open_existing(data_file.clone()).unwrap();
         let key_pair = reopened
-            .app_runtime.store
+            .app_runtime
+            .store
             .local_device_encryption_key_pair("device-a")
             .unwrap()
             .unwrap();
@@ -3597,7 +4102,8 @@ mod tests {
             .find(|ns| ns.owner_id == "persona-professional")
             .expect("expected persona namespace");
         let manifests = app
-            .app_runtime.store
+            .app_runtime
+            .store
             .local_vault_manifests_with_keys(persona_ns)
             .unwrap();
         assert!(!manifests.is_empty(), "expected at least one manifest");
@@ -3616,7 +4122,8 @@ mod tests {
 
         // Verify the new device can actually unwrap the key via the wrapped access entry
         let enc_key_pair = app
-            .app_runtime.store
+            .app_runtime
+            .store
             .local_device_encryption_key_pair(&device_id)
             .unwrap()
             .expect("missing local encryption key pair");
@@ -3763,7 +4270,8 @@ mod tests {
             "vault-manifest-professional-v2",
         ] {
             let manifest = app
-                .app_runtime.store
+                .app_runtime
+                .store
                 .local_file_manifest(manifest_id)
                 .unwrap()
                 .unwrap();
@@ -5736,7 +6244,8 @@ mod tests {
             owner_id: persona_id.clone(),
         };
         let manifests = app
-            .app_runtime.store
+            .app_runtime
+            .store
             .local_vault_manifests_with_keys(&namespace)
             .unwrap();
         assert!(!manifests.is_empty(), "expected vault manifests");
@@ -5764,7 +6273,8 @@ mod tests {
 
             // Verify device B can actually unwrap the content key
             let enc_key_pair = app
-                .app_runtime.store
+                .app_runtime
+                .store
                 .local_device_encryption_key_pair(&device_b_id)
                 .unwrap()
                 .expect("missing device B encryption key");
@@ -5931,7 +6441,8 @@ mod tests {
         let mut alice = DemoApp::bootstrap(Some(file_a.clone()), true);
 
         let alice_persona = alice
-            .app_runtime.store
+            .app_runtime
+            .store
             .materialized()
             .personas_current
             .keys()
@@ -5968,17 +6479,26 @@ mod tests {
 
         // Bob should now have his own identity
         assert!(
-            !bob.app_runtime.store.materialized().roots_current.is_empty(),
+            !bob.app_runtime
+                .store
+                .materialized()
+                .roots_current
+                .is_empty(),
             "Bob should have a root after invite accept"
         );
         assert!(
-            !bob.app_runtime.store.materialized().personas_current.is_empty(),
+            !bob.app_runtime
+                .store
+                .materialized()
+                .personas_current
+                .is_empty(),
             "Bob should have a persona after invite accept"
         );
 
         // Bob should also have Alice's persona in his store
         assert!(
-            bob.app_runtime.store
+            bob.app_runtime
+                .store
                 .materialized()
                 .persona(&alice_persona)
                 .is_some(),

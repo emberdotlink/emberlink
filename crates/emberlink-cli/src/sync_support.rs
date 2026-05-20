@@ -1,13 +1,13 @@
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
+use core_event_types::EventBody;
+use core_principals::{RelayAdmission, RelayMode, SyncProfile, TrustThreshold};
 use core_sync::{
     PortableSyncBatch, build_relay_transport_hint, check_relay_admission, filter_batch_by_profile,
     plan_pull_batch, relevant_event_ids_for_context,
 };
 use core_trust::derive_score;
-use core_event_types::{EventBody};
-use core_principals::{RelayAdmission, RelayMode, SyncProfile, TrustThreshold};
 
 use crate::{DemoApp, relay_admission_label};
 
@@ -896,7 +896,8 @@ impl DemoApp {
     ) -> String {
         let peer_id = other.current_peer_id();
         let local_cursor =
-            self.app_runtime.store
+            self.app_runtime
+                .store
                 .peer_cursor(&peer_id)
                 .unwrap_or(core_principals::PeerCursor {
                     peer_id: peer_id.clone(),
@@ -907,30 +908,37 @@ impl DemoApp {
             plan_pull_batch(&local_cursor, "other-to-local", &other_event_ids, |id| {
                 self.app_runtime.store.has_event(id)
             });
-        let relevant_remote_ids =
-            relevant_event_ids_for_context(other.app_runtime.store.events(), &self.light_sync_context());
+        let relevant_remote_ids = relevant_event_ids_for_context(
+            other.app_runtime.store.events(),
+            &self.light_sync_context(),
+        );
         let other_to_local =
             filter_batch_by_profile(&other_to_local_raw, profile, &relevant_remote_ids);
 
         let reverse_peer_id = self.current_peer_id();
-        let other_cursor =
-            other
-                .app_runtime.store
-                .peer_cursor(&reverse_peer_id)
-                .unwrap_or(core_principals::PeerCursor {
-                    peer_id: reverse_peer_id.clone(),
-                    last_event_id: None,
-                });
+        let other_cursor = other
+            .app_runtime
+            .store
+            .peer_cursor(&reverse_peer_id)
+            .unwrap_or(core_principals::PeerCursor {
+                peer_id: reverse_peer_id.clone(),
+                last_event_id: None,
+            });
         let local_event_ids = self.app_runtime.store.event_ids();
         let local_to_other_raw =
             plan_pull_batch(&other_cursor, "local-to-other", &local_event_ids, |id| {
                 other.app_runtime.store.has_event(id)
             });
-        let relevant_local_ids =
-            relevant_event_ids_for_context(self.app_runtime.store.events(), &other.light_sync_context());
+        let relevant_local_ids = relevant_event_ids_for_context(
+            self.app_runtime.store.events(),
+            &other.light_sync_context(),
+        );
         let local_to_other =
             filter_batch_by_profile(&local_to_other_raw, profile, &relevant_local_ids);
-        let local_to_other_events = self.app_runtime.store.events_by_ids(&local_to_other.event_ids);
+        let local_to_other_events = self
+            .app_runtime
+            .store
+            .events_by_ids(&local_to_other.event_ids);
         let local_to_other_message_count = local_to_other_events
             .iter()
             .filter(|event| matches!(event.body, EventBody::MessageSent(_)))
@@ -939,7 +947,10 @@ impl DemoApp {
             .iter()
             .filter(|event| matches!(event.body, EventBody::ContentPublished(_)))
             .count();
-        let other_to_local_events = other.app_runtime.store.events_by_ids(&other_to_local.event_ids);
+        let other_to_local_events = other
+            .app_runtime
+            .store
+            .events_by_ids(&other_to_local.event_ids);
         let other_to_local_message_count = other_to_local_events
             .iter()
             .filter(|event| matches!(event.body, EventBody::MessageSent(_)))

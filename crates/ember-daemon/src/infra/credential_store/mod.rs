@@ -82,6 +82,17 @@ pub trait CredentialStore: Send + Sync {
     /// stable order MUST sort the returned vec themselves.
     async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>, StoreError>;
 
+    /// Enumerate key names without reading the underlying plaintext values.
+    ///
+    /// Backends that can answer from metadata alone should override this so
+    /// callers can distinguish "is this provider configured?" from "can I
+    /// decrypt/use the secret right now?". The default falls back to
+    /// [`Self::list`] for backends where plain enumeration and normal listing
+    /// are the same operation.
+    async fn list_metadata(&self, prefix: Option<&str>) -> Result<Vec<String>, StoreError> {
+        self.list(prefix).await
+    }
+
     /// Delete the key at `key`.
     ///
     /// Backends that don't support deletion fall back to the default
@@ -156,6 +167,10 @@ pub mod test_helpers {
                 .filter(|k| prefix.is_empty() || k.starts_with(prefix))
                 .cloned()
                 .collect())
+        }
+
+        async fn list_metadata(&self, prefix: Option<&str>) -> Result<Vec<String>, StoreError> {
+            self.list(prefix).await
         }
 
         async fn delete(&self, key: &str) -> Result<(), StoreError> {

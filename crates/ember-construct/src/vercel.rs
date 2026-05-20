@@ -44,23 +44,11 @@ use core_construct_runtime::ActionKey;
 
 /// Vercel CLI global flags that take a value as the *next* argv token.
 /// When stripping, both the flag and its value are removed.
-const VALUE_BEARING_GLOBAL_FLAGS: &[&str] = &[
-    "--token",
-    "-t",
-    "--scope",
-    "-S",
-    "--project",
-    "--cwd",
-];
+const VALUE_BEARING_GLOBAL_FLAGS: &[&str] =
+    &["--token", "-t", "--scope", "-S", "--project", "--cwd"];
 
 /// Vercel CLI global flags that are valueless (boolean toggles).
-const BOOLEAN_GLOBAL_FLAGS: &[&str] = &[
-    "--debug",
-    "-d",
-    "--no-color",
-    "--yes",
-    "-y",
-];
+const BOOLEAN_GLOBAL_FLAGS: &[&str] = &["--debug", "-d", "--no-color", "--yes", "-y"];
 
 /// Strip global flags (and their values, where applicable) from `argv`.
 ///
@@ -79,9 +67,7 @@ pub(crate) fn strip_global_flags(argv: &[String]) -> Vec<String> {
         // shouldn't have `=value` but accept it tolerantly).
         if let Some(eq) = tok.find('=') {
             let name = &tok[..eq];
-            if VALUE_BEARING_GLOBAL_FLAGS.contains(&name)
-                || BOOLEAN_GLOBAL_FLAGS.contains(&name)
-            {
+            if VALUE_BEARING_GLOBAL_FLAGS.contains(&name) || BOOLEAN_GLOBAL_FLAGS.contains(&name) {
                 i += 1;
                 continue;
             }
@@ -609,14 +595,8 @@ mod tests {
 
     #[test]
     fn token_flag_before_group_stripped() {
-        let r = classify_vercel_argv(&args(&[
-            "--token",
-            "vc_secret",
-            "projects",
-            "remove",
-            "p",
-        ]))
-        .unwrap();
+        let r = classify_vercel_argv(&args(&["--token", "vc_secret", "projects", "remove", "p"]))
+            .unwrap();
         assert_eq!(r.0, "vercel.projects.remove");
     }
 
@@ -635,106 +615,65 @@ mod tests {
 
     #[test]
     fn project_flag_after_verb_stripped() {
-        let r = classify_vercel_argv(&args(&[
-            "env",
-            "remove",
-            "FOO",
-            "--project",
-            "myproj",
-        ]))
-        .unwrap();
+        let r =
+            classify_vercel_argv(&args(&["env", "remove", "FOO", "--project", "myproj"])).unwrap();
         assert_eq!(r.0, "vercel.env.remove");
     }
 
     #[test]
     fn cwd_flag_stripped() {
-        let r = classify_vercel_argv(&args(&[
-            "--cwd",
-            "/tmp/proj",
-            "deploy",
-        ]))
-        .unwrap();
+        let r = classify_vercel_argv(&args(&["--cwd", "/tmp/proj", "deploy"])).unwrap();
         assert_eq!(r.0, "vercel.deploy");
     }
 
     #[test]
     fn debug_boolean_flag_stripped() {
-        let r =
-            classify_vercel_argv(&args(&["--debug", "secrets", "remove", "name"])).unwrap();
+        let r = classify_vercel_argv(&args(&["--debug", "secrets", "remove", "name"])).unwrap();
         assert_eq!(r.0, "vercel.secrets.remove");
     }
 
     #[test]
     fn no_color_boolean_flag_stripped() {
-        let r =
-            classify_vercel_argv(&args(&["--no-color", "rollback", "deployment"])).unwrap();
+        let r = classify_vercel_argv(&args(&["--no-color", "rollback", "deployment"])).unwrap();
         assert_eq!(r.0, "vercel.rollback");
     }
 
     #[test]
     fn yes_boolean_flag_stripped() {
-        let r =
-            classify_vercel_argv(&args(&["--yes", "alias", "remove", "alias.com"])).unwrap();
+        let r = classify_vercel_argv(&args(&["--yes", "alias", "remove", "alias.com"])).unwrap();
         assert_eq!(r.0, "vercel.alias.remove");
     }
 
     #[test]
     fn equals_form_token_flag_stripped() {
-        let r = classify_vercel_argv(&args(&[
-            "--token=vc_secret",
-            "tokens",
-            "revoke",
-            "tok",
-        ]))
-        .unwrap();
+        let r =
+            classify_vercel_argv(&args(&["--token=vc_secret", "tokens", "revoke", "tok"])).unwrap();
         assert_eq!(r.0, "vercel.tokens.revoke");
     }
 
     #[test]
     fn equals_form_scope_flag_stripped() {
-        let r = classify_vercel_argv(&args(&[
-            "domains",
-            "--scope=myteam",
-            "buy",
-            "example.com",
-        ]))
-        .unwrap();
+        let r = classify_vercel_argv(&args(&["domains", "--scope=myteam", "buy", "example.com"]))
+            .unwrap();
         assert_eq!(r.0, "vercel.domains.buy");
     }
 
     #[test]
     fn equals_form_project_flag_stripped() {
-        let r = classify_vercel_argv(&args(&[
-            "env",
-            "--project=myproj",
-            "push",
-        ]))
-        .unwrap();
+        let r = classify_vercel_argv(&args(&["env", "--project=myproj", "push"])).unwrap();
         assert_eq!(r.0, "vercel.env.push");
     }
 
     #[test]
     fn short_token_flag_stripped() {
-        let r = classify_vercel_argv(&args(&[
-            "-t",
-            "vc_secret",
-            "projects",
-            "remove",
-            "p",
-        ]))
-        .unwrap();
+        let r =
+            classify_vercel_argv(&args(&["-t", "vc_secret", "projects", "remove", "p"])).unwrap();
         assert_eq!(r.0, "vercel.projects.remove");
     }
 
     #[test]
     fn short_scope_flag_stripped() {
-        let r = classify_vercel_argv(&args(&[
-            "-S",
-            "myteam",
-            "rollback",
-            "deployment",
-        ]))
-        .unwrap();
+        let r = classify_vercel_argv(&args(&["-S", "myteam", "rollback", "deployment"])).unwrap();
         assert_eq!(r.0, "vercel.rollback");
     }
 
@@ -758,15 +697,27 @@ mod tests {
     #[test]
     fn flags_reordered_classification_stable() {
         let a = classify_vercel_argv(&args(&[
-            "domains", "remove", "example.com", "--scope", "myteam",
+            "domains",
+            "remove",
+            "example.com",
+            "--scope",
+            "myteam",
         ]))
         .unwrap();
         let b = classify_vercel_argv(&args(&[
-            "--scope", "myteam", "domains", "remove", "example.com",
+            "--scope",
+            "myteam",
+            "domains",
+            "remove",
+            "example.com",
         ]))
         .unwrap();
         let c = classify_vercel_argv(&args(&[
-            "domains", "--scope", "myteam", "remove", "example.com",
+            "domains",
+            "--scope",
+            "myteam",
+            "remove",
+            "example.com",
         ]))
         .unwrap();
         assert_eq!(a.0, b.0);
@@ -913,11 +864,9 @@ mod tests {
     // contract slice this Construct depends on: the broker registry can
     // hold a `MockBroker::new(BrokerProvider::Vercel)`, and a request that
     // declares `provider = Vercel` round-trips through issue → revoke
-    // without panicking. Real Vercel impl is implementation-note-72 (separate task).
+    // without panicking. Real Vercel impl is implementation-note-89 (separate task).
 
-    use core_broker::{
-        Broker, BrokerError, BrokerProvider, BrokerRequest, MockBroker,
-    };
+    use core_broker::{Broker, BrokerError, BrokerProvider, BrokerRequest, MockBroker};
     use std::time::Duration;
 
     fn vercel_request(ttl_secs: u64) -> BrokerRequest {

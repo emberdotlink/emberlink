@@ -17,7 +17,7 @@ thiserror = "2"
 # `ureq` is the native HTTP client used by both Anthropic and Cloudflare brokers; it does not compile to wasm32.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 chrono = { version = "0.4", default-features = false, features = ["alloc", "serde", "std"], optional = true }
-ureq = { version = "2", default-features = false, features = ["json", "tls"], optional = true }
+ureq = { version = "3", default-features = false, features = ["json", "rustls"], optional = true }
 
 [features]
 default = []

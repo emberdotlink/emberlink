@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use core_events::{EventEnvelope, EventRef};
-use core_trust::derive_public_statements;
-use core_grant_types::grant_conditions::{GrantCondition, MAX_CONDITION_DEPTH};
 use core_event_types::{EventBody, EventRefRelation, FileManifest};
+use core_events::{EventEnvelope, EventRef};
+use core_grant_types::grant_conditions::{GrantCondition, MAX_CONDITION_DEPTH};
 use core_principals::{EndpointDescriptor, TrustAttestation};
+use core_trust::derive_public_statements;
 use core_types::{Validate, ValidationError};
 
 use crate::{
@@ -100,11 +100,9 @@ pub fn advance_chain_head(state: &mut MaterializedState, event: &EventEnvelope) 
 /// Defence in depth alongside `GrantCondition::validate_depth`.
 pub(crate) fn json_max_depth(v: &serde_json::Value) -> u32 {
     match v {
-        serde_json::Value::Array(arr) => arr
-            .iter()
-            .map(|x| 1 + json_max_depth(x))
-            .max()
-            .unwrap_or(0),
+        serde_json::Value::Array(arr) => {
+            arr.iter().map(|x| 1 + json_max_depth(x)).max().unwrap_or(0)
+        }
         serde_json::Value::Object(map) => map
             .values()
             .map(|x| 1 + json_max_depth(x))
@@ -689,8 +687,8 @@ pub fn apply_event(
                 // and could blow the stack on adversarial input; a flat
                 // `Value` parse is bounded by serde_json's own depth guard
                 // and gives us a cheap pre-check.
-                let raw_value: serde_json::Value =
-                    serde_json::from_str(&body.conditions_json).map_err(|e| {
+                let raw_value: serde_json::Value = serde_json::from_str(&body.conditions_json)
+                    .map_err(|e| {
                         ValidationError::invalid_format(format!(
                             "grant offer conditions_json is not valid JSON: {e}"
                         ))
@@ -896,8 +894,10 @@ mod tests {
     //! authorize + materialize tests live in `authorize.rs` and `memory.rs`.
     use super::*;
     use core_crypto::FixtureSigner;
+    use core_event_types::{
+        DeviceReplacedEvent, EventBody, RecoveryRequestedEvent, RootCreatedEvent, SignerBinding,
+    };
     use core_events::{EventEnvelope, EventRef as CrateEventRef};
-    use core_event_types::{DeviceReplacedEvent, EventBody, RecoveryRequestedEvent, RootCreatedEvent, SignerBinding};
     use core_principals::{KeyAlgorithm, PublicKeyMaterial};
 
     fn make_key(key_id: &str) -> PublicKeyMaterial {
@@ -971,7 +971,10 @@ mod tests {
             SignerBinding::root("root-a", "key-root-a"),
         );
         let result = apply_event(&mut state, &event);
-        assert!(result.is_err(), "cross-root replaced_device must be rejected");
+        assert!(
+            result.is_err(),
+            "cross-root replaced_device must be rejected"
+        );
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("device-b") && err.contains("root-a"),

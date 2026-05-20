@@ -316,7 +316,10 @@ mod tests {
         kr.create_key("roundtrip").expect("create");
         let pt = some_plaintext_b64();
         let ct = kr.encrypt("roundtrip", &pt).expect("encrypt");
-        assert!(ct.starts_with("vault:v1:"), "ciphertext must have vault:v1: prefix");
+        assert!(
+            ct.starts_with("vault:v1:"),
+            "ciphertext must have vault:v1: prefix"
+        );
         let recovered = kr.decrypt("roundtrip", &ct).expect("decrypt");
         assert_eq!(recovered, pt, "recovered plaintext must match original");
     }
@@ -360,6 +363,9 @@ mod tests {
         let err = kr
             .decrypt("key-b", &ct)
             .expect_err("decrypt with wrong key should fail");
-        assert!(matches!(err, TransitError::AesGcm | TransitError::Base64(_)));
+        assert!(matches!(
+            err,
+            TransitError::AesGcm | TransitError::Base64(_)
+        ));
     }
 }

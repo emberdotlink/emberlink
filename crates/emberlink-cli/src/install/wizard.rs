@@ -23,7 +23,7 @@
 //! - [`wizard_step_chown_data_dirs`] — chown `~/.ember/{vault,grants,…}`.
 //! - [`wizard_step_provision_mek`] — vault MEK in System.keychain (macOS) /
 //!   keyring (Linux). Without this the daemon refuses to start.
-//!   implementation-note-302.
+//!   implementation-note-425.
 //! - [`wizard_step_emit_launch_spec`] — launchd plist or systemd unit.
 //! - [`wizard_step_add_user_to_group`] — operator → `ember-clients`.
 //! - [`wizard_step_verify`] — daemon socket present + responsive.
@@ -75,13 +75,9 @@ pub enum Platform {
 /// output.
 #[derive(Debug, thiserror::Error)]
 pub enum WizardError {
-    #[error(
-        "sudo elevation failed; please run `sudo -v` manually then re-run install"
-    )]
+    #[error("sudo elevation failed; please run `sudo -v` manually then re-run install")]
     SudoFailed,
-    #[error(
-        "unsupported platform: {0}; the install wizard supports macOS, Linux, and WSL"
-    )]
+    #[error("unsupported platform: {0}; the install wizard supports macOS, Linux, and WSL")]
     UnsupportedPlatform(String),
     #[error("transcript io error: {0}; check ~/.ember/ permissions and re-run install")]
     TranscriptIo(#[from] io::Error),
@@ -105,7 +101,9 @@ pub enum WizardError {
          (Linux) / `dseditgroup -o edit -a {user} -t user ember-clients` (macOS)"
     )]
     GroupAdd { user: String, stderr: String },
-    #[error("verify failed: {0}; check the daemon launcher (`launchctl list | grep ember` on macOS, `systemctl status emberd` on Linux)")]
+    #[error(
+        "verify failed: {0}; check the daemon launcher (`launchctl list | grep ember` on macOS, `systemctl status emberd` on Linux)"
+    )]
     Verify(String),
 }
 
@@ -117,6 +115,7 @@ pub const WIZARD_STEPS: &[&str] = &[
     "chown-data-dirs",
     "provision-mek",
     "emit-launch-spec",
+    "load-apparmor",
     "add-user-to-group",
     "verify",
 ];
@@ -261,7 +260,7 @@ pub trait InstallPrimitives {
     /// Provision the vault MEK in System.keychain (macOS) / keyring (Linux).
     /// The daemon refuses to start without this. Idempotent — re-running
     /// against an existing MEK item is a no-op (preserves access to existing
-    /// encrypted state). implementation-note-302.
+    /// encrypted state). implementation-note-425.
     fn provision_se_mek(&self, home: &Path) -> Result<(), daemon_install::InstallError>;
     fn install_launch_spec(
         &self,
@@ -274,6 +273,11 @@ pub trait InstallPrimitives {
         user: &str,
     ) -> Result<(), daemon_install::InstallError>;
     fn socket_responsive(&self, socket: &Path) -> Result<(), String>;
+    /// Load the AppArmor profile for agent containers into the kernel via
+    /// `apparmor_parser -r`. Linux-only; non-Linux implementations may return
+    /// `Ok(())` immediately. Idempotent — `-r` (replace) mode is safe to
+    /// re-run on an already-loaded profile.
+    fn load_apparmor_profile(&self) -> Result<(), daemon_install::InstallError>;
 
     /// Reverse of [`provision_ember_user`] — delete the `ember` system user
     /// and the `ember`/`ember-clients` groups. Best-effort; tolerates "no
@@ -294,10 +298,7 @@ pub trait InstallPrimitives {
     /// unrecoverable), so rollback intentionally leaves the MEK in place.
     /// An operator who wants to wipe it can do so manually via `security
     /// delete-generic-password` / `secret-tool clear`.
-    fn unwind_provision_se_mek(
-        &self,
-        _home: &Path,
-    ) -> Result<(), daemon_install::InstallError> {
+    fn unwind_provision_se_mek(&self, _home: &Path) -> Result<(), daemon_install::InstallError> {
         Ok(())
     }
     /// Reverse of [`install_launch_spec`] — remove the launchd plist (macOS)
@@ -306,6 +307,14 @@ pub trait InstallPrimitives {
         &self,
         _platform: &Platform,
     ) -> Result<(), daemon_install::InstallError> {
+        Ok(())
+    }
+    /// Reverse of [`load_apparmor_profile`] — removing a loaded AppArmor
+    /// profile from the kernel risks stranding running containers that were
+    /// granted confinement under it, so rollback is intentionally a no-op.
+    /// An operator who wants to unload the profile can run
+    /// `apparmor_parser -R /etc/apparmor.d/ember-agent` manually.
+    fn unwind_load_apparmor_profile(&self) -> Result<(), daemon_install::InstallError> {
         Ok(())
     }
     /// Reverse of [`add_operator_to_group`] — remove the operator from the
@@ -405,16 +414,14 @@ impl InstallPrimitives for RealPrimitives {
             }
         };
 
-        let cmd_string =
-            format!("{} {}", program, args.iter().cloned().collect::<Vec<_>>().join(" "));
-        let output = Command::new(program)
-            .args(&args)
-            .output()
-            .map_err(|e| daemon_install::InstallError::Subprocess {
+        let cmd_string = format!("{} {}", program, args.to_vec().join(" "));
+        let output = Command::new(program).args(&args).output().map_err(|e| {
+            daemon_install::InstallError::Subprocess {
                 cmd: cmd_string.clone(),
                 stderr: format!("spawn failed: {e}"),
                 exit_code: None,
-            })?;
+            }
+        })?;
         if output.status.success() {
             return Ok(());
         }
@@ -439,6 +446,10 @@ impl InstallPrimitives for RealPrimitives {
                 socket.display()
             ))
         }
+    }
+
+    fn load_apparmor_profile(&self) -> Result<(), daemon_install::InstallError> {
+        load_apparmor_profile_impl()
     }
 
     /// Delete the `ember` system user + groups via the platform-native
@@ -474,11 +485,7 @@ impl InstallPrimitives for RealPrimitives {
                 &["ember-clients"],
                 &["does not exist", "no such group"],
             );
-            let _ = run_tolerant(
-                "groupdel",
-                &["ember"],
-                &["does not exist", "no such group"],
-            );
+            let _ = run_tolerant("groupdel", &["ember"], &["does not exist", "no such group"]);
             Ok(())
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -576,15 +583,7 @@ impl InstallPrimitives for RealPrimitives {
             Platform::MacOS => {
                 let _ = run_tolerant(
                     "dseditgroup",
-                    &[
-                        "-o",
-                        "edit",
-                        "-d",
-                        user,
-                        "-t",
-                        "user",
-                        "ember-clients",
-                    ],
+                    &["-o", "edit", "-d", user, "-t", "user", "ember-clients"],
                     &["not a member", "is not a member"],
                 );
                 Ok(())
@@ -639,6 +638,62 @@ fn run_tolerant(
         stderr,
         exit_code: output.status.code(),
     })
+}
+
+// apparmor_profile_loaded_into_kernel
+/// Load the AppArmor profile for agent containers into the kernel.
+///
+/// On Linux: invokes `apparmor_parser -r infra/apparmor/ember-agent.profile`
+/// via sudo. The `-r` (replace) flag is idempotent — re-running after the
+/// profile is already loaded silently replaces it in place. If `apparmor_parser`
+/// is not installed (some minimal distros ship without it), the error is
+/// downgraded to a `tracing::warn` so the install continues. The
+/// `security_opt: apparmor=ember-agent` declaration in `compose.yml.j2` will
+/// surface as a container-start error if the profile is genuinely missing at
+/// runtime, which is the correct failure mode.
+///
+/// On non-Linux: skips with an informational log.
+#[cfg(target_os = "linux")]
+fn load_apparmor_profile_impl() -> Result<(), daemon_install::InstallError> {
+    let profile_path = "infra/apparmor/ember-agent.profile";
+    let output = Command::new("sudo")
+        .args(["apparmor_parser", "-r", profile_path])
+        .output();
+    match output {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::warn!(
+                "apparmor_parser not found on PATH — skipping AppArmor profile load; \
+                 install apparmor-utils if AppArmor enforcement is required"
+            );
+            Ok(())
+        }
+        Err(e) => Err(daemon_install::InstallError::Subprocess {
+            cmd: format!("sudo apparmor_parser -r {profile_path}"),
+            stderr: format!("spawn failed: {e}"),
+            exit_code: None,
+        }),
+        Ok(out) if out.status.success() => {
+            tracing::info!(
+                profile = profile_path,
+                "apparmor_profile_loaded_into_kernel: profile loaded/replaced"
+            );
+            Ok(())
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            Err(daemon_install::InstallError::Subprocess {
+                cmd: format!("sudo apparmor_parser -r {profile_path}"),
+                stderr,
+                exit_code: out.status.code(),
+            })
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn load_apparmor_profile_impl() -> Result<(), daemon_install::InstallError> {
+    tracing::info!("apparmor_profile_loaded_into_kernel: skipped on non-Linux platform");
+    Ok(())
 }
 
 /// Run the install wizard.
@@ -760,6 +815,7 @@ pub fn run_wizard_steps_from<P: InstallPrimitives>(
                 "chown-data-dirs" => wizard_step_chown_data_dirs(ctx, primitives)?,
                 "provision-mek" => wizard_step_provision_mek(ctx, primitives)?,
                 "emit-launch-spec" => wizard_step_emit_launch_spec(ctx, primitives)?,
+                "load-apparmor" => wizard_step_load_apparmor(ctx, primitives)?,
                 "add-user-to-group" => wizard_step_add_user_to_group(ctx, primitives)?,
                 "verify" => wizard_step_verify(ctx, primitives)?,
                 other => {
@@ -827,7 +883,10 @@ pub fn wizard_step_chown_data_dirs<P: InstallPrimitives>(
             source,
         })?;
     Ok(StepOutcome::Completed {
-        note: format!("chowned {}/.ember to ember:ember-clients", ctx.home.display()),
+        note: format!(
+            "chowned {}/.ember to ember:ember-clients",
+            ctx.home.display()
+        ),
     })
 }
 
@@ -839,7 +898,7 @@ pub fn wizard_step_chown_data_dirs<P: InstallPrimitives>(
 /// already exists, preserving access to any existing encrypted state from
 /// a prior install. Re-running this step is safe.
 ///
-/// implementation-note-302. The older
+/// implementation-note-425. The older
 /// non-wizard install path (in `crates/emberlink-cli/src/bin/ember.rs`)
 /// called this between the chown step and the launchd-plist step; the
 /// wizard refactor dropped it, causing every fresh install to end with a
@@ -875,15 +934,48 @@ pub fn wizard_step_emit_launch_spec<P: InstallPrimitives>(
         })?;
     let note = match &ctx.platform {
         Platform::MacOS => "installed LaunchDaemon plist".to_string(),
-        Platform::Linux { .. } | Platform::WslLinux { .. } => {
-            "installed systemd unit".to_string()
-        }
+        Platform::Linux { .. } | Platform::WslLinux { .. } => "installed systemd unit".to_string(),
         Platform::Unsupported(name) => format!("unsupported platform: {name}"),
     };
     Ok(StepOutcome::Completed { note })
 }
 
-/// Step 5 — add the invoking operator to the `ember-clients` connect group
+/// Step 5 — load the AppArmor profile for agent containers into the kernel.
+///
+/// On Linux invokes `sudo apparmor_parser -r infra/apparmor/ember-agent.profile`
+/// via the [`InstallPrimitives::load_apparmor_profile`] seam. Idempotent — the
+/// `-r` flag replaces an already-loaded profile in place. If `apparmor_parser`
+/// is absent the step logs a warning and returns `Completed` rather than
+/// failing the wizard (the missing binary is surfaced as a warning, not an
+/// error, consistent with the brief's NotFound handling contract).
+///
+/// On non-Linux the step is a no-op and returns `Skipped`.
+pub fn wizard_step_load_apparmor<P: InstallPrimitives>(
+    ctx: &WizardContext,
+    primitives: &P,
+) -> Result<StepOutcome, WizardError> {
+    match &ctx.platform {
+        Platform::Linux { .. } | Platform::WslLinux { .. } => {
+            primitives
+                .load_apparmor_profile()
+                .map_err(|source| WizardError::Install {
+                    step: "load-apparmor",
+                    source,
+                })?;
+            Ok(StepOutcome::Completed {
+                note: "AppArmor profile ember-agent loaded into kernel".to_string(),
+            })
+        }
+        _ => Ok(StepOutcome::Skipped {
+            reason: format!(
+                "AppArmor profile load skipped on {}",
+                platform_label(&ctx.platform)
+            ),
+        }),
+    }
+}
+
+/// Step 6 — add the invoking operator to the `ember-clients` connect group
 /// so the operator's processes can reach the daemon socket. Step 1 already
 /// did this internally; this step re-runs the platform-specific group-add
 /// command so the wizard transcript surfaces a distinct line, and so a
@@ -955,9 +1047,7 @@ fn print_relogin_banner(platform: &Platform) {
     println!("Ok | install wizard complete.");
     match platform {
         Platform::MacOS => {
-            println!(
-                "  Open a new terminal so the ember-clients group membership takes effect."
-            );
+            println!("  Open a new terminal so the ember-clients group membership takes effect.");
         }
         Platform::Linux { .. } | Platform::WslLinux { .. } => {
             println!("  Run `newgrp ember-clients` (or log out and back in) so the new");
@@ -1204,9 +1294,7 @@ fn prompt_resume_choice(prior_state: &WizardState) -> char {
     if let Some(err) = &prior_state.last_error {
         println!("  Last error: {err}");
     }
-    print!(
-        "[r]esume from step '{next_step_label}', [b]rollback, [c]ancel? "
-    );
+    print!("[r]esume from step '{next_step_label}', [b]rollback, [c]ancel? ");
     io::stdout().flush().ok();
     let mut buf = String::new();
     let stdin = io::stdin();
@@ -1248,6 +1336,12 @@ pub fn run_rollback<P: InstallPrimitives>(
                         source,
                     })?;
             }
+            "load-apparmor" => {
+                // AppArmor profile unload is intentionally a no-op on rollback —
+                // removing a loaded profile strands running containers that were
+                // confined under it. See unwind_load_apparmor_profile docstring.
+                primitives.unwind_load_apparmor_profile().ok();
+            }
             "provision-mek" => {
                 primitives
                     .unwind_provision_se_mek(&ctx.home)
@@ -1265,12 +1359,12 @@ pub fn run_rollback<P: InstallPrimitives>(
                     })?;
             }
             "provision-user" => {
-                primitives
-                    .unwind_provision_ember_user()
-                    .map_err(|source| WizardError::Install {
+                primitives.unwind_provision_ember_user().map_err(|source| {
+                    WizardError::Install {
                         step: "unwind-provision-user",
                         source,
-                    })?;
+                    }
+                })?;
             }
             other => {
                 tracing::warn!(step = %other, "rollback: unknown step, skipping");
@@ -1283,7 +1377,7 @@ pub fn run_rollback<P: InstallPrimitives>(
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// implementation-note-289 — new-machine daemon detection + prompt
+// implementation-note-407 — new-machine daemon detection + prompt
 // ───────────────────────────────────────────────────────────────────────────
 
 /// Three-state result of [`detect_daemon_installed`].
@@ -1419,11 +1513,16 @@ impl std::fmt::Display for DaemonInstallPromptError {
 /// Returns `Ok(())` when the operator consented and the install succeeded.
 /// Returns `Err(DaemonInstallPromptError::Declined)` when the operator said no.
 /// Returns other `Err` variants for non-interactive mode or subprocess failures.
-// implementation-note-289 checkpoint
+// implementation-note-407 checkpoint
 pub fn prompt_install_daemon(non_interactive: bool) -> Result<(), DaemonInstallPromptError> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
-    prompt_install_daemon_with(non_interactive, &mut stdout, &mut stdin.lock(), &RealSudoRunner)
+    prompt_install_daemon_with(
+        non_interactive,
+        &mut stdout,
+        &mut stdin.lock(),
+        &RealSudoRunner,
+    )
 }
 
 /// Trait for running `sudo ember daemon install`. Abstracted for test injection.
@@ -1472,11 +1571,7 @@ where
 
     // Cohort-A-friendly explanation.
     writeln!(out).ok();
-    writeln!(
-        out,
-        "The ember daemon is not installed on this machine."
-    )
-    .ok();
+    writeln!(out, "The ember daemon is not installed on this machine.").ok();
     writeln!(out).ok();
     writeln!(
         out,
@@ -1509,15 +1604,13 @@ where
     }
 
     // Operator consented — run the install.
-    let status = runner
-        .run_sudo_install()
-        .map_err(|e| {
-            if std::env::current_exe().is_err() {
-                DaemonInstallPromptError::ExeNotFound(e)
-            } else {
-                DaemonInstallPromptError::SpawnFailed(e)
-            }
-        })?;
+    let status = runner.run_sudo_install().map_err(|e| {
+        if std::env::current_exe().is_err() {
+            DaemonInstallPromptError::ExeNotFound(e)
+        } else {
+            DaemonInstallPromptError::SpawnFailed(e)
+        }
+    })?;
 
     if status.success() {
         Ok(())
@@ -1653,8 +1746,7 @@ mod tests {
     fn parse_distro_id_extracts_value() {
         let tmp = tempdir().expect("tempdir");
         let path = tmp.path().join("os-release");
-        fs::write(&path, "NAME=Foo\nID=arch\nPRETTY_NAME=\"Arch Linux\"\n")
-            .expect("write fixture");
+        fs::write(&path, "NAME=Foo\nID=arch\nPRETTY_NAME=\"Arch Linux\"\n").expect("write fixture");
         assert_eq!(parse_distro_id(&path), Some("arch".to_string()));
     }
 
@@ -1678,8 +1770,7 @@ mod tests {
     fn is_wsl_detects_microsoft_marker() {
         let tmp = tempdir().expect("tempdir");
         let path = tmp.path().join("proc-version");
-        fs::write(&path, "Linux version 5.15.0-microsoft-standard-WSL2\n")
-            .expect("write fixture");
+        fs::write(&path, "Linux version 5.15.0-microsoft-standard-WSL2\n").expect("write fixture");
         assert!(is_wsl(&path));
     }
 
@@ -1705,17 +1796,11 @@ mod tests {
             self.calls.borrow_mut().push("provision_ember_user");
             Ok(())
         }
-        fn chown_ember_data_dirs(
-            &self,
-            _home: &Path,
-        ) -> Result<(), daemon_install::InstallError> {
+        fn chown_ember_data_dirs(&self, _home: &Path) -> Result<(), daemon_install::InstallError> {
             self.calls.borrow_mut().push("chown_ember_data_dirs");
             Ok(())
         }
-        fn provision_se_mek(
-            &self,
-            _home: &Path,
-        ) -> Result<(), daemon_install::InstallError> {
+        fn provision_se_mek(&self, _home: &Path) -> Result<(), daemon_install::InstallError> {
             self.calls.borrow_mut().push("provision_se_mek");
             Ok(())
         }
@@ -1737,6 +1822,10 @@ mod tests {
         }
         fn socket_responsive(&self, _socket: &Path) -> Result<(), String> {
             self.calls.borrow_mut().push("socket_responsive");
+            Ok(())
+        }
+        fn load_apparmor_profile(&self) -> Result<(), daemon_install::InstallError> {
+            self.calls.borrow_mut().push("load_apparmor_profile");
             Ok(())
         }
     }
@@ -1798,6 +1887,7 @@ mod tests {
                 "chown_ember_data_dirs",
                 "provision_se_mek",
                 "install_launch_spec",
+                "load_apparmor_profile",
                 "add_operator_to_group",
                 "socket_responsive",
             ]
@@ -1832,16 +1922,10 @@ mod tests {
             fn provision_ember_user(&self) -> Result<(), daemon_install::InstallError> {
                 Ok(())
             }
-            fn chown_ember_data_dirs(
-                &self,
-                _: &Path,
-            ) -> Result<(), daemon_install::InstallError> {
+            fn chown_ember_data_dirs(&self, _: &Path) -> Result<(), daemon_install::InstallError> {
                 Ok(())
             }
-            fn provision_se_mek(
-                &self,
-                _: &Path,
-            ) -> Result<(), daemon_install::InstallError> {
+            fn provision_se_mek(&self, _: &Path) -> Result<(), daemon_install::InstallError> {
                 Ok(())
             }
             fn install_launch_spec(
@@ -1860,6 +1944,9 @@ mod tests {
             }
             fn socket_responsive(&self, _: &Path) -> Result<(), String> {
                 Err("not present".to_string())
+            }
+            fn load_apparmor_profile(&self) -> Result<(), daemon_install::InstallError> {
+                Ok(())
             }
         }
         let outcome = wizard_step_verify(&fixture_ctx(), &MissingSocket).expect("returns Ok");
@@ -1894,17 +1981,11 @@ mod tests {
                 Ok(())
             }
         }
-        fn chown_ember_data_dirs(
-            &self,
-            _: &Path,
-        ) -> Result<(), daemon_install::InstallError> {
+        fn chown_ember_data_dirs(&self, _: &Path) -> Result<(), daemon_install::InstallError> {
             self.calls.borrow_mut().push("chown_ember_data_dirs");
             Ok(())
         }
-        fn provision_se_mek(
-            &self,
-            _: &Path,
-        ) -> Result<(), daemon_install::InstallError> {
+        fn provision_se_mek(&self, _: &Path) -> Result<(), daemon_install::InstallError> {
             self.calls.borrow_mut().push("provision_se_mek");
             Ok(())
         }
@@ -1928,14 +2009,15 @@ mod tests {
             self.calls.borrow_mut().push("socket_responsive");
             Ok(())
         }
+        fn load_apparmor_profile(&self) -> Result<(), daemon_install::InstallError> {
+            self.calls.borrow_mut().push("load_apparmor_profile");
+            Ok(())
+        }
         fn unwind_provision_ember_user(&self) -> Result<(), daemon_install::InstallError> {
             self.calls.borrow_mut().push("unwind_provision_ember_user");
             Ok(())
         }
-        fn unwind_provision_se_mek(
-            &self,
-            _: &Path,
-        ) -> Result<(), daemon_install::InstallError> {
+        fn unwind_provision_se_mek(&self, _: &Path) -> Result<(), daemon_install::InstallError> {
             self.calls.borrow_mut().push("unwind_provision_se_mek");
             Ok(())
         }
@@ -2053,7 +2135,10 @@ mod tests {
         }
         // Pre-write a state file so we can confirm rollback clears it.
         save_wizard_state(&state).expect("save state");
-        assert!(state_path().exists(), "state file should exist pre-rollback");
+        assert!(
+            state_path().exists(),
+            "state file should exist pre-rollback"
+        );
 
         let result = run_rollback(&ctx, &stub, &state);
 
@@ -2071,7 +2156,10 @@ mod tests {
         // Reverse order: chown-data-dirs first, then provision-user.
         assert_eq!(
             calls,
-            vec!["unwind_chown_ember_data_dirs", "unwind_provision_ember_user"]
+            vec![
+                "unwind_chown_ember_data_dirs",
+                "unwind_provision_ember_user"
+            ]
         );
         assert!(!exists_after, "state file should be cleared after rollback");
     }
@@ -2088,8 +2176,7 @@ mod tests {
         let state = WizardState {
             completed_steps: vec!["provision-user".into(), "chown-data-dirs".into()],
             last_error: Some(
-                "install step 'provision-mek' failed: subprocess: cmd=security, exit=1"
-                    .into(),
+                "install step 'provision-mek' failed: subprocess: cmd=security, exit=1".into(),
             ),
         };
 
@@ -2120,11 +2207,17 @@ mod tests {
             }
         }
         drop(_guard);
-        assert!(rollback_result.is_ok(), "rollback failed: {rollback_result:?}");
+        assert!(
+            rollback_result.is_ok(),
+            "rollback failed: {rollback_result:?}"
+        );
         let calls = stub.calls.borrow().clone();
         assert_eq!(
             calls,
-            vec!["unwind_chown_ember_data_dirs", "unwind_provision_ember_user"]
+            vec![
+                "unwind_chown_ember_data_dirs",
+                "unwind_provision_ember_user"
+            ]
         );
 
         // (d) Cancel → no unwind calls happen.
@@ -2147,9 +2240,7 @@ mod tests {
             last_error: Some("boom".into()),
         };
         save_wizard_state_at(&state, &path).expect("save");
-        let loaded = load_wizard_state_at(&path)
-            .expect("load")
-            .expect("present");
+        let loaded = load_wizard_state_at(&path).expect("load").expect("present");
         assert_eq!(loaded, state);
     }
 
@@ -2200,7 +2291,10 @@ mod tests {
             detail: "useradd: permission denied".into(),
         }
         .to_string();
-        assert!(user.contains("ember daemon install --debug-install"), "got: {user}");
+        assert!(
+            user.contains("ember daemon install --debug-install"),
+            "got: {user}"
+        );
         assert!(user.contains("useradd: permission denied"), "got: {user}");
 
         let group = WizardError::GroupAdd {
@@ -2212,7 +2306,10 @@ mod tests {
         assert!(group.contains("alice"), "got: {group}");
 
         let verify = WizardError::Verify("socket missing".into()).to_string();
-        assert!(verify.contains("launchctl") || verify.contains("systemctl"), "got: {verify}");
+        assert!(
+            verify.contains("launchctl") || verify.contains("systemctl"),
+            "got: {verify}"
+        );
 
         let unsupported = WizardError::UnsupportedPlatform("plan9".into()).to_string();
         assert!(unsupported.contains("plan9"), "got: {unsupported}");
@@ -2241,7 +2338,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // implementation-note-289 — T2 tests
+    // implementation-note-407 — T2 tests
     // ----------------------------------------------------------------
 
     /// detect_daemon_installed: socket present → Running.
@@ -2285,10 +2382,16 @@ mod tests {
 
     impl MockSudoRunner {
         fn succeeds() -> Self {
-            Self { called: std::cell::Cell::new(false), succeed: true }
+            Self {
+                called: std::cell::Cell::new(false),
+                succeed: true,
+            }
         }
         fn fails() -> Self {
-            Self { called: std::cell::Cell::new(false), succeed: false }
+            Self {
+                called: std::cell::Cell::new(false),
+                succeed: false,
+            }
         }
     }
 
@@ -2323,7 +2426,10 @@ mod tests {
             result = result.map_err(|e| e.to_string())
         );
         // Must not have spawned the subprocess.
-        assert!(!runner.called.get(), "runner must not be called in non-interactive mode");
+        assert!(
+            !runner.called.get(),
+            "runner must not be called in non-interactive mode"
+        );
     }
 
     /// T2 — operator answers 'y' → runner is called and Ok(()) returned on success.
@@ -2336,8 +2442,15 @@ mod tests {
 
         let result = prompt_install_daemon_with(false, &mut out, &mut input, &runner);
 
-        assert!(result.is_ok(), "expected Ok after consent; got: {}", result.unwrap_err());
-        assert!(runner.called.get(), "runner must be called after operator consent");
+        assert!(
+            result.is_ok(),
+            "expected Ok after consent; got: {}",
+            result.unwrap_err()
+        );
+        assert!(
+            runner.called.get(),
+            "runner must be called after operator consent"
+        );
 
         // Output must contain the cohort-A explanation and the command.
         let printed = String::from_utf8(out).expect("utf8");
@@ -2365,7 +2478,10 @@ mod tests {
             matches!(result, Err(DaemonInstallPromptError::Declined)),
             "expected Declined"
         );
-        assert!(!runner.called.get(), "runner must not be called when declined");
+        assert!(
+            !runner.called.get(),
+            "runner must not be called when declined"
+        );
     }
 
     /// T2 — runner returns non-zero → InstallFailed variant.
@@ -2384,5 +2500,49 @@ mod tests {
             result = result.map_err(|e| e.to_string())
         );
         assert!(runner.called.get());
+    }
+
+    /// T1 (cross-platform) — the non-Linux branch of `load_apparmor_profile_impl`
+    /// returns `Ok(())` without invoking any subprocess. Gated to non-Linux runners
+    /// so it is not exercised on Linux CI (where the real `#[cfg(target_os="linux")]`
+    /// branch would be compiled in instead).
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn load_apparmor_profile_skips_on_non_linux() {
+        // The non-Linux impl is a no-op — it must return Ok(()) without any
+        // subprocess side effects.
+        let result = load_apparmor_profile_impl();
+        assert!(
+            result.is_ok(),
+            "load_apparmor_profile_impl must return Ok(()) on non-Linux; got: {result:?}"
+        );
+    }
+
+    /// T1 (cross-platform) — `wizard_step_load_apparmor` skips on macOS via
+    /// the `Platform::MacOS` branch and returns a `Skipped` outcome (not an error).
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn wizard_step_load_apparmor_skips_on_macos() {
+        let stub = StubPrimitives::default();
+        let mut ctx = fixture_ctx();
+        ctx.platform = Platform::MacOS;
+
+        let outcome = wizard_step_load_apparmor(&ctx, &stub)
+            .expect("wizard_step_load_apparmor must return Ok on macOS");
+
+        match outcome {
+            StepOutcome::Skipped { reason } => {
+                assert!(
+                    reason.contains("macos"),
+                    "skip reason should mention platform; got: {reason}"
+                );
+            }
+            other => panic!("expected Skipped on macOS, got {other:?}"),
+        }
+        // load_apparmor_profile should NOT have been called.
+        assert!(
+            stub.calls.borrow().is_empty(),
+            "load_apparmor_profile must not be called on macOS"
+        );
     }
 }

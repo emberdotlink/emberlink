@@ -99,7 +99,13 @@ mod tests {
         let store = DaemonStore::open_in_memory().unwrap();
         for _ in 0..21 {
             store
-                .log_event(Some("agent-burst"), "credential.access", None, "allowed", None)
+                .log_event(
+                    Some("agent-burst"),
+                    "credential.access",
+                    None,
+                    "allowed",
+                    None,
+                )
                 .unwrap();
         }
         let anomalies = store.detect_anomalies().unwrap();
@@ -117,7 +123,13 @@ mod tests {
         let store = DaemonStore::open_in_memory().unwrap();
         for _ in 0..4 {
             store
-                .log_event(Some("agent-denier"), "credential.access", None, "denied", None)
+                .log_event(
+                    Some("agent-denier"),
+                    "credential.access",
+                    None,
+                    "denied",
+                    None,
+                )
                 .unwrap();
         }
         let anomalies = store.detect_anomalies().unwrap();
@@ -136,7 +148,13 @@ mod tests {
         // normal agent: 2 denied events (below threshold of 3)
         for _ in 0..2 {
             store
-                .log_event(Some("agent-normal"), "credential.access", None, "denied", None)
+                .log_event(
+                    Some("agent-normal"),
+                    "credential.access",
+                    None,
+                    "denied",
+                    None,
+                )
                 .unwrap();
         }
         // anomalous agent: 4 denied events (above threshold)
@@ -146,12 +164,8 @@ mod tests {
                 .unwrap();
         }
         let anomalies = store.detect_anomalies().unwrap();
-        assert!(anomalies
-            .iter()
-            .all(|a| a.agent_id != "agent-normal"));
-        assert!(anomalies
-            .iter()
-            .any(|a| a.agent_id == "agent-bad"));
+        assert!(anomalies.iter().all(|a| a.agent_id != "agent-normal"));
+        assert!(anomalies.iter().any(|a| a.agent_id == "agent-bad"));
     }
 
     #[test]

@@ -42,9 +42,7 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
-use core_broker::{
-    Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential,
-};
+use core_broker::{Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
@@ -111,11 +109,7 @@ pub trait VercelHttpClient: Send + Sync {
 
     /// DELETE `url` with `Authorization: Bearer <bearer>`. Used for the
     /// `DELETE /v3/user/tokens/<token_id>` revoke endpoint.
-    async fn delete_bearer(
-        &self,
-        url: &str,
-        bearer: &str,
-    ) -> Result<(u16, String), String>;
+    async fn delete_bearer(&self, url: &str, bearer: &str) -> Result<(u16, String), String>;
 }
 
 /// Production [`VercelHttpClient`] backed by `reqwest`.
@@ -161,11 +155,7 @@ impl VercelHttpClient for ReqwestVercelClient {
         Ok((status, text))
     }
 
-    async fn delete_bearer(
-        &self,
-        url: &str,
-        bearer: &str,
-    ) -> Result<(u16, String), String> {
+    async fn delete_bearer(&self, url: &str, bearer: &str) -> Result<(u16, String), String> {
         let resp = self
             .inner
             .delete(url)
@@ -261,15 +251,13 @@ pub fn build_create_token_body(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let team_id_default = default_team_id
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    let team_id_default = default_team_id.map(str::trim).filter(|s| !s.is_empty());
     let team_id = team_id_explicit.or(team_id_default);
 
     // Vercel's `expiration` is a Unix timestamp in milliseconds (the
     // dashboard surfaces an absolute date). Pass an explicit absolute
     // expiration so the minted credential is always bounded.
-    let expiration_ms = (now_epoch_secs as i64)
+    let expiration_ms = now_epoch_secs
         .saturating_add(scope.expiration_seconds as i64)
         .saturating_mul(1000);
 
@@ -319,8 +307,7 @@ struct CreatedToken {
 /// - 403 (parent token missing `tokens:create` scope) → `PolicyRejected`
 /// - everything else → `Upstream` with a descriptive message
 fn map_vercel_error(status: u16, body: &str) -> BrokerError {
-    let parsed: serde_json::Value =
-        serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+    let parsed: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
     let error_code = parsed
         .pointer("/error/code")
         .and_then(|v| v.as_str())
@@ -368,11 +355,8 @@ impl Broker for VercelBroker {
             .map_err(|e| BrokerError::InvalidScope(format!("scope deserialize: {e}")))?;
 
         let now_secs = Utc::now().timestamp();
-        let body = build_create_token_body(
-            &scope,
-            self.parent.default_team_id.as_deref(),
-            now_secs,
-        )?;
+        let body =
+            build_create_token_body(&scope, self.parent.default_team_id.as_deref(), now_secs)?;
 
         let (status, resp_body) = self
             .client
@@ -571,11 +555,7 @@ impl VercelHttpClient for MockVercelClient {
         }
     }
 
-    async fn delete_bearer(
-        &self,
-        url: &str,
-        bearer: &str,
-    ) -> Result<(u16, String), String> {
+    async fn delete_bearer(&self, url: &str, bearer: &str) -> Result<(u16, String), String> {
         self.calls
             .lock()
             .expect("mock vercel mutex")
@@ -683,8 +663,7 @@ mod tests {
 
     #[test]
     fn provider_returns_vercel() {
-        let broker =
-            VercelBroker::with_client(fixture_parent(), Arc::new(MockVercelClient::new()));
+        let broker = VercelBroker::with_client(fixture_parent(), Arc::new(MockVercelClient::new()));
         assert_eq!(broker.provider(), BrokerProvider::Vercel);
     }
 
@@ -695,8 +674,7 @@ mod tests {
             expiration_seconds: 3600,
             name: "ember-personal".to_string(),
         };
-        let body = build_create_token_body(&scope, None, 1_700_000_000)
-            .expect("body must build");
+        let body = build_create_token_body(&scope, None, 1_700_000_000).expect("body must build");
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("json");
         assert_eq!(
             parsed.get("name").and_then(|v| v.as_str()),
@@ -721,8 +699,7 @@ mod tests {
             expiration_seconds: 1800,
             name: "ember-team".to_string(),
         };
-        let body = build_create_token_body(&scope, None, 1_700_000_000)
-            .expect("body must build");
+        let body = build_create_token_body(&scope, None, 1_700_000_000).expect("body must build");
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("json");
         assert_eq!(
             parsed.get("teamId").and_then(|v| v.as_str()),
@@ -788,10 +765,10 @@ mod tests {
 
     #[tokio::test]
     async fn issue_personal_scope_happy_path_returns_token_and_records_state() {
-        let mock = Arc::new(
-            MockVercelClient::new()
-                .with_response(200, create_ok_body("tk_personal", "ember-p", "vc1_minted_personal")),
-        );
+        let mock = Arc::new(MockVercelClient::new().with_response(
+            200,
+            create_ok_body("tk_personal", "ember-p", "vc1_minted_personal"),
+        ));
         let broker = VercelBroker::with_client(fixture_parent_no_default(), mock.clone());
         let req = vercel_request(
             serde_json::json!({
@@ -881,9 +858,7 @@ mod tests {
 
     #[tokio::test]
     async fn issue_unauthorized_401_returns_policy_rejected() {
-        let mock = Arc::new(
-            MockVercelClient::new().with_response(401, unauthorized_body()),
-        );
+        let mock = Arc::new(MockVercelClient::new().with_response(401, unauthorized_body()));
         let broker = VercelBroker::with_client(fixture_parent(), mock);
         let req = vercel_request(
             serde_json::json!({
@@ -902,9 +877,7 @@ mod tests {
 
     #[tokio::test]
     async fn issue_forbidden_403_returns_policy_rejected() {
-        let mock = Arc::new(
-            MockVercelClient::new().with_response(403, forbidden_scope_body()),
-        );
+        let mock = Arc::new(MockVercelClient::new().with_response(403, forbidden_scope_body()));
         let broker = VercelBroker::with_client(fixture_parent(), mock);
         let req = vercel_request(
             serde_json::json!({
@@ -923,9 +896,7 @@ mod tests {
 
     #[tokio::test]
     async fn issue_bad_request_400_returns_upstream() {
-        let mock = Arc::new(
-            MockVercelClient::new().with_response(400, bad_request_body()),
-        );
+        let mock = Arc::new(MockVercelClient::new().with_response(400, bad_request_body()));
         let broker = VercelBroker::with_client(fixture_parent(), mock);
         let req = vercel_request(
             serde_json::json!({
@@ -950,9 +921,7 @@ mod tests {
 
     #[tokio::test]
     async fn issue_invalid_expiration_422_returns_upstream() {
-        let mock = Arc::new(
-            MockVercelClient::new().with_response(422, invalid_expiration_body()),
-        );
+        let mock = Arc::new(MockVercelClient::new().with_response(422, invalid_expiration_body()));
         let broker = VercelBroker::with_client(fixture_parent(), mock);
         let req = vercel_request(
             serde_json::json!({
@@ -971,8 +940,7 @@ mod tests {
 
     #[tokio::test]
     async fn issue_with_wrong_provider_in_request_is_rejected() {
-        let broker =
-            VercelBroker::with_client(fixture_parent(), Arc::new(MockVercelClient::new()));
+        let broker = VercelBroker::with_client(fixture_parent(), Arc::new(MockVercelClient::new()));
         let mut req = vercel_request(
             serde_json::json!({
                 "team_id": "team_explicit",
@@ -990,7 +958,10 @@ mod tests {
     async fn revoke_happy_path_calls_delete_and_drops_state() {
         let mock = Arc::new(
             MockVercelClient::new()
-                .with_response(200, create_ok_body("tk_rev_1", "ember-rev", "vc1_rev_token"))
+                .with_response(
+                    200,
+                    create_ok_body("tk_rev_1", "ember-rev", "vc1_rev_token"),
+                )
                 .with_response(204, String::new()),
         );
         let broker = VercelBroker::with_client(fixture_parent(), mock.clone());
@@ -1029,7 +1000,11 @@ mod tests {
         let mock = Arc::new(
             MockVercelClient::new()
                 .with_response(200, create_ok_body("tk_404", "ember-404", "vc1_404"))
-                .with_response(404, "{\"error\":{\"code\":\"not_found\",\"message\":\"Token not found\"}}".to_string()),
+                .with_response(
+                    404,
+                    "{\"error\":{\"code\":\"not_found\",\"message\":\"Token not found\"}}"
+                        .to_string(),
+                ),
         );
         let broker = VercelBroker::with_client(fixture_parent(), mock.clone());
         let cred = Broker::issue(
@@ -1082,8 +1057,7 @@ mod tests {
 
     #[tokio::test]
     async fn revoke_unknown_id_returns_unknown_materialization() {
-        let broker =
-            VercelBroker::with_client(fixture_parent(), Arc::new(MockVercelClient::new()));
+        let broker = VercelBroker::with_client(fixture_parent(), Arc::new(MockVercelClient::new()));
         let err = Broker::revoke(&broker, "does-not-exist").await.unwrap_err();
         assert!(matches!(err, BrokerError::UnknownMaterialization(_)));
     }

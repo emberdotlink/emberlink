@@ -3,12 +3,23 @@ use std::path::{Path, PathBuf};
 
 use emberlink_app::{AppBackend, UiAction};
 
-use core_crypto::{grant_chain, FixtureSigner};
+use core_approval::{ApprovalResponse, ApprovalStatus};
+use core_crypto::{FixtureSigner, grant_chain};
+use core_event_types::{
+    ContentPublishedEvent, ContentVisibility, EventBody, MessageSentEvent,
+    PresentationAudienceKind, SignerBinding,
+};
+use core_grant_types::{
+    AccessGrant, AttestationBinding, Block, Condition, GrantMode, GrantStatus, RecipientProfile,
+    ResourceSelector, ResourceType, Statement, Usage,
+};
 use core_identity::{
     device_added_event, device_encryption_key_rotated_event, device_frozen_event,
     device_key_rotated_event, device_replaced_event, root_key_rotated_event,
 };
 use core_personas::persona_key_rotated_event;
+use core_principals::AdmissionToken;
+use core_principals::{SurvivalMode, SyncProfile, TrustThreshold};
 use core_recovery::{
     guardian_enrolled_event, recovery_approved_event, recovery_contested_event,
     recovery_executed_event, recovery_rejected_event, recovery_requested_event,
@@ -25,12 +36,7 @@ use core_sync::{
     relevant_event_ids_for_context, wrap_for_relay,
 };
 use core_trust::{derive_score, trust_attested_event, trust_revoked_event};
-use core_grant_types::{AccessGrant, AttestationBinding, Block, Condition, GrantMode, GrantStatus, RecipientProfile, ResourceSelector, ResourceType, Statement, Usage};
-use core_event_types::{ContentPublishedEvent, ContentVisibility, EventBody, MessageSentEvent, PresentationAudienceKind, SignerBinding};
-use core_principals::{SurvivalMode, SyncProfile, TrustThreshold};
-use core_principals::{AdmissionToken};
 use core_types::{Validate, ValidationError};
-use core_approval::{ApprovalResponse, ApprovalStatus};
 
 use crate::biometric::{BiometricError, BiometricOutcome, require_biometric};
 
@@ -60,9 +66,7 @@ fn parse_duration_to_secs(s: &str) -> Result<u64, String> {
             .map(|v| v * 3600)
             .map_err(|e| e.to_string())
     } else if let Some(n) = s.strip_suffix('m') {
-        n.parse::<u64>()
-            .map(|v| v * 60)
-            .map_err(|e| e.to_string())
+        n.parse::<u64>().map(|v| v * 60).map_err(|e| e.to_string())
     } else if let Some(n) = s.strip_suffix('s') {
         n.parse::<u64>().map_err(|e| e.to_string())
     } else {
@@ -71,11 +75,7 @@ fn parse_duration_to_secs(s: &str) -> Result<u64, String> {
 }
 
 pub(crate) fn truncate_id(id: &str) -> &str {
-    if id.len() > 12 {
-        &id[..12]
-    } else {
-        id
-    }
+    if id.len() > 12 { &id[..12] } else { id }
 }
 
 /// Parse a list of `--cap <kind>:<arg>` CLI flags into composite-grant
@@ -125,7 +125,10 @@ fn render_resource(r: &ResourceSelector) -> String {
     match r {
         ResourceSelector::Exact { value } => value.clone(),
         ResourceSelector::Glob { pattern } => format!("glob:{pattern}"),
-        ResourceSelector::GlobWithSubtarget { primary_glob, subtarget_glob } => {
+        ResourceSelector::GlobWithSubtarget {
+            primary_glob,
+            subtarget_glob,
+        } => {
             format!("glob:{primary_glob}:{subtarget_glob}")
         }
         ResourceSelector::Regex { pattern } => format!("re:{pattern}"),
@@ -200,9 +203,9 @@ impl DemoApp {
             ["import", rest @ ..] => self.handle_import(rest),
             ["show", "vault", rest @ ..] | ["vault", rest @ ..] => self.handle_vault(rest),
             ["show", "grant", rest @ ..] | ["grant", rest @ ..] => self.handle_grant(rest),
-            // EMBER-implementation-note-172: Subcommand::Audit — query the receipts table.
+            // EMBER-implementation-note-244: Subcommand::Audit — query the receipts table.
             ["audit", rest @ ..] => self.handle_audit(rest),
-            // implementation-note-156 — `ember approval approve|deny <id>` is the
+            // implementation-note-205 — `ember approval approve|deny <id>` is the
             // demo-grade approval command. On macOS it triggers
             // LocalAuthentication (Touch ID / device passcode) before
             // mutating state; declined biometric refuses the approval.
@@ -483,7 +486,8 @@ impl DemoApp {
         let attester_key_id = attester.active_key.key_id.clone();
         let signer = self.persona_signer(&attester_id)?;
         let previous_event_id = self
-            .app_runtime.store
+            .app_runtime
+            .store
             .events()
             .iter()
             .rev()
@@ -775,7 +779,10 @@ impl DemoApp {
         }
         self.append_live_event(
             self.allocate_event_id("recovery-executed"),
-            recovery_executed_event(&session.request_id, core_principals::RecoveryScope::FreezeDevice),
+            recovery_executed_event(
+                &session.request_id,
+                core_principals::RecoveryScope::FreezeDevice,
+            ),
             SignerBinding::root(&session.root_id, root_key_id.clone()),
             &root_signer,
         )?;
@@ -791,13 +798,15 @@ impl DemoApp {
         )?;
         let vault_namespaces = self.vault_namespaces_for_root(&session.root_id)?;
         if let Some(replacement_device) = &replacement_device {
-            self.app_runtime.store
+            self.app_runtime
+                .store
                 .restore_persona_access_to_replacement_device(
                     &session.target_device_id,
                     &replacement_device.device_id,
                 )?;
             for namespace in &vault_namespaces {
-                self.app_runtime.store
+                self.app_runtime
+                    .store
                     .restore_local_vault_access_to_replacement_device(
                         namespace,
                         &session.target_device_id,
@@ -806,14 +815,19 @@ impl DemoApp {
             }
         } else {
             for namespace in &vault_namespaces {
-                self.app_runtime.store
+                self.app_runtime
+                    .store
                     .revoke_local_vault_access_for_inactive_device(
                         namespace,
                         &session.target_device_id,
                     )?;
             }
         }
-        if let Some(mut manifest) = self.app_runtime.store.file_manifest(&self.storage_manifest.id) {
+        if let Some(mut manifest) = self
+            .app_runtime
+            .store
+            .file_manifest(&self.storage_manifest.id)
+        {
             if let Some(replacement_device) = &replacement_device {
                 let manifest_id = manifest.id.clone();
                 let replacement_access = self
@@ -1043,7 +1057,8 @@ impl DemoApp {
         let signer = self.device_signer(&device_id)?;
         let signing_key_id = self.devices[index].active_key.key_id.clone();
         let next_version = self
-            .app_runtime.store
+            .app_runtime
+            .store
             .materialized()
             .device_encryption_key_history
             .get(&device_id)
@@ -1069,7 +1084,8 @@ impl DemoApp {
             &signer,
         )?;
         self.devices[index].active_encryption_key = new_encryption_key.clone();
-        self.app_runtime.store
+        self.app_runtime
+            .store
             .upsert_local_device_encryption_key(&device_id, &key_pair)?;
         self.rewrap_manifest_access_for_device(&device_id)?;
         self.persist_to_disk()?;
@@ -1084,7 +1100,9 @@ impl DemoApp {
         &mut self,
         device_id: &str,
     ) -> Result<(), ValidationError> {
-        self.app_runtime.store.prime_manifest_keys_for_device(device_id)?;
+        self.app_runtime
+            .store
+            .prime_manifest_keys_for_device(device_id)?;
         Ok(())
     }
 
@@ -1145,7 +1163,8 @@ impl DemoApp {
             .ok_or_else(|| ValidationError::new(format!("unknown device: {device_ref}")))?;
         let peer_id = self.current_peer_id();
         let current_endpoint = self
-            .app_runtime.store
+            .app_runtime
+            .store
             .materialized()
             .endpoint(&peer_id)
             .cloned()
@@ -1300,7 +1319,8 @@ impl DemoApp {
             owner_id: device.device_id.clone(),
             key_pair,
         });
-        self.app_runtime.store
+        self.app_runtime
+            .store
             .upsert_local_device_encryption_key(device_id, &encryption_key_pair)?;
         self.devices.push(device);
         self.persist_to_disk()?;
@@ -1314,7 +1334,8 @@ impl DemoApp {
 
         let root_id = self.storage_manifest_root_id(&self.storage_manifest)?;
         if !self
-            .app_runtime.store
+            .app_runtime
+            .store
             .materialized()
             .storage_relationships_current
             .contains_key(&self.storage_relationship.id)
@@ -1326,7 +1347,8 @@ impl DemoApp {
             )?;
         }
         if !self
-            .app_runtime.store
+            .app_runtime
+            .store
             .materialized()
             .storage_balances_current
             .contains_key(&self.storage_ledger.relationship_id)
@@ -1338,7 +1360,8 @@ impl DemoApp {
             )?;
         }
         if self
-            .app_runtime.store
+            .app_runtime
+            .store
             .file_manifest(&self.storage_manifest.id)
             .is_none()
         {
@@ -1355,7 +1378,12 @@ impl DemoApp {
 
     pub(crate) fn initialize_runtime_vault_state(&mut self) -> Result<(), ValidationError> {
         let namespace = self.seed_vault_namespace();
-        if self.app_runtime.store.local_vault_catalog(&namespace)?.is_none() {
+        if self
+            .app_runtime
+            .store
+            .local_vault_catalog(&namespace)?
+            .is_none()
+        {
             let recipients = self.manifest_key_recipients_for_namespace(&namespace)?;
             if recipients.is_empty() {
                 return Err(ValidationError::new(
@@ -1398,7 +1426,8 @@ impl DemoApp {
             )?;
         }
         if self
-            .app_runtime.store
+            .app_runtime
+            .store
             .local_presentation_template("template-professional-card")?
             .is_none()
         {
@@ -1416,11 +1445,13 @@ impl DemoApp {
                 ],
                 Some(3600),
             )?;
-            self.app_runtime.store
+            self.app_runtime
+                .store
                 .upsert_local_presentation_template(&template)?;
         }
         if self
-            .app_runtime.store
+            .app_runtime
+            .store
             .local_presentation_template("template-professional-peer-card")?
             .is_none()
         {
@@ -1437,7 +1468,8 @@ impl DemoApp {
                 ],
                 Some(3600),
             )?;
-            self.app_runtime.store
+            self.app_runtime
+                .store
                 .upsert_local_presentation_template(&template)?;
         }
         Ok(())
@@ -1491,7 +1523,8 @@ impl DemoApp {
                 .map(|persona| persona.root_id.as_str())
         };
         Ok(self
-            .app_runtime.store
+            .app_runtime
+            .store
             .local_vault_namespaces()?
             .into_iter()
             .filter(|namespace| match namespace.owner_kind {
@@ -1505,7 +1538,8 @@ impl DemoApp {
 
     pub(crate) fn refresh_storage_manifest_from_runtime(&mut self) -> Result<(), ValidationError> {
         if let Some(relationship) = self
-            .app_runtime.store
+            .app_runtime
+            .store
             .materialized()
             .storage_relationships_current
             .get(&self.storage_relationship.id)
@@ -1513,14 +1547,19 @@ impl DemoApp {
             self.storage_relationship = relationship.clone();
         }
         if let Some(balance) = self
-            .app_runtime.store
+            .app_runtime
+            .store
             .materialized()
             .storage_balances_current
             .get(&self.storage_ledger.relationship_id)
         {
             self.storage_ledger = balance.clone();
         }
-        if let Some(manifest) = self.app_runtime.store.file_manifest(&self.storage_manifest.id) {
+        if let Some(manifest) = self
+            .app_runtime
+            .store
+            .file_manifest(&self.storage_manifest.id)
+        {
             self.storage_manifest = manifest;
         }
         Ok(())
@@ -1530,7 +1569,8 @@ impl DemoApp {
         &self,
     ) -> Result<core_event_types::FileManifest, ValidationError> {
         Ok(self
-            .app_runtime.store
+            .app_runtime
+            .store
             .file_manifest(&self.storage_manifest.id)
             .unwrap_or_else(|| self.storage_manifest.clone()))
     }
@@ -1577,7 +1617,8 @@ impl DemoApp {
 
     pub(crate) fn current_storage_relationship(&self) -> core_event_types::StorageRelationship {
         match self
-            .app_runtime.store
+            .app_runtime
+            .store
             .materialized()
             .storage_relationships_current
             .get(&self.storage_relationship.id)
@@ -1591,7 +1632,8 @@ impl DemoApp {
 
     pub(crate) fn current_storage_ledger(&self) -> core_event_types::StorageLedgerEntry {
         match self
-            .app_runtime.store
+            .app_runtime
+            .store
             .materialized()
             .storage_balances_current
             .get(&self.storage_ledger.relationship_id)
@@ -1616,7 +1658,8 @@ impl DemoApp {
         let manifest = self.current_storage_manifest()?;
         let chunks = if self.app_runtime.store.file_manifest(&manifest.id).is_some() {
             let (restore_device_id, chunks) = self
-                .app_runtime.store
+                .app_runtime
+                .store
                 .plan_storage_restore(&manifest.id, &relationship)?;
             return Ok((relationship, manifest, restore_device_id, chunks));
         } else {
@@ -1661,7 +1704,8 @@ impl DemoApp {
             ));
         }
         let chunks = self
-            .app_runtime.store
+            .app_runtime
+            .store
             .manifest_payload_chunks_for_device(&manifest.id, &device_id)?;
         Ok((manifest, device_id, chunks))
     }
@@ -1867,7 +1911,8 @@ impl DemoApp {
             .map(|device| device.device_id.clone())
             .collect();
         for device_id in &device_ids {
-            self.app_runtime.store
+            self.app_runtime
+                .store
                 .grant_persona_device_access(persona_id, device_id)?;
         }
         Ok(device_ids)
@@ -1878,7 +1923,8 @@ impl DemoApp {
         persona_id: &str,
     ) -> Result<Vec<String>, ValidationError> {
         Ok(self
-            .app_runtime.store
+            .app_runtime
+            .store
             .persona_device_access_for_persona(persona_id)?
             .into_iter()
             .map(|record| record.device_id)
@@ -1931,7 +1977,8 @@ impl DemoApp {
     ) -> Result<Vec<String>, ValidationError> {
         let mut lines = Vec::new();
         for record in self
-            .app_runtime.store
+            .app_runtime
+            .store
             .persona_device_access_for_device(device_id)?
         {
             if let Some(persona) = self
@@ -1956,7 +2003,7 @@ impl DemoApp {
         Ok(lines)
     }
 
-    /// EMBER-implementation-note-172 — Subcommand::Audit dispatch for the demo shell.
+    /// EMBER-implementation-note-244 — Subcommand::Audit dispatch for the demo shell.
     ///
     /// Accepts the same filter flags as `ember audit query` (`--actor`,
     /// `--kind`, `--grant-id`, `--since`, `--limit`, `--format`). In the
@@ -2083,7 +2130,10 @@ impl DemoApp {
                 ) {
                     Ok(args) => match dirs_next::home_dir()
                         .ok_or_else(|| "could not determine home directory".to_string())
-                        .and_then(|home| crate::binary::install::binary_install(&args, &home).map_err(|e| e.to_string())) {
+                        .and_then(|home| {
+                            crate::binary::install::binary_install(&args, &home)
+                                .map_err(|e| e.to_string())
+                        }) {
                         Ok(()) => "[binary install] OK\n".to_string(),
                         Err(e) => format!("binary install error: {e}\n"),
                     },
@@ -2120,12 +2170,10 @@ impl DemoApp {
                     Err(e) => format!("{e}\n"),
                 }
             }
-            ["binary", ..] => {
-                "Usage: binary install <tool>@<version> --from-path <path>\n       \
+            ["binary", ..] => "Usage: binary install <tool>@<version> --from-path <path>\n       \
                  binary list\n       binary update <tool>\n       \
                  binary remove <tool>@<version>\n"
-                    .to_string()
-            }
+                .to_string(),
             ["construct", "sign", rest @ ..] => {
                 // Build argv with a dummy binary name; clap uses argv[0] as the
                 // program name, so we prepend "ember-construct-sign" and pass
@@ -2158,13 +2206,11 @@ impl DemoApp {
                     Err(e) => format!("{e}\n"),
                 }
             }
-            ["construct", ..] => {
-                "Usage: construct sign --binary <path> --construct-toml <path> \
+            ["construct", ..] => "Usage: construct sign --binary <path> --construct-toml <path> \
                  --version <semver> --identity-root-keypath <path>\n       \
                  construct dev <path>\n       construct dev --list\n       \
                  construct dev --unregister <path>\n"
-                    .to_string()
-            }
+                .to_string(),
             _ => "Unknown command. Run `help` for examples.\n".to_string(),
         }
     }
@@ -2174,7 +2220,12 @@ impl DemoApp {
         writeln!(&mut out, "Emberlink identity status").unwrap();
         writeln!(&mut out, "  peer:    {}", self.peer_id).unwrap();
         writeln!(&mut out, "  state:   {}", self.state_location_label()).unwrap();
-        writeln!(&mut out, "  events:  {}", self.app_runtime.store.event_count()).unwrap();
+        writeln!(
+            &mut out,
+            "  events:  {}",
+            self.app_runtime.store.event_count()
+        )
+        .unwrap();
         writeln!(&mut out).unwrap();
 
         if self.roots.is_empty() {
@@ -2967,7 +3018,8 @@ impl DemoApp {
             Some(p) => p.clone(),
             None => {
                 let available: Vec<_> = self
-                    .app_runtime.store
+                    .app_runtime
+                    .store
                     .materialized()
                     .personas_current
                     .keys()
@@ -3082,7 +3134,12 @@ impl DemoApp {
         writeln!(&mut out).unwrap();
 
         // Create identity if none exists
-        let has_identity = !self.app_runtime.store.materialized().roots_current.is_empty();
+        let has_identity = !self
+            .app_runtime
+            .store
+            .materialized()
+            .roots_current
+            .is_empty();
         if !has_identity {
             let Some(my_name) = name else {
                 return format!(
@@ -4542,8 +4599,10 @@ impl DemoApp {
             &remote_event_ids,
             |id| self.app_runtime.store.has_event(id),
         );
-        let relevant_remote_ids =
-            relevant_event_ids_for_context(other.app_runtime.store.events(), &self.light_sync_context());
+        let relevant_remote_ids = relevant_event_ids_for_context(
+            other.app_runtime.store.events(),
+            &self.light_sync_context(),
+        );
         let batch = filter_batch_by_profile(&raw_batch, profile, &relevant_remote_ids);
         let remote_events = other.app_runtime.store.events_by_ids(&batch.event_ids);
         let cursor_event_id = self.next_sync_cursor_event_id(
@@ -4642,7 +4701,12 @@ impl DemoApp {
             if peer_state_file.exists() || peer_sqlite_file.exists() {
                 let peer = Self::open_existing(peer_state_file)?;
                 let source_peer_id = self.current_peer_id();
-                Some(peer.app_runtime.store.peer_cursor(&source_peer_id)?.last_event_id)
+                Some(
+                    peer.app_runtime
+                        .store
+                        .peer_cursor(&source_peer_id)?
+                        .last_event_id,
+                )
             } else {
                 None
             }
@@ -4750,7 +4814,8 @@ impl DemoApp {
         peer_id: &str,
     ) -> Result<String, ValidationError> {
         let endpoint = self
-            .app_runtime.store
+            .app_runtime
+            .store
             .materialized()
             .endpoint(peer_id)
             .ok_or_else(|| {
@@ -4863,11 +4928,8 @@ impl DemoApp {
                 _ => i += 1,
             }
         }
-        let export = core_trust::queries::export_trust_graph(
-            &self.trust_attestations,
-            persona_id,
-            depth,
-        );
+        let export =
+            core_trust::queries::export_trust_graph(&self.trust_attestations, persona_id, depth);
         match serde_json::to_string_pretty(&export) {
             Ok(json) => format!("{json}\n"),
             Err(e) => format!("Failed to serialize trust graph: {e}\n"),
@@ -5319,7 +5381,8 @@ impl DemoApp {
             .map(|device| device.device_id.clone())
             .ok_or_else(|| ValidationError::new(format!("unknown active device: {device_ref}")))?;
 
-        self.app_runtime.store
+        self.app_runtime
+            .store
             .grant_persona_device_access(&persona_id, &device_id)?;
 
         let rewrapped = self.wrap_vault_keys_for_new_device(&persona_id, &device_id)?;
@@ -5351,7 +5414,8 @@ impl DemoApp {
             owner_id: persona_id.to_string(),
         };
         let manifests_with_keys = self
-            .app_runtime.store
+            .app_runtime
+            .store
             .local_vault_manifests_with_keys(&namespace)?;
         let mut count = 0;
         for (mut manifest, content_key) in manifests_with_keys {
@@ -5371,7 +5435,9 @@ impl DemoApp {
                 &content_key,
             )?;
             grant_manifest_access(&mut manifest, access)?;
-            self.app_runtime.store.upsert_local_file_manifest(&manifest)?;
+            self.app_runtime
+                .store
+                .upsert_local_file_manifest(&manifest)?;
             count += 1;
         }
         Ok(count)
@@ -5391,7 +5457,8 @@ impl DemoApp {
             .map(|device| device.device_id.clone())
             .ok_or_else(|| ValidationError::new(format!("unknown device: {device_ref}")))?;
 
-        self.app_runtime.store
+        self.app_runtime
+            .store
             .revoke_persona_device_access(&persona_id, &device_id)?;
 
         Ok(format!(
@@ -5461,7 +5528,9 @@ impl DemoApp {
                     i += 2;
                 }
                 "--condition" if i + 1 < tokens.len() => {
-                    match core_grant_types::grant_conditions::GrantCondition::parse_cli(tokens[i + 1]) {
+                    match core_grant_types::grant_conditions::GrantCondition::parse_cli(
+                        tokens[i + 1],
+                    ) {
                         Ok(cond) => conditions.push(cond),
                         Err(e) => return format!("invalid --condition: {e}\n"),
                     }
@@ -5543,7 +5612,9 @@ impl DemoApp {
                     i += 2;
                 }
                 "--condition" if i + 1 < tokens.len() => {
-                    match core_grant_types::grant_conditions::GrantCondition::parse_cli(tokens[i + 1]) {
+                    match core_grant_types::grant_conditions::GrantCondition::parse_cli(
+                        tokens[i + 1],
+                    ) {
                         Ok(cond) => conditions.push(cond),
                         Err(e) => return format!("invalid --condition: {e}\n"),
                     }
@@ -5720,9 +5791,7 @@ impl DemoApp {
                 match fetch_response.strip_prefix(&format!("OFFER {} ", grant_link.offer_id)) {
                     Some(hex) => hex.trim().to_string(),
                     None => {
-                        return format!(
-                            "error: unexpected relay response: {fetch_response}\n"
-                        );
+                        return format!("error: unexpected relay response: {fetch_response}\n");
                     }
                 };
 
@@ -5770,28 +5839,27 @@ impl DemoApp {
         let claimed_at = result["claimed_at"].as_u64().unwrap_or(0);
 
         // If this was a relay-assisted claim, send CLAIM_OFFER to mark it consumed.
-        let relay_notice = if let (Some(addr), Some(oid)) =
-            (relay_addr_for_claim, offer_id_for_relay_claim)
-        {
-            let claim_cmd = format!("CLAIM_OFFER {oid}");
-            match self.relay_round_trip(&addr, claim_cmd.as_bytes()) {
-                Ok(frames) => {
-                    let resp = frames
-                        .into_iter()
-                        .next()
-                        .and_then(|f| String::from_utf8(f).ok())
-                        .unwrap_or_default();
-                    if resp.starts_with("OK") {
-                        format!("\trelay-claimed\t{addr}\t{resp}")
-                    } else {
-                        format!("\trelay-claim-warning\t{resp}")
+        let relay_notice =
+            if let (Some(addr), Some(oid)) = (relay_addr_for_claim, offer_id_for_relay_claim) {
+                let claim_cmd = format!("CLAIM_OFFER {oid}");
+                match self.relay_round_trip(&addr, claim_cmd.as_bytes()) {
+                    Ok(frames) => {
+                        let resp = frames
+                            .into_iter()
+                            .next()
+                            .and_then(|f| String::from_utf8(f).ok())
+                            .unwrap_or_default();
+                        if resp.starts_with("OK") {
+                            format!("\trelay-claimed\t{addr}\t{resp}")
+                        } else {
+                            format!("\trelay-claim-warning\t{resp}")
+                        }
                     }
+                    Err(e) => format!("\trelay-claim-warning\tfailed to notify relay: {e}"),
                 }
-                Err(e) => format!("\trelay-claim-warning\tfailed to notify relay: {e}"),
-            }
-        } else {
-            String::new()
-        };
+            } else {
+                String::new()
+            };
 
         format!(
             "grant claimed\t{offer_id}\tpersona\t{persona_id}\tissuer\t{issuer_persona_id}\tat\t{claimed_at}{relay_notice}\n"
@@ -5856,8 +5924,13 @@ impl DemoApp {
             }
         }
 
-        let (Some(persona_ref), Some(recipient_id), Some(kind_str), Some(profile_str), Some(mode_str)) =
-            (persona, recipient, kind, profile, mode)
+        let (
+            Some(persona_ref),
+            Some(recipient_id),
+            Some(kind_str),
+            Some(profile_str),
+            Some(mode_str),
+        ) = (persona, recipient, kind, profile, mode)
         else {
             return "Usage: grant create --persona <p> --recipient <id> --kind peer|service \
                     --profile human|agent|service --mode one_shot|renewable|standing\n"
@@ -5881,11 +5954,8 @@ impl DemoApp {
         ) {
             Ok(msg) => {
                 // Auto-deposit: after grant creation, attempt auto-deposit for ReadCredential caps.
-                let deposit_note = self.attempt_credential_deposit_for_caps(
-                    &msg,
-                    &parsed_caps,
-                    relay.as_deref(),
-                );
+                let deposit_note =
+                    self.attempt_credential_deposit_for_caps(&msg, &parsed_caps, relay.as_deref());
                 format!("{}{}", msg, deposit_note)
             }
             Err(err) => format!("Failed to create grant: {}\n", err),
@@ -5944,25 +6014,22 @@ impl DemoApp {
             .unwrap_or("(no credential:read statement)");
 
         // 2. Check for local credential deposit.
-        let local_payload: Option<Vec<u8>> = match self
-            .app_runtime
-            .store
-            .fetch_credential_deposit(grant_id)
-        {
-            Ok(Some(row)) => {
-                // The deposit stores the raw payload bytes hex-encoded in encrypted_blocks_json.
-                // Try hex-decode first, fall back to treating it as raw UTF-8 payload.
-                Some(
-                    core_types::hex_to_bytes(row.encrypted_blocks_json.trim())
-                        .unwrap_or_else(|_| row.encrypted_blocks_json.into_bytes()),
-                )
-            }
-            Ok(None) => None,
-            Err(e) => {
-                eprintln!("warning: could not read local credential deposit: {e}");
-                None
-            }
-        };
+        let local_payload: Option<Vec<u8>> =
+            match self.app_runtime.store.fetch_credential_deposit(grant_id) {
+                Ok(Some(row)) => {
+                    // The deposit stores the raw payload bytes hex-encoded in encrypted_blocks_json.
+                    // Try hex-decode first, fall back to treating it as raw UTF-8 payload.
+                    Some(
+                        core_types::hex_to_bytes(row.encrypted_blocks_json.trim())
+                            .unwrap_or_else(|_| row.encrypted_blocks_json.into_bytes()),
+                    )
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    eprintln!("warning: could not read local credential deposit: {e}");
+                    None
+                }
+            };
 
         // 3. If no local deposit, try to fetch from relay.
         let credential_bytes: Vec<u8> = if let Some(b) = local_payload {
@@ -6006,11 +6073,12 @@ impl DemoApp {
 
         // 4. Render the credential.
         let credential_text = String::from_utf8_lossy(&credential_bytes);
-        let formatted_value = if let Ok(v) = serde_json::from_str::<serde_json::Value>(&credential_text) {
-            serde_json::to_string_pretty(&v).unwrap_or_else(|_| credential_text.to_string())
-        } else {
-            credential_text.to_string()
-        };
+        let formatted_value =
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&credential_text) {
+                serde_json::to_string_pretty(&v).unwrap_or_else(|_| credential_text.to_string())
+            } else {
+                credential_text.to_string()
+            };
 
         format!(
             "grant  {grant_id}\nscope  {scope_label}\n{}\n{formatted_value}\n",
@@ -6056,8 +6124,7 @@ impl DemoApp {
         };
 
         // Find a namespace that contains this object.
-        let payload_bytes: Option<Vec<u8>> =
-            self.find_vault_object_payload(&object_id);
+        let payload_bytes: Option<Vec<u8>> = self.find_vault_object_payload(&object_id);
 
         let Some(payload) = payload_bytes else {
             return format!(
@@ -6102,14 +6169,18 @@ impl DemoApp {
                 owner_id: persona_id.clone(),
             };
             if let Ok(Some(catalog)) = self.app_runtime.store.local_vault_catalog(&ns)
-                && let Some(object) =
-                    catalog.objects.iter().find(|o| o.id == *object_id && !o.deleted)
+                && let Some(object) = catalog
+                    .objects
+                    .iter()
+                    .find(|o| o.id == *object_id && !o.deleted)
                 && let Some(revision) = catalog
                     .revisions
                     .iter()
                     .find(|r| r.id == object.latest_revision_id)
-                && let Ok(bytes) =
-                    self.app_runtime.store.local_manifest_payload_bytes(&revision.manifest_id)
+                && let Ok(bytes) = self
+                    .app_runtime
+                    .store
+                    .local_manifest_payload_bytes(&revision.manifest_id)
             {
                 return Some(bytes);
             }
@@ -6121,14 +6192,18 @@ impl DemoApp {
                 owner_id: root_id.clone(),
             };
             if let Ok(Some(catalog)) = self.app_runtime.store.local_vault_catalog(&ns)
-                && let Some(object) =
-                    catalog.objects.iter().find(|o| o.id == *object_id && !o.deleted)
+                && let Some(object) = catalog
+                    .objects
+                    .iter()
+                    .find(|o| o.id == *object_id && !o.deleted)
                 && let Some(revision) = catalog
                     .revisions
                     .iter()
                     .find(|r| r.id == object.latest_revision_id)
-                && let Ok(bytes) =
-                    self.app_runtime.store.local_manifest_payload_bytes(&revision.manifest_id)
+                && let Ok(bytes) = self
+                    .app_runtime
+                    .store
+                    .local_manifest_payload_bytes(&revision.manifest_id)
             {
                 return Some(bytes);
             }
@@ -6171,7 +6246,8 @@ impl DemoApp {
         };
 
         match self
-            .app_runtime.store
+            .app_runtime
+            .store
             .list_active_grants(persona_id.as_deref(), recipient_profile)
         {
             Ok(grants) => self.render_grant_list(&grants),
@@ -6219,7 +6295,10 @@ impl DemoApp {
             .store
             .renew_access_grant(grant_id, new_expires_at, None)
         {
-            Ok(()) => format!("renewed grant\t{}\texpires_at={}\n", grant_id, new_expires_at),
+            Ok(()) => format!(
+                "renewed grant\t{}\texpires_at={}\n",
+                grant_id, new_expires_at
+            ),
             Err(err) => format!("Failed to renew grant: {}\n", err),
         }
     }
@@ -6250,7 +6329,8 @@ impl DemoApp {
             }
         }
 
-        match self.edit_grant_command(grant_id, label.as_deref(), mode.as_deref(), note.as_deref()) {
+        match self.edit_grant_command(grant_id, label.as_deref(), mode.as_deref(), note.as_deref())
+        {
             Ok(msg) => msg,
             Err(err) => format!("Failed to edit grant: {}\n", err),
         }
@@ -6286,7 +6366,8 @@ impl DemoApp {
         };
 
         match self
-            .app_runtime.store
+            .app_runtime
+            .store
             .list_grants_for_recipient(recipient_kind, &recipient_id)
         {
             Ok(grants) => self.render_recipient_detail(&recipient_id, &kind_str, &grants),
@@ -6323,7 +6404,8 @@ impl DemoApp {
         };
 
         match self
-            .app_runtime.store
+            .app_runtime
+            .store
             .grant_history_timeline(persona_id.as_deref(), limit, None)
         {
             Ok(entries) => self.render_grant_history_timeline(&entries),
@@ -6359,15 +6441,35 @@ impl DemoApp {
                 let mut year = 1970u64;
                 let mut remaining_days = days_since_epoch;
                 loop {
-                    let days_in_year = if year.is_multiple_of(400) || (year.is_multiple_of(4) && !year.is_multiple_of(100)) { 366 } else { 365 };
+                    let days_in_year = if year.is_multiple_of(400)
+                        || (year.is_multiple_of(4) && !year.is_multiple_of(100))
+                    {
+                        366
+                    } else {
+                        365
+                    };
                     if remaining_days < days_in_year {
                         break;
                     }
                     remaining_days -= days_in_year;
                     year += 1;
                 }
-                let is_leap = year.is_multiple_of(400) || (year.is_multiple_of(4) && !year.is_multiple_of(100));
-                let month_days: [u64; 12] = [31, if is_leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+                let is_leap = year.is_multiple_of(400)
+                    || (year.is_multiple_of(4) && !year.is_multiple_of(100));
+                let month_days: [u64; 12] = [
+                    31,
+                    if is_leap { 29 } else { 28 },
+                    31,
+                    30,
+                    31,
+                    30,
+                    31,
+                    31,
+                    30,
+                    31,
+                    30,
+                    31,
+                ];
                 let mut month = 1u64;
                 for &md in &month_days {
                     if remaining_days < md {
@@ -6380,9 +6482,7 @@ impl DemoApp {
                 writeln!(
                     &mut out,
                     "{year:04}-{month:02}-{day:02} {h:02}:{m:02}:{s:02}  {:<22}  {:<24}  {}",
-                    entry.agent_id,
-                    entry.scope,
-                    entry.outcome,
+                    entry.agent_id, entry.scope, entry.outcome,
                 )
                 .unwrap();
             }
@@ -6421,12 +6521,11 @@ impl DemoApp {
                         .as_deref()
                         .unwrap_or(row.requester_id.as_str());
                     // Parse capability from scope JSON; fall back to raw JSON on error.
-                    let capability = serde_json::from_str::<serde_json::Value>(
-                        &row.requested_scope_json,
-                    )
-                    .ok()
-                    .and_then(|v| v["capability"].as_str().map(str::to_owned))
-                    .unwrap_or_else(|| row.requested_scope_json.clone());
+                    let capability =
+                        serde_json::from_str::<serde_json::Value>(&row.requested_scope_json)
+                            .ok()
+                            .and_then(|v| v["capability"].as_str().map(str::to_owned))
+                            .unwrap_or_else(|| row.requested_scope_json.clone());
                     let duration = match row.requested_duration_secs {
                         Some(s) => format!("{}s", s),
                         None => "unbounded".to_string(),
@@ -6535,7 +6634,7 @@ impl DemoApp {
         }
     }
 
-    // ── implementation-note-156: hardware-attested approval ─────────────────────
+    // ── implementation-note-205: hardware-attested approval ─────────────────────
     //
     // `ember approval approve|deny <id> [--no-biometric] [--reason <r>]`
     //
@@ -6635,7 +6734,7 @@ impl DemoApp {
             Ok(()) => {
                 // Audit line — surfaced in `ember show audit` and tee'd into
                 // the daemon log. The `biometric` + `credential_id` fields
-                // satisfy the implementation-note-156 acceptance criterion.
+                // satisfy the implementation-note-205 acceptance criterion.
                 let cred = credential_id.as_deref().unwrap_or("");
                 format!(
                     "approved\t{}\tbiometric={}\tcredential_id={}\n",
@@ -6740,22 +6839,21 @@ impl DemoApp {
         let persona_id = persona.id.clone();
         let persona_root_id = persona.root_id.clone();
 
-        let recipient_kind = PresentationAudienceKind::parse(kind_str)
-            .ok_or_else(|| ValidationError::new(format!("invalid kind: {kind_str}. Use: peer, service")))?;
+        let recipient_kind = PresentationAudienceKind::parse(kind_str).ok_or_else(|| {
+            ValidationError::new(format!("invalid kind: {kind_str}. Use: peer, service"))
+        })?;
 
-        let recipient_profile = RecipientProfile::parse(profile_str)
-            .ok_or_else(|| {
-                ValidationError::new(format!(
-                    "invalid profile: {profile_str}. Use: human, agent, service"
-                ))
-            })?;
+        let recipient_profile = RecipientProfile::parse(profile_str).ok_or_else(|| {
+            ValidationError::new(format!(
+                "invalid profile: {profile_str}. Use: human, agent, service"
+            ))
+        })?;
 
-        let mode = GrantMode::parse(mode_str)
-            .ok_or_else(|| {
-                ValidationError::new(format!(
-                    "invalid mode: {mode_str}. Use: one_shot, renewable, standing"
-                ))
-            })?;
+        let mode = GrantMode::parse(mode_str).ok_or_else(|| {
+            ValidationError::new(format!(
+                "invalid mode: {mode_str}. Use: one_shot, renewable, standing"
+            ))
+        })?;
 
         let statements = parse_capabilities(cap_strs)?;
 
@@ -6782,9 +6880,8 @@ impl DemoApp {
         // blocks can be signed against this chain tail. See
         // `core_crypto::grant_chain::PubkeyNextKeyPair`.
         let root_key_pair = self.grant_chain_root_key(&persona_root_id)?;
-        let signed = grant_chain::sign_block_zero(&root_key_pair, &block).map_err(|e| {
-            ValidationError::new(format!("grant chain signing failed: {e}"))
-        })?;
+        let signed = grant_chain::sign_block_zero(&root_key_pair, &block)
+            .map_err(|e| ValidationError::new(format!("grant chain signing failed: {e}")))?;
         self.store_chain_secret(&grant_id, signed.pubkey_next_secret);
 
         let grant = AccessGrant {
@@ -6826,7 +6923,8 @@ impl DemoApp {
         note: Option<&str>,
     ) -> Result<String, ValidationError> {
         let mut grant = self
-            .app_runtime.store
+            .app_runtime
+            .store
             .access_grant(grant_id)?
             .ok_or_else(|| ValidationError::new(format!("grant not found: {grant_id}")))?;
 
@@ -6972,7 +7070,12 @@ impl DemoApp {
             .resolve_persona(&g.issuing_persona_id)
             .map(|p| p.label.clone())
             .unwrap_or_else(|| g.issuing_persona_id.clone());
-        writeln!(&mut out, "  persona:   {} ({})", persona_label, g.issuing_persona_id).unwrap();
+        writeln!(
+            &mut out,
+            "  persona:   {} ({})",
+            persona_label, g.issuing_persona_id
+        )
+        .unwrap();
         writeln!(
             &mut out,
             "  recipient: {} ({})",
@@ -7053,7 +7156,12 @@ impl DemoApp {
         }
 
         if detail.linked_artifact_count > 0 {
-            writeln!(&mut out, "  linked artifacts: {}", detail.linked_artifact_count).unwrap();
+            writeln!(
+                &mut out,
+                "  linked artifacts: {}",
+                detail.linked_artifact_count
+            )
+            .unwrap();
         }
 
         if !detail.history.is_empty() {
@@ -7173,7 +7281,10 @@ impl DemoApp {
                  badge weight --badge <badge_id> [--viewer <persona>] [--depth <n>]\n"
                     .to_string()
             }
-            _ => format!("Unknown badge subcommand: {}\nUse: badge issue|revoke|dispute|list|gallery|visibility|weight\n", tokens.join(" ")),
+            _ => format!(
+                "Unknown badge subcommand: {}\nUse: badge issue|revoke|dispute|list|gallery|visibility|weight\n",
+                tokens.join(" ")
+            ),
         }
     }
 
@@ -7229,7 +7340,14 @@ impl DemoApp {
         // Default: self-issue if no recipient specified
         let issuer_ref = match issuer.as_deref() {
             Some(r) => r.to_string(),
-            None => match self.app_runtime.store.materialized().personas_current.keys().next() {
+            None => match self
+                .app_runtime
+                .store
+                .materialized()
+                .personas_current
+                .keys()
+                .next()
+            {
                 Some(id) => id.clone(),
                 None => return "error: no personas found; run `init` first\n".to_string(),
             },
@@ -7320,7 +7438,14 @@ impl DemoApp {
                 Some(p) => p.id.clone(),
                 None => return format!("error: unknown persona: {r}\n"),
             },
-            None => match self.app_runtime.store.materialized().personas_current.keys().next() {
+            None => match self
+                .app_runtime
+                .store
+                .materialized()
+                .personas_current
+                .keys()
+                .next()
+            {
                 Some(id) => id.clone(),
                 None => return "error: no personas found\n".to_string(),
             },
@@ -7385,7 +7510,14 @@ impl DemoApp {
                 Some(p) => p.id.clone(),
                 None => return format!("error: unknown persona: {r}\n"),
             },
-            None => match self.app_runtime.store.materialized().personas_current.keys().next() {
+            None => match self
+                .app_runtime
+                .store
+                .materialized()
+                .personas_current
+                .keys()
+                .next()
+            {
                 Some(id) => id.clone(),
                 None => return "error: no personas found\n".to_string(),
             },
@@ -7563,7 +7695,10 @@ impl DemoApp {
             None => return format!("error: unknown persona: {persona_ref}\n"),
         };
 
-        let action = UiAction::GetBadgeGallery { persona_id, visible_only };
+        let action = UiAction::GetBadgeGallery {
+            persona_id,
+            visible_only,
+        };
         match self.app_runtime.handle_action(action) {
             Ok((result, _)) => {
                 let entries = match result.as_array() {
@@ -7859,8 +7994,7 @@ mod dry10_grant_list_output_tests {
         assert!(!out.contains("Active grants"));
         // Each non-empty line is parseable JSON.
         for line in out.lines().filter(|l| !l.is_empty()) {
-            let v: serde_json::Value =
-                serde_json::from_str(line).expect("each ndjson line parses");
+            let v: serde_json::Value = serde_json::from_str(line).expect("each ndjson line parses");
             // Object form for grant rows.
             assert!(v.get("id").is_some(), "row missing id field: {line}");
             assert!(v.get("mode").is_some(), "row missing mode field: {line}");

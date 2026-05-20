@@ -40,9 +40,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use core_broker::{
-    Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential,
-};
+use core_broker::{Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
@@ -212,7 +210,10 @@ impl HashiVaultBroker {
     /// Number of materializations the broker currently tracks. Used by
     /// tests to assert state transitions across `issue`/`revoke` calls.
     pub fn active_count(&self) -> usize {
-        self.state.lock().expect("hashivault broker state mutex").len()
+        self.state
+            .lock()
+            .expect("hashivault broker state mutex")
+            .len()
     }
 
     /// Address (`VAULT_ADDR`) the consumer must pair with the minted
@@ -352,16 +353,12 @@ fn map_vault_http_error(status: u16, body: &str) -> BrokerError {
     };
 
     if status == 401 || status == 403 {
-        return BrokerError::PolicyRejected(format!(
-            "Vault {status}: {msg_for_log}"
-        ));
+        return BrokerError::PolicyRejected(format!("Vault {status}: {msg_for_log}"));
     }
 
     let lower = msg_for_log.to_ascii_lowercase();
     if status == 503 || lower.contains("vault is sealed") || lower.contains("sealed") {
-        return BrokerError::Upstream(format!(
-            "Vault sealed (status={status}): {msg_for_log}"
-        ));
+        return BrokerError::Upstream(format!("Vault sealed (status={status}): {msg_for_log}"));
     }
 
     BrokerError::Upstream(format!("Vault {status}: {msg_for_log}"))
@@ -407,12 +404,11 @@ impl Broker for HashiVaultBroker {
             return Err(err);
         }
 
-        let envelope: VaultTokenCreateResponse =
-            serde_json::from_str(&resp_body).map_err(|e| {
-                BrokerError::Upstream(format!(
-                    "Vault auth/token/create response parse failed: {e}; body={resp_body}"
-                ))
-            })?;
+        let envelope: VaultTokenCreateResponse = serde_json::from_str(&resp_body).map_err(|e| {
+            BrokerError::Upstream(format!(
+                "Vault auth/token/create response parse failed: {e}; body={resp_body}"
+            ))
+        })?;
 
         if !envelope.errors_vec().is_empty() {
             return Err(BrokerError::Upstream(format!(
@@ -440,8 +436,7 @@ impl Broker for HashiVaultBroker {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or("ember-vault");
-        let materialization_id =
-            format!("vault-{}-{}", display, chrono_timestamp(expires_at));
+        let materialization_id = format!("vault-{}-{}", display, chrono_timestamp(expires_at));
 
         self.state
             .lock()
@@ -717,10 +712,8 @@ mod tests {
 
     #[test]
     fn provider_returns_hashi_vault() {
-        let broker = HashiVaultBroker::with_client(
-            fixture_parent(),
-            Arc::new(MockHttpClient::new()),
-        );
+        let broker =
+            HashiVaultBroker::with_client(fixture_parent(), Arc::new(MockHttpClient::new()));
         assert_eq!(broker.provider(), BrokerProvider::HashiVault);
     }
 
@@ -736,13 +729,13 @@ mod tests {
         let body = build_create_token_body(&scope).expect("body must build");
         let parsed: serde_json::Value = serde_json::from_str(&body).expect("json");
         assert_eq!(
-            parsed.get("policies").and_then(|v| v.as_array()).map(|a| a.len()),
+            parsed
+                .get("policies")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len()),
             Some(2)
         );
-        assert_eq!(
-            parsed.get("ttl").and_then(|v| v.as_str()),
-            Some("3600s")
-        );
+        assert_eq!(parsed.get("ttl").and_then(|v| v.as_str()), Some("3600s"));
         assert_eq!(
             parsed.get("renewable").and_then(|v| v.as_bool()),
             Some(true)
@@ -817,7 +810,9 @@ mod tests {
             }),
             3600,
         );
-        let cred = Broker::issue(&broker, req).await.expect("issue must succeed");
+        let cred = Broker::issue(&broker, req)
+            .await
+            .expect("issue must succeed");
         // The broker returns a JSON bundle pairing the child token
         // with VAULT_ADDR — the daemon-side handler splits it into
         // VAULT_TOKEN + VAULT_ADDR env vars at injection time.
@@ -859,10 +854,10 @@ mod tests {
 
     #[tokio::test]
     async fn issue_no_parent_default_is_true_when_absent_in_scope() {
-        let mock = Arc::new(MockHttpClient::new().with_response(
-            200,
-            create_ok_body("hvs.np-token", 60, &["read-only"]),
-        ));
+        let mock = Arc::new(
+            MockHttpClient::new()
+                .with_response(200, create_ok_body("hvs.np-token", 60, &["read-only"])),
+        );
         let broker = HashiVaultBroker::with_client(fixture_parent(), mock.clone());
         // Scope omits `no_parent` — must default to true.
         let req = vault_request(
@@ -873,7 +868,9 @@ mod tests {
             }),
             60,
         );
-        Broker::issue(&broker, req).await.expect("issue must succeed");
+        Broker::issue(&broker, req)
+            .await
+            .expect("issue must succeed");
         let call = mock.last_call().expect("call recorded");
         assert!(
             call.body.contains("\"no_parent\":true"),
@@ -884,14 +881,11 @@ mod tests {
 
     #[tokio::test]
     async fn issue_namespace_passthrough_sets_x_vault_namespace_header() {
-        let mock = Arc::new(MockHttpClient::new().with_response(
-            200,
-            create_ok_body("hvs.ns-token", 60, &["read-only"]),
-        ));
-        let broker = HashiVaultBroker::with_client(
-            fixture_parent_with_namespace(),
-            mock.clone(),
+        let mock = Arc::new(
+            MockHttpClient::new()
+                .with_response(200, create_ok_body("hvs.ns-token", 60, &["read-only"])),
         );
+        let broker = HashiVaultBroker::with_client(fixture_parent_with_namespace(), mock.clone());
         let req = vault_request(
             serde_json::json!({
                 "policies": ["read-only"],
@@ -901,7 +895,9 @@ mod tests {
             }),
             60,
         );
-        Broker::issue(&broker, req).await.expect("issue must succeed");
+        Broker::issue(&broker, req)
+            .await
+            .expect("issue must succeed");
         let call = mock.last_call().expect("call recorded");
         assert_eq!(call.namespace.as_deref(), Some("admin/team-zero"));
     }
@@ -928,8 +924,7 @@ mod tests {
 
     #[tokio::test]
     async fn issue_400_returns_upstream_with_descriptive_message() {
-        let mock =
-            Arc::new(MockHttpClient::new().with_response(400, invalid_request_body()));
+        let mock = Arc::new(MockHttpClient::new().with_response(400, invalid_request_body()));
         let broker = HashiVaultBroker::with_client(fixture_parent(), mock);
         let req = vault_request(
             serde_json::json!({
@@ -979,10 +974,8 @@ mod tests {
 
     #[tokio::test]
     async fn issue_with_wrong_provider_in_request_is_rejected() {
-        let broker = HashiVaultBroker::with_client(
-            fixture_parent(),
-            Arc::new(MockHttpClient::new()),
-        );
+        let broker =
+            HashiVaultBroker::with_client(fixture_parent(), Arc::new(MockHttpClient::new()));
         let mut req = vault_request(
             serde_json::json!({
                 "policies": ["read-only"],
@@ -1001,10 +994,7 @@ mod tests {
     async fn revoke_happy_path_calls_revoke_self_with_child_token() {
         let mock = Arc::new(
             MockHttpClient::new()
-                .with_response(
-                    200,
-                    create_ok_body("hvs.child-rev-1", 60, &["read-only"]),
-                )
+                .with_response(200, create_ok_body("hvs.child-rev-1", 60, &["read-only"]))
                 .with_response(204, "".to_string()),
         );
         let broker = HashiVaultBroker::with_client(fixture_parent(), mock.clone());
@@ -1044,10 +1034,7 @@ mod tests {
     async fn revoke_already_expired_404_is_treated_as_success() {
         let mock = Arc::new(
             MockHttpClient::new()
-                .with_response(
-                    200,
-                    create_ok_body("hvs.child-expired", 60, &["read-only"]),
-                )
+                .with_response(200, create_ok_body("hvs.child-expired", 60, &["read-only"]))
                 .with_response(404, r#"{"errors":[]}"#.to_string()),
         );
         let broker = HashiVaultBroker::with_client(fixture_parent(), mock.clone());
@@ -1075,10 +1062,8 @@ mod tests {
 
     #[tokio::test]
     async fn revoke_unknown_id_returns_unknown_materialization() {
-        let broker = HashiVaultBroker::with_client(
-            fixture_parent(),
-            Arc::new(MockHttpClient::new()),
-        );
+        let broker =
+            HashiVaultBroker::with_client(fixture_parent(), Arc::new(MockHttpClient::new()));
         let err = Broker::revoke(&broker, "does-not-exist").await.unwrap_err();
         assert!(matches!(err, BrokerError::UnknownMaterialization(_)));
     }
@@ -1103,10 +1088,9 @@ mod tests {
 
     #[test]
     fn hashivault_scope_default_no_parent_is_true_when_absent() {
-        let parsed: HashiVaultScope = serde_json::from_str(
-            r#"{"policies":["x"],"ttl_seconds":60,"renewable":false}"#,
-        )
-        .expect("deserialize");
+        let parsed: HashiVaultScope =
+            serde_json::from_str(r#"{"policies":["x"],"ttl_seconds":60,"renewable":false}"#)
+                .expect("deserialize");
         assert!(parsed.no_parent, "no_parent must default to true");
     }
 

@@ -94,8 +94,7 @@ pub fn build_jwt(
     let header = Header::new(Algorithm::RS256);
     let key = EncodingKey::from_rsa_pem(private_key_pem.as_bytes())
         .map_err(|e| GhAppError::JwtSigning(e.to_string()))?;
-    jsonwebtoken::encode(&header, &claims, &key)
-        .map_err(|e| GhAppError::JwtSigning(e.to_string()))
+    jsonwebtoken::encode(&header, &claims, &key).map_err(|e| GhAppError::JwtSigning(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -202,7 +201,10 @@ impl HttpClient for ReqwestClient {
             .map_err(|e| GhAppError::Http(e.to_string()))?;
 
         let status = resp.status().as_u16();
-        let text = resp.text().await.map_err(|e| GhAppError::Http(e.to_string()))?;
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| GhAppError::Http(e.to_string()))?;
         Ok((status, text))
     }
 }
@@ -230,13 +232,7 @@ pub async fn mint_installation_token(
     repos: &[String],
     permissions: &[(String, String)],
 ) -> Result<InstallationToken, GhAppError> {
-    mint_installation_token_with_client(
-        creds,
-        repos,
-        permissions,
-        &ReqwestClient::default(),
-    )
-    .await
+    mint_installation_token_with_client(creds, repos, permissions, &ReqwestClient::default()).await
 }
 
 /// Testable variant of [`mint_installation_token`] with an injected HTTP client.
@@ -391,7 +387,10 @@ mod tests {
         let json = serde_json::to_string(&req).expect("must serialize");
         assert!(json.contains("my-repo"), "repos must appear in body");
         assert!(json.contains("contents"), "permissions must appear in body");
-        assert!(json.contains("pull_requests"), "permissions must appear in body");
+        assert!(
+            json.contains("pull_requests"),
+            "permissions must appear in body"
+        );
     }
 
     #[test]
@@ -399,8 +398,14 @@ mod tests {
         let req = build_access_token_request(&[], &[]);
         let json = serde_json::to_string(&req).expect("must serialize");
         // Both fields are skip_serializing_if = empty so they must be absent.
-        assert!(!json.contains("repositories"), "empty repos must be omitted: {json}");
-        assert!(!json.contains("permissions"), "empty perms must be omitted: {json}");
+        assert!(
+            !json.contains("repositories"),
+            "empty repos must be omitted: {json}"
+        );
+        assert!(
+            !json.contains("permissions"),
+            "empty perms must be omitted: {json}"
+        );
     }
 
     #[tokio::test]

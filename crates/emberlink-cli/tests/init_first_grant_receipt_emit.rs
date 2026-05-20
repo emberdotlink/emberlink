@@ -1,4 +1,4 @@
-//! T2 integration tests for EMBER-INIT-FIRST-implementation-note-283.
+//! T2 integration tests for EMBER-INIT-FIRST-implementation-note-401.
 //!
 //! Verifies that `ember init` emits a real signed Grant Receipt v2 envelope
 //! to `<data_dir>/receipts/first.json`, and that re-running is idempotent
@@ -15,8 +15,8 @@ use std::process::Command;
 
 use core_crypto::Signer as _;
 use emberlink_cli::onboarding::first_grant::{
-    emit_first_grant_receipt, first_receipt_exists, first_receipt_path,
-    FirstGrantReceiptFile, INIT_FIRST_GRANT_RECEIPT_EMIT_SENTINEL,
+    FirstGrantReceiptFile, INIT_FIRST_GRANT_RECEIPT_EMIT_SENTINEL, emit_first_grant_receipt,
+    first_receipt_exists, first_receipt_path,
 };
 
 fn ember_bin() -> &'static str {
@@ -49,6 +49,7 @@ fn run_ember_init(config_path: &std::path::Path) -> (String, String, i32) {
         .env("EMBER_VAULT_PASSPHRASE", "test-receipt-passphrase")
         .env("EMBER_KEYRING_SERVICE", "ember-test-receipt-emit")
         .env("EMBER_KEYRING_ACCOUNT", "test-receipt-emit")
+        .env("EMBER_SKIP_DAEMON_INSTALL_CHECK", "1")
         .output()
         .expect("spawn ember init");
     (
@@ -128,10 +129,7 @@ fn ember_init_stdout_contains_receipt_path_and_sentinel() {
     let data_dir = tmp.path().join("data");
 
     let (stdout, stderr, code) = run_ember_init(&config_path);
-    assert_eq!(
-        code, 0,
-        "ember init must exit 0; stderr: {stderr}"
-    );
+    assert_eq!(code, 0, "ember init must exit 0; stderr: {stderr}");
 
     // stdout must name the receipt file path.
     let expected_path = data_dir.join("receipts/first.json");
@@ -194,17 +192,13 @@ fn emit_first_grant_receipt_writes_valid_json() {
     let pubkey_str = pk.0.clone();
     let persona_id = "persona-test-0000000000000001";
 
-    let path = emit_first_grant_receipt(
-        &data_dir,
-        persona_id,
-        &pubkey_str,
-        &signer,
-    )
-    .expect("emit must succeed");
+    let path = emit_first_grant_receipt(&data_dir, persona_id, &pubkey_str, &signer)
+        .expect("emit must succeed");
 
     // File must exist and be parseable as FirstGrantReceiptFile.
     let raw = fs::read_to_string(&path).expect("read receipt file");
-    let file: FirstGrantReceiptFile = serde_json::from_str(&raw).expect("parse FirstGrantReceiptFile");
+    let file: FirstGrantReceiptFile =
+        serde_json::from_str(&raw).expect("parse FirstGrantReceiptFile");
 
     assert_eq!(file.issuer.persona, persona_id);
     assert!(file.evidence.signed);
@@ -217,7 +211,10 @@ fn emit_first_grant_receipt_writes_valid_json() {
     assert!(!file.lifecycle.revoked_at.is_empty());
 
     // The embedded receipt must have a receipt_id and signature.
-    assert!(!file.receipt.receipt_id.is_empty(), "receipt_id must be populated");
+    assert!(
+        !file.receipt.receipt_id.is_empty(),
+        "receipt_id must be populated"
+    );
     assert!(
         file.receipt.signature.is_some(),
         "signature must be populated"
@@ -239,17 +236,18 @@ fn emit_first_grant_receipt_idempotent_returns_existing_path() {
     let persona_id = "persona-test-0000000000000002";
 
     // First call — writes the file.
-    let path1 =
-        emit_first_grant_receipt(&data_dir, persona_id, &pubkey_str, &signer)
-            .expect("first emit must succeed");
-    assert!(first_receipt_exists(&data_dir), "checkpoint must exist after first emit");
+    let path1 = emit_first_grant_receipt(&data_dir, persona_id, &pubkey_str, &signer)
+        .expect("first emit must succeed");
+    assert!(
+        first_receipt_exists(&data_dir),
+        "checkpoint must exist after first emit"
+    );
 
     let content_first = fs::read(&path1).expect("read after first emit");
 
     // Second call — idempotency guard fires; file must be unchanged.
-    let path2 =
-        emit_first_grant_receipt(&data_dir, persona_id, &pubkey_str, &signer)
-            .expect("second emit must succeed (idempotent)");
+    let path2 = emit_first_grant_receipt(&data_dir, persona_id, &pubkey_str, &signer)
+        .expect("second emit must succeed (idempotent)");
 
     let content_second = fs::read(&path2).expect("read after second emit");
     assert_eq!(path1, path2, "paths must match");

@@ -246,7 +246,7 @@ pub enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         rest: Vec<String>,
     },
-    /// Approve or deny a pending approval (implementation-note-156).
+    /// Approve or deny a pending approval (implementation-note-205).
     Approval {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         rest: Vec<String>,
@@ -340,7 +340,7 @@ pub enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         rest: Vec<String>,
     },
-    /// Query the receipts audit log (EMBER-implementation-note-172).
+    /// Query the receipts audit log (EMBER-implementation-note-244).
     ///
     /// Subcommand::Audit — dispatches to the receipt-query handler.
     /// Filters: --since <duration|ISO>, --actor <persona-id>,
@@ -468,7 +468,10 @@ mod tests {
         ])
         .unwrap();
         let cmd = args.command.expect("subcommand");
-        assert_eq!(cmd.to_legacy_string(), "approval approve appr-1 --no-biometric");
+        assert_eq!(
+            cmd.to_legacy_string(),
+            "approval approve appr-1 --no-biometric"
+        );
     }
 
     #[test]
@@ -514,7 +517,8 @@ mod tests {
 
     #[test]
     fn unknown_subcommand_falls_through_to_legacy() {
-        let args = Args::try_parse_from(["emberlink-cli", "totally-unknown", "foo", "bar"]).unwrap();
+        let args =
+            Args::try_parse_from(["emberlink-cli", "totally-unknown", "foo", "bar"]).unwrap();
         let cmd = args.command.expect("subcommand");
         assert_eq!(cmd.to_legacy_string(), "totally-unknown foo bar");
     }
@@ -541,14 +545,9 @@ mod tests {
 
     #[test]
     fn state_flag_is_global() {
-        let args = Args::try_parse_from([
-            "emberlink-cli",
-            "--state",
-            "/tmp/x.tsv",
-            "show",
-            "broker",
-        ])
-        .unwrap();
+        let args =
+            Args::try_parse_from(["emberlink-cli", "--state", "/tmp/x.tsv", "show", "broker"])
+                .unwrap();
         assert_eq!(args.state, Some(PathBuf::from("/tmp/x.tsv")));
         let cmd = args.command.expect("subcommand");
         assert_eq!(cmd.to_legacy_string(), "show broker");
@@ -562,56 +561,36 @@ mod tests {
 
     #[test]
     fn json_flag_selects_json_mode() {
-        let args =
-            Args::try_parse_from(["emberlink-cli", "--json", "grant", "list"]).unwrap();
+        let args = Args::try_parse_from(["emberlink-cli", "--json", "grant", "list"]).unwrap();
         assert!(args.json);
         assert_eq!(args.output_mode(), output::Mode::Json);
     }
 
     #[test]
     fn quiet_flag_selects_quiet_mode() {
-        let args =
-            Args::try_parse_from(["emberlink-cli", "--quiet", "grant", "list"]).unwrap();
+        let args = Args::try_parse_from(["emberlink-cli", "--quiet", "grant", "list"]).unwrap();
         assert!(args.quiet);
         assert_eq!(args.output_mode(), output::Mode::Quiet);
     }
 
     #[test]
     fn json_wins_over_quiet() {
-        let args = Args::try_parse_from([
-            "emberlink-cli",
-            "--json",
-            "--quiet",
-            "grant",
-            "list",
-        ])
-        .unwrap();
+        let args =
+            Args::try_parse_from(["emberlink-cli", "--json", "--quiet", "grant", "list"]).unwrap();
         assert_eq!(args.output_mode(), output::Mode::Json);
     }
 
     #[test]
     fn color_never_disables_ansi() {
-        let args = Args::try_parse_from([
-            "emberlink-cli",
-            "--color",
-            "never",
-            "grant",
-            "list",
-        ])
-        .unwrap();
+        let args =
+            Args::try_parse_from(["emberlink-cli", "--color", "never", "grant", "list"]).unwrap();
         assert_eq!(args.output_mode(), output::Mode::Human { color: false });
     }
 
     #[test]
     fn color_always_enables_ansi() {
-        let args = Args::try_parse_from([
-            "emberlink-cli",
-            "--color",
-            "always",
-            "grant",
-            "list",
-        ])
-        .unwrap();
+        let args =
+            Args::try_parse_from(["emberlink-cli", "--color", "always", "grant", "list"]).unwrap();
         assert_eq!(args.output_mode(), output::Mode::Human { color: true });
     }
 

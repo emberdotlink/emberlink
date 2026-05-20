@@ -16,20 +16,35 @@ pub struct BinaryRemoveArgs {
 
 fn manifest_path() -> PathBuf {
     if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home).join(".ember").join("binaries").join("manifest.toml")
+        PathBuf::from(home)
+            .join(".ember")
+            .join("binaries")
+            .join("manifest.toml")
     } else {
         PathBuf::from("/usr/local/lib/ember/binaries/manifest.toml")
     }
 }
 
 pub fn binary_remove(args: &BinaryRemoveArgs) -> Result<(), Box<dyn std::error::Error>> {
+    binary_remove_at(args, &manifest_path())
+}
+
+/// Variant of [`binary_remove`] that takes the manifest path explicitly
+/// rather than deriving it from `$HOME`. Production code uses
+/// [`binary_remove`]; tests use this entry point with a tempdir-rooted
+/// path so they don't have to mutate the process-global `HOME` env var
+/// (which races with every test that reads HOME-derived state under the
+/// cargo parallel runner).
+pub fn binary_remove_at(
+    args: &BinaryRemoveArgs,
+    path: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (tool_name, version) = args
         .tool_at_version
         .split_once('@')
         .ok_or_else(|| format!("expected <tool>@<version>, got '{}'", args.tool_at_version))?;
 
-    let path = manifest_path();
-    let mut manifest = load_manifest(&path)?;
+    let mut manifest = load_manifest(path)?;
 
     let before = manifest.entries.len();
     manifest
@@ -48,7 +63,7 @@ pub fn binary_remove(args: &BinaryRemoveArgs) -> Result<(), Box<dyn std::error::
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, toml_out)?;
+    std::fs::write(path, toml_out)?;
 
     println!(
         "[binary remove] OK — {}@{} removed from {}",
@@ -87,17 +102,21 @@ mod tests {
         };
         std::fs::write(&manifest_toml, toml::to_string_pretty(&manifest).unwrap()).unwrap();
 
-        // SAFETY: test sets HOME to a tempdir before invoking binary_remove.
-        // Single-threaded test; no concurrent env access.
-        unsafe { std::env::set_var("HOME", dir.path()); }
-
         let args = BinaryRemoveArgs {
             tool_at_version: "ember-gh@1.0.0".to_string(),
         };
 
-        binary_remove(&args).expect("remove should succeed");
+        // Use the path-explicit variant so the test doesn't mutate
+        // the process-global HOME env var. Mutating HOME would race
+        // every test that reads HOME-derived state under the cargo
+        // parallel runner (the previous version of this test
+        // intermittently failed in workspace test sweeps).
+        binary_remove_at(&args, &manifest_toml).expect("remove should succeed");
 
         let updated = load_manifest(&manifest_toml).expect("manifest must parse after remove");
-        assert!(updated.entries.is_empty(), "manifest must be empty after removing the only entry");
+        assert!(
+            updated.entries.is_empty(),
+            "manifest must be empty after removing the only entry"
+        );
     }
 }

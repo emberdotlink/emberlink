@@ -1,5 +1,5 @@
 //!
-//! implementation-note-82 — emberd refuses to start when
+//! implementation-note-105 — emberd refuses to start when
 //! no on-disk config exists. Closes the production silent-fallback
 //! that was the May-12 25-hour leaked-daemon incident root cause.
 

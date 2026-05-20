@@ -85,9 +85,7 @@ pub fn load_from_dir(base: &std::path::Path) -> Option<AzureServicePrincipal> {
 
     // Default: client-secret if present. Otherwise fall back to WIF
     // when AZURE_OIDC_TOKEN_PATH is set. Neither set → misconfigured.
-    let auth_method = if let Some(client_secret) =
-        parse_env_var(&env_contents, KEY_CLIENT_SECRET)
-    {
+    let auth_method = if let Some(client_secret) = parse_env_var(&env_contents, KEY_CLIENT_SECRET) {
         AzureAuthMethod::ClientSecret {
             client_secret: SecretString::from(client_secret),
         }
@@ -140,9 +138,11 @@ pub async fn azure_config_from_store(
         key: &str,
     ) -> Result<Option<String>, StoreError> {
         match store.get(key).await {
-            Ok(bytes) => Ok(Some(String::from_utf8(bytes).map_err(|e| {
-                StoreError::Other(format!("non-utf8 in {}: {e}", key))
-            })?)),
+            Ok(bytes) => {
+                Ok(Some(String::from_utf8(bytes).map_err(|e| {
+                    StoreError::Other(format!("non-utf8 in {}: {e}", key))
+                })?))
+            }
             Err(StoreError::NotFound(_)) => Ok(None),
             Err(other) => Err(other),
         }
@@ -332,8 +332,7 @@ mod tests {
 
     #[test]
     fn parse_env_var_strips_quotes_and_whitespace() {
-        let env =
-            "AZURE_TENANT_ID=\"tenant-uuid\"\nAZURE_CLIENT_ID='client-uuid'\nAZURE_CLIENT_SECRET=plain\n";
+        let env = "AZURE_TENANT_ID=\"tenant-uuid\"\nAZURE_CLIENT_ID='client-uuid'\nAZURE_CLIENT_SECRET=plain\n";
         assert_eq!(
             parse_env_var(env, "AZURE_TENANT_ID"),
             Some("tenant-uuid".to_string())
@@ -351,13 +350,16 @@ mod tests {
     #[test]
     fn parse_env_var_skips_comments_and_blanks() {
         let env = "\n# comment\n\nAZURE_TENANT_ID=42\n";
-        assert_eq!(parse_env_var(env, "AZURE_TENANT_ID"), Some("42".to_string()));
+        assert_eq!(
+            parse_env_var(env, "AZURE_TENANT_ID"),
+            Some("42".to_string())
+        );
     }
 
     #[tokio::test]
     async fn azure_config_from_store_happy_path() {
-        use crate::infra::credential_store::test_helpers::MockCredentialStore;
         use crate::infra::credential_store::CredentialStore;
+        use crate::infra::credential_store::test_helpers::MockCredentialStore;
 
         let mock = MockCredentialStore::new();
         mock.put(STORE_KEY_TENANT_ID, b"11111111-2222-3333-4444-555555555555")

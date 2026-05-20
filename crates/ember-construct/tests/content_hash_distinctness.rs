@@ -11,8 +11,21 @@ use std::process::Command;
 
 /// Vendor names matching the 15 [[bin]] targets.
 const VENDORS: &[&str] = &[
-    "aws", "az", "gcloud", "vercel", "wrangler", "gh", "git", "docker", "kubectl", "pulumi",
-    "terraform", "tofu", "flyctl", "npm", "okta",
+    "aws",
+    "az",
+    "gcloud",
+    "vercel",
+    "wrangler",
+    "gh",
+    "git",
+    "docker",
+    "kubectl",
+    "pulumi",
+    "terraform",
+    "tofu",
+    "flyctl",
+    "npm",
+    "okta",
 ];
 
 #[test]

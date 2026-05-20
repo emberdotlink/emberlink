@@ -1,5 +1,24 @@
 //! Vault MEK + sealed-credentials store.
 //!
+//! implementation-note-314 — -A
+//! (`vault_macos_se::get_mek_passphrase` already returns
+//! `Zeroizing<String>`; the caller at `Vault::open_from_config` binds
+//! the result directly and passes `&passphrase`, so the buffer is
+//! zeroed on the `Drop` at function exit — verified against the
+//! current file shape, no rebind needed), -B (encrypt-then-MAC +
+//! verify-then-decrypt in `ember_broker::secure_enclave::stub_unwrap`
+//! via `subtle::ConstantTimeEq`; auth tag now computed over the
+//! ciphertext so tampered blobs are rejected before any plaintext is
+//! produced), and -C (the leakable code path —
+//! `SeError::UnwrapFailed → VaultError::Crypto` formatting in
+//! `vault_macos_se.rs:105-106` — was eliminated by the upstream
+//! Plan-2A System.keychain refactor: the daemon now reads the MEK
+//! passphrase directly from `/Library/Keychains/System.keychain` via
+//! `SecKeychain::find_generic_password` and no longer ever maps
+//! `SeError` into `VaultError`, so the SE key-label and stub-key-
+//! registry implementation details cannot reach the operator-facing
+//! error string by construction).
+//!
 //! ## Tier 1: start-of-session unlock
 //!
 //! `Vault::open_from_config` reads the MEK passphrase via the SE-backed
@@ -22,7 +41,7 @@ use rusqlite::{OptionalExtension, params};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-/// implementation-note-23 C5 — AAD domain-separator prefix byte. AEAD
+/// implementation-note-27 C5 — AAD domain-separator prefix byte. AEAD
 /// associated data for every C5+-sealed credential row is the byte
 /// sequence `[AAD_VERSION_BYTE] || uuid_bytes_of_row_id` (17 bytes).
 /// The literal `0x01` future-proofs the format: if we ever rotate the
@@ -55,7 +74,7 @@ pub const DEFAULT_KEYRING_SERVICE: &str = "ember-daemon";
 /// Compile-time default keyring account name.
 pub const DEFAULT_KEYRING_ACCOUNT: &str = "vault";
 
-// implementation-note-23 C4 — Argon2id KDF parameter pins. The MEK is
+// implementation-note-27 C4 — Argon2id KDF parameter pins. The MEK is
 // derived by `Vault::from_passphrase` via Argon2id; pinning the cost
 // parameters here (and writing them to `vault.params` next to
 // `vault.salt`) lets `Vault::open_from_config` refuse to unlock a vault
@@ -103,7 +122,7 @@ pub enum VaultError {
 
 /// Reasons a credential name fails the design path grammar.
 ///
-/// Grammar (per task brief implementation-note-225):
+/// Grammar (per task brief implementation-note-315):
 ///   - Lowercase ASCII letters `a-z`
 ///   - Digits `0-9`
 ///   - Hyphens `-`
@@ -137,10 +156,9 @@ impl std::fmt::Display for VaultNameError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             VaultNameError::Empty => write!(f, "credential name is empty"),
-            VaultNameError::TooLong { len } => write!(
-                f,
-                "credential name too long: {len} chars (max 128)"
-            ),
+            VaultNameError::TooLong { len } => {
+                write!(f, "credential name too long: {len} chars (max 128)")
+            }
             VaultNameError::BadCharacter(c) => write!(
                 f,
                 "credential name contains invalid character {c:?}: only lowercase \
@@ -152,14 +170,12 @@ impl std::fmt::Display for VaultNameError {
                  match ^[a-z][a-z0-9-]*$ (start with letter; no leading/trailing \
                  hyphen; no empty segments)"
             ),
-            VaultNameError::TooFewSegments => write!(
-                f,
-                "credential name has no segments (min depth 1)"
-            ),
-            VaultNameError::TooManySegments { count } => write!(
-                f,
-                "credential name has {count} segments (max depth 7)"
-            ),
+            VaultNameError::TooFewSegments => {
+                write!(f, "credential name has no segments (min depth 1)")
+            }
+            VaultNameError::TooManySegments { count } => {
+                write!(f, "credential name has {count} segments (max depth 7)")
+            }
         }
     }
 }
@@ -268,14 +284,14 @@ pub struct CredentialInfo {
 
 /// Which user-presence policy lane is calling into the vault.
 ///
-/// Phase 1 (implementation-note-226): the parameter is plumbed through the four
-/// public CRUD entry points (`add`, `list`, `get`, `remove`) but is **not yet
-/// load-bearing** — method bodies behave identically for both variants.
+/// Phase 2A (`implementation-note-316`) makes the parameter
+/// load-bearing for storage namespace selection: `Headless` now maps to a
+/// dedicated internal row-name prefix while `Interactive` preserves the
+/// historical flat names. The per-scope MEK split is still follow-up work.
 ///
-/// Phase 2 will branch on `scope` to route to a per-scope MEK derivation and a
-/// per-scope `credentials` table prefix so that interactive (Touch-ID-gated)
-/// and headless (CI / agent / unattended) credentials cannot read each other's
-/// ciphertext even if one keyring entry is compromised.
+/// Phase 2B will route `scope` to a per-scope MEK derivation so interactive
+/// (Touch-ID-gated) and headless (CI / agent / unattended) credentials cannot
+/// read each other's ciphertext even if one keyring entry is compromised.
 ///
 /// Existing callsites all pass `Interactive` so behaviour is preserved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,6 +303,30 @@ pub enum VaultScope {
     /// and any path that cannot present a biometric prompt. No callers in
     /// Phase 1 — wired up in Phase 2 along with the per-scope MEK split.
     Headless,
+}
+
+const HEADLESS_SCOPE_STORAGE_PREFIX: &str = "__headless/";
+
+pub(crate) fn storage_name_for_scope(scope: VaultScope, logical_name: &str) -> String {
+    match scope {
+        VaultScope::Interactive => logical_name.to_string(),
+        VaultScope::Headless => format!("{HEADLESS_SCOPE_STORAGE_PREFIX}{logical_name}"),
+    }
+}
+
+pub(crate) fn logical_name_from_storage(scope: VaultScope, stored_name: &str) -> Option<String> {
+    match scope {
+        VaultScope::Interactive => {
+            if stored_name.starts_with(HEADLESS_SCOPE_STORAGE_PREFIX) {
+                None
+            } else {
+                Some(stored_name.to_string())
+            }
+        }
+        VaultScope::Headless => stored_name
+            .strip_prefix(HEADLESS_SCOPE_STORAGE_PREFIX)
+            .map(str::to_string),
+    }
 }
 
 /// Newtype wrapper around the 16-byte Argon2id salt used to derive the vault
@@ -356,11 +396,11 @@ pub enum VaultKeyStore {
 
 /// MEK holder for the daemon's sealed-credentials store.
 ///
-/// **implementation-note-23 C1**: `Vault` is `ZeroizeOnDrop` so the
+/// **implementation-note-27 C1**: `Vault` is `ZeroizeOnDrop` so the
 /// in-memory MEK is wiped on Drop (explicit lock, daemon shutdown, the
 /// final `Rc<Vault>` / `Arc<Vault>` reference going away).
 ///
-/// implementation-note-137 (F-S1-001 HIGH + F-S1-008 LOW): `Clone` is
+/// implementation-note-317 (F-S1-001 HIGH + F-S1-008 LOW): `Clone` is
 /// REMOVED. Prior to this commit `Vault` derived `Clone` so the in-memory
 /// MEK byte-array could be by-value-copied across LocalSet spawn boundaries
 /// (runtime.rs spawned each proxy + dashboard task with a fresh
@@ -369,11 +409,12 @@ pub enum VaultKeyStore {
 /// new 32-byte memory block holding the MEK, multiplying the secret's
 /// in-memory footprint and the per-copy `Drop` zeroization budget.
 ///
-/// After C1: sharing is `Rc<Vault>` ONLY. `ProxyState.vault` is
-/// `Rc<Vault>`, `run_dashboard`'s `vault` parameter is `Option<Rc<Vault>>`,
-/// and `runtime.rs` uses `Rc::clone(&vault)` (cheap ref-count bump) on
-/// the spawn boundary. The single underlying MEK byte-array gets zeroized
-/// exactly once — when the last reference drops.
+/// After C1/C2: sharing is `Rc<Vault>` ONLY, but long-lived helper lanes now
+/// resolve that live vault through `DaemonStore`'s shared slot instead of
+/// owning private runtime copies. `runtime.rs` drops the startup `Rc<Vault>`
+/// after wiring the slot, so explicit lock can clear the shared slot and let
+/// the single underlying MEK byte-array zeroize when the last live reference
+/// drops.
 #[derive(zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct Vault {
     vault_key: [u8; 32],
@@ -388,7 +429,7 @@ impl Vault {
     /// compile-time-pinned parameters (`VAULT_ARGON2_*` constants).
     /// Matches `Argon2::default()` in argon2 v0.5 — existing vaults
     /// sealed under the default continue to decrypt without rotation
-    /// (implementation-note-23 C4).
+    /// (implementation-note-27 C4).
     pub fn from_passphrase(passphrase: &str, salt: &[u8; 16]) -> Self {
         let params = argon2::Params::new(
             VAULT_ARGON2_M_KIB,
@@ -397,11 +438,8 @@ impl Vault {
             Some(VAULT_ARGON2_OUTPUT_LEN),
         )
         .expect("Argon2 params are compile-time-pinned to a valid combination");
-        let argon2 = argon2::Argon2::new(
-            argon2::Algorithm::Argon2id,
-            argon2::Version::V0x13,
-            params,
-        );
+        let argon2 =
+            argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
         let mut key = [0u8; 32];
         argon2
             .hash_password_into(passphrase.as_bytes(), salt, &mut key)
@@ -436,58 +474,17 @@ impl Vault {
     ///
     /// Salt is read from `<data_dir>/vault.salt`; created on first call.
     pub fn open_from_config(config: &DaemonConfig) -> Result<Vault, VaultError> {
-        let salt = vault_salt(config)?;
-        // implementation-note-23 C4: refuse to unlock if vault.params
-        // disagrees with the compile-time Argon2 pin. Runs BEFORE any
-        // keyring access so a param mismatch aborts before a (potentially
-        // user-presence-gated) Keychain prompt fires.
-        check_or_write_vault_params(config)?;
-        let service = resolve_keyring_service(&config.keyring);
-        let account = resolve_keyring_account(&config.keyring);
+        open_from_config_with_presence(config, PresenceAfterOpen::MarkUnlocked)
+    }
 
-        // implementation-note-227 — macOS separate-uid posture (design).
-        // The system-uid LaunchDaemon install lane has no login keychain
-        // and cannot reach the operator's SE-wrapped keychain entry, so we
-        // route through the on-disk SE-wrapped MEK blob laid down at
-        // install time. The env-var override (precedence rule 1) must
-        // still win: when `EMBER_VAULT_PASSPHRASE` is set we fall through
-        // to `resolve_passphrase` below so the env value is consumed +
-        // zeroized exactly once. Skipped under cargo-test binaries
-        // (`is_cargo_test_binary`) so tests never reach the real SE.
-        #[cfg(target_os = "macos")]
-        if !is_cargo_test_binary()
-            && std::env::var("EMBER_VAULT_PASSPHRASE").is_err()
-            && is_separate_uid_posture()
-        {
-            let passphrase =
-                crate::infra::vault_macos_se::get_mek_passphrase(&config.data_dir)?;
-            crate::trust::presence::mark_unlocked();
-            return Ok(Vault::from_passphrase(&passphrase, &salt));
-        }
-
-        // Belt-and-suspenders: refuse to open the production keyring service
-        // unless the operator has explicitly opted in with
-        // `$HOME/.ember-production`. Dev/QA daemons that point at a custom
-        // service name (via config or env override) bypass this check. Skipped
-        // entirely under cargo-test binaries — the passphrase branch below is
-        // also gated there, so the real keychain is never touched in tests.
-        if !is_cargo_test_binary() {
-            let home = dirs_next::home_dir().ok_or_else(|| {
-                VaultError::ProductionSentinelMissing(
-                    "refusing to open vault: home directory not resolvable (no $HOME)"
-                        .to_string(),
-                )
-            })?;
-            check_production_sentinel(&service, DEFAULT_KEYRING_SERVICE, &home)?;
-        }
-
-        let passphrase = resolve_passphrase(&service, &account)?;
-        // A successful unlock (Tier 1, possibly via the macOS user-presence
-        // prompt) flips the in-process session state to Unlocked so per-op
-        // `require_user_presence` gates don't double-prompt within the
-        // idle window.
-        crate::trust::presence::mark_unlocked();
-        Ok(Vault::from_passphrase(&passphrase, &salt))
+    /// Open the vault for daemon bootstrap work without flipping operator
+    /// presence to Unlocked.
+    ///
+    /// This keeps startup-only vault hydration distinct from the interactive
+    /// session-open posture in design: the daemon may need a temporary vault
+    /// handle during boot, but that must not look like a live operator session.
+    pub(crate) fn open_bootstrap_from_config(config: &DaemonConfig) -> Result<Vault, VaultError> {
+        open_from_config_with_presence(config, PresenceAfterOpen::LeaveLocked)
     }
 
     /// Open the vault using a `VaultKeyStore` to select the unlock lane.
@@ -509,77 +506,148 @@ impl Vault {
         config: &DaemonConfig,
         key_store: &VaultKeyStore,
     ) -> Result<Vault, VaultError> {
-        // implementation-note-23 C4: same params gate as
-        // `open_from_config` — runs before any keyring access so a
-        // mismatch aborts before a (potentially user-presence-gated)
-        // Keychain prompt fires.
-        check_or_write_vault_params(config)?;
-        match key_store {
-            VaultKeyStore::Passphrase(salt) => {
-                // Same resolution + checkpoint + presence-mark sequence as
-                // `open_from_config`, but the salt is taken from the enum
-                // variant rather than re-resolved from disk. The caller is
-                // responsible for ensuring the salt matches the one originally
-                // used to seal the vault — typically by populating the variant
-                // via `vault_salt(config)`.
-                let service = resolve_keyring_service(&config.keyring);
-                let account = resolve_keyring_account(&config.keyring);
+        open_with_key_store_and_presence(config, key_store, PresenceAfterOpen::MarkUnlocked)
+    }
+}
 
-                if !is_cargo_test_binary() {
-                    let home = dirs_next::home_dir().ok_or_else(|| {
-                        VaultError::ProductionSentinelMissing(
-                            "refusing to open vault: home directory not resolvable (no $HOME)"
-                                .to_string(),
-                        )
-                    })?;
-                    check_production_sentinel(&service, DEFAULT_KEYRING_SERVICE, &home)?;
-                }
+#[derive(Clone, Copy)]
+enum PresenceAfterOpen {
+    LeaveLocked,
+    MarkUnlocked,
+}
 
-                let passphrase = resolve_passphrase(&service, &account)?;
-                crate::trust::presence::mark_unlocked();
-                Ok(Vault::from_passphrase(&passphrase, salt.as_bytes()))
-            }
-            VaultKeyStore::EnvPassphrase => {
-                // Headless / CI lane — refuse to fall back to the keyring; if
-                // the env var is missing, the caller asked for the wrong lane.
-                let passphrase = match std::env::var("EMBER_VAULT_PASSPHRASE") {
-                    Ok(p) => {
-                        // Same single-threaded-startup zeroize as
-                        // `resolve_passphrase`'s env branch.
-                        // Safety: single-threaded init path; no other threads
-                        // are reading env at this point.
-                        unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
-                        p
-                    }
-                    Err(_) => {
-                        return Err(VaultError::Keyring(
-                            "VaultKeyStore::EnvPassphrase selected but \
-                             EMBER_VAULT_PASSPHRASE is not set"
-                                .to_string(),
-                        ));
-                    }
-                };
-                let salt = vault_salt(config)?;
-                crate::trust::presence::mark_unlocked();
-                Ok(Vault::from_passphrase(&passphrase, &salt))
-            }
-            #[cfg(target_os = "macos")]
-            VaultKeyStore::SecureEnclave(_wrapped) => {
-                // STUB: real implementation will unwrap `_wrapped.key_label`
-                // via SecKeyCopyMatching + SecKeyCreateDecryptedData (which
-                // forces the LocalAuthentication prompt and never exposes the
-                // SE-resident key to userland). Tracked under
-                // .A-SE-WIRE; the enum shape lands first so .B can
-                // build on it without dragging in the full SecKey API.
-                Err(VaultError::Crypto(
-                    "VaultKeyStore::SecureEnclave is not yet implemented; \
-                     use VaultKeyStore::Passphrase variant — see .A-SE-WIRE"
-                        .to_string(),
-                ))
-            }
-        }
+fn finish_open(passphrase: &str, salt: &[u8; 16], presence: PresenceAfterOpen) -> Vault {
+    if matches!(presence, PresenceAfterOpen::MarkUnlocked) {
+        crate::trust::presence::mark_unlocked();
+    }
+    Vault::from_passphrase(passphrase, salt)
+}
+
+fn open_from_config_with_presence(
+    config: &DaemonConfig,
+    presence: PresenceAfterOpen,
+) -> Result<Vault, VaultError> {
+    let salt = vault_salt(config)?;
+    // implementation-note-27 C4: refuse to unlock if vault.params
+    // disagrees with the compile-time Argon2 pin. Runs BEFORE any
+    // keyring access so a param mismatch aborts before a (potentially
+    // user-presence-gated) Keychain prompt fires.
+    check_or_write_vault_params(config)?;
+    let service = resolve_keyring_service(&config.keyring);
+    let account = resolve_keyring_account(&config.keyring);
+
+    // implementation-note-318 — macOS separate-uid posture (design).
+    // The system-uid LaunchDaemon install lane has no login keychain
+    // and cannot reach the operator's SE-wrapped keychain entry, so we
+    // route through the on-disk SE-wrapped MEK blob laid down at
+    // install time. The env-var override (precedence rule 1) must
+    // still win: when `EMBER_VAULT_PASSPHRASE` is set we fall through
+    // to `resolve_passphrase` below so the env value is consumed +
+    // zeroized exactly once. Skipped under cargo-test binaries
+    // (`is_cargo_test_binary`) so tests never reach the real SE.
+    #[cfg(target_os = "macos")]
+    if !is_cargo_test_binary()
+        && std::env::var("EMBER_VAULT_PASSPHRASE").is_err()
+        && is_separate_uid_posture()
+    {
+        let passphrase = crate::infra::vault_macos_se::get_mek_passphrase(&config.data_dir)?;
+        return Ok(finish_open(&passphrase, &salt, presence));
     }
 
+    // Belt-and-suspenders: refuse to open the production keyring service
+    // unless the operator has explicitly opted in with
+    // `$HOME/.ember-production`. Dev/QA daemons that point at a custom
+    // service name (via config or env override) bypass this check. Skipped
+    // entirely under cargo-test binaries — the passphrase branch below is
+    // also gated there, so the real keychain is never touched in tests.
+    if !is_cargo_test_binary() {
+        let home = dirs_next::home_dir().ok_or_else(|| {
+            VaultError::ProductionSentinelMissing(
+                "refusing to open vault: home directory not resolvable (no $HOME)".to_string(),
+            )
+        })?;
+        check_production_sentinel(&service, DEFAULT_KEYRING_SERVICE, &home)?;
+    }
+
+    let passphrase = resolve_passphrase(&service, &account)?;
+    Ok(finish_open(&passphrase, &salt, presence))
+}
+
+fn open_with_key_store_and_presence(
+    config: &DaemonConfig,
+    key_store: &VaultKeyStore,
+    presence: PresenceAfterOpen,
+) -> Result<Vault, VaultError> {
+    // implementation-note-27 C4: same params gate as
+    // `open_from_config` — runs before any keyring access so a
+    // mismatch aborts before a (potentially user-presence-gated)
+    // Keychain prompt fires.
+    check_or_write_vault_params(config)?;
+    match key_store {
+        VaultKeyStore::Passphrase(salt) => {
+            // Same resolution + checkpoint + presence-mark sequence as
+            // `open_from_config`, but the salt is taken from the enum
+            // variant rather than re-resolved from disk. The caller is
+            // responsible for ensuring the salt matches the one originally
+            // used to seal the vault — typically by populating the variant
+            // via `vault_salt(config)`.
+            let service = resolve_keyring_service(&config.keyring);
+            let account = resolve_keyring_account(&config.keyring);
+
+            if !is_cargo_test_binary() {
+                let home = dirs_next::home_dir().ok_or_else(|| {
+                    VaultError::ProductionSentinelMissing(
+                        "refusing to open vault: home directory not resolvable (no $HOME)"
+                            .to_string(),
+                    )
+                })?;
+                check_production_sentinel(&service, DEFAULT_KEYRING_SERVICE, &home)?;
+            }
+
+            let passphrase = resolve_passphrase(&service, &account)?;
+            Ok(finish_open(&passphrase, salt.as_bytes(), presence))
+        }
+        VaultKeyStore::EnvPassphrase => {
+            // Headless / CI lane — refuse to fall back to the keyring; if
+            // the env var is missing, the caller asked for the wrong lane.
+            let passphrase = match std::env::var("EMBER_VAULT_PASSPHRASE") {
+                Ok(p) => {
+                    // Same single-threaded-startup zeroize as
+                    // `resolve_passphrase`'s env branch.
+                    // Safety: single-threaded init path; no other threads
+                    // are reading env at this point.
+                    unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
+                    p
+                }
+                Err(_) => {
+                    return Err(VaultError::Keyring(
+                        "VaultKeyStore::EnvPassphrase selected but \
+                         EMBER_VAULT_PASSPHRASE is not set"
+                            .to_string(),
+                    ));
+                }
+            };
+            let salt = vault_salt(config)?;
+            Ok(finish_open(&passphrase, &salt, presence))
+        }
+        #[cfg(target_os = "macos")]
+        VaultKeyStore::SecureEnclave(_wrapped) => {
+            // STUB: real implementation will unwrap `_wrapped.key_label`
+            // via SecKeyCopyMatching + SecKeyCreateDecryptedData (which
+            // forces the LocalAuthentication prompt and never exposes the
+            // SE-resident key to userland). Tracked under
+            // .A-SE-WIRE; the enum shape lands first so .B can
+            // build on it without dragging in the full SecKey API.
+            Err(VaultError::Crypto(
+                "VaultKeyStore::SecureEnclave is not yet implemented; \
+                 use VaultKeyStore::Passphrase variant — see .A-SE-WIRE"
+                    .to_string(),
+            ))
+        }
+    }
+}
+
+impl Vault {
     /// Seal raw bytes under the vault master key and return
     /// `(nonce, ciphertext)` suitable for storing side-by-side in two
     /// BLOB columns. Used by persona-secret at-rest encryption (F-05).
@@ -621,17 +689,13 @@ impl Vault {
         value: &[u8],
         metadata: Option<&str>,
     ) -> Result<CredentialInfo, VaultError> {
-        // Phase 1 (implementation-note-226): scope is plumbed but not yet
-        // load-bearing. Phase 2 will branch on `scope` to route to a per-scope
-        // MEK + per-scope credentials-table prefix.
-        let _ = scope;
-
         // design path-grammar gate — applies to NEW entries only.
         // Existing rows with non-conformant names continue to function via
         // `get`/`list`/`remove`; this check fires only on insert.
         validate_credential_name(name).map_err(VaultError::InvalidName)?;
+        let stored_name = storage_name_for_scope(scope, name);
 
-        // implementation-note-23 C5: mint the row id BEFORE encrypting
+        // implementation-note-27 C5: mint the row id BEFORE encrypting
         // so the AEAD AAD can be bound to the row's UUID. AAD format is
         // `[0x01, row_uuid_bytes...]` (17 bytes). Decrypt-side (Vault::get)
         // tries this AAD first, falling back to no-AAD for legacy rows.
@@ -659,7 +723,14 @@ impl Vault {
             .execute(
                 "INSERT INTO credentials (id, name, nonce, ciphertext, created_at, metadata) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![id, name, nonce_bytes.as_slice(), ciphertext, created_at, metadata],
+                params![
+                    id,
+                    stored_name,
+                    nonce_bytes.as_slice(),
+                    ciphertext,
+                    created_at,
+                    metadata
+                ],
             )
             .map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?;
 
@@ -676,11 +747,6 @@ impl Vault {
         scope: VaultScope,
         store: &DaemonStore,
     ) -> Result<Vec<CredentialInfo>, VaultError> {
-        // Phase 1 (implementation-note-226): scope is plumbed but not yet
-        // load-bearing. Phase 2 will branch on `scope` to route to a per-scope
-        // credentials-table prefix.
-        let _ = scope;
-
         let mut stmt = store
             .conn()
             .prepare("SELECT id, name, created_at, metadata FROM credentials ORDER BY created_at")
@@ -699,7 +765,12 @@ impl Vault {
 
         let mut result = Vec::new();
         for row in rows {
-            result.push(row.map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?);
+            let mut info = row.map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?;
+            let Some(logical_name) = logical_name_from_storage(scope, &info.name) else {
+                continue;
+            };
+            info.name = logical_name;
+            result.push(info);
         }
         Ok(result)
     }
@@ -710,21 +781,17 @@ impl Vault {
         store: &DaemonStore,
         name: &str,
     ) -> Result<Vec<u8>, VaultError> {
-        // Phase 1 (implementation-note-226): scope is plumbed but not yet
-        // load-bearing. Phase 2 will branch on `scope` to route to a per-scope
-        // MEK + per-scope credentials-table prefix.
-        let _ = scope;
-
-        // implementation-note-23 C5: select the row id alongside
+        // implementation-note-27 C5: select the row id alongside
         // nonce/ciphertext so the AAD-aware decrypt can bind to it.
         // Legacy rows whose id parses cleanly still flow through the
         // AAD-aware path first; the fallback path below catches any
         // ciphertext that was sealed without AAD.
+        let stored_name = storage_name_for_scope(scope, name);
         let result: Option<(String, Vec<u8>, Vec<u8>)> = store
             .conn()
             .query_row(
                 "SELECT id, nonce, ciphertext FROM credentials WHERE name = ?1",
-                params![name],
+                params![stored_name],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
@@ -777,14 +844,13 @@ impl Vault {
         store: &DaemonStore,
         name: &str,
     ) -> Result<(), VaultError> {
-        // Phase 1 (implementation-note-226): scope is plumbed but not yet
-        // load-bearing. Phase 2 will branch on `scope` to route to a per-scope
-        // credentials-table prefix.
-        let _ = scope;
-
+        let stored_name = storage_name_for_scope(scope, name);
         let rows_affected = store
             .conn()
-            .execute("DELETE FROM credentials WHERE name = ?1", params![name])
+            .execute(
+                "DELETE FROM credentials WHERE name = ?1",
+                params![stored_name],
+            )
             .map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?;
 
         if rows_affected == 0 {
@@ -799,7 +865,7 @@ impl Vault {
     /// `UnlockPinTracker` calls into this method when the grace window
     /// expires with no live pins. Phase 1 logs the request but does not
     /// actually zero the MEK reference — the real implementation lands in
-    /// **Phase 2** (`implementation-note-224`) alongside the
+    /// **Phase 2** (`implementation-note-313`) alongside the
     /// session-lifecycle wiring that calls it. The Phase 1 stub exists so
     /// the substrate (the pin tracker + the API hook on Vault) can land in
     /// isolation without the multi-file lifecycle changes.
@@ -833,13 +899,10 @@ impl Vault {
         value: &[u8],
         metadata: Option<&str>,
     ) -> Result<CredentialInfo, VaultError> {
-        // Phase 1 (implementation-note-226): scope plumbed; Phase 2 will
-        // branch routing.
-        let _ = scope;
-
         validate_credential_name(name).map_err(VaultError::InvalidName)?;
+        let stored_name = storage_name_for_scope(scope, name);
 
-        // implementation-note-23 C5: mint id first, bind AAD to the
+        // implementation-note-27 C5: mint id first, bind AAD to the
         // new row's UUID. Same pattern as `Vault::add`.
         let id = format!("cred-{}", Uuid::new_v4());
         let aad = aad_for_row_id(&id).expect("freshly-minted cred-<uuid> id parses");
@@ -864,12 +927,22 @@ impl Vault {
         let tx = conn
             .unchecked_transaction()
             .map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?;
-        tx.execute("DELETE FROM credentials WHERE name = ?1", params![name])
-            .map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?;
+        tx.execute(
+            "DELETE FROM credentials WHERE name = ?1",
+            params![stored_name],
+        )
+        .map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?;
         tx.execute(
             "INSERT INTO credentials (id, name, nonce, ciphertext, created_at, metadata) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![id, name, nonce_bytes.as_slice(), ciphertext, created_at, metadata],
+            params![
+                id,
+                stored_name,
+                nonce_bytes.as_slice(),
+                ciphertext,
+                created_at,
+                metadata
+            ],
         )
         .map_err(|e| VaultError::Store(StoreError::Sqlite(e)))?;
         tx.commit()
@@ -921,9 +994,26 @@ pub enum AutoUnsealOutcome {
 ///   each re-implementing keyring lookup.
 ///
 /// Always-attempted: there is no relay/hosted/first-party mode flag in
-/// `DaemonConfig` today (implementation-note-214 task instructions explicitly note this).
+/// `DaemonConfig` today (implementation-note-296 task instructions explicitly note this).
 /// If one is added later, gate auto-unseal on first-party mode here.
 pub fn try_auto_unseal_from_keyring(config: &DaemonConfig) -> AutoUnsealOutcome {
+    try_auto_unseal_from_keyring_with_presence(config, PresenceAfterOpen::MarkUnlocked)
+}
+
+/// Best-effort auto-unseal variant used only during daemon bootstrap.
+///
+/// This preserves the startup contract of "open a temporary bootstrap vault if
+/// a key source already exists" without silently treating boot as an
+/// interactive operator unlock or publishing that handle into the daemon's
+/// shared live-vault slot.
+pub(crate) fn try_bootstrap_auto_unseal_from_keyring(config: &DaemonConfig) -> AutoUnsealOutcome {
+    try_auto_unseal_from_keyring_with_presence(config, PresenceAfterOpen::LeaveLocked)
+}
+
+fn try_auto_unseal_from_keyring_with_presence(
+    config: &DaemonConfig,
+    presence: PresenceAfterOpen,
+) -> AutoUnsealOutcome {
     let service = resolve_keyring_service(&config.keyring);
     let account = resolve_keyring_account(&config.keyring);
 
@@ -935,8 +1025,7 @@ pub fn try_auto_unseal_from_keyring(config: &DaemonConfig) -> AutoUnsealOutcome 
             Some(h) => h,
             None => {
                 return AutoUnsealOutcome::Error(VaultError::ProductionSentinelMissing(
-                    "refusing to open vault: home directory not resolvable (no $HOME)"
-                        .to_string(),
+                    "refusing to open vault: home directory not resolvable (no $HOME)".to_string(),
                 ));
             }
         };
@@ -952,7 +1041,7 @@ pub fn try_auto_unseal_from_keyring(config: &DaemonConfig) -> AutoUnsealOutcome 
         Err(e) => return AutoUnsealOutcome::Error(e),
     };
 
-    // implementation-note-23 C4: refuse to auto-unseal if the
+    // implementation-note-27 C4: refuse to auto-unseal if the
     // vault.params sidecar disagrees with the compile-time Argon2 pin.
     // Same enforcement as `open_from_config`.
     if let Err(e) = check_or_write_vault_params(config) {
@@ -963,16 +1052,58 @@ pub fn try_auto_unseal_from_keyring(config: &DaemonConfig) -> AutoUnsealOutcome 
     // "keyring miss" (NoKeyringEntry) from "platform error" (Error).
     match resolve_passphrase_no_provision(&service, &account) {
         Ok(Some(passphrase)) => {
-            // Same Tier-1 → Tier-2 hand-off as `open_from_config` — flip
-            // the gate to Unlocked so per-op
-            // `require_user_presence` checks succeed within the idle
-            // window without re-prompting.
-            crate::trust::presence::mark_unlocked();
-            AutoUnsealOutcome::Unsealed(Vault::from_passphrase(&passphrase, &salt))
+            AutoUnsealOutcome::Unsealed(finish_open(&passphrase, &salt, presence))
         }
         Ok(None) => AutoUnsealOutcome::NoKeyringEntry,
         Err(e) => AutoUnsealOutcome::Error(e),
     }
+}
+
+/// Reopen the runtime vault without provisioning a fresh passphrase source.
+///
+/// Used by the same-daemon interactive reopen path after an explicit
+/// `vault_lock`. Unlike [`Vault::open_from_config`], this helper MUST NOT
+/// silently mint a new key source when the original passphrase entry has
+/// disappeared — a reopened daemon must either recover the existing MEK or
+/// fail closed.
+pub(crate) fn reopen_from_runtime_config(config: &DaemonConfig) -> Result<Vault, VaultError> {
+    let service = resolve_keyring_service(&config.keyring);
+    let account = resolve_keyring_account(&config.keyring);
+    let salt = vault_salt(config)?;
+    check_or_write_vault_params(config)?;
+
+    #[cfg(target_os = "macos")]
+    if !is_cargo_test_binary()
+        && std::env::var("EMBER_VAULT_PASSPHRASE").is_err()
+        && is_separate_uid_posture()
+    {
+        let passphrase = crate::infra::vault_macos_se::get_mek_passphrase(&config.data_dir)?;
+        return Ok(finish_open(
+            &passphrase,
+            &salt,
+            PresenceAfterOpen::MarkUnlocked,
+        ));
+    }
+
+    if !is_cargo_test_binary() {
+        let home = dirs_next::home_dir().ok_or_else(|| {
+            VaultError::ProductionSentinelMissing(
+                "refusing to open vault: home directory not resolvable (no $HOME)".to_string(),
+            )
+        })?;
+        check_production_sentinel(&service, DEFAULT_KEYRING_SERVICE, &home)?;
+    }
+
+    let passphrase = resolve_passphrase_no_provision(&service, &account)?.ok_or_else(|| {
+        VaultError::Keyring(
+            "runtime vault reopen requires an existing passphrase entry; none found".to_string(),
+        )
+    })?;
+    Ok(finish_open(
+        &passphrase,
+        &salt,
+        PresenceAfterOpen::MarkUnlocked,
+    ))
 }
 
 /// Like `resolve_passphrase` but never provisions a new keyring entry.
@@ -1112,8 +1243,8 @@ pub fn log_vault_identity(config: &DaemonConfig, config_path: Option<&std::path:
 
     // Warn when the default (production) service is in use but a custom config path was given —
     // this is the foot-gun state where an operator forgot to set [keyring].service.
-    let using_default_service = config.keyring.service.is_none()
-        && std::env::var("EMBER_KEYRING_SERVICE").is_err();
+    let using_default_service =
+        config.keyring.service.is_none() && std::env::var("EMBER_KEYRING_SERVICE").is_err();
 
     if using_default_service && let Some(cp) = config_path {
         let default_path = DaemonConfig::default_config_path();
@@ -1142,7 +1273,7 @@ pub struct MigrateMekAclResult {
 /// (biometric on macOS via `kSecAttrAccessControl`).
 ///
 /// This migrates a pre-existing MEK entry created before
-/// implementation-note-78 shipped so subsequent vault operations
+/// implementation-note-100 shipped so subsequent vault operations
 /// use Touch ID instead of the plain keychain password.
 ///
 /// Safety contract:
@@ -1156,7 +1287,8 @@ pub fn migrate_mek_acl(service: &str, account: &str) -> Result<MigrateMekAclResu
 
     // Detect whether biometric ACL should apply for this service.
     #[cfg(target_os = "macos")]
-    let wants_biometric = crate::infra::vault_macos::apply_user_presence(service, DEFAULT_KEYRING_SERVICE);
+    let wants_biometric =
+        crate::infra::vault_macos::apply_user_presence(service, DEFAULT_KEYRING_SERVICE);
     #[cfg(not(target_os = "macos"))]
     let wants_biometric = false;
 
@@ -1325,14 +1457,24 @@ fn is_separate_uid_posture() -> bool {
     // (see install.rs::render_launchd_plist_body), so any env-var-based
     // home resolution would see the operator's home and miss the
     // /var/empty checkpoint that signals the design separate-uid posture.
-    // Per adversarial review implementation-note-45-(-B).
+    // Per adversarial review implementation-note-62-(-B).
     //
     // The Ok(None) and Err(e) arms both return false but log distinctly
     // so an operator debugging "why did the daemon land on the keychain
     // branch instead of SE?" can tell apart a provisioning race (uid
     // exists in kernel but passwd entry not yet written) from a real
     // passwd-database I/O failure. Per self-review 
-    // (implementation-note-228).
+    // (implementation-note-319).
+    //
+    // implementation-note-320: all three 
+    // findings from the 2026-05-13 self-review are now closed.
+    // (this site): Ok(None) / Err distinguished above.
+    // : TOCTOU on file-based MEK blob — obviated by the
+    //   System.keychain migration in vault_macos_se.rs (no filesystem
+    //   read of the MEK blob remains).
+    // : error-category asymmetry — addressed during the keychain
+    //   migration (both lookup-failure paths now map to VaultError::Io
+    //   with consistent operator-facing recovery hint).
     match nix::unistd::User::from_uid(nix::unistd::geteuid()) {
         Ok(Some(user)) => user.dir == std::path::Path::new("/var/empty"),
         Ok(None) => {
@@ -1364,7 +1506,11 @@ pub fn keyring_writes_suppressed() -> bool {
     std::env::var("EMBER_VAULT_MOCK").is_ok() || is_cargo_test_binary()
 }
 
-pub fn verify_keyring_roundtrip(service: &str, account: &str, expected: &str) -> Result<(), VaultError> {
+pub fn verify_keyring_roundtrip(
+    service: &str,
+    account: &str,
+    expected: &str,
+) -> Result<(), VaultError> {
     // Test gate — skip the real-keychain verification step under the same
     // conditions that suppress keyring access in resolve_passphrase above.
     if cfg!(test) || std::env::var("EMBER_VAULT_MOCK").is_ok() || is_cargo_test_binary() {
@@ -1462,8 +1608,8 @@ fn resolve_passphrase(service: &str, account: &str) -> Result<String, VaultError
 fn vault_salt(config: &DaemonConfig) -> Result<[u8; 16], VaultError> {
     let salt_path = config.data_dir.join("vault.salt");
     if salt_path.exists() {
-        let bytes = std::fs::read(&salt_path)
-            .map_err(|e| VaultError::Io(format!("salt read: {e}")))?;
+        let bytes =
+            std::fs::read(&salt_path).map_err(|e| VaultError::Io(format!("salt read: {e}")))?;
         let salt: [u8; 16] = bytes
             .try_into()
             .map_err(|_| VaultError::Io("invalid salt length".to_string()))?;
@@ -1493,7 +1639,7 @@ fn vault_salt(config: &DaemonConfig) -> Result<[u8; 16], VaultError> {
     }
 }
 
-/// implementation-note-23 C4: enforce Argon2 parameter pinning via a
+/// implementation-note-27 C4: enforce Argon2 parameter pinning via a
 /// `<data_dir>/vault.params` sidecar file.
 ///
 /// - If the file exists, parse it and refuse to proceed if any value
@@ -1514,13 +1660,18 @@ fn check_or_write_vault_params(config: &DaemonConfig) -> Result<(), VaultError> 
         let contents = std::fs::read_to_string(&params_path)
             .map_err(|e| VaultError::Io(format!("vault.params read: {e}")))?;
         let parsed: toml::Value = toml::from_str(&contents).map_err(|e| {
-            VaultError::Crypto(format!("argon2 params mismatch: vault.params parse error: {e}"))
+            VaultError::Crypto(format!(
+                "argon2 params mismatch: vault.params parse error: {e}"
+            ))
         })?;
-        let argon2_tbl = parsed.get("argon2").and_then(|v| v.as_table()).ok_or_else(|| {
-            VaultError::Crypto(
-                "argon2 params mismatch: vault.params missing [argon2] table".to_string(),
-            )
-        })?;
+        let argon2_tbl = parsed
+            .get("argon2")
+            .and_then(|v| v.as_table())
+            .ok_or_else(|| {
+                VaultError::Crypto(
+                    "argon2 params mismatch: vault.params missing [argon2] table".to_string(),
+                )
+            })?;
 
         let m = argon2_tbl
             .get("m")
@@ -1549,18 +1700,24 @@ fn check_or_write_vault_params(config: &DaemonConfig) -> Result<(), VaultError> 
                         .to_string(),
                 )
             })?;
-        let alg = argon2_tbl.get("alg").and_then(|v| v.as_str()).ok_or_else(|| {
-            VaultError::Crypto(
-                "argon2 params mismatch: vault.params [argon2].alg missing or wrong type"
-                    .to_string(),
-            )
-        })?;
-        let ver = argon2_tbl.get("ver").and_then(|v| v.as_str()).ok_or_else(|| {
-            VaultError::Crypto(
-                "argon2 params mismatch: vault.params [argon2].ver missing or wrong type"
-                    .to_string(),
-            )
-        })?;
+        let alg = argon2_tbl
+            .get("alg")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                VaultError::Crypto(
+                    "argon2 params mismatch: vault.params [argon2].alg missing or wrong type"
+                        .to_string(),
+                )
+            })?;
+        let ver = argon2_tbl
+            .get("ver")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                VaultError::Crypto(
+                    "argon2 params mismatch: vault.params [argon2].ver missing or wrong type"
+                        .to_string(),
+                )
+            })?;
 
         if m != VAULT_ARGON2_M_KIB as i64
             || t != VAULT_ARGON2_T_COST as i64
@@ -1628,8 +1785,7 @@ fn check_or_write_vault_params(config: &DaemonConfig) -> Result<(), VaultError> 
 fn generate_passphrase() -> String {
     // 32 chars from an alphanumeric alphabet (62 chars) → ~190 bits of entropy.
     // Sampled by rejection from OS entropy to avoid modulo bias.
-    const ALPHABET: &[u8; 62] =
-        b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const ALPHABET: &[u8; 62] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut out = String::with_capacity(32);
     let mut scratch = [0u8; 64];
     while out.len() < 32 {
@@ -1662,7 +1818,7 @@ mod tests {
         [99u8; 32]
     }
 
-    /// implementation-note-23 C5: a roundtrip through `add` → `get`
+    /// implementation-note-27 C5: a roundtrip through `add` → `get`
     /// succeeds when the row carries per-row AAD bound to the row's
     /// UUID. The shape of the test is intentionally minimal — the
     /// existing `add_list_get_roundtrip` test exercises the happy path
@@ -1691,7 +1847,7 @@ mod tests {
         assert_eq!(value, b"some-secret-value");
     }
 
-    /// implementation-note-23 C5: a credentials row whose ciphertext
+    /// implementation-note-27 C5: a credentials row whose ciphertext
     /// was written WITHOUT AAD (legacy daemon before C5 shipped) must
     /// still decrypt through `Vault::get` via the no-AAD fallback path.
     /// The test synthesises a legacy row directly via SQL so the
@@ -1705,8 +1861,7 @@ mod tests {
 
         // Hand-roll a no-AAD ciphertext for the row, then INSERT it
         // directly. Mirrors what an old daemon's `add` would have done.
-        let cipher =
-            chacha20poly1305::XChaCha20Poly1305::new_from_slice(&vault.vault_key).unwrap();
+        let cipher = chacha20poly1305::XChaCha20Poly1305::new_from_slice(&vault.vault_key).unwrap();
         let mut nonce_bytes = [0u8; 24];
         getrandom::fill(&mut nonce_bytes).unwrap();
         let nonce = chacha20poly1305::XNonce::from_slice(&nonce_bytes);
@@ -1738,7 +1893,7 @@ mod tests {
         assert_eq!(value, b"legacy-plaintext");
     }
 
-    /// implementation-note-23 C4: when `vault.params` contains values
+    /// implementation-note-27 C4: when `vault.params` contains values
     /// that do not match the compile-time-pinned Argon2 parameters,
     /// `Vault::open_from_config` refuses to proceed with
     /// `VaultError::Crypto("argon2 params mismatch...")`. The file is
@@ -1788,7 +1943,7 @@ ver = "V0x13"
         }
     }
 
-    /// implementation-note-23 C4 partner: a fresh vault (no
+    /// implementation-note-27 C4 partner: a fresh vault (no
     /// `vault.params` on disk) lays one down on first open with the
     /// pinned params, and a subsequent open against the same data_dir
     /// succeeds (the params file now exists and matches).
@@ -1826,7 +1981,7 @@ ver = "V0x13"
         assert!(contents.contains("V0x13"));
     }
 
-    /// implementation-note-23 C1: `Vault` must implement
+    /// implementation-note-27 C1: `Vault` must implement
     /// `ZeroizeOnDrop` so the MEK is wiped from memory when the Vault is
     /// dropped (explicit lock, daemon shutdown, or any Rc going to zero
     /// references). Compile-time trait assertion: the function body
@@ -1845,7 +2000,13 @@ ver = "V0x13"
         let store = DaemonStore::open_in_memory().unwrap();
         let vault = Vault::new(test_key());
         vault
-            .add(VaultScope::Interactive, &store, "rotation-target", b"old", None)
+            .add(
+                VaultScope::Interactive,
+                &store,
+                "rotation-target",
+                b"old",
+                None,
+            )
             .unwrap();
         assert_eq!(
             vault
@@ -1853,9 +2014,17 @@ ver = "V0x13"
                 .unwrap(),
             b"old"
         );
-        assert!(vault
-            .replace(VaultScope::Interactive, &store, "rotation-target", b"new", None)
-            .is_ok());
+        assert!(
+            vault
+                .replace(
+                    VaultScope::Interactive,
+                    &store,
+                    "rotation-target",
+                    b"new",
+                    None
+                )
+                .is_ok()
+        );
         assert_eq!(
             vault
                 .get(VaultScope::Interactive, &store, "rotation-target")
@@ -1876,9 +2045,17 @@ ver = "V0x13"
     fn replace_succeeds_on_absent_name() {
         let store = DaemonStore::open_in_memory().unwrap();
         let vault = Vault::new(test_key());
-        assert!(vault
-            .replace(VaultScope::Interactive, &store, "fresh-name", b"value", None)
-            .is_ok());
+        assert!(
+            vault
+                .replace(
+                    VaultScope::Interactive,
+                    &store,
+                    "fresh-name",
+                    b"value",
+                    None
+                )
+                .is_ok()
+        );
         assert_eq!(
             vault
                 .get(VaultScope::Interactive, &store, "fresh-name")
@@ -1891,13 +2068,7 @@ ver = "V0x13"
     fn replace_validates_name_grammar() {
         let store = DaemonStore::open_in_memory().unwrap();
         let vault = Vault::new(test_key());
-        let outcome = vault.replace(
-            VaultScope::Interactive,
-            &store,
-            "Invalid-Name",
-            b"x",
-            None,
-        );
+        let outcome = vault.replace(VaultScope::Interactive, &store, "Invalid-Name", b"x", None);
         match outcome {
             Err(VaultError::InvalidName(_)) => (),
             other => panic!(
@@ -1913,7 +2084,13 @@ ver = "V0x13"
         let vault = Vault::new(test_key());
 
         let info = vault
-            .add(VaultScope::Interactive, &store, "my-api-key", b"supersecret", None)
+            .add(
+                VaultScope::Interactive,
+                &store,
+                "my-api-key",
+                b"supersecret",
+                None,
+            )
             .unwrap();
         assert_eq!(info.name, "my-api-key");
         assert!(info.id.starts_with("cred-"));
@@ -1922,8 +2099,60 @@ ver = "V0x13"
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "my-api-key");
 
-        let value = vault.get(VaultScope::Interactive, &store, "my-api-key").unwrap();
+        let value = vault
+            .get(VaultScope::Interactive, &store, "my-api-key")
+            .unwrap();
         assert_eq!(value, b"supersecret");
+    }
+
+    #[test]
+    fn headless_scope_isolated_from_interactive_namespace() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let interactive_vault = Vault::new(test_key());
+        let headless_vault = Vault::new(other_key());
+
+        interactive_vault
+            .add(
+                VaultScope::Interactive,
+                &store,
+                "provider/token",
+                b"interactive-secret",
+                None,
+            )
+            .unwrap();
+        headless_vault
+            .add(
+                VaultScope::Headless,
+                &store,
+                "provider/token",
+                b"headless-secret",
+                None,
+            )
+            .unwrap();
+
+        let interactive = interactive_vault
+            .get(VaultScope::Interactive, &store, "provider/token")
+            .unwrap();
+        let headless = headless_vault
+            .get(VaultScope::Headless, &store, "provider/token")
+            .unwrap();
+        assert_eq!(interactive, b"interactive-secret");
+        assert_eq!(headless, b"headless-secret");
+
+        let interactive_names = interactive_vault
+            .list(VaultScope::Interactive, &store)
+            .unwrap()
+            .into_iter()
+            .map(|info| info.name)
+            .collect::<Vec<_>>();
+        let headless_names = headless_vault
+            .list(VaultScope::Headless, &store)
+            .unwrap()
+            .into_iter()
+            .map(|info| info.name)
+            .collect::<Vec<_>>();
+        assert_eq!(interactive_names, vec!["provider/token".to_string()]);
+        assert_eq!(headless_names, vec!["provider/token".to_string()]);
     }
 
     #[test]
@@ -1931,7 +2160,9 @@ ver = "V0x13"
         let store = DaemonStore::open_in_memory().unwrap();
         let vault = Vault::new(test_key());
 
-        vault.add(VaultScope::Interactive, &store, "token", b"value1", None).unwrap();
+        vault
+            .add(VaultScope::Interactive, &store, "token", b"value1", None)
+            .unwrap();
         let result = vault.add(VaultScope::Interactive, &store, "token", b"value2", None);
         assert!(result.is_err());
     }
@@ -1950,8 +2181,12 @@ ver = "V0x13"
         let store = DaemonStore::open_in_memory().unwrap();
         let vault = Vault::new(test_key());
 
-        vault.add(VaultScope::Interactive, &store, "ephemeral", b"data", None).unwrap();
-        vault.remove(VaultScope::Interactive, &store, "ephemeral").unwrap();
+        vault
+            .add(VaultScope::Interactive, &store, "ephemeral", b"data", None)
+            .unwrap();
+        vault
+            .remove(VaultScope::Interactive, &store, "ephemeral")
+            .unwrap();
 
         let result = vault.get(VaultScope::Interactive, &store, "ephemeral");
         assert!(matches!(result, Err(VaultError::NotFound)));
@@ -1962,7 +2197,15 @@ ver = "V0x13"
         let store = DaemonStore::open_in_memory().unwrap();
         let vault = Vault::new(test_key());
 
-        vault.add(VaultScope::Interactive, &store, "secret", b"confidential", None).unwrap();
+        vault
+            .add(
+                VaultScope::Interactive,
+                &store,
+                "secret",
+                b"confidential",
+                None,
+            )
+            .unwrap();
 
         let wrong_vault = Vault::new(other_key());
         let result = wrong_vault.get(VaultScope::Interactive, &store, "secret");
@@ -1975,9 +2218,17 @@ ver = "V0x13"
         let vault = Vault::new(test_key());
 
         vault
-            .add(VaultScope::Interactive, &store, "key1", b"secret1", Some("tag=prod"))
+            .add(
+                VaultScope::Interactive,
+                &store,
+                "key1",
+                b"secret1",
+                Some("tag=prod"),
+            )
             .unwrap();
-        vault.add(VaultScope::Interactive, &store, "key2", b"secret2", None).unwrap();
+        vault
+            .add(VaultScope::Interactive, &store, "key2", b"secret2", None)
+            .unwrap();
 
         let list = vault.list(VaultScope::Interactive, &store).unwrap();
         assert_eq!(list.len(), 2);
@@ -2005,7 +2256,13 @@ ver = "V0x13"
         // First vault: write a credential.
         let vault1 = Vault::open_from_config(&config).expect("open vault 1");
         vault1
-            .add(VaultScope::Interactive, &store, "round-trip-key", b"secret-value", None)
+            .add(
+                VaultScope::Interactive,
+                &store,
+                "round-trip-key",
+                b"secret-value",
+                None,
+            )
             .unwrap();
 
         // Re-set the env var: open_from_config removes it after first read.
@@ -2016,7 +2273,9 @@ ver = "V0x13"
 
         // Second vault from same config: must decrypt successfully.
         let vault2 = Vault::open_from_config(&config).expect("open vault 2");
-        let value = vault2.get(VaultScope::Interactive, &store, "round-trip-key").unwrap();
+        let value = vault2
+            .get(VaultScope::Interactive, &store, "round-trip-key")
+            .unwrap();
         assert_eq!(value, b"secret-value");
 
         let list = vault2.list(VaultScope::Interactive, &store).unwrap();
@@ -2059,7 +2318,10 @@ ver = "V0x13"
             std::env::set_var("EMBER_KEYRING_ACCOUNT", "env-account");
         }
 
-        let config = KeyringConfig { service: None, account: None };
+        let config = KeyringConfig {
+            service: None,
+            account: None,
+        };
 
         assert_eq!(resolve_keyring_service(&config), "env-service");
         assert_eq!(resolve_keyring_account(&config), "env-account");
@@ -2078,7 +2340,10 @@ ver = "V0x13"
             std::env::remove_var("EMBER_KEYRING_ACCOUNT");
         }
 
-        let config = KeyringConfig { service: None, account: None };
+        let config = KeyringConfig {
+            service: None,
+            account: None,
+        };
 
         assert_eq!(resolve_keyring_service(&config), DEFAULT_KEYRING_SERVICE);
         assert_eq!(resolve_keyring_account(&config), DEFAULT_KEYRING_ACCOUNT);
@@ -2148,8 +2413,7 @@ ver = "V0x13"
     fn sentinel_absent_production_service_refuses() {
         let tmp = tempfile::tempdir().unwrap();
         // No checkpoint file created.
-        let result =
-            check_production_sentinel("ember-daemon", "ember-daemon", tmp.path());
+        let result = check_production_sentinel("ember-daemon", "ember-daemon", tmp.path());
         match result {
             Err(VaultError::ProductionSentinelMissing(msg)) => {
                 assert!(msg.contains(".ember-production"));
@@ -2184,8 +2448,7 @@ ver = "V0x13"
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("ember-production"), b"").unwrap();
         std::fs::write(tmp.path().join(".ember_production"), b"").unwrap();
-        let result =
-            check_production_sentinel("ember-daemon", "ember-daemon", tmp.path());
+        let result = check_production_sentinel("ember-daemon", "ember-daemon", tmp.path());
         assert!(
             matches!(result, Err(VaultError::ProductionSentinelMissing(_))),
             "near-miss filenames must not satisfy checkpoint"
@@ -2214,6 +2477,33 @@ ver = "V0x13"
     }
 
     #[test]
+    fn bootstrap_open_from_config_leaves_presence_locked() {
+        let _guard = crate::PROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let config = DaemonConfig::for_test(tmp.path());
+        crate::trust::presence::lock();
+        // SAFETY: test-only — env mutation gated by PROCESS_TEST_LOCK above.
+        unsafe { std::env::set_var("EMBER_VAULT_PASSPHRASE", "bootstrap-open-passphrase") };
+
+        let _vault = Vault::open_bootstrap_from_config(&config).expect("bootstrap vault open");
+
+        let (is_unlocked, idle_secs) = crate::trust::presence::snapshot();
+        assert!(
+            !is_unlocked,
+            "bootstrap vault open must not look like an interactive operator unlock"
+        );
+        assert!(
+            idle_secs.is_none(),
+            "bootstrap vault open must leave presence in Locked state"
+        );
+        // SAFETY: the happy path removes the env var itself; remove again so a
+        // failure above cannot leak process-global state into later tests.
+        unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
+    }
+
+    #[test]
     fn env_var_removed_after_resolve_passphrase_no_provision() {
         let _guard = crate::PROCESS_TEST_LOCK
             .lock()
@@ -2229,6 +2519,41 @@ ver = "V0x13"
             std::env::var("EMBER_VAULT_PASSPHRASE").is_err(),
             "EMBER_VAULT_PASSPHRASE must be absent after resolve_passphrase_no_provision"
         );
+    }
+
+    #[test]
+    fn bootstrap_auto_unseal_leaves_presence_locked() {
+        let _guard = crate::PROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let config = DaemonConfig::for_test(tmp.path());
+        crate::trust::presence::lock();
+        // SAFETY: test-only — env mutation gated by PROCESS_TEST_LOCK above.
+        unsafe { std::env::set_var("EMBER_VAULT_PASSPHRASE", "bootstrap-auto-passphrase") };
+
+        match try_bootstrap_auto_unseal_from_keyring(&config) {
+            AutoUnsealOutcome::Unsealed(_) => {}
+            AutoUnsealOutcome::NoKeyringEntry => {
+                panic!("env passphrase should satisfy bootstrap auto-unseal")
+            }
+            AutoUnsealOutcome::Error(err) => {
+                panic!("bootstrap auto-unseal should succeed: {err}")
+            }
+        }
+
+        let (is_unlocked, idle_secs) = crate::trust::presence::snapshot();
+        assert!(
+            !is_unlocked,
+            "bootstrap auto-unseal must not look like an interactive operator unlock"
+        );
+        assert!(
+            idle_secs.is_none(),
+            "bootstrap auto-unseal must leave presence in Locked state"
+        );
+        // SAFETY: the happy path removes the env var itself; remove again so a
+        // failure above cannot leak process-global state into later tests.
+        unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
     }
 
     // --- macOS user-presence gate routing ---
@@ -2315,7 +2640,7 @@ ver = "V0x13"
         unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
     }
 
-    // --- implementation-note-229: migrate_mek_acl ---
+    // --- implementation-note-321: migrate_mek_acl ---
 
     // Serial lock: tests that mutate EMBER_VAULT_TEST_KEYRING_PRESENT must not
     // run concurrently — cargo test threads share the process environment.
@@ -2355,7 +2680,8 @@ ver = "V0x13"
         let result = migrate_mek_acl("ember-daemon-qa", "vault");
         unsafe { std::env::remove_var("EMBER_VAULT_TEST_KEYRING_PRESENT") };
 
-        let result = result.expect("migrate_mek_acl must succeed for qa service with entry present");
+        let result =
+            result.expect("migrate_mek_acl must succeed for qa service with entry present");
         assert_eq!(
             result.before_acl_kind, "system_keyring",
             "qa service: before_acl_kind must be system_keyring"
@@ -2429,7 +2755,7 @@ mod name_validation_tests {
         assert!(validate_credential_name("a/b/c/d/e/f/g").is_ok());
     }
 
-    /// implementation-note-230 Phase 1 — the v2 path grammar
+    /// implementation-note-322 Phase 1 — the v2 path grammar
     /// (design §5.3) introduces credential-type intermediate segments like
     /// `github/apps/<slug>/install-<id>/private-key` which are 5 segments
     /// deep. The previous `> 4` cap rejected these; the lifted `> 7` cap
@@ -2437,8 +2763,7 @@ mod name_validation_tests {
     #[test]
     fn validate_credential_name_accepts_five_segment_v2_path() {
         assert!(
-            validate_credential_name("github/apps/test-slug/install-12345/private-key")
-                .is_ok(),
+            validate_credential_name("github/apps/test-slug/install-12345/private-key").is_ok(),
             "5-segment v2 path should be accepted under design §5.3"
         );
     }
@@ -2446,13 +2771,10 @@ mod name_validation_tests {
     /// Partner test — 8 segments must still be rejected at the new hard cap.
     #[test]
     fn validate_credential_name_rejects_eight_segment_path() {
-        let outcome =
-            validate_credential_name("a/b/c/d/e/f/g/h");
+        let outcome = validate_credential_name("a/b/c/d/e/f/g/h");
         match outcome {
             Err(VaultNameError::TooManySegments { count }) => assert_eq!(count, 8),
-            other => panic!(
-                "expected TooManySegments {{ count: 8 }}, got {other:?}"
-            ),
+            other => panic!("expected TooManySegments {{ count: 8 }}, got {other:?}"),
         }
     }
 

@@ -11,6 +11,7 @@ publish = false
 async-trait = "0.1"
 http = "1"
 percent-encoding = "2"
+serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 zeroize = { version = "1", features = ["derive"] }
 core-types = { path = "../core-types" }

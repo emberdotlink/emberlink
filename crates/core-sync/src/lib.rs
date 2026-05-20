@@ -1,10 +1,12 @@
 use std::collections::{HashMap, HashSet};
 
 use core_crypto::{PublicKey, Signature, Verifier};
+use core_event_types::{
+    EndpointRotatedEvent, EventBody, RelayHintUpdatedEvent, RelayShutdownNoticeEvent,
+};
 use core_events::EventEnvelope;
-use core_event_types::{EndpointRotatedEvent, EventBody, RelayHintUpdatedEvent, RelayShutdownNoticeEvent};
-use core_principals::{PeerCursor, RelayAdmission, RelayMode, SyncProfile, TrustThreshold};
 use core_principals::{AdmissionToken, RelayEnvelope, SyncBatch};
+use core_principals::{PeerCursor, RelayAdmission, RelayMode, SyncProfile, TrustThreshold};
 use core_types::{Validate, ValidationError};
 use serde::{Deserialize, Serialize};
 
@@ -658,31 +660,19 @@ fn is_event_relevant_to_context(event: &EventEnvelope, context: &LightSyncContex
         EventBody::DisclosureRevoked(body) => {
             context.persona_ids.contains(&body.revoker_persona_id)
         }
-        EventBody::GrantOfferCreated(body) => {
-            context.persona_ids.contains(&body.issuer_persona_id)
-        }
+        EventBody::GrantOfferCreated(body) => context.persona_ids.contains(&body.issuer_persona_id),
         EventBody::GrantOfferClaimed(body) => {
             context.persona_ids.contains(&body.recipient_persona_id)
         }
-        EventBody::GrantOfferRevoked(body) => {
-            context.persona_ids.contains(&body.issuer_persona_id)
-        }
+        EventBody::GrantOfferRevoked(body) => context.persona_ids.contains(&body.issuer_persona_id),
         EventBody::BadgeIssued(body) => {
             context.persona_ids.contains(&body.issuer_persona_id)
                 || context.persona_ids.contains(&body.recipient_persona_id)
         }
-        EventBody::BadgeRevoked(body) => {
-            context.persona_ids.contains(&body.revoker_persona_id)
-        }
-        EventBody::BadgeDisputed(body) => {
-            context.persona_ids.contains(&body.disputer_persona_id)
-        }
-        EventBody::CredentialDeposited(body) => {
-            context.persona_ids.contains(&body.issuer_id)
-        }
-        EventBody::CredentialRevoked(body) => {
-            context.persona_ids.contains(&body.revoker_id)
-        }
+        EventBody::BadgeRevoked(body) => context.persona_ids.contains(&body.revoker_persona_id),
+        EventBody::BadgeDisputed(body) => context.persona_ids.contains(&body.disputer_persona_id),
+        EventBody::CredentialDeposited(body) => context.persona_ids.contains(&body.issuer_id),
+        EventBody::CredentialRevoked(body) => context.persona_ids.contains(&body.revoker_id),
     }
 }
 
@@ -777,9 +767,14 @@ pub fn filter_batch_by_profile(
 mod tests {
     use super::*;
     use core_crypto::{Ed25519Verifier, FixtureSigner, Signer as CryptoSigner};
+    use core_event_types::{
+        ChunkReference, ContentPublishedEvent, ContentVisibility, DeviceAddedEvent, EventType,
+        FileManifest, ManifestDeviceAccess, MessageSentEvent, RootCreatedEvent, SignerBinding,
+        StorageLedgerEntry, StorageLedgerUpdatedEvent, StorageManifestPublishedEvent,
+        StorageRelationship, StorageRelationshipCreatedEvent,
+    };
     use core_events::{EventEnvelope, EventRef};
-    use core_event_types::{ChunkReference, ContentPublishedEvent, ContentVisibility, DeviceAddedEvent, EventType, FileManifest, ManifestDeviceAccess, MessageSentEvent, RootCreatedEvent, SignerBinding, StorageLedgerEntry, StorageLedgerUpdatedEvent, StorageManifestPublishedEvent, StorageRelationship, StorageRelationshipCreatedEvent};
-    use core_principals::{PublicKeyMaterial};
+    use core_principals::PublicKeyMaterial;
 
     fn test_key(key_id: &str) -> PublicKeyMaterial {
         PublicKeyMaterial {
@@ -883,8 +878,14 @@ mod tests {
 
         assert_eq!(updated.event_type(), EventType::RelayHintUpdated);
         assert_eq!(rotated.event_type(), EventType::EndpointRotated);
-        assert_eq!(updated.subject().kind, core_event_types::SubjectKind::Endpoint);
-        assert_eq!(rotated.subject().kind, core_event_types::SubjectKind::Endpoint);
+        assert_eq!(
+            updated.subject().kind,
+            core_event_types::SubjectKind::Endpoint
+        );
+        assert_eq!(
+            rotated.subject().kind,
+            core_event_types::SubjectKind::Endpoint
+        );
     }
 
     #[test]

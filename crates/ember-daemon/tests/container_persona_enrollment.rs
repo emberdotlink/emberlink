@@ -1,4 +1,4 @@
-//! implementation-note-168 (design §"In-container
+//! implementation-note-238 (design §"In-container
 //! extension") — T2 integration tests for per-socket Persona
 //! enrollment.
 //!
@@ -29,8 +29,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use ember_daemon::infra::handler::{
-    dispatch_method_with_context, enroll_container_persona, EnrolledPrincipal, HandlerError,
-    RequestContext,
+    EnrolledPrincipal, HandlerError, PeerCred, RequestContext, dispatch_method_with_context,
+    enroll_container_persona,
 };
 use ember_daemon::infra::rate_limit::RateLimiter;
 use ember_daemon::infra::receipt::init_identity;
@@ -71,9 +71,21 @@ fn ensure_test_identity() -> tempfile::TempDir {
 
 /// Build a `RequestContext` from a per-agent socket path so the
 /// dispatch layer takes the enrolled-principal branch.
+// container_persona_enrollment_tests_green_sentinel
+// (implementation-note-235):
+// Use `RequestContext::socket_for_test(peer)` to get a ctx with a
+// synthetic presence_token bound to `peer.uid`. The cfg(test)
+// synthesis in `RequestContext::socket` is unreachable from
+// integration tests in `tests/` by Rust language semantics —
+// `socket_for_test` is the pub helper that mints the same stub-
+// signed presence_token without the cfg(test) gate.
 fn ctx_for_per_agent_socket(socket_path: PathBuf) -> RequestContext {
     let principal = PeerCredPrincipal::new(1001, 12345, socket_path);
-    RequestContext::socket(None).with_peer_cred_principal(Some(principal))
+    let peer = PeerCred {
+        uid: 1001,
+        pid: Some(12345),
+    };
+    RequestContext::socket_for_test(peer).with_peer_cred_principal(Some(principal))
 }
 
 // ---------------------------------------------------------------------------
@@ -134,6 +146,9 @@ async fn test_rpc_on_agent_socket_uses_enrollment_not_wire() {
             &persona_p.id,
             &parent_grant.id,
             "blake3:test-brief-hash-aaaa",
+            None,
+            None,
+            None,
         )
         .expect("record enrollment");
 
@@ -194,17 +209,9 @@ async fn test_rpc_on_unenrolled_socket_refused() {
 
     // Use a low-risk method (`ping`) so the test isolates the
     // enrollment gate from downstream handler logic.
-    let result = dispatch_method_with_context(
-        &store,
-        &vault,
-        &policy,
-        &rl,
-        None,
-        ctx,
-        "ping",
-        &json!({}),
-    )
-    .await;
+    let result =
+        dispatch_method_with_context(&store, &vault, &policy, &rl, None, ctx, "ping", &json!({}))
+            .await;
 
     let (code, msg) = result.expect_err("RPC on unenrolled per-agent socket must refuse");
     assert_eq!(
@@ -261,6 +268,9 @@ async fn test_worker_b_cannot_impersonate_orchestrator() {
             &orchestrator.id,
             &orch_grant.id,
             "blake3:orchestrator-brief",
+            None,
+            None,
+            None,
         )
         .expect("enroll O");
     store
@@ -269,6 +279,9 @@ async fn test_worker_b_cannot_impersonate_orchestrator() {
             &worker_b.id,
             &_b_grant.id,
             "blake3:worker-b-brief",
+            None,
+            None,
+            None,
         )
         .expect("enroll B");
 
@@ -329,7 +342,9 @@ async fn test_revoked_enrollment_refuses_rpcs() {
     let rl = test_rl();
     let vault = test_vault();
 
-    let persona = store.create_persona("persona-revoked").expect("create persona");
+    let persona = store
+        .create_persona("persona-revoked")
+        .expect("create persona");
     let grant = store
         .create_grant(&persona.id, "test-cred", "read", Some(3600))
         .expect("create grant");
@@ -342,17 +357,23 @@ async fn test_revoked_enrollment_refuses_rpcs() {
             &persona.id,
             &grant.id,
             "blake3:revoked-brief",
+            None,
+            None,
+            None,
         )
         .expect("record enrollment");
 
     // Sanity: the helper resolves before revoke.
-    let resolved = enroll_container_persona(&store, &socket_path)
-        .expect("enrollment resolves before revoke");
-    assert_eq!(resolved, EnrolledPrincipal {
-        persona_id: persona.id.clone(),
-        grant_id: grant.id.clone(),
-        brief_content_hash: "blake3:revoked-brief".to_string(),
-    });
+    let resolved =
+        enroll_container_persona(&store, &socket_path).expect("enrollment resolves before revoke");
+    assert_eq!(
+        resolved,
+        EnrolledPrincipal {
+            persona_id: persona.id.clone(),
+            grant_id: grant.id.clone(),
+            brief_content_hash: "blake3:revoked-brief".to_string(),
+        }
+    );
 
     // Revoke the enrollment.
     store
@@ -366,17 +387,9 @@ async fn test_revoked_enrollment_refuses_rpcs() {
 
     // After revoke, dispatch refuses RPCs on the socket.
     let ctx = ctx_for_per_agent_socket(socket_path.clone());
-    let result = dispatch_method_with_context(
-        &store,
-        &vault,
-        &policy,
-        &rl,
-        None,
-        ctx,
-        "ping",
-        &json!({}),
-    )
-    .await;
+    let result =
+        dispatch_method_with_context(&store, &vault, &policy, &rl, None, ctx, "ping", &json!({}))
+            .await;
     let (code, msg) = result.expect_err("RPC on revoked socket must refuse");
     assert_eq!(
         code,

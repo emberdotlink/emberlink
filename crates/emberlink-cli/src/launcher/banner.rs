@@ -188,10 +188,10 @@ pub fn detect_install_posture() -> InstallPosture {
 /// Return the current user's login name, or `None` on failure.
 fn current_username() -> Option<String> {
     // $USER is the most portable and avoids a process spawn.
-    if let Ok(u) = std::env::var("USER") {
-        if !u.is_empty() {
-            return Some(u);
-        }
+    if let Ok(u) = std::env::var("USER")
+        && !u.is_empty()
+    {
+        return Some(u);
     }
     // Fallback: spawn whoami.
     let out = Command::new("whoami").output().ok()?;
@@ -292,9 +292,7 @@ fn detect_posture_via_ps() -> Option<InstallPosture> {
     if !ps_out.status.success() {
         return None;
     }
-    let daemon_user = String::from_utf8_lossy(&ps_out.stdout)
-        .trim()
-        .to_string();
+    let daemon_user = String::from_utf8_lossy(&ps_out.stdout).trim().to_string();
     if daemon_user.is_empty() {
         return None;
     }
@@ -509,7 +507,10 @@ mod tests {
             s.contains("uid=ember (kernel-isolated from agent)"),
             "SeparateUid banner must contain posture label"
         );
-        assert!(s.contains("design"), "SeparateUid banner must reference design");
+        assert!(
+            s.contains("design"),
+            "SeparateUid banner must reference design"
+        );
         let loaded = LauncherState::load(&state_path);
         assert!(loaded.is_acknowledged("ember-claude-code", "v0.3.0"));
     }
@@ -531,7 +532,10 @@ mod tests {
         .unwrap();
         assert!(rendered);
         let s = String::from_utf8(out).unwrap();
-        assert!(s.contains("dev-mode; relaxed threat model"), "SingleUid banner must contain posture label");
+        assert!(
+            s.contains("dev-mode; relaxed threat model"),
+            "SingleUid banner must contain posture label"
+        );
         assert!(s.contains("SINGLE-UID"));
         assert!(s.contains("design"));
         // State written + key marked.
@@ -587,10 +591,10 @@ mod tests {
         assert!(!rendered);
         assert!(out.is_empty());
         // Crucially: NOT acknowledged — next run without --no-banner shows it.
-        assert!(!state_path.exists() || !LauncherState::load(&state_path).is_acknowledged(
-            "ember-claude-code",
-            "v0.3.0"
-        ));
+        assert!(
+            !state_path.exists()
+                || !LauncherState::load(&state_path).is_acknowledged("ember-claude-code", "v0.3.0")
+        );
     }
 
     #[test]
@@ -667,7 +671,10 @@ mod tests {
             copy.contains("uid=ember (kernel-isolated from agent)"),
             "SeparateUid copy must identify posture"
         );
-        assert!(!copy.contains("relaxed threat model"), "SeparateUid copy must not show dev-mode warning");
+        assert!(
+            !copy.contains("relaxed threat model"),
+            "SeparateUid copy must not show dev-mode warning"
+        );
     }
 
     #[test]
@@ -677,7 +684,10 @@ mod tests {
             copy.contains("dev-mode; relaxed threat model"),
             "SingleUid copy must identify posture"
         );
-        assert!(!copy.contains("uid=ember (kernel-isolated from agent)"), "SingleUid copy must not show production posture label");
+        assert!(
+            !copy.contains("uid=ember (kernel-isolated from agent)"),
+            "SingleUid copy must not show production posture label"
+        );
     }
 
     #[test]

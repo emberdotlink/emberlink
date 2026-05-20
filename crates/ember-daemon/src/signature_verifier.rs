@@ -116,10 +116,10 @@ pub fn verify_construct_signature(
         .unwrap_or(&sidecar.blake3)
         .to_string();
     let cache_key: CacheKey = (blake3_hex_only.clone(), trust_graph_version);
-    if let Ok(g) = cache.inner.read() {
-        if g.contains_key(&cache_key) {
-            return Ok(());
-        }
+    if let Ok(g) = cache.inner.read()
+        && g.contains_key(&cache_key)
+    {
+        return Ok(());
     }
 
     // Step 3 — re-compute blake3.
@@ -151,10 +151,11 @@ pub fn verify_construct_signature(
         "publisher_did": sidecar.publisher_did,
         "version": sidecar.version,
     });
-    let canonical_bytes = core_crypto::canonicalize_jcs(&canonical_payload_value)
-        .map_err(|e| VerifyError::SignatureInvalid {
+    let canonical_bytes = core_crypto::canonicalize_jcs(&canonical_payload_value).map_err(|e| {
+        VerifyError::SignatureInvalid {
             reason: format!("jcs: {e}"),
-        })?;
+        }
+    })?;
 
     let sig_b64 = sidecar
         .signature
@@ -163,12 +164,12 @@ pub fn verify_construct_signature(
     let sig_bytes = base64::engine::general_purpose::STANDARD
         .decode(sig_b64)
         .map_err(|e| VerifyError::Base64(e.to_string()))?;
-    let sig = ed25519_dalek::Signature::from_slice(&sig_bytes)
-        .map_err(|e| VerifyError::SignatureInvalid {
+    let sig = ed25519_dalek::Signature::from_slice(&sig_bytes).map_err(|e| {
+        VerifyError::SignatureInvalid {
             reason: format!("sig parse: {e}"),
-        })?;
+        }
+    })?;
 
-    use ed25519_dalek::Verifier as _;
     publisher_key
         .pubkey
         .verify_strict(&canonical_bytes, &sig)
@@ -214,8 +215,7 @@ mod tests {
         });
         let canonical_bytes = core_crypto::canonicalize_jcs(&payload_value).unwrap();
         let signature = signing_key.sign(&canonical_bytes);
-        let sig_b64 =
-            base64::engine::general_purpose::STANDARD.encode(signature.to_bytes());
+        let sig_b64 = base64::engine::general_purpose::STANDARD.encode(signature.to_bytes());
         let signature_field = format!("ed25519:{sig_b64}");
 
         let sidecar = SidecarEnvelope {
@@ -284,9 +284,11 @@ mod tests {
             "publisher_did": sidecar.publisher_did,
             "version": sidecar.version,
         });
-        let canonical_bytes = core_crypto::canonicalize_jcs(&canonical_payload_value)
-            .map_err(|e| VerifyError::SignatureInvalid {
-                reason: format!("jcs: {e}"),
+        let canonical_bytes =
+            core_crypto::canonicalize_jcs(&canonical_payload_value).map_err(|e| {
+                VerifyError::SignatureInvalid {
+                    reason: format!("jcs: {e}"),
+                }
             })?;
 
         let sig_b64 = sidecar
@@ -302,11 +304,11 @@ mod tests {
             }
         })?;
 
-        pubkey
-            .verify_strict(&canonical_bytes, &sig)
-            .map_err(|e| VerifyError::SignatureInvalid {
+        pubkey.verify_strict(&canonical_bytes, &sig).map_err(|e| {
+            VerifyError::SignatureInvalid {
                 reason: format!("ed25519 verify: {e}"),
-            })?;
+            }
+        })?;
 
         if let Ok(mut g) = cache.inner.write() {
             g.insert(cache_key, ());
@@ -379,8 +381,7 @@ mod tests {
         // Pass different binary bytes — the blake3 won't match.
         let tampered_binary = b"tampered-binary-content";
         let cache = VerifierCache::new();
-        let result =
-            verify_construct_signature(&sidecar, tampered_binary, &toml_bytes, &cache, 1);
+        let result = verify_construct_signature(&sidecar, tampered_binary, &toml_bytes, &cache, 1);
         match result {
             Err(VerifyError::BinaryPinMismatch { .. }) => {}
             other => panic!("expected BinaryPinMismatch, got {other:?}"),
@@ -408,11 +409,14 @@ mod tests {
         // Second call with tampered binary — would normally fail blake3, but
         // cache hit returns Ok before reaching the crypto path.
         let tampered_binary = b"completely-different-bytes";
-        let result =
-            verify_with_stub_pubkey(&sidecar, tampered_binary, &toml_bytes, verifying_key, &cache, 1);
-        assert!(
-            result.is_ok(),
-            "cache hit must short-circuit: {result:?}"
+        let result = verify_with_stub_pubkey(
+            &sidecar,
+            tampered_binary,
+            &toml_bytes,
+            verifying_key,
+            &cache,
+            1,
         );
+        assert!(result.is_ok(), "cache hit must short-circuit: {result:?}");
     }
 }

@@ -17,3 +17,12 @@ rustls-pemfile = "2"
 rcgen = "0.14"
 tungstenite = "0.29"
 webpki-roots = "1.0"
+
+# Dev-only deps for the design §2.b JWKS endpoint integration tests in
+# `tests/relay_integration.rs`. base64 decodes the JWKS `x` field for
+# the EIC-pod-auth round-trip check; ed25519-dalek + serde_json build the
+# fixture DID and parse the relay's JSON response.
+[dev-dependencies]
+base64 = "0.22"
+ed25519-dalek = "2.1.1"
+serde_json = "1"

@@ -1,9 +1,9 @@
-//! `ember demo seed` — **implementation-note-297** synthetic Grant-Receipt seeder.
+//! `ember demo seed` — **implementation-note-418** synthetic Grant-Receipt seeder.
 //!
 //! For the SCION 2026-05-15 Beat 8 close, `ember receipt tree --grant <id>`
 //! needs at least a few receipts on the chain to render. The production
 //! spawn flow does not yet emit receipts at every step (filed as
-//! implementation-note-298 and related per-call-receipt
+//! implementation-note-94 and related per-call-receipt
 //! tasks). Until those land, this verb mints synthetic Grant Receipts onto
 //! an existing grant chain so the demo has artifacts to display.
 //!
@@ -17,10 +17,10 @@
 //! audit data; that's exactly the lie the Grant Warden product exists to
 //! prevent.
 
-use ember_daemon::infra::config::DaemonConfig;
-use ember_daemon::infra::receipt::{emit_receipt, DaemonPersona};
-use ember_daemon::infra::store::DaemonStore;
 use core_grant_types::grant_receipt::TerminalReason;
+use ember_daemon::infra::config::DaemonConfig;
+use ember_daemon::infra::receipt::{DaemonPersona, emit_receipt};
+use ember_daemon::infra::store::DaemonStore;
 
 /// Errors raised by `ember demo seed`.
 #[derive(Debug)]

@@ -2,7 +2,7 @@
 //!
 //! H1 invariant (cohort-A test plan): every grant terminates in a signed
 //! Receipt across all four termination paths. Coverage post-M3 follow-up
-//! (implementation-note-241, v2_receipt_coverage_audit_v030_2026_05_09):
+//! (implementation-note-337, v2_receipt_coverage_audit_v030_2026_05_09):
 //!
 //! | Path               | Location                                | TerminationReason |
 //! |--------------------|----------------------------------------|-------------------|
@@ -54,7 +54,10 @@ use core_state::sessions::{SessionMeta, SessionStore};
 use thiserror::Error;
 use tracing::warn;
 
-use crate::infra::receipt::{current_identity, issue::{issue_cohort_a_receipt, TerminationMeta}, DaemonPersona};
+use crate::infra::receipt::{
+    DaemonPersona, current_identity,
+    issue::{TerminationMeta, issue_cohort_a_receipt},
+};
 use crate::infra::store::{DaemonStore, StoreError};
 
 #[derive(Debug, Error)]
@@ -103,7 +106,7 @@ impl<'a> Signer for DaemonPersonaSigner<'a> {
         // `DaemonPersona::sign` returns the raw 64-byte signature; the
         // `core_crypto::Signature` wire form is `ed25519sig:<128-hex>`.
         let raw = self.persona.sign(payload);
-        Signature(format!("ed25519sig:{}", hex::encode(&*raw)))
+        Signature(format!("ed25519sig:{}", hex::encode(*raw)))
     }
 
     fn public_key(&self) -> PublicKey {
@@ -161,6 +164,7 @@ pub fn transition_to_terminated_dirty_at(
     session_store
         .close(&session.session_id)
         .map_err(LifecycleError::Close)?;
+    let _ = crate::infra::interactive_unlock::release_session_pin(&session.session_id);
 
     // 4. Revoke broker grant — reuses clean-exit path, which emits the v1
     //    grant Receipt + cascades to children.

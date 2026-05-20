@@ -1,5 +1,5 @@
 //! `ember init --for claude-code` and `ember uninstall --for claude-code`
-//! orchestration (implementation-note-271).
+//! orchestration (implementation-note-387).
 //!
 //! Per design §2 / §3: a one-command first-run setup that wires Claude Code
 //! to the local ember daemon. This module is the orchestration layer — the
@@ -30,7 +30,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use crate::onboarding::settings_patch::{
-    add_pretooluse_hook, has_pretooluse_hook, remove_pretooluse_hook, PatchError,
+    PatchError, add_pretooluse_hook, has_pretooluse_hook, remove_pretooluse_hook,
 };
 
 /// Default 24-hour grant TTL per design §3.
@@ -73,28 +73,21 @@ pub fn default_settings_json_path() -> Result<PathBuf, InitError> {
     Ok(home_dir()?.join(".claude").join("settings.json"))
 }
 
-/// Compute the default persona name for cohort A: `claude-code-{hostname}`.
-/// Falls back to `claude-code-localhost` if the hostname can't be resolved.
+/// Compute the default persona name for cohort A in the locked 2-slot
+/// Persona schema (CONTEXT.md "Identity surface" §Persona ID schema):
+/// `claude-code-<context>` via [`crate::launcher::default_persona_id_for_runtime`].
+///
+/// The `<context>` slot resolves to the worktree directory name when the
+/// caller passed one (future `-w` flag); without context, it falls back
+/// to `default`. This drops the prior hostname-keyed default — multi-host
+/// users who relied on per-host persona separation must now set
+/// `EMBER_PERSONA` explicitly or pass `-w <name>` to the launcher.
+///
+/// implementation-note-433 anchor: routes
+/// through `default_persona_id_for_runtime` so launcher + init agree on
+/// the same persona-id shape.
 pub fn claude_code_persona_name() -> String {
-    let raw = current_hostname().unwrap_or_else(|| "localhost".to_string());
-    // Sanitize: lowercase, keep `[a-z0-9-]`, collapse runs of other chars
-    // into `-`. Personas are user-visible, so a clean slug is friendlier.
-    let mut slug = String::with_capacity(raw.len());
-    for ch in raw.chars() {
-        let lc = ch.to_ascii_lowercase();
-        if lc.is_ascii_alphanumeric() || lc == '-' {
-            slug.push(lc);
-        } else if !slug.ends_with('-') && !slug.is_empty() {
-            slug.push('-');
-        }
-    }
-    let trimmed = slug.trim_matches('-');
-    let final_slug = if trimmed.is_empty() {
-        "localhost"
-    } else {
-        trimmed
-    };
-    format!("claude-code-{final_slug}")
+    crate::launcher::default_persona_id_for_runtime("claude-code", None)
 }
 
 /// Resolve the user's home directory. Wraps `dirs_next::home_dir`.
@@ -104,28 +97,6 @@ fn home_dir() -> Result<PathBuf, InitError> {
 
 /// Best-effort hostname resolution. Returns `None` if the platform call
 /// fails or the result isn't valid UTF-8. Intentionally permissive — the
-/// caller has a fallback.
-fn current_hostname() -> Option<String> {
-    // libc's gethostname is portable; we keep this dep-free by reading
-    // the `HOSTNAME` env var first (set on most shells) and falling back
-    // to `uname -n` via `nix`-style direct syscall through `std`. Since
-    // we don't have `hostname` in deps, env-var-only is acceptable.
-    if let Ok(h) = std::env::var("HOSTNAME")
-        && !h.is_empty()
-    {
-        return Some(h);
-    }
-    // Try `nodename` from `uname -n` shape — the `command -v hostname`
-    // shell-out is intentionally avoided (we'd just return None and use
-    // the fallback). On macOS / Linux, `HOST` is sometimes set instead.
-    if let Ok(h) = std::env::var("HOST")
-        && !h.is_empty()
-    {
-        return Some(h);
-    }
-    None
-}
-
 /// Write the grant scope template to `~/.ember/grant-template.toml` if
 /// missing. Returns `true` on a fresh write, `false` if the file already
 /// existed (idempotent path).
@@ -240,10 +211,10 @@ pub fn print_next_commands() {
 /// Stub limitation per the brief: today the user pastes the value
 /// directly. A future revision can shell out to `gh auth token` in-process
 /// and pipe the bytes — but that requires a `Command::output()` call with
-/// careful buffer handling, which we defer to keep the implementation-note-290 surface
+/// careful buffer handling, which we defer to keep the implementation-note-410 surface
 /// minimal. The `ember vault add --stdin` path is the same shape.
 ///
-/// implementation-note-306: reframed to position the broker's
+/// implementation-note-435: reframed to position the broker's
 /// GH App installation token minting as the default path, with PAT as the
 /// emergency fallback. The default behavior on Enter is unchanged (skip; no
 /// PAT stored). `ember gh-app install` is referenced as the recommended next
@@ -283,7 +254,7 @@ pub fn prompt_for_gh_pat(stdin_is_terminal: bool) -> io::Result<Option<String>> 
 /// daemon is running and ready.
 ///
 /// Used by `cmd_init_for_claude_code` to decide whether to autostart the
-/// daemon before opening the vault (implementation-note-285).
+/// daemon before opening the vault (implementation-note-403).
 /// The socket file is created by the daemon on bind and removed on clean
 /// shutdown, so its presence is a reliable liveness indicator.
 pub fn daemon_socket_exists(socket_path: &std::path::Path) -> bool {
@@ -293,7 +264,7 @@ pub fn daemon_socket_exists(socket_path: &std::path::Path) -> bool {
 /// Decide whether the autostart path should install a LaunchAgent / systemd
 /// user unit, or fall back to a raw `--background` daemon spawn.
 ///
-/// implementation-note-284: the LaunchAgent / systemd-user
+/// implementation-note-402: the LaunchAgent / systemd-user
 /// path is correct for the canonical "production user" install (single
 /// always-up daemon per login session) — but it baked an absolute `~/.ember/`
 /// path resolved against the operator's *real* HOME at install time, so an
@@ -333,7 +304,7 @@ pub fn should_use_launch_agent(home: &std::path::Path, config: Option<&std::path
 
 /// Resolve the autostart liveness-wait timeout in seconds. Honors the
 /// `EMBER_DAEMON_AUTOSTART_TIMEOUT_SECS` env override; falls back to a
-/// 10s default (raised from 5s in implementation-note-284
+/// 10s default (raised from 5s in implementation-note-402
 /// because first-time provisioning — vault.salt + daemon.db schema — can
 /// exceed 5s on slow disks).
 pub fn autostart_liveness_timeout_secs() -> u64 {
@@ -367,30 +338,16 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn persona_name_uses_hostname_when_set() {
-        let prev = std::env::var("HOSTNAME").ok();
-        // Safety: tests run single-threaded under cargo's default harness for
-        // this isolated env mutation; the value is restored at end-of-test.
-        unsafe { std::env::set_var("HOSTNAME", "alice-laptop") };
+    fn persona_name_uses_2_slot_default_shape() {
+        // implementation-note-433: the default
+        // persona now follows the locked 2-slot Persona schema
+        // (CONTEXT.md "Identity surface" §Persona ID schema) —
+        // `claude-code-<context>` where `<context>` is `default` until
+        // the `-w` flag wires worktree-dir-name through. Hostname keying
+        // is gone; multi-host users who relied on per-host separation
+        // must set EMBER_PERSONA explicitly.
         let name = claude_code_persona_name();
-        match prev {
-            Some(v) => unsafe { std::env::set_var("HOSTNAME", v) },
-            None => unsafe { std::env::remove_var("HOSTNAME") },
-        }
-        assert_eq!(name, "claude-code-alice-laptop");
-    }
-
-    #[test]
-    fn persona_name_sanitizes_special_chars() {
-        let prev = std::env::var("HOSTNAME").ok();
-        unsafe { std::env::set_var("HOSTNAME", "Alice.M1.local") };
-        let name = claude_code_persona_name();
-        match prev {
-            Some(v) => unsafe { std::env::set_var("HOSTNAME", v) },
-            None => unsafe { std::env::remove_var("HOSTNAME") },
-        }
-        // Dots collapse into a single dash; case lowered.
-        assert_eq!(name, "claude-code-alice-m1-local");
+        assert_eq!(name, "claude-code-default");
     }
 
     #[test]
@@ -491,10 +448,7 @@ mod tests {
         let pretooluse = v.pointer("/hooks/PreToolUse").unwrap().as_array().unwrap();
         assert_eq!(pretooluse.len(), 1);
         assert_eq!(
-            pretooluse[0]
-                .pointer("/hooks/0/command")
-                .unwrap()
-                .as_str(),
+            pretooluse[0].pointer("/hooks/0/command").unwrap().as_str(),
             Some("/usr/local/bin/my-hook")
         );
     }
@@ -534,7 +488,7 @@ mod tests {
         assert!(result.is_none());
     }
 
-    /// implementation-note-306: the reframed prompt must
+    /// implementation-note-435: the reframed prompt must
     /// position skip as the RECOMMENDED default and reference the GH App
     /// install path. This test validates the prompt text by capturing the
     /// function source directly (the actual eprintln output goes to stderr
@@ -549,7 +503,7 @@ mod tests {
         // future edits.
         let src = include_str!("claude_code.rs");
         assert!(
-            src.contains("implementation-note-306"),
+            src.contains("implementation-note-435"),
             "checkpoint must be present in source"
         );
         assert!(
@@ -570,7 +524,7 @@ mod tests {
         );
     }
 
-    // ── implementation-note-285 tests ───────────────────────
+    // ── implementation-note-403 tests ───────────────────────
 
     /// daemon_socket_exists returns true when the socket file is present.
     /// This mirrors the liveness probe used by cmd_init_for_claude_code to
@@ -613,7 +567,7 @@ mod tests {
         unimplemented!("run manually: ember daemon stop && ember init --for claude-code")
     }
 
-    // ── implementation-note-284 tests ───────────────────────
+    // ── implementation-note-402 tests ───────────────────────
 
     /// LaunchAgent/systemd path is appropriate for a default user HOME with
     /// no --config override.
@@ -661,7 +615,15 @@ mod tests {
     /// Default timeout is 10s when the env override is unset or invalid.
     #[test]
     fn autostart_liveness_timeout_default_is_10() {
+        // Serialize against the other EMBER_DAEMON_AUTOSTART_TIMEOUT_SECS-
+        // mutating test below; cargo's parallel runner would otherwise
+        // interleave set/remove and produce test-order-dependent failures.
+        let _g = crate::EMBER_DAEMON_AUTOSTART_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("EMBER_DAEMON_AUTOSTART_TIMEOUT_SECS").ok();
+        // SAFETY: holds the test lock for the duration of the env
+        // mutation; restored before return.
         unsafe { std::env::remove_var("EMBER_DAEMON_AUTOSTART_TIMEOUT_SECS") };
         let secs = autostart_liveness_timeout_secs();
         if let Some(v) = prev {
@@ -673,13 +635,18 @@ mod tests {
     /// Env override is honored when it parses as a positive integer.
     #[test]
     fn autostart_liveness_timeout_honors_env() {
+        // Serialize against the other EMBER_DAEMON_AUTOSTART_TIMEOUT_SECS-
+        // mutating test above; same rationale.
+        let _g = crate::EMBER_DAEMON_AUTOSTART_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("EMBER_DAEMON_AUTOSTART_TIMEOUT_SECS").ok();
+        // SAFETY: holds the test lock for the duration of the env
+        // mutation; restored before return.
         unsafe { std::env::set_var("EMBER_DAEMON_AUTOSTART_TIMEOUT_SECS", "30") };
         let secs = autostart_liveness_timeout_secs();
         match prev {
-            Some(v) => unsafe {
-                std::env::set_var("EMBER_DAEMON_AUTOSTART_TIMEOUT_SECS", v)
-            },
+            Some(v) => unsafe { std::env::set_var("EMBER_DAEMON_AUTOSTART_TIMEOUT_SECS", v) },
             None => unsafe { std::env::remove_var("EMBER_DAEMON_AUTOSTART_TIMEOUT_SECS") },
         }
         assert_eq!(secs, 30);

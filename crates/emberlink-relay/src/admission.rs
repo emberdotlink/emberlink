@@ -96,8 +96,7 @@ pub fn gate(
     // is permissive for the scaffold — it accepts any auth-header value
     // including None, matching the relay's current open-mode behaviour).
     let _ = auth_header;
-    let persona = persona_header
-        .ok_or_else(|| AdmissionError::PersonaForbidden(String::new()))?;
+    let persona = persona_header.ok_or_else(|| AdmissionError::PersonaForbidden(String::new()))?;
     if persona.trim().is_empty() {
         return Err(AdmissionError::PersonaForbidden(persona.to_string()));
     }

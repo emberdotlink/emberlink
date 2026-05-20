@@ -33,7 +33,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use ember_broker::github_app::GhAppCredentials;
 
 /// Filename inside `~/.config/emberlink/` containing `EMBER_ENGINE_APP_ID`
@@ -122,24 +122,19 @@ pub fn load_with_paths(
         return Ok(None);
     }
 
-    let env_contents = fs::read_to_string(env_path)
-        .with_context(|| format!("reading {}", env_path.display()))?;
-    let app_id = parse_env_var(&env_contents, KEY_APP_ID).ok_or_else(|| {
+    let env_contents =
+        fs::read_to_string(env_path).with_context(|| format!("reading {}", env_path.display()))?;
+    let app_id = parse_env_var(&env_contents, KEY_APP_ID)
+        .ok_or_else(|| anyhow!("{} present but missing {KEY_APP_ID}", env_path.display()))?;
+    let installation_id = parse_env_var(&env_contents, KEY_INSTALLATION_ID).ok_or_else(|| {
         anyhow!(
-            "{} present but missing {KEY_APP_ID}",
+            "{} present but missing {KEY_INSTALLATION_ID}",
             env_path.display()
         )
     })?;
-    let installation_id =
-        parse_env_var(&env_contents, KEY_INSTALLATION_ID).ok_or_else(|| {
-            anyhow!(
-                "{} present but missing {KEY_INSTALLATION_ID}",
-                env_path.display()
-            )
-        })?;
 
-    let private_key_pem = fs::read_to_string(pem_path)
-        .with_context(|| format!("reading {}", pem_path.display()))?;
+    let private_key_pem =
+        fs::read_to_string(pem_path).with_context(|| format!("reading {}", pem_path.display()))?;
 
     if private_key_pem.trim().is_empty() {
         return Err(anyhow!(
@@ -177,7 +172,7 @@ const PURPOSE_INSTALLATION_ID: &str = "installation-id";
 /// finds. Single-installation deployments therefore behave identically
 /// to the legacy flat-key reader; multi-installation deployments will
 /// pin to a specific slug+install via a later config knob (out of
-/// scope here — see implementation-note-93).
+/// scope here — see implementation-note-116).
 ///
 /// Returns:
 /// - `Ok(Some(creds))` when a complete triple is present.
@@ -202,9 +197,11 @@ pub async fn github_config_from_store(
         key: &str,
     ) -> Result<Option<String>, StoreError> {
         match store.get(key).await {
-            Ok(bytes) => Ok(Some(String::from_utf8(bytes).map_err(|e| {
-                StoreError::Other(format!("non-utf8 in {}: {e}", key))
-            })?)),
+            Ok(bytes) => {
+                Ok(Some(String::from_utf8(bytes).map_err(|e| {
+                    StoreError::Other(format!("non-utf8 in {}: {e}", key))
+                })?))
+            }
             Err(StoreError::NotFound(_)) => Ok(None),
             Err(other) => Err(other),
         }
@@ -265,8 +262,7 @@ pub async fn github_config_from_store(
 
         let pk_key = format!("{STORE_PREFIX_GITHUB_APPS}{triple_key}/{PURPOSE_PRIVATE_KEY}");
         let app_key = format!("{STORE_PREFIX_GITHUB_APPS}{triple_key}/{PURPOSE_APP_ID}");
-        let inst_key =
-            format!("{STORE_PREFIX_GITHUB_APPS}{triple_key}/{PURPOSE_INSTALLATION_ID}");
+        let inst_key = format!("{STORE_PREFIX_GITHUB_APPS}{triple_key}/{PURPOSE_INSTALLATION_ID}");
 
         let private_key_pem = get_opt(store, &pk_key).await?.ok_or_else(|| {
             StoreError::Other(format!("{pk_key}: present in list() but missing on get()"))
@@ -354,7 +350,10 @@ mod tests {
     #[test]
     fn parse_env_var_returns_first_match() {
         let env = "EMBER_ENGINE_APP_ID=12345\nEMBER_ENGINE_INSTALLATION_ID=67890\n";
-        assert_eq!(parse_env_var(env, "EMBER_ENGINE_APP_ID"), Some("12345".to_string()));
+        assert_eq!(
+            parse_env_var(env, "EMBER_ENGINE_APP_ID"),
+            Some("12345".to_string())
+        );
         assert_eq!(
             parse_env_var(env, "EMBER_ENGINE_INSTALLATION_ID"),
             Some("67890".to_string())
@@ -366,7 +365,10 @@ mod tests {
         let env = r#"EMBER_ENGINE_APP_ID="12345"
 EMBER_ENGINE_INSTALLATION_ID='67890'
 "#;
-        assert_eq!(parse_env_var(env, "EMBER_ENGINE_APP_ID"), Some("12345".to_string()));
+        assert_eq!(
+            parse_env_var(env, "EMBER_ENGINE_APP_ID"),
+            Some("12345".to_string())
+        );
         assert_eq!(
             parse_env_var(env, "EMBER_ENGINE_INSTALLATION_ID"),
             Some("67890".to_string())
@@ -376,7 +378,10 @@ EMBER_ENGINE_INSTALLATION_ID='67890'
     #[test]
     fn parse_env_var_skips_comments_and_blanks() {
         let env = "\n# comment\n\nEMBER_ENGINE_APP_ID=42\n";
-        assert_eq!(parse_env_var(env, "EMBER_ENGINE_APP_ID"), Some("42".to_string()));
+        assert_eq!(
+            parse_env_var(env, "EMBER_ENGINE_APP_ID"),
+            Some("42".to_string())
+        );
     }
 
     #[test]
@@ -415,7 +420,9 @@ EMBER_ENGINE_INSTALLATION_ID='67890'
             "EMBER_ENGINE_APP_ID=12345\nEMBER_ENGINE_INSTALLATION_ID=67890\n",
         );
         write(&tmp.path().join(PEM_FILENAME), PEM_FAKE);
-        let result = load_from_dir(tmp.path()).expect("load must succeed").expect("creds present");
+        let result = load_from_dir(tmp.path())
+            .expect("load must succeed")
+            .expect("creds present");
         assert_eq!(result.app_id, "12345");
         assert_eq!(result.installation_id, "67890");
         assert!(result.private_key_pem.contains("BEGIN PRIVATE KEY"));
@@ -434,13 +441,19 @@ EMBER_ENGINE_INSTALLATION_ID='67890'
             Ok(_) => panic!("expected Err, got Ok"),
         };
         let msg = format!("{err:#}");
-        assert!(msg.contains("EMBER_ENGINE_APP_ID"), "error must name the missing key: {msg}");
+        assert!(
+            msg.contains("EMBER_ENGINE_APP_ID"),
+            "error must name the missing key: {msg}"
+        );
     }
 
     #[test]
     fn load_from_dir_env_missing_installation_id_is_error() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        write(&tmp.path().join(ENV_FILENAME), "EMBER_ENGINE_APP_ID=12345\n");
+        write(
+            &tmp.path().join(ENV_FILENAME),
+            "EMBER_ENGINE_APP_ID=12345\n",
+        );
         write(&tmp.path().join(PEM_FILENAME), PEM_TRUNCATED);
         let err = match load_from_dir(tmp.path()) {
             Err(e) => e,
@@ -475,8 +488,8 @@ EMBER_ENGINE_INSTALLATION_ID='67890'
     /// github/apps/<slug>/install-<id>/{private-key,app-id,installation-id}".
     #[tokio::test]
     async fn github_config_from_store_reads_adr_099_grammar() {
-        use crate::infra::credential_store::test_helpers::MockCredentialStore;
         use crate::infra::credential_store::CredentialStore;
+        use crate::infra::credential_store::test_helpers::MockCredentialStore;
 
         let mock = MockCredentialStore::new();
         mock.put(
@@ -488,12 +501,9 @@ EMBER_ENGINE_INSTALLATION_ID='67890'
         mock.put("github/apps/test-app/install-42/app-id", b"12345")
             .await
             .unwrap();
-        mock.put(
-            "github/apps/test-app/install-42/installation-id",
-            b"42",
-        )
-        .await
-        .unwrap();
+        mock.put("github/apps/test-app/install-42/installation-id", b"42")
+            .await
+            .unwrap();
 
         let result = github_config_from_store(&mock).await.unwrap();
         let creds = result.expect("credentials should be present");
@@ -523,8 +533,8 @@ EMBER_ENGINE_INSTALLATION_ID='67890'
     /// fat-fingered one leaf.
     #[tokio::test]
     async fn github_config_from_store_partial_triple_is_err() {
-        use crate::infra::credential_store::test_helpers::MockCredentialStore;
         use crate::infra::credential_store::CredentialStore;
+        use crate::infra::credential_store::test_helpers::MockCredentialStore;
 
         let mock = MockCredentialStore::new();
         mock.put(
@@ -560,8 +570,8 @@ EMBER_ENGINE_INSTALLATION_ID='67890'
         assert!(!pem_path.exists(), "test pem path must not exist");
         assert!(!env_path.exists(), "test env path must not exist");
 
-        let result = load_with_paths(env_path, pem_path)
-            .expect("missing files must not return Err");
+        let result =
+            load_with_paths(env_path, pem_path).expect("missing files must not return Err");
         assert!(
             result.is_none(),
             "missing files via env-var paths must return Ok(None)"

@@ -2,7 +2,7 @@
 //!
 //! Exposes [`run_main`] so the `ember-proxy` binary (in this crate) and the
 //! workspace bin alias in `emberlink-cli` can both call the same entry point.
-//! Per implementation-note-63 / design §2: `cargo install emberlink` should produce
+//! Per implementation-note-79 / design §2: `cargo install emberlink` should produce
 //! both `ember` and `ember-proxy` on `$PATH` in one step.
 
 pub mod claude_code_hook;
@@ -13,7 +13,7 @@ pub mod evaluator;
 /// Parsed from `std::env::args()`, dispatches to [`claude_code_hook::run`]
 /// on `hook` / `--claude-code-hook`, or prints usage on `--help` / no args.
 ///
-/// implementation-note-11: the hook dispatch path is wrapped in `std::panic::catch_unwind`
+/// implementation-note-13: the hook dispatch path is wrapped in `std::panic::catch_unwind`
 /// so any unexpected panic emits a structured JSON response and exits 0 rather
 /// than producing an unstructured backtrace that Claude Code cannot consume.
 /// The `allow` value in the panic response tracks `explicit_fail_open` from
@@ -22,9 +22,8 @@ pub fn run_main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("hook") | Some("--claude-code-hook") => {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                claude_code_hook::run()
-            }));
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| claude_code_hook::run()));
             match result {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {

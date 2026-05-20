@@ -60,7 +60,12 @@ mod tests {
         let pk = signer.public_key();
         let payload = b"canonicalized receipt body bytes";
         let sig = daemon_persona_sign_receipt(payload, &signer);
-        assert!(daemon_persona_verify_receipt(payload, &pk, &sig, &Ed25519Verifier));
+        assert!(daemon_persona_verify_receipt(
+            payload,
+            &pk,
+            &sig,
+            &Ed25519Verifier
+        ));
     }
 
     #[test]
@@ -71,7 +76,12 @@ mod tests {
         let sig = daemon_persona_sign_receipt(&payload, &signer);
         // Flip one byte — any modification must break verification.
         payload[0] ^= 0x01;
-        assert!(!daemon_persona_verify_receipt(&payload, &pk, &sig, &Ed25519Verifier));
+        assert!(!daemon_persona_verify_receipt(
+            &payload,
+            &pk,
+            &sig,
+            &Ed25519Verifier
+        ));
     }
 
     #[test]
@@ -79,7 +89,12 @@ mod tests {
         let signer = FixtureSigner::new("persona-receipt-empty");
         let pk = signer.public_key();
         let sig = daemon_persona_sign_receipt(b"", &signer);
-        assert!(daemon_persona_verify_receipt(b"", &pk, &sig, &Ed25519Verifier));
+        assert!(daemon_persona_verify_receipt(
+            b"",
+            &pk,
+            &sig,
+            &Ed25519Verifier
+        ));
     }
 
     #[test]
@@ -90,7 +105,12 @@ mod tests {
         let payload = b"receipt body signed by key A";
         let sig = daemon_persona_sign_receipt(payload, &signer_a);
         // Verifying key-A's signature under key-B must fail.
-        assert!(!daemon_persona_verify_receipt(payload, &pk_b, &sig, &Ed25519Verifier));
+        assert!(!daemon_persona_verify_receipt(
+            payload,
+            &pk_b,
+            &sig,
+            &Ed25519Verifier
+        ));
     }
 
     /// T1 property test: sign → verify round-trip holds for any payload.

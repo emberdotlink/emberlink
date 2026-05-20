@@ -1,15 +1,19 @@
 //! PATH-shadow directory installer for `ember claude-code` and analogous launchers.
 //!
 //!
-//! Implements design §3 PATH-shadow doctrine sub-A (implementation-note-305).
-//! The launcher prepends `~/.ember/shadow/` to the child process's PATH so that
+//! Implements design §3 PATH-shadow doctrine sub-A (implementation-note-434).
+//! The launcher prepends `~/.ember/shadow/bin/` to the child process's PATH so that
 //! tool invocations like `gh pr create` transparently resolve to the ember-gh
 //! Construct binary rather than the system binary. This module populates the
-//! shadow directory with the required symlinks.
+//! `bin/` subdirectory of the shadow root with the required symlinks.
+//!
+//! Layout:
+//! - `~/.ember/shadow/bin/`  — shim binaries (PATH-prepended); managed by this module.
+//! - `~/.ember/shadow/`      — credential / config / state files; NOT PATH-prepended.
 //!
 //! Callers (sub-B WIRING) call [`install_path_shadow`] before exec'ing the child;
-//! they are responsible for prepending `shadow_dir` to the child env's PATH.
-//! This module does NOT touch PATH itself and does NOT spawn any processes.
+//! they are responsible for prepending `shadow_bin_dir(shadow_dir)` to the child
+//! env's PATH. This module does NOT touch PATH itself and does NOT spawn any processes.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -24,11 +28,21 @@ pub struct ConstructSpec {
     pub target_binary: PathBuf,
 }
 
-/// Populate `shadow_dir` with symlinks described by `constructs`.
+/// Return the `bin/` subdirectory of `shadow_dir` that is prepended to PATH.
 ///
-/// - Creates `shadow_dir` (mode 0700) if it does not exist. Idempotent if the
-///   directory already exists with the same mode.
-/// - For each [`ConstructSpec`], creates `shadow_dir/<tool_name> -> target_binary`.
+/// Shim binaries live under `<shadow_dir>/bin/`; credential and config files
+/// live directly under `<shadow_dir>/`. Callers must prepend the return value
+/// of this function (not `shadow_dir` itself) to the child process's PATH.
+pub fn shadow_bin_dir(shadow_dir: &Path) -> PathBuf {
+    shadow_dir.join("bin")
+}
+
+/// Populate the `bin/` subdirectory of `shadow_dir` with symlinks described
+/// by `constructs`.
+///
+/// - Creates `<shadow_dir>/bin/` (mode 0700) if it does not exist. Idempotent
+///   if the directory already exists with the same mode.
+/// - For each [`ConstructSpec`], creates `<shadow_dir>/bin/<tool_name> -> target_binary`.
 ///   - If a symlink already points to the correct target: no-op.
 ///   - If a symlink exists with a different target: removes it and re-creates.
 ///   - If a regular file (or other non-symlink filesystem object) exists at the
@@ -38,25 +52,24 @@ pub struct ConstructSpec {
 ///
 /// On success returns `Ok(())`. Callers may retry after resolving conflicts.
 pub fn install_path_shadow(shadow_dir: &Path, constructs: &[ConstructSpec]) -> io::Result<()> {
-    // Create the shadow directory if absent, then enforce 0700.
-    std::fs::create_dir_all(shadow_dir)?;
+    // Shim binaries go into the bin/ subdirectory, not the shadow root.
+    let bin_dir = shadow_bin_dir(shadow_dir);
+    // Create the bin directory if absent, then enforce 0700.
+    std::fs::create_dir_all(&bin_dir)?;
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o700);
-        std::fs::set_permissions(shadow_dir, perms)?;
+        std::fs::set_permissions(&bin_dir, perms)?;
     }
 
     for spec in constructs {
-        let shim_path = shadow_dir.join(&spec.tool_name);
+        let shim_path = bin_dir.join(&spec.tool_name);
 
         match shim_path.symlink_metadata() {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 // Nothing there — create the symlink.
                 std::os::unix::fs::symlink(&spec.target_binary, &shim_path).map_err(|e| {
-                    io::Error::other(format!(
-                        "create symlink {}: {e}",
-                        shim_path.display()
-                    ))
+                    io::Error::other(format!("create symlink {}: {e}", shim_path.display()))
                 })?;
             }
             Err(e) => {
@@ -81,13 +94,14 @@ pub fn install_path_shadow(shadow_dir: &Path, constructs: &[ConstructSpec]) -> i
                                     shim_path.display()
                                 ))
                             })?;
-                            std::os::unix::fs::symlink(&spec.target_binary, &shim_path)
-                                .map_err(|e| {
+                            std::os::unix::fs::symlink(&spec.target_binary, &shim_path).map_err(
+                                |e| {
                                     io::Error::other(format!(
                                         "create symlink {}: {e}",
                                         shim_path.display()
                                     ))
-                                })?;
+                                },
+                            )?;
                         }
                         Err(e) => {
                             return Err(io::Error::other(format!(
@@ -120,7 +134,7 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     #[test]
-    fn installs_creates_dir_and_symlinks() {
+    fn installs_creates_bin_dir_and_symlinks() {
         let tmp = tempfile::tempdir().unwrap();
         let shadow = tmp.path().join("shadow");
         let bin_a = tmp.path().join("ember-gh");
@@ -141,17 +155,25 @@ mod tests {
 
         install_path_shadow(&shadow, &specs).unwrap();
 
-        // Directory must exist with mode 0700.
-        let meta = std::fs::metadata(&shadow).unwrap();
+        // The bin/ subdirectory must exist with mode 0700.
+        let bin_dir = shadow_bin_dir(&shadow);
+        let meta = std::fs::metadata(&bin_dir).unwrap();
         assert!(meta.is_dir());
         {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(meta.permissions().mode() & 0o777, 0o700);
         }
 
-        // Both symlinks must resolve to the correct target.
-        assert_eq!(std::fs::read_link(shadow.join("gh")).unwrap(), bin_a);
-        assert_eq!(std::fs::read_link(shadow.join("git")).unwrap(), bin_b);
+        // Shim symlinks must be under bin/, not the shadow root.
+        assert_eq!(std::fs::read_link(bin_dir.join("gh")).unwrap(), bin_a);
+        assert_eq!(std::fs::read_link(bin_dir.join("git")).unwrap(), bin_b);
+    }
+
+    #[test]
+    fn shadow_bin_dir_is_bin_subdir_of_shadow_root() {
+        let shadow = std::path::Path::new("/home/user/.ember/shadow");
+        let bin = shadow_bin_dir(shadow);
+        assert_eq!(bin, std::path::Path::new("/home/user/.ember/shadow/bin"));
     }
 
     #[test]
@@ -170,14 +192,18 @@ mod tests {
         // Second call — must succeed without error.
         install_path_shadow(&shadow, &specs).unwrap();
 
-        assert_eq!(std::fs::read_link(shadow.join("gh")).unwrap(), bin);
+        assert_eq!(
+            std::fs::read_link(shadow_bin_dir(&shadow).join("gh")).unwrap(),
+            bin
+        );
     }
 
     #[test]
     fn replaces_wrong_target_symlink() {
         let tmp = tempfile::tempdir().unwrap();
         let shadow = tmp.path().join("shadow");
-        std::fs::create_dir_all(&shadow).unwrap();
+        let bin_dir = shadow_bin_dir(&shadow);
+        std::fs::create_dir_all(&bin_dir).unwrap();
 
         let stale_target = tmp.path().join("old-binary");
         let correct_target = tmp.path().join("ember-gh");
@@ -185,7 +211,7 @@ mod tests {
         std::fs::write(&correct_target, b"").unwrap();
 
         // Pre-install a symlink pointing at the stale target.
-        symlink(&stale_target, shadow.join("gh")).unwrap();
+        symlink(&stale_target, bin_dir.join("gh")).unwrap();
 
         let specs = vec![ConstructSpec {
             tool_name: "gh".to_string(),
@@ -196,7 +222,7 @@ mod tests {
 
         // Symlink must now point to the correct target.
         assert_eq!(
-            std::fs::read_link(shadow.join("gh")).unwrap(),
+            std::fs::read_link(bin_dir.join("gh")).unwrap(),
             correct_target
         );
     }
@@ -205,10 +231,11 @@ mod tests {
     fn errors_on_regular_file() {
         let tmp = tempfile::tempdir().unwrap();
         let shadow = tmp.path().join("shadow");
-        std::fs::create_dir_all(&shadow).unwrap();
+        let bin_dir = shadow_bin_dir(&shadow);
+        std::fs::create_dir_all(&bin_dir).unwrap();
 
         // Place a regular file where the shim should go.
-        std::fs::write(shadow.join("gh"), b"I am a regular file").unwrap();
+        std::fs::write(bin_dir.join("gh"), b"I am a regular file").unwrap();
 
         let bin = tmp.path().join("ember-gh");
         std::fs::write(&bin, b"").unwrap();

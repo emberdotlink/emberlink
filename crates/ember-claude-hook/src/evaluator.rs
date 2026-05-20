@@ -18,7 +18,9 @@ pub fn evaluate_tool_call(
 ) -> ScopeDecision {
     match tool_name {
         "Bash" => evaluate_bash(template, params),
-        "Read" | "Write" | "Edit" | "MultiEdit" => evaluate_filepath(template, project_root, params),
+        "Read" | "Write" | "Edit" | "MultiEdit" => {
+            evaluate_filepath(template, project_root, params)
+        }
         "WebFetch" | "WebSearch" => evaluate_web(template, params),
         // MCP tools and anything not in the above set: require approval.
         _ => ScopeDecision::RequireApproval {
@@ -70,7 +72,11 @@ fn evaluate_bash(template: &ScopeTemplate, params: &Value) -> ScopeDecision {
     }
 }
 
-fn evaluate_filepath(template: &ScopeTemplate, project_root: &Path, params: &Value) -> ScopeDecision {
+fn evaluate_filepath(
+    template: &ScopeTemplate,
+    project_root: &Path,
+    params: &Value,
+) -> ScopeDecision {
     let path = params
         .get("file_path")
         .or_else(|| params.get("path"))

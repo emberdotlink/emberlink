@@ -59,10 +59,10 @@ pub fn cmd_cluster_bootstrap(
     // segment of `cluster-daemon-persona/<cluster-id>`.
     let vault_key = vault_key_for_cluster(cluster_id);
     if let Err(e) = validate_credential_name(&vault_key) {
+        eprintln!("error: cluster-id {cluster_id:?} is not a valid vault-path segment: {e}");
         eprintln!(
-            "error: cluster-id {cluster_id:?} is not a valid vault-path segment: {e}"
+            "       Use lowercase letters, digits, and hyphens only (e.g. \"team-zero-dev\")."
         );
-        eprintln!("       Use lowercase letters, digits, and hyphens only (e.g. \"team-zero-dev\").");
         process::exit(2);
     }
 
@@ -104,7 +104,13 @@ pub fn cmd_cluster_bootstrap(
 
     // Store the privkey seed in the vault (hex-encoded).
     let seed_hex = hex::encode(seed);
-    match vault.add(VaultScope::Interactive, &store, &vault_key, seed_hex.as_bytes(), Some("daemon-persona-seed")) {
+    match vault.add(
+        VaultScope::Interactive,
+        &store,
+        &vault_key,
+        seed_hex.as_bytes(),
+        Some("daemon-persona-seed"),
+    ) {
         Ok(_) => {}
         Err(e) => {
             eprintln!("error: failed to store Daemon Persona seed in vault: {e}");
@@ -129,9 +135,7 @@ pub fn cmd_cluster_bootstrap(
         println!("  X25519 recipient:  {x25519_recipient_hex}");
         println!();
         println!("Next steps:");
-        println!(
-            "  1. Set `recipientPubkey: {x25519_recipient_hex}` in your EmberSeal CR."
-        );
+        println!("  1. Set `recipientPubkey: {x25519_recipient_hex}` in your EmberSeal CR.");
         println!("  2. Deliver the privkey seed to EIC via Kubernetes secret:");
         println!("       ember vault get {vault_key} | kubectl create secret generic \\");
         println!("           ember-daemon-persona --from-literal=seed=$(cat) \\");
@@ -139,9 +143,7 @@ pub fn cmd_cluster_bootstrap(
         println!("  3. Set EMBER_DAEMON_PERSONA_SEED_HEX in the EIC deployment env.");
         println!("  4. Recovery after PVC wipe = redeploy with the same secret.");
         println!();
-        println!(
-            "  Two-phase fallback: `ember cluster bootstrap {cluster_id} --two-phase`"
-        );
+        println!("  Two-phase fallback: `ember cluster bootstrap {cluster_id} --two-phase`");
         println!("  prints the original design flow documentation.");
     }
 }
@@ -286,7 +288,9 @@ pub fn cmd_cluster_restore(
         println!("           --from-literal=seed=$(cat {seed_path}) \\");
         println!("           -n ember-system --dry-run=client -o yaml | kubectl apply -f -");
         println!("  2. Re-deploy EIC (restart the StatefulSet):");
-        println!("       kubectl rollout restart statefulset/ember-infra-controller -n ember-system");
+        println!(
+            "       kubectl rollout restart statefulset/ember-infra-controller -n ember-system"
+        );
         println!("  3. After EIC is running, confirm daemon readiness:");
         println!("       ember cluster restore {cluster_id} --verify");
         println!("  4. The EmberSeal CR `recipientPubkey` is UNCHANGED — no CR update needed.");
@@ -308,7 +312,11 @@ pub struct RecoveryStatus {
 
 impl RecoveryStatus {
     fn status_label(&self) -> &'static str {
-        if self.daemon_running { "success" } else { "partial" }
+        if self.daemon_running {
+            "success"
+        } else {
+            "partial"
+        }
     }
 
     fn print_human(&self) {
@@ -330,7 +338,10 @@ fn probe_daemon_readiness(config: &DaemonConfig) -> RecoveryStatus {
             daemon_running: true,
             pid: Some(status.pid),
         },
-        _ => RecoveryStatus { daemon_running: false, pid: None },
+        _ => RecoveryStatus {
+            daemon_running: false,
+            pid: None,
+        },
     }
 }
 
@@ -349,13 +360,25 @@ fn write_seed_envelope(cluster_id: &str, seed_hex: &str, seed_out: Option<&str>)
     match std::fs::File::create(&path) {
         Ok(mut f) => {
             if let Err(e) = f.write_all(seed_hex.as_bytes()) {
-                eprintln!("warning: failed to write seed envelope to {}: {e}", path.display());
-                eprintln!("         Continuing — operator must obtain seed via `ember vault get {}`", vault_key_for_cluster(cluster_id));
+                eprintln!(
+                    "warning: failed to write seed envelope to {}: {e}",
+                    path.display()
+                );
+                eprintln!(
+                    "         Continuing — operator must obtain seed via `ember vault get {}`",
+                    vault_key_for_cluster(cluster_id)
+                );
             }
         }
         Err(e) => {
-            eprintln!("warning: cannot create seed envelope at {}: {e}", path.display());
-            eprintln!("         Continuing — operator must obtain seed via `ember vault get {}`", vault_key_for_cluster(cluster_id));
+            eprintln!(
+                "warning: cannot create seed envelope at {}: {e}",
+                path.display()
+            );
+            eprintln!(
+                "         Continuing — operator must obtain seed via `ember vault get {}`",
+                vault_key_for_cluster(cluster_id)
+            );
         }
     }
 
@@ -430,9 +453,7 @@ fn print_existing_bootstrap(
         });
         println!("{}", serde_json::to_string_pretty(&out).unwrap());
     } else {
-        println!(
-            "Daemon Persona keypair for cluster {cluster_id} already exists (idempotent)."
-        );
+        println!("Daemon Persona keypair for cluster {cluster_id} already exists (idempotent).");
         println!();
         println!("  Vault key:         {vault_key}");
         println!("  Ed25519 pubkey:    {ed25519_pubkey_hex}");
@@ -494,7 +515,11 @@ mod tests {
     #[test]
     fn generate_daemon_persona_keypair_x25519_is_hex_64() {
         let (_seed, _pub, x25519) = generate_daemon_persona_keypair();
-        assert_eq!(x25519.len(), 64, "X25519 pubkey must be 64 hex chars: {x25519}");
+        assert_eq!(
+            x25519.len(),
+            64,
+            "X25519 pubkey must be 64 hex chars: {x25519}"
+        );
         assert!(
             x25519.chars().all(|c| c.is_ascii_hexdigit()),
             "X25519 pubkey must be hex: {x25519}"
@@ -526,7 +551,10 @@ mod tests {
         );
 
         // When the daemon is not running, status_label() returns "partial".
-        let status = RecoveryStatus { daemon_running: false, pid: None };
+        let status = RecoveryStatus {
+            daemon_running: false,
+            pid: None,
+        };
         assert_eq!(
             status.status_label(),
             "partial",
@@ -543,10 +571,17 @@ mod tests {
         let path_str = tmp.to_string_lossy().to_string();
 
         let returned = write_seed_envelope("test-cluster", &seed_hex, Some(&path_str));
-        assert_eq!(returned, path_str, "returned path must match supplied seed_out");
+        assert_eq!(
+            returned, path_str,
+            "returned path must match supplied seed_out"
+        );
 
         let contents = std::fs::read_to_string(&tmp).expect("seed envelope file must exist");
-        assert_eq!(contents.trim(), seed_hex.trim(), "seed envelope contents must match hex");
+        assert_eq!(
+            contents.trim(),
+            seed_hex.trim(),
+            "seed envelope contents must match hex"
+        );
 
         let _ = std::fs::remove_file(&tmp);
     }
@@ -554,10 +589,16 @@ mod tests {
     /// recovery-status reporter: RecoveryStatus correctly labels running / not-running.
     #[test]
     fn recover_status_reporter_labels() {
-        let running = RecoveryStatus { daemon_running: true, pid: Some(12345) };
+        let running = RecoveryStatus {
+            daemon_running: true,
+            pid: Some(12345),
+        };
         assert_eq!(running.status_label(), "success");
 
-        let not_running = RecoveryStatus { daemon_running: false, pid: None };
+        let not_running = RecoveryStatus {
+            daemon_running: false,
+            pid: None,
+        };
         assert_eq!(not_running.status_label(), "partial");
     }
 }

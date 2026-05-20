@@ -88,8 +88,5 @@ pub trait GrantStore: Send + Sync {
     /// **Post:** returns every grant whose `issuer == persona`, regardless
     /// of state (Active / Paused / Revoked all included). Empty `Vec` if
     /// the persona has no grants.
-    async fn list_by_persona(
-        &self,
-        persona: &PrincipalId,
-    ) -> Result<Vec<Grant>, StoreError>;
+    async fn list_by_persona(&self, persona: &PrincipalId) -> Result<Vec<Grant>, StoreError>;
 }

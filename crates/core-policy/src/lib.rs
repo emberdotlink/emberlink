@@ -7,6 +7,6 @@
 pub mod scope_template;
 
 pub use scope_template::{
-    ScopeDecision, ScopeTemplate, ParseError,
-    DEFAULT_CLAUDE_CODE_TEMPLATE_TOML, DEFAULT_CLAUDE_CODE_TEMPLATE_ID,
+    DEFAULT_CLAUDE_CODE_TEMPLATE_ID, DEFAULT_CLAUDE_CODE_TEMPLATE_TOML, ParseError, ScopeDecision,
+    ScopeTemplate,
 };

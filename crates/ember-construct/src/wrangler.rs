@@ -205,7 +205,8 @@ mod tests {
 
     #[test]
     fn secret_bulk_with_flags_classified() {
-        let r = classify_wrangler_argv(&args(&["secret", "bulk", "--input", "secrets.json"])).unwrap();
+        let r =
+            classify_wrangler_argv(&args(&["secret", "bulk", "--input", "secrets.json"])).unwrap();
         assert_eq!(r.0, "wrangler.secret.bulk");
     }
 
@@ -219,13 +220,22 @@ mod tests {
 
     #[test]
     fn r2_object_put_with_flags_classified() {
-        let r = classify_wrangler_argv(&args(&["r2", "object", "put", "my-bucket/key", "--file", "data.bin"])).unwrap();
+        let r = classify_wrangler_argv(&args(&[
+            "r2",
+            "object",
+            "put",
+            "my-bucket/key",
+            "--file",
+            "data.bin",
+        ]))
+        .unwrap();
         assert_eq!(r.0, "wrangler.r2.put");
     }
 
     #[test]
     fn r2_object_delete_classified() {
-        let r = classify_wrangler_argv(&args(&["r2", "object", "delete", "my-bucket/key"])).unwrap();
+        let r =
+            classify_wrangler_argv(&args(&["r2", "object", "delete", "my-bucket/key"])).unwrap();
         assert_eq!(r.0, "wrangler.r2.delete");
     }
 
@@ -261,7 +271,15 @@ mod tests {
 
     #[test]
     fn r2_bucket_create_with_flags_classified() {
-        let r = classify_wrangler_argv(&args(&["r2", "bucket", "create", "my-bucket", "--location", "WNAM"])).unwrap();
+        let r = classify_wrangler_argv(&args(&[
+            "r2",
+            "bucket",
+            "create",
+            "my-bucket",
+            "--location",
+            "WNAM",
+        ]))
+        .unwrap();
         assert_eq!(r.0, "wrangler.r2.bucket.create");
     }
 
@@ -283,7 +301,15 @@ mod tests {
 
     #[test]
     fn kv_key_put_with_flags_classified() {
-        let r = classify_wrangler_argv(&args(&["kv:key", "put", "MY_KEY", "value", "--binding", "MY_KV"])).unwrap();
+        let r = classify_wrangler_argv(&args(&[
+            "kv:key",
+            "put",
+            "MY_KEY",
+            "value",
+            "--binding",
+            "MY_KV",
+        ]))
+        .unwrap();
         assert_eq!(r.0, "wrangler.kv.put");
     }
 
@@ -321,7 +347,8 @@ mod tests {
 
     #[test]
     fn d1_execute_classified() {
-        let r = classify_wrangler_argv(&args(&["d1", "execute", "MY_DB", "--command", "SELECT 1"])).unwrap();
+        let r = classify_wrangler_argv(&args(&["d1", "execute", "MY_DB", "--command", "SELECT 1"]))
+            .unwrap();
         assert_eq!(r.0, "wrangler.d1.execute");
     }
 
@@ -349,7 +376,8 @@ mod tests {
 
     #[test]
     fn d1_create_with_flags_classified() {
-        let r = classify_wrangler_argv(&args(&["d1", "create", "MY_DB", "--location", "wnam"])).unwrap();
+        let r = classify_wrangler_argv(&args(&["d1", "create", "MY_DB", "--location", "wnam"]))
+            .unwrap();
         assert_eq!(r.0, "wrangler.d1.create");
     }
 

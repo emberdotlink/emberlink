@@ -25,8 +25,8 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::transit::{
-    DecryptData, DecryptRequest, EncryptData, EncryptRequest, KeyData, TransitError, TransitKeyring,
-    VaultResponse, warn_auth_failure,
+    DecryptData, DecryptRequest, EncryptData, EncryptRequest, KeyData, TransitError,
+    TransitKeyring, VaultResponse, warn_auth_failure,
 };
 
 /// Sink for receipts emitted by ember-kms encrypt / decrypt handlers.
@@ -184,14 +184,8 @@ fn build_router(keyring: TransitKeyring, receipt_sink: Arc<dyn ReceiptSink>) -> 
         receipt_sink,
     };
     Router::new()
-        .route(
-            "/v1/{engine}/encrypt/{key}",
-            post(encrypt_handler),
-        )
-        .route(
-            "/v1/{engine}/decrypt/{key}",
-            post(decrypt_handler),
-        )
+        .route("/v1/{engine}/encrypt/{key}", post(encrypt_handler))
+        .route("/v1/{engine}/decrypt/{key}", post(decrypt_handler))
         .route(
             "/v1/{engine}/keys/{key}",
             post(create_key_handler).get(get_key_handler),
@@ -308,12 +302,14 @@ async fn decrypt_handler(
             (StatusCode::OK, Json(resp)).into_response()
         }
         Err(TransitError::KeyNotFound(_)) => vault_error(StatusCode::NOT_FOUND, "key not found"),
-        Err(TransitError::MalformedCiphertext) => {
-            vault_error(StatusCode::BAD_REQUEST, "ciphertext must start with 'vault:v1:'")
-        }
-        Err(TransitError::AesGcm) => {
-            vault_error(StatusCode::BAD_REQUEST, "decryption failed: authentication tag mismatch")
-        }
+        Err(TransitError::MalformedCiphertext) => vault_error(
+            StatusCode::BAD_REQUEST,
+            "ciphertext must start with 'vault:v1:'",
+        ),
+        Err(TransitError::AesGcm) => vault_error(
+            StatusCode::BAD_REQUEST,
+            "decryption failed: authentication tag mismatch",
+        ),
         Err(e) => {
             warn!(error = %e, "decrypt error");
             vault_error(StatusCode::INTERNAL_SERVER_ERROR, "decrypt failed")
@@ -488,7 +484,11 @@ mod tests {
         let server = KmsServer::new();
         let bound = server.bind().await.expect("bind ephemeral");
         let local = bound.local_addr();
-        assert!(local.ip().is_loopback(), "expected loopback, got {}", local.ip());
+        assert!(
+            local.ip().is_loopback(),
+            "expected loopback, got {}",
+            local.ip()
+        );
         assert_ne!(local.port(), 0, "expected OS-assigned port, got 0");
     }
 
@@ -510,8 +510,7 @@ mod tests {
     #[tokio::test]
     async fn missing_auth_header_returns_401() {
         let (base, _h) = spawn_test_server().await;
-        let client: Client<_, Empty<Bytes>> =
-            Client::builder(TokioExecutor::new()).build_http();
+        let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
         let req = hyper::Request::builder()
             .method("POST")
             .uri(format!("{base}/v1/transit/encrypt/test-key"))
@@ -637,8 +636,7 @@ mod tests {
         let resp = client.request(req).await.expect("encrypt");
         assert_eq!(resp.status(), StatusCode::OK);
         let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
-        let enc_val: serde_json::Value =
-            serde_json::from_slice(&body_bytes).expect("encrypt json");
+        let enc_val: serde_json::Value = serde_json::from_slice(&body_bytes).expect("encrypt json");
         let ciphertext = enc_val["data"]["ciphertext"]
             .as_str()
             .expect("ciphertext field")
@@ -653,9 +651,10 @@ mod tests {
         let resp = client.request(req).await.expect("decrypt");
         assert_eq!(resp.status(), StatusCode::OK);
         let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
-        let dec_val: serde_json::Value =
-            serde_json::from_slice(&body_bytes).expect("decrypt json");
-        let recovered = dec_val["data"]["plaintext"].as_str().expect("plaintext field");
+        let dec_val: serde_json::Value = serde_json::from_slice(&body_bytes).expect("decrypt json");
+        let recovered = dec_val["data"]["plaintext"]
+            .as_str()
+            .expect("plaintext field");
         assert_eq!(recovered, pt_b64);
     }
 
@@ -715,8 +714,7 @@ mod tests {
     #[tokio::test]
     async fn x_vault_token_header_accepted() {
         let (base, _h) = spawn_test_server().await;
-        let client: Client<_, Empty<Bytes>> =
-            Client::builder(TokioExecutor::new()).build_http();
+        let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
         let req = hyper::Request::builder()
             .method("POST")
             .uri(format!("{base}/v1/transit/keys/vault-token-test"))
@@ -730,7 +728,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Receipt emission (implementation-note-36)
+    // Receipt emission (implementation-note-49)
     // -----------------------------------------------------------------------
 
     /// Test-double sink that records every call into a Mutex<Vec<_>>.
@@ -782,7 +780,12 @@ mod tests {
 
         // The sink received exactly one kms_wrap receipt with non-sensitive metadata.
         let captured = sink.receipts.lock().unwrap();
-        assert_eq!(captured.len(), 1, "expected 1 receipt, got {}", captured.len());
+        assert_eq!(
+            captured.len(),
+            1,
+            "expected 1 receipt, got {}",
+            captured.len()
+        );
         let r = &captured[0];
         assert_eq!(r.kind, ReceiptKind::KmsWrap);
         assert_eq!(r.key_name, "wrap-key");
@@ -792,7 +795,10 @@ mod tests {
         assert_eq!(r.caller_persona, "unknown");
         // No payload bytes anywhere in the receipt JSON.
         let json = serde_json::to_string(r).expect("serialize");
-        assert!(!json.contains(&pt_b64), "receipt JSON contains the plaintext: {json}");
+        assert!(
+            !json.contains(&pt_b64),
+            "receipt JSON contains the plaintext: {json}"
+        );
     }
 
     #[tokio::test]
@@ -836,7 +842,12 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         let captured = sink.receipts.lock().unwrap();
-        assert_eq!(captured.len(), 2, "expected 2 receipts, got {}", captured.len());
+        assert_eq!(
+            captured.len(),
+            2,
+            "expected 2 receipts, got {}",
+            captured.len()
+        );
         assert!(captured.iter().all(|r| r.kind == ReceiptKind::KmsUnwrap));
         assert_eq!(captured[0].outcome, ReceiptOutcome::Success);
         assert_eq!(captured[0].request_size_bytes, ct_len);
@@ -844,7 +855,10 @@ mod tests {
         assert_eq!(captured[1].request_size_bytes, bad_len);
         for r in captured.iter() {
             let json = serde_json::to_string(r).unwrap();
-            assert!(!json.contains("audit"), "receipt JSON leaked plaintext substring");
+            assert!(
+                !json.contains("audit"),
+                "receipt JSON leaked plaintext substring"
+            );
             assert!(
                 !json.contains("ciphertext"),
                 "receipt JSON contains 'ciphertext' field name: {json}"

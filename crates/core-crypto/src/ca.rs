@@ -7,8 +7,8 @@
 
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use rcgen::{
-    BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose, SanType,
-    SerialNumber, PKCS_ED25519,
+    BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose,
+    PKCS_ED25519, SanType, SerialNumber,
 };
 use regex::Regex;
 use rustls_pki_types::{CertificateDer, PrivatePkcs8KeyDer};
@@ -31,6 +31,16 @@ pub enum CaError {
     SpiffeUriParseFailed,
     #[error("cert encode failed: {0}")]
     CertEncodeFailed(String),
+    /// No bridge-identity SAN URI (SPIFFE or `urn:emberlink:agent:`) was found
+    /// on the certificate. Used by [`extract_bridge_identity`] when the cert
+    /// SAN extension is missing or carries no URI in either accepted grammar.
+    #[error("no bridge identity SAN URI on certificate")]
+    NoBridgeIdentity,
+    /// The certificate's SAN extension itself failed to parse — distinct from
+    /// "no matching URI present" so callers can distinguish a malformed cert
+    /// (operator error) from a valid cert with the wrong identity shape.
+    #[error("SAN extension parse failed: {0}")]
+    SanParseFailed(String),
 }
 
 /// A generated edge CA with its signing material.
@@ -79,14 +89,40 @@ pub struct SpiffeIdentity {
     pub peer_hostname: String,
 }
 
+/// Typed SPIFFE URI shape parsed by [`parse_spiffe_uri_container`].
+///
+/// design §Component 2 specifies two co-SAN URI shapes on the bridge-client +
+/// SCION-agent certs:
+///
+/// - `spiffe://emberd/persona/<persona>/peer/<peer-hostname>` — the persona
+///   shape preserved verbatim from the original KMS-edge precedent. Parsed
+///   into [`SpiffeUri::Persona`] wrapping a [`SpiffeIdentity`] so existing
+///   callers can pattern-match and recover the same `{persona, peer_hostname}`
+///   pair they got from [`parse_spiffe_uri`].
+/// - `spiffe://emberd/container/<container-ref>` — the container shape this
+///   variant adds. `<container-ref>` is an opaque per-runtime identifier
+///   (Docker hash, OrbStack VM uuid, k3s pod uid, etc. per the
+///   `20260516-222000-container-identity` grill matrix) and is preserved
+///   verbatim into [`SpiffeUri::Container::container_ref`].
+///
+/// Anchor: `parse_spiffe_uri_container` — implementation-note-25.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpiffeUri {
+    /// `spiffe://emberd/persona/<persona>/peer/<peer-hostname>` shape.
+    Persona {
+        persona: String,
+        peer_hostname: String,
+    },
+    /// `spiffe://emberd/container/<container-ref>` shape (design §Component 2).
+    Container { container_ref: String },
+}
+
 // ─── Grammar helpers ────────────────────────────────────────────────────────
 
 static LABEL_RE: OnceLock<Regex> = OnceLock::new();
 
 fn label_regex() -> &'static Regex {
-    LABEL_RE.get_or_init(|| {
-        Regex::new(r"^[a-z][a-z0-9-]{0,62}$").expect("label regex is valid")
-    })
+    LABEL_RE.get_or_init(|| Regex::new(r"^[a-z][a-z0-9-]{0,62}$").expect("label regex is valid"))
 }
 
 fn validate_persona(persona: &str) -> Result<(), CaError> {
@@ -124,10 +160,10 @@ fn validate_hostname(hostname: &str) -> Result<(), CaError> {
 fn seed_to_pkcs8_v1_der(seed: &[u8; 32]) -> Vec<u8> {
     // Inner bytes total = 3 + 7 + 36 = 46 = 0x2e
     let mut der = Vec::with_capacity(48);
-    der.extend_from_slice(&[0x30, 0x2e]);                                 // SEQUENCE 46 bytes
-    der.extend_from_slice(&[0x02, 0x01, 0x00]);                          // INTEGER 0
+    der.extend_from_slice(&[0x30, 0x2e]); // SEQUENCE 46 bytes
+    der.extend_from_slice(&[0x02, 0x01, 0x00]); // INTEGER 0
     der.extend_from_slice(&[0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70]); // OID 1.3.101.112
-    der.extend_from_slice(&[0x04, 0x22, 0x04, 0x20]);                    // OCTET STRING wrappers
+    der.extend_from_slice(&[0x04, 0x22, 0x04, 0x20]); // OCTET STRING wrappers
     der.extend_from_slice(seed);
     der
 }
@@ -137,8 +173,11 @@ fn seed_to_pkcs8_v1_der(seed: &[u8; 32]) -> Vec<u8> {
 fn signing_key_to_rcgen_keypair(signing_key: &SigningKey) -> Result<KeyPair, CaError> {
     let seed: [u8; 32] = signing_key.to_bytes();
     let pkcs8 = seed_to_pkcs8_v1_der(&seed);
-    KeyPair::from_pkcs8_der_and_sign_algo(&PrivatePkcs8KeyDer::from(pkcs8.as_slice()), &PKCS_ED25519)
-        .map_err(|e| CaError::CertEncodeFailed(e.to_string()))
+    KeyPair::from_pkcs8_der_and_sign_algo(
+        &PrivatePkcs8KeyDer::from(pkcs8.as_slice()),
+        &PKCS_ED25519,
+    )
+    .map_err(|e| CaError::CertEncodeFailed(e.to_string()))
 }
 
 // ─── Public API ──────────────────────────────────────────────────────────────
@@ -198,15 +237,10 @@ pub fn generate_edge_ca(seed: Option<[u8; 32]>) -> Result<EdgeCa, CaError> {
 /// Returns a [`Csr`] containing the verified public key and the first SPIFFE
 /// URI SAN found in the CSR.  Returns `Err(CaError::InvalidCsrSignature)` if
 /// the CSR's self-signature does not verify with `expected_public`.
-pub fn parse_csr_signed_by(
-    csr_pem: &[u8],
-    expected_public: &VerifyingKey,
-) -> Result<Csr, CaError> {
+pub fn parse_csr_signed_by(csr_pem: &[u8], expected_public: &VerifyingKey) -> Result<Csr, CaError> {
     // Decode PEM → DER.
-    let pem_str = std::str::from_utf8(csr_pem)
-        .map_err(|_| CaError::InvalidCsrSignature)?;
-    let pem_block = pem::parse(pem_str)
-        .map_err(|_| CaError::InvalidCsrSignature)?;
+    let pem_str = std::str::from_utf8(csr_pem).map_err(|_| CaError::InvalidCsrSignature)?;
+    let pem_block = pem::parse(pem_str).map_err(|_| CaError::InvalidCsrSignature)?;
     let der_bytes = pem_block.contents();
 
     // Parse the CSR with x509-parser (pure ASN.1, no ring).
@@ -380,9 +414,7 @@ impl rcgen::SigningKey for Ed25519SubjectKey {
     fn sign(&self, _msg: &[u8]) -> Result<Vec<u8>, rcgen::Error> {
         // Unreachable: the CA's Issuer signing key signs the cert; this
         // wrapper only provides the subject public key to the cert encoder.
-        unreachable!(
-            "Ed25519SubjectKey::sign must not be called — CA Issuer key signs the cert"
-        )
+        unreachable!("Ed25519SubjectKey::sign must not be called — CA Issuer key signs the cert")
     }
 }
 
@@ -392,19 +424,15 @@ impl rcgen::SigningKey for Ed25519SubjectKey {
 /// The CSR is self-signed by `signing_key`, as required by PKCS#10.
 ///
 /// Used by the CLI peer-enroll flow and by tests to set up round-trip scenarios.
-pub fn generate_csr_pem(
-    signing_key: &SigningKey,
-    spiffe_uri: &str,
-) -> Result<Vec<u8>, CaError> {
+pub fn generate_csr_pem(signing_key: &SigningKey, spiffe_uri: &str) -> Result<Vec<u8>, CaError> {
     let key_pair = signing_key_to_rcgen_keypair(signing_key)?;
 
     let mut params = CertificateParams::new(Vec::<String>::new())
         .map_err(|e| CaError::CertEncodeFailed(e.to_string()))?;
-    params.subject_alt_names = vec![SanType::URI(
-        spiffe_uri
-            .try_into()
-            .map_err(|e: rcgen::Error| CaError::CertEncodeFailed(e.to_string()))?,
-    )];
+    params.subject_alt_names =
+        vec![SanType::URI(spiffe_uri.try_into().map_err(
+            |e: rcgen::Error| CaError::CertEncodeFailed(e.to_string()),
+        )?)];
 
     let csr = params
         .serialize_request(&key_pair)
@@ -432,10 +460,8 @@ pub fn ca_fingerprint(cert_der: &[u8]) -> [u8; 32] {
 pub fn parse_spiffe_uri(uri: &str) -> Result<SpiffeIdentity, CaError> {
     static SPIFFE_RE: OnceLock<Regex> = OnceLock::new();
     let re = SPIFFE_RE.get_or_init(|| {
-        Regex::new(
-            r"^spiffe://emberd/persona/([a-z][a-z0-9-]{0,62})/peer/([a-z][a-z0-9-]{0,62})$",
-        )
-        .expect("SPIFFE URI regex is valid")
+        Regex::new(r"^spiffe://emberd/persona/([a-z][a-z0-9-]{0,62})/peer/([a-z][a-z0-9-]{0,62})$")
+            .expect("SPIFFE URI regex is valid")
     });
 
     // Reject any URL-encoded characters before regex match.
@@ -451,4 +477,149 @@ pub fn parse_spiffe_uri(uri: &str) -> Result<SpiffeIdentity, CaError> {
         persona,
         peer_hostname,
     })
+}
+
+/// Parse a SPIFFE URI under the `spiffe://emberd/` trust domain and return its
+/// typed shape. Accepts both the persona and container URI shapes specified by
+/// design §Component 2:
+///
+/// - `spiffe://emberd/persona/<persona>/peer/<peer-hostname>` —
+///   [`SpiffeUri::Persona`] (delegates to [`parse_spiffe_uri`] verbatim so the
+///   existing strict grammar is preserved bit-for-bit).
+/// - `spiffe://emberd/container/<container-ref>` —
+///   [`SpiffeUri::Container`]. `<container-ref>` is an opaque per-runtime
+///   identifier (Docker hash, OrbStack VM uuid, k3s pod uid, etc.). The
+///   grammar is intentionally permissive — lowercase alphanumerics plus
+///   `[:_-]`, 1–128 chars, no slashes, no `%` escapes — because the source of
+///   truth for the value is the runtime control plane, not this parser.
+///
+/// Rejects everything else with [`CaError::SpiffeUriParseFailed`], including
+/// URIs that match the SPIFFE prefix but use a path other than `/persona/...`
+/// or `/container/...`. Leaves room for future shapes (e.g. `/spawn/...` per
+/// design's spawn-uuid rename) — adding a variant here is purely additive.
+///
+/// Anchor: `parse_spiffe_uri_container` — implementation-note-25.
+pub fn parse_spiffe_uri_container(uri: &str) -> Result<SpiffeUri, CaError> {
+    // Reject URL-encoding up front, matching parse_spiffe_uri's invariant.
+    if uri.contains('%') {
+        return Err(CaError::SpiffeUriParseFailed);
+    }
+
+    // Persona shape — delegate to the existing strict parser so its grammar
+    // (and every existing parse + reject case) is preserved verbatim.
+    if let Ok(persona_id) = parse_spiffe_uri(uri) {
+        return Ok(SpiffeUri::Persona {
+            persona: persona_id.persona,
+            peer_hostname: persona_id.peer_hostname,
+        });
+    }
+
+    // Container shape — `spiffe://emberd/container/<container-ref>`.
+    // Container-ref grammar is intentionally permissive: lowercase letters,
+    // digits, and `:_-`, 1–128 chars total. This admits Docker hashes
+    // (64 hex), UUIDs (with dashes), and the `orbstack:5f3a-…` style without
+    // pinning to a single runtime's id format. Slashes and `%` are excluded
+    // (the latter caught above) so the URI cannot smuggle extra path
+    // segments or percent-encoded surprises past this gate.
+    static CONTAINER_RE: OnceLock<Regex> = OnceLock::new();
+    let re = CONTAINER_RE.get_or_init(|| {
+        Regex::new(r"^spiffe://emberd/container/([a-z0-9][a-z0-9:_-]{0,127})$")
+            .expect("SPIFFE container URI regex is valid")
+    });
+
+    let caps = re.captures(uri).ok_or(CaError::SpiffeUriParseFailed)?;
+    let container_ref = caps[1].to_owned();
+
+    Ok(SpiffeUri::Container { container_ref })
+}
+
+// ─── Consolidated bridge-identity SAN parser ────────────────────────────────
+//
+// san_parser_consolidated_core_crypto_ca — implementation-note-26
+//
+// Single entry point for extracting an agent/persona identity from a parsed
+// X.509 client cert's Subject Alternative Name extension. Replaces the
+// per-caller hand-rolled SAN walks previously living in
+// `ember_proxy::mtls::extract_agent_id_from_cert` (design component 2).
+//
+// Accepts two SAN URI grammars:
+//   1. `spiffe://emberd/persona/<persona>/peer/<peer-hostname>`
+//      → `persona_id = <persona>`, `container_id = Some(<peer-hostname>)`
+//   2. `urn:emberlink:agent:<agent_id>`
+//      → `persona_id = <agent_id>`, `container_id = None`
+//
+// Both grammars enforce `^[a-z][a-z0-9-]{0,62}$` on captured labels, so
+// callers can trust that `BridgeIdentity.persona_id` is grammar-conformant
+// without re-validating.
+//
+// TODO: KMS-edge parser
+// should switch to extract_bridge_identity once located.
+
+/// The identity extracted from a bridge client certificate's SAN extension.
+///
+/// `persona_id` is always grammar-conformant (`^[a-z][a-z0-9-]{0,62}$`).
+/// `container_id` is `Some` only when the cert carries a SPIFFE URI whose
+/// `peer/<peer-hostname>` segment names a specific worker container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeIdentity {
+    pub persona_id: String,
+    pub container_id: Option<String>,
+}
+
+/// Extract a [`BridgeIdentity`] from the SAN extension of a parsed X.509 cert.
+///
+/// Walks the cert's Subject Alternative Name URI entries and returns the first
+/// URI that matches a supported grammar (SPIFFE or `urn:emberlink:agent:`).
+///
+/// # Errors
+///
+/// - [`CaError::SanParseFailed`] — the SAN extension itself is malformed.
+/// - [`CaError::NoBridgeIdentity`] — the cert has no SAN extension, or the
+///   SAN extension carries no URI entry matching either accepted grammar.
+pub fn extract_bridge_identity(
+    cert: &x509_parser::certificate::X509Certificate<'_>,
+) -> Result<BridgeIdentity, CaError> {
+    let san_ext = cert
+        .subject_alternative_name()
+        .map_err(|e| CaError::SanParseFailed(e.to_string()))?
+        .ok_or(CaError::NoBridgeIdentity)?;
+
+    for gn in &san_ext.value.general_names {
+        if let x509_parser::extensions::GeneralName::URI(uri) = gn {
+            // Try SPIFFE grammar first.
+            if uri.starts_with("spiffe://")
+                && let Ok(spiffe) = parse_spiffe_uri(uri)
+            {
+                return Ok(BridgeIdentity {
+                    persona_id: spiffe.persona,
+                    container_id: Some(spiffe.peer_hostname),
+                });
+            }
+            // Then the URN grammar.
+            if let Some(agent_id) = parse_emberlink_agent_urn(uri) {
+                return Ok(BridgeIdentity {
+                    persona_id: agent_id,
+                    container_id: None,
+                });
+            }
+        }
+    }
+
+    Err(CaError::NoBridgeIdentity)
+}
+
+/// Parse `urn:emberlink:agent:<agent_id>` and return the agent ID portion.
+///
+/// Returns `None` if the URI does not match the grammar. Mirrors the regex
+/// previously defined inline in `ember_proxy::mtls` so the two SAN parsers
+/// share a single grammar source of truth.
+fn parse_emberlink_agent_urn(uri: &str) -> Option<String> {
+    static URN_RE: OnceLock<Regex> = OnceLock::new();
+    let re = URN_RE.get_or_init(|| {
+        Regex::new(r"^urn:emberlink:agent:([a-z][a-z0-9-]{0,62})$")
+            .expect("agent URN regex is valid")
+    });
+    re.captures(uri)
+        .and_then(|caps| caps.get(1))
+        .map(|m| m.as_str().to_owned())
 }

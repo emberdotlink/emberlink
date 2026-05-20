@@ -1,5 +1,5 @@
 //!
-//! Privilege-boundary mechanisms for `ember-exec` (implementation-note-263).
+//! Privilege-boundary mechanisms for `ember-exec` (implementation-note-368).
 //!
 //! Two responsibilities, deliberately kept side-effect-free at this layer:
 //!
@@ -20,7 +20,7 @@
 //!    pre-drop identity) and BEFORE any `execve` (so the child inherits
 //!    the dropped credentials).
 //!
-//! Subtask C ([`implementation-note-264`]) wires both
+//! Subtask C ([`implementation-note-370`]) wires both
 //! mechanisms into the `SpawnDirective` handler. This module owns the
 //! mechanisms; the orchestration lives in `main.rs` after C lands.
 
@@ -29,7 +29,7 @@ use std::path::Path;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::pty::{encode_data_frame, encode_winsize_frame, pump_connection};
-use crate::uds::{read_frame, write_frame, ExecFrame, FrameError, SpawnDirective};
+use crate::uds::{ExecFrame, FrameError, SpawnDirective, read_frame, write_frame};
 
 /// `verify_content_hash` fails with this when the on-disk binary doesn't
 /// match the expected hex. The actual hash is included so the daemon can
@@ -47,7 +47,10 @@ pub struct HashMismatchError {
 #[derive(Debug, thiserror::Error)]
 pub enum VerifyError {
     #[error("io error reading {path}: {source}")]
-    Io { path: String, source: std::io::Error },
+    Io {
+        path: String,
+        source: std::io::Error,
+    },
     #[error(transparent)]
     Mismatch(#[from] HashMismatchError),
 }
@@ -89,10 +92,10 @@ pub fn verify_content_hash(binary_path: &Path, expected_hex: &str) -> Result<(),
 /// On non-Linux targets (macOS, etc.) this returns `Err(nix::Error::ENOSYS)`.
 /// The SCION ember-exec runtime only runs as root on Linux — macOS builds
 /// compile clean but the privilege-drop path is unsupported at runtime.
-// implementation-note-266
+// implementation-note-372
 #[cfg(target_os = "linux")]
 pub fn drop_privileges(target_uid: u32, target_gid: u32) -> nix::Result<()> {
-    use nix::unistd::{setresgid, setresuid, Gid, Uid};
+    use nix::unistd::{Gid, Uid, setresgid, setresuid};
     let gid = Gid::from_raw(target_gid);
     setresgid(gid, gid, gid)?;
     let uid = Uid::from_raw(target_uid);
@@ -119,7 +122,7 @@ pub enum HandleSpawnError {
     Frame(#[from] FrameError),
 }
 
-/// implementation-note-264 + implementation-note-265: glue
+/// implementation-note-370 + implementation-note-371: glue
 /// handler that runs the full gated-spawn flow for a single `SpawnDirective`.
 ///
 /// 1. Verify `binary_path` against `content_hash_expected`. On mismatch,
@@ -138,7 +141,7 @@ pub enum HandleSpawnError {
 ///    `ExecFrame::OutputBytes` frames toward the peer.
 /// 4. On child exit, write `ExecFrame::Exit { code }` and return.
 ///
-// PtyBridge wired into handle_spawn_directive per implementation-note-265:
+// PtyBridge wired into handle_spawn_directive per implementation-note-371:
 // `pump_connection` owns the fork+pty+pump body; this handler owns the
 // outer ExecFrame ↔ inner TAG_DATA/TAG_WINSIZE translation.
 pub async fn handle_spawn_directive<S>(
@@ -184,9 +187,10 @@ where
 
     // Spawn the pty pump as a background task; the handler runs the
     // translation loop in parallel.
-    let pump_task = tokio::spawn(async move {
-        pump_connection(pump_side, Path::new(&binary_path), &argv).await
-    });
+    let pump_task =
+        tokio::spawn(
+            async move { pump_connection(pump_side, Path::new(&binary_path), &argv).await },
+        );
 
     // Split the local end of the duplex so we can read pty output and
     // write framed input concurrently.
@@ -328,7 +332,9 @@ mod tests {
         let wrong = "0".repeat(64);
         let result = verify_content_hash(f.path(), &wrong);
         match result {
-            Err(VerifyError::Mismatch(HashMismatchError { actual, expected, .. })) => {
+            Err(VerifyError::Mismatch(HashMismatchError {
+                actual, expected, ..
+            })) => {
                 assert_eq!(expected, wrong);
                 assert_ne!(actual, wrong);
                 // The actual must be the real blake3 of the file.
@@ -357,10 +363,13 @@ mod tests {
         // setresgid/setresuid to the current ids succeed for any process,
         // root or not. We're verifying the call path doesn't panic and
         // returns Ok.
-        assert!(result.is_ok(), "drop_privileges(current) failed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "drop_privileges(current) failed: {result:?}"
+        );
     }
 
-    /// implementation-note-264: `handle_spawn_directive`
+    /// implementation-note-370: `handle_spawn_directive`
     /// runs the verify → spawn → exit flow end-to-end. We use `/bin/sh`
     /// (universally present on Linux/macOS) and hash it for a real
     /// content_hash_expected to exercise the OK branch.
@@ -391,9 +400,8 @@ mod tests {
             content_hash_expected: sh_hash,
         };
         let (mut writer, mut reader) = duplex(64 * 1024);
-        let handle = tokio::spawn(async move {
-            handle_spawn_directive(directive, &mut writer).await
-        });
+        let handle =
+            tokio::spawn(async move { handle_spawn_directive(directive, &mut writer).await });
 
         // Drain frames until we hit Exit; assert the exit code.
         let mut saw_exit = None;
@@ -428,7 +436,9 @@ mod tests {
             content_hash_expected: "0".repeat(64),
         };
         let (mut writer, mut reader) = duplex(64 * 1024);
-        let _ = handle_spawn_directive(directive, &mut writer).await.unwrap();
+        let _ = handle_spawn_directive(directive, &mut writer)
+            .await
+            .unwrap();
         let frame = crate::uds::read_frame(&mut reader).await.unwrap().unwrap();
         assert!(matches!(frame, ExecFrame::HashMismatch { .. }));
     }

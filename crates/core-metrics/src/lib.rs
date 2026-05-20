@@ -21,7 +21,15 @@ pub const HISTOGRAM_BUCKETS_LATENCY_SECONDS: &[f64] = &[
 /// Default histogram buckets for size-shaped metrics, in bytes.
 /// Spans serialized-receipt sizes (~200B) up to bulk-export sizes (~1MB).
 pub const HISTOGRAM_BUCKETS_BYTES: &[f64] = &[
-    128.0, 256.0, 512.0, 1024.0, 4096.0, 16384.0, 65536.0, 262_144.0, 1_048_576.0,
+    128.0,
+    256.0,
+    512.0,
+    1024.0,
+    4096.0,
+    16384.0,
+    65536.0,
+    262_144.0,
+    1_048_576.0,
 ];
 
 /// Receipt kind, mirrored from design §"Kinds". Newtype-bound so labels

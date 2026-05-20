@@ -28,7 +28,10 @@ fn main() {
         .unwrap_or_else(|| "(no-git)".to_string());
 
     println!("cargo:rustc-env=EMBERLINK_GIT_SHA={sha}");
-    println!("cargo:rustc-env=EMBERLINK_BUILD_TIMESTAMP={}", iso8601_now());
+    println!(
+        "cargo:rustc-env=EMBERLINK_BUILD_TIMESTAMP={}",
+        iso8601_now()
+    );
 
     // Rebuild when HEAD or the active branch ref moves. Both files must be
     // listed: `.git/HEAD` is the symbolic-ref pointer, and the file it points

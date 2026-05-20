@@ -37,7 +37,13 @@ fn vault_open_add_get_round_trips_across_sessions() {
     {
         let vault1 = Vault::open_from_config(&config).expect("open vault 1");
         vault1
-            .add(VaultScope::Interactive, &store1, "decrypt-fix-key", b"super-secret-value", None)
+            .add(
+                VaultScope::Interactive,
+                &store1,
+                "decrypt-fix-key",
+                b"super-secret-value",
+                None,
+            )
             .expect("add credential");
 
         let same_session = vault1
@@ -68,7 +74,13 @@ fn vault_key_stable_across_opens_with_persistent_salt() {
     {
         let vault1 = Vault::open_from_config(&config).expect("open 1");
         vault1
-            .add(VaultScope::Interactive, &store, "stable-key", b"stable-value", None)
+            .add(
+                VaultScope::Interactive,
+                &store,
+                "stable-key",
+                b"stable-value",
+                None,
+            )
             .expect("add");
     }
 
@@ -79,7 +91,10 @@ fn vault_key_stable_across_opens_with_persistent_salt() {
         let value = v
             .get(VaultScope::Interactive, &store, "stable-key")
             .unwrap_or_else(|e| panic!("get on re-open #{i} failed: {e:?}"));
-        assert_eq!(value, b"stable-value", "re-open #{i} returned wrong plaintext");
+        assert_eq!(
+            value, b"stable-value",
+            "re-open #{i} returned wrong plaintext"
+        );
     }
 }
 
@@ -96,28 +111,55 @@ fn multi_credential_multi_session_all_decrypt() {
     // Add three credentials under three different opens.
     {
         let v = Vault::open_from_config(&config).expect("open 1");
-        v.add(VaultScope::Interactive, &store, "pulumi/operator/team-zero-dev/team-zero-dev", b"pulumi-pass", None)
-            .expect("add pulumi");
+        v.add(
+            VaultScope::Interactive,
+            &store,
+            "pulumi/operator/team-zero-dev/team-zero-dev",
+            b"pulumi-pass",
+            None,
+        )
+        .expect("add pulumi");
     }
     {
         let v = Vault::open_from_config(&config).expect("open 2");
-        v.add(VaultScope::Interactive, &store, "tailscale/api-token", b"ts-token", None)
-            .expect("add tailscale token");
+        v.add(
+            VaultScope::Interactive,
+            &store,
+            "tailscale/api-token",
+            b"ts-token",
+            None,
+        )
+        .expect("add tailscale token");
     }
     {
         let v = Vault::open_from_config(&config).expect("open 3");
-        v.add(VaultScope::Interactive, &store, "tailscale/tailnet", b"tailnet-name", None)
-            .expect("add tailnet");
+        v.add(
+            VaultScope::Interactive,
+            &store,
+            "tailscale/tailnet",
+            b"tailnet-name",
+            None,
+        )
+        .expect("add tailnet");
     }
 
     // List sees all three (mirrors the operator's working `vault list`).
     let list_vault = Vault::open_from_config(&config).expect("open for list");
-    let listed = list_vault.list(VaultScope::Interactive, &store).expect("list");
-    assert_eq!(listed.len(), 3, "all three entries must be present in index");
+    let listed = list_vault
+        .list(VaultScope::Interactive, &store)
+        .expect("list");
+    assert_eq!(
+        listed.len(),
+        3,
+        "all three entries must be present in index"
+    );
 
     // Get every entry under a fresh vault open — every read must succeed.
     let names_and_expected = [
-        ("pulumi/operator/team-zero-dev/team-zero-dev", &b"pulumi-pass"[..]),
+        (
+            "pulumi/operator/team-zero-dev/team-zero-dev",
+            &b"pulumi-pass"[..],
+        ),
         ("tailscale/api-token", &b"ts-token"[..]),
         ("tailscale/tailnet", &b"tailnet-name"[..]),
     ];

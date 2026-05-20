@@ -1,9 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use core_crypto::{Verifier, DOMAIN_EVENT};
+use core_crypto::{DOMAIN_EVENT, Verifier};
+use core_event_types::{
+    EventBody, EventRefRelation, EventSubject, EventType, FileManifest, KeyRole, SignerBinding,
+    SubjectKind,
+};
 use core_events::{EventEnvelope, EventRef};
-use core_event_types::{EventBody, EventRefRelation, EventSubject, EventType, FileManifest, KeyRole, SignerBinding, SubjectKind};
-use core_principals::{PeerCursor};
+use core_principals::PeerCursor;
 use core_types::{SchemaVersion, Validate, ValidationError};
 
 use crate::materialize::{advance_chain_head, apply_event, apply_storage_event, check_chain};
@@ -224,7 +227,12 @@ impl EventLog for MemoryEventLog {
     fn events_of_type(&self, event_type: EventType) -> Vec<EventEnvelope> {
         self.type_index
             .get(&event_type)
-            .map(|indices| indices.iter().map(|&idx| self.events[idx].clone()).collect())
+            .map(|indices| {
+                indices
+                    .iter()
+                    .map(|&idx| self.events[idx].clone())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -341,9 +349,7 @@ impl EventLog for MemoryEventLog {
                         })?;
                         let seq: u64 = if parts.len() == 3 {
                             parts[2].parse().map_err(|_| {
-                                ValidationError::new(format!(
-                                    "invalid ref seq in: {r}"
-                                ))
+                                ValidationError::new(format!("invalid ref seq in: {r}"))
                             })?
                         } else {
                             0
@@ -384,11 +390,7 @@ impl EventLog for MemoryEventLog {
     fn peer_cursor(&self, peer_id: &str) -> Result<PeerCursor, ValidationError> {
         Ok(PeerCursor {
             peer_id: peer_id.to_string(),
-            last_event_id: self
-                .peer_cursors
-                .get(peer_id)
-                .cloned()
-                .unwrap_or(None),
+            last_event_id: self.peer_cursors.get(peer_id).cloned().unwrap_or(None),
         })
     }
 
@@ -444,7 +446,9 @@ impl EventLog for MemoryEventLog {
                 return Err(ValidationError::new("signature verification failed"));
             }
             if seen_ids.contains(event.event_id.as_str())
-                || imported.iter().any(|e: &EventEnvelope| e.event_id == event.event_id)
+                || imported
+                    .iter()
+                    .any(|e: &EventEnvelope| e.event_id == event.event_id)
             {
                 continue;
             }
@@ -503,8 +507,10 @@ impl EventLog for MemoryEventLog {
 #[cfg(test)]
 mod tests {
     use core_crypto::{FixtureSigner, FixtureVerifier};
+    use core_event_types::{
+        DeviceAddedEvent, EventBody, PersonaCreatedEvent, RootCreatedEvent, SignerBinding,
+    };
     use core_events::EventEnvelope;
-    use core_event_types::{DeviceAddedEvent, EventBody, PersonaCreatedEvent, RootCreatedEvent, SignerBinding};
     use core_principals::{KeyAlgorithm, PublicKeyMaterial, SurvivalMode};
 
     use super::*;

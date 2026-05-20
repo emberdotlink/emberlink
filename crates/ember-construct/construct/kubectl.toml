@@ -1,3 +1,4 @@
+# CLASSIFICATION: PUBLIC
 # Construct manifest for ember-kubectl per design §2.
 # Action schema: each [[actions]] declares an allowed action_key, optional
 # budget caps, biometric requirement, and a permit/deny default. The daemon's
@@ -181,3 +182,19 @@ biometric = "required"
 [[actions]]
 key = "kubectl.read"
 default = "permit"
+
+# --- silence-override catalog (design §C8 Knob 10) ---
+
+[actions.kubectl-wait]
+classify_argv = "wait *"
+silence_timeout_secs = 1800    # kubectl wait commonly idles for minutes
+wall_clock_timeout_secs = 3600
+
+[actions.kubectl-rollout-status]
+classify_argv = "rollout status *"
+silence_timeout_secs = 600
+
+[actions.kubectl-logs-follow]
+classify_argv = "logs -f *"
+silence_timeout_secs = 1800
+wall_clock_timeout_secs = 7200

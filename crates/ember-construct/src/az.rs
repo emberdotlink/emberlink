@@ -73,9 +73,7 @@ pub(crate) fn strip_global_flags(argv: &[String]) -> Vec<String> {
         // shouldn't have `=value` but accept it tolerantly).
         if let Some(eq) = tok.find('=') {
             let name = &tok[..eq];
-            if VALUE_BEARING_GLOBAL_FLAGS.contains(&name)
-                || BOOLEAN_GLOBAL_FLAGS.contains(&name)
-            {
+            if VALUE_BEARING_GLOBAL_FLAGS.contains(&name) || BOOLEAN_GLOBAL_FLAGS.contains(&name) {
                 i += 1;
                 continue;
             }
@@ -149,9 +147,7 @@ pub fn classify_az_argv(argv: &[String]) -> Option<ActionKey> {
 
         // vmss <verb>
         "vmss" => match g1 {
-            "create" | "delete" | "scale" | "update" => {
-                Some(ActionKey(format!("az.vmss.{}", g1)))
-            }
+            "create" | "delete" | "scale" | "update" => Some(ActionKey(format!("az.vmss.{}", g1))),
             v if is_read_only_verb(v) => None,
             _ => None,
         },
@@ -159,16 +155,12 @@ pub fn classify_az_argv(argv: &[String]) -> Option<ActionKey> {
         // storage account <verb> | storage blob <verb> | storage container <verb>
         "storage" => match (g1, g2) {
             ("account", Some(verb)) => match verb {
-                "create" | "delete" => {
-                    Some(ActionKey(format!("az.storage.account.{verb}")))
-                }
+                "create" | "delete" => Some(ActionKey(format!("az.storage.account.{verb}"))),
                 v if is_read_only_verb(v) => None,
                 _ => None,
             },
             ("blob", Some(verb)) => match verb {
-                "delete" | "upload" => {
-                    Some(ActionKey(format!("az.storage.blob.{verb}")))
-                }
+                "delete" | "upload" => Some(ActionKey(format!("az.storage.blob.{verb}"))),
                 v if is_read_only_verb(v) => None,
                 _ => None,
             },
@@ -190,9 +182,7 @@ pub fn classify_az_argv(argv: &[String]) -> Option<ActionKey> {
                 _ => None,
             },
             ("secret", Some(verb)) => match verb {
-                "set" | "delete" | "show" => {
-                    Some(ActionKey(format!("az.keyvault.secret.{verb}")))
-                }
+                "set" | "delete" | "show" => Some(ActionKey(format!("az.keyvault.secret.{verb}"))),
                 v if is_read_only_verb(v) && verb != "show" => None,
                 _ => None,
             },
@@ -207,16 +197,12 @@ pub fn classify_az_argv(argv: &[String]) -> Option<ActionKey> {
         // role assignment <verb> | role definition <verb>
         "role" => match (g1, g2) {
             ("assignment", Some(verb)) => match verb {
-                "create" | "delete" => {
-                    Some(ActionKey(format!("az.role.assignment.{verb}")))
-                }
+                "create" | "delete" => Some(ActionKey(format!("az.role.assignment.{verb}"))),
                 v if is_read_only_verb(v) => None,
                 _ => None,
             },
             ("definition", Some(verb)) => match verb {
-                "create" | "delete" => {
-                    Some(ActionKey(format!("az.role.definition.{verb}")))
-                }
+                "create" | "delete" => Some(ActionKey(format!("az.role.definition.{verb}"))),
                 v if is_read_only_verb(v) => None,
                 _ => None,
             },
@@ -249,31 +235,23 @@ pub fn classify_az_argv(argv: &[String]) -> Option<ActionKey> {
 
         // functionapp <verb>
         "functionapp" => match g1 {
-            "create" | "delete" | "deploy" => {
-                Some(ActionKey(format!("az.functionapp.{}", g1)))
-            }
+            "create" | "delete" | "deploy" => Some(ActionKey(format!("az.functionapp.{}", g1))),
             v if is_read_only_verb(v) => None,
             _ => None,
         },
 
         // webapp <verb>
         "webapp" => match g1 {
-            "create" | "delete" | "deploy" => {
-                Some(ActionKey(format!("az.webapp.{}", g1)))
-            }
+            "create" | "delete" | "deploy" => Some(ActionKey(format!("az.webapp.{}", g1))),
             v if is_read_only_verb(v) => None,
             _ => None,
         },
 
         // network vnet delete | network nsg rule {create,delete}
         "network" => match (g1, g2, g3) {
-            ("vnet", Some("delete"), _) => {
-                Some(ActionKey("az.network.vnet.delete".to_string()))
-            }
+            ("vnet", Some("delete"), _) => Some(ActionKey("az.network.vnet.delete".to_string())),
             ("nsg", Some("rule"), Some(verb)) => match verb {
-                "create" | "delete" => {
-                    Some(ActionKey(format!("az.network.nsg.rule.{verb}")))
-                }
+                "create" | "delete" => Some(ActionKey(format!("az.network.nsg.rule.{verb}"))),
                 v if is_read_only_verb(v) => None,
                 _ => None,
             },
@@ -385,19 +363,13 @@ mod tests {
 
     #[test]
     fn storage_account_create_classified() {
-        let r = classify_az_argv(&args(&[
-            "storage", "account", "create", "--name", "s",
-        ]))
-        .unwrap();
+        let r = classify_az_argv(&args(&["storage", "account", "create", "--name", "s"])).unwrap();
         assert_eq!(r.0, "az.storage.account.create");
     }
 
     #[test]
     fn storage_account_delete_classified() {
-        let r = classify_az_argv(&args(&[
-            "storage", "account", "delete", "--name", "s",
-        ]))
-        .unwrap();
+        let r = classify_az_argv(&args(&["storage", "account", "delete", "--name", "s"])).unwrap();
         assert_eq!(r.0, "az.storage.account.delete");
     }
 
@@ -413,28 +385,20 @@ mod tests {
 
     #[test]
     fn storage_blob_delete_classified() {
-        let r = classify_az_argv(&args(&[
-            "storage", "blob", "delete", "--name", "b",
-        ]))
-        .unwrap();
+        let r = classify_az_argv(&args(&["storage", "blob", "delete", "--name", "b"])).unwrap();
         assert_eq!(r.0, "az.storage.blob.delete");
     }
 
     #[test]
     fn storage_blob_upload_classified() {
-        let r = classify_az_argv(&args(&[
-            "storage", "blob", "upload", "--file", "f",
-        ]))
-        .unwrap();
+        let r = classify_az_argv(&args(&["storage", "blob", "upload", "--file", "f"])).unwrap();
         assert_eq!(r.0, "az.storage.blob.upload");
     }
 
     #[test]
     fn storage_container_delete_classified() {
-        let r = classify_az_argv(&args(&[
-            "storage", "container", "delete", "--name", "c",
-        ]))
-        .unwrap();
+        let r =
+            classify_az_argv(&args(&["storage", "container", "delete", "--name", "c"])).unwrap();
         assert_eq!(r.0, "az.storage.container.delete");
     }
 
@@ -690,19 +654,15 @@ mod tests {
 
     #[test]
     fn network_nsg_rule_create_classified() {
-        let r = classify_az_argv(&args(&[
-            "network", "nsg", "rule", "create", "--name", "r",
-        ]))
-        .unwrap();
+        let r =
+            classify_az_argv(&args(&["network", "nsg", "rule", "create", "--name", "r"])).unwrap();
         assert_eq!(r.0, "az.network.nsg.rule.create");
     }
 
     #[test]
     fn network_nsg_rule_delete_classified() {
-        let r = classify_az_argv(&args(&[
-            "network", "nsg", "rule", "delete", "--name", "r",
-        ]))
-        .unwrap();
+        let r =
+            classify_az_argv(&args(&["network", "nsg", "rule", "delete", "--name", "r"])).unwrap();
         assert_eq!(r.0, "az.network.nsg.rule.delete");
     }
 
@@ -810,10 +770,7 @@ mod tests {
 
     #[test]
     fn resource_group_short_flag_stripped() {
-        let r = classify_az_argv(&args(&[
-            "-g", "my-rg", "vm", "delete", "--name", "vm1",
-        ]))
-        .unwrap();
+        let r = classify_az_argv(&args(&["-g", "my-rg", "vm", "delete", "--name", "vm1"])).unwrap();
         assert_eq!(r.0, "az.vm.delete");
     }
 
@@ -843,12 +800,7 @@ mod tests {
     #[test]
     fn query_flag_value_form_stripped() {
         let r = classify_az_argv(&args(&[
-            "--query",
-            "[].name",
-            "vm",
-            "delete",
-            "--name",
-            "vm1",
+            "--query", "[].name", "vm", "delete", "--name", "vm1",
         ]))
         .unwrap();
         assert_eq!(r.0, "az.vm.delete");
@@ -856,15 +808,13 @@ mod tests {
 
     #[test]
     fn verbose_boolean_flag_stripped() {
-        let r =
-            classify_az_argv(&args(&["--verbose", "vm", "delete", "--name", "vm1"])).unwrap();
+        let r = classify_az_argv(&args(&["--verbose", "vm", "delete", "--name", "vm1"])).unwrap();
         assert_eq!(r.0, "az.vm.delete");
     }
 
     #[test]
     fn debug_boolean_flag_stripped() {
-        let r =
-            classify_az_argv(&args(&["--debug", "vm", "delete", "--name", "vm1"])).unwrap();
+        let r = classify_az_argv(&args(&["--debug", "vm", "delete", "--name", "vm1"])).unwrap();
         assert_eq!(r.0, "az.vm.delete");
     }
 
@@ -994,7 +944,7 @@ mod tests {
     // contract slice this Construct depends on: the broker registry can
     // hold a `MockBroker::new(BrokerProvider::AzureCli)`, and a request that
     // declares `provider = AzureCli` round-trips through issue → revoke
-    // without panicking. Real Azure CLI impl is implementation-note-66
+    // without panicking. Real Azure CLI impl is implementation-note-82
     // (separate task).
 
     use core_broker::{Broker, BrokerError, BrokerProvider, BrokerRequest, MockBroker};

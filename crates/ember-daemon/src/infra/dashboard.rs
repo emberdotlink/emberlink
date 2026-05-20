@@ -1,22 +1,21 @@
-// implementation-note-138
+// implementation-note-187
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use http_body_util::Full;
-use hyper::{Method, Request, Response, StatusCode, body::Incoming};
 use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode, body::Incoming};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, watch};
 
+use crate::infra::store::{DaemonStore, LiveVaultSlot};
 use crate::trust::approval::ApprovalOutcome;
-use crate::infra::store::DaemonStore;
 
-/// implementation-note-119 — actions hidden from the operator audit timeline by
+/// implementation-note-167 — actions hidden from the operator audit timeline by
 /// default. Internal bookkeeping events (vault unseal, lifecycle plumbing)
 /// leak implementation detail and clutter screenshots; the dashboard exposes
 /// a `[show internal events]` toggle that re-fetches with `?include_internal=1`
@@ -38,7 +37,7 @@ fn is_internal_audit_action(action: &str) -> bool {
 
 /// Build a `persona_id -> persona.name` map from the store. Used by the
 /// dashboard JSON endpoints to surface real display names alongside the
-/// raw persona id (implementation-note-119). Falls back to an empty map on
+/// raw persona id (implementation-note-167). Falls back to an empty map on
 /// store error so endpoints stay live; consumers must treat missing keys
 /// as "no name available" and render the id instead.
 fn persona_name_map(store: &DaemonStore) -> HashMap<String, String> {
@@ -50,7 +49,7 @@ fn persona_name_map(store: &DaemonStore) -> HashMap<String, String> {
         .collect()
 }
 
-/// implementation-note-74: default persona for the dashboard's
+/// implementation-note-91: default persona for the dashboard's
 /// single-tenant flows (passkey enrollment, credential listing).
 /// Returns the first persona ordered by `list_personas()` — the QA
 /// daemon ships exactly one, so this is unambiguous; production
@@ -68,7 +67,7 @@ fn default_persona_id(store: &DaemonStore) -> Option<String> {
 /// 69K.7: live budget gauge + pause/extend buttons + receipt viewer.
 const CSRF_HEADER: &str = "X-Ember-CSRF-Token";
 
-// implementation-note-74: the legacy `base64url_encode` helper used by
+// implementation-note-91: the legacy `base64url_encode` helper used by
 // the now-deleted `/api/webauthn/challenge` stub was removed. The
 // new flow returns webauthn-rs's `CreationChallengeResponse` /
 // `RequestChallengeResponse` types directly via `serde_json::to_value`,
@@ -170,7 +169,7 @@ fn origin_ok(headers: &hyper::HeaderMap, expected_origin: &str) -> bool {
 /// `vault` is the master key the main daemon already opened (via keyring auto-unseal
 /// or fallback `Vault::open_from_config`). The dashboard's separate store needs the
 /// same vault attached so the biometric-attested approve path can read vault-sealed
-/// persona secrets when minting composite-grant chains. Pre implementation-note-74 the
+/// persona secrets when minting composite-grant chains. Pre implementation-note-91 the
 /// dashboard approve path never touched persona secrets, so the omission was
 /// invisible; the WebAuthn-attested path triggers `mint_composite_chain_for_grant`
 /// which reads the persona signing key. Mirrors the git-echo proxy pattern in
@@ -188,11 +187,11 @@ pub async fn run_dashboard(
     addr: SocketAddr,
     db_path: PathBuf,
     version: String,
-    // implementation-note-137: was `Option<Vault>` (Clone-copied
-    // from the daemon's Rc<Vault>). Now `Option<Rc<Vault>>` so the
-    // single MEK byte-array is shared across the daemon + dashboard
-    // tasks without an extra by-value copy.
-    vault: Option<std::rc::Rc<crate::infra::vault::Vault>>,
+    // implementation-note-186: the dashboard shares the daemon's
+    // live-vault slot instead of owning a private `Rc<Vault>`. Explicit
+    // lock can therefore cut off dashboard-side persona-secret access
+    // without restarting the dashboard task.
+    vault_slot: Option<LiveVaultSlot>,
     mut shutdown: watch::Receiver<bool>,
     bind_tx: Option<oneshot::Sender<Result<SocketAddr, std::io::Error>>>,
 ) {
@@ -247,7 +246,7 @@ pub async fn run_dashboard(
         }
     };
 
-    // implementation-note-74 follow-up: attach the same vault the main daemon
+    // implementation-note-91 follow-up: attach the same vault the main daemon
     // opened so the WebAuthn-attested approve path can read vault-sealed
     // persona secrets when minting composite chains. Pre-WebAuthn the
     // dashboard approve path never touched persona secrets, so the omission
@@ -255,24 +254,18 @@ pub async fn run_dashboard(
     // `mint_composite_chain_for_grant` (which reads the persona signing
     // key) a missing vault surfaces as
     // `"persona '<id>' secret is vault-sealed but no vault is attached"`.
-    if let Some(v) = vault {
-        // implementation-note-137: `v` is already `Rc<Vault>` —
-        // hand the shared reference straight to the store rather than
-        // wrapping a by-value copy.
-        store.set_vault(v);
+    if let Some(slot) = vault_slot {
+        store.replace_vault_slot(slot);
     }
 
-    // implementation-note-74: build the WebAuthn relying-party gate.
+    // implementation-note-91: build the WebAuthn relying-party gate.
     // `None` is the documented escape hatch for unit tests that
     // construct DashboardState directly; in the production daemon
     // path we always have a configured gate so the dashboard
     // approval surface is fail-closed.
     #[cfg(feature = "webauthn")]
     #[allow(clippy::arc_with_non_send_sync)]
-    let webauthn = match crate::webauthn::WebauthnGate::new(
-        &expected_origin,
-        Arc::clone(&store),
-    ) {
+    let webauthn = match crate::webauthn::WebauthnGate::new(&expected_origin, Arc::clone(&store)) {
         Ok(gate) => Some(Arc::new(gate)),
         Err(e) => {
             tracing::warn!(
@@ -303,15 +296,15 @@ pub async fn run_dashboard(
                             csrf_token: csrf_token.clone(),
                             started_at,
                             expected_origin: expected_origin.clone(),
-                            // implementation-note-139: the listener
+                            // implementation-note-188: the listener
                             // is alive at this point — propagate the resolved
                             // local_addr so `/api/status` reports it instead
                             // of relying on the configured (pre-bind) port.
                             dashboard_actual_addr: Some(local_addr),
-                            // implementation-note-125: derive data_dir from
+                            // implementation-note-174: derive data_dir from
                             // db_path parent so snapshot blobs can be served.
                             data_dir: db_path.parent().map(|p| p.to_path_buf()).unwrap_or_default(),
-                            // implementation-note-74: per-connection clone of
+                            // implementation-note-91: per-connection clone of
                             // the gate handle. Cheap (Arc bump). The gate
                             // itself owns the Webauthn config + Store ref.
                             #[cfg(feature = "webauthn")]
@@ -356,12 +349,11 @@ pub async fn run_dashboard(
 /// every new write at the RPC gate; this helper bridges the read side
 /// for rows that predate the migration. Exported for tests.
 pub fn display_action_key(action: &str) -> String {
-    if let Some(rest) = action.strip_prefix("did:") {
-        if let Some(colon_idx) = rest.find(':') {
-            if colon_idx > 0 {
-                return action.to_string();
-            }
-        }
+    if let Some(rest) = action.strip_prefix("did:")
+        && let Some(colon_idx) = rest.find(':')
+        && colon_idx > 0
+    {
+        return action.to_string();
     }
     format!("did:ember:{action}")
 }
@@ -371,7 +363,7 @@ pub fn display_action_key(action: &str) -> String {
 /// `/approvals/{id}` page so the two surfaces can never drift. Injected
 /// into both templates via `{{COMPOSITE_STATEMENTS_JS}}`. The function name
 /// `render_composite_statements` (and the rendered class `composite-statements`)
-/// are the implementation-note-140 target_state_anchor markers — search for
+/// are the implementation-note-189 target_state_anchor markers — search for
 /// either if you are tracing why the page hides "3 statements" by default.
 pub const COMPOSITE_STATEMENTS_JS: &str = r#"
 // render_composite_statements — single source of truth for the composite
@@ -403,7 +395,7 @@ function renderCompositeStatements(stmts){
   const rows = stmts.map(function(s,i){
     const actions = (s.actions||[]).map(displayActionKey).join(',');
     const resource = renderResourceSelector(s.resource);
-    // implementation-note-141 — `time:wall_clock on * · 90s` reads as
+    // implementation-note-190 — `time:wall_clock on * · 90s` reads as
     // technical noise (time isn't bound to a resource). When the
     // selector resolves to wildcard, drop the `on *` clause and let
     // the budget speak for itself.
@@ -461,7 +453,7 @@ a{color:var(--accent);text-decoration:none}
 #header .meta{display:flex;align-items:center;gap:16px;color:var(--text-muted);font-size:12px}
 #header .status-dot{width:8px;height:8px;border-radius:50%;background:var(--success);display:inline-block;margin-right:6px;box-shadow:0 0 6px var(--success)}
 #header .status-dot.offline{background:var(--danger);box-shadow:0 0 6px var(--danger)}
-/* implementation-note-142: ambient daemon-identity strip in the
+/* implementation-note-191: ambient daemon-identity strip in the
    header. Subtle by design — the viewer registers it in peripheral
    vision so the verify-time --pubkey arg lands as recognition rather
    than mystery. Prominent treatment lives on the receipt detail page. */
@@ -525,7 +517,7 @@ tbody td{padding:10px 14px;color:var(--text-primary)}
 .composite-stmt-idx{color:var(--text-muted);font-weight:600}
 .approval-link{color:var(--accent);text-decoration:none}
 .approval-link:hover{text-decoration:underline}
-/* implementation-note-141 — hover preview of the composite breakdown
+/* implementation-note-190 — hover preview of the composite breakdown
    surfaces what's hidden behind the "N statements" link without
    forcing the operator to navigate. CSS-only — no JS needed; the
    inline preview shares its render with the dedicated /approvals
@@ -644,7 +636,7 @@ tbody td{padding:10px 14px;color:var(--text-primary)}
     <div class="card"><div class="label">Audit Events</div><div class="value" id="cnt-audit">—</div></div>
   </div>
 
-  <!-- BEAT-7-implementation-note-143 — per-agent panel grouped by persona_id so an
+  <!-- BEAT-7-implementation-note-192 — per-agent panel grouped by persona_id so an
        operator can revoke worker-a's anthropic statement without affecting
        worker-b. Each tile lists the agent's active grants with inline links
        to the per-statement revoke buttons on the grant detail page. The
@@ -681,7 +673,7 @@ tbody td{padding:10px 14px;color:var(--text-primary)}
           <option value="vault.">vault.*</option>
           <option value="sandbox.">sandbox.*</option>
         </select>
-        <!-- implementation-note-118 — persona/scope/date filters -->
+        <!-- implementation-note-166 — persona/scope/date filters -->
         <input type="text" id="audit-persona-filter" placeholder="persona id" oninput="loadDashboard()" style="background:var(--bg-hover);border:1px solid var(--border);border-radius:4px;color:var(--text-muted);font-family:inherit;font-size:11px;padding:3px 6px;width:120px">
         <input type="text" id="audit-scope-filter" placeholder="scope prefix" oninput="loadDashboard()" style="background:var(--bg-hover);border:1px solid var(--border);border-radius:4px;color:var(--text-muted);font-family:inherit;font-size:11px;padding:3px 6px;width:120px">
         <input type="date" id="audit-since-filter" onchange="loadDashboard()" style="background:var(--bg-hover);border:1px solid var(--border);border-radius:4px;color:var(--text-muted);font-family:inherit;font-size:11px;padding:3px 6px">
@@ -721,7 +713,7 @@ tbody td{padding:10px 14px;color:var(--text-primary)}
         <input type="text" id="receipt-persona-filter" placeholder="persona id…" oninput="loadReceipts()" style="background:var(--bg-hover);border:1px solid var(--border);border-radius:4px;padding:3px 6px;color:var(--text-primary);font-family:inherit;font-size:11px;width:140px">
       </div>
     </div>
-    <!-- implementation-note-144 — cross-receipt search panel.
+    <!-- implementation-note-193 — cross-receipt search panel.
          Three text inputs (persona / scope / grant) live-fire searchReceipts()
          on input; the clear button resets and falls back to loadReceipts(). -->
     <div class="receipt-search" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px;padding:8px;background:var(--bg-card);border:1px solid var(--border);border-radius:6px">
@@ -777,7 +769,7 @@ const CSRF_TOKEN = "{{CSRF_TOKEN}}";
 const CSRF_HEADERS = {'X-Ember-CSRF-Token': CSRF_TOKEN};
 {{COMPOSITE_STATEMENTS_JS}}
 function ts(iso){if(!iso)return'—';const d=new Date(iso);return d.toLocaleString(undefined,{month:'short',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'});}
-// implementation-note-119 — relative_time / formatRelative: render audit + grant
+// implementation-note-167 — relative_time / formatRelative: render audit + grant
 // timestamps as 'Just now' / '12s ago' / '3 min ago' / '04/26 1:34 AM'
 // long-tail fallback so screenshots don't lead with raw ISO strings. Tooltip
 // (title=) keeps the precise ISO for operators who need it.
@@ -806,7 +798,7 @@ function relTime(iso){
 }
 function trunc(s,n){if(!s)return'—';return s.length>n?s.slice(0,n)+'…':s;}
 function truncPersona(s){if(!s)return'—';const p='persona-';if(s.startsWith(p)){return p+s.slice(p.length,p.length+12);}return trunc(s,20);}
-// implementation-note-119 — persona.name primary label; raw persona_id moves to
+// implementation-note-167 — persona.name primary label; raw persona_id moves to
 // the tooltip so screenshots show real names instead of UUID prefixes.
 // Falls back to truncPersona when no name was returned by the API.
 function personaLabel(id, name){
@@ -819,7 +811,7 @@ function personaLabel(id, name){
 function badge(cls,text){return`<span class="badge ${cls}">${text}</span>`;}
 function grantStatusClass(s){if(s==='active')return'active';if(s==='expired')return'expired';if(s==='revoked')return'revoked';if(s==='exhausted_by_budget'||s==='expired_by_budget')return'exhausted';return '';}
 
-// implementation-note-141 — humanize audit-event labels for the timeline
+// implementation-note-190 — humanize audit-event labels for the timeline
 // render. Raw event names are dot-segmented identifiers used by the
 // Python/TS agent SDKs to demultiplex; on screen they read as log
 // lines, not product copy. Map known events to spaces-and-capitals.
@@ -885,13 +877,13 @@ function updateGrantRow(grantId, g) {
   if(statusCell) statusCell.innerHTML = badge(g.status, g.status);
 }
 
-// implementation-note-119 — pick the most demo-meaningful budget axis from a
+// implementation-note-167 — pick the most demo-meaningful budget axis from a
 // composite grant's statements array (cents > tokens > wall_clock_secs).
 // Returns a gauge-wrap div, or '<span …>none</span>' when no statement has
 // a budget cap set.
 function compositeGrantBudgetGauge(stmts) {
   if(!Array.isArray(stmts) || stmts.length===0) return '<span style="color:var(--text-dim);font-size:11px">—</span>';
-  // implementation-note-145 — build a compact per-statement budget summary so
+  // implementation-note-194 — build a compact per-statement budget summary so
   // the operator sees all caps, not just the "best" single axis.
   const capParts = [];
   for(const s of stmts) {
@@ -905,8 +897,8 @@ function compositeGrantBudgetGauge(stmts) {
   if(!capParts.length) return '<span style="color:var(--text-dim);font-size:11px">none</span>';
   return '<span style="color:var(--text-muted);font-size:11px">'+capParts.join(' | ')+'</span>';
 }
-// implementation-note-145: shipped
-// implementation-note-145 — scope cell for the Active Grants table. Composite
+// implementation-note-194: shipped
+// implementation-note-194 — scope cell for the Active Grants table. Composite
 // grants show "N statements · action1, action2, action3" so the operator
 // sees real scope instead of '*'. Single-statement grants show flat scope.
 function grantScopeText(g) {
@@ -921,13 +913,13 @@ function grantScopeText(g) {
   return g.scope||'—';
 }
 function renderBudgetGauge(g) {
-  // implementation-note-146 — composite grants surface their real
+  // implementation-note-195 — composite grants surface their real
   // budget via the canonical `statements` array (same name across all three
   // /api/grants* endpoints). Delegate to the composite helper when present.
   const stmts = Array.isArray(g.statements) ? g.statements : null;
   if(stmts && stmts.length>0) {
     let html = compositeGrantBudgetGauge(stmts);
-    // implementation-note-141 — only show the budget-cell banner for soft
+    // implementation-note-190 — only show the budget-cell banner for soft
     // pause (paused flag set but status still active). Hard pause flips
     // g.status to "paused" which already renders as a yellow pill in
     // the Status column; doubling up overlaps the budget text.
@@ -1016,7 +1008,7 @@ async function submitExtend(){
   if(!resp.ok){const e=await resp.json().catch(()=>({error:'failed'}));alert('Extend failed: '+(e.error||resp.status));}
   loadDashboard();
 }
-// implementation-note-74: WebAuthn ceremony — auth/begin → navigator.credentials.get()
+// implementation-note-91: WebAuthn ceremony — auth/begin → navigator.credentials.get()
 // → POST /api/approvals/<id>/<action> with the verified assertion.
 //
 // The daemon mints a challenge bound to the specific approval_id at
@@ -1178,7 +1170,7 @@ function credentialToJson(cred){
   if(typeof cred.authenticatorAttachment === 'string') out.authenticatorAttachment = cred.authenticatorAttachment;
   return out;
 }
-// implementation-note-147 — dismiss a pending approval card.
+// implementation-note-196 — dismiss a pending approval card.
 // Records approval.dismissed in the audit log; does NOT re-fire desktop
 // notifications. Card vanishes immediately on success.
 async function dismissApproval(id){
@@ -1241,13 +1233,13 @@ async function loadDashboard(){
   try{
     const showAll=document.getElementById('show-all-grants')?.checked;
     const grantsUrl=showAll?'/api/grants/all':'/api/grants';
-    // implementation-note-119 — operator audit hides internal lifecycle events
+    // implementation-note-167 — operator audit hides internal lifecycle events
     // (vault.auto_unseal_from_keyring + *.internal.*) by default; toggle
     // surfaces them via ?include_internal=1. Action filter dropdown narrows
     // to one family (grant.*, approval.*, broker.*, etc.) via ?action_filter=.
     const showInternal=document.getElementById('show-internal-events')?.checked;
     const actionFilter=document.getElementById('audit-action-filter')?.value||'';
-    // implementation-note-118 — persona/scope/since query params.
+    // implementation-note-166 — persona/scope/since query params.
     const personaFilter=document.getElementById('audit-persona-filter')?.value?.trim()||'';
     const scopeFilter=document.getElementById('audit-scope-filter')?.value?.trim()||'';
     const sinceDate=document.getElementById('audit-since-filter')?.value||'';
@@ -1302,12 +1294,12 @@ async function loadDashboard(){
     const pending=Number(status.pending_approvals??approvals.length??0);
     document.getElementById('cnt-approvals').textContent=String(pending);
     document.getElementById('cnt-audit').textContent=status.audit_events??audit.length??'0';
-    // implementation-note-141 — surface pending count in the browser tab
+    // implementation-note-190 — surface pending count in the browser tab
     // title so a YC viewer scanning the take notices the counter
     // tick. Reverts to bare "ember" when nothing's awaiting.
     document.title = pending > 0 ? `ember · ${pending} pending` : 'ember';
 
-    // BEAT-7-implementation-note-143 — per-agent tiles. Group active grants by
+    // BEAT-7-implementation-note-192 — per-agent tiles. Group active grants by
     // persona_id; each tile shows the persona alias + a credential roll-up
     // with links to the grant detail page (where per-statement revoke
     // buttons live). Terminal/show-all grants are excluded so the panel
@@ -1364,9 +1356,9 @@ async function loadDashboard(){
         <td>${renderGrantActions(g)}</td>
       </tr>`).join('');
       // Connect SSE for active grants with budgets (simple or composite).
-      // implementation-note-119 — also wire composite grants whose statements carry
+      // implementation-note-167 — also wire composite grants whose statements carry
       // a budget so the gauge ticks up in real time during the demo.
-      // implementation-note-146 — read `statements` (canonical name).
+      // implementation-note-195 — read `statements` (canonical name).
       grants.filter(g=>g.status==='active'&&(
         (g.budget&&(g.budget.tokens!=null||g.budget.cents!=null))||
         (Array.isArray(g.statements)&&g.statements.some(s=>s.budget&&(s.budget.cents!=null||s.budget.tokens!=null||s.budget.wall_clock_secs!=null)))
@@ -1379,13 +1371,13 @@ async function loadDashboard(){
       ac.innerHTML='<div class="empty">Awaiting approval requests.</div>';
     }else{
       ac.innerHTML=approvals.map(a=>{
-        // implementation-note-140 — composite breakdown moved to the
+        // implementation-note-189 — composite breakdown moved to the
         // dedicated /approvals/{id} page (behind a Show details disclosure).
         // Cards now render a one-line summary + link so the dashboard stays
         // glanceable for the demo. Single-statement approvals keep the
         // legacy per-field row layout.
         const stmts = Array.isArray(a.composite_statements) ? a.composite_statements : null;
-        // implementation-note-141 — composite scope cell surfaces a hover
+        // implementation-note-190 — composite scope cell surfaces a hover
         // preview of the inline breakdown so the operator can see what
         // they would be approving without navigating to the detail page.
         // The preview reuses renderCompositeStatements so the dashboard
@@ -1394,12 +1386,12 @@ async function loadDashboard(){
         <div class="row"><span class="field">Scope</span><span class="scope-hover"><a class="field-val approval-link" href="/approvals/${a.id}" tabindex="0">${compositeSummary(stmts)}</a><span class="scope-preview">${renderCompositeStatements(stmts)}</span></span></div>` : `
         <div class="row"><span class="field">Credential</span><span class="field-val">${a.credential_name||'—'}</span></div>
         <div class="row"><span class="field">Scope</span><a class="field-val approval-link" href="/approvals/${a.id}">${a.scope||'—'}</a></div>`;
-        // implementation-note-141 — for composites the row's flat `action` is
+        // implementation-note-190 — for composites the row's flat `action` is
         // statement 0's verb, which misrepresents a multi-verb chain.
         // Surface "composite (N statements)" instead so the card matches
         // the detail page and what the storyboard voiceover claims.
         const action_label = stmts ? `composite (${stmts.length} statements)` : (a.action||'—');
-        // implementation-note-141 — composite approvals are multi-statement
+        // implementation-note-190 — composite approvals are multi-statement
         // chains; the card only shows the summary, not the breakdown.
         // The operator must never approve a chain they cannot see, so
         // for composites the card surfaces Review (→ detail page) +
@@ -1551,7 +1543,7 @@ async function loadReceipts(){
     if(rb)rb.innerHTML='<tr><td colspan="6" class="empty">error loading receipts</td></tr>';
   }
 }
-// implementation-note-144 — cross-receipt search. When any input
+// implementation-note-193 — cross-receipt search. When any input
 // has a value we hit /api/receipts/search and render the result in the
 // existing receipts table; an empty form falls back to loadReceipts() so
 // the standard signed/since filters resume.
@@ -1604,7 +1596,7 @@ function clearReceiptSearch(){
 loadDashboard();
 loadReceipts();
 loadMaturation();
-// implementation-note-142 — fetch the daemon's Ed25519 identity once
+// implementation-note-191 — fetch the daemon's Ed25519 identity once
 // on load + every 2s thereafter. Success populates the header
 // fingerprint and clears the daemon-offline class; failure adds it.
 // The fingerprint persists in the DOM after failure so the closing
@@ -1633,7 +1625,7 @@ async function loadIdentity(){
 }
 loadIdentity();
 setInterval(loadIdentity, 2000);
-// implementation-note-124 — FINDING C: drop the dashboard refresh
+// implementation-note-173 — FINDING C: drop the dashboard refresh
 // cadence from 5s to 2s so the cents-gauge ticks visibly during Beat 4
 // of the WEDGE storyboard (where the agent burns through the budget
 // call-by-call). SSE handles instantaneous warning/exhaust transitions;
@@ -1643,7 +1635,7 @@ setInterval(loadIdentity, 2000);
 setInterval(loadDashboard,2000);
 setInterval(loadReceipts,15000);
 
-// implementation-note-148 — live receipts panel: stream new receipt rows from
+// implementation-note-197 — live receipts panel: stream new receipt rows from
 // /api/receipts/stream and prepend them to #receipts-list. EventSource
 // auto-reconnects via the server-emitted retry hint, so the client stays
 // live without a manual setInterval poll. Capped at 50 visible rows so
@@ -1699,7 +1691,7 @@ body{font-family:'JetBrains Mono',ui-monospace,'Cascadia Code','Fira Code',monos
 .card-title{font-size:12px;text-transform:uppercase;letter-spacing:.8px;color:var(--text-muted);margin-bottom:16px}
 .field{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid var(--border)}
 .field:last-of-type{border-bottom:none;margin-bottom:0;padding-bottom:0}
-/* implementation-note-141 — author-defined `display:flex` overrides the
+/* implementation-note-190 — author-defined `display:flex` overrides the
    user-agent `[hidden]{display:none}` rule (CSS specificity gotcha),
    so `el.hidden = true` had no visible effect on `.field` rows.
    Explicit override below restores the expected behavior. */
@@ -1741,7 +1733,7 @@ body{font-family:'JetBrains Mono',ui-monospace,'Cascadia Code','Fira Code',monos
   <div class="field"><span class="field-label">Risk</span><span class="field-val"><span class="badge {{RISK_LEVEL}}">{{RISK_LEVEL}}</span></span></div>
   <div class="field"><span class="field-label">Persona</span><span class="field-val">{{PERSONA_PREFIX}}</span></div>
   <div class="field"><span class="field-label">Requested</span><span class="field-val">{{CREATED_AT}}</span></div>
-  <!-- implementation-note-141 — composite breakdown is the scope. Always
+  <!-- implementation-note-190 — composite breakdown is the scope. Always
        visible so the operator can never approve a chain they cannot
        see. Hidden only for single-statement approvals (which do not
        have a meaningful breakdown). -->
@@ -1765,7 +1757,7 @@ let breakdownRendered = false;
 function renderBreakdown(stmts){
   if(breakdownRendered) return;
   if(!Array.isArray(stmts) || stmts.length===0) return;
-  // implementation-note-141 — composite breakdown is the scope. Show it
+  // implementation-note-190 — composite breakdown is the scope. Show it
   // inline as soon as the page loads; never gate "what am I approving?"
   // behind a disclosure. The flat Credential and Scope rows are
   // statement 0's projection — misleading for a multi-statement chain
@@ -1805,7 +1797,7 @@ async function pollStatus(){
 // Fire once on load so the breakdown appears without waiting 2s.
 pollStatus();
 pollTimer = setInterval(pollStatus, 2000);
-// implementation-note-74: dedicated approval page — same auth/begin →
+// implementation-note-91: dedicated approval page — same auth/begin →
 // navigator.credentials.get() → POST/<action> ceremony as the main
 // dashboard pending-approvals card. Fail-closed: no WebAuthn, no
 // state flip.
@@ -1919,7 +1911,7 @@ async function resolve(action){
 </body>
 </html>"#;
 
-/// implementation-note-74: first-run passkey enrollment page at `/settings/passkeys`.
+/// implementation-note-91: first-run passkey enrollment page at `/settings/passkeys`.
 ///
 /// Guides the operator through registering their platform authenticator
 /// (Touch ID on macOS, Windows Hello on Windows). Calls
@@ -2140,7 +2132,7 @@ loadEnrolledList();
 </body>
 </html>"#;
 
-// implementation-note-149: shipped
+// implementation-note-198: shipped
 /// Compute the ETag for the dashboard HTML using the compile-time git SHA.
 /// Returns the ETag value in the form `"<sha>"` (with surrounding quotes as
 /// required by RFC 7232). If `if_none_match` equals the current ETag the
@@ -2159,10 +2151,7 @@ fn dashboard_etag() -> &'static str {
 /// * Otherwise → 200 OK with the full HTML body, `ETag`, and
 ///   `Cache-Control: no-cache` (allows the browser to cache but requires
 ///   revalidation before serving from cache — NOT `no-store`).
-fn dashboard_etag_response(
-    if_none_match: Option<&str>,
-    html: String,
-) -> Response<Full<Bytes>> {
+fn dashboard_etag_response(if_none_match: Option<&str>, html: String) -> Response<Full<Bytes>> {
     let etag = dashboard_etag();
     let matched = if_none_match
         .map(|v| v.trim() == etag || v.trim() == "*")
@@ -2209,7 +2198,7 @@ pub struct DashboardState {
     /// Defaults to `"http://127.0.0.1:3141"` for backwards-compat with tests
     /// that construct `DashboardState` without an explicit origin.
     pub expected_origin: String,
-    /// implementation-note-139: the address the dashboard actually
+    /// implementation-note-188: the address the dashboard actually
     /// bound to, surfaced via `/api/status` as `dashboard_addr_bound`. Always
     /// `Some` when the dashboard is serving traffic (you can't reach this
     /// state otherwise) but the field is `Option<>` so test fixtures can
@@ -2217,10 +2206,10 @@ pub struct DashboardState {
     /// Resolved from `TcpListener::local_addr()` after a successful bind so
     /// port-0 ephemeral assignments are reflected truthfully.
     pub dashboard_actual_addr: Option<SocketAddr>,
-    /// implementation-note-125: daemon data directory — used to serve
+    /// implementation-note-174: daemon data directory — used to serve
     /// cluster-snapshot blobs from `<data_dir>/snapshots/`.
     pub data_dir: std::path::PathBuf,
-    /// implementation-note-74: server-side WebAuthn relying party.
+    /// implementation-note-91: server-side WebAuthn relying party.
     ///
     /// `Some` when the daemon's `webauthn` cargo feature is on AND
     /// the gate initialized successfully. The dashboard's
@@ -2254,27 +2243,30 @@ pub async fn handle_dashboard_request(
             // browser cache the document but requires revalidation before use —
             // a 304 path avoids re-transmitting the full HTML on every load
             // while still guaranteeing staleness never survives a daemon upgrade.
-            let if_none_match = headers
-                .get("if-none-match")
-                .and_then(|v| v.to_str().ok());
+            let if_none_match = headers.get("if-none-match").and_then(|v| v.to_str().ok());
             dashboard_etag_response(if_none_match, html)
         }
 
         (Method::GET, "/api/status") => {
             let active_grants = state.store.list_active_grants().unwrap_or_default().len();
-            let pending_approvals = state.store.list_pending_approvals().unwrap_or_default().len();
+            let pending_approvals = state
+                .store
+                .list_pending_approvals()
+                .unwrap_or_default()
+                .len();
             let audit_events = state.store.audit_count().unwrap_or(0);
-            let active_agents = state.store.list_personas().unwrap_or_default()
+            let active_agents = state
+                .store
+                .list_personas()
+                .unwrap_or_default()
                 .iter()
                 .filter(|p| p.status == "active")
                 .count();
-            // implementation-note-139: stringify the bound address
+            // implementation-note-188: stringify the bound address
             // (or `null`) so the CLI `status` subcommand stops printing the
             // configured-but-not-bound port. Field shape: `Option<String>` →
             // `null` when the dashboard isn't bound, full `host:port` when it is.
-            let dashboard_addr_bound = state
-                .dashboard_actual_addr
-                .map(|a| a.to_string());
+            let dashboard_addr_bound = state.dashboard_actual_addr.map(|a| a.to_string());
             let body = serde_json::json!({
                 "running": true,
                 "version": state.version,
@@ -2320,32 +2312,36 @@ pub async fn handle_dashboard_request(
         (Method::GET, "/api/receipts") => {
             use crate::infra::receipt::ReceiptFilter;
 
-            let (persona_id, signed_only, since_iso, view) = req.uri().query().map(|q| {
-                let mut pid: Option<String> = None;
-                let mut signed = false;
-                let mut since: Option<String> = None;
-                let mut view = "rollup".to_string();
-                for kv in q.split('&') {
-                    let mut parts = kv.splitn(2, '=');
-                    let k = parts.next().unwrap_or("");
-                    let v = parts.next().unwrap_or("");
-                    match k {
-                        "persona_id" if !v.is_empty() => pid = Some(v.to_string()),
-                        "signed_only" if v == "true" || v == "1" => signed = true,
-                        "view" if !v.is_empty() => view = v.to_string(),
-                        "since" => {
-                            let now = chrono::Utc::now();
-                            since = match v {
-                                "24h" => Some((now - chrono::Duration::hours(24)).to_rfc3339()),
-                                "7d" => Some((now - chrono::Duration::days(7)).to_rfc3339()),
-                                _ => None,
-                            };
+            let (persona_id, signed_only, since_iso, view) = req
+                .uri()
+                .query()
+                .map(|q| {
+                    let mut pid: Option<String> = None;
+                    let mut signed = false;
+                    let mut since: Option<String> = None;
+                    let mut view = "rollup".to_string();
+                    for kv in q.split('&') {
+                        let mut parts = kv.splitn(2, '=');
+                        let k = parts.next().unwrap_or("");
+                        let v = parts.next().unwrap_or("");
+                        match k {
+                            "persona_id" if !v.is_empty() => pid = Some(v.to_string()),
+                            "signed_only" if v == "true" || v == "1" => signed = true,
+                            "view" if !v.is_empty() => view = v.to_string(),
+                            "since" => {
+                                let now = chrono::Utc::now();
+                                since = match v {
+                                    "24h" => Some((now - chrono::Duration::hours(24)).to_rfc3339()),
+                                    "7d" => Some((now - chrono::Duration::days(7)).to_rfc3339()),
+                                    _ => None,
+                                };
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
-                }
-                (pid, signed, since, view)
-            }).unwrap_or((None, false, None, "rollup".to_string()));
+                    (pid, signed, since, view)
+                })
+                .unwrap_or((None, false, None, "rollup".to_string()));
 
             let filter = ReceiptFilter {
                 persona_id,
@@ -2374,10 +2370,7 @@ pub async fn handle_dashboard_request(
                         let action_summary = format!(
                             "{} · {}",
                             r.summary.service,
-                            r.summary.resource
-                                .chars()
-                                .take(40)
-                                .collect::<String>()
+                            r.summary.resource.chars().take(40).collect::<String>()
                         );
                         serde_json::json!({
                             "id": r.id,
@@ -2395,16 +2388,13 @@ pub async fn handle_dashboard_request(
                 json_response(StatusCode::OK, &serde_json::Value::Array(body))
             } else {
                 // ?view=rollup (default) — rollup envelope via compute_rollups.
-                let rows = state
-                    .store
-                    .list_receipt_rows(&filter)
-                    .unwrap_or_default();
+                let rows = state.store.list_receipt_rows(&filter).unwrap_or_default();
                 let body = rollup_view(&rows);
                 json_response(StatusCode::OK, &body)
             }
         }
 
-        // implementation-note-148 — Server-Sent Events stream feeding the live
+        // implementation-note-197 — Server-Sent Events stream feeding the live
         // receipts panel on the dashboard. Mirrors the single-shot
         // snapshot pattern used by `/sse/grants/{id}`: emit the latest
         // 50 receipt rows as individual `data:` events, set the
@@ -2420,10 +2410,7 @@ pub async fn handle_dashboard_request(
                 limit: Some(50),
                 ..Default::default()
             };
-            let rows = state
-                .store
-                .list_receipt_rows(&filter)
-                .unwrap_or_default();
+            let rows = state.store.list_receipt_rows(&filter).unwrap_or_default();
             let mut body = String::with_capacity(256 + rows.len() * 256);
             // EventSource reconnect hint: 1000ms — combined with the
             // single-shot snapshot this gives ~1Hz polling. The 5-minute
@@ -2464,7 +2451,7 @@ pub async fn handle_dashboard_request(
                 .unwrap()
         }
 
-        // implementation-note-144 — cross-receipt search panel.
+        // implementation-note-193 — cross-receipt search panel.
         // GET /api/receipts/search — query receipts by persona / scope /
         // grant_id / resource. Empty result is `[]` (200); store error
         // returns 500 with `{"error": "search failed"}`.
@@ -2480,26 +2467,32 @@ pub async fn handle_dashboard_request(
         (Method::GET, "/api/receipts/search") => {
             use crate::infra::receipt::ReceiptFilter;
 
-            let (persona, scope, grant_id, resource) = req.uri().query().map(|q| {
-                let mut p: Option<String> = None;
-                let mut s: Option<String> = None;
-                let mut g: Option<String> = None;
-                let mut r: Option<String> = None;
-                for kv in q.split('&') {
-                    let mut parts = kv.splitn(2, '=');
-                    let k = parts.next().unwrap_or("");
-                    let v = parts.next().unwrap_or("");
-                    if v.is_empty() { continue; }
-                    match k {
-                        "persona" => p = Some(v.to_string()),
-                        "scope" => s = Some(v.to_string()),
-                        "grant_id" => g = Some(v.to_string()),
-                        "resource" => r = Some(v.to_string()),
-                        _ => {}
+            let (persona, scope, grant_id, resource) = req
+                .uri()
+                .query()
+                .map(|q| {
+                    let mut p: Option<String> = None;
+                    let mut s: Option<String> = None;
+                    let mut g: Option<String> = None;
+                    let mut r: Option<String> = None;
+                    for kv in q.split('&') {
+                        let mut parts = kv.splitn(2, '=');
+                        let k = parts.next().unwrap_or("");
+                        let v = parts.next().unwrap_or("");
+                        if v.is_empty() {
+                            continue;
+                        }
+                        match k {
+                            "persona" => p = Some(v.to_string()),
+                            "scope" => s = Some(v.to_string()),
+                            "grant_id" => g = Some(v.to_string()),
+                            "resource" => r = Some(v.to_string()),
+                            _ => {}
+                        }
                     }
-                }
-                (p, s, g, r)
-            }).unwrap_or((None, None, None, None));
+                    (p, s, g, r)
+                })
+                .unwrap_or((None, None, None, None));
 
             let filter = ReceiptFilter {
                 persona_id: persona.clone(),
@@ -2538,10 +2531,7 @@ pub async fn handle_dashboard_request(
                             let action_summary = format!(
                                 "{} · {}",
                                 r.summary.service,
-                                r.summary.resource
-                                    .chars()
-                                    .take(40)
-                                    .collect::<String>()
+                                r.summary.resource.chars().take(40).collect::<String>()
                             );
                             serde_json::json!({
                                 "id": r.id,
@@ -2556,7 +2546,7 @@ pub async fn handle_dashboard_request(
                             })
                         })
                         .collect();
-                    // implementation-note-150: shipped
+                    // implementation-note-199: shipped
                     json_response(StatusCode::OK, &serde_json::Value::Array(body))
                 }
             }
@@ -2566,20 +2556,22 @@ pub async fn handle_dashboard_request(
             let personas = state.store.list_personas().unwrap_or_default();
             let body: Vec<serde_json::Value> = personas
                 .iter()
-                .map(|p| serde_json::json!({
-                    "id": p.id,
-                    "name": p.name,
-                    "public_key": p.public_key,
-                    "created_at": p.created_at,
-                    "status": p.status,
-                }))
+                .map(|p| {
+                    serde_json::json!({
+                        "id": p.id,
+                        "name": p.name,
+                        "public_key": p.public_key,
+                        "created_at": p.created_at,
+                        "status": p.status,
+                    })
+                })
                 .collect();
             json_response(StatusCode::OK, &serde_json::Value::Array(body))
         }
 
         (Method::GET, "/api/grants") => {
             let grants = state.store.list_active_grants().unwrap_or_default();
-            // implementation-note-119 — surface persona.name alongside persona_id
+            // implementation-note-167 — surface persona.name alongside persona_id
             // so the dashboard can render real display names instead of UUID
             // prefixes. Lookup is rendering-layer only; raw persona_id is
             // unchanged, contract additive.
@@ -2589,23 +2581,36 @@ pub async fn handle_dashboard_request(
                 .map(|g| {
                     let mut conds = serde_json::Map::new();
                     if let Some(rate) = g.max_uses_per_hour {
-                        conds.insert("rate_limit".to_string(), serde_json::json!(format!("{}/hour", rate)));
+                        conds.insert(
+                            "rate_limit".to_string(),
+                            serde_json::json!(format!("{}/hour", rate)),
+                        );
                     }
                     if let (Some(start), Some(end)) = (g.allowed_hours_start, g.allowed_hours_end) {
-                        conds.insert("time_window".to_string(), serde_json::json!(format!("{}:00-{}:00 UTC", start, end)));
+                        conds.insert(
+                            "time_window".to_string(),
+                            serde_json::json!(format!("{}:00-{}:00 UTC", start, end)),
+                        );
                     }
                     if let Some(ref targets) = g.allowed_targets {
                         conds.insert("allowed_targets".to_string(), serde_json::json!(targets));
                     }
                     if let Some(limit) = g.spending_limit_cents {
-                        conds.insert("spending_limit".to_string(), serde_json::json!(format!("${}.{:02}/day", limit / 100, limit % 100)));
+                        conds.insert(
+                            "spending_limit".to_string(),
+                            serde_json::json!(format!("${}.{:02}/day", limit / 100, limit % 100)),
+                        );
                     }
                     if let Some(depth) = g.max_delegation_depth {
                         conds.insert("delegation_depth".to_string(), serde_json::json!(depth));
                     }
-                    let conditions = if conds.is_empty() { serde_json::Value::Null } else { serde_json::Value::Object(conds) };
+                    let conditions = if conds.is_empty() {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::Value::Object(conds)
+                    };
 
-                    // implementation-note-151 (budget_persists_on_simple_grant) —
+                    // implementation-note-200 (budget_persists_on_simple_grant) —
                     // surface the projected budget + usage so the dashboard's
                     // BUDGET column and live gauge JS can render the operator-
                     // configured ceilings. `g.budget` projects from the signed
@@ -2632,13 +2637,15 @@ pub async fn handle_dashboard_request(
                             },
                             None => (None, None),
                         };
-                    let revoked_sids =
-                        state.store.get_revoked_sids(&g.id).unwrap_or_default();
+                    let revoked_sids = state.store.get_revoked_sids(&g.id).unwrap_or_default();
 
                     let mut entry = serde_json::Map::new();
                     entry.insert("id".into(), serde_json::json!(g.id));
                     entry.insert("persona_id".into(), serde_json::json!(g.persona_id));
-                    entry.insert("persona_name".into(), serde_json::json!(names.get(&g.persona_id).cloned()));
+                    entry.insert(
+                        "persona_name".into(),
+                        serde_json::json!(names.get(&g.persona_id).cloned()),
+                    );
                     entry.insert(
                         "parent_persona_id".into(),
                         serde_json::json!(parent_persona_id),
@@ -2647,7 +2654,10 @@ pub async fn handle_dashboard_request(
                         "parent_persona_name".into(),
                         serde_json::json!(parent_persona_name),
                     );
-                    entry.insert("credential_name".into(), serde_json::json!(g.credential_name));
+                    entry.insert(
+                        "credential_name".into(),
+                        serde_json::json!(g.credential_name),
+                    );
                     entry.insert("scope".into(), serde_json::json!(g.scope));
                     entry.insert("created_at".into(), serde_json::json!(g.created_at));
                     entry.insert("expires_at".into(), serde_json::json!(g.expires_at));
@@ -2655,10 +2665,16 @@ pub async fn handle_dashboard_request(
                     entry.insert("conditions".into(), conditions);
                     entry.insert("revoked_sids".into(), serde_json::json!(revoked_sids));
                     if let Some(b) = g.budget.as_ref().filter(|b| !b.is_none_set()) {
-                        entry.insert("budget".into(), serde_json::to_value(b).unwrap_or(serde_json::Value::Null));
-                        entry.insert("usage".into(), serde_json::to_value(&g.usage).unwrap_or(serde_json::Value::Null));
+                        entry.insert(
+                            "budget".into(),
+                            serde_json::to_value(b).unwrap_or(serde_json::Value::Null),
+                        );
+                        entry.insert(
+                            "usage".into(),
+                            serde_json::to_value(&g.usage).unwrap_or(serde_json::Value::Null),
+                        );
                     }
-                    // implementation-note-146 — emit the per-Statement
+                    // implementation-note-195 — emit the per-Statement
                     // array under `statements` to match `grant_to_json_with_store`
                     // (the canonical serializer used by /api/grants/all and
                     // /api/grants/{id}). Previously this list endpoint emitted
@@ -2666,7 +2682,7 @@ pub async fn handle_dashboard_request(
                     // callers into `g.statements || g.composite_statements`
                     // fallbacks that cemented the divergence.
                     //
-                    // implementation-note-141 — silently dropping the
+                    // implementation-note-190 — silently dropping the
                     // get_access_grant error means the dashboard rendered
                     // BUDGET=`—` for fully-valid grants whenever chain
                     // verification failed (or transiently failed during the
@@ -2675,43 +2691,42 @@ pub async fn handle_dashboard_request(
                     // because the next 5s loadDashboard tick re-hit the API
                     // after the chain stabilized. Log the error so the next
                     // diagnosis isn't blind.
-                    let statements: serde_json::Value =
-                        match state.store.get_access_grant(&g.id) {
-                            Ok(chain) => {
-                                let arr: Vec<serde_json::Value> = chain
-                                    .statements()
-                                    .map(|(block_index, s)| {
-                                        // implementation-note-146 —
-                                        // per-Statement shape mirrors
-                                        // grant_to_json_with_store so the
-                                        // list and detail endpoints emit
-                                        // the same fields (incl. conditions).
-                                        serde_json::json!({
-                                            "sid": s.sid,
-                                            "block_index": block_index,
-                                            "resource_type": s.resource_type.as_str(),
-                                            "actions": s.actions,
-                                            "resource": s.resource,
-                                            "budget": s.budget,
-                                            "usage": s.usage,
-                                            "conditions": s.conditions,
-                                        })
+                    let statements: serde_json::Value = match state.store.get_access_grant(&g.id) {
+                        Ok(chain) => {
+                            let arr: Vec<serde_json::Value> = chain
+                                .statements()
+                                .map(|(block_index, s)| {
+                                    // implementation-note-195 —
+                                    // per-Statement shape mirrors
+                                    // grant_to_json_with_store so the
+                                    // list and detail endpoints emit
+                                    // the same fields (incl. conditions).
+                                    serde_json::json!({
+                                        "sid": s.sid,
+                                        "block_index": block_index,
+                                        "resource_type": s.resource_type.as_str(),
+                                        "actions": s.actions,
+                                        "resource": s.resource,
+                                        "budget": s.budget,
+                                        "usage": s.usage,
+                                        "conditions": s.conditions,
                                     })
-                                    .collect();
-                                serde_json::Value::Array(arr)
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    grant_id = %g.id,
-                                    persona_id = %g.persona_id,
-                                    status = %g.status,
-                                    error = %e,
-                                    "/api/grants: get_access_grant failed; \
-                                     rendering empty statements array (BUDGET cell will show `—`)"
-                                );
-                                serde_json::Value::Array(Vec::new())
-                            }
-                        };
+                                })
+                                .collect();
+                            serde_json::Value::Array(arr)
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                grant_id = %g.id,
+                                persona_id = %g.persona_id,
+                                status = %g.status,
+                                error = %e,
+                                "/api/grants: get_access_grant failed; \
+                                 rendering empty statements array (BUDGET cell will show `—`)"
+                            );
+                            serde_json::Value::Array(Vec::new())
+                        }
+                    };
                     entry.insert("statements".into(), statements);
                     entry.insert("paused".into(), serde_json::json!(g.paused));
                     serde_json::Value::Object(entry)
@@ -2728,29 +2743,31 @@ pub async fn handle_dashboard_request(
 
         (Method::GET, "/api/approvals") => {
             let approvals = state.store.list_pending_approvals().unwrap_or_default();
-            // implementation-note-119 — `persona.name` lookup for the approval card.
+            // implementation-note-167 — `persona.name` lookup for the approval card.
             let names = persona_name_map(&state.store);
             let body: Vec<serde_json::Value> = approvals
                 .iter()
-                .map(|a| serde_json::json!({
-                    "id": a.id,
-                    "persona_id": a.persona_id,
-                    "persona_name": names.get(&a.persona_id).cloned(),
-                    "credential_name": a.credential_name,
-                    "scope": a.scope,
-                    "ttl_secs": a.ttl_secs,
-                    "action": a.action,
-                    "risk_level": a.risk_level,
-                    "status": a.status,
-                    "reason": a.reason,
-                    "created_at": a.created_at,
-                    // implementation-note-152 — composite envelopes (sandbox-run 3-statement
-                    // bundle) surface as a single approval entry whose
-                    // statements array drives the per-statement card UI.
-                    "composite_statements": a.composite_statements,
-                    "result_grant_id": a.result_grant_id,
-                    "skill_ref": a.skill_ref,
-                }))
+                .map(|a| {
+                    serde_json::json!({
+                        "id": a.id,
+                        "persona_id": a.persona_id,
+                        "persona_name": names.get(&a.persona_id).cloned(),
+                        "credential_name": a.credential_name,
+                        "scope": a.scope,
+                        "ttl_secs": a.ttl_secs,
+                        "action": a.action,
+                        "risk_level": a.risk_level,
+                        "status": a.status,
+                        "reason": a.reason,
+                        "created_at": a.created_at,
+                        // implementation-note-201 — composite envelopes (sandbox-run 3-statement
+                        // bundle) surface as a single approval entry whose
+                        // statements array drives the per-statement card UI.
+                        "composite_statements": a.composite_statements,
+                        "result_grant_id": a.result_grant_id,
+                        "skill_ref": a.skill_ref,
+                    })
+                })
                 .collect();
             json_response(StatusCode::OK, &serde_json::Value::Array(body))
         }
@@ -2763,34 +2780,37 @@ pub async fn handle_dashboard_request(
             let id = path.strip_prefix("/api/approvals/").unwrap_or("");
             match state.store.get_approval(id) {
                 Ok(a) => {
-                    // implementation-note-119 — additive `persona_name` lookup.
+                    // implementation-note-167 — additive `persona_name` lookup.
                     let persona_name = state.store.get_persona(&a.persona_id).ok().map(|p| p.name);
-                    json_response(StatusCode::OK, &serde_json::json!({
-                        "id": a.id,
-                        "persona_id": a.persona_id,
-                        "persona_name": persona_name,
-                        "credential_name": a.credential_name,
-                        "scope": a.scope,
-                        "ttl_secs": a.ttl_secs,
-                        "action": a.action,
-                        "risk_level": a.risk_level,
-                        "status": a.status,
-                        "reason": a.reason,
-                        "created_at": a.created_at,
-                        // implementation-note-152 — surface composite statements + minted grant ID.
-                        "composite_statements": a.composite_statements,
-                        "result_grant_id": a.result_grant_id,
-                        "skill_ref": a.skill_ref,
-                    }))
+                    json_response(
+                        StatusCode::OK,
+                        &serde_json::json!({
+                            "id": a.id,
+                            "persona_id": a.persona_id,
+                            "persona_name": persona_name,
+                            "credential_name": a.credential_name,
+                            "scope": a.scope,
+                            "ttl_secs": a.ttl_secs,
+                            "action": a.action,
+                            "risk_level": a.risk_level,
+                            "status": a.status,
+                            "reason": a.reason,
+                            "created_at": a.created_at,
+                            // implementation-note-201 — surface composite statements + minted grant ID.
+                            "composite_statements": a.composite_statements,
+                            "result_grant_id": a.result_grant_id,
+                            "skill_ref": a.skill_ref,
+                        }),
+                    )
                 }
                 Err(_) => error_response(404, "approval not found"),
             }
         }
 
         (Method::GET, "/api/audit") => {
-            // implementation-note-153: shipped
+            // implementation-note-202: shipped
             use crate::infra::audit::AuditFilter;
-            // implementation-note-119 — operator audit timeline hides internal
+            // implementation-note-167 — operator audit timeline hides internal
             // bookkeeping events (vault.auto_unseal_from_keyring + the
             // generic `*.internal.*` namespace) by default. The dashboard
             // toggle re-fetches with `?include_internal=1` so internal
@@ -2799,13 +2819,22 @@ pub async fn handle_dashboard_request(
             // (e.g. `grant.`, `approval.`, `broker.`). Both are rendering-
             // layer only — store rows are unchanged.
             //
-            // implementation-note-118 — additional query params:
+            // implementation-note-166 — additional query params:
             //   ?persona_filter=<persona-id> — exact-match agent_id column
             //   ?scope_filter=<prefix>       — credential LIKE prefix%
             //   ?since=<unix-ms>             — inclusive lower-bound timestamp
             //   ?before=<unix-ms>            — inclusive upper-bound timestamp
-            let (include_internal, action_filter, persona_filter, scope_filter, since_ms, before_ms) =
-                req.uri().query().map(|q| {
+            let (
+                include_internal,
+                action_filter,
+                persona_filter,
+                scope_filter,
+                since_ms,
+                before_ms,
+            ) = req
+                .uri()
+                .query()
+                .map(|q| {
                     let mut include = false;
                     let mut a_filter: Option<String> = None;
                     let mut p_filter: Option<String> = None;
@@ -2836,7 +2865,8 @@ pub async fn handle_dashboard_request(
                         }
                     }
                     (include, a_filter, p_filter, s_filter, since, before)
-                }).unwrap_or((false, None, None, None, None, None));
+                })
+                .unwrap_or((false, None, None, None, None, None));
             let entries = state
                 .store
                 .query_audit(&AuditFilter {
@@ -2854,10 +2884,7 @@ pub async fn handle_dashboard_request(
                 .iter()
                 .filter(|e| include_internal || !is_internal_audit_action(&e.action))
                 .map(|e| {
-                    let persona_name = e
-                        .agent_id
-                        .as_deref()
-                        .and_then(|id| names.get(id).cloned());
+                    let persona_name = e.agent_id.as_deref().and_then(|id| names.get(id).cloned());
                     serde_json::json!({
                         "id": e.id,
                         "timestamp": e.timestamp,
@@ -2874,12 +2901,12 @@ pub async fn handle_dashboard_request(
         }
 
         (Method::GET, "/api/maturation/candidates") => {
-            // implementation-note-154: shipped
+            // implementation-note-203: shipped
             let conn = state.store.conn();
             let mut stmt = match conn.prepare(
                 "SELECT action, credential, COUNT(*) as freq, MAX(timestamp) as last_seen \
                  FROM audit_log GROUP BY action, credential \
-                 HAVING freq > 2 ORDER BY freq DESC LIMIT 20"
+                 HAVING freq > 2 ORDER BY freq DESC LIMIT 20",
             ) {
                 Ok(s) => s,
                 Err(e) => {
@@ -2903,7 +2930,7 @@ pub async fn handle_dashboard_request(
             && path.starts_with("/api/grants/")
             && path.ends_with("/revoke-statement") =>
         {
-            // implementation-note-155 — per-statement revoke
+            // implementation-note-204 — per-statement revoke
             // wired through the dashboard. Body: `{"sid": "S0"}`.
             if !origin_ok(&headers, &state.expected_origin) {
                 error_response(403, "origin or referer header missing or mismatched")
@@ -2980,9 +3007,14 @@ pub async fn handle_dashboard_request(
                     .strip_suffix("/approve-always")
                     .unwrap();
                 // Default 30-day TTL per design spec.
+                // standing_grant_expires_at_capped: emit strict RFC-3339
+                // (with TZ) so `create_standing_grant`'s parser accepts it.
+                // 29 days keeps the value safely inside MAX_GRANT_TTL_SECS
+                // (30 days) — by the time the store sees it, sub-second
+                // drift from now-to-resolve would not push it past the cap.
                 let expires_at = {
-                    let thirty_days = chrono::Utc::now() + chrono::Duration::days(30);
-                    Some(thirty_days.format("%Y-%m-%dT%H:%M:%S").to_string())
+                    let twenty_nine_days = chrono::Utc::now() + chrono::Duration::days(29);
+                    Some(twenty_nine_days.to_rfc3339())
                 };
                 match state.store.resolve_approval(
                     id,
@@ -2991,7 +3023,10 @@ pub async fn handle_dashboard_request(
                         expires_at,
                     },
                 ) {
-                    Ok(()) => json_response(StatusCode::OK, &serde_json::json!({"approved": true, "standing_grant_created": true})),
+                    Ok(()) => json_response(
+                        StatusCode::OK,
+                        &serde_json::json!({"approved": true, "standing_grant_created": true}),
+                    ),
                     Err(e) => error_response(400, &e.to_string()),
                 }
             }
@@ -3035,7 +3070,7 @@ pub async fn handle_dashboard_request(
             }
         }
 
-        // implementation-note-74: WebAuthn registration ceremony — begin.
+        // implementation-note-91: WebAuthn registration ceremony — begin.
         //
         // Body: optional `{persona_id}`. Defaults to the daemon's
         // first persona (single-tenant local dashboard). Returns
@@ -3054,7 +3089,10 @@ pub async fn handle_dashboard_request(
             #[cfg(feature = "webauthn")]
             {
                 if !origin_ok(&headers, &state.expected_origin) {
-                    return Ok(error_response(403, "origin or referer header missing or mismatched"));
+                    return Ok(error_response(
+                        403,
+                        "origin or referer header missing or mismatched",
+                    ));
                 }
                 if !csrf_ok(&headers, &state.csrf_token) {
                     return Ok(error_response(403, "csrf token missing or mismatched"));
@@ -3099,7 +3137,7 @@ pub async fn handle_dashboard_request(
             }
         }
 
-        // implementation-note-74: WebAuthn registration ceremony — finish.
+        // implementation-note-91: WebAuthn registration ceremony — finish.
         //
         // Body: `{challenge_id, credential}` where `credential` is the
         // `RegisterPublicKeyCredential` JSON the browser produced from
@@ -3113,7 +3151,10 @@ pub async fn handle_dashboard_request(
             #[cfg(feature = "webauthn")]
             {
                 if !origin_ok(&headers, &state.expected_origin) {
-                    return Ok(error_response(403, "origin or referer header missing or mismatched"));
+                    return Ok(error_response(
+                        403,
+                        "origin or referer header missing or mismatched",
+                    ));
                 }
                 if !csrf_ok(&headers, &state.csrf_token) {
                     return Ok(error_response(403, "csrf token missing or mismatched"));
@@ -3159,7 +3200,7 @@ pub async fn handle_dashboard_request(
             }
         }
 
-        // implementation-note-74: WebAuthn authentication ceremony — begin.
+        // implementation-note-91: WebAuthn authentication ceremony — begin.
         //
         // Body: `{approval_id}`. The daemon looks up the approval to
         // determine the persona, loads that persona's enrolled
@@ -3172,7 +3213,10 @@ pub async fn handle_dashboard_request(
             #[cfg(feature = "webauthn")]
             {
                 if !origin_ok(&headers, &state.expected_origin) {
-                    return Ok(error_response(403, "origin or referer header missing or mismatched"));
+                    return Ok(error_response(
+                        403,
+                        "origin or referer header missing or mismatched",
+                    ));
                 }
                 if !csrf_ok(&headers, &state.csrf_token) {
                     return Ok(error_response(403, "csrf token missing or mismatched"));
@@ -3218,7 +3262,24 @@ pub async fn handle_dashboard_request(
             }
         }
 
-        // implementation-note-74: list enrolled credentials for a persona.
+        // Browser-side daemon presence-token minting is intentionally disabled.
+        // The shipped dashboard WebAuthn flows are passkey enrollment and
+        // approval confirmation. This route previously minted a wildcard token
+        // with a fake uid and a local stub signer; that misrepresented the
+        // actual trust boundary, so the surface now fails closed until it can
+        // bind to real runtime-backed operator state.
+        _ if method == Method::POST && path == "/api/webauthn/auth/complete" => {
+            let _ = req;
+            if !origin_ok(&headers, &state.expected_origin) {
+                error_response(403, "origin or referer header missing or mismatched")
+            } else if !csrf_ok(&headers, &state.csrf_token) {
+                error_response(403, "csrf token missing or mismatched")
+            } else {
+                webauthn_auth_complete_not_shipped_response()
+            }
+        }
+
+        // implementation-note-91: list enrolled credentials for a persona.
         // Used by the `/settings/passkeys` page to render the list.
         _ if method == Method::GET && path.starts_with("/api/webauthn/credentials") => {
             #[cfg(feature = "webauthn")]
@@ -3253,14 +3314,17 @@ pub async fn handle_dashboard_request(
             }
         }
 
-        // implementation-note-74: delete an enrolled credential. Body
+        // implementation-note-91: delete an enrolled credential. Body
         // `{persona_id, credential_id}`. Used by the settings page's
         // Remove button.
         _ if method == Method::POST && path == "/api/webauthn/credentials/delete" => {
             #[cfg(feature = "webauthn")]
             {
                 if !origin_ok(&headers, &state.expected_origin) {
-                    return Ok(error_response(403, "origin or referer header missing or mismatched"));
+                    return Ok(error_response(
+                        403,
+                        "origin or referer header missing or mismatched",
+                    ));
                 }
                 if !csrf_ok(&headers, &state.csrf_token) {
                     return Ok(error_response(403, "csrf token missing or mismatched"));
@@ -3283,10 +3347,7 @@ pub async fn handle_dashboard_request(
                     return Ok(error_response(400, "missing persona_id or credential_id"));
                 };
                 match gate.delete_credential(&p, &c) {
-                    Ok(()) => json_response(
-                        StatusCode::OK,
-                        &serde_json::json!({"deleted": true}),
-                    ),
+                    Ok(()) => json_response(StatusCode::OK, &serde_json::json!({"deleted": true})),
                     Err(e) => error_response(500, &e.to_string()),
                 }
             }
@@ -3307,7 +3368,7 @@ pub async fn handle_dashboard_request(
             json_response(StatusCode::OK, &body)
         }
 
-        // implementation-note-125: GET /api/cluster-snapshot/latest
+        // implementation-note-174: GET /api/cluster-snapshot/latest
         // Returns the most recent snapshot_id from the local snapshots dir.
         // The puller on the operator's daemon calls this to discover the latest
         // snapshot before fetching the full blob.
@@ -3341,17 +3402,18 @@ pub async fn handle_dashboard_request(
                     }
                     match best {
                         None => error_response(404, "no snapshots available"),
-                        Some((_, snapshot_id)) => {
-                            json_response(StatusCode::OK, &serde_json::json!({
+                        Some((_, snapshot_id)) => json_response(
+                            StatusCode::OK,
+                            &serde_json::json!({
                                 "snapshot_id": snapshot_id,
-                            }))
-                        }
+                            }),
+                        ),
                     }
                 }
             }
         }
 
-        // implementation-note-125: GET /api/cluster-snapshot/{id}
+        // implementation-note-174: GET /api/cluster-snapshot/{id}
         // Returns { manifest, encrypted_blob_hex } for the given snapshot_id prefix.
         // The puller fetches this after discovering the latest snapshot_id.
         _ if method == Method::GET && path.starts_with("/api/cluster-snapshot/") => {
@@ -3412,7 +3474,9 @@ pub async fn handle_dashboard_request(
                 error_response(400, "missing grant id")
             } else {
                 match state.store.get_grant(id) {
-                    Ok(g) => json_response(StatusCode::OK, &grant_to_json_with_store(&g, &state.store)),
+                    Ok(g) => {
+                        json_response(StatusCode::OK, &grant_to_json_with_store(&g, &state.store))
+                    }
                     Err(_) => error_response(404, "grant not found"),
                 }
             }
@@ -3435,7 +3499,9 @@ pub async fn handle_dashboard_request(
                     .unwrap();
                 match state.store.pause_grant(id) {
                     Ok(()) => json_response(StatusCode::OK, &serde_json::json!({"paused": true})),
-                    Err(crate::infra::store::StoreError::NotFound) => error_response(404, "grant not found"),
+                    Err(crate::infra::store::StoreError::NotFound) => {
+                        error_response(404, "grant not found")
+                    }
                     Err(e) => error_response(400, &e.to_string()),
                 }
             }
@@ -3458,7 +3524,9 @@ pub async fn handle_dashboard_request(
                     .unwrap();
                 match state.store.resume_grant(id) {
                     Ok(()) => json_response(StatusCode::OK, &serde_json::json!({"paused": false})),
-                    Err(crate::infra::store::StoreError::NotFound) => error_response(404, "grant not found"),
+                    Err(crate::infra::store::StoreError::NotFound) => {
+                        error_response(404, "grant not found")
+                    }
                     Err(e) => error_response(400, &e.to_string()),
                 }
             }
@@ -3482,20 +3550,29 @@ pub async fn handle_dashboard_request(
 
                 // Read body bytes then parse JSON
                 use http_body_util::BodyExt as _;
-                let body_bytes = req.into_body().collect().await.map(|c| c.to_bytes()).unwrap_or_default();
-                let params: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap_or_default();
+                let body_bytes = req
+                    .into_body()
+                    .collect()
+                    .await
+                    .map(|c| c.to_bytes())
+                    .unwrap_or_default();
+                let params: serde_json::Value =
+                    serde_json::from_slice(&body_bytes).unwrap_or_default();
                 let tokens_delta = params["tokens_delta"].as_u64();
                 let cents_delta = params["cents_delta"].as_u64();
                 let ttl_extension_secs = params["ttl_extension_secs"].as_u64();
 
-                match state.store.extend_grant(id, tokens_delta, cents_delta, ttl_extension_secs) {
+                match state
+                    .store
+                    .extend_grant(id, tokens_delta, cents_delta, ttl_extension_secs)
+                {
                     Ok(g) => json_response(StatusCode::OK, &grant_to_json(&g)),
                     Err(e) => error_response(400, &e.to_string()),
                 }
             }
         }
 
-        // POST /api/approvals/{id}/dismiss — implementation-note-147
+        // POST /api/approvals/{id}/dismiss — implementation-note-196
         // Operator-initiated dismiss. Sets status to 'dismissed', records
         // `approval.dismissed` audit event, removes the card from the dashboard.
         _ if method == Method::POST
@@ -3513,16 +3590,28 @@ pub async fn handle_dashboard_request(
                     .strip_suffix("/dismiss")
                     .unwrap();
                 match state.store.dismiss_approval(id) {
-                    Ok(()) => json_response(StatusCode::OK, &serde_json::json!({"dismissed": true})),
-                    Err(crate::infra::store::StoreError::NotFound) => error_response(404, "approval not found"),
-                    Err(crate::infra::store::StoreError::AlreadyResolved) => error_response(409, "approval already resolved"),
+                    Ok(()) => {
+                        json_response(StatusCode::OK, &serde_json::json!({"dismissed": true}))
+                    }
+                    Err(crate::infra::store::StoreError::NotFound) => {
+                        error_response(404, "approval not found")
+                    }
+                    Err(crate::infra::store::StoreError::AlreadyResolved) => {
+                        error_response(409, "approval already resolved")
+                    }
                     Err(e) => error_response(400, &e.to_string()),
                 }
             }
         }
 
         // GET /grants/{id} — HTML grant-detail page with Pause/Extend buttons.
-        (Method::GET, p) if p.starts_with("/grants/") && !p.contains("/pause") && !p.contains("/unpause") && !p.contains("/extend") && !p.contains("/revoke") => {
+        (Method::GET, p)
+            if p.starts_with("/grants/")
+                && !p.contains("/pause")
+                && !p.contains("/unpause")
+                && !p.contains("/extend")
+                && !p.contains("/revoke") =>
+        {
             let id = p.strip_prefix("/grants/").unwrap_or("");
             if id.is_empty() {
                 error_response(400, "missing grant id")
@@ -3563,14 +3652,19 @@ pub async fn handle_dashboard_request(
         // of the grant row so active grants remain viewable.
         (Method::GET, p) if p.starts_with("/receipts/") => {
             let id = p.strip_prefix("/receipts/").unwrap_or("");
-            let accept = req.headers()
+            let accept = req
+                .headers()
                 .get("accept")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
             let format_param = req.uri().query().and_then(|q| {
                 q.split('&').find_map(|kv| {
                     let mut parts = kv.splitn(2, '=');
-                    if parts.next() == Some("format") { parts.next() } else { None }
+                    if parts.next() == Some("format") {
+                        parts.next()
+                    } else {
+                        None
+                    }
                 })
             });
             let want_json = format_param == Some("json")
@@ -3687,9 +3781,13 @@ pub async fn handle_dashboard_request(
             } else if let Some(bt) = grant.budget.as_ref().and_then(|b| b.tokens) {
                 let tokens_used = grant.usage.tokens;
                 let pct = tokens_used * 100 / bt.max(1);
-                if pct >= 100 { "budget_exhausted" }
-                else if pct >= 95 { "budget_warning" }
-                else { "usage_update" }
+                if pct >= 100 {
+                    "budget_exhausted"
+                } else if pct >= 95 {
+                    "budget_warning"
+                } else {
+                    "usage_update"
+                }
             } else {
                 "usage_update"
             };
@@ -3730,12 +3828,12 @@ pub async fn handle_dashboard_request(
             }
         }
 
-        // implementation-note-156 — first-run passkey enrollment page.
+        // implementation-note-205 — first-run passkey enrollment page.
         // Explains how to register the operator's platform authenticator
         // (Touch ID on macOS, Windows Hello on Windows) so the dashboard
         // Approve button raises the OS biometric sheet.
         (Method::GET, "/settings/passkeys") => {
-            // implementation-note-74: substitute the per-process CSRF token
+            // implementation-note-91: substitute the per-process CSRF token
             // so the page can issue authenticated POSTs to
             // /api/webauthn/{register,credentials/delete}.
             let html = PASSKEYS_SETTINGS_HTML.replace("{{CSRF_TOKEN}}", &state.csrf_token);
@@ -3776,21 +3874,34 @@ fn grant_to_json_with_store(
 ) -> serde_json::Value {
     let mut conds = serde_json::Map::new();
     if let Some(rate) = g.max_uses_per_hour {
-        conds.insert("rate_limit".to_string(), serde_json::json!(format!("{}/hour", rate)));
+        conds.insert(
+            "rate_limit".to_string(),
+            serde_json::json!(format!("{}/hour", rate)),
+        );
     }
     if let (Some(start), Some(end)) = (g.allowed_hours_start, g.allowed_hours_end) {
-        conds.insert("time_window".to_string(), serde_json::json!(format!("{}:00-{}:00 UTC", start, end)));
+        conds.insert(
+            "time_window".to_string(),
+            serde_json::json!(format!("{}:00-{}:00 UTC", start, end)),
+        );
     }
     if let Some(ref targets) = g.allowed_targets {
         conds.insert("allowed_targets".to_string(), serde_json::json!(targets));
     }
     if let Some(limit) = g.spending_limit_cents {
-        conds.insert("spending_limit".to_string(), serde_json::json!(format!("${}.{:02}/day", limit / 100, limit % 100)));
+        conds.insert(
+            "spending_limit".to_string(),
+            serde_json::json!(format!("${}.{:02}/day", limit / 100, limit % 100)),
+        );
     }
     if let Some(depth) = g.max_delegation_depth {
         conds.insert("delegation_depth".to_string(), serde_json::json!(depth));
     }
-    let conditions = if conds.is_empty() { serde_json::Value::Null } else { serde_json::Value::Object(conds) };
+    let conditions = if conds.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::Object(conds)
+    };
 
     let statements: serde_json::Value = match store.get_access_grant(&g.id) {
         Ok(chain) => {
@@ -3824,11 +3935,11 @@ fn grant_to_json_with_store(
         }
     };
 
-    // implementation-note-119 — additive `persona_name` lookup so the dashboard
+    // implementation-note-167 — additive `persona_name` lookup so the dashboard
     // can render the persona's display name as the primary label.
     let persona_name = store.get_persona(&g.persona_id).ok().map(|p| p.name);
 
-    // dashboard_agent_tree_view_promoted — implementation-note-157
+    // dashboard_agent_tree_view_promoted — implementation-note-206
     // Slice A (backend). Surface parent persona id+name when this grant was
     // minted via delegate (g.parent_grant_id is Some). The Active Agents
     // tile renders "delegated by <parent_alias>" above the credential list.
@@ -3848,7 +3959,7 @@ fn grant_to_json_with_store(
             None => (None, None),
         };
 
-    // implementation-note-155 — surface seconds-remaining
+    // implementation-note-204 — surface seconds-remaining
     // alongside the absolute timestamp so the dashboard JS can render a
     // tick-down counter without re-parsing RFC3339 in every browser.
     // `null` when the grant has no TTL or the timestamp is unparseable.
@@ -3885,21 +3996,34 @@ fn grant_to_json_with_store(
 fn grant_to_json(g: &crate::trust::grant::GrantInfo) -> serde_json::Value {
     let mut conds = serde_json::Map::new();
     if let Some(rate) = g.max_uses_per_hour {
-        conds.insert("rate_limit".to_string(), serde_json::json!(format!("{}/hour", rate)));
+        conds.insert(
+            "rate_limit".to_string(),
+            serde_json::json!(format!("{}/hour", rate)),
+        );
     }
     if let (Some(start), Some(end)) = (g.allowed_hours_start, g.allowed_hours_end) {
-        conds.insert("time_window".to_string(), serde_json::json!(format!("{}:00-{}:00 UTC", start, end)));
+        conds.insert(
+            "time_window".to_string(),
+            serde_json::json!(format!("{}:00-{}:00 UTC", start, end)),
+        );
     }
     if let Some(ref targets) = g.allowed_targets {
         conds.insert("allowed_targets".to_string(), serde_json::json!(targets));
     }
     if let Some(limit) = g.spending_limit_cents {
-        conds.insert("spending_limit".to_string(), serde_json::json!(format!("${}.{:02}/day", limit / 100, limit % 100)));
+        conds.insert(
+            "spending_limit".to_string(),
+            serde_json::json!(format!("${}.{:02}/day", limit / 100, limit % 100)),
+        );
     }
     if let Some(depth) = g.max_delegation_depth {
         conds.insert("delegation_depth".to_string(), serde_json::json!(depth));
     }
-    let conditions = if conds.is_empty() { serde_json::Value::Null } else { serde_json::Value::Object(conds) };
+    let conditions = if conds.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::Object(conds)
+    };
     serde_json::json!({
         "id": g.id,
         "persona_id": g.persona_id,
@@ -3957,7 +4081,8 @@ fn build_signed_receipt_html(r: &core_grant_types::grant_receipt::GrantReceipt) 
         })
         .collect();
     let statements_table = if statements_rows.is_empty() {
-        "<p style=\"color:var(--text-muted);font-size:12px\">No statements recorded.</p>".to_string()
+        "<p style=\"color:var(--text-muted);font-size:12px\">No statements recorded.</p>"
+            .to_string()
     } else {
         format!(
             r#"<table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr style="color:var(--text-muted);text-align:left"><th>SID</th><th>Tokens</th><th>Cents</th><th>Requests</th><th>Wall-clock</th></tr></thead><tbody>{statements_rows}</tbody></table>"#
@@ -3991,7 +4116,7 @@ pre{{background:var(--bg-hover);border:1px solid var(--border);border-radius:6px
 .btn:hover{{opacity:.8}}
 .actions{{display:flex;gap:8px;margin-top:14px}}
 table td,table th{{padding:6px 10px;border-bottom:1px solid var(--border)}}
-/* implementation-note-142: Signed-by card. Foreground treatment for
+/* implementation-note-191: Signed-by card. Foreground treatment for
    the trust anchor — this is the moment the viewer's eye is on the
    receipt artifact, perfect time to bind pubkey↔receipt visually. */
 .signed-block{{padding:16px 18px;background:rgba(232,93,38,.05);border:1px solid rgba(232,93,38,.22);border-radius:6px;margin-bottom:14px}}
@@ -4095,7 +4220,11 @@ table td,table th{{padding:6px 10px;border-bottom:1px solid var(--border)}}
         service = r.summary.service,
         resource = r.summary.resource,
         issued = r.lifecycle.issued_at,
-        last_used = r.lifecycle.last_used_at.map(|t| format!("epoch {t}")).unwrap_or_else(|| "—".into()),
+        last_used = r
+            .lifecycle
+            .last_used_at
+            .map(|t| format!("epoch {t}"))
+            .unwrap_or_else(|| "—".into()),
         terminated = r.lifecycle.terminated_at,
         statements_table = statements_table,
         signer_pubkey = r.evidence.signer_pubkey,
@@ -4107,7 +4236,7 @@ table td,table th{{padding:6px 10px;border-bottom:1px solid var(--border)}}
     )
 }
 
-/// implementation-note-142: render a 64-hex Ed25519 pubkey as a
+/// implementation-note-191: render a 64-hex Ed25519 pubkey as a
 /// short SSH-style fingerprint (`4a5d:a587:dd36:53b2`) using the first
 /// 8 bytes / 16 hex chars. Decorative only — the full pubkey is the
 /// actual trust anchor. Returns `—` for placeholder / empty inputs so
@@ -4163,11 +4292,11 @@ fn build_receipt_json(g: &crate::trust::grant::GrantInfo) -> serde_json::Value {
 /// no budget show an "unbounded" note.
 ///
 /// Pure function of the statement slice — testable without a running server.
-/// implementation-note-155 — per-Statement gauges with an
+/// implementation-note-204 — per-Statement gauges with an
 /// inline "Revoke" button per row. `revoked_sids` is the slice of sids that
 /// have already been revoked (struck through, button hidden). Wires to
 /// `POST /api/grants/{id}/revoke-statement` via the page's JS handler.
-// TERMINAL-implementation-note-158: terminal grants suppress per-Statement Revoke
+// TERMINAL-implementation-note-207: terminal grants suppress per-Statement Revoke
 pub(crate) fn render_statement_gauges_with_revoke(
     grant_id: &str,
     statements: &[(usize, &core_grant_types::Statement)],
@@ -4199,7 +4328,8 @@ pub(crate) fn render_statement_gauges_with_revoke(
             r#"<span style="font-size:11px;color:var(--danger);font-weight:600;text-decoration:none">REVOKED</span>"#.to_string()
         } else if is_terminal {
             // Grant has reached a terminal state — per-statement revoke is meaningless.
-            r#"<span style="font-size:11px;color:var(--text-muted);font-weight:600">FINAL</span>"#.to_string()
+            r#"<span style="font-size:11px;color:var(--text-muted);font-weight:600">FINAL</span>"#
+                .to_string()
         } else {
             format!(
                 r#"<button class="btn btn-danger" style="padding:2px 8px;font-size:10px" data-revoke-sid="{sid}" data-grant-id="{gid}">Revoke</button>"#,
@@ -4212,7 +4342,11 @@ pub(crate) fn render_statement_gauges_with_revoke(
             sid = stmt.sid,
             rt = stmt.resource_type.as_str(),
         ));
-        let has_budget = stmt.budget.as_ref().map(|b| !b.is_none_set()).unwrap_or(false);
+        let has_budget = stmt
+            .budget
+            .as_ref()
+            .map(|b| !b.is_none_set())
+            .unwrap_or(false);
         if !has_budget {
             out.push_str(r#"<div style="color:var(--text-dim);font-size:12px">unbounded</div>"#);
         } else if let Some(b) = &stmt.budget {
@@ -4243,7 +4377,10 @@ pub(crate) fn render_statement_gauges_with_revoke(
                 ));
             }
             if let Some(cap) = b.wall_clock_secs {
-                let pct = (u.wall_clock_secs * 100).checked_div(cap).unwrap_or(100).min(100);
+                let pct = (u.wall_clock_secs * 100)
+                    .checked_div(cap)
+                    .unwrap_or(100)
+                    .min(100);
                 let color = gauge_color(pct);
                 out.push_str(&format!(
                     r#"<div class="gauge-label"><span>wall-clock</span><span>{used}s / {cap}s ({pct}%)</span></div><div class="gauge-track"><div class="gauge-fill" style="width:{pct}%;background:{color}"></div></div>"#,
@@ -4256,7 +4393,9 @@ pub(crate) fn render_statement_gauges_with_revoke(
     out
 }
 
-pub(crate) fn render_statement_gauges(statements: &[(usize, &core_grant_types::Statement)]) -> String {
+pub(crate) fn render_statement_gauges(
+    statements: &[(usize, &core_grant_types::Statement)],
+) -> String {
     if statements.is_empty() {
         return String::new();
     }
@@ -4277,7 +4416,11 @@ pub(crate) fn render_statement_gauges(statements: &[(usize, &core_grant_types::S
             sid = stmt.sid,
             rt = stmt.resource_type.as_str(),
         ));
-        let has_budget = stmt.budget.as_ref().map(|b| !b.is_none_set()).unwrap_or(false);
+        let has_budget = stmt
+            .budget
+            .as_ref()
+            .map(|b| !b.is_none_set())
+            .unwrap_or(false);
         if !has_budget {
             out.push_str(r#"<div style="color:var(--text-dim);font-size:12px">unbounded</div>"#);
         } else if let Some(b) = &stmt.budget {
@@ -4308,7 +4451,10 @@ pub(crate) fn render_statement_gauges(statements: &[(usize, &core_grant_types::S
                 ));
             }
             if let Some(cap) = b.wall_clock_secs {
-                let pct = (u.wall_clock_secs * 100).checked_div(cap).unwrap_or(100).min(100);
+                let pct = (u.wall_clock_secs * 100)
+                    .checked_div(cap)
+                    .unwrap_or(100)
+                    .min(100);
                 let color = gauge_color(pct);
                 out.push_str(&format!(
                     r#"<div class="gauge-label"><span>wall-clock</span><span>{used}s / {cap}s ({pct}%)</span></div><div class="gauge-track"><div class="gauge-fill" style="width:{pct}%;background:{color}"></div></div>"#,
@@ -4323,7 +4469,13 @@ pub(crate) fn render_statement_gauges(statements: &[(usize, &core_grant_types::S
 
 #[inline]
 fn gauge_color(pct: u64) -> &'static str {
-    if pct >= 95 { "var(--danger)" } else if pct >= 80 { "var(--warning)" } else { "var(--success)" }
+    if pct >= 95 {
+        "var(--danger)"
+    } else if pct >= 80 {
+        "var(--warning)"
+    } else {
+        "var(--success)"
+    }
 }
 
 /// Render the `/grants/{id}` HTML detail page.
@@ -4356,7 +4508,11 @@ fn build_grant_detail_html_with_revoked(
 
     let is_terminal = matches!(
         g.status.as_str(),
-        "revoked" | "expired" | "expired_by_budget" | "exhausted_by_budget" | "parent_cascade_revoked"
+        "revoked"
+            | "expired"
+            | "expired_by_budget"
+            | "exhausted_by_budget"
+            | "parent_cascade_revoked"
     );
 
     let budget_section = if let Some(chain) = access_grant {
@@ -4365,7 +4521,9 @@ fn build_grant_detail_html_with_revoked(
         if gauges.is_empty() {
             String::new()
         } else {
-            format!(r#"<div class="card"><div class="card-title">Statements &amp; Budget</div>{gauges}</div>"#)
+            format!(
+                r#"<div class="card"><div class="card-title">Statements &amp; Budget</div>{gauges}</div>"#
+            )
         }
     } else {
         String::new()
@@ -4395,7 +4553,8 @@ fn build_grant_detail_html_with_revoked(
   <button type="submit" class="btn btn-danger" onclick="return confirm('Revoke this grant? This cannot be undone.')">Revoke</button>
 </form>
 <a href="/" class="btn btn-neutral">Back</a>"#,
-            id = g.id, csrf = csrf_token,
+            id = g.id,
+            csrf = csrf_token,
         )
     } else {
         format!(
@@ -4410,7 +4569,8 @@ fn build_grant_detail_html_with_revoked(
 </form>
 <a href="/receipts/{id}" class="btn btn-neutral">Receipt</a>
 <a href="/" class="btn btn-neutral">Back</a>"#,
-            id = g.id, csrf = csrf_token,
+            id = g.id,
+            csrf = csrf_token,
         )
     };
 
@@ -4559,7 +4719,7 @@ document.querySelectorAll('form[action$="/pause"],form[action$="/unpause"],form[
   }});
 }});
 
-// implementation-note-155 — per-statement revoke buttons.
+// implementation-note-204 — per-statement revoke buttons.
 document.querySelectorAll('button[data-revoke-sid]').forEach(btn=>{{
   btn.addEventListener('click',async e=>{{
     e.preventDefault();
@@ -4576,7 +4736,7 @@ document.querySelectorAll('button[data-revoke-sid]').forEach(btn=>{{
   }});
 }});
 
-// implementation-note-155 — live tick-down. Computes
+// implementation-note-204 — live tick-down. Computes
 // time-remaining from `expires_at` once per second; flips the status
 // badge to EXPIRED at the boundary. The server-side `expire_stale_grants`
 // sweep is the source of truth for the audit `grant.expired` event;
@@ -4615,9 +4775,9 @@ setInterval(renderTimeRemaining,1000);
 // Mirrors the summary page connectSSE pattern (sseConnections keyed by
 // grant id). Drops the former /api/grants/{id} poll every 2s.
 //
-// implementation-note-159: wall-clock gauge reads server-computed
+// implementation-note-208: wall-clock gauge reads server-computed
 // usage.wall_clock_secs from SSE events; tickWallClockGauge removed.
-// implementation-note-146 — statements array name is canonical.
+// implementation-note-195 — statements array name is canonical.
 function applyUsageGauges(stmts){{
   if(!Array.isArray(stmts))return;
   document.querySelectorAll('span').forEach(sidSpan=>{{
@@ -4722,11 +4882,14 @@ fn build_receipt_html(
         let budget_cents = g.budget.as_ref().and_then(|b| b.cents);
         let tokens_used = g.usage.tokens;
         let cents_used = g.usage.cents;
-        let token_pct = budget_tokens.map(|bt| (tokens_used * 100).checked_div(bt).unwrap_or(100u64));
+        let token_pct =
+            budget_tokens.map(|bt| (tokens_used * 100).checked_div(bt).unwrap_or(100u64));
         let cents_pct = budget_cents.map(|bc| (cents_used * 100).checked_div(bc).unwrap_or(100u64));
         let token_gauge = if let (Some(bt), Some(pct)) = (budget_tokens, token_pct) {
             let color = gauge_color(pct);
-            format!(r#"<div class="gauge-label"><span>Tokens</span><span>{tokens_used} / {bt} ({pct}%)</span></div><div class="gauge-track"><div class="gauge-fill" style="width:{pct}%;background:{color}"></div></div>"#)
+            format!(
+                r#"<div class="gauge-label"><span>Tokens</span><span>{tokens_used} / {bt} ({pct}%)</span></div><div class="gauge-track"><div class="gauge-fill" style="width:{pct}%;background:{color}"></div></div>"#
+            )
         } else {
             String::new()
         };
@@ -4734,7 +4897,9 @@ fn build_receipt_html(
             let color = gauge_color(pct);
             let used_fmt = format!("${:.2}", cents_used as f64 / 100.0);
             let budget_fmt = format!("${:.2}", bc as f64 / 100.0);
-            format!(r#"<div class="gauge-label"><span>Cost</span><span>{used_fmt} / {budget_fmt} ({pct}%)</span></div><div class="gauge-track"><div class="gauge-fill" style="width:{pct}%;background:{color}"></div></div>"#)
+            format!(
+                r#"<div class="gauge-label"><span>Cost</span><span>{used_fmt} / {budget_fmt} ({pct}%)</span></div><div class="gauge-track"><div class="gauge-fill" style="width:{pct}%;background:{color}"></div></div>"#
+            )
         } else {
             String::new()
         };
@@ -4743,7 +4908,9 @@ fn build_receipt_html(
         } else {
             ""
         };
-        format!(r#"<div class="card"><div class="card-title">Budget &amp; Usage</div>{token_gauge}{cents_gauge}{no_budget_msg}</div>"#)
+        format!(
+            r#"<div class="card"><div class="card-title">Budget &amp; Usage</div>{token_gauge}{cents_gauge}{no_budget_msg}</div>"#
+        )
     };
 
     let status_class = match g.status.as_str() {
@@ -4753,7 +4920,8 @@ fn build_receipt_html(
         _ => "pending",
     };
 
-    format!(r#"<!DOCTYPE html>
+    format!(
+        r#"<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -4939,8 +5107,16 @@ fn receipt_row_to_rollup(r: &crate::infra::receipt::ReceiptRow) -> DashboardRoll
         kind: rollup_kind,
         ts: r.materialized_at.clone(),
         receipt_hash: r.id.clone(),
-        persona: if r.actor.is_empty() { None } else { Some(r.actor.clone()) },
-        action: if r.resource.is_empty() { None } else { Some(r.resource.clone()) },
+        persona: if r.actor.is_empty() {
+            None
+        } else {
+            Some(r.actor.clone())
+        },
+        action: if r.resource.is_empty() {
+            None
+        } else {
+            Some(r.resource.clone())
+        },
         exit_code: None,
         denied_reason: None,
     }
@@ -4964,12 +5140,11 @@ fn rollup_view(rows: &[crate::infra::receipt::ReceiptRow]) -> serde_json::Value 
         .map(|r| {
             let (outcome_str, denial_reason) = match &r.outcome {
                 RollupOutcome::Success => ("success".to_string(), None),
-                RollupOutcome::Denied { reason } => {
-                    ("denied".to_string(), Some(reason.clone()))
-                }
-                RollupOutcome::Errored { exit_code } => {
-                    ("errored".to_string(), Some(format!("exit_code={exit_code}")))
-                }
+                RollupOutcome::Denied { reason } => ("denied".to_string(), Some(reason.clone())),
+                RollupOutcome::Errored { exit_code } => (
+                    "errored".to_string(),
+                    Some(format!("exit_code={exit_code}")),
+                ),
                 RollupOutcome::InFlight => ("in_flight".to_string(), None),
                 RollupOutcome::Incomplete => ("incomplete".to_string(), None),
             };
@@ -5019,18 +5194,29 @@ fn error_response(status: u16, msg: &str) -> Response<Full<Bytes>> {
         .unwrap()
 }
 
+/// The dashboard's shipped WebAuthn surfaces are passkey enrollment and
+/// per-approval confirmation. Browser-side daemon presence-token minting is
+/// intentionally disabled until this module can bind assertions to a real
+/// runtime-backed operator identity and signer.
+fn webauthn_auth_complete_not_shipped_response() -> Response<Full<Bytes>> {
+    error_response(
+        501,
+        "dashboard webauthn auth-complete is not a shipped daemon presence-token surface; use approval routes or local daemon presence_token_mint",
+    )
+}
+
 /// Truncate a persona ID for UI display. Keeps the 12-char UUID prefix after "persona-".
 /// Render the dedicated `/approvals/{id}` page HTML for a given approval
 /// record, with all `{{TOKEN}}` placeholders substituted.
 ///
-/// implementation-note-140 — the page leads with the high-level
+/// implementation-note-189 — the page leads with the high-level
 /// Approve/Deny decision; the per-statement breakdown for composite
 /// approvals is rendered client-side from the polled JSON behind a
 /// "Show details" disclosure (collapsed-by-default). Both the dashboard
 /// pending-approvals card and this page share the same
 /// `renderCompositeStatements` helper via `COMPOSITE_STATEMENTS_JS`,
 /// so the two surfaces cannot drift.
-/// implementation-note-74: shared dashboard handler for approve + deny.
+/// implementation-note-91: shared dashboard handler for approve + deny.
 ///
 /// Verifies a WebAuthn assertion against the persona's enrolled
 /// credentials before flipping approval state. Refuses the state
@@ -5066,8 +5252,7 @@ async fn resolve_approval_via_dashboard(
 
     // Decide which path: real WebAuthn vs legacy claim.
     #[cfg(feature = "webauthn")]
-    let use_real_webauthn = state.webauthn.is_some()
-        && std::env::var("EMBER_DISABLE_BIO").is_err();
+    let use_real_webauthn = state.webauthn.is_some() && std::env::var("EMBER_DISABLE_BIO").is_err();
     #[cfg(not(feature = "webauthn"))]
     let use_real_webauthn = false;
 
@@ -5088,7 +5273,7 @@ async fn resolve_approval_via_dashboard(
                 _ => {
                     return error_response(
                         401,
-                        "missing webauthn challenge_id — visit /settings/passkeys to enroll a passkey first, then retry"
+                        "missing webauthn challenge_id — visit /settings/passkeys to enroll a passkey first, then retry",
                     );
                 }
             };
@@ -5106,10 +5291,7 @@ async fn resolve_approval_via_dashboard(
                     return error_response(401, "challenge expired or mismatched — retry");
                 }
                 Err(crate::webauthn::WebauthnError::VerifyFailed(why)) => {
-                    return error_response(
-                        401,
-                        &format!("assertion did not verify: {why}"),
-                    );
+                    return error_response(401, &format!("assertion did not verify: {why}"));
                 }
                 Err(crate::webauthn::WebauthnError::NotEnrolled) => {
                     return error_response(
@@ -5167,7 +5349,7 @@ pub fn render_approval_page(
     approval: &crate::trust::approval::ApprovalRequestInfo,
     persona_name: Option<&str>,
 ) -> String {
-    // implementation-note-141 — for composite approvals, the row's flat `action`
+    // implementation-note-190 — for composite approvals, the row's flat `action`
     // column is the verb of statement 0; that misrepresents a multi-verb
     // chain on the operator-facing card (e.g. an Anthropic+budget+session
     // bundle showing as "credential.access"). Render an honest summary
@@ -5177,12 +5359,15 @@ pub fn render_approval_page(
     } else {
         approval.action.clone()
     };
-    // implementation-note-141 — show "name <identifier>" so the operator
+    // implementation-note-190 — show "name <identifier>" so the operator
     // sees both the human-friendly handle (e.g. `qa`) and the unique
     // persona-id suffix used in audit logs and grant chains. The
     // identifier-only fallback covers personas that lack a name.
     let persona_label = match persona_name.filter(|n| !n.is_empty()) {
-        Some(name) => format!("{name} <span class=\"persona-id\">{}</span>", truncate_persona_id(&approval.persona_id)),
+        Some(name) => format!(
+            "{name} <span class=\"persona-id\">{}</span>",
+            truncate_persona_id(&approval.persona_id)
+        ),
         None => truncate_persona_id(&approval.persona_id),
     };
     // COMPOSITE-prior change-TESTS-DASHBOARD — render skill_ref row when present on the
@@ -5276,7 +5461,10 @@ mod tests {
         // treated as already-prefixed. The validator at write time
         // refuses these, but the display layer must not silently let
         // them through with a missing `did:ember:` decoration either.
-        assert_eq!(display_action_key("did::gh.pr_create"), "did:ember:did::gh.pr_create");
+        assert_eq!(
+            display_action_key("did::gh.pr_create"),
+            "did:ember:did::gh.pr_create"
+        );
         assert_eq!(
             display_action_key("did:something_without_a_colon"),
             "did:ember:did:something_without_a_colon"
@@ -5294,21 +5482,18 @@ mod tests {
             csrf_token: TEST_CSRF_TOKEN.to_string(),
             started_at: std::time::Instant::now(),
             expected_origin: TEST_EXPECTED_ORIGIN.to_string(),
-            // implementation-note-139: default to a well-known
+            // implementation-note-188: default to a well-known
             // localhost addr so most tests see a "bound" dashboard; tests
             // that exercise the "not bound" branch override directly.
-            dashboard_actual_addr: Some(
-                "127.0.0.1:3141".parse().expect("test addr parse"),
-            ),
+            dashboard_actual_addr: Some("127.0.0.1:3141".parse().expect("test addr parse")),
             data_dir: std::path::PathBuf::from("/tmp/.ember-test/data"),
-            // implementation-note-74: tests don't construct a gate; the
+            // implementation-note-91: tests don't construct a gate; the
             // approval handler falls back to the legacy
             // `{biometric: bool}` body field when this is `None`.
             #[cfg(feature = "webauthn")]
             webauthn: None,
         })
     }
-
 
     // Test-accessible wrapper that accepts any body type.
     async fn call(state: Arc<DashboardState>, path: &str) -> Response<Full<Bytes>> {
@@ -5344,10 +5529,7 @@ mod tests {
         handle_dashboard_boxed(state, req).await
     }
 
-    async fn call_post_wrong_csrf(
-        state: Arc<DashboardState>,
-        path: &str,
-    ) -> Response<Full<Bytes>> {
+    async fn call_post_wrong_csrf(state: Arc<DashboardState>, path: &str) -> Response<Full<Bytes>> {
         let req = Request::builder()
             .method("POST")
             .uri(format!("http://localhost{path}"))
@@ -5372,25 +5554,28 @@ mod tests {
                 let html = DASHBOARD_HTML
                     .replace("{{COMPOSITE_STATEMENTS_JS}}", COMPOSITE_STATEMENTS_JS)
                     .replace("{{CSRF_TOKEN}}", &state.csrf_token);
-                let if_none_match = headers
-                    .get("if-none-match")
-                    .and_then(|v| v.to_str().ok());
+                let if_none_match = headers.get("if-none-match").and_then(|v| v.to_str().ok());
                 dashboard_etag_response(if_none_match, html)
             }
 
             (Method::GET, "/api/status") => {
                 let active_grants = state.store.list_active_grants().unwrap_or_default().len();
-                let pending_approvals = state.store.list_pending_approvals().unwrap_or_default().len();
+                let pending_approvals = state
+                    .store
+                    .list_pending_approvals()
+                    .unwrap_or_default()
+                    .len();
                 let audit_events = state.store.audit_count().unwrap_or(0);
-                let active_agents = state.store.list_personas().unwrap_or_default()
+                let active_agents = state
+                    .store
+                    .list_personas()
+                    .unwrap_or_default()
                     .iter()
                     .filter(|p| p.status == "active")
                     .count();
-                // implementation-note-139: mirror the production
+                // implementation-note-188: mirror the production
                 // handler so `api_status_*` tests cover the new field shape.
-                let dashboard_addr_bound = state
-                    .dashboard_actual_addr
-                    .map(|a| a.to_string());
+                let dashboard_addr_bound = state.dashboard_actual_addr.map(|a| a.to_string());
                 let body = serde_json::json!({
                     "running": true,
                     "version": state.version,
@@ -5409,7 +5594,7 @@ mod tests {
                 let body: Vec<serde_json::Value> = grants
                     .iter()
                     .map(|g| {
-                        // implementation-note-146 — test handler mirrors
+                        // implementation-note-195 — test handler mirrors
                         // production: emit the per-Statement array under
                         // `statements` (the canonical name from
                         // grant_to_json_with_store) so JS callers no longer
@@ -5418,7 +5603,10 @@ mod tests {
                         let mut val = grant_to_json_with_store(g, &state.store);
                         if let Some(obj) = val.as_object_mut() {
                             // add persona_name (production path adds this too)
-                            obj.insert("persona_name".into(), serde_json::json!(names.get(&g.persona_id).cloned()));
+                            obj.insert(
+                                "persona_name".into(),
+                                serde_json::json!(names.get(&g.persona_id).cloned()),
+                            );
                             obj.insert("paused".into(), serde_json::json!(g.paused));
                         }
                         val
@@ -5429,7 +5617,8 @@ mod tests {
 
             (Method::GET, "/api/anomalies") => {
                 let anomalies = state.store.detect_anomalies().unwrap_or_default();
-                let body = serde_json::to_value(&anomalies).unwrap_or(serde_json::Value::Array(vec![]));
+                let body =
+                    serde_json::to_value(&anomalies).unwrap_or(serde_json::Value::Array(vec![]));
                 json_response(StatusCode::OK, &body)
             }
 
@@ -5450,29 +5639,33 @@ mod tests {
                 let id = path.strip_prefix("/api/approvals/").unwrap_or("");
                 match state.store.get_approval(id) {
                     Ok(a) => {
-                        // implementation-note-119 — surface persona.name for the
+                        // implementation-note-167 — surface persona.name for the
                         // approval-detail render path (test handler mirrors
                         // production).
-                        let persona_name = state.store.get_persona(&a.persona_id).ok().map(|p| p.name);
-                        json_response(StatusCode::OK, &serde_json::json!({
-                            "id": a.id,
-                            "persona_id": a.persona_id,
-                            "persona_name": persona_name,
-                            "credential_name": a.credential_name,
-                            "scope": a.scope,
-                            "ttl_secs": a.ttl_secs,
-                            "action": a.action,
-                            "risk_level": a.risk_level,
-                            "status": a.status,
-                            "reason": a.reason,
-                            "created_at": a.created_at,
-                            // implementation-note-140 — mirrors production handler so
-                            // the polled /api/approvals/{id} response carries the
-                            // composite_statements array; the page JS calls
-                            // renderBreakdown(data.composite_statements) on each poll.
-                            "composite_statements": a.composite_statements,
-                            "result_grant_id": a.result_grant_id,
-                        }))
+                        let persona_name =
+                            state.store.get_persona(&a.persona_id).ok().map(|p| p.name);
+                        json_response(
+                            StatusCode::OK,
+                            &serde_json::json!({
+                                "id": a.id,
+                                "persona_id": a.persona_id,
+                                "persona_name": persona_name,
+                                "credential_name": a.credential_name,
+                                "scope": a.scope,
+                                "ttl_secs": a.ttl_secs,
+                                "action": a.action,
+                                "risk_level": a.risk_level,
+                                "status": a.status,
+                                "reason": a.reason,
+                                "created_at": a.created_at,
+                                // implementation-note-189 — mirrors production handler so
+                                // the polled /api/approvals/{id} response carries the
+                                // composite_statements array; the page JS calls
+                                // renderBreakdown(data.composite_statements) on each poll.
+                                "composite_statements": a.composite_statements,
+                                "result_grant_id": a.result_grant_id,
+                            }),
+                        )
                     }
                     Err(_) => error_response(404, "approval not found"),
                 }
@@ -5480,38 +5673,44 @@ mod tests {
 
             (Method::GET, "/api/audit") => {
                 use crate::infra::audit::AuditFilter;
-                // implementation-note-119 — mirror the production handler's
+                // implementation-note-167 — mirror the production handler's
                 // `?include_internal=1` toggle and `?action_filter=<prefix>`
                 // so test coverage reflects the same operator-audit semantics.
-                let (include_internal, action_filter) = req.uri().query().map(|q| {
-                    let mut include = false;
-                    let mut filter: Option<String> = None;
-                    for kv in q.split('&') {
-                        let mut parts = kv.splitn(2, '=');
-                        let k = parts.next().unwrap_or("");
-                        let v = parts.next().unwrap_or("");
-                        if k == "include_internal" && (v == "1" || v == "true") {
-                            include = true;
+                let (include_internal, action_filter) = req
+                    .uri()
+                    .query()
+                    .map(|q| {
+                        let mut include = false;
+                        let mut filter: Option<String> = None;
+                        for kv in q.split('&') {
+                            let mut parts = kv.splitn(2, '=');
+                            let k = parts.next().unwrap_or("");
+                            let v = parts.next().unwrap_or("");
+                            if k == "include_internal" && (v == "1" || v == "true") {
+                                include = true;
+                            }
+                            if k == "action_filter" && !v.is_empty() {
+                                filter = Some(v.to_string());
+                            }
                         }
-                        if k == "action_filter" && !v.is_empty() {
-                            filter = Some(v.to_string());
-                        }
-                    }
-                    (include, filter)
-                }).unwrap_or((false, None));
+                        (include, filter)
+                    })
+                    .unwrap_or((false, None));
                 let entries = state
                     .store
-                    .query_audit(&AuditFilter { limit: Some(100), action_prefix: action_filter, ..Default::default() })
+                    .query_audit(&AuditFilter {
+                        limit: Some(100),
+                        action_prefix: action_filter,
+                        ..Default::default()
+                    })
                     .unwrap_or_default();
                 let names = persona_name_map(&state.store);
                 let body: Vec<serde_json::Value> = entries
                     .iter()
                     .filter(|e| include_internal || !is_internal_audit_action(&e.action))
                     .map(|e| {
-                        let persona_name = e
-                            .agent_id
-                            .as_deref()
-                            .and_then(|id| names.get(id).cloned());
+                        let persona_name =
+                            e.agent_id.as_deref().and_then(|id| names.get(id).cloned());
                         serde_json::json!({
                             "id": e.id,
                             "timestamp": e.timestamp,
@@ -5528,12 +5727,12 @@ mod tests {
             }
 
             (Method::GET, "/api/maturation/candidates") => {
-                // implementation-note-154: shipped
+                // implementation-note-203: shipped
                 let conn = state.store.conn();
                 let mut stmt = match conn.prepare(
                     "SELECT action, credential, COUNT(*) as freq, MAX(timestamp) as last_seen \
                      FROM audit_log GROUP BY action, credential \
-                     HAVING freq > 2 ORDER BY freq DESC LIMIT 20"
+                     HAVING freq > 2 ORDER BY freq DESC LIMIT 20",
                 ) {
                     Ok(s) => s,
                     Err(e) => {
@@ -5573,7 +5772,13 @@ mod tests {
             }
 
             // /grants/{id} — HTML grant-detail page
-            (Method::GET, p) if p.starts_with("/grants/") && !p.contains("/pause") && !p.contains("/unpause") && !p.contains("/extend") && !p.contains("/revoke") => {
+            (Method::GET, p)
+                if p.starts_with("/grants/")
+                    && !p.contains("/pause")
+                    && !p.contains("/unpause")
+                    && !p.contains("/extend")
+                    && !p.contains("/revoke") =>
+            {
                 let id = p.strip_prefix("/grants/").unwrap_or("");
                 if id.is_empty() {
                     error_response(400, "missing grant id")
@@ -5581,7 +5786,8 @@ mod tests {
                     match state.store.get_grant(id) {
                         Ok(g) => {
                             let chain = state.store.get_access_grant(&g.id).ok();
-                            let html = build_grant_detail_html(&g, &state.csrf_token, chain.as_ref());
+                            let html =
+                                build_grant_detail_html(&g, &state.csrf_token, chain.as_ref());
                             Response::builder()
                                 .status(StatusCode::OK)
                                 .header("content-type", "text/html; charset=utf-8")
@@ -5627,7 +5833,7 @@ mod tests {
                 && path.starts_with("/api/grants/")
                 && path.ends_with("/revoke-statement") =>
             {
-                // implementation-note-155 — test handler mirrors
+                // implementation-note-204 — test handler mirrors
                 // the production per-statement revoke route.
                 if !origin_ok(&headers, &state.expected_origin) {
                     error_response(403, "origin or referer header missing or mismatched")
@@ -5683,7 +5889,9 @@ mod tests {
                         .strip_suffix("/revoke")
                         .unwrap();
                     match state.store.revoke_grant(id) {
-                        Ok(()) => json_response(StatusCode::OK, &serde_json::json!({"revoked": true})),
+                        Ok(()) => {
+                            json_response(StatusCode::OK, &serde_json::json!({"revoked": true}))
+                        }
                         Err(e) => error_response(400, &e.to_string()),
                     }
                 }
@@ -5703,9 +5911,12 @@ mod tests {
                         .unwrap()
                         .strip_suffix("/approve-always")
                         .unwrap();
+                    // standing_grant_expires_at_capped: see sibling fix at
+                    // dashboard.rs:3074 for the rationale (strict RFC-3339
+                    // + 29 days to stay safely inside MAX_GRANT_TTL_SECS).
                     let expires_at = {
-                        let thirty_days = chrono::Utc::now() + chrono::Duration::days(30);
-                        Some(thirty_days.format("%Y-%m-%dT%H:%M:%S").to_string())
+                        let twenty_nine_days = chrono::Utc::now() + chrono::Duration::days(29);
+                        Some(twenty_nine_days.to_rfc3339())
                     };
                     match state.store.resolve_approval(
                         id,
@@ -5714,7 +5925,10 @@ mod tests {
                             expires_at,
                         },
                     ) {
-                        Ok(()) => json_response(StatusCode::OK, &serde_json::json!({"approved": true, "standing_grant_created": true})),
+                        Ok(()) => json_response(
+                            StatusCode::OK,
+                            &serde_json::json!({"approved": true, "standing_grant_created": true}),
+                        ),
                         Err(e) => error_response(400, &e.to_string()),
                     }
                 }
@@ -5735,7 +5949,9 @@ mod tests {
                         .strip_suffix("/approve")
                         .unwrap();
                     match state.store.resolve_approval(id, &ApprovalOutcome::Approved) {
-                        Ok(()) => json_response(StatusCode::OK, &serde_json::json!({"approved": true})),
+                        Ok(()) => {
+                            json_response(StatusCode::OK, &serde_json::json!({"approved": true}))
+                        }
                         Err(e) => error_response(400, &e.to_string()),
                     }
                 }
@@ -5761,13 +5977,25 @@ mod tests {
                             reason: "denied via dashboard".to_string(),
                         },
                     ) {
-                        Ok(()) => json_response(StatusCode::OK, &serde_json::json!({"denied": true})),
+                        Ok(()) => {
+                            json_response(StatusCode::OK, &serde_json::json!({"denied": true}))
+                        }
                         Err(e) => error_response(400, &e.to_string()),
                     }
                 }
             }
 
-            // implementation-note-147 — dismiss (test handler)
+            _ if method == Method::POST && path == "/api/webauthn/auth/complete" => {
+                if !origin_ok(&headers, &state.expected_origin) {
+                    error_response(403, "origin or referer header missing or mismatched")
+                } else if !csrf_ok(&headers, &state.csrf_token) {
+                    error_response(403, "csrf token missing or mismatched")
+                } else {
+                    webauthn_auth_complete_not_shipped_response()
+                }
+            }
+
+            // implementation-note-196 — dismiss (test handler)
             _ if method == Method::POST
                 && path.starts_with("/api/approvals/")
                 && path.ends_with("/dismiss") =>
@@ -5783,9 +6011,15 @@ mod tests {
                         .strip_suffix("/dismiss")
                         .unwrap();
                     match state.store.dismiss_approval(id) {
-                        Ok(()) => json_response(StatusCode::OK, &serde_json::json!({"dismissed": true})),
-                        Err(crate::infra::store::StoreError::NotFound) => error_response(404, "approval not found"),
-                        Err(crate::infra::store::StoreError::AlreadyResolved) => error_response(409, "approval already resolved"),
+                        Ok(()) => {
+                            json_response(StatusCode::OK, &serde_json::json!({"dismissed": true}))
+                        }
+                        Err(crate::infra::store::StoreError::NotFound) => {
+                            error_response(404, "approval not found")
+                        }
+                        Err(crate::infra::store::StoreError::AlreadyResolved) => {
+                            error_response(409, "approval already resolved")
+                        }
                         Err(e) => error_response(400, &e.to_string()),
                     }
                 }
@@ -5807,8 +6041,12 @@ mod tests {
                         .strip_suffix("/pause")
                         .unwrap();
                     match state.store.pause_grant(id) {
-                        Ok(()) => json_response(StatusCode::OK, &serde_json::json!({"paused": true})),
-                        Err(crate::infra::store::StoreError::NotFound) => error_response(404, "grant not found"),
+                        Ok(()) => {
+                            json_response(StatusCode::OK, &serde_json::json!({"paused": true}))
+                        }
+                        Err(crate::infra::store::StoreError::NotFound) => {
+                            error_response(404, "grant not found")
+                        }
                         Err(e) => error_response(400, &e.to_string()),
                     }
                 }
@@ -5829,8 +6067,12 @@ mod tests {
                         .strip_suffix("/unpause")
                         .unwrap();
                     match state.store.resume_grant(id) {
-                        Ok(()) => json_response(StatusCode::OK, &serde_json::json!({"paused": false})),
-                        Err(crate::infra::store::StoreError::NotFound) => error_response(404, "grant not found"),
+                        Ok(()) => {
+                            json_response(StatusCode::OK, &serde_json::json!({"paused": false}))
+                        }
+                        Err(crate::infra::store::StoreError::NotFound) => {
+                            error_response(404, "grant not found")
+                        }
                         Err(e) => error_response(400, &e.to_string()),
                     }
                 }
@@ -5867,7 +6109,7 @@ mod tests {
             }
 
             // 69K.7: grant detail
-            // implementation-note-146 — test handler mirrors
+            // implementation-note-195 — test handler mirrors
             // production by routing through `grant_to_json_with_store`, so
             // /api/grants/{id} emits the canonical `statements` array (same
             // shape as /api/grants and /api/grants/all).
@@ -5883,7 +6125,10 @@ mod tests {
                     error_response(400, "missing or invalid grant id")
                 } else {
                     match state.store.get_grant(id) {
-                        Ok(g) => json_response(StatusCode::OK, &grant_to_json_with_store(&g, &state.store)),
+                        Ok(g) => json_response(
+                            StatusCode::OK,
+                            &grant_to_json_with_store(&g, &state.store),
+                        ),
                         Err(_) => error_response(404, "grant not found"),
                     }
                 }
@@ -5914,8 +6159,10 @@ mod tests {
                 } else {
                     match state.store.get_grant(grant_id) {
                         Ok(g) => {
-                            let data = serde_json::to_string(&grant_to_json(&g)).unwrap_or_default();
-                            let body = format!("retry: 5000\nevent: usage_update\ndata: {data}\n\n");
+                            let data =
+                                serde_json::to_string(&grant_to_json(&g)).unwrap_or_default();
+                            let body =
+                                format!("retry: 5000\nevent: usage_update\ndata: {data}\n\n");
                             Response::builder()
                                 .status(StatusCode::OK)
                                 .header("content-type", "text/event-stream")
@@ -5927,7 +6174,7 @@ mod tests {
                 }
             }
 
-            // implementation-note-148 — test handler for `/api/receipts/stream`.
+            // implementation-note-197 — test handler for `/api/receipts/stream`.
             // Mirrors the production single-shot SSE snapshot so route
             // tests can assert content-type + framing without spinning
             // up a real listener.
@@ -5969,32 +6216,40 @@ mod tests {
             // AP-CONSTRUCT-RECEIPT-ROLLUP-DASHBOARD: supports ?view=rollup|raw.
             (Method::GET, "/api/receipts") => {
                 use crate::infra::receipt::ReceiptFilter;
-                let (persona_id, signed_only, since_iso, view) = req.uri().query().map(|q| {
-                    let mut pid: Option<String> = None;
-                    let mut signed = false;
-                    let mut since: Option<String> = None;
-                    let mut view = "rollup".to_string();
-                    for kv in q.split('&') {
-                        let mut parts = kv.splitn(2, '=');
-                        let k = parts.next().unwrap_or("");
-                        let v = parts.next().unwrap_or("");
-                        match k {
-                            "persona_id" if !v.is_empty() => pid = Some(v.to_string()),
-                            "signed_only" if v == "true" || v == "1" => signed = true,
-                            "view" if !v.is_empty() => view = v.to_string(),
-                            "since" => {
-                                let now = chrono::Utc::now();
-                                since = match v {
-                                    "24h" => Some((now - chrono::Duration::hours(24)).to_rfc3339()),
-                                    "7d" => Some((now - chrono::Duration::days(7)).to_rfc3339()),
-                                    _ => None,
-                                };
+                let (persona_id, signed_only, since_iso, view) = req
+                    .uri()
+                    .query()
+                    .map(|q| {
+                        let mut pid: Option<String> = None;
+                        let mut signed = false;
+                        let mut since: Option<String> = None;
+                        let mut view = "rollup".to_string();
+                        for kv in q.split('&') {
+                            let mut parts = kv.splitn(2, '=');
+                            let k = parts.next().unwrap_or("");
+                            let v = parts.next().unwrap_or("");
+                            match k {
+                                "persona_id" if !v.is_empty() => pid = Some(v.to_string()),
+                                "signed_only" if v == "true" || v == "1" => signed = true,
+                                "view" if !v.is_empty() => view = v.to_string(),
+                                "since" => {
+                                    let now = chrono::Utc::now();
+                                    since = match v {
+                                        "24h" => {
+                                            Some((now - chrono::Duration::hours(24)).to_rfc3339())
+                                        }
+                                        "7d" => {
+                                            Some((now - chrono::Duration::days(7)).to_rfc3339())
+                                        }
+                                        _ => None,
+                                    };
+                                }
+                                _ => {}
                             }
-                            _ => {}
                         }
-                    }
-                    (pid, signed, since, view)
-                }).unwrap_or((None, false, None, "rollup".to_string()));
+                        (pid, signed, since, view)
+                    })
+                    .unwrap_or((None, false, None, "rollup".to_string()));
                 let filter = ReceiptFilter {
                     persona_id,
                     signed_only,
@@ -6005,30 +6260,36 @@ mod tests {
                     resource: None,
                 };
                 if view == "raw" {
-                    let receipts = state.store.list_receipts_filtered(&filter).unwrap_or_default();
+                    let receipts = state
+                        .store
+                        .list_receipts_filtered(&filter)
+                        .unwrap_or_default();
                     let names = persona_name_map(&state.store);
-                    let body: Vec<serde_json::Value> = receipts.iter().map(|r| {
-                        let signed = r.evidence.signer_pubkey != "0".repeat(64)
-                            && r.evidence.sig != "0".repeat(128)
-                            && !r.evidence.signer_pubkey.is_empty();
-                        let persona_name = names.get(&r.summary.persona_id).cloned();
-                        let action_summary = format!(
-                            "{} · {}",
-                            r.summary.service,
-                            r.summary.resource.chars().take(40).collect::<String>()
-                        );
-                        serde_json::json!({
-                            "id": r.id,
-                            "grant_id": r.grant_id,
-                            "persona_id": r.summary.persona_id,
-                            "persona_name": persona_name,
-                            "action_summary": action_summary,
-                            "terminal_reason": format!("{:?}", r.lifecycle.terminal_reason),
-                            "created_at_epoch": r.lifecycle.terminated_at,
-                            "signed": signed,
-                            "signer_pubkey": r.evidence.signer_pubkey,
+                    let body: Vec<serde_json::Value> = receipts
+                        .iter()
+                        .map(|r| {
+                            let signed = r.evidence.signer_pubkey != "0".repeat(64)
+                                && r.evidence.sig != "0".repeat(128)
+                                && !r.evidence.signer_pubkey.is_empty();
+                            let persona_name = names.get(&r.summary.persona_id).cloned();
+                            let action_summary = format!(
+                                "{} · {}",
+                                r.summary.service,
+                                r.summary.resource.chars().take(40).collect::<String>()
+                            );
+                            serde_json::json!({
+                                "id": r.id,
+                                "grant_id": r.grant_id,
+                                "persona_id": r.summary.persona_id,
+                                "persona_name": persona_name,
+                                "action_summary": action_summary,
+                                "terminal_reason": format!("{:?}", r.lifecycle.terminal_reason),
+                                "created_at_epoch": r.lifecycle.terminated_at,
+                                "signed": signed,
+                                "signer_pubkey": r.evidence.signer_pubkey,
+                            })
                         })
-                    }).collect();
+                        .collect();
                     json_response(StatusCode::OK, &serde_json::Value::Array(body))
                 } else {
                     let rows = state.store.list_receipt_rows(&filter).unwrap_or_default();
@@ -6037,32 +6298,38 @@ mod tests {
                 }
             }
 
-            // implementation-note-144 — test handler mirrors the
+            // implementation-note-193 — test handler mirrors the
             // production `/api/receipts/search` route so `searchReceipts`-
             // style tests can assert filter behavior without spinning up a
             // real listener.
             (Method::GET, "/api/receipts/search") => {
                 use crate::infra::receipt::ReceiptFilter;
-                let (persona, scope, grant_id, resource) = req.uri().query().map(|q| {
-                    let mut p: Option<String> = None;
-                    let mut s: Option<String> = None;
-                    let mut g: Option<String> = None;
-                    let mut r: Option<String> = None;
-                    for kv in q.split('&') {
-                        let mut parts = kv.splitn(2, '=');
-                        let k = parts.next().unwrap_or("");
-                        let v = parts.next().unwrap_or("");
-                        if v.is_empty() { continue; }
-                        match k {
-                            "persona" => p = Some(v.to_string()),
-                            "scope" => s = Some(v.to_string()),
-                            "grant_id" => g = Some(v.to_string()),
-                            "resource" => r = Some(v.to_string()),
-                            _ => {}
+                let (persona, scope, grant_id, resource) = req
+                    .uri()
+                    .query()
+                    .map(|q| {
+                        let mut p: Option<String> = None;
+                        let mut s: Option<String> = None;
+                        let mut g: Option<String> = None;
+                        let mut r: Option<String> = None;
+                        for kv in q.split('&') {
+                            let mut parts = kv.splitn(2, '=');
+                            let k = parts.next().unwrap_or("");
+                            let v = parts.next().unwrap_or("");
+                            if v.is_empty() {
+                                continue;
+                            }
+                            match k {
+                                "persona" => p = Some(v.to_string()),
+                                "scope" => s = Some(v.to_string()),
+                                "grant_id" => g = Some(v.to_string()),
+                                "resource" => r = Some(v.to_string()),
+                                _ => {}
+                            }
                         }
-                    }
-                    (p, s, g, r)
-                }).unwrap_or((None, None, None, None));
+                        (p, s, g, r)
+                    })
+                    .unwrap_or((None, None, None, None));
 
                 let filter = ReceiptFilter {
                     persona_id: persona,
@@ -6079,7 +6346,8 @@ mod tests {
                 };
                 let names = persona_name_map(&state.store);
                 let scope_needle = scope.as_deref().or(resource.as_deref());
-                let body: Vec<serde_json::Value> = receipts.iter()
+                let body: Vec<serde_json::Value> = receipts
+                    .iter()
                     .filter(|r| match scope_needle {
                         Some(needle) if !needle.is_empty() => r.summary.resource.contains(needle),
                         _ => true,
@@ -6109,22 +6377,21 @@ mod tests {
                             "signed": signed,
                             "signer_pubkey": r.evidence.signer_pubkey,
                         })
-                    }).collect();
+                    })
+                    .collect();
                 json_response(StatusCode::OK, &serde_json::Value::Array(body))
             }
 
-            // implementation-note-156 — first-run passkey enrollment page. Mirror
+            // implementation-note-205 — first-run passkey enrollment page. Mirror
             // the production handler at line 2411 so test fixtures stay
             // in sync. Without this the test stub's routing table drifts
             // from production and `settings_passkeys_returns_enrollment_page`
             // sees 404 instead of 200.
-            (Method::GET, "/settings/passkeys") => {
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "text/html; charset=utf-8")
-                    .body(Full::new(Bytes::from(PASSKEYS_SETTINGS_HTML)))
-                    .unwrap()
-            }
+            (Method::GET, "/settings/passkeys") => Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/html; charset=utf-8")
+                .body(Full::new(Bytes::from(PASSKEYS_SETTINGS_HTML)))
+                .unwrap(),
 
             _ => Response::builder()
                 .status(StatusCode::NOT_FOUND)
@@ -6138,7 +6405,12 @@ mod tests {
         let state = make_state();
         let resp = call(state, "/").await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert!(ct.contains("text/html"));
     }
 
@@ -6147,7 +6419,10 @@ mod tests {
         let state = make_state();
         let resp = call(state, "/api/status").await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["running"], true);
     }
@@ -6157,7 +6432,10 @@ mod tests {
         let state = make_state();
         let resp = call(state, "/api/grants").await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json.is_array());
         assert_eq!(json.as_array().unwrap().len(), 0);
@@ -6168,7 +6446,10 @@ mod tests {
         let state = make_state();
         let resp = call(state, "/api/approvals").await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json.is_array());
     }
@@ -6178,7 +6459,10 @@ mod tests {
         let state = make_state();
         let resp = call(state, "/api/audit").await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json.is_array());
     }
@@ -6190,7 +6474,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
-    // implementation-note-74: the old `/api/webauthn/challenge` stub
+    // implementation-note-91: the old `/api/webauthn/challenge` stub
     // (returns random bytes the client claims it signed) is gone;
     // the new flow is `/api/webauthn/{register,auth}/{begin,complete}`
     // with real signature verification at finish time. The new flow's
@@ -6200,7 +6484,7 @@ mod tests {
     // `qember.sh demo headless` (which uses the CLI biometric path
     // that also honors `EMBER_DISABLE_BIO=1`).
 
-    /// implementation-note-156 — `resolve_approval_with_biometric` records the
+    /// implementation-note-205 — `resolve_approval_with_biometric` records the
     /// biometric flag + credential_id in the audit log so an auditor can
     /// distinguish hardware-attested approvals from click-throughs.
     #[tokio::test]
@@ -6210,7 +6494,14 @@ mod tests {
         let persona = state.store.create_persona("agent-bio").unwrap();
         let req = state
             .store
-            .submit_approval(&persona.id, "stripe-key", "read", None, "credential:read", "low")
+            .submit_approval(
+                &persona.id,
+                "stripe-key",
+                "read",
+                None,
+                "credential:read",
+                "low",
+            )
             .unwrap();
 
         state
@@ -6264,29 +6555,38 @@ mod tests {
     async fn api_grants_returns_created_grant() {
         let state = make_state();
         let persona = state.store.create_persona("test-agent").unwrap();
-        state.store.create_grant(&persona.id, "api-key", "read", None).unwrap();
+        state
+            .store
+            .create_grant(&persona.id, "api-key", "read", None)
+            .unwrap();
 
         let resp = call(state, "/api/grants").await;
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let arr = json.as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["persona_id"], persona.id);
     }
 
-    /// implementation-note-146 — /api/grants list must include the
+    /// implementation-note-195 — /api/grants list must include the
     /// per-Statement array under the canonical field name `statements`
     /// (matching grant_to_json_with_store / /api/grants/all / /api/grants/{id})
     /// so the dashboard JS can render real scope + budget for multi-statement
     /// grants without a `g.statements || g.composite_statements` fallback.
     #[tokio::test]
     async fn api_grants_list_includes_statements_for_composite_grant() {
-        use core_grant_types::{Budget, ResourceSelector, ResourceType, Statement, Usage};
         use core_grant_types::{Action, StatementId};
+        use core_grant_types::{Budget, ResourceSelector, ResourceType, Statement, Usage};
 
         let state = make_state();
         let persona = state.store.create_persona("cstmt-agent").unwrap();
-        let grant = state.store.create_grant(&persona.id, "api-key", "read", None).unwrap();
+        let grant = state
+            .store
+            .create_grant(&persona.id, "api-key", "read", None)
+            .unwrap();
 
         // Overwrite blocks_json with a 2-statement composite chain.
         let stmts = vec![
@@ -6295,8 +6595,14 @@ mod tests {
                 resource_type: ResourceType::Credential,
                 actions: vec![Action::from("read")],
                 resource: ResourceSelector::Any,
-                budget: Some(Budget { cents: Some(2_000), ..Default::default() }),
-                usage: Usage { cents: 412, ..Default::default() },
+                budget: Some(Budget {
+                    cents: Some(2_000),
+                    ..Default::default()
+                }),
+                usage: Usage {
+                    cents: 412,
+                    ..Default::default()
+                },
                 conditions: vec![],
             },
             Statement {
@@ -6339,11 +6645,12 @@ mod tests {
         let arr = json.as_array().unwrap();
         assert_eq!(arr.len(), 1);
 
-        let stmts_field = arr[0]["statements"].as_array()
+        let stmts_field = arr[0]["statements"]
+            .as_array()
             .expect("statements must be an array");
         assert_eq!(stmts_field.len(), 2, "should have 2 statements");
 
-        // implementation-note-146 — assert the legacy
+        // implementation-note-195 — assert the legacy
         // `composite_statements` field is gone from /api/grants. The list
         // endpoint must align on `statements` (the canonical name used by
         // /api/grants/all and /api/grants/{id}).
@@ -6354,42 +6661,50 @@ mod tests {
         );
 
         // SA has a cents budget — the demo gauge needs to read it.
-        let sa = stmts_field.iter().find(|s| s["sid"] == "SA")
+        let sa = stmts_field
+            .iter()
+            .find(|s| s["sid"] == "SA")
             .expect("SA statement must be present");
         assert_eq!(sa["budget"]["cents"], 2_000, "SA budget.cents must be 2000");
         assert_eq!(sa["usage"]["cents"], 412, "SA usage.cents must be 412");
 
         // SB has no budget.
-        let sb = stmts_field.iter().find(|s| s["sid"] == "SB")
+        let sb = stmts_field
+            .iter()
+            .find(|s| s["sid"] == "SB")
             .expect("SB statement must be present");
         assert!(sb["budget"].is_null(), "SB budget must be null");
     }
 
-    /// implementation-note-146 — /api/grants list and
+    /// implementation-note-195 — /api/grants list and
     /// /api/grants/{id} detail must emit the per-Statement array under the
     /// same field name (`statements`). Without this, dashboard JS callers
     /// have to fall back through `g.statements || g.composite_statements`
     /// and the two endpoints drift.
     #[tokio::test]
     async fn api_grants_list_and_detail_field_shapes_match() {
-        use core_grant_types::{Budget, ResourceSelector, ResourceType, Statement, Usage};
         use core_grant_types::{Action, StatementId};
+        use core_grant_types::{Budget, ResourceSelector, ResourceType, Statement, Usage};
 
         let state = make_state();
         let persona = state.store.create_persona("parity-agent").unwrap();
-        let grant = state.store.create_grant(&persona.id, "api-key", "read", None).unwrap();
+        let grant = state
+            .store
+            .create_grant(&persona.id, "api-key", "read", None)
+            .unwrap();
 
-        let stmts = vec![
-            Statement {
-                sid: StatementId::from("SX"),
-                resource_type: ResourceType::Credential,
-                actions: vec![Action::from("read")],
-                resource: ResourceSelector::Any,
-                budget: Some(Budget { cents: Some(1_000), ..Default::default() }),
-                usage: Usage::default(),
-                conditions: vec![],
-            },
-        ];
+        let stmts = vec![Statement {
+            sid: StatementId::from("SX"),
+            resource_type: ResourceType::Credential,
+            actions: vec![Action::from("read")],
+            resource: ResourceSelector::Any,
+            budget: Some(Budget {
+                cents: Some(1_000),
+                ..Default::default()
+            }),
+            usage: Usage::default(),
+            conditions: vec![],
+        }];
         let root = state.store.persona_root_keypair(&persona.id).unwrap();
         let chain = crate::trust::grant::access_grant_from_statements(
             &grant.id,
@@ -6443,7 +6758,7 @@ mod tests {
             "/api/grants/{{id}} must emit `statements` as an array"
         );
 
-        // dashboard_agent_tree_view_promoted — implementation-note-157
+        // dashboard_agent_tree_view_promoted — implementation-note-206
         // Slice A: list + detail must both expose parent_persona_id,
         // parent_persona_name, and revoked_sids so the Active Agents tile
         // can render the delegation tree + inline revoke without a
@@ -6505,7 +6820,16 @@ mod tests {
         // exact same per-Statement shape (sid, block_index, resource_type,
         // actions, resource, budget, usage, conditions).
         for (list_s, detail_s) in list_stmts.iter().zip(detail_stmts.iter()) {
-            for field in ["sid", "block_index", "resource_type", "actions", "resource", "budget", "usage", "conditions"] {
+            for field in [
+                "sid",
+                "block_index",
+                "resource_type",
+                "actions",
+                "resource",
+                "budget",
+                "usage",
+                "conditions",
+            ] {
                 assert_eq!(
                     list_s[field], detail_s[field],
                     "statements[].{field} must match across /api/grants and /api/grants/{{id}}"
@@ -6518,12 +6842,24 @@ mod tests {
     async fn api_status_counts_reflect_store_state() {
         let state = make_state();
         let persona = state.store.create_persona("agent-x").unwrap();
-        state.store.create_grant(&persona.id, "key", "read", None).unwrap();
-        state.store.submit_approval(&persona.id, "key2", "write", None, "access", "high").unwrap();
-        state.store.log_event(Some(&persona.id), "test.event", None, "ok", None).unwrap();
+        state
+            .store
+            .create_grant(&persona.id, "key", "read", None)
+            .unwrap();
+        state
+            .store
+            .submit_approval(&persona.id, "key2", "write", None, "access", "high")
+            .unwrap();
+        state
+            .store
+            .log_event(Some(&persona.id), "test.event", None, "ok", None)
+            .unwrap();
 
         let resp = call(Arc::clone(&state), "/api/status").await;
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["active_grants"], 1);
         assert_eq!(json["pending_approvals"], 1);
@@ -6537,7 +6873,10 @@ mod tests {
         let state = make_state();
         let resp = call_post(state, "/api/grants/nonexistent/revoke").await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["error"].is_string());
     }
@@ -6547,7 +6886,10 @@ mod tests {
         let state = make_state();
         let resp = call_post(state, "/api/approvals/nonexistent/approve").await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["error"].is_string());
     }
@@ -6556,11 +6898,21 @@ mod tests {
     async fn post_revoke_grant_succeeds() {
         let state = make_state();
         let persona = state.store.create_persona("agent-r").unwrap();
-        let grant = state.store.create_grant(&persona.id, "key", "read", None).unwrap();
+        let grant = state
+            .store
+            .create_grant(&persona.id, "key", "read", None)
+            .unwrap();
 
-        let resp = call_post(Arc::clone(&state), &format!("/api/grants/{}/revoke", grant.id)).await;
+        let resp = call_post(
+            Arc::clone(&state),
+            &format!("/api/grants/{}/revoke", grant.id),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["revoked"], true);
     }
@@ -6569,11 +6921,21 @@ mod tests {
     async fn post_approve_approval_succeeds() {
         let state = make_state();
         let persona = state.store.create_persona("agent-a").unwrap();
-        let req = state.store.submit_approval(&persona.id, "key", "read", None, "access", "low").unwrap();
+        let req = state
+            .store
+            .submit_approval(&persona.id, "key", "read", None, "access", "low")
+            .unwrap();
 
-        let resp = call_post(Arc::clone(&state), &format!("/api/approvals/{}/approve", req.id)).await;
+        let resp = call_post(
+            Arc::clone(&state),
+            &format!("/api/approvals/{}/approve", req.id),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["approved"], true);
     }
@@ -6582,11 +6944,21 @@ mod tests {
     async fn post_deny_approval_succeeds() {
         let state = make_state();
         let persona = state.store.create_persona("agent-d").unwrap();
-        let req = state.store.submit_approval(&persona.id, "key", "read", None, "access", "low").unwrap();
+        let req = state
+            .store
+            .submit_approval(&persona.id, "key", "read", None, "access", "low")
+            .unwrap();
 
-        let resp = call_post(Arc::clone(&state), &format!("/api/approvals/{}/deny", req.id)).await;
+        let resp = call_post(
+            Arc::clone(&state),
+            &format!("/api/approvals/{}/deny", req.id),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["denied"], true);
     }
@@ -6596,7 +6968,10 @@ mod tests {
         let state = make_state();
         let resp = call(state, "/api/anomalies").await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json.is_array());
         assert_eq!(json.as_array().unwrap().len(), 0);
@@ -6606,7 +6981,10 @@ mod tests {
     async fn api_grants_includes_conditions_field() {
         let state = make_state();
         let persona = state.store.create_persona("agent-cond").unwrap();
-        let grant = state.store.create_grant(&persona.id, "api-key", "read", None).unwrap();
+        let grant = state
+            .store
+            .create_grant(&persona.id, "api-key", "read", None)
+            .unwrap();
 
         // Set rate_limit and time_window conditions directly in the store.
         state.store.conn().execute(
@@ -6615,12 +6993,18 @@ mod tests {
         ).unwrap();
 
         let resp = call(state, "/api/grants").await;
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let arr = json.as_array().unwrap();
         assert_eq!(arr.len(), 1);
         let conditions = &arr[0]["conditions"];
-        assert!(conditions.is_object(), "conditions should be an object when grant has conditions");
+        assert!(
+            conditions.is_object(),
+            "conditions should be an object when grant has conditions"
+        );
         assert_eq!(conditions["rate_limit"], "10/hour");
         assert_eq!(conditions["time_window"], "9:00-17:00 UTC");
     }
@@ -6629,11 +7013,23 @@ mod tests {
     async fn api_anomalies_detects_high_denial_rate() {
         let state = make_state();
         for _ in 0..4 {
-            state.store.log_event(Some("agent-flagged"), "credential.access", None, "denied", None).unwrap();
+            state
+                .store
+                .log_event(
+                    Some("agent-flagged"),
+                    "credential.access",
+                    None,
+                    "denied",
+                    None,
+                )
+                .unwrap();
         }
         let resp = call(state, "/api/anomalies").await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let arr = json.as_array().unwrap();
         assert!(!arr.is_empty());
@@ -6646,12 +7042,20 @@ mod tests {
         let state = make_state();
         let resp = call(state, "/health").await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "ok");
         // uptime_secs must reflect elapsed time since state construction, not Unix epoch.
-        let uptime = json["uptime_secs"].as_u64().expect("uptime_secs must be a u64");
-        assert!(uptime < 10, "uptime_secs={uptime} looks like Unix epoch, not elapsed seconds");
+        let uptime = json["uptime_secs"]
+            .as_u64()
+            .expect("uptime_secs must be a u64");
+        assert!(
+            uptime < 10,
+            "uptime_secs={uptime} looks like Unix epoch, not elapsed seconds"
+        );
     }
 
     #[tokio::test]
@@ -6659,12 +7063,20 @@ mod tests {
         let state = make_state();
         let resp = call(state, "/api/health").await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "ok");
         // uptime_secs must reflect elapsed time since state construction, not Unix epoch.
-        let uptime = json["uptime_secs"].as_u64().expect("uptime_secs must be a u64");
-        assert!(uptime < 10, "uptime_secs={uptime} looks like Unix epoch, not elapsed seconds");
+        let uptime = json["uptime_secs"]
+            .as_u64()
+            .expect("uptime_secs must be a u64");
+        assert!(
+            uptime < 10,
+            "uptime_secs={uptime} looks like Unix epoch, not elapsed seconds"
+        );
     }
 
     // --- CSRF protection tests ---
@@ -6674,21 +7086,30 @@ mod tests {
         let state = make_state();
         let resp = call(state, "/").await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let s = std::str::from_utf8(&body).unwrap();
         assert!(
             s.contains(&format!("const CSRF_TOKEN = \"{}\";", TEST_CSRF_TOKEN)),
             "expected CSRF_TOKEN constant in HTML"
         );
         // Placeholder must be fully substituted.
-        assert!(!s.contains("{{CSRF_TOKEN}}"), "placeholder should be replaced");
+        assert!(
+            !s.contains("{{CSRF_TOKEN}}"),
+            "placeholder should be replaced"
+        );
     }
 
     #[tokio::test]
     async fn generate_csrf_token_is_64_hex_chars() {
         let t = generate_csrf_token().expect("rng should work");
         assert_eq!(t.len(), 64);
-        assert!(t.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            t.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
         // Two consecutive calls must differ (randomness sanity check).
         let t2 = generate_csrf_token().expect("rng should work");
         assert_ne!(t, t2);
@@ -6699,7 +7120,10 @@ mod tests {
         let state = make_state();
         let resp = call_post_no_csrf(state, "/api/approvals/fake-id/approve").await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["error"].as_str().unwrap().contains("csrf"));
     }
@@ -6742,19 +7166,60 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    #[tokio::test]
+    async fn webauthn_auth_complete_returns_501_and_no_presence_token() {
+        let state = make_state();
+        let resp = call_post(Arc::clone(&state), "/api/webauthn/auth/complete").await;
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not a shipped daemon presence-token surface"),
+            "error should explain that browser auth-complete is disabled as a daemon token surface"
+        );
+        assert!(
+            json.get("presence_token").is_none(),
+            "fail-closed response must not include a presence token"
+        );
+    }
+
+    #[tokio::test]
+    async fn webauthn_auth_complete_without_csrf_returns_403() {
+        let state = make_state();
+        let resp = call_post_no_csrf(state, "/api/webauthn/auth/complete").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
     // --- /approvals/<id> deep-link route tests ---
 
     #[tokio::test]
     async fn approval_deep_link_returns_200_with_approve_button() {
         let state = make_state();
         let persona = state.store.create_persona("agent-deep").unwrap();
-        let req = state.store.submit_approval(&persona.id, "my-key", "read", None, "access", "high").unwrap();
+        let req = state
+            .store
+            .submit_approval(&persona.id, "my-key", "read", None, "access", "high")
+            .unwrap();
 
         let resp = call(Arc::clone(&state), &format!("/approvals/{}", req.id)).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert!(ct.contains("text/html"));
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let s = std::str::from_utf8(&body).unwrap();
         assert!(s.contains("Approve"), "page should contain Approve button");
         assert!(s.contains("Deny"), "page should contain Deny button");
@@ -6768,20 +7233,32 @@ mod tests {
         let state = make_state();
         let resp = call(state, "/approvals/approval-does-not-exist").await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let s = std::str::from_utf8(&body).unwrap();
-        assert!(s.contains("not found") || s.contains("resolved"), "404 page should explain the state");
+        assert!(
+            s.contains("not found") || s.contains("resolved"),
+            "404 page should explain the state"
+        );
     }
 
     #[tokio::test]
     async fn approval_deep_link_embeds_csrf_token() {
         let state = make_state();
         let persona = state.store.create_persona("agent-csrf-check").unwrap();
-        let req = state.store.submit_approval(&persona.id, "k", "read", None, "access", "low").unwrap();
+        let req = state
+            .store
+            .submit_approval(&persona.id, "k", "read", None, "access", "low")
+            .unwrap();
 
         let resp = call(Arc::clone(&state), &format!("/approvals/{}", req.id)).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let s = std::str::from_utf8(&body).unwrap();
         assert!(
             s.contains(&format!("const CSRF_TOKEN = \"{}\";", TEST_CSRF_TOKEN)),
@@ -6793,12 +7270,22 @@ mod tests {
     async fn approval_deep_link_approve_via_post_respects_csrf() {
         let state = make_state();
         let persona = state.store.create_persona("agent-dl-approve").unwrap();
-        let req = state.store.submit_approval(&persona.id, "k", "read", None, "access", "low").unwrap();
+        let req = state
+            .store
+            .submit_approval(&persona.id, "k", "read", None, "access", "low")
+            .unwrap();
 
         // POST approve with valid CSRF — should succeed (200, approved: true)
-        let resp = call_post(Arc::clone(&state), &format!("/api/approvals/{}/approve", req.id)).await;
+        let resp = call_post(
+            Arc::clone(&state),
+            &format!("/api/approvals/{}/approve", req.id),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["approved"], true);
 
@@ -6812,7 +7299,10 @@ mod tests {
     async fn approval_deep_link_approve_without_csrf_returns_403() {
         let state = make_state();
         let persona = state.store.create_persona("agent-dl-nocsrf").unwrap();
-        let req = state.store.submit_approval(&persona.id, "k", "read", None, "access", "low").unwrap();
+        let req = state
+            .store
+            .submit_approval(&persona.id, "k", "read", None, "access", "low")
+            .unwrap();
 
         let resp = call_post_no_csrf(state, &format!("/api/approvals/{}/approve", req.id)).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -6820,7 +7310,7 @@ mod tests {
 
     #[tokio::test]
     async fn approval_deep_link_renders_composite_breakdown_inline() {
-        // implementation-note-141 — the dedicated /approvals/{id} page must
+        // implementation-note-190 — the dedicated /approvals/{id} page must
         // surface the full per-statement breakdown inline, never gated
         // behind a "Show details" disclosure. The operator must never be
         // one click away from approving authority chains they cannot see.
@@ -6836,18 +7326,24 @@ mod tests {
         //      the dashboard card and this page never drift.
         let state = make_state();
         let persona = state.store.create_persona("agent-composite").unwrap();
-        let req = state.store.submit_approval(
-            &persona.id,
-            "github-key",
-            "composite",
-            None,
-            "credential.access",
-            "high",
-        ).unwrap();
+        let req = state
+            .store
+            .submit_approval(
+                &persona.id,
+                "github-key",
+                "composite",
+                None,
+                "credential.access",
+                "high",
+            )
+            .unwrap();
 
         let resp = call(Arc::clone(&state), &format!("/approvals/{}", req.id)).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let s = std::str::from_utf8(&body).unwrap();
 
         // Legacy disclosure must NOT appear — that was the UX bug.
@@ -6893,7 +7389,7 @@ mod tests {
         assert!(s.contains("Deny"));
     }
 
-    // --- implementation-note-141 — composite render polish ---
+    // --- implementation-note-190 — composite render polish ---
 
     #[tokio::test]
     async fn composite_statements_js_handles_internally_tagged_resource_selector() {
@@ -6904,7 +7400,10 @@ mod tests {
         // shipped JS now reads the `kind` discriminant directly.
         let state = make_state();
         let resp = call(state, "/").await;
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let s = std::str::from_utf8(&body).unwrap();
         assert!(
             s.contains("function renderResourceSelector"),
@@ -6920,7 +7419,7 @@ mod tests {
 
     #[tokio::test]
     async fn dashboard_card_template_routes_composite_through_detail_review() {
-        // implementation-note-141 — composite approvals are multi-statement
+        // implementation-note-190 — composite approvals are multi-statement
         // chains; the dashboard pending-approvals card only shows the
         // summary ("composite (N statements)"), not the breakdown. The
         // operator must never approve a chain they cannot see, so the
@@ -6937,7 +7436,10 @@ mod tests {
         // ternary that picks Review-and-Approve for composites.
         let state = make_state();
         let resp = call(state, "/").await;
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let s = std::str::from_utf8(&body).unwrap();
         assert!(
             s.contains("Review &amp; Approve"),
@@ -6951,7 +7453,7 @@ mod tests {
 
     #[tokio::test]
     async fn composite_statement_render_drops_on_star_for_any_resource() {
-        // implementation-note-141 — `time:wall_clock on * · 90s` reads as
+        // implementation-note-190 — `time:wall_clock on * · 90s` reads as
         // technical noise; time isn't bound to a resource. When the
         // selector resolves to wildcard, the JS render now elides the
         // `on *` clause. Assert the shipped helper contains the elision
@@ -6959,7 +7461,10 @@ mod tests {
         // helper's source ships with the guard).
         let state = make_state();
         let resp = call(state, "/").await;
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let s = std::str::from_utf8(&body).unwrap();
         assert!(
             s.contains("(resource === '*')"),
@@ -6976,7 +7481,10 @@ mod tests {
         // it is clickable.
         let state = make_state();
         let resp = call(state, "/").await;
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let s = std::str::from_utf8(&body).unwrap();
         assert!(
             !s.contains("click to review"),
@@ -7008,25 +7516,36 @@ mod tests {
                 sid: "s1".into(),
                 resource_type: ResourceType::Session,
                 actions: vec!["llm:generate".into()],
-                resource: ResourceSelector::Glob { pattern: "*".into() },
-                budget: Some(Budget { tokens: Some(1), ..Budget::default() }),
+                resource: ResourceSelector::Glob {
+                    pattern: "*".into(),
+                },
+                budget: Some(Budget {
+                    tokens: Some(1),
+                    ..Budget::default()
+                }),
                 usage: Usage::default(),
                 conditions: vec![],
             },
         ];
-        let req = state.store.propose_grant(
-            &persona.id,
-            "k",
-            "composite",
-            Some(60),
-            "credential.access",
-            "low",
-            stmts,
-        ).unwrap();
+        let req = state
+            .store
+            .propose_grant(
+                &persona.id,
+                "k",
+                "composite",
+                Some(60),
+                "credential.access",
+                "low",
+                stmts,
+            )
+            .unwrap();
 
         let resp = call(Arc::clone(&state), &format!("/approvals/{}", req.id)).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let s = std::str::from_utf8(&body).unwrap();
         assert!(
             s.contains("composite (2 statements)"),
@@ -7040,7 +7559,7 @@ mod tests {
 
     #[tokio::test]
     async fn approval_detail_page_renders_persona_name_with_identifier() {
-        // implementation-note-141 — Persona field shows "<name> <identifier>"
+        // implementation-note-190 — Persona field shows "<name> <identifier>"
         // so the operator sees both the human-friendly handle (e.g.
         // `qa`) and the unique persona-id suffix used in audit logs
         // and grant chains. The previous "name only" rendering hid the
@@ -7048,11 +7567,17 @@ mod tests {
         // a friendly name.
         let state = make_state();
         let persona = state.store.create_persona("qa").unwrap();
-        let req = state.store.submit_approval(&persona.id, "k", "read", None, "credential.access", "low").unwrap();
+        let req = state
+            .store
+            .submit_approval(&persona.id, "k", "read", None, "credential.access", "low")
+            .unwrap();
 
         let resp = call(Arc::clone(&state), &format!("/approvals/{}", req.id)).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let s = std::str::from_utf8(&body).unwrap();
         // Both the friendly name and the truncated UUID must be present.
         assert!(
@@ -7063,14 +7588,17 @@ mod tests {
 
     #[tokio::test]
     async fn dashboard_html_inlines_shared_composite_helper() {
-        // implementation-note-140 — the dashboard pending-approvals card and
+        // implementation-note-189 — the dashboard pending-approvals card and
         // the dedicated /approvals/{id} page share a single JS helper for
         // rendering the composite-statement breakdown. Assert the helper is
         // baked into the dashboard HTML so the two surfaces cannot drift.
         let state = make_state();
         let resp = call(state, "/").await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let s = std::str::from_utf8(&body).unwrap();
         assert!(
             s.contains("function renderCompositeStatements"),
@@ -7089,13 +7617,24 @@ mod tests {
     async fn api_approval_by_id_returns_200_with_json_body() {
         let state = make_state();
         let persona = state.store.create_persona("agent-poll").unwrap();
-        let req = state.store.submit_approval(&persona.id, "poll-key", "read", None, "access", "low").unwrap();
+        let req = state
+            .store
+            .submit_approval(&persona.id, "poll-key", "read", None, "access", "low")
+            .unwrap();
 
         let resp = call(Arc::clone(&state), &format!("/api/approvals/{}", req.id)).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert!(ct.contains("application/json"));
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["id"], req.id);
         assert_eq!(json["status"], "pending");
@@ -7106,14 +7645,23 @@ mod tests {
     async fn api_approval_by_id_reflects_resolved_status() {
         let state = make_state();
         let persona = state.store.create_persona("agent-poll-resolved").unwrap();
-        let req = state.store.submit_approval(&persona.id, "k", "read", None, "access", "low").unwrap();
+        let req = state
+            .store
+            .submit_approval(&persona.id, "k", "read", None, "access", "low")
+            .unwrap();
 
         // Resolve via approve
-        state.store.resolve_approval(&req.id, &ApprovalOutcome::Approved).unwrap();
+        state
+            .store
+            .resolve_approval(&req.id, &ApprovalOutcome::Approved)
+            .unwrap();
 
         let resp = call(Arc::clone(&state), &format!("/api/approvals/{}", req.id)).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "approved");
     }
@@ -7123,7 +7671,10 @@ mod tests {
         let state = make_state();
         let resp = call(state, "/api/approvals/approval-does-not-exist").await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["error"].as_str().is_some());
     }
@@ -7132,13 +7683,28 @@ mod tests {
     async fn api_approvals_approve_always_endpoint_works() {
         let state = make_state();
         let persona = state.store.create_persona("agent-always").unwrap();
-        let req = state.store.submit_approval(
-            &persona.id, "key", "read", None, "credential.access.github-token", "low"
-        ).unwrap();
+        let req = state
+            .store
+            .submit_approval(
+                &persona.id,
+                "key",
+                "read",
+                None,
+                "credential.access.github-token",
+                "low",
+            )
+            .unwrap();
 
-        let resp = call_post(Arc::clone(&state), &format!("/api/approvals/{}/approve-always", req.id)).await;
+        let resp = call_post(
+            Arc::clone(&state),
+            &format!("/api/approvals/{}/approve-always", req.id),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["approved"], true);
         assert_eq!(json["standing_grant_created"], true);
@@ -7160,11 +7726,13 @@ mod tests {
     async fn api_approvals_approve_always_without_csrf_returns_403() {
         let state = make_state();
         let persona = state.store.create_persona("agent-always-nocsrf").unwrap();
-        let req = state.store.submit_approval(
-            &persona.id, "key", "read", None, "access", "low"
-        ).unwrap();
+        let req = state
+            .store
+            .submit_approval(&persona.id, "key", "read", None, "access", "low")
+            .unwrap();
 
-        let resp = call_post_no_csrf(state, &format!("/api/approvals/{}/approve-always", req.id)).await;
+        let resp =
+            call_post_no_csrf(state, &format!("/api/approvals/{}/approve-always", req.id)).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
@@ -7174,7 +7742,10 @@ mod tests {
     async fn api_grants_pause_toggles_paused_flag() {
         let state = make_state();
         let persona = state.store.create_persona("agent-pause").unwrap();
-        let grant = state.store.create_grant(&persona.id, "api-key", "read", None).unwrap();
+        let grant = state
+            .store
+            .create_grant(&persona.id, "api-key", "read", None)
+            .unwrap();
 
         // Verify initially not paused
         let g0 = state.store.get_grant(&grant.id).unwrap();
@@ -7182,9 +7753,16 @@ mod tests {
         assert_eq!(g0.status, "active");
 
         // Pause via endpoint — hard pause sets status='paused'
-        let resp = call_post(Arc::clone(&state), &format!("/api/grants/{}/pause", grant.id)).await;
+        let resp = call_post(
+            Arc::clone(&state),
+            &format!("/api/grants/{}/pause", grant.id),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["paused"], true);
 
@@ -7194,7 +7772,11 @@ mod tests {
         assert_eq!(g1.status, "paused");
 
         // Unpause — restores status='active'
-        let resp2 = call_post(Arc::clone(&state), &format!("/api/grants/{}/unpause", grant.id)).await;
+        let resp2 = call_post(
+            Arc::clone(&state),
+            &format!("/api/grants/{}/unpause", grant.id),
+        )
+        .await;
         assert_eq!(resp2.status(), StatusCode::OK);
         let g2 = state.store.get_grant(&grant.id).unwrap();
         assert!(!g2.paused);
@@ -7205,13 +7787,23 @@ mod tests {
     async fn api_grants_extend_calls_extend_grant_method() {
         let state = make_state();
         let persona = state.store.create_persona("agent-extend").unwrap();
-        let grant = state.store.create_grant(&persona.id, "api-key", "read", Some(3600)).unwrap();
+        let grant = state
+            .store
+            .create_grant(&persona.id, "api-key", "read", Some(3600))
+            .unwrap();
         let original_expires = grant.expires_at.clone();
 
         // Call extend with empty body (test helper applies no deltas, just re-fetches)
-        let resp = call_post(Arc::clone(&state), &format!("/api/grants/{}/extend", grant.id)).await;
+        let resp = call_post(
+            Arc::clone(&state),
+            &format!("/api/grants/{}/extend", grant.id),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["id"], grant.id);
         // With no deltas the expires_at should be unchanged
@@ -7222,7 +7814,10 @@ mod tests {
     async fn dashboard_renders_budget_gauge_when_grant_has_budget() {
         let state = make_state();
         let persona = state.store.create_persona("agent-gauge").unwrap();
-        let grant = state.store.create_grant(&persona.id, "api-key", "*:read", None).unwrap();
+        let grant = state
+            .store
+            .create_grant(&persona.id, "api-key", "*:read", None)
+            .unwrap();
         // Set budget + usage on the first-statement of the chain. V0
         // schema: the envelope-level `budget` / `usage` fields are gone;
         // consumers read from the `statements` array. Block 0 must be
@@ -7242,19 +7837,25 @@ mod tests {
         }
         if let Some(first) = chain.blocks.first_mut() {
             let root = state.store.persona_root_keypair(&persona.id).unwrap();
-            let resigned = core_crypto::grant_chain::sign_block_zero(&root, &first.block)
-                .unwrap();
+            let resigned = core_crypto::grant_chain::sign_block_zero(&root, &first.block).unwrap();
             *first = resigned.signed;
         }
         let blocks_json = serde_json::to_string(&chain.blocks).unwrap();
-        state.store.conn().execute(
-            "UPDATE grants SET blocks_json = ?1 WHERE id = ?2",
-            rusqlite::params![blocks_json, grant.id],
-        ).unwrap();
+        state
+            .store
+            .conn()
+            .execute(
+                "UPDATE grants SET blocks_json = ?1 WHERE id = ?2",
+                rusqlite::params![blocks_json, grant.id],
+            )
+            .unwrap();
 
         // Get grant from API — budget + usage live on `statements[0]`.
         let resp = call(Arc::clone(&state), "/api/grants").await;
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let arr = json.as_array().unwrap();
         assert_eq!(arr.len(), 1);
@@ -7266,39 +7867,71 @@ mod tests {
     async fn dashboard_renders_view_receipt_link_when_grant_terminal() {
         let state = make_state();
         let persona = state.store.create_persona("agent-receipt").unwrap();
-        let grant = state.store.create_grant(&persona.id, "api-key", "read", None).unwrap();
+        let grant = state
+            .store
+            .create_grant(&persona.id, "api-key", "read", None)
+            .unwrap();
         // Revoke to make it terminal
         state.store.revoke_grant(&grant.id).unwrap();
 
         // /api/grants/all should include the revoked grant
         let resp = call(Arc::clone(&state), "/api/grants/all").await;
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let arr = json.as_array().unwrap();
-        let revoked = arr.iter().find(|g| g["id"] == grant.id).expect("revoked grant in list");
+        let revoked = arr
+            .iter()
+            .find(|g| g["id"] == grant.id)
+            .expect("revoked grant in list");
         assert_eq!(revoked["status"], "revoked");
 
         // Receipt viewer returns HTML
         let resp2 = call(Arc::clone(&state), &format!("/receipts/{}", grant.id)).await;
         assert_eq!(resp2.status(), StatusCode::OK);
-        let body2 = http_body_util::BodyExt::collect(resp2.into_body()).await.unwrap().to_bytes();
+        let body2 = http_body_util::BodyExt::collect(resp2.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let s = std::str::from_utf8(&body2).unwrap();
-        assert!(s.contains("Grant Receipt"), "receipt page should have title");
+        assert!(
+            s.contains("Grant Receipt"),
+            "receipt page should have title"
+        );
         assert!(s.contains(&grant.id), "receipt page should embed grant id");
-        assert!(s.contains("Download JSON"), "receipt page should have download button");
+        assert!(
+            s.contains("Download JSON"),
+            "receipt page should have download button"
+        );
     }
 
     #[tokio::test]
     async fn sse_endpoint_returns_event_stream() {
         let state = make_state();
         let persona = state.store.create_persona("agent-sse").unwrap();
-        let grant = state.store.create_grant(&persona.id, "api-key", "read", None).unwrap();
+        let grant = state
+            .store
+            .create_grant(&persona.id, "api-key", "read", None)
+            .unwrap();
 
         let resp = call(state, &format!("/sse/grants/{}", grant.id)).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
-        assert!(ct.contains("text/event-stream"), "SSE endpoint must return event-stream content-type");
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            ct.contains("text/event-stream"),
+            "SSE endpoint must return event-stream content-type"
+        );
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let s = std::str::from_utf8(&body).unwrap();
         assert!(s.contains("event:"), "SSE body should contain event type");
         assert!(s.contains("data:"), "SSE body should contain data field");
@@ -7311,7 +7944,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
-    // implementation-note-148 — `/api/receipts/stream` is the live receipts panel
+    // implementation-note-197 — `/api/receipts/stream` is the live receipts panel
     // SSE feed. Empty-store path must still return 200 + event-stream
     // content-type so the EventSource client transitions to `open`.
     #[tokio::test]
@@ -7319,7 +7952,12 @@ mod tests {
         let state = make_state();
         let resp = call(state, "/api/receipts/stream").await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert!(
             ct.contains("text/event-stream"),
             "receipts stream must return event-stream content-type, got {ct}"
@@ -7361,16 +7999,22 @@ mod tests {
     /// div per statement, shows the SID, and uses "unbounded" when no budget.
     #[test]
     fn render_statement_gauges_emits_one_div_per_statement() {
-        use core_grant_types::{Budget, ResourceSelector, ResourceType, Statement, Usage};
         use core_grant_types::{Action, StatementId};
+        use core_grant_types::{Budget, ResourceSelector, ResourceType, Statement, Usage};
 
         let s0 = Statement {
             sid: StatementId::from("S0"),
             resource_type: ResourceType::Credential,
             actions: vec![Action::from("read")],
             resource: ResourceSelector::Any,
-            budget: Some(Budget { tokens: Some(10_000), ..Default::default() }),
-            usage: Usage { tokens: 3_000, ..Default::default() },
+            budget: Some(Budget {
+                tokens: Some(10_000),
+                ..Default::default()
+            }),
+            usage: Usage {
+                tokens: 3_000,
+                ..Default::default()
+            },
             conditions: vec![],
         };
         let s1 = Statement {
@@ -7378,8 +8022,14 @@ mod tests {
             resource_type: ResourceType::Session,
             actions: vec![Action::from("create")],
             resource: ResourceSelector::Any,
-            budget: Some(Budget { cents: Some(500), ..Default::default() }),
-            usage: Usage { cents: 125, ..Default::default() },
+            budget: Some(Budget {
+                cents: Some(500),
+                ..Default::default()
+            }),
+            usage: Usage {
+                cents: 125,
+                ..Default::default()
+            },
             conditions: vec![],
         };
         let s2 = Statement {
@@ -7396,8 +8046,11 @@ mod tests {
         let html = render_statement_gauges(&pairs);
 
         // Three wrapper divs — use the unique inline style from render_statement_gauges.
-        assert_eq!(html.matches(r#"padding:14px;margin-bottom:12px"#).count(), 3,
-            "should emit one wrapper div per statement");
+        assert_eq!(
+            html.matches(r#"padding:14px;margin-bottom:12px"#).count(),
+            3,
+            "should emit one wrapper div per statement"
+        );
 
         // SIDs are present
         assert!(html.contains("S0"), "html should contain SID S0");
@@ -7413,20 +8066,26 @@ mod tests {
         // S2 is unbounded
         let s2_start = html.rfind("S2").expect("S2 in output");
         let s2_section = &html[s2_start..];
-        assert!(s2_section.contains("unbounded"), "S2 with no budget should say unbounded");
+        assert!(
+            s2_section.contains("unbounded"),
+            "S2 with no budget should say unbounded"
+        );
     }
 
     /// Integration test: /receipts/{id} shows per-Statement gauges for a
     /// 3-statement composite grant.
     #[tokio::test]
     async fn receipt_html_shows_per_statement_gauges_for_composite_grant() {
-        use core_grant_types::{Budget, ResourceSelector, ResourceType, Statement, Usage};
         use core_grant_types::{Action, StatementId};
+        use core_grant_types::{Budget, ResourceSelector, ResourceType, Statement, Usage};
 
         let state = make_state();
         let persona = state.store.create_persona("p-3stmt").unwrap();
         // Start with a single-statement grant so we have a valid row.
-        let grant = state.store.create_grant(&persona.id, "api-key", "read", Some(3600)).unwrap();
+        let grant = state
+            .store
+            .create_grant(&persona.id, "api-key", "read", Some(3600))
+            .unwrap();
 
         // Build a 3-statement composite chain and overwrite blocks_json.
         let stmts = vec![
@@ -7435,8 +8094,14 @@ mod tests {
                 resource_type: ResourceType::Credential,
                 actions: vec![Action::from("read")],
                 resource: ResourceSelector::Any,
-                budget: Some(Budget { tokens: Some(20_000), ..Default::default() }),
-                usage: Usage { tokens: 5_000, ..Default::default() },
+                budget: Some(Budget {
+                    tokens: Some(20_000),
+                    ..Default::default()
+                }),
+                usage: Usage {
+                    tokens: 5_000,
+                    ..Default::default()
+                },
                 conditions: vec![],
             },
             Statement {
@@ -7444,8 +8109,14 @@ mod tests {
                 resource_type: ResourceType::Session,
                 actions: vec![Action::from("create")],
                 resource: ResourceSelector::Any,
-                budget: Some(Budget { cents: Some(1_000), ..Default::default() }),
-                usage: Usage { cents: 250, ..Default::default() },
+                budget: Some(Budget {
+                    cents: Some(1_000),
+                    ..Default::default()
+                }),
+                usage: Usage {
+                    cents: 250,
+                    ..Default::default()
+                },
                 conditions: vec![],
             },
             Statement {
@@ -7467,16 +8138,24 @@ mod tests {
             0,
             Some(9_999_999_999),
             &root,
-        ).unwrap();
+        )
+        .unwrap();
         let blocks_json = serde_json::to_string(&chain.blocks).unwrap();
-        state.store.conn().execute(
-            "UPDATE grants SET blocks_json = ?1 WHERE id = ?2",
-            rusqlite::params![blocks_json, grant.id],
-        ).unwrap();
+        state
+            .store
+            .conn()
+            .execute(
+                "UPDATE grants SET blocks_json = ?1 WHERE id = ?2",
+                rusqlite::params![blocks_json, grant.id],
+            )
+            .unwrap();
 
         let resp = call(Arc::clone(&state), &format!("/receipts/{}", grant.id)).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let html = std::str::from_utf8(&body).unwrap();
 
         // Three statement wrapper divs (one per statement). Each uses the
@@ -7489,8 +8168,14 @@ mod tests {
         assert!(html.contains("S0"), "should show SID S0");
         assert!(html.contains("S1"), "should show SID S1");
         assert!(html.contains("S2"), "should show SID S2");
-        assert!(html.contains("unbounded"), "S2 with no budget should render as unbounded");
-        assert!(html.contains("Statements"), "card title should say Statements");
+        assert!(
+            html.contains("unbounded"),
+            "S2 with no budget should render as unbounded"
+        );
+        assert!(
+            html.contains("Statements"),
+            "card title should say Statements"
+        );
     }
 
     // --- /grants/{id} detail page tests ---
@@ -7499,34 +8184,69 @@ mod tests {
     async fn grant_detail_page_returns_200_for_active_grant() {
         let state = make_state();
         let persona = state.store.create_persona("detail-agent").unwrap();
-        let grant = state.store.create_grant(&persona.id, "api-key", "read", None).unwrap();
+        let grant = state
+            .store
+            .create_grant(&persona.id, "api-key", "read", None)
+            .unwrap();
 
         let resp = call(Arc::clone(&state), &format!("/grants/{}", grant.id)).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
         assert!(ct.contains("text/html"));
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let html = std::str::from_utf8(&body).unwrap();
-        assert!(html.contains("Grant Detail"), "page should have Grant Detail title");
+        assert!(
+            html.contains("Grant Detail"),
+            "page should have Grant Detail title"
+        );
         assert!(html.contains(&grant.id), "page should embed grant id");
-        assert!(html.contains("Pause"), "active grant should show Pause button");
-        assert!(html.contains("Extend"), "active grant should show Extend button");
-        assert!(html.contains("Revoke"), "active grant should show Revoke button");
+        assert!(
+            html.contains("Pause"),
+            "active grant should show Pause button"
+        );
+        assert!(
+            html.contains("Extend"),
+            "active grant should show Extend button"
+        );
+        assert!(
+            html.contains("Revoke"),
+            "active grant should show Revoke button"
+        );
     }
 
     #[tokio::test]
     async fn grant_detail_page_shows_resume_when_paused() {
         let state = make_state();
         let persona = state.store.create_persona("detail-paused").unwrap();
-        let grant = state.store.create_grant(&persona.id, "api-key", "read", None).unwrap();
+        let grant = state
+            .store
+            .create_grant(&persona.id, "api-key", "read", None)
+            .unwrap();
         state.store.pause_grant(&grant.id).unwrap();
 
         let resp = call(Arc::clone(&state), &format!("/grants/{}", grant.id)).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let html = std::str::from_utf8(&body).unwrap();
-        assert!(html.contains("Resume"), "paused grant should show Resume button");
-        assert!(!html.contains(">Pause<"), "paused grant should not show Pause button");
+        assert!(
+            html.contains("Resume"),
+            "paused grant should show Resume button"
+        );
+        assert!(
+            !html.contains(">Pause<"),
+            "paused grant should not show Pause button"
+        );
         assert!(html.contains("paused"), "page should indicate paused state");
     }
 
@@ -7534,16 +8254,31 @@ mod tests {
     async fn grant_detail_page_shows_receipt_link_for_terminal_grant() {
         let state = make_state();
         let persona = state.store.create_persona("detail-terminal").unwrap();
-        let grant = state.store.create_grant(&persona.id, "api-key", "read", None).unwrap();
+        let grant = state
+            .store
+            .create_grant(&persona.id, "api-key", "read", None)
+            .unwrap();
         state.store.revoke_grant(&grant.id).unwrap();
 
         let resp = call(Arc::clone(&state), &format!("/grants/{}", grant.id)).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let html = std::str::from_utf8(&body).unwrap();
-        assert!(html.contains("View Receipt"), "terminal grant page should have View Receipt link");
-        assert!(!html.contains(">Pause<"), "terminal grant should not show Pause button");
-        assert!(!html.contains(">Revoke<"), "terminal grant should not show Revoke button");
+        assert!(
+            html.contains("View Receipt"),
+            "terminal grant page should have View Receipt link"
+        );
+        assert!(
+            !html.contains(">Pause<"),
+            "terminal grant should not show Pause button"
+        );
+        assert!(
+            !html.contains(">Revoke<"),
+            "terminal grant should not show Revoke button"
+        );
     }
 
     #[tokio::test]
@@ -7557,9 +8292,16 @@ mod tests {
     async fn pause_hard_sets_status_and_blocks_evaluate() {
         let state = make_state();
         let persona = state.store.create_persona("hard-pause-agent").unwrap();
-        let grant = state.store.create_grant(&persona.id, "api-key", "read", None).unwrap();
+        let grant = state
+            .store
+            .create_grant(&persona.id, "api-key", "read", None)
+            .unwrap();
 
-        let resp = call_post(Arc::clone(&state), &format!("/api/grants/{}/pause", grant.id)).await;
+        let resp = call_post(
+            Arc::clone(&state),
+            &format!("/api/grants/{}/pause", grant.id),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
 
         // Status must be 'paused', not just the advisory flag.
@@ -7569,17 +8311,31 @@ mod tests {
 
         // evaluate_grant must not return the grant (proxy-blocking).
         let eval = state.store.evaluate_grant(&persona.id, "api-key");
-        assert!(eval.is_err(), "paused grant must not be returned by evaluate_grant");
+        assert!(
+            eval.is_err(),
+            "paused grant must not be returned by evaluate_grant"
+        );
     }
 
     #[tokio::test]
     async fn unpause_restores_status_to_active() {
         let state = make_state();
         let persona = state.store.create_persona("unpause-agent").unwrap();
-        let grant = state.store.create_grant(&persona.id, "api-key", "read", None).unwrap();
+        let grant = state
+            .store
+            .create_grant(&persona.id, "api-key", "read", None)
+            .unwrap();
 
-        call_post(Arc::clone(&state), &format!("/api/grants/{}/pause", grant.id)).await;
-        let resp = call_post(Arc::clone(&state), &format!("/api/grants/{}/unpause", grant.id)).await;
+        call_post(
+            Arc::clone(&state),
+            &format!("/api/grants/{}/pause", grant.id),
+        )
+        .await;
+        let resp = call_post(
+            Arc::clone(&state),
+            &format!("/api/grants/{}/unpause", grant.id),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
 
         let g = state.store.get_grant(&grant.id).unwrap();
@@ -7605,21 +8361,30 @@ mod tests {
     fn truncate_persona_id_normal() {
         let full = "persona-368a0fc5-809a-4539-abcd-ef0123456789";
         let got = truncate_persona_id(full);
-        assert_eq!(got, "persona-368a0fc5-809", "should keep 12 UUID chars after persona- prefix");
+        assert_eq!(
+            got, "persona-368a0fc5-809",
+            "should keep 12 UUID chars after persona- prefix"
+        );
     }
 
     #[test]
     fn truncate_persona_id_short_does_not_panic() {
         let short = "persona-abc";
         let got = truncate_persona_id(short);
-        assert_eq!(got, "persona-abc", "short UUID portion should not panic or over-reach");
+        assert_eq!(
+            got, "persona-abc",
+            "short UUID portion should not panic or over-reach"
+        );
     }
 
     #[test]
     fn truncate_persona_id_missing_prefix_returns_as_is() {
         let no_prefix = "368a0fc5";
         let got = truncate_persona_id(no_prefix);
-        assert_eq!(got, "368a0fc5", "missing persona- prefix should return as-is");
+        assert_eq!(
+            got, "368a0fc5",
+            "missing persona- prefix should return as-is"
+        );
     }
 
     #[test]
@@ -7627,7 +8392,10 @@ mod tests {
         // Exactly 12 UUID chars after "persona-" — returned unchanged (no ellipsis added).
         let exactly_12 = "persona-368a0fc5-809";
         let got = truncate_persona_id(exactly_12);
-        assert_eq!(got, "persona-368a0fc5-809", "exactly-12-char UUID portion should be returned as-is");
+        assert_eq!(
+            got, "persona-368a0fc5-809",
+            "exactly-12-char UUID portion should be returned as-is"
+        );
     }
 
     // --- Origin/Referer header checks ---
@@ -7678,7 +8446,7 @@ mod tests {
         assert!(!origin_ok(&h, "http://127.0.0.1:3141"));
     }
 
-    // --- implementation-note-74 follow-up: loopback aliases ---
+    // --- implementation-note-91 follow-up: loopback aliases ---
     // The dashboard binds to 127.0.0.1, but the WebAuthn rp_id is pinned to
     // `localhost`, so a browser following the WebAuthn flow sends
     // `Origin: http://localhost:<port>`. Both forms are the same loopback
@@ -7750,7 +8518,10 @@ mod tests {
     async fn post_revoke_without_origin_returns_403() {
         let state = make_state();
         let persona = state.store.create_persona("no-origin-agent").unwrap();
-        let grant = state.store.create_grant(&persona.id, "key", "read", None).unwrap();
+        let grant = state
+            .store
+            .create_grant(&persona.id, "key", "read", None)
+            .unwrap();
         // Build POST with valid CSRF but no Origin/Referer.
         let req = Request::builder()
             .method("POST")
@@ -7766,11 +8537,17 @@ mod tests {
     async fn post_approve_with_wrong_origin_returns_403() {
         let state = make_state();
         let persona = state.store.create_persona("wrong-origin-agent").unwrap();
-        let req_a = state.store.submit_approval(&persona.id, "key", "read", None, "access", "low").unwrap();
+        let req_a = state
+            .store
+            .submit_approval(&persona.id, "key", "read", None, "access", "low")
+            .unwrap();
         // Build POST with valid CSRF but mismatched Origin.
         let req = Request::builder()
             .method("POST")
-            .uri(format!("http://localhost/api/approvals/{}/approve", req_a.id))
+            .uri(format!(
+                "http://localhost/api/approvals/{}/approve",
+                req_a.id
+            ))
             .header("origin", "http://evil.example.com")
             .header(CSRF_HEADER, TEST_CSRF_TOKEN)
             .body(http_body_util::Empty::<Bytes>::new())
@@ -7783,12 +8560,21 @@ mod tests {
     async fn post_approve_with_matching_referer_only_passes_origin_check() {
         let state = make_state();
         let persona = state.store.create_persona("referer-agent").unwrap();
-        let req_a = state.store.submit_approval(&persona.id, "key", "read", None, "access", "low").unwrap();
+        let req_a = state
+            .store
+            .submit_approval(&persona.id, "key", "read", None, "access", "low")
+            .unwrap();
         // Build POST with valid CSRF and matching Referer (no Origin).
         let req = Request::builder()
             .method("POST")
-            .uri(format!("http://localhost/api/approvals/{}/approve", req_a.id))
-            .header("referer", format!("{TEST_EXPECTED_ORIGIN}/approvals/{}", req_a.id))
+            .uri(format!(
+                "http://localhost/api/approvals/{}/approve",
+                req_a.id
+            ))
+            .header(
+                "referer",
+                format!("{TEST_EXPECTED_ORIGIN}/approvals/{}", req_a.id),
+            )
             .header(CSRF_HEADER, TEST_CSRF_TOKEN)
             .body(http_body_util::Empty::<Bytes>::new())
             .unwrap();
@@ -7797,7 +8583,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    // --- implementation-note-147: dismiss endpoint ---
+    // --- implementation-note-196: dismiss endpoint ---
 
     #[tokio::test]
     async fn dismiss_approval_returns_200_and_removes_from_pending() {
@@ -7808,15 +8594,25 @@ mod tests {
             .submit_approval(&persona.id, "key", "read", None, "access", "low")
             .unwrap();
 
-        let resp = call_post(Arc::clone(&state), &format!("/api/approvals/{}/dismiss", approval.id)).await;
+        let resp = call_post(
+            Arc::clone(&state),
+            &format!("/api/approvals/{}/dismiss", approval.id),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["dismissed"], true);
 
         // Approval should no longer appear in pending list.
         let pending = state.store.list_pending_approvals().unwrap();
-        assert!(pending.iter().all(|a| a.id != approval.id), "dismissed approval must not appear in pending");
+        assert!(
+            pending.iter().all(|a| a.id != approval.id),
+            "dismissed approval must not appear in pending"
+        );
 
         // Status must be 'dismissed'.
         let resolved = state.store.get_approval(&approval.id).unwrap();
@@ -7832,8 +8628,16 @@ mod tests {
             .submit_approval(&persona.id, "key", "read", None, "access", "low")
             .unwrap();
 
-        call_post(Arc::clone(&state), &format!("/api/approvals/{}/dismiss", approval.id)).await;
-        let resp = call_post(Arc::clone(&state), &format!("/api/approvals/{}/dismiss", approval.id)).await;
+        call_post(
+            Arc::clone(&state),
+            &format!("/api/approvals/{}/dismiss", approval.id),
+        )
+        .await;
+        let resp = call_post(
+            Arc::clone(&state),
+            &format!("/api/approvals/{}/dismiss", approval.id),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::CONFLICT);
     }
 
@@ -7852,22 +8656,35 @@ mod tests {
             .store
             .submit_approval(&persona.id, "key", "read", None, "access", "low")
             .unwrap();
-        let resp = call_post_no_csrf(state, &format!("/api/approvals/{}/dismiss", approval.id)).await;
+        let resp =
+            call_post_no_csrf(state, &format!("/api/approvals/{}/dismiss", approval.id)).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
-    // --- implementation-note-119: audit action_filter query param ---
+    // --- implementation-note-167: audit action_filter query param ---
 
     #[tokio::test]
     async fn audit_action_filter_returns_only_matching_prefix() {
         let state = make_state();
-        state.store.log_event(None, "grant.create", None, "ok", None).unwrap();
-        state.store.log_event(None, "approval.dismissed", None, "ok", None).unwrap();
-        state.store.log_event(None, "broker.materialization", None, "ok", None).unwrap();
+        state
+            .store
+            .log_event(None, "grant.create", None, "ok", None)
+            .unwrap();
+        state
+            .store
+            .log_event(None, "approval.dismissed", None, "ok", None)
+            .unwrap();
+        state
+            .store
+            .log_event(None, "broker.materialization", None, "ok", None)
+            .unwrap();
 
         let resp = call(Arc::clone(&state), "/api/audit?action_filter=grant.").await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let arr = json.as_array().unwrap();
         assert_eq!(arr.len(), 1, "only grant.* actions should be returned");
@@ -7877,18 +8694,27 @@ mod tests {
     #[tokio::test]
     async fn audit_action_filter_empty_returns_all() {
         let state = make_state();
-        state.store.log_event(None, "grant.create", None, "ok", None).unwrap();
-        state.store.log_event(None, "approval.dismissed", None, "ok", None).unwrap();
+        state
+            .store
+            .log_event(None, "grant.create", None, "ok", None)
+            .unwrap();
+        state
+            .store
+            .log_event(None, "approval.dismissed", None, "ok", None)
+            .unwrap();
 
         let resp = call(Arc::clone(&state), "/api/audit?action_filter=").await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let arr = json.as_array().unwrap();
         assert_eq!(arr.len(), 2, "empty filter returns all events");
     }
 
-    // --- implementation-note-161: /api/receipts endpoint ---
+    // --- implementation-note-210: /api/receipts endpoint ---
 
     /// Ensure the receipts singleton identity is active (mirrors receipt.rs
     /// test helper) so revoke_grant can emit signed receipts.
@@ -7906,7 +8732,10 @@ mod tests {
         // ?view=rollup (default) returns empty rollup array.
         let resp = call(state, "/api/receipts").await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json.is_array(), "receipts response must be an array");
         assert_eq!(json.as_array().unwrap().len(), 0);
@@ -7917,7 +8746,10 @@ mod tests {
         let state = make_state();
         let resp = call(state, "/api/receipts?view=raw").await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json.is_array(), "raw receipts response must be an array");
         assert_eq!(json.as_array().unwrap().len(), 0);
@@ -7928,19 +8760,31 @@ mod tests {
         ensure_receipt_identity();
         let state = make_state();
         let persona = state.store.create_persona("agent-receipt-signed").unwrap();
-        let grant = state.store.create_grant(&persona.id, "gh-token", "push", None).unwrap();
+        let grant = state
+            .store
+            .create_grant(&persona.id, "gh-token", "push", None)
+            .unwrap();
         state.store.revoke_grant(&grant.id).unwrap();
 
         // Use ?view=raw to test the raw per-receipt shape.
         let resp = call(Arc::clone(&state), "/api/receipts?view=raw").await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let arr = json.as_array().unwrap();
         assert_eq!(arr.len(), 1, "one revoked grant → one receipt");
         assert_eq!(arr[0]["grant_id"], grant.id);
-        assert!(arr[0]["signed"].is_boolean(), "signed field must be boolean");
-        assert!(arr[0]["signed"].as_bool().unwrap(), "receipt signed by daemon identity");
+        assert!(
+            arr[0]["signed"].is_boolean(),
+            "signed field must be boolean"
+        );
+        assert!(
+            arr[0]["signed"].as_bool().unwrap(),
+            "receipt signed by daemon identity"
+        );
         assert!(arr[0]["action_summary"].is_string());
         assert!(arr[0]["persona_id"].is_string());
     }
@@ -7959,16 +8803,23 @@ mod tests {
         let url = format!("/api/receipts?view=raw&persona_id={}", a.id);
         let resp = call(Arc::clone(&state), &url).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let arr = json.as_array().unwrap();
-        assert_eq!(arr.len(), 1, "persona filter must return only receipts for that persona");
+        assert_eq!(
+            arr.len(),
+            1,
+            "persona filter must return only receipts for that persona"
+        );
         assert_eq!(arr[0]["persona_id"], a.id.as_str());
     }
 
     #[tokio::test]
     async fn receipts_search_persona_isolates_rows() {
-        // implementation-note-144 — `/api/receipts/search?persona=`
+        // implementation-note-193 — `/api/receipts/search?persona=`
         // must surface only receipts whose persona_id matches.
         ensure_receipt_identity();
         let state = make_state();
@@ -7982,10 +8833,17 @@ mod tests {
         let url = format!("/api/receipts/search?persona={}", a.id);
         let resp = call(Arc::clone(&state), &url).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let arr = json.as_array().expect("search response must be an array");
-        assert_eq!(arr.len(), 1, "persona filter must isolate to one persona's receipts");
+        assert_eq!(
+            arr.len(),
+            1,
+            "persona filter must isolate to one persona's receipts"
+        );
         assert_eq!(arr[0]["persona_id"], a.id.as_str());
     }
 
@@ -7996,11 +8854,16 @@ mod tests {
         ensure_receipt_identity();
         let state = make_state();
         let persona = state.store.create_persona("agent-rcpt-so").unwrap();
-        let g_signed = state.store.create_grant(&persona.id, "cred", "r", None).unwrap();
+        let g_signed = state
+            .store
+            .create_grant(&persona.id, "cred", "r", None)
+            .unwrap();
         state.store.revoke_grant(&g_signed.id).unwrap();
 
         // Manually insert an unsigned receipt row.
-        use core_grant_types::grant_receipt::{Evidence, GrantReceipt, Lifecycle, ReceiptSummary, TerminalReason};
+        use core_grant_types::grant_receipt::{
+            Evidence, GrantReceipt, Lifecycle, ReceiptSummary, TerminalReason,
+        };
         let unsigned = GrantReceipt {
             id: "rct-unsigned-test".to_string(),
             grant_id: "grant-unsigned-test".to_string(),
@@ -8022,22 +8885,37 @@ mod tests {
                 terminal_reason: TerminalReason::Expired,
             },
             attestation: Default::default(),
+            dev_mode_active: false,
             evidence: Evidence::default(), // all-zero placeholder → unsigned
         };
         state.store.store_receipt(&unsigned).unwrap();
 
         // Without filter (raw view): both receipts visible.
         let resp_all = call(Arc::clone(&state), "/api/receipts?view=raw").await;
-        let body_all = http_body_util::BodyExt::collect(resp_all.into_body()).await.unwrap().to_bytes();
+        let body_all = http_body_util::BodyExt::collect(resp_all.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let all: serde_json::Value = serde_json::from_slice(&body_all).unwrap();
         assert_eq!(all.as_array().unwrap().len(), 2, "unfiltered returns both");
 
         // With signed_only=true (raw view): only the signed receipt.
-        let resp_signed = call(Arc::clone(&state), "/api/receipts?view=raw&signed_only=true").await;
-        let body_signed = http_body_util::BodyExt::collect(resp_signed.into_body()).await.unwrap().to_bytes();
+        let resp_signed = call(
+            Arc::clone(&state),
+            "/api/receipts?view=raw&signed_only=true",
+        )
+        .await;
+        let body_signed = http_body_util::BodyExt::collect(resp_signed.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let signed: serde_json::Value = serde_json::from_slice(&body_signed).unwrap();
         let signed_arr = signed.as_array().unwrap();
-        assert_eq!(signed_arr.len(), 1, "signed_only=true must exclude unsigned receipt");
+        assert_eq!(
+            signed_arr.len(),
+            1,
+            "signed_only=true must exclude unsigned receipt"
+        );
         assert!(signed_arr[0]["signed"].as_bool().unwrap());
     }
 
@@ -8046,15 +8924,24 @@ mod tests {
         ensure_receipt_identity();
         let state = make_state();
         let persona = state.store.create_persona("My Test Agent").unwrap();
-        let grant = state.store.create_grant(&persona.id, "key", "r", None).unwrap();
+        let grant = state
+            .store
+            .create_grant(&persona.id, "key", "r", None)
+            .unwrap();
         state.store.revoke_grant(&grant.id).unwrap();
 
         let resp = call(Arc::clone(&state), "/api/receipts?view=raw").await;
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let arr = json.as_array().unwrap();
         assert_eq!(arr.len(), 1);
-        assert_eq!(arr[0]["persona_name"], "My Test Agent", "persona_name must be resolved from store");
+        assert_eq!(
+            arr[0]["persona_name"], "My Test Agent",
+            "persona_name must be resolved from store"
+        );
     }
 
     // AP-CONSTRUCT-RECEIPT-ROLLUP-DASHBOARD — T1 unit tests for rollup_view
@@ -8065,7 +8952,11 @@ mod tests {
         let rows: Vec<crate::infra::receipt::ReceiptRow> = vec![];
         let val = rollup_view(&rows);
         assert!(val.is_array(), "rollup_view must return JSON array");
-        assert_eq!(val.as_array().unwrap().len(), 0, "empty rows → empty rollup");
+        assert_eq!(
+            val.as_array().unwrap().len(),
+            0,
+            "empty rows → empty rollup"
+        );
     }
 
     #[test]
@@ -8110,25 +9001,29 @@ mod tests {
     #[test]
     fn rollup_view_denied_outcome_inlines_denial_reason() {
         use crate::infra::receipt::ReceiptRow;
-        let rows = vec![
-            ReceiptRow {
-                id: "rct-denied".to_string(),
-                kind: "broker_materialization".to_string(),
-                actor: "persona-deny".to_string(),
-                resource: "gh".to_string(),
-                grant_id: String::new(),
-                materialized_at: "2026-05-05T12:00:00Z".to_string(),
-                terminal_reason: "rate_limited".to_string(),
-                requested_scope: None,
-                granted_scope: None,
-            },
-        ];
+        let rows = vec![ReceiptRow {
+            id: "rct-denied".to_string(),
+            kind: "broker_materialization".to_string(),
+            actor: "persona-deny".to_string(),
+            resource: "gh".to_string(),
+            grant_id: String::new(),
+            materialized_at: "2026-05-05T12:00:00Z".to_string(),
+            terminal_reason: "rate_limited".to_string(),
+            requested_scope: None,
+            granted_scope: None,
+        }];
         let val = rollup_view(&rows);
         let arr = val.as_array().unwrap();
         // broker_materialization without a revocation → Incomplete outcome.
         // Key check: denial_reason field must be present (possibly null).
-        assert!(arr[0].get("denial_reason").is_some(), "denial_reason field must be present");
-        assert!(arr[0]["sub_receipts"].is_array(), "sub_receipts field must be present");
+        assert!(
+            arr[0].get("denial_reason").is_some(),
+            "denial_reason field must be present"
+        );
+        assert!(
+            arr[0]["sub_receipts"].is_array(),
+            "sub_receipts field must be present"
+        );
     }
 
     #[tokio::test]
@@ -8136,22 +9031,37 @@ mod tests {
         ensure_receipt_identity();
         let state = make_state();
         let persona = state.store.create_persona("agent-rollup-test").unwrap();
-        let grant = state.store.create_grant(&persona.id, "gh-token", "push", None).unwrap();
+        let grant = state
+            .store
+            .create_grant(&persona.id, "gh-token", "push", None)
+            .unwrap();
         state.store.revoke_grant(&grant.id).unwrap();
 
         // Default view=rollup.
         let resp = call(Arc::clone(&state), "/api/receipts").await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let arr = json.as_array().unwrap();
         assert_eq!(arr.len(), 1, "one revoked grant → one rollup row");
         let row = &arr[0];
-        assert!(row["materialization_id"].is_string(), "must have materialization_id");
+        assert!(
+            row["materialization_id"].is_string(),
+            "must have materialization_id"
+        );
         assert!(row["receipt_count"].is_number(), "must have receipt_count");
         assert!(row["outcome"].is_string(), "must have outcome field");
-        assert!(row["sub_receipts"].is_array(), "must have sub_receipts for click-through detail");
-        assert!(row.get("denial_reason").is_some(), "denial_reason must be present (null or string)");
+        assert!(
+            row["sub_receipts"].is_array(),
+            "must have sub_receipts for click-through detail"
+        );
+        assert!(
+            row.get("denial_reason").is_some(),
+            "denial_reason must be present (null or string)"
+        );
     }
 
     #[tokio::test]
@@ -8159,12 +9069,18 @@ mod tests {
         ensure_receipt_identity();
         let state = make_state();
         let persona = state.store.create_persona("agent-rollup-explicit").unwrap();
-        let grant = state.store.create_grant(&persona.id, "cred", "read", None).unwrap();
+        let grant = state
+            .store
+            .create_grant(&persona.id, "cred", "read", None)
+            .unwrap();
         state.store.revoke_grant(&grant.id).unwrap();
 
         let resp = call(Arc::clone(&state), "/api/receipts?view=rollup").await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json.is_array(), "?view=rollup must return array");
         let arr = json.as_array().unwrap();
@@ -8176,19 +9092,34 @@ mod tests {
         ensure_receipt_identity();
         let state = make_state();
         let persona = state.store.create_persona("agent-raw-shape").unwrap();
-        let grant = state.store.create_grant(&persona.id, "cred", "read", None).unwrap();
+        let grant = state
+            .store
+            .create_grant(&persona.id, "cred", "read", None)
+            .unwrap();
         state.store.revoke_grant(&grant.id).unwrap();
 
         let resp = call(Arc::clone(&state), "/api/receipts?view=raw").await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let arr = json.as_array().unwrap();
         assert_eq!(arr.len(), 1, "?view=raw must return per-receipt list");
         // Legacy shape must have grant_id, persona_id, signed fields.
-        assert!(arr[0]["grant_id"].is_string(), "raw shape must have grant_id");
-        assert!(arr[0]["persona_id"].is_string(), "raw shape must have persona_id");
-        assert!(arr[0]["signed"].is_boolean(), "raw shape must have signed field");
+        assert!(
+            arr[0]["grant_id"].is_string(),
+            "raw shape must have grant_id"
+        );
+        assert!(
+            arr[0]["persona_id"].is_string(),
+            "raw shape must have persona_id"
+        );
+        assert!(
+            arr[0]["signed"].is_boolean(),
+            "raw shape must have signed field"
+        );
     }
 
     #[tokio::test]
@@ -8196,13 +9127,31 @@ mod tests {
         let state = make_state();
         let resp = call(state, "/").await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let s = std::str::from_utf8(&body).unwrap();
-        assert!(s.contains("Grant Receipts"), "dashboard must contain Grant Receipts section heading");
-        assert!(s.contains("receipts-body"), "dashboard must contain receipts table body element");
-        assert!(s.contains("receipt-signed-filter"), "dashboard must contain signed filter control");
-        assert!(s.contains("receipt-since-filter"), "dashboard must contain since filter control");
-        assert!(s.contains("function loadReceipts"), "dashboard must contain loadReceipts JS function");
+        assert!(
+            s.contains("Grant Receipts"),
+            "dashboard must contain Grant Receipts section heading"
+        );
+        assert!(
+            s.contains("receipts-body"),
+            "dashboard must contain receipts table body element"
+        );
+        assert!(
+            s.contains("receipt-signed-filter"),
+            "dashboard must contain signed filter control"
+        );
+        assert!(
+            s.contains("receipt-since-filter"),
+            "dashboard must contain since filter control"
+        );
+        assert!(
+            s.contains("function loadReceipts"),
+            "dashboard must contain loadReceipts JS function"
+        );
     }
 
     /// DASHBOARD-EMPTY-STATE-FIRST-RECEIPT — fresh-daemon dashboard ships
@@ -8214,7 +9163,10 @@ mod tests {
         let state = make_state();
         let resp = call(state, "/").await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let s = std::str::from_utf8(&body).unwrap();
         assert!(
             s.contains("dashboard-empty-state-first-receipt"),
@@ -8240,19 +9192,31 @@ mod tests {
 
     #[tokio::test]
     async fn approval_page_no_longer_has_narrow_button() {
-        // implementation-note-162: disabled Narrow button was removed for clean screenshots.
+        // implementation-note-211: disabled Narrow button was removed for clean screenshots.
         let state = make_state();
         let persona = state.store.create_persona("agent-narrow-check").unwrap();
-        let req = state.store.submit_approval(&persona.id, "key", "read", None, "access", "low").unwrap();
+        let req = state
+            .store
+            .submit_approval(&persona.id, "key", "read", None, "access", "low")
+            .unwrap();
         let resp = call(Arc::clone(&state), &format!("/approvals/{}", req.id)).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let s = std::str::from_utf8(&body).unwrap();
-        assert!(!s.contains("btn-narrow"), "Narrow button must have been removed from approval page");
-        assert!(!s.contains("Narrow"), "Narrow text must not appear on approval page");
+        assert!(
+            !s.contains("btn-narrow"),
+            "Narrow button must have been removed from approval page"
+        );
+        assert!(
+            !s.contains("Narrow"),
+            "Narrow text must not appear on approval page"
+        );
     }
 
-    /// implementation-note-156 — `/settings/passkeys` returns the enrollment page with
+    /// implementation-note-205 — `/settings/passkeys` returns the enrollment page with
     /// expected content so operators can register their platform authenticator.
     #[tokio::test]
     async fn settings_passkeys_returns_enrollment_page() {
@@ -8264,8 +9228,14 @@ mod tests {
             .unwrap()
             .to_bytes();
         let html = std::str::from_utf8(&body).unwrap();
-        assert!(html.contains("Register Passkey"), "enrollment button missing");
-        assert!(html.contains("navigator.credentials.create"), "WebAuthn create call missing");
+        assert!(
+            html.contains("Register Passkey"),
+            "enrollment button missing"
+        );
+        assert!(
+            html.contains("navigator.credentials.create"),
+            "WebAuthn create call missing"
+        );
         assert!(
             html.contains("/api/webauthn/register/begin"),
             "register begin endpoint reference missing"
@@ -8274,10 +9244,13 @@ mod tests {
             html.contains("/api/webauthn/register/complete"),
             "register complete endpoint reference missing"
         );
-        assert!(html.contains("Enrolled Passkeys"), "enrolled passkeys section missing");
+        assert!(
+            html.contains("Enrolled Passkeys"),
+            "enrolled passkeys section missing"
+        );
     }
 
-    /// implementation-note-74 — the `/approvals/{id}` page wires the real
+    /// implementation-note-91 — the `/approvals/{id}` page wires the real
     /// auth/begin → navigator.credentials.get → POST/<action> ceremony
     /// into the resolve() function so Approve/Deny calls carry a verified
     /// WebAuthn assertion (same as the main dashboard cards).
@@ -8310,7 +9283,7 @@ mod tests {
         );
     }
 
-    /// implementation-note-140 — the `/approvals/{id}` dedicated page must
+    /// implementation-note-189 — the `/approvals/{id}` dedicated page must
     /// expose composite_statements via the polled JSON AND embed the shared
     /// renderCompositeStatements helper so the breakdown renders identically
     /// to the main dashboard card. This is the YC-partner deep-link path.
@@ -8329,7 +9302,9 @@ mod tests {
                 sid: "s0-credential".to_string(),
                 resource_type: ResourceType::Credential,
                 actions: vec!["credential:read".to_string()],
-                resource: ResourceSelector::Exact { value: "github-token".to_string() },
+                resource: ResourceSelector::Exact {
+                    value: "github-token".to_string(),
+                },
                 budget: None,
                 usage: Usage::default(),
                 conditions: vec![],
@@ -8338,8 +9313,13 @@ mod tests {
                 sid: "s1-session".to_string(),
                 resource_type: ResourceType::Session,
                 actions: vec!["llm:generate".to_string()],
-                resource: ResourceSelector::Glob { pattern: "anthropic/*".to_string() },
-                budget: Some(Budget { tokens: Some(20_000), ..Budget::default() }),
+                resource: ResourceSelector::Glob {
+                    pattern: "anthropic/*".to_string(),
+                },
+                budget: Some(Budget {
+                    tokens: Some(20_000),
+                    ..Budget::default()
+                }),
                 usage: Usage::default(),
                 conditions: vec![],
             },
@@ -8348,7 +9328,10 @@ mod tests {
                 resource_type: ResourceType::Time,
                 actions: vec!["time:wall_clock".to_string()],
                 resource: ResourceSelector::Any,
-                budget: Some(Budget { wall_clock_secs: Some(1800), ..Budget::default() }),
+                budget: Some(Budget {
+                    wall_clock_secs: Some(1800),
+                    ..Budget::default()
+                }),
                 usage: Usage::default(),
                 conditions: vec![],
             },
@@ -8371,7 +9354,10 @@ mod tests {
         //    page JS has data to call renderBreakdown(data.composite_statements).
         let api_resp = call(Arc::clone(&state), &format!("/api/approvals/{}", req.id)).await;
         assert_eq!(api_resp.status(), StatusCode::OK);
-        let api_body = http_body_util::BodyExt::collect(api_resp.into_body()).await.unwrap().to_bytes();
+        let api_body = http_body_util::BodyExt::collect(api_resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&api_body).unwrap();
         let stmts_json = json["composite_statements"]
             .as_array()
@@ -8391,7 +9377,10 @@ mod tests {
         //    the same function so they can never drift).
         let page_resp = call(Arc::clone(&state), &format!("/approvals/{}", req.id)).await;
         assert_eq!(page_resp.status(), StatusCode::OK);
-        let page_body = http_body_util::BodyExt::collect(page_resp.into_body()).await.unwrap().to_bytes();
+        let page_body = http_body_util::BodyExt::collect(page_resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let html = std::str::from_utf8(&page_body).unwrap();
         assert!(
             html.contains("function renderCompositeStatements"),
@@ -8418,10 +9407,20 @@ mod tests {
         let state = make_state();
         let resp = call(state, "/api/maturation/candidates").await;
         assert_eq!(resp.status(), StatusCode::OK);
-        let body = http_body_util::BodyExt::collect(resp.into_body()).await.unwrap().to_bytes();
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(json.is_array(), "maturation candidates response must be a JSON array");
-        assert_eq!(json.as_array().unwrap().len(), 0, "empty store yields no candidates");
+        assert!(
+            json.is_array(),
+            "maturation candidates response must be a JSON array"
+        );
+        assert_eq!(
+            json.as_array().unwrap().len(),
+            0,
+            "empty store yields no candidates"
+        );
     }
 
 }

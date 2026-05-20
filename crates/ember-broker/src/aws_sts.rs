@@ -46,12 +46,10 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 use aws_credential_types::Credentials;
-use aws_sigv4::http_request::{sign, SignableBody, SignableRequest, SigningSettings};
+use aws_sigv4::http_request::{SignableBody, SignableRequest, SigningSettings, sign};
 use aws_sigv4::sign::v4;
 use chrono::{DateTime, Utc};
-use core_broker::{
-    Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential,
-};
+use core_broker::{Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
@@ -296,14 +294,10 @@ impl<'de> Deserialize<'de> for AwsStsScope {
             }),
             AwsStsMode::WebIdentity => {
                 let role_arn = raw.role_arn.ok_or_else(|| {
-                    serde::de::Error::custom(
-                        "web_identity mode requires role_arn",
-                    )
+                    serde::de::Error::custom("web_identity mode requires role_arn")
                 })?;
                 let oidc_token = raw.oidc_token.ok_or_else(|| {
-                    serde::de::Error::custom(
-                        "web_identity mode requires oidc_token",
-                    )
+                    serde::de::Error::custom("web_identity mode requires oidc_token")
                 })?;
                 Ok(AwsStsScope::WebIdentity {
                     role_arn,
@@ -384,11 +378,7 @@ impl StsHttpClient for ReqwestStsClient {
         for (k, v) in headers {
             req = req.header(k, v);
         }
-        let resp = req
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
+        let resp = req.body(body).send().await.map_err(|e| e.to_string())?;
         let status = resp.status().as_u16();
         let text = resp.text().await.map_err(|e| e.to_string())?;
         Ok((status, text))
@@ -532,8 +522,8 @@ fn build_signed_headers(
     )
     .map_err(|e| BrokerError::Other(format!("sigv4 signable: {e}")))?;
 
-    let signing_output = sign(signable, &params)
-        .map_err(|e| BrokerError::Other(format!("sigv4 sign: {e}")))?;
+    let signing_output =
+        sign(signable, &params).map_err(|e| BrokerError::Other(format!("sigv4 sign: {e}")))?;
     let (instructions, _sig) = signing_output.into_parts();
     let (sig_headers, sig_params) = instructions.into_parts();
     debug_assert!(
@@ -552,7 +542,10 @@ fn build_signed_headers(
 /// Returns `Ok(creds)` on success. STS errors come back as XML bodies
 /// with status >= 400 and an `<ErrorResponse>` envelope; mapping those
 /// is handled by the caller via [`map_sts_error`].
-fn parse_sts_credentials(body: &str, action: StsAction) -> Result<AwsVendedCredentials, BrokerError> {
+fn parse_sts_credentials(
+    body: &str,
+    action: StsAction,
+) -> Result<AwsVendedCredentials, BrokerError> {
     // Real-world STS XML uses an `<*Result><Credentials>` envelope. We
     // do a minimal regex-free extract by tag matching — STS responses
     // are deterministic XML produced by AWS, not user input.
@@ -562,7 +555,9 @@ fn parse_sts_credentials(body: &str, action: StsAction) -> Result<AwsVendedCrede
         .find(creds_tag_open)
         .and_then(|start| {
             let after = start + creds_tag_open.len();
-            body[after..].find(creds_tag_close).map(|end| &body[after..after + end])
+            body[after..]
+                .find(creds_tag_close)
+                .map(|end| &body[after..after + end])
         })
         .ok_or_else(|| {
             BrokerError::Upstream(format!(
@@ -579,18 +574,14 @@ fn parse_sts_credentials(body: &str, action: StsAction) -> Result<AwsVendedCrede
         Some(creds_block[after..after + e].to_string())
     };
 
-    let access_key_id = extract("AccessKeyId").ok_or_else(|| {
-        BrokerError::Upstream("STS response missing AccessKeyId".to_string())
-    })?;
-    let secret_access_key = extract("SecretAccessKey").ok_or_else(|| {
-        BrokerError::Upstream("STS response missing SecretAccessKey".to_string())
-    })?;
-    let session_token = extract("SessionToken").ok_or_else(|| {
-        BrokerError::Upstream("STS response missing SessionToken".to_string())
-    })?;
-    let expiration = extract("Expiration").ok_or_else(|| {
-        BrokerError::Upstream("STS response missing Expiration".to_string())
-    })?;
+    let access_key_id = extract("AccessKeyId")
+        .ok_or_else(|| BrokerError::Upstream("STS response missing AccessKeyId".to_string()))?;
+    let secret_access_key = extract("SecretAccessKey")
+        .ok_or_else(|| BrokerError::Upstream("STS response missing SecretAccessKey".to_string()))?;
+    let session_token = extract("SessionToken")
+        .ok_or_else(|| BrokerError::Upstream("STS response missing SessionToken".to_string()))?;
+    let expiration = extract("Expiration")
+        .ok_or_else(|| BrokerError::Upstream("STS response missing Expiration".to_string()))?;
 
     Ok(AwsVendedCredentials {
         access_key_id,
@@ -605,18 +596,16 @@ fn parse_sts_credentials(body: &str, action: StsAction) -> Result<AwsVendedCrede
 fn map_sts_error(status: u16, body: &str) -> BrokerError {
     let code = extract_error_code(body).unwrap_or_default();
     match code.as_str() {
-        "AccessDenied" | "AccessDeniedException" => BrokerError::PolicyRejected(format!(
-            "STS access denied: {body}"
-        )),
+        "AccessDenied" | "AccessDeniedException" => {
+            BrokerError::PolicyRejected(format!("STS access denied: {body}"))
+        }
         // AssumeRoleWithWebIdentity-specific: the OIDC token is bad
         // (malformed, expired, audience-mismatched, signature-invalid,
         // or issuer not in the role's trust policy). Map to
         // PolicyRejected — the caller's identity credential failed
         // policy at AWS' end, same shape as AccessDenied.
         "InvalidIdentityToken" | "IDPRejectedClaim" | "IDPCommunicationError" => {
-            BrokerError::PolicyRejected(format!(
-                "STS rejected web identity token: {body}"
-            ))
+            BrokerError::PolicyRejected(format!("STS rejected web identity token: {body}"))
         }
         "ExpiredToken" | "ExpiredTokenException" | "TokenRefreshRequired" => {
             BrokerError::Upstream(format!("STS credentials expired: {body}"))
@@ -662,12 +651,13 @@ fn build_assume_role_body(
     inline_policy: Option<&str>,
     external_id: Option<&str>,
 ) -> String {
-    let mut params: Vec<(&str, String)> = Vec::new();
-    params.push(("Action", "AssumeRole".to_string()));
-    params.push(("Version", "2011-06-15".to_string()));
-    params.push(("RoleArn", role_arn.to_string()));
-    params.push(("RoleSessionName", session_name.to_string()));
-    params.push(("DurationSeconds", ttl_seconds.to_string()));
+    let mut params: Vec<(&str, String)> = vec![
+        ("Action", "AssumeRole".to_string()),
+        ("Version", "2011-06-15".to_string()),
+        ("RoleArn", role_arn.to_string()),
+        ("RoleSessionName", session_name.to_string()),
+        ("DurationSeconds", ttl_seconds.to_string()),
+    ];
     if let Some(pol) = inline_policy {
         params.push(("Policy", pol.to_string()));
     }
@@ -772,9 +762,7 @@ impl Broker for AwsStsBroker {
                 inline_policy,
                 external_id,
             } => {
-                let effective_role = role_arn
-                    .clone()
-                    .or_else(|| self.default_role_arn.clone());
+                let effective_role = role_arn.clone().or_else(|| self.default_role_arn.clone());
                 let arn = effective_role.ok_or_else(|| {
                     BrokerError::InvalidScope(
                         "assume_role mode requires role_arn (no default_role_arn configured)"
@@ -803,12 +791,8 @@ impl Broker for AwsStsBroker {
                 session_name,
                 ttl_seconds,
             } => {
-                let body = assume_role_with_web_identity(
-                    role_arn,
-                    session_name,
-                    oidc_token,
-                    *ttl_seconds,
-                );
+                let body =
+                    assume_role_with_web_identity(role_arn, session_name, oidc_token, *ttl_seconds);
                 // Unsigned — no Authorization header. STS validates
                 // the OIDC token directly against the role's trust
                 // policy.
@@ -853,9 +837,8 @@ impl Broker for AwsStsBroker {
         // The token is a JSON-encoded credential bundle so the consumer
         // (broker_exec / apply_credential_to_env) can split into
         // AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY + AWS_SESSION_TOKEN.
-        let token_json = serde_json::to_string(&vended).map_err(|e| {
-            BrokerError::Other(format!("serialize vended credentials: {e}"))
-        })?;
+        let token_json = serde_json::to_string(&vended)
+            .map_err(|e| BrokerError::Other(format!("serialize vended credentials: {e}")))?;
 
         self.state
             .lock()
@@ -1017,11 +1000,8 @@ mod tests {
 
     #[test]
     fn parse_get_session_token_xml_extracts_credentials() {
-        let parsed = parse_sts_credentials(
-            &get_session_token_ok_xml(),
-            StsAction::GetSessionToken,
-        )
-        .expect("parse ok");
+        let parsed = parse_sts_credentials(&get_session_token_ok_xml(), StsAction::GetSessionToken)
+            .expect("parse ok");
         assert_eq!(parsed.access_key_id, "ASIASESSIONKEY");
         assert_eq!(parsed.session_token, "sessionTokenValueXyz");
     }
@@ -1039,10 +1019,7 @@ mod tests {
     fn map_sts_error_expired_token_returns_upstream() {
         let err = map_sts_error(403, &expired_token_xml());
         let msg = format!("{err}");
-        assert!(
-            matches!(err, BrokerError::Upstream(_)),
-            "expected Upstream"
-        );
+        assert!(matches!(err, BrokerError::Upstream(_)), "expected Upstream");
         assert!(
             msg.contains("expired") || msg.contains("Expired"),
             "error message should mention expiration: {msg}"
@@ -1109,7 +1086,9 @@ mod tests {
             }),
             3600,
         );
-        let cred = Broker::issue(&broker, req).await.expect("issue must succeed");
+        let cred = Broker::issue(&broker, req)
+            .await
+            .expect("issue must succeed");
         assert!(cred.materialization_id.starts_with("aws-sts-agent-1-"));
 
         // Token is a JSON bundle — parse it and verify the three fields.
@@ -1138,7 +1117,9 @@ mod tests {
             }),
             1800,
         );
-        let cred = Broker::issue(&broker, req).await.expect("issue must succeed");
+        let cred = Broker::issue(&broker, req)
+            .await
+            .expect("issue must succeed");
         let bundle: AwsVendedCredentials =
             serde_json::from_str(cred.token.expose_secret()).expect("bundle must parse");
         assert_eq!(bundle.access_key_id, "ASIASESSIONKEY");
@@ -1162,7 +1143,9 @@ mod tests {
             3600,
         );
         // Should use AssumeRole (default role) not GetSessionToken.
-        let cred = Broker::issue(&broker, req).await.expect("issue must succeed");
+        let cred = Broker::issue(&broker, req)
+            .await
+            .expect("issue must succeed");
         assert!(cred.materialization_id.starts_with("aws-sts-agent-3-"));
     }
 
@@ -1330,7 +1313,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // AssumeRoleWithWebIdentity — implementation-note-46 tests
+    // AssumeRoleWithWebIdentity — implementation-note-64 tests
     // -----------------------------------------------------------------
 
     fn assume_role_with_web_identity_ok_xml() -> String {
@@ -1371,7 +1354,8 @@ mod tests {
 
     #[test]
     fn assume_role_with_web_identity_body_has_required_params() {
-        let token = SecretString::from("eyJhbGciOiJSUzI1NiIsImtpZCI6Im9pZGMifQ.body.sig".to_string());
+        let token =
+            SecretString::from("eyJhbGciOiJSUzI1NiIsImtpZCI6Im9pZGMifQ.body.sig".to_string());
         let body = assume_role_with_web_identity(
             "arn:aws:iam::111122223333:role/oidc-federated",
             "agent-web",
@@ -1489,7 +1473,9 @@ mod tests {
             }),
             3600,
         );
-        let cred = Broker::issue(&broker, req).await.expect("issue must succeed");
+        let cred = Broker::issue(&broker, req)
+            .await
+            .expect("issue must succeed");
 
         // Vended credentials parse + match XML fixture.
         let bundle: AwsVendedCredentials =

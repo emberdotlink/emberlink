@@ -1,6 +1,8 @@
-use core_approval::{ApprovalLifecycle, ApprovalOutcome, LifecycleError, RequestId, SubmitMetadata};
-use core_grants::Grant;
+use core_approval::{
+    ApprovalLifecycle, ApprovalOutcome, LifecycleError, RequestId, SubmitMetadata,
+};
 use core_grant_types::approval::RequestedScope;
+use core_grants::Grant;
 
 struct MockLifecycle;
 
@@ -55,8 +57,7 @@ fn trait_shape_compiles() {
 fn decide_returns_none_on_denied() {
     let m = MockLifecycle;
     let id = RequestId("test-id".into());
-    let result =
-        futures::executor::block_on(m.decide(&id, ApprovalOutcome::Denied)).unwrap();
+    let result = futures::executor::block_on(m.decide(&id, ApprovalOutcome::Denied)).unwrap();
     assert!(result.is_none());
 }
 

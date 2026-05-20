@@ -35,7 +35,10 @@ fn make_store() -> DaemonStore {
 fn make_persona(store: &DaemonStore) -> String {
     let vault = Rc::new(ember_daemon::infra::vault::Vault::new([1u8; 32]));
     store.set_vault(Rc::clone(&vault));
-    store.create_persona("test-agent").expect("create persona").id
+    store
+        .create_persona("test-agent")
+        .expect("create persona")
+        .id
 }
 
 fn minimal_statement(credential_name: &str) -> StatementProposal {
@@ -69,6 +72,17 @@ fn fake_approval_with_skill_ref(skill_ref: Option<&str>) -> ApprovalRequestInfo 
         composite_statements: None,
         result_grant_id: None,
         skill_ref: skill_ref.map(str::to_owned),
+        // implementation-note-7 — the
+        // five grant-shaping fields default to None for legacy fixtures
+        // that don't exercise the delegation-cap path.
+        max_delegation_depth: None,
+        max_uses_per_hour: None,
+        allowed_hours_start: None,
+        allowed_hours_end: None,
+        allowed_targets: None,
+        budget: None,
+        max_children_per_day: None,
+        auto_delegate_scope_template: None,
     }
 }
 
@@ -248,7 +262,9 @@ fn list_pending_approvals_returns_skill_ref() {
         .propose_grant_typed(&proposal, "credential.access", "low")
         .expect("propose_grant_typed must succeed");
 
-    let pending = store.list_pending_approvals().expect("list_pending_approvals");
+    let pending = store
+        .list_pending_approvals()
+        .expect("list_pending_approvals");
     assert_eq!(pending.len(), 1, "should have exactly one pending approval");
 
     let p = &pending[0];

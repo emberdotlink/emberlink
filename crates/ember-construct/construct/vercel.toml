@@ -23,6 +23,7 @@ name = "ember-vercel"
 version = "0.1.0"
 publisher = "did:emberlink"
 description = "Vercel CLI Construct. Mediates `vercel` invocations through ember's credential broker: project/domain/team/secret/alias removals (irreversible loss) require biometric; `domains buy` (spending money) requires biometric; `tokens revoke` (privilege removal) requires biometric; `env remove` (can break prod) requires biometric. All other classified mutating verbs (deploy, env add/pull/push, projects add, domains add, dns/certs ops, alias set, integration add, rollback, promote, teams create/invite, tokens create, secrets add/rename, git disconnect) gate without biometric. VERCEL_TOKEN is the credential injection env var."
+authority_refs = ["vercel"]
 
 # Default policy for unlisted action keys.
 default = "deny"

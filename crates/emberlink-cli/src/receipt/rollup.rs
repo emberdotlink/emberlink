@@ -191,7 +191,7 @@ pub fn read_receipts_from_jsonl(path: &Path) -> Result<Vec<RawReceipt>, RollupEr
         source: e,
     })?;
     let mut out = Vec::new();
-    for (_idx, line) in raw.lines().enumerate() {
+    for line in raw.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -261,8 +261,7 @@ pub fn verify_chain(
     if matches!(rollup.outcome, RollupOutcome::Incomplete) {
         return Err(RollupError::ChainBroken {
             materialization_id: materialization_id.to_string(),
-            reason: "chain incomplete — session.construct_invocation never landed"
-                .to_string(),
+            reason: "chain incomplete — session.construct_invocation never landed".to_string(),
         });
     }
 
@@ -298,9 +297,10 @@ impl From<ConstructInvocationRollup> for RollupRow {
         let (outcome, outcome_detail) = match &r.outcome {
             RollupOutcome::Success => ("success".to_string(), None),
             RollupOutcome::Denied { reason } => ("denied".to_string(), Some(reason.clone())),
-            RollupOutcome::Errored { exit_code } => {
-                ("errored".to_string(), Some(format!("exit_code={exit_code}")))
-            }
+            RollupOutcome::Errored { exit_code } => (
+                "errored".to_string(),
+                Some(format!("exit_code={exit_code}")),
+            ),
             RollupOutcome::InFlight => ("in_flight".to_string(), None),
             RollupOutcome::Incomplete => ("incomplete".to_string(), None),
         };
@@ -345,20 +345,18 @@ fn apply_filters(
     rollups
         .into_iter()
         .filter(|r| {
-            if let Some(mid) = &filters.materialization {
-                if &r.materialization_id != mid {
-                    return false;
-                }
-            }
-            if filters.incomplete_only
-                && !matches!(r.outcome, RollupOutcome::Incomplete)
+            if let Some(mid) = &filters.materialization
+                && &r.materialization_id != mid
             {
                 return false;
             }
-            if let Some(cutoff) = since_iso {
-                if r.started_at.as_str() < cutoff {
-                    return false;
-                }
+            if filters.incomplete_only && !matches!(r.outcome, RollupOutcome::Incomplete) {
+                return false;
+            }
+            if let Some(cutoff) = since_iso
+                && r.started_at.as_str() < cutoff
+            {
+                return false;
             }
             true
         })
@@ -549,8 +547,7 @@ mod tests {
 
     #[test]
     fn parse_since_iso_passthrough() {
-        let out =
-            parse_since("2026-05-05T00:00:00Z").expect("iso-8601 passes through");
+        let out = parse_since("2026-05-05T00:00:00Z").expect("iso-8601 passes through");
         assert_eq!(out.as_deref(), Some("2026-05-05T00:00:00Z"));
     }
 
@@ -589,7 +586,10 @@ mod tests {
         let lines = success_chain("m_abc");
         let f = write_events(&lines);
         let out = rollup_command(f.path(), &RollupFilters::default(), false).unwrap();
-        assert!(out.contains("m_abc"), "table missing materialization id: {out}");
+        assert!(
+            out.contains("m_abc"),
+            "table missing materialization id: {out}"
+        );
         assert!(out.contains("success"), "table missing outcome: {out}");
         assert!(out.contains("gh.pr_create"), "table missing action: {out}");
     }
@@ -647,7 +647,10 @@ mod tests {
             ..Default::default()
         };
         let out = rollup_command(f.path(), &filters, false).unwrap();
-        assert!(out.contains("No rollups"), "expected friendly empty msg: {out}");
+        assert!(
+            out.contains("No rollups"),
+            "expected friendly empty msg: {out}"
+        );
     }
 
     #[test]
@@ -677,8 +680,8 @@ mod tests {
         let lines = incomplete_chain("m_crash");
         let f = write_events(&lines);
         let receipts = read_receipts_from_jsonl(f.path()).unwrap();
-        let err = verify_chain(&receipts, "m_crash")
-            .expect_err("incomplete chain should not verify");
+        let err =
+            verify_chain(&receipts, "m_crash").expect_err("incomplete chain should not verify");
         match err {
             RollupError::ChainBroken {
                 materialization_id,
@@ -724,8 +727,7 @@ mod tests {
         ];
         let f = write_events(&lines);
         let receipts = read_receipts_from_jsonl(f.path()).unwrap();
-        let err = verify_chain(&receipts, "m_no_head")
-            .expect_err("missing chain head should fail");
+        let err = verify_chain(&receipts, "m_no_head").expect_err("missing chain head should fail");
         match err {
             RollupError::ChainBroken { reason, .. } => {
                 assert!(reason.contains("chain head"), "got: {reason}");

@@ -98,9 +98,11 @@ pub async fn hashivault_config_from_store(
         key: &str,
     ) -> Result<Option<String>, StoreError> {
         match store.get(key).await {
-            Ok(bytes) => Ok(Some(String::from_utf8(bytes).map_err(|e| {
-                StoreError::Other(format!("non-utf8 in {}: {e}", key))
-            })?)),
+            Ok(bytes) => {
+                Ok(Some(String::from_utf8(bytes).map_err(|e| {
+                    StoreError::Other(format!("non-utf8 in {}: {e}", key))
+                })?))
+            }
             Err(StoreError::NotFound(_)) => Ok(None),
             Err(other) => Err(other),
         }
@@ -214,10 +216,7 @@ mod tests {
     #[test]
     fn load_from_dir_missing_address_returns_none() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        write(
-            &tmp.path().join(ENV_FILENAME),
-            "VAULT_TOKEN=hvs.solo\n",
-        );
+        write(&tmp.path().join(ENV_FILENAME), "VAULT_TOKEN=hvs.solo\n");
         assert!(
             load_from_dir(tmp.path()).is_none(),
             "missing VAULT_ADDR must return None"
@@ -226,8 +225,7 @@ mod tests {
 
     #[test]
     fn parse_env_var_strips_quotes_and_whitespace() {
-        let env =
-            "VAULT_TOKEN=\"hvs.quoted\"\nVAULT_ADDR='https://vault.example.com:8200'\n";
+        let env = "VAULT_TOKEN=\"hvs.quoted\"\nVAULT_ADDR='https://vault.example.com:8200'\n";
         assert_eq!(
             parse_env_var(env, "VAULT_TOKEN"),
             Some("hvs.quoted".to_string())
@@ -246,8 +244,8 @@ mod tests {
 
     #[tokio::test]
     async fn hashivault_config_from_store_happy_path() {
-        use crate::infra::credential_store::test_helpers::MockCredentialStore;
         use crate::infra::credential_store::CredentialStore;
+        use crate::infra::credential_store::test_helpers::MockCredentialStore;
 
         let mock = MockCredentialStore::new();
         mock.put(STORE_KEY_VAULT_TOKEN, b"hvs.test_parent_token")

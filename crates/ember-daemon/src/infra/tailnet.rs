@@ -60,9 +60,9 @@ use std::time::Duration;
 // create_grant which returns GrantInfo, and LeaseHandle is built from GrantInfo
 // fields (id, persona_id, credential_name, expires_at). Migrate once create_grant
 // is updated to return core_grants::Grant or a dedicated LeaseResult type.
-use crate::trust::grant::GrantInfo;
 use crate::infra::store::{DaemonStore, StoreError};
 use crate::infra::vault::{VaultError, VaultScope};
+use crate::trust::grant::GrantInfo;
 
 /// Tailnet ACL tag the daemon will accept lease requests from. Bound to
 /// the Team Zero homelab tag from `infra/tailnet/acl.json`. Anything
@@ -191,29 +191,22 @@ pub fn lease_credential(
     // grant: if the credential is missing or the vault is locked, no
     // grant row gets written and the operator sees a clean failure.
     let vault = store.vault().ok_or_else(|| {
-        StoreError::InvalidInput(
-            "lease_credential: daemon vault is not attached".to_string(),
-        )
+        StoreError::InvalidInput("lease_credential: daemon vault is not attached".to_string())
     })?;
-    let credential = vault.get(VaultScope::Interactive, store, credential_name).map_err(map_vault_err)?;
+    let credential = vault
+        .get(VaultScope::Interactive, store, credential_name)
+        .map_err(map_vault_err)?;
 
     // Mint a single-statement composite grant scoped to this resource.
     // Reuses the existing `create_grant` machinery so the receipt-emit
     // path on TTL expiry is identical to every other daemon grant —
     // we deliberately do NOT bypass `create_grant` to expose a "general
     // grant minting endpoint", per the task constraint.
-    let info: GrantInfo = store.create_grant(
-        persona_id,
-        credential_name,
-        credential_name,
-        Some(ttl_secs),
-    )?;
-    let expires_at = info
-        .expires_at
-        .clone()
-        .ok_or_else(|| StoreError::InvalidInput(
-            "lease_credential: TTL grant returned no expires_at".to_string(),
-        ))?;
+    let info: GrantInfo =
+        store.create_grant(persona_id, credential_name, credential_name, Some(ttl_secs))?;
+    let expires_at = info.expires_at.clone().ok_or_else(|| {
+        StoreError::InvalidInput("lease_credential: TTL grant returned no expires_at".to_string())
+    })?;
 
     tracing::info!(
         grant_id = %info.id,
@@ -274,7 +267,13 @@ mod tests {
         let persona = store.create_persona("agent-tailnet").expect("persona");
         let vault = store.vault().expect("vault");
         vault
-            .add(VaultScope::Interactive, &store, "github-pat", b"ghp_test", None)
+            .add(
+                VaultScope::Interactive,
+                &store,
+                "github-pat",
+                b"ghp_test",
+                None,
+            )
             .expect("seed credential");
 
         let err = lease_credential(
@@ -294,7 +293,13 @@ mod tests {
         let persona = store.create_persona("agent-zero-ttl").expect("persona");
         let vault = store.vault().expect("vault");
         vault
-            .add(VaultScope::Interactive, &store, "github-pat", b"ghp_test", None)
+            .add(
+                VaultScope::Interactive,
+                &store,
+                "github-pat",
+                b"ghp_test",
+                None,
+            )
             .expect("seed credential");
 
         let err = lease_credential(
@@ -314,7 +319,13 @@ mod tests {
         let persona = store.create_persona("agent-cap").expect("persona");
         let vault = store.vault().expect("vault");
         vault
-            .add(VaultScope::Interactive, &store, "github-pat", b"ghp_test", None)
+            .add(
+                VaultScope::Interactive,
+                &store,
+                "github-pat",
+                b"ghp_test",
+                None,
+            )
             .expect("seed credential");
 
         let err = lease_credential(
@@ -357,7 +368,13 @@ mod tests {
 
         let vault = store.vault().expect("vault");
         vault
-            .add(VaultScope::Interactive, &store, "github-pat", b"ghp_secret_value", None)
+            .add(
+                VaultScope::Interactive,
+                &store,
+                "github-pat",
+                b"ghp_secret_value",
+                None,
+            )
             .expect("seed credential");
 
         let lease = lease_credential(
@@ -380,7 +397,10 @@ mod tests {
         // The minted grant is active and TTL-bounded.
         let grant = store.get_grant(&lease.grant_id).expect("get_grant");
         assert_eq!(grant.status, "active");
-        assert!(grant.expires_at.is_some(), "TTL grant must carry expires_at");
+        assert!(
+            grant.expires_at.is_some(),
+            "TTL grant must carry expires_at"
+        );
 
         // Pre-condition: zero receipts before the sweep.
         assert_eq!(

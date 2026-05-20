@@ -1,5 +1,5 @@
 //! Receipt v2 `spawn.witness` body kind — round-trip + parent-signature
-//! verification tests. implementation-note-30 (CRIT-7 mitigation).
+//! verification tests. implementation-note-38 (CRIT-7 mitigation).
 //!
 //! These tests exercise the dual-signing model:
 //!   1. The parent persona signs `JCS(spawn.witness body excluding parent_signature)`,
@@ -30,6 +30,11 @@ fn make_envelope(body: serde_json::Value) -> ReceiptEnvelope {
         presence_kind: None,
         body,
         signature: None,
+        calling_principal: None,
+        presence_reason: None,
+        handle_id: None,
+        challenge_hash: None,
+        verifier_aaguid: None,
     }
 }
 
@@ -103,9 +108,10 @@ fn forged_parent_persona_id_rejected() {
 
     // 2. Attacker tampers with parent_persona_id (now claims a different parent
     //    authorized the spawn) while keeping the real parent's signature.
-    body.as_object_mut()
-        .unwrap()
-        .insert("parent_persona_id".into(), serde_json::json!("persona-FORGED-parent"));
+    body.as_object_mut().unwrap().insert(
+        "parent_persona_id".into(),
+        serde_json::json!("persona-FORGED-parent"),
+    );
 
     // 3. Verification under the real parent's pubkey MUST fail — the canonical
     //    bytes the verifier recomputes no longer match what the parent signed.
@@ -135,7 +141,11 @@ fn missing_parent_signature_field_rejected() {
     assert!(
         matches!(
             r,
-            Err(core_events::receipt::sign::SignError::SpawnWitnessMissingField { field: "parent_signature" })
+            Err(
+                core_events::receipt::sign::SignError::SpawnWitnessMissingField {
+                    field: "parent_signature"
+                }
+            )
         ),
         "missing parent_signature must be flagged, got {r:?}"
     );
@@ -176,11 +186,15 @@ fn parent_signature_stable_across_field_order() {
 
     // Round-trip through a fresh JSON Object that re-inserts in a different
     // order. JCS sorts the keys identically — the canonical bytes match.
+    // `ca_fingerprint` (Slice C, bridge_ca_fingerprint_in_spawn_receipt) is
+    // included so the reorder preserves every field on the wire body; a
+    // missing field would change the canonical bytes and break verification.
     let obj = body.as_object().unwrap();
     let mut reordered = serde_json::Map::new();
     for key in [
         "spawn_grant_id",
         "parent_signature",
+        "ca_fingerprint",
         "container_id",
         "parent_persona_id",
         "spawned_persona_id",

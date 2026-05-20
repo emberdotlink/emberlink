@@ -55,6 +55,52 @@ pub enum PresenceKind {
     RevokedBefore,
 }
 
+/// receipt_v2_presence_reason — per design Topic 6 D5 / implementation-note-37.
+/// *Why* the presence proof was requested. Distinct from [`PresenceKind`]
+/// (which is *what kind* of presence the receipt witnesses): `PresenceReason`
+/// records the lifecycle event that triggered re-prompting the user for
+/// physical presence — opening a fresh session, extending a near-expiry
+/// handle, adding scope to an existing handle, just-in-time provisioning at
+/// the moment of first use, or re-authenticating after a step-up trigger.
+///
+/// `None` on receipts where presence wasn't re-elicited for this call
+/// (e.g. mid-session tool calls that ride an already-bound presence handle).
+/// The serde-default + `skip_serializing_if = is_none` keep older fixtures
+/// round-tripping cleanly without setting the field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PresenceReason {
+    /// A new session/handle was opened — first presence challenge in the
+    /// session's lifetime. Strongest baseline claim.
+    SessionOpen,
+    /// An existing handle was extended past its original expiry. Presence
+    /// was re-elicited because the original window was about to lapse.
+    Extend,
+    /// Scope was added to an existing handle (broader caps than originally
+    /// minted). Presence was re-elicited because the new scope crosses a
+    /// policy threshold that demands fresh consent.
+    AddScope,
+    /// Just-in-time mint at the moment of first use. Presence was elicited
+    /// because no live handle existed when the call landed; the handle was
+    /// created on-demand for this RPC.
+    Jit,
+    /// Step-up re-authentication triggered by a policy event (e.g. risk
+    /// signal, anomaly detection, explicit `reauth` admin action). Presence
+    /// was re-elicited despite an existing valid handle.
+    ReAuth,
+}
+
+/// Opaque handle ID for a presence-proof binding (per design Topic 6).
+/// String alias kept newtype-light to avoid churn on call sites that
+/// already carry handle IDs as strings (UUID, opaque server-issued tokens).
+pub type HandleId = String;
+
+/// WebAuthn AAGUID of the authenticator that produced the presence proof
+/// (16 bytes, per the FIDO2 spec). Captured on receipts where the presence
+/// proof was sourced from a hardware authenticator so audit can distinguish
+/// platform vs roaming authenticators (and specific vendor/model).
+pub type Aaguid = [u8; 16];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReceiptEnvelope {
     pub version: ReceiptVersion,
@@ -78,6 +124,36 @@ pub struct ReceiptEnvelope {
     /// Persona-signed (per design). Hex-encoded ed25519. Out of scope this PR — populated by signing helper.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+    /// Principal identity captured at the daemon's accept gate via SO_PEERCRED.
+    /// `None` on receipts where peer-cred was not captured (pre-design receipts).
+    /// `skip_serializing_if` is load-bearing: `None` must not emit the key so
+    /// existing receipts signed without this field continue to verify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calling_principal: Option<crate::receipt::sign::CallingPrincipal>,
+    /// *Why* presence was re-elicited for this call (session-open / extend /
+    /// add-scope / jit / re-auth). `None` on receipts where presence wasn't
+    /// re-elicited (mid-session tool calls riding an existing handle). See
+    /// [`PresenceReason`] for the variants. Per design Topic 6 D5 /
+    /// implementation-note-37.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_reason: Option<PresenceReason>,
+    /// Opaque handle ID for the presence-proof binding this call rode (or
+    /// minted). `None` on receipts that don't touch a presence handle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle_id: Option<HandleId>,
+    /// SHA-256 of the presence challenge bound to the call, as produced by
+    /// [`core_crypto::bind_presence_challenge`]. Recorded so audit can
+    /// re-bind the challenge tuple (workflow_id, action_key, spiffe_uri,
+    /// nonce) deterministically without storing the components themselves.
+    /// `None` on receipts without an associated presence challenge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub challenge_hash: Option<[u8; 32]>,
+    /// AAGUID of the WebAuthn authenticator that produced the presence
+    /// proof. `None` when the proof did not originate from a hardware
+    /// authenticator (e.g. presence delegated to OS biometric, or the
+    /// receipt didn't witness a hardware presence event).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verifier_aaguid: Option<Aaguid>,
 }
 
 #[cfg(test)]
@@ -109,6 +185,22 @@ mod tests {
             assert_eq!(json, want);
             let back: PresenceKind = serde_json::from_str(&json).unwrap();
             assert_eq!(back, k);
+        }
+    }
+
+    #[test]
+    fn presence_reason_round_trip() {
+        for (r, want) in [
+            (PresenceReason::SessionOpen, "\"session_open\""),
+            (PresenceReason::Extend, "\"extend\""),
+            (PresenceReason::AddScope, "\"add_scope\""),
+            (PresenceReason::Jit, "\"jit\""),
+            (PresenceReason::ReAuth, "\"re_auth\""),
+        ] {
+            let json = serde_json::to_string(&r).unwrap();
+            assert_eq!(json, want);
+            let back: PresenceReason = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, r);
         }
     }
 }

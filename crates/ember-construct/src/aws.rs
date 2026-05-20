@@ -81,9 +81,7 @@ pub(crate) fn strip_global_flags(argv: &[String]) -> Vec<String> {
         // shouldn't have `=value` but accept it tolerantly).
         if let Some(eq) = tok.find('=') {
             let name = &tok[..eq];
-            if VALUE_BEARING_GLOBAL_FLAGS.contains(&name)
-                || BOOLEAN_GLOBAL_FLAGS.contains(&name)
-            {
+            if VALUE_BEARING_GLOBAL_FLAGS.contains(&name) || BOOLEAN_GLOBAL_FLAGS.contains(&name) {
                 i += 1;
                 continue;
             }
@@ -167,9 +165,7 @@ pub fn classify_aws_argv(argv: &[String]) -> Option<ActionKey> {
         "s3api" => match verb {
             "put-object" => Some(ActionKey("aws.s3api.put-object".to_string())),
             "delete-object" => Some(ActionKey("aws.s3api.delete-object".to_string())),
-            "put-bucket-policy" => {
-                Some(ActionKey("aws.s3api.put-bucket-policy".to_string()))
-            }
+            "put-bucket-policy" => Some(ActionKey("aws.s3api.put-bucket-policy".to_string())),
             _ => None,
         },
 
@@ -408,10 +404,7 @@ mod tests {
 
     #[test]
     fn secretsmanager_get_secret_value_passthrough() {
-        assert!(
-            classify_aws_argv(&args(&["secretsmanager", "get-secret-value"]))
-                .is_none()
-        );
+        assert!(classify_aws_argv(&args(&["secretsmanager", "get-secret-value"])).is_none());
     }
 
     // --- kms ---
@@ -543,37 +536,32 @@ mod tests {
 
     #[test]
     fn output_flag_after_verb_stripped() {
-        let r =
-            classify_aws_argv(&args(&["iam", "delete-role", "--output", "json"])).unwrap();
+        let r = classify_aws_argv(&args(&["iam", "delete-role", "--output", "json"])).unwrap();
         assert_eq!(r.0, "aws.iam.delete-role");
     }
 
     #[test]
     fn no_cli_pager_boolean_flag_stripped() {
-        let r =
-            classify_aws_argv(&args(&["--no-cli-pager", "kms", "decrypt"])).unwrap();
+        let r = classify_aws_argv(&args(&["--no-cli-pager", "kms", "decrypt"])).unwrap();
         assert_eq!(r.0, "aws.kms.decrypt");
     }
 
     #[test]
     fn equals_form_region_flag_stripped() {
-        let r =
-            classify_aws_argv(&args(&["--region=us-west-2", "ec2", "terminate-instances"]))
-                .unwrap();
+        let r = classify_aws_argv(&args(&["--region=us-west-2", "ec2", "terminate-instances"]))
+            .unwrap();
         assert_eq!(r.0, "aws.ec2.terminate-instances");
     }
 
     #[test]
     fn equals_form_profile_flag_stripped() {
-        let r =
-            classify_aws_argv(&args(&["s3api", "--profile=p", "delete-object"])).unwrap();
+        let r = classify_aws_argv(&args(&["s3api", "--profile=p", "delete-object"])).unwrap();
         assert_eq!(r.0, "aws.s3api.delete-object");
     }
 
     #[test]
     fn debug_boolean_flag_stripped() {
-        let r =
-            classify_aws_argv(&args(&["--debug", "lambda", "delete-function"])).unwrap();
+        let r = classify_aws_argv(&args(&["--debug", "lambda", "delete-function"])).unwrap();
         assert_eq!(r.0, "aws.lambda.delete-function");
     }
 
@@ -594,18 +582,12 @@ mod tests {
 
     #[test]
     fn flags_reordered_classification_stable() {
-        let a = classify_aws_argv(&args(&[
-            "s3", "rm", "s3://b/k", "--region", "us-east-1",
-        ]))
-        .unwrap();
-        let b = classify_aws_argv(&args(&[
-            "--region", "us-east-1", "s3", "rm", "s3://b/k",
-        ]))
-        .unwrap();
-        let c = classify_aws_argv(&args(&[
-            "s3", "--region", "us-east-1", "rm", "s3://b/k",
-        ]))
-        .unwrap();
+        let a =
+            classify_aws_argv(&args(&["s3", "rm", "s3://b/k", "--region", "us-east-1"])).unwrap();
+        let b =
+            classify_aws_argv(&args(&["--region", "us-east-1", "s3", "rm", "s3://b/k"])).unwrap();
+        let c =
+            classify_aws_argv(&args(&["s3", "--region", "us-east-1", "rm", "s3://b/k"])).unwrap();
         assert_eq!(a.0, b.0);
         assert_eq!(b.0, c.0);
     }
@@ -725,11 +707,9 @@ mod tests {
     // contract slice this Construct depends on: the broker registry can
     // hold a `MockBroker::new(BrokerProvider::AwsSts)`, and a request that
     // declares `provider = AwsSts` round-trips through issue → revoke
-    // without panicking. Real STS impl is implementation-note-65 (separate task).
+    // without panicking. Real STS impl is implementation-note-81 (separate task).
 
-    use core_broker::{
-        Broker, BrokerError, BrokerProvider, BrokerRequest, MockBroker,
-    };
+    use core_broker::{Broker, BrokerError, BrokerProvider, BrokerRequest, MockBroker};
     use std::time::Duration;
 
     fn aws_sts_request(ttl_secs: u64) -> BrokerRequest {

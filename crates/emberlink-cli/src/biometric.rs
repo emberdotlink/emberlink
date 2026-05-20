@@ -1,4 +1,4 @@
-//! implementation-note-156 — biometric (Touch ID / device passcode) gate for high-risk
+//! implementation-note-205 — biometric (Touch ID / device passcode) gate for high-risk
 //! CLI operations like `ember approval approve <id>`.
 //!
 //! ## Goal
@@ -222,11 +222,8 @@ mod macos {
                 ));
             }
 
-            let outcome = run_evaluate_policy(
-                context,
-                LA_POLICY_DEVICE_OWNER_AUTHENTICATION,
-                reason,
-            );
+            let outcome =
+                run_evaluate_policy(context, LA_POLICY_DEVICE_OWNER_AUTHENTICATION, reason);
             release_object(context);
 
             match outcome {
@@ -272,9 +269,7 @@ mod macos {
 
     unsafe fn can_evaluate_policy(ctx: Id, policy: c_long) -> bool {
         unsafe {
-            let sel = sel_registerName(
-                CString::new("canEvaluatePolicy:error:").unwrap().as_ptr(),
-            );
+            let sel = sel_registerName(CString::new("canEvaluatePolicy:error:").unwrap().as_ptr());
             let mut err: Id = std::ptr::null_mut();
             msg_send_bool_long_outerr(ctx, sel, policy, &mut err) != 0
         }
@@ -307,9 +302,8 @@ mod macos {
                 let desc = if err.is_null() {
                     "biometric verification declined".to_string()
                 } else {
-                    let desc_sel = sel_registerName(
-                        CString::new("localizedDescription").unwrap().as_ptr(),
-                    );
+                    let desc_sel =
+                        sel_registerName(CString::new("localizedDescription").unwrap().as_ptr());
                     let ns_desc = msg_send_id(err, desc_sel);
                     nsstring_to_string(ns_desc)
                         .unwrap_or_else(|| "biometric verification declined".to_string())
@@ -326,9 +320,7 @@ mod macos {
             if cls.is_null() {
                 return std::ptr::null_mut();
             }
-            let sel = sel_registerName(
-                CString::new("stringWithUTF8String:").unwrap().as_ptr(),
-            );
+            let sel = sel_registerName(CString::new("stringWithUTF8String:").unwrap().as_ptr());
             let cstr = CString::new(s).unwrap_or_else(|_| CString::new("").unwrap());
             msg_send_id_cstr(cls, sel, cstr.as_ptr())
         }

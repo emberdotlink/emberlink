@@ -107,8 +107,7 @@ pub fn emit_checkpoint_to(
     };
 
     // Merge the event into a flat JSON object with the top-level "event" key.
-    let mut obj = serde_json::to_value(&event)
-        .map_err(CheckpointError::Serde)?;
+    let mut obj = serde_json::to_value(&event).map_err(CheckpointError::Serde)?;
     let map = obj
         .as_object_mut()
         .expect("SpawnCheckpointEvent always serializes as a JSON object");
@@ -117,10 +116,10 @@ pub fn emit_checkpoint_to(
 
     let line = serde_json::to_string(&obj).map_err(CheckpointError::Serde)?;
 
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(CheckpointError::Io)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(CheckpointError::Io)?;
     }
     let mut f = OpenOptions::new()
         .create(true)
@@ -149,8 +148,8 @@ pub async fn emit_checkpoint(
     // Resolve the primary worktree root via headless-runtime's git helper.
     // Fall back to cwd on failure (daemon is typically launched from the
     // repo root; this is a best-effort path).
-    let root = core_construct_runtime::layout::primary_worktree_root()
-        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let root =
+        core_construct_runtime::layout::primary_worktree_root().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let events_path = root.join(core_construct_runtime::layout::ENGINE_EVENTS_FILE);
     emit_checkpoint_to(&events_path, agent_id, checkpoint, result)
 }
@@ -189,11 +188,7 @@ mod tests {
 
         for variant in variants {
             let rt = roundtrip_checkpoint(variant.clone());
-            assert_eq!(
-                variant, rt,
-                "roundtrip mismatch for {:?}",
-                variant
-            );
+            assert_eq!(variant, rt, "roundtrip mismatch for {:?}", variant);
         }
     }
 
@@ -201,8 +196,7 @@ mod tests {
     fn serde_roundtrip_result_ok_and_err() {
         let ok = SpawnCheckpointResult::Ok;
         let json_ok = serde_json::to_string(&ok).expect("serialize ok");
-        let rt_ok: SpawnCheckpointResult =
-            serde_json::from_str(&json_ok).expect("deserialize ok");
+        let rt_ok: SpawnCheckpointResult = serde_json::from_str(&json_ok).expect("deserialize ok");
         assert_eq!(ok, rt_ok);
 
         let err = SpawnCheckpointResult::Err {
@@ -237,10 +231,7 @@ mod tests {
             v2.get("kind").and_then(|k| k.as_str()),
             Some("container_created"),
         );
-        assert_eq!(
-            v2.get("container_id").and_then(|v| v.as_str()),
-            Some("xyz"),
-        );
+        assert_eq!(v2.get("container_id").and_then(|v| v.as_str()), Some("xyz"),);
     }
 
     // -----------------------------------------------------------------------
@@ -266,8 +257,7 @@ mod tests {
         let lines: Vec<&str> = contents.lines().collect();
         assert_eq!(lines.len(), 1, "expected exactly one line");
 
-        let v: serde_json::Value =
-            serde_json::from_str(lines[0]).expect("parse line as JSON");
+        let v: serde_json::Value = serde_json::from_str(lines[0]).expect("parse line as JSON");
 
         assert_eq!(
             v.get("event").and_then(|e| e.as_str()),
@@ -286,10 +276,7 @@ mod tests {
             v.get("agent_id").and_then(|a| a.as_str()),
             Some("agent-test-001"),
         );
-        assert_eq!(
-            v.get("outcome").and_then(|o| o.as_str()),
-            Some("ok"),
-        );
+        assert_eq!(v.get("outcome").and_then(|o| o.as_str()), Some("ok"),);
         assert!(v.get("ts").is_some(), "ts must be present");
     }
 
@@ -331,10 +318,7 @@ mod tests {
             v2.get("kind").and_then(|k| k.as_str()),
             Some("sciontool_alive"),
         );
-        assert_eq!(
-            v2.get("outcome").and_then(|o| o.as_str()),
-            Some("err"),
-        );
+        assert_eq!(v2.get("outcome").and_then(|o| o.as_str()), Some("err"),);
         assert_eq!(
             v2.get("reason").and_then(|r| r.as_str()),
             Some("sciontool timed out"),

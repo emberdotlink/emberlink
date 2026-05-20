@@ -239,8 +239,8 @@ pub fn spawn_session_ssh_agent_se(
     std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o660))
         .context("set SE socket permissions")?;
 
-    let session_key = SeSessionKey::new(se_handle)
-        .map_err(|e| anyhow::anyhow!("SE session key init: {e}"))?;
+    let session_key =
+        SeSessionKey::new(se_handle).map_err(|e| anyhow::anyhow!("SE session key init: {e}"))?;
     let session_key = Arc::new(session_key);
 
     let guard = Arc::new(SeAgentGuard {
@@ -375,7 +375,11 @@ mod tests {
         let frame = encode_identities_answer_p256(&pubkey);
 
         let msg_len = u32::from_be_bytes(frame[0..4].try_into().unwrap()) as usize;
-        assert_eq!(frame.len(), 4 + msg_len, "frame length prefix must match body");
+        assert_eq!(
+            frame.len(),
+            4 + msg_len,
+            "frame length prefix must match body"
+        );
         assert_eq!(frame[4], SSH_AGENT_IDENTITIES_ANSWER);
 
         let nkeys = u32::from_be_bytes(frame[5..9].try_into().unwrap());

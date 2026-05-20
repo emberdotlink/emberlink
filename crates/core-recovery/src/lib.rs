@@ -1,5 +1,11 @@
-use core_event_types::{EventBody, GuardianEnrolledEvent, GuardianKeyRotatedEvent, RecoveryApprovedEvent, RecoveryContestedEvent, RecoveryExecutedEvent, RecoveryPolicyCreatedEvent, RecoveryRejectedEvent, RecoveryRequestedEvent};
-use core_principals::{RecoveryApproval, RecoveryExecution, RecoveryPolicy, RecoveryRequest, RecoveryScope};
+use core_event_types::{
+    EventBody, GuardianEnrolledEvent, GuardianKeyRotatedEvent, RecoveryApprovedEvent,
+    RecoveryContestedEvent, RecoveryExecutedEvent, RecoveryPolicyCreatedEvent,
+    RecoveryRejectedEvent, RecoveryRequestedEvent,
+};
+use core_principals::{
+    RecoveryApproval, RecoveryExecution, RecoveryPolicy, RecoveryRequest, RecoveryScope,
+};
 
 pub fn create_policy(
     root_id: impl Into<String>,

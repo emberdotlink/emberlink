@@ -7,7 +7,7 @@
 //! Provider-specific scopes (Cloudflare, Anthropic, GitHub, AWS STS, GCP,
 //! Tailscale) are represented at the trait boundary as opaque
 //! `serde_json::Value` payloads. Each provider implementation deserializes
-//! this into its own typed struct (see `implementation-note-8` and
+//! this into its own typed struct (see `implementation-note-10` and
 //! sibling tasks). The trait stays provider-agnostic so a single
 //! `Box<dyn Broker>` can be stored in the daemon's broker registry.
 //!
@@ -20,7 +20,7 @@
 
 // `anthropic` ships the real Anthropic Admin-API broker. ureq does not
 // compile to `wasm32-unknown-unknown`, so the module is also gated off
-// for that target. Feature-gated per implementation-note-9: the trait
+// for that target. Feature-gated per implementation-note-11: the trait
 // crate compiles with --no-default-features to trait + types + MockBroker
 // only; provider impls require explicit opt-in.
 #[cfg(all(not(target_arch = "wasm32"), feature = "anthropic"))]
@@ -38,7 +38,7 @@ pub mod cloudflare;
 pub use cloudflare::CloudflareBroker;
 
 // Opaque `SecretRef` contract — agents hold the opaque id, never the
-// plaintext (implementation-note-10). The trust boundary for
+// plaintext (implementation-note-12). The trust boundary for
 // resolving `SecretRef` → plaintext is ember-proxy / ember-tools, which
 // emits a per-resolution Receipt.
 pub mod secret_ref;
@@ -274,7 +274,6 @@ pub trait Broker: Send + Sync {
     }
 }
 
-
 /// In-memory broker for tests.
 ///
 /// `issue()` returns a deterministic canary credential. The
@@ -310,7 +309,11 @@ impl MockBroker {
 
     /// Returns the recorded revoke calls, in call order.
     pub fn revoke_calls(&self) -> Vec<String> {
-        self.state.lock().expect("mock broker mutex").revoke_log.clone()
+        self.state
+            .lock()
+            .expect("mock broker mutex")
+            .revoke_log
+            .clone()
     }
 
     /// Number of materializations still active.

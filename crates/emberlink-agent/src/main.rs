@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use core_state::EventStore;
-use emberlink_agent::runtime::{process_line, AgentConfig, AgentRuntime};
+use emberlink_agent::runtime::{AgentConfig, AgentRuntime, process_line};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 /// Maximum allowed line length (1 MB). Lines exceeding this are rejected
@@ -114,9 +114,7 @@ async fn main() {
                             "message": "request exceeds 1MB limit"
                         }
                     });
-                    let _ = stdout
-                        .write_all(err.to_string().as_bytes())
-                        .await;
+                    let _ = stdout.write_all(err.to_string().as_bytes()).await;
                     let _ = stdout.write_all(b"\n").await;
                     let _ = stdout.flush().await;
                     continue;

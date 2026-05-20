@@ -7,7 +7,7 @@
 //!      Ed25519 seed with info "ember-seal-v1") using XChaCha20-Poly1305.
 //!   3. Described by a signed [`SnapshotManifest`] chained via `prev_snapshot_id`.
 //!
-//! **Snapshot scope** (per implementation-note-35, design §Decision):
+//! **Snapshot scope** (per implementation-note-48, design §Decision):
 //!   - `credentials` table rows (vault-sealed blobs)
 //!   - `vault.salt` file bytes (critical: without it the MEK cannot be rebuilt)
 //!   - `personas` table rows
@@ -28,10 +28,12 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use core_crypto::{derive_snapshot_encryption_key, encrypt_content, decrypt_content, EncryptedContent};
+use core_crypto::{
+    EncryptedContent, decrypt_content, derive_snapshot_encryption_key, encrypt_content,
+};
 use core_grant_types::grant_receipt::{Evidence, SnapshotManifest};
 
-use crate::infra::receipt::{DaemonPersona, CANONICAL_VERSION};
+use crate::infra::receipt::{CANONICAL_VERSION, DaemonPersona};
 use crate::infra::store::{DaemonStore, StoreError};
 use crate::infra::vault::VaultScope;
 
@@ -320,9 +322,8 @@ pub fn dump_vault_state(
     // vault.salt — read from disk
     let salt_path = data_dir.join("vault.salt");
     let vault_salt_hex = if salt_path.exists() {
-        let bytes = std::fs::read(&salt_path).map_err(|e| {
-            StoreError::InvalidInput(format!("snapshot: read vault.salt: {e}"))
-        })?;
+        let bytes = std::fs::read(&salt_path)
+            .map_err(|e| StoreError::InvalidInput(format!("snapshot: read vault.salt: {e}")))?;
         hex::encode(&bytes)
     } else {
         // No salt file means the vault has never been initialized.
@@ -357,14 +358,17 @@ pub fn encrypt_vault_blob(
     state: &SerializedVaultState,
     identity: &DaemonPersona,
 ) -> Result<Vec<u8>, StoreError> {
-    let json = serde_json::to_vec(state).map_err(|e| {
-        StoreError::InvalidInput(format!("snapshot: serialize vault state: {e}"))
-    })?;
+    let json = serde_json::to_vec(state)
+        .map_err(|e| StoreError::InvalidInput(format!("snapshot: serialize vault state: {e}")))?;
     let content_key = derive_snapshot_encryption_key(&*identity.seed_bytes());
     let encrypted = encrypt_content(&content_key, &json, b"ember-snapshot-v1")
         .map_err(|e| StoreError::InvalidInput(format!("snapshot: encrypt vault state: {e}")))?;
     // Format: `nonce_hex:ciphertext_hex` — both fields are hex strings.
-    let blob = format!("{}:{}", encrypted.nonce_hex, hex::encode(&encrypted.ciphertext));
+    let blob = format!(
+        "{}:{}",
+        encrypted.nonce_hex,
+        hex::encode(&encrypted.ciphertext)
+    );
     Ok(blob.into_bytes())
 }
 
@@ -387,9 +391,8 @@ pub fn decrypt_vault_blob(
     let content_key = derive_snapshot_encryption_key(&*identity.seed_bytes());
     let plaintext = decrypt_content(&content_key, &encrypted, b"ember-snapshot-v1")
         .map_err(|e| StoreError::InvalidInput(format!("snapshot: decrypt vault state: {e}")))?;
-    serde_json::from_slice(&plaintext).map_err(|e| {
-        StoreError::InvalidInput(format!("snapshot: deserialize vault state: {e}"))
-    })
+    serde_json::from_slice(&plaintext)
+        .map_err(|e| StoreError::InvalidInput(format!("snapshot: deserialize vault state: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -421,7 +424,7 @@ pub fn sign_snapshot_manifest(manifest: &mut SnapshotManifest, identity: &Daemon
     let sig_bytes = identity.sign(hash_hex.as_bytes());
     manifest.evidence = Evidence {
         hash: hash_hex,
-        sig: hex::encode(&*sig_bytes),
+        sig: hex::encode(*sig_bytes),
         signer_pubkey: identity.pubkey_hex(),
         canonical_version: CANONICAL_VERSION,
     };
@@ -434,11 +437,8 @@ pub fn sign_snapshot_manifest(manifest: &mut SnapshotManifest, identity: &Daemon
 ///   - the signature is not the all-zeros placeholder;
 ///   - the canonical hash matches `evidence.hash`;
 ///   - Ed25519 signature verifies.
-pub fn verify_snapshot_manifest(
-    manifest: &SnapshotManifest,
-    expected_pubkey_hex: &str,
-) -> bool {
-    use ed25519_dalek::{Signature, VerifyingKey, Verifier as _};
+pub fn verify_snapshot_manifest(manifest: &SnapshotManifest, expected_pubkey_hex: &str) -> bool {
+    use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
 
     let Ok(pubkey_bytes) = hex::decode(expected_pubkey_hex) else {
         return false;
@@ -572,8 +572,7 @@ impl SnapshotEmitter {
         if let Err(e) = std::fs::create_dir_all(&snapshot_dir) {
             tracing::warn!(error = %e, "snapshot: could not create snapshots dir");
         } else {
-            let manifest_path =
-                snapshot_dir.join(format!("{}.manifest.json", &snapshot_id[..16]));
+            let manifest_path = snapshot_dir.join(format!("{}.manifest.json", &snapshot_id[..16]));
             let blob_path = snapshot_dir.join(format!("{}.blob.bin", &snapshot_id[..16]));
             if let Ok(manifest_json) = serde_json::to_vec_pretty(&manifest)
                 && let Err(e) = std::fs::write(&manifest_path, &manifest_json)
@@ -587,7 +586,10 @@ impl SnapshotEmitter {
 
         // 7. Update state.
         {
-            let mut guard = self.last_emitted_at.lock().expect("snapshot mutex poisoned");
+            let mut guard = self
+                .last_emitted_at
+                .lock()
+                .expect("snapshot mutex poisoned");
             *guard = Some(Instant::now());
         }
         {
@@ -704,7 +706,10 @@ pub async fn pull_cluster_snapshot(
         .body(Full::new(Bytes::new()))
         .map_err(|e| PullError::Http(e.to_string()))?;
 
-    let resp = client.request(req).await.map_err(|e| PullError::Http(e.to_string()))?;
+    let resp = client
+        .request(req)
+        .await
+        .map_err(|e| PullError::Http(e.to_string()))?;
     let status = resp.status().as_u16();
     if status == 404 {
         tracing::debug!(endpoint = %eic_endpoint, "pull: no snapshots available on EIC yet");
@@ -749,7 +754,10 @@ pub async fn pull_cluster_snapshot(
         .body(Full::new(Bytes::new()))
         .map_err(|e| PullError::Http(e.to_string()))?;
 
-    let resp2 = client2.request(req2).await.map_err(|e| PullError::Http(e.to_string()))?;
+    let resp2 = client2
+        .request(req2)
+        .await
+        .map_err(|e| PullError::Http(e.to_string()))?;
     let status2 = resp2.status().as_u16();
     if status2 != 200 {
         return Err(PullError::HttpStatus(status2));
@@ -784,7 +792,13 @@ pub async fn pull_cluster_snapshot(
         .map_err(|e| PullError::Deserialize(e.to_string()))?;
 
     // Store blob — ignore duplicate-name errors (idempotent on retry).
-    match vault.add(VaultScope::Interactive, store, &blob_key, &blob_bytes, Some("cluster-snapshot-blob")) {
+    match vault.add(
+        VaultScope::Interactive,
+        store,
+        &blob_key,
+        &blob_bytes,
+        Some("cluster-snapshot-blob"),
+    ) {
         Ok(_) => {}
         Err(crate::infra::vault::VaultError::Store(StoreError::Sqlite(e)))
             if e.to_string().contains("UNIQUE constraint") =>
@@ -795,7 +809,13 @@ pub async fn pull_cluster_snapshot(
     }
 
     // Store manifest JSON — ignore duplicate-name errors (idempotent on retry).
-    match vault.add(VaultScope::Interactive, store, &meta_key, &manifest_json, Some("cluster-snapshot-manifest")) {
+    match vault.add(
+        VaultScope::Interactive,
+        store,
+        &meta_key,
+        &manifest_json,
+        Some("cluster-snapshot-manifest"),
+    ) {
         Ok(_) => {}
         Err(crate::infra::vault::VaultError::Store(StoreError::Sqlite(e)))
             if e.to_string().contains("UNIQUE constraint") =>
@@ -819,7 +839,7 @@ pub async fn pull_cluster_snapshot(
 ///
 /// Call [`SnapshotPuller::maybe_pull`] on a Tokio interval at daemon startup.
 /// Only active when `snapshot_pull_endpoint` is configured (per design
-/// implementation-note-125).
+/// implementation-note-174).
 pub struct SnapshotPuller {
     interval_secs: u64,
     last_pulled_at: Mutex<Option<Instant>>,
@@ -856,9 +876,14 @@ impl SnapshotPuller {
             return Ok(None);
         }
 
-        let result =
-            pull_cluster_snapshot(eic_endpoint, cluster_id, eic_persona_pubkey_hex, vault, store)
-                .await;
+        let result = pull_cluster_snapshot(
+            eic_endpoint,
+            cluster_id,
+            eic_persona_pubkey_hex,
+            vault,
+            store,
+        )
+        .await;
 
         // Update last_pulled_at regardless of pull outcome so we don't hammer
         // a transiently unavailable EIC on every tick.
@@ -931,7 +956,10 @@ pub fn list_local_snapshots(
             // Fetch the blob to get size_bytes.
             let id_prefix = segments.get(2)?.strip_prefix("meta-").unwrap_or("");
             let blob_key = snapshot_blob_key(&cluster_id, id_prefix);
-            let size_bytes = vault.get(VaultScope::Interactive, store, &blob_key).map(|b| b.len()).unwrap_or(0);
+            let size_bytes = vault
+                .get(VaultScope::Interactive, store, &blob_key)
+                .map(|b| b.len())
+                .unwrap_or(0);
 
             Some(LocalSnapshotEntry {
                 snapshot_id: manifest.snapshot_id,
@@ -943,7 +971,7 @@ pub fn list_local_snapshots(
         })
         .collect();
 
-    entries.sort_by(|a, b| b.taken_at.cmp(&a.taken_at));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.taken_at));
     entries
 }
 
@@ -1197,13 +1225,23 @@ mod tests {
         use crate::infra::vault::Vault;
         use bytes::Bytes;
         use http_body_util::Full;
-        use hyper::{Request, Response, StatusCode};
         use hyper::service::service_fn;
+        use hyper::{Request, Response, StatusCode};
         use hyper_util::rt::TokioIo;
         use std::rc::Rc;
         use std::sync::Arc;
         use tempfile::TempDir;
         use tokio::net::TcpListener;
+
+        // `Vault::open_from_config` finishes the unlock by calling
+        // `presence::mark_unlocked()` (production behavior). Without
+        // the cross-module guard sibling tests in `infra::vault::*`
+        // that assert presence stays Locked (e.g.
+        // `bootstrap_open_from_config_leaves_presence_locked`) race
+        // this side effect.
+        let _process_test_guard = crate::PROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let tmp = TempDir::new().unwrap();
         let identity = test_identity(tmp.path());
@@ -1239,7 +1277,9 @@ mod tests {
         local.spawn_local(async move {
             // Accept exactly two requests: /latest, then the full fetch.
             for _ in 0..2 {
-                let Ok((stream, _)) = listener.accept().await else { break };
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
                 let snap_id = snapshot_id_clone.clone();
                 let manifest_c = manifest_clone.clone();
                 let blob_hex_c = blob_hex_clone.clone();
@@ -1257,14 +1297,15 @@ mod tests {
                                 serde_json::json!({
                                     "manifest": manifest_c,
                                     "encrypted_blob_hex": blob_hex_c,
-                                }).to_string()
+                                })
+                                .to_string()
                             };
                             Ok::<_, std::convert::Infallible>(
                                 Response::builder()
                                     .status(StatusCode::OK)
                                     .header("content-type", "application/json")
                                     .body(Full::new(Bytes::from(body)))
-                                    .unwrap()
+                                    .unwrap(),
                             )
                         }
                     });
@@ -1285,9 +1326,15 @@ mod tests {
         let vault = Vault::open_from_config(&config).expect("vault open");
 
         // Run the pull inside the LocalSet.
-        let result = local.run_until(
-            pull_cluster_snapshot(&endpoint, "test-cluster", &pubkey_hex, &vault, &store)
-        ).await;
+        let result = local
+            .run_until(pull_cluster_snapshot(
+                &endpoint,
+                "test-cluster",
+                &pubkey_hex,
+                &vault,
+                &store,
+            ))
+            .await;
 
         assert!(
             matches!(result, Err(PullError::SignatureInvalid)),
@@ -1295,9 +1342,13 @@ mod tests {
         );
 
         // Vault must be empty — no writes on signature failure.
-        let creds = vault.list(VaultScope::Interactive, &store).unwrap_or_default();
+        let creds = vault
+            .list(VaultScope::Interactive, &store)
+            .unwrap_or_default();
         assert!(
-            creds.iter().all(|c| !c.name.starts_with("cluster-snapshot")),
+            creds
+                .iter()
+                .all(|c| !c.name.starts_with("cluster-snapshot")),
             "vault must not contain cluster-snapshot entries after signature failure"
         );
     }
@@ -1309,11 +1360,18 @@ mod tests {
         use crate::infra::vault::Vault;
         use bytes::Bytes;
         use http_body_util::Full;
-        use hyper::{Request, Response, StatusCode};
         use hyper::service::service_fn;
+        use hyper::{Request, Response, StatusCode};
         use hyper_util::rt::TokioIo;
         use tempfile::TempDir;
         use tokio::net::TcpListener;
+
+        // See pull_cluster_snapshot_rejects_tampered_manifest for the
+        // PROCESS_TEST_LOCK rationale — Vault::open_from_config calls
+        // production mark_unlocked.
+        let _process_test_guard = crate::PROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         let tmp = TempDir::new().unwrap();
         let identity = test_identity(tmp.path());
@@ -1344,7 +1402,9 @@ mod tests {
         let local = tokio::task::LocalSet::new();
         local.spawn_local(async move {
             for _ in 0..2 {
-                let Ok((stream, _)) = listener.accept().await else { break };
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
                 let snap_id = snapshot_id_clone.clone();
                 let manifest_c = manifest_clone.clone();
                 let blob_hex_c = blob_hex_clone.clone();
@@ -1362,14 +1422,15 @@ mod tests {
                                 serde_json::json!({
                                     "manifest": manifest_c,
                                     "encrypted_blob_hex": blob_hex_c,
-                                }).to_string()
+                                })
+                                .to_string()
                             };
                             Ok::<_, std::convert::Infallible>(
                                 Response::builder()
                                     .status(StatusCode::OK)
                                     .header("content-type", "application/json")
                                     .body(Full::new(Bytes::from(body)))
-                                    .unwrap()
+                                    .unwrap(),
                             )
                         }
                     });
@@ -1387,16 +1448,28 @@ mod tests {
         };
         let vault = Vault::open_from_config(&config).expect("vault open");
 
-        let result = local.run_until(
-            pull_cluster_snapshot(&endpoint, "my-cluster", &pubkey_hex, &vault, &store)
-        ).await;
+        let result = local
+            .run_until(pull_cluster_snapshot(
+                &endpoint,
+                "my-cluster",
+                &pubkey_hex,
+                &vault,
+                &store,
+            ))
+            .await;
 
         assert!(result.is_ok(), "expected Ok, got: {result:?}");
         let returned_id = result.unwrap();
-        assert_eq!(returned_id, Some(snapshot_id.clone()), "should return the pulled snapshot_id");
+        assert_eq!(
+            returned_id,
+            Some(snapshot_id.clone()),
+            "should return the pulled snapshot_id"
+        );
 
         // Vault must contain blob + manifest entries.
-        let creds = vault.list(VaultScope::Interactive, &store).unwrap_or_default();
+        let creds = vault
+            .list(VaultScope::Interactive, &store)
+            .unwrap_or_default();
         let has_blob = creds.iter().any(|c| c.name.contains("snap-"));
         let has_meta = creds.iter().any(|c| c.name.contains("meta-"));
         assert!(has_blob, "vault must contain blob entry");

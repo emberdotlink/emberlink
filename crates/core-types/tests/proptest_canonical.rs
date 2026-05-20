@@ -14,10 +14,12 @@
 //! - `GrantLink::signing_payload` determinism (same inputs => same bytes,
 //!   any input change => different bytes).
 
+use core_event_types::{
+    EventBody, PersonaCreatedEvent, RecoveryExecutedEvent, RootCreatedEvent, RootRevokedEvent,
+};
 use core_grant_types::GrantLink;
-use core_event_types::{EventBody, PersonaCreatedEvent, RecoveryExecutedEvent, RootCreatedEvent, RootRevokedEvent};
 use core_principals::{KeyAlgorithm, PublicKeyMaterial, RecoveryScope, SurvivalMode};
-use core_types::{CanonicalEncode};
+use core_types::CanonicalEncode;
 use proptest::prelude::*;
 
 // ── Strategies ──────────────────────────────────────────────────────────────

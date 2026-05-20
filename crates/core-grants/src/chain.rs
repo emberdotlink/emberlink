@@ -1,11 +1,11 @@
-// implementation-note-37 — chain-builder helpers lifted from ember-daemon::trust::grant (design §1 concern 3)
+// implementation-note-50 — chain-builder helpers lifted from ember-daemon::trust::grant (design §1 concern 3)
 
 use core_crypto::grant_chain::{self, RootKeyPair};
+use core_event_types::PresentationAudienceKind;
 use core_grant_types::{
     AccessGrant, AttestationBinding, Block, Budget, GrantMode, GrantStatus, RecipientProfile,
     ResourceSelector, ResourceType, SignedBlock, Statement, Usage,
 };
-use core_event_types::PresentationAudienceKind;
 
 /// Error type bridged from `StoreError` context — re-used here so callers
 /// that want a standalone chain builder don't need to depend on `ember-daemon`.
@@ -197,7 +197,9 @@ pub fn scope_to_actions_and_selector(
             subtarget_glob: parts[3].to_string(),
         }
     } else if scope.contains('*') {
-        ResourceSelector::Glob { pattern: scope.into() }
+        ResourceSelector::Glob {
+            pattern: scope.into(),
+        }
     } else if parts.len() >= 3 {
         let tail = parts[2..].join(":");
         if tail.contains('*') {
@@ -206,7 +208,9 @@ pub fn scope_to_actions_and_selector(
             ResourceSelector::Exact { value: tail }
         }
     } else {
-        ResourceSelector::Exact { value: credential_name.to_string() }
+        ResourceSelector::Exact {
+            value: credential_name.to_string(),
+        }
     };
     (vec![action], selector)
 }

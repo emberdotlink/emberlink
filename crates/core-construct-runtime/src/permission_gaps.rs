@@ -106,9 +106,9 @@ pub fn gaps_file_path() -> Option<PathBuf> {
     Some(root.join(PERMISSION_GAPS_FILE))
 }
 
-// ─── implementation-note-14 — Phase 1 substrate ───────────────
+// ─── implementation-note-16 — Phase 1 substrate ───────────────
 //
-// implementation-note-15
+// implementation-note-17
 //
 // Per design §"Pre-flight scope check at enrollment" Layer 2 (Historical):
 // at headless-enrollment time, the CTA surfaces recent permission-gap
@@ -123,7 +123,7 @@ pub fn gaps_file_path() -> Option<PathBuf> {
 //   `$EMBER_AGENT_ID` (per `permission-gap-report.sh`); the
 //   agent/persona binding is the orchestrator's responsibility. Phase 2
 //   will replace this with a proper persona-id linkage once
-//   implementation-note-16 ships the enrollment surface.
+//   implementation-note-18 ships the enrollment surface.
 // - Filters by `ts >= now - since`. `ts` is parsed as RFC3339 UTC; a
 //   malformed `ts` excludes the record (defensive — bad timestamps
 //   should not leak across the time-window filter).
@@ -238,9 +238,7 @@ pub fn recent_gaps_for_persona_at(
         if parsed_utc < cutoff {
             continue;
         }
-        let entry = acc
-            .entry(rec.command.clone())
-            .or_insert((0, parsed_utc));
+        let entry = acc.entry(rec.command.clone()).or_insert((0, parsed_utc));
         entry.0 = entry.0.saturating_add(1);
         if parsed_utc > entry.1 {
             entry.1 = parsed_utc;
@@ -320,7 +318,10 @@ mod tests {
             .expect("append succeeded");
 
         let written = std::fs::read_to_string(&path).expect("file written");
-        assert!(!written.is_empty(), "helper always appends; filter is in release()");
+        assert!(
+            !written.is_empty(),
+            "helper always appends; filter is in release()"
+        );
     }
 
     /// Empty reason string must not produce a gap record (guard is in release()).
@@ -331,8 +332,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("permission-gaps.jsonl");
 
-        append_permission_gap_to(&path, "", "", "agent-xyz")
-            .expect("append succeeded");
+        append_permission_gap_to(&path, "", "", "agent-xyz").expect("append succeeded");
 
         let written = std::fs::read_to_string(&path).expect("file written");
         let line = written.lines().next().expect("at least one line");
@@ -348,8 +348,7 @@ mod tests {
         let path = dir.path().join("permission-gaps.jsonl");
 
         let long = "x".repeat(2000);
-        append_permission_gap_to(&path, &long, &long, "agent-cap")
-            .expect("append succeeded");
+        append_permission_gap_to(&path, &long, &long, "agent-cap").expect("append succeeded");
 
         let written = std::fs::read_to_string(&path).expect("file written");
         let line = written.lines().next().expect("at least one line");
@@ -358,8 +357,16 @@ mod tests {
         let cmd = v["command"].as_str().expect("command is string");
         let rsn = v["reason"].as_str().expect("reason is string");
 
-        assert!(cmd.len() <= MAX_FIELD_LEN, "command len {} exceeds cap", cmd.len());
-        assert!(rsn.len() <= MAX_FIELD_LEN, "reason len {} exceeds cap", rsn.len());
+        assert!(
+            cmd.len() <= MAX_FIELD_LEN,
+            "command len {} exceeds cap",
+            cmd.len()
+        );
+        assert!(
+            rsn.len() <= MAX_FIELD_LEN,
+            "reason len {} exceeds cap",
+            rsn.len()
+        );
         assert_eq!(cmd.len(), MAX_FIELD_LEN);
         assert_eq!(rsn.len(), MAX_FIELD_LEN);
     }
@@ -405,9 +412,9 @@ mod tests {
         assert_eq!(truncate_bytes(s, 100), "aéb"); // well under cap — no truncation
     }
 
-    // ─── implementation-note-14 Phase 1 tests ────────────────
+    // ─── implementation-note-16 Phase 1 tests ────────────────
     //
-    // implementation-note-15 — T1 unit tests for
+    // implementation-note-17 — T1 unit tests for
     // `recent_gaps_for_persona_at`.
 
     /// Write one gap line to a fixture path. Avoids `set_current_dir`
@@ -435,8 +442,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("does-not-exist.jsonl");
         let now = Utc::now();
-        let result =
-            recent_gaps_for_persona_at(&path, "main", Duration::from_secs(7 * 86400), now);
+        let result = recent_gaps_for_persona_at(&path, "main", Duration::from_secs(7 * 86400), now);
         assert!(result.is_empty());
     }
 
@@ -458,8 +464,7 @@ mod tests {
         // Recent record: 1 hour back — inside a 7-day window.
         write_gap(&path, "2026-05-10T11:00:00Z", "recent-cmd", "main");
 
-        let result =
-            recent_gaps_for_persona_at(&path, "main", Duration::from_secs(7 * 86400), now);
+        let result = recent_gaps_for_persona_at(&path, "main", Duration::from_secs(7 * 86400), now);
 
         assert_eq!(result.len(), 1, "expected only the recent record");
         assert_eq!(result[0].command, "recent-cmd");
@@ -481,8 +486,7 @@ mod tests {
         write_gap(&path, "2026-05-10T11:00:00Z", "cmd-b", "other");
         write_gap(&path, "2026-05-10T11:00:00Z", "cmd-c", "orchestrator");
 
-        let result =
-            recent_gaps_for_persona_at(&path, "main", Duration::from_secs(7 * 86400), now);
+        let result = recent_gaps_for_persona_at(&path, "main", Duration::from_secs(7 * 86400), now);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].command, "cmd-a");
@@ -504,8 +508,7 @@ mod tests {
         write_gap(&path, "2026-05-10T08:00:00Z", "ember-gh.pr.merge", "main");
         write_gap(&path, "2026-05-10T11:30:00Z", "ember-gh.pr.merge", "main");
 
-        let result =
-            recent_gaps_for_persona_at(&path, "main", Duration::from_secs(7 * 86400), now);
+        let result = recent_gaps_for_persona_at(&path, "main", Duration::from_secs(7 * 86400), now);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].command, "ember-gh.pr.merge");
@@ -535,8 +538,7 @@ mod tests {
         write_gap(&path, "2026-05-09T04:00:00Z", "cmd-c", "main");
         write_gap(&path, "2026-05-09T05:00:00Z", "cmd-c", "main");
 
-        let result =
-            recent_gaps_for_persona_at(&path, "main", Duration::from_secs(7 * 86400), now);
+        let result = recent_gaps_for_persona_at(&path, "main", Duration::from_secs(7 * 86400), now);
 
         assert_eq!(result.len(), 3);
         // Count-descending: b (3), c (2), a (1).
@@ -569,11 +571,11 @@ mod tests {
                 .append(true)
                 .open(&path)
                 .expect("open append");
-            f.write_all(b"{\"ts\":\"2026-05-10T11:00:00Z\",\"comma").unwrap();
+            f.write_all(b"{\"ts\":\"2026-05-10T11:00:00Z\",\"comma")
+                .unwrap();
         }
 
-        let result =
-            recent_gaps_for_persona_at(&path, "main", Duration::from_secs(7 * 86400), now);
+        let result = recent_gaps_for_persona_at(&path, "main", Duration::from_secs(7 * 86400), now);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].command, "valid-cmd");
@@ -594,8 +596,7 @@ mod tests {
         write_gap(&path, "not-a-timestamp", "cmd-x", "main");
         write_gap(&path, "2026-05-10T11:00:00Z", "cmd-y", "main");
 
-        let result =
-            recent_gaps_for_persona_at(&path, "main", Duration::from_secs(7 * 86400), now);
+        let result = recent_gaps_for_persona_at(&path, "main", Duration::from_secs(7 * 86400), now);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].command, "cmd-y");

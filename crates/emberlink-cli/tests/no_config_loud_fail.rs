@@ -1,4 +1,4 @@
-//! Integration test for implementation-note-279.
+//! Integration test for implementation-note-396.
 //!
 //! Pins the load_config loud-fail contract: when no `--config`,
 //! `EMBER_CONFIG`, or `EMBER_DEMO_DIR` is set, AND `~/.ember/config.toml`
@@ -31,7 +31,10 @@ fn cli_exits_loudly_when_no_config_resolves() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     let exit_code = out.status.code().unwrap_or(-1);
 
-    assert_eq!(exit_code, 1, "expected exit 1, got {exit_code}; stderr: {stderr}");
+    assert_eq!(
+        exit_code, 1,
+        "expected exit 1, got {exit_code}; stderr: {stderr}"
+    );
     assert!(
         stderr.contains("no ember config found"),
         "expected stderr to contain `no ember config found`; got: {stderr}"

@@ -11,9 +11,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use core_crypto::Ed25519Verifier;
-use core_sync::{PortableRelaySubmission, check_relay_submission_admission};
+use core_crypto::{Ed25519Verifier, parse_did, resolve_did_jwks};
 use core_principals::{RelayAdmission, RelayMode, TrustThreshold};
+use core_sync::{PortableRelaySubmission, check_relay_submission_admission};
 
 use crate::tls::{RelayStream, TlsMode};
 
@@ -166,10 +166,7 @@ impl RelayConfig {
                 }
                 "--admin-token" => {
                     i += 1;
-                    let token = args
-                        .get(i)
-                        .ok_or("--admin-token requires a value")?
-                        .clone();
+                    let token = args.get(i).ok_or("--admin-token requires a value")?.clone();
                     if token.is_empty() {
                         return Err("--admin-token must not be empty".to_string());
                     }
@@ -598,13 +595,28 @@ pub fn dispatch_command(
         Command::ShutdownNotice(notice) => handle_shutdown_notice(stream, state, notice),
         Command::Drain(peer_id) => handle_drain(stream, state, &peer_id),
         Command::Submission => handle_envelope_submission(stream, payload, config, state),
-        Command::DepositOffer { offer_id, expires_at, payload: offer_payload } => {
+        Command::DepositOffer {
+            offer_id,
+            expires_at,
+            payload: offer_payload,
+        } => {
             // R-H1: Gate offer commands behind relay admission policy.
             if !offer_admission_ok(config) {
-                respond(stream, b"REJECTED relay admission policy requires authenticated submission");
+                respond(
+                    stream,
+                    b"REJECTED relay admission policy requires authenticated submission",
+                );
                 return;
             }
-            handle_deposit_offer(stream, state, config, offer_id, expires_at, offer_payload, "anon");
+            handle_deposit_offer(
+                stream,
+                state,
+                config,
+                offer_id,
+                expires_at,
+                offer_payload,
+                "anon",
+            );
         }
         Command::FetchOffer(offer_id) => {
             // DRY-8-MIGRATE: representative migration to typed admission token.
@@ -614,7 +626,10 @@ pub fn dispatch_command(
             // are still on the inline `offer_admission_ok` path; see
             // DRY-8-MIGRATE follow-ups (one per remaining handler).
             if !offer_admission_ok(config) {
-                respond(stream, b"REJECTED relay admission policy requires authenticated submission");
+                respond(
+                    stream,
+                    b"REJECTED relay admission policy requires authenticated submission",
+                );
                 return;
             }
             // The legacy frame protocol does not carry persona/scope headers,
@@ -633,54 +648,86 @@ pub fn dispatch_command(
         }
         Command::ClaimOffer(offer_id) => {
             if !offer_admission_ok(config) {
-                respond(stream, b"REJECTED relay admission policy requires authenticated submission");
+                respond(
+                    stream,
+                    b"REJECTED relay admission policy requires authenticated submission",
+                );
                 return;
             }
             handle_claim_offer(stream, state, &offer_id);
         }
         Command::FetchAndClaimOffer(offer_id) => {
             if !offer_admission_ok(config) {
-                respond(stream, b"REJECTED relay admission policy requires authenticated submission");
+                respond(
+                    stream,
+                    b"REJECTED relay admission policy requires authenticated submission",
+                );
                 return;
             }
             handle_fetch_and_claim_offer(stream, state, &offer_id);
         }
         Command::DepositCredential { grant_id, payload } => {
             if !offer_admission_ok(config) {
-                respond(stream, b"REJECTED relay admission policy requires authenticated submission");
+                respond(
+                    stream,
+                    b"REJECTED relay admission policy requires authenticated submission",
+                );
                 return;
             }
             handle_deposit_credential(stream, state, grant_id, payload);
         }
         Command::FetchCredential(grant_id) => {
             if !offer_admission_ok(config) {
-                respond(stream, b"REJECTED relay admission policy requires authenticated submission");
+                respond(
+                    stream,
+                    b"REJECTED relay admission policy requires authenticated submission",
+                );
                 return;
             }
             handle_fetch_credential(stream, state, &grant_id);
         }
-        Command::RequestGrant { target_id, requester_id, scope, justification } => {
+        Command::RequestGrant {
+            target_id,
+            requester_id,
+            scope,
+            justification,
+        } => {
             if !offer_admission_ok(config) {
-                respond(stream, b"REJECTED relay admission policy requires authenticated submission");
+                respond(
+                    stream,
+                    b"REJECTED relay admission policy requires authenticated submission",
+                );
                 return;
             }
             handle_request_grant(stream, state, target_id, requester_id, scope, justification);
         }
         Command::FetchGrantRequests(target_id) => {
             if !offer_admission_ok(config) {
-                respond(stream, b"REJECTED relay admission policy requires authenticated submission");
+                respond(
+                    stream,
+                    b"REJECTED relay admission policy requires authenticated submission",
+                );
                 return;
             }
             handle_fetch_grant_requests(stream, state, &target_id);
         }
-        Command::RespondGrantRequest { request_id, approved } => {
+        Command::RespondGrantRequest {
+            request_id,
+            approved,
+        } => {
             if !offer_admission_ok(config) {
-                respond(stream, b"REJECTED relay admission policy requires authenticated submission");
+                respond(
+                    stream,
+                    b"REJECTED relay admission policy requires authenticated submission",
+                );
                 return;
             }
             handle_respond_grant_request(stream, state, &request_id, approved);
         }
-        Command::AdminRequired => respond(stream, b"AUTH-REQUIRED admin token required for this command"),
+        Command::AdminRequired => respond(
+            stream,
+            b"AUTH-REQUIRED admin token required for this command",
+        ),
     }
 }
 
@@ -918,7 +965,9 @@ fn parse_notice_args(remainder: &str) -> Command {
     // Format: <reason> <deadline-epoch>  (deadline is the last space-separated token)
     if let Some((reason, deadline_str)) = remainder.rsplit_once(' ') {
         let reason = reason.trim();
-        if !reason.is_empty() && let Ok(deadline_epoch) = deadline_str.trim().parse::<u64>() {
+        if !reason.is_empty()
+            && let Ok(deadline_epoch) = deadline_str.trim().parse::<u64>()
+        {
             return Command::ShutdownNotice(ShutdownNotice {
                 reason: reason.to_string(),
                 deadline_epoch,
@@ -954,7 +1003,11 @@ fn parse_deposit_offer(remainder: &str) -> Command {
         Ok(b) => b,
         Err(_) => return Command::Submission,
     };
-    Command::DepositOffer { offer_id, expires_at, payload }
+    Command::DepositOffer {
+        offer_id,
+        expires_at,
+        payload,
+    }
 }
 
 /// Parse the remainder of a `DEPOSIT_CREDENTIAL` command.
@@ -1068,7 +1121,12 @@ fn parse_request_grant(remainder: &str) -> Command {
         Some(s) if !s.trim().is_empty() => s.trim().to_string(),
         _ => return Command::Submission,
     };
-    Command::RequestGrant { target_id, requester_id, scope, justification }
+    Command::RequestGrant {
+        target_id,
+        requester_id,
+        scope,
+        justification,
+    }
 }
 
 /// Parse the remainder of a `RESPOND_GRANT_REQUEST` command.
@@ -1089,7 +1147,10 @@ fn parse_respond_grant_request(remainder: &str) -> Command {
         "denied" => false,
         _ => return Command::Submission,
     };
-    Command::RespondGrantRequest { request_id, approved }
+    Command::RespondGrantRequest {
+        request_id,
+        approved,
+    }
 }
 
 /// Store a grant request from an agent targeting a human identity.
@@ -1109,7 +1170,10 @@ pub fn handle_request_grant(
     // Rate limit: cap at 100 pending requests per target to prevent memory exhaustion.
     {
         let existing = s.grant_requests.entry(target_id.clone()).or_default();
-        let pending_count = existing.iter().filter(|r| matches!(r.status, GrantRequestStatus::Pending)).count();
+        let pending_count = existing
+            .iter()
+            .filter(|r| matches!(r.status, GrantRequestStatus::Pending))
+            .count();
         if pending_count >= 100 {
             respond(stream, b"RATE_LIMITED");
             return;
@@ -1119,7 +1183,9 @@ pub fn handle_request_grant(
     // Use hex-encoded random ID to prevent enumeration attacks.
     s.next_grant_request_id += 1;
     let n = s.next_grant_request_id;
-    let mixed = n.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let mixed = n
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     let request_id = format!("gr-{:016x}", mixed);
 
     let request = GrantRequest {
@@ -1357,7 +1423,9 @@ pub fn handle_deposit_offer(
 
     // Update counters.
     s.offer_bytes_total += payload.len();
-    *s.offer_counts_by_source.entry(source.to_string()).or_insert(0) += 1;
+    *s.offer_counts_by_source
+        .entry(source.to_string())
+        .or_insert(0) += 1;
 
     s.offers.insert(
         offer_id.clone(),
@@ -1402,10 +1470,7 @@ pub fn handle_fetch_offer(
         Some(offer) if offer.claimed => respond(stream, b"CLAIMED"),
         Some(offer) => {
             let hex_payload = hex::encode(&offer.payload);
-            respond(
-                stream,
-                format!("OFFER {offer_id} {hex_payload}").as_bytes(),
-            );
+            respond(stream, format!("OFFER {offer_id} {hex_payload}").as_bytes());
         }
     }
 }
@@ -1470,10 +1535,7 @@ pub fn handle_fetch_and_claim_offer(
         Some(offer) => {
             offer.claimed = true;
             let hex_payload = hex::encode(&offer.payload);
-            respond(
-                stream,
-                format!("OFFER {offer_id} {hex_payload}").as_bytes(),
-            );
+            respond(stream, format!("OFFER {offer_id} {hex_payload}").as_bytes());
         }
     }
 }
@@ -1847,10 +1909,16 @@ pub fn run_health_server(port: u16, mode: RelayMode, start_time: Instant, ws_por
         };
         let request = std::str::from_utf8(&buf[..n]).unwrap_or("");
 
-        // Only serve GET /health; everything else is 404.
+        // Only serve GET /health and the design §2.b JWKS endpoint;
+        // everything else is 404. The JWKS handler shares the health-server
+        // listener (plain TCP, no TLS) because Phase 2 ships the resolver as
+        // an extension of the existing health surface — providers fetch JWKS
+        // over plain HTTP and verify the signature chain themselves.
         let is_health = request.starts_with("GET /health ")
             || request.starts_with("GET /health\r")
             || request == "GET /health";
+
+        let jwks_did = parse_jwks_request(request);
 
         if is_health {
             let uptime = start_time.elapsed().as_secs();
@@ -1870,9 +1938,80 @@ pub fn run_health_server(port: u16, mode: RelayMode, start_time: Instant, ws_por
                 body
             );
             let _ = tcp.write_all(response.as_bytes());
+        } else if let Some(did_str) = jwks_did {
+            // design §2.b — emit the JWKS for `?did=did:emberlink:<root-pubkey>`.
+            // Parse failures return 400 with a short JSON error body so the
+            // operator (or the upstream OIDC provider) sees why the request
+            // was rejected. Success returns 200 with `application/jwk-set+json`
+            // per RFC 7517 §8.5.1.
+            //
+            // Anchor: `did_emberlink_resolver_phase2` — design-PHASE2-RELAY-RESOLVER-IMPL.
+            match parse_did(&did_str) {
+                Ok(did) => {
+                    let jwks = resolve_did_jwks(&did);
+                    let body = jwks.to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/jwk-set+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = tcp.write_all(response.as_bytes());
+                }
+                Err(e) => {
+                    let body = format!(r#"{{"error":"invalid_did","reason":"{e}"}}"#);
+                    let response = format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = tcp.write_all(response.as_bytes());
+                }
+            }
         } else {
-            let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let response =
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             let _ = tcp.write_all(response.as_bytes());
         }
     }
+}
+
+/// Parse an HTTP request line and return the `did` query parameter when it
+/// targets `GET /.well-known/jwks.json?did=…`. Returns `None` for any other
+/// request shape (including a `/.well-known/jwks.json` path without the
+/// required `did` parameter, which is treated as a malformed JWKS request
+/// rather than a separate endpoint).
+///
+/// The parser is intentionally minimal — it walks the first request line
+/// only, accepts both `HTTP/1.0` and `HTTP/1.1` as the trailing version,
+/// and treats anything beyond the request line as opaque. URL decoding is
+/// not applied to the `did=…` value because `did:emberlink:<base64url>` is
+/// already restricted to characters that do not require percent-encoding;
+/// callers sending percent-encoded forms get a 400 from `parse_did` once
+/// the colons get mangled, which is the correct surface.
+///
+/// Anchor: `did_emberlink_resolver_phase2` — design-PHASE2-RELAY-RESOLVER-IMPL.
+pub fn parse_jwks_request(request: &str) -> Option<String> {
+    let request_line = request.lines().next()?;
+    let path_and_query = request_line.strip_prefix("GET ")?;
+    // Trim the trailing ` HTTP/1.x` token if present.
+    let path_and_query = match path_and_query.split_once(' ') {
+        Some((p, _version)) => p,
+        None => path_and_query,
+    };
+    let (path, query) = match path_and_query.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (path_and_query, ""),
+    };
+    if path != "/.well-known/jwks.json" {
+        return None;
+    }
+    // Walk `did=<value>` out of the query string. The DID grammar contains
+    // colons but no `&` or `=`, so the simple split-on-`&` then split-on-`=`
+    // scheme suffices.
+    for pair in query.split('&') {
+        if let Some(value) = pair.strip_prefix("did=") {
+            return Some(value.to_owned());
+        }
+    }
+    None
 }

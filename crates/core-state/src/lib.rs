@@ -5,7 +5,6 @@ mod schema;
 pub mod sessions;
 pub mod snapshot;
 
-pub use sessions::{SessionMeta, SessionStore};
 pub use adapters::{
     OAuthAdapter, OAuthAuthorizeRequest, OAuthBindingMeta, OAuthTokenClaims,
     OAuthTokenExchangeRequest, OidcClaimAdapter, PasskeyAdapter, PasskeyAssertionResult,
@@ -13,16 +12,17 @@ pub use adapters::{
     verify_passkey_assertion,
 };
 pub use blockstore::SqliteBlockStore;
+pub use sessions::{SessionMeta, SessionStore};
 
 // Re-export shared types from core-eventlog so downstream crates can continue
 // importing from core-state without changes.
+pub use core_eventlog::MemoryEventLog;
 pub use core_eventlog::{
     AllowAllAuthorizer, Authorizer, CredentialDepositRecord, CredentialDepositStatus, DeviceRecord,
     DeviceStatus, EventLog, GuardianRecord, IdentityAuthorizer, MaterializedState, PersonaRecord,
     PersonaStatus, RecoveryPolicyRecord, RecoveryRequestRecord, RecoveryRequestStatus, RootRecord,
     RootStatus, SyncBatchRecord,
 };
-pub use core_eventlog::MemoryEventLog;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -34,10 +34,21 @@ use core_crypto::{
     generate_content_key, generate_random_identifier,
     grant_chain::{self, ChainError},
 };
+use core_event_types::{
+    BlockStore, ChunkReference, DurabilityPolicy, EventBody, EventType, FileManifest,
+    ImportedClaim, ManifestDeviceAccess, PresentationArtifact, PresentationAudienceKind,
+    PresentationTemplate, RetentionPolicy, ServiceBinding, StructuredRecordMeta, VaultCatalog,
+    VaultNamespace, VaultOwnerKind,
+};
 use core_eventlog::materialize::{
     apply_event, apply_storage_event, event_affects_materialized_state,
 };
 use core_events::EventEnvelope;
+use core_grant_types::{
+    AccessGrant, AccessGrantDetail, AccessGrantHistoryEntry, AccessGrantSummary, GrantMode,
+    GrantStatus, RecipientProfile, SignedBlock, Statement,
+};
+use core_principals::PeerCursor;
 use core_storage::{
     EncryptedBlock, ManifestKeyRecipient, PresentationArtifactEnvelope,
     add_vault_object_with_initial_revision, add_vault_revision,
@@ -48,17 +59,18 @@ use core_storage::{
     tombstone_vault_object, unwrap_manifest_key_access, wrap_manifest_key_access,
     wrap_manifest_key_for_recipients,
 };
-use core_grant_types::{
-    AccessGrant, AccessGrantDetail, AccessGrantHistoryEntry, AccessGrantSummary, GrantMode,
-    GrantStatus, RecipientProfile, SignedBlock, Statement,
-};
-use core_event_types::{BlockStore, ChunkReference, DurabilityPolicy, EventBody, EventType, FileManifest, ImportedClaim, ManifestDeviceAccess, PresentationArtifact, PresentationAudienceKind, PresentationTemplate, RetentionPolicy, ServiceBinding, StructuredRecordMeta, VaultCatalog, VaultNamespace, VaultOwnerKind};
-use core_principals::{PeerCursor};
 use core_types::{Validate, ValidationError};
 use rusqlite::{Connection, OptionalExtension, params};
-use zeroize::Zeroizing;
 use serde_json::Value as JsonValue;
+use zeroize::Zeroizing;
 
+pub use persist::CredentialDepositRow;
+use persist::{
+    delete_access_grant as persist_delete_access_grant, load_access_grant,
+    load_access_grant_history, load_access_grants_by_persona, load_access_grants_for_recipient,
+    load_artifact_ids_by_grant, load_grant_history_timeline, load_grant_offer,
+    load_grant_offers_by_persona, write_access_grant, write_access_grant_history,
+};
 use persist::{
     delete_local_block, delete_local_file_manifest, delete_local_manifest_key,
     delete_local_vault_catalog_manifest_history,
@@ -79,13 +91,6 @@ use persist::{
     write_materialized_tables, write_peer_cursor,
     write_service_binding as persist_write_service_binding,
 };
-use persist::{
-    delete_access_grant as persist_delete_access_grant, load_access_grant,
-    load_access_grant_history, load_access_grants_by_persona, load_access_grants_for_recipient,
-    load_artifact_ids_by_grant, load_grant_history_timeline, load_grant_offer,
-    load_grant_offers_by_persona, write_access_grant, write_access_grant_history,
-};
-pub use persist::CredentialDepositRow;
 use schema::SQLITE_INIT_DDL;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -588,7 +593,10 @@ fn statement_dominated_by(new: &Statement, existing: &[Statement]) -> bool {
 /// glob(p) ⊇ glob(c) requires the patterns be equal or parent is `*`. This
 /// is coarse-grained on purpose — the authoritative evaluator in core-policy
 /// (design Open Questions) will subsume this.
-fn resource_covers(parent: &core_grant_types::ResourceSelector, child: &core_grant_types::ResourceSelector) -> bool {
+fn resource_covers(
+    parent: &core_grant_types::ResourceSelector,
+    child: &core_grant_types::ResourceSelector,
+) -> bool {
     use core_grant_types::ResourceSelector as R;
     match (parent, child) {
         (R::Any, _) => true,
@@ -632,7 +640,10 @@ fn parent_glob_covers_exact(pattern: &str, value: &str) -> bool {
 /// Child budget ≤ parent budget on every axis the parent constrains. If
 /// parent is `None`, anything is fine. If parent sets an axis that child
 /// leaves open, child fails (unbounded > bounded).
-fn budget_le(child: &Option<core_grant_types::Budget>, parent: &Option<core_grant_types::Budget>) -> bool {
+fn budget_le(
+    child: &Option<core_grant_types::Budget>,
+    parent: &Option<core_grant_types::Budget>,
+) -> bool {
     let Some(p) = parent else { return true };
     let c = child.clone().unwrap_or_default();
     if let Some(cap) = p.tokens
@@ -688,7 +699,10 @@ impl EventStore {
     /// The `master_key` should be the same keychain-derived `xchacha20-key:...` value
     /// used to protect `local-state.enc`. Application shells (CLI, GUI) supply this from
     /// their keychain layer; `core-state` itself never touches the OS keychain.
-    pub fn open_with_key(path: impl AsRef<Path>, master_key: String) -> Result<Self, ValidationError> {
+    pub fn open_with_key(
+        path: impl AsRef<Path>,
+        master_key: String,
+    ) -> Result<Self, ValidationError> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -943,9 +957,11 @@ impl EventStore {
         now_epoch_secs: u64,
     ) -> Result<usize, ValidationError> {
         use core_crypto::{PublicKey, Signature};
+        use core_event_types::{
+            EventBody, EventRefRelation, EventSubject, KeyRole, SignerBinding, SubjectKind,
+        };
         use core_events::EventRef;
-        use core_event_types::{EventBody, EventRefRelation, EventSubject, KeyRole, SignerBinding, SubjectKind};
-        use core_types::{SchemaVersion};
+        use core_types::SchemaVersion;
 
         let mut imported = 0;
         for line in data.lines() {
@@ -1488,10 +1504,7 @@ impl EventStore {
     /// The caller-supplied error mapping policy for the soft-log of
     /// `ChainUnsigned` lives outside this function so the read path can
     /// stay `&self`.
-    pub fn verify_access_grant_chain(
-        &self,
-        grant: &AccessGrant,
-    ) -> Result<(), ChainError> {
+    pub fn verify_access_grant_chain(&self, grant: &AccessGrant) -> Result<(), ChainError> {
         if grant.blocks.is_empty() {
             return Err(ChainError::EmptyChain);
         }
@@ -1522,10 +1535,7 @@ impl EventStore {
 
     /// Create a new access grant. Validates the issuing persona exists and is active.
     /// Records a "created" history entry.
-    pub fn create_access_grant(
-        &mut self,
-        grant: &AccessGrant,
-    ) -> Result<(), ValidationError> {
+    pub fn create_access_grant(&mut self, grant: &AccessGrant) -> Result<(), ValidationError> {
         grant.validate()?;
         let persona = self
             .materialized
@@ -1586,10 +1596,8 @@ impl EventStore {
         // dominated by some statement in the existing chain. This is the
         // coarse shape-check (design § "Attenuation"); the authoritative
         // evaluator lives in core-policy.
-        let existing_statements: Vec<Statement> = existing
-            .statements()
-            .map(|(_i, s)| s.clone())
-            .collect();
+        let existing_statements: Vec<Statement> =
+            existing.statements().map(|(_i, s)| s.clone()).collect();
         for (_i, s) in grant.statements() {
             if !statement_dominated_by(s, &existing_statements) {
                 return Err(ValidationError::new(
@@ -1676,10 +1684,8 @@ impl EventStore {
         grant.updated_at = now;
         if let Some(block) = new_block {
             // Attenuation guard on the appended block.
-            let existing_statements: Vec<Statement> = grant
-                .statements()
-                .map(|(_i, s)| s.clone())
-                .collect();
+            let existing_statements: Vec<Statement> =
+                grant.statements().map(|(_i, s)| s.clone()).collect();
             for s in &block.block.statements {
                 if !statement_dominated_by(s, &existing_statements) {
                     return Err(ValidationError::new(
@@ -1761,10 +1767,19 @@ impl EventStore {
         recipient_profile: Option<RecipientProfile>,
     ) -> Result<Vec<AccessGrantSummary>, ValidationError> {
         let now = self.now_epoch_secs();
-        let grants =
-            load_access_grants_by_persona(&self.conn, persona_id, recipient_profile, Some("active"), now)?;
+        let grants = load_access_grants_by_persona(
+            &self.conn,
+            persona_id,
+            recipient_profile,
+            Some("active"),
+            now,
+        )?;
         // Filter out derived Expired/Pending from the "active" stored status
-        Ok(grants.into_iter().filter(|g| g.status == GrantStatus::Active).map(grant_to_summary).collect())
+        Ok(grants
+            .into_iter()
+            .filter(|g| g.status == GrantStatus::Active)
+            .map(grant_to_summary)
+            .collect())
     }
 
     /// List all grants for a specific recipient (active, expired, revoked).
@@ -1774,7 +1789,8 @@ impl EventStore {
         recipient_id: &str,
     ) -> Result<Vec<AccessGrantSummary>, ValidationError> {
         let now = self.now_epoch_secs();
-        let grants = load_access_grants_for_recipient(&self.conn, recipient_kind, recipient_id, now)?;
+        let grants =
+            load_access_grants_for_recipient(&self.conn, recipient_kind, recipient_id, now)?;
         Ok(grants.into_iter().map(grant_to_summary).collect())
     }
 
@@ -1895,7 +1911,9 @@ impl EventStore {
                  WHERE grant_id = ?1
                  ORDER BY accessed_at ASC",
             )
-            .map_err(|err| ValidationError::new(format!("prepare credential_access_log query: {err}")))?;
+            .map_err(|err| {
+                ValidationError::new(format!("prepare credential_access_log query: {err}"))
+            })?;
         let rows = stmt
             .query_map(params![grant_id], |row| {
                 Ok(CredentialAccessEntry {
@@ -1908,10 +1926,11 @@ impl EventStore {
             })
             .map_err(|err| ValidationError::new(format!("query credential_access_log: {err}")))?
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|err| ValidationError::new(format!("collect credential_access_log rows: {err}")))?;
+            .map_err(|err| {
+                ValidationError::new(format!("collect credential_access_log rows: {err}"))
+            })?;
         Ok(rows)
     }
-
 
     // --- Approval queue ---
 
@@ -1940,7 +1959,9 @@ impl EventStore {
                     req.created_at as i64,
                     req.resolved_at.map(|v| v as i64),
                     &req.resolver_id,
-                    req.narrowed_scope.as_ref().and_then(|s| serde_json::to_string(s).ok()),
+                    req.narrowed_scope
+                        .as_ref()
+                        .and_then(|s| serde_json::to_string(s).ok()),
                     &req.denial_reason,
                 ],
             )
@@ -1994,7 +2015,9 @@ impl EventStore {
                  FROM approval_requests WHERE status = 'pending'
                  ORDER BY created_at DESC",
             )
-            .map_err(|err| ValidationError::new(format!("prepare list pending approvals: {err}")))?;
+            .map_err(|err| {
+                ValidationError::new(format!("prepare list pending approvals: {err}"))
+            })?;
         let rows = stmt
             .query_map([], |row| {
                 Ok(ApprovalRequestRow {
@@ -2029,9 +2052,9 @@ impl EventStore {
         request_id: &str,
         response: &core_grant_types::approval::ApprovalResponse,
     ) -> Result<(), ValidationError> {
-        let row = self
-            .get_approval_request(request_id)?
-            .ok_or_else(|| ValidationError::new(format!("approval request not found: {request_id}")))?;
+        let row = self.get_approval_request(request_id)?.ok_or_else(|| {
+            ValidationError::new(format!("approval request not found: {request_id}"))
+        })?;
 
         let scope: core_grant_types::approval::RequestedScope =
             serde_json::from_str(&row.requested_scope_json)
@@ -2247,7 +2270,13 @@ impl EventStore {
                 write_encrypted_local_block(&tx, block)?;
             }
         }
-        write_local_vault_catalog_head(&tx, &catalog.namespace, &catalog_manifest, content_key, self.master_key.as_ref().map(|s| s.as_str()))?;
+        write_local_vault_catalog_head(
+            &tx,
+            &catalog.namespace,
+            &catalog_manifest,
+            content_key,
+            self.master_key.as_ref().map(|s| s.as_str()),
+        )?;
         tx.commit().map_err(|err| {
             ValidationError::new(format!("commit local vault catalog transaction: {err}"))
         })?;
@@ -2284,7 +2313,12 @@ impl EventStore {
         let tx = self.conn.transaction().map_err(|err| {
             ValidationError::new(format!("begin local manifest key transaction: {err}"))
         })?;
-        write_local_manifest_key(&tx, manifest_id, content_key, self.master_key.as_ref().map(|s| s.as_str()))?;
+        write_local_manifest_key(
+            &tx,
+            manifest_id,
+            content_key,
+            self.master_key.as_ref().map(|s| s.as_str()),
+        )?;
         tx.commit().map_err(|err| {
             ValidationError::new(format!("commit local manifest key transaction: {err}"))
         })?;
@@ -2292,7 +2326,11 @@ impl EventStore {
     }
 
     pub fn local_manifest_key(&self, manifest_id: &str) -> Result<Option<String>, ValidationError> {
-        load_local_manifest_key(&self.conn, manifest_id, self.master_key.as_ref().map(|s| s.as_str()))
+        load_local_manifest_key(
+            &self.conn,
+            manifest_id,
+            self.master_key.as_ref().map(|s| s.as_str()),
+        )
     }
 
     pub fn upsert_local_device_encryption_key(
@@ -2325,7 +2363,12 @@ impl EventStore {
                 "begin local device encryption key transaction: {err}"
             ))
         })?;
-        write_local_device_encryption_key(&tx, device_id, key_pair, self.master_key.as_ref().map(|s| s.as_str()))?;
+        write_local_device_encryption_key(
+            &tx,
+            device_id,
+            key_pair,
+            self.master_key.as_ref().map(|s| s.as_str()),
+        )?;
         tx.commit().map_err(|err| {
             ValidationError::new(format!(
                 "commit local device encryption key transaction: {err}"
@@ -2337,7 +2380,11 @@ impl EventStore {
         &self,
         device_id: &str,
     ) -> Result<Option<LocalKeyPair>, ValidationError> {
-        load_local_device_encryption_key(&self.conn, device_id, self.master_key.as_ref().map(|s| s.as_str()))
+        load_local_device_encryption_key(
+            &self.conn,
+            device_id,
+            self.master_key.as_ref().map(|s| s.as_str()),
+        )
     }
 
     pub fn unwrap_manifest_key_for_device(
@@ -2570,7 +2617,13 @@ impl EventStore {
                 write_encrypted_local_block(&tx, block)?;
             }
         }
-        write_local_vault_catalog_head(&tx, &catalog.namespace, &manifest, content_key, self.master_key.as_ref().map(|s| s.as_str()))?;
+        write_local_vault_catalog_head(
+            &tx,
+            &catalog.namespace,
+            &manifest,
+            content_key,
+            self.master_key.as_ref().map(|s| s.as_str()),
+        )?;
         tx.commit().map_err(|err| {
             ValidationError::new(format!("commit local vault catalog transaction: {err}"))
         })?;
@@ -2582,7 +2635,11 @@ impl EventStore {
         namespace: &VaultNamespace,
     ) -> Result<Option<VaultCatalog>, ValidationError> {
         namespace.validate()?;
-        let Some((manifest, content_key)) = load_local_vault_catalog_head(&self.conn, namespace, self.master_key.as_ref().map(|s| s.as_str()))?
+        let Some((manifest, content_key)) = load_local_vault_catalog_head(
+            &self.conn,
+            namespace,
+            self.master_key.as_ref().map(|s| s.as_str()),
+        )?
         else {
             return Ok(None);
         };
@@ -2612,8 +2669,11 @@ impl EventStore {
         &self,
         namespace: &VaultNamespace,
     ) -> Result<Vec<(FileManifest, String)>, ValidationError> {
-        let Some((catalog_manifest, catalog_key)) =
-            load_local_vault_catalog_head(&self.conn, namespace, self.master_key.as_ref().map(|s| s.as_str()))?
+        let Some((catalog_manifest, catalog_key)) = load_local_vault_catalog_head(
+            &self.conn,
+            namespace,
+            self.master_key.as_ref().map(|s| s.as_str()),
+        )?
         else {
             return Ok(Vec::new());
         };
@@ -3027,8 +3087,8 @@ impl EventStore {
         let mut revisions = Vec::with_capacity(imported_claims.len());
         for (index, imported_claim) in imported_claims.iter().enumerate() {
             imported_claim.validate()?;
-            let claim_type =
-                core_event_types::ClaimType::parse(&imported_claim.claim_type).ok_or_else(|| {
+            let claim_type = core_event_types::ClaimType::parse(&imported_claim.claim_type)
+                .ok_or_else(|| {
                     ValidationError::new(format!(
                         "unsupported imported claim type: {}",
                         imported_claim.claim_type
@@ -3119,12 +3179,12 @@ impl EventStore {
         let recipients: Vec<core_storage::ManifestKeyRecipient> = access_records
             .iter()
             .filter_map(|r| {
-                mat.devices_current
-                    .get(&r.device_id)
-                    .map(|d| core_storage::manifest_key_recipient(
+                mat.devices_current.get(&r.device_id).map(|d| {
+                    core_storage::manifest_key_recipient(
                         &d.device_id,
                         &d.active_encryption_key.public_key,
-                    ))
+                    )
+                })
             })
             .collect();
         if recipients.is_empty() {
@@ -3213,9 +3273,13 @@ impl EventStore {
             }
         }
 
-        let catalog_key = load_local_vault_catalog_head(&self.conn, namespace, self.master_key.as_ref().map(|s| s.as_str()))?
-            .map(|(_, content_key)| content_key)
-            .unwrap_or_else(|| generate_content_key("vault-catalog"));
+        let catalog_key = load_local_vault_catalog_head(
+            &self.conn,
+            namespace,
+            self.master_key.as_ref().map(|s| s.as_str()),
+        )?
+        .map(|(_, content_key)| content_key)
+        .unwrap_or_else(|| generate_content_key("vault-catalog"));
         let mut catalog = self
             .local_vault_catalog(namespace)?
             .unwrap_or(create_vault_catalog(namespace.clone())?);
@@ -3317,9 +3381,13 @@ impl EventStore {
             return Err(ValidationError::new("file content must not be empty"));
         }
 
-        let catalog_key = load_local_vault_catalog_head(&self.conn, namespace, self.master_key.as_ref().map(|s| s.as_str()))?
-            .map(|(_, content_key)| content_key)
-            .unwrap_or_else(|| generate_content_key("vault-catalog"));
+        let catalog_key = load_local_vault_catalog_head(
+            &self.conn,
+            namespace,
+            self.master_key.as_ref().map(|s| s.as_str()),
+        )?
+        .map(|(_, content_key)| content_key)
+        .unwrap_or_else(|| generate_content_key("vault-catalog"));
         let mut catalog = self
             .local_vault_catalog(namespace)?
             .unwrap_or(create_vault_catalog(namespace.clone())?);
@@ -3404,9 +3472,13 @@ impl EventStore {
                 "vault tombstone requires at least one recipient device",
             ));
         }
-        let catalog_key = load_local_vault_catalog_head(&self.conn, namespace, self.master_key.as_ref().map(|s| s.as_str()))?
-            .map(|(_, content_key)| content_key)
-            .ok_or_else(|| ValidationError::new("local vault catalog not found"))?;
+        let catalog_key = load_local_vault_catalog_head(
+            &self.conn,
+            namespace,
+            self.master_key.as_ref().map(|s| s.as_str()),
+        )?
+        .map(|(_, content_key)| content_key)
+        .ok_or_else(|| ValidationError::new("local vault catalog not found"))?;
         let mut catalog = self
             .local_vault_catalog(namespace)?
             .ok_or_else(|| ValidationError::new("local vault catalog not found"))?;
@@ -3673,8 +3745,11 @@ impl EventStore {
         namespace: &VaultNamespace,
     ) -> Result<Option<LocalVaultGcPlan>, ValidationError> {
         namespace.validate()?;
-        let Some((catalog_manifest, _content_key)) =
-            load_local_vault_catalog_head(&self.conn, namespace, self.master_key.as_ref().map(|s| s.as_str()))?
+        let Some((catalog_manifest, _content_key)) = load_local_vault_catalog_head(
+            &self.conn,
+            namespace,
+            self.master_key.as_ref().map(|s| s.as_str()),
+        )?
         else {
             return Ok(None);
         };
@@ -4073,11 +4148,15 @@ impl EventLog for EventStore {
     }
 
     fn events_of_type(&self, event_type: EventType) -> Vec<EventEnvelope> {
-        EventStore::events_of_type(self, event_type).cloned().collect()
+        EventStore::events_of_type(self, event_type)
+            .cloned()
+            .collect()
     }
 
     fn events_of_type_rev(&self, event_type: EventType) -> Vec<EventEnvelope> {
-        EventStore::events_of_type_rev(self, event_type).cloned().collect()
+        EventStore::events_of_type_rev(self, event_type)
+            .cloned()
+            .collect()
     }
 
     fn export_events(&self) -> String {
@@ -4129,13 +4208,17 @@ impl EventLog for EventStore {
     }
 }
 
-fn parse_approval_status(s: &str) -> Result<core_grant_types::approval::ApprovalStatus, ValidationError> {
+fn parse_approval_status(
+    s: &str,
+) -> Result<core_grant_types::approval::ApprovalStatus, ValidationError> {
     match s {
         "pending" => Ok(core_grant_types::approval::ApprovalStatus::Pending),
         "approved" => Ok(core_grant_types::approval::ApprovalStatus::Approved),
         "denied" => Ok(core_grant_types::approval::ApprovalStatus::Denied),
         "expired" => Ok(core_grant_types::approval::ApprovalStatus::Expired),
-        "narrowed_and_approved" => Ok(core_grant_types::approval::ApprovalStatus::NarrowedAndApproved),
+        "narrowed_and_approved" => {
+            Ok(core_grant_types::approval::ApprovalStatus::NarrowedAndApproved)
+        }
         other => Err(ValidationError::invalid_format(format!(
             "unknown approval status: {other}"
         ))),
@@ -4150,15 +4233,24 @@ mod tests {
         FixtureSigner, FixtureVerifier, LocalKeySigner, generate_content_key,
         generate_local_encryption_key_pair, generate_local_key_pair,
     };
+    use core_event_types::{
+        ContentPublishedEvent, ContentVisibility, DeviceAddedEvent,
+        DeviceEncryptionKeyRotatedEvent, DeviceFrozenEvent, DeviceKeyRotatedEvent,
+        DeviceReplacedEvent, DeviceRevokedEvent, EndpointRotatedEvent, EventBody,
+        GuardianEnrolledEvent, MessageSentEvent, PersonaCreatedEvent, PersonaKeyRotatedEvent,
+        PersonaRevokedEvent, RecoveryApprovedEvent, RecoveryContestedEvent, RecoveryExecutedEvent,
+        RecoveryPolicyCreatedEvent, RecoveryRejectedEvent, RecoveryRequestedEvent,
+        RelayHintUpdatedEvent, RootCreatedEvent, RootKeyRotatedEvent, RootRevokedEvent,
+        SignerBinding, TrustAttestedEvent, TrustRevokedEvent,
+    };
     use core_events::{EventEnvelope, EventRef};
+    use core_principals::{PublicKeyMaterial, RecoveryScope, SurvivalMode};
     use core_storage::{
         EncryptedBlock, ManifestKeyRecipient, create_relationship, decrypt_block, encrypt_block,
         ledger_delta, manifest_chunk, manifest_device_access, manifest_key_recipient,
         publish_manifest, storage_ledger_updated_event, storage_manifest_published_event,
         storage_relationship_created_event, wrap_manifest_key_access,
     };
-    use core_event_types::{ContentPublishedEvent, ContentVisibility, DeviceAddedEvent, DeviceEncryptionKeyRotatedEvent, DeviceFrozenEvent, DeviceKeyRotatedEvent, DeviceReplacedEvent, DeviceRevokedEvent, EndpointRotatedEvent, EventBody, GuardianEnrolledEvent, MessageSentEvent, PersonaCreatedEvent, PersonaKeyRotatedEvent, PersonaRevokedEvent, RecoveryApprovedEvent, RecoveryContestedEvent, RecoveryExecutedEvent, RecoveryPolicyCreatedEvent, RecoveryRejectedEvent, RecoveryRequestedEvent, RelayHintUpdatedEvent, RootCreatedEvent, RootKeyRotatedEvent, RootRevokedEvent, SignerBinding, TrustAttestedEvent, TrustRevokedEvent};
-    use core_principals::{PublicKeyMaterial, RecoveryScope, SurvivalMode};
     use rusqlite::OptionalExtension;
 
     use super::*;
@@ -9056,7 +9148,6 @@ mod tests {
         store
     }
 
-
     // Grant CRUD tests deferred — see design follow-up PR for composite grant test port.
 
     fn sample_approval_request(id: &str) -> core_grant_types::approval::ApprovalRequest {
@@ -9176,7 +9267,9 @@ mod tests {
             denial_reason: Some("forged".into()),
             granted_duration_secs: None,
         };
-        let err = store.resolve_approval_request("req-1", &response2).unwrap_err();
+        let err = store
+            .resolve_approval_request("req-1", &response2)
+            .unwrap_err();
         assert!(err.message.contains("cannot transition"));
     }
 }

@@ -45,12 +45,21 @@ fn run_ember(args: &[&str]) -> (String, String, i32) {
 /// the literal `(no-git)` fallback. The trailing newline is required so we
 /// catch accidental `eprint!` / missing-newline regressions.
 fn assert_version_format(stdout: &str) {
-    assert!(stdout.ends_with('\n'), "stdout missing trailing newline: {stdout:?}");
+    assert!(
+        stdout.ends_with('\n'),
+        "stdout missing trailing newline: {stdout:?}"
+    );
     let line = stdout.trim_end_matches('\n');
 
     // Must start with "ember " and have exactly one line.
-    assert!(!stdout.trim_end_matches('\n').contains('\n'), "expected single line, got: {stdout:?}");
-    assert!(line.starts_with("ember "), "expected `ember ` prefix, got: {line:?}");
+    assert!(
+        !stdout.trim_end_matches('\n').contains('\n'),
+        "expected single line, got: {stdout:?}"
+    );
+    assert!(
+        line.starts_with("ember "),
+        "expected `ember ` prefix, got: {line:?}"
+    );
 
     // Hand-rolled regex-equivalent. Splits are stable and avoid pulling in
     // the `regex` crate just for this test.
@@ -60,7 +69,9 @@ fn assert_version_format(stdout: &str) {
         .expect("expected space after semver");
     assert!(
         semver.split('.').count() == 3
-            && semver.split('.').all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')),
+            && semver
+                .split('.')
+                .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')),
         "expected semver `X.Y.Z`, got: {semver:?}"
     );
 
@@ -72,8 +83,7 @@ fn assert_version_format(stdout: &str) {
         "expected parenthesized sha, got: {sha_paren:?}"
     );
     let sha = &sha_paren[1..sha_paren.len() - 1];
-    let sha_ok = sha == "no-git"
-        || (sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit()));
+    let sha_ok = sha == "no-git" || (sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit()));
     assert!(sha_ok, "sha group must be 7+ hex or `no-git`, got: {sha:?}");
 
     let after_built = after_sha
@@ -81,8 +91,14 @@ fn assert_version_format(stdout: &str) {
         .expect("expected `built ` keyword");
     // RFC 3339 / ISO 8601 UTC: `YYYY-MM-DDTHH:MM:SSZ`. The build script
     // always renders Z; accept any non-empty value to keep the test robust.
-    assert!(after_built.contains('T'), "expected ISO8601 timestamp with `T`, got: {after_built:?}");
-    assert!(after_built.ends_with('Z'), "expected UTC `Z` suffix, got: {after_built:?}");
+    assert!(
+        after_built.contains('T'),
+        "expected ISO8601 timestamp with `T`, got: {after_built:?}"
+    );
+    assert!(
+        after_built.ends_with('Z'),
+        "expected UTC `Z` suffix, got: {after_built:?}"
+    );
 }
 
 #[test]
@@ -111,5 +127,8 @@ fn version_subcommand_matches_flag() {
     let (sub_out, _, sub_code) = run_ember(&["version"]);
     assert_eq!(flag_code, 0);
     assert_eq!(sub_code, 0);
-    assert_eq!(flag_out, sub_out, "flag vs subcommand version output diverged");
+    assert_eq!(
+        flag_out, sub_out,
+        "flag vs subcommand version output diverged"
+    );
 }

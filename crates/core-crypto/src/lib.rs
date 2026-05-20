@@ -8,6 +8,7 @@
 #[cfg(not(target_arch = "wasm32"))]
 pub mod ca;
 pub mod canonicalize;
+pub mod did;
 pub mod grant_chain;
 pub mod persona;
 pub mod presence;
@@ -17,22 +18,24 @@ pub mod x509;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use ca::{
-    ca_fingerprint, generate_edge_ca, parse_csr_signed_by, parse_spiffe_uri, sign_client_cert,
+    BridgeIdentity, CaError, ca_fingerprint, extract_bridge_identity, generate_edge_ca,
+    parse_csr_signed_by, parse_spiffe_uri, sign_client_cert,
 };
-#[cfg(not(target_arch = "wasm32"))]
-pub use x509::{mint_per_agent_ca_with_name_constraints, mint_per_agent_client_cert, X509Error};
 pub use canonicalize::{CanonicalizeError, canonicalize_jcs};
+pub use did::{
+    DID_EMBERLINK_PREFIX, DidEmberlink, DidError, did_from_root_pubkey, parse_did, resolve_did_jwks,
+};
 pub use persona::{daemon_persona_sign_receipt, daemon_persona_verify_receipt};
+#[cfg(not(target_arch = "wasm32"))]
+pub use x509::{X509Error, mint_per_agent_ca_with_name_constraints, mint_per_agent_client_cert};
 
 use age::Decryptor;
 use age::secrecy::ExposeSecret;
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
-use core_principals::{KeyAlgorithm};
+use core_principals::KeyAlgorithm;
 use core_types::{ValidationError, bytes_to_hex, hex_to_bytes};
-use ed25519_dalek::{
-    Signature as DalekSignature, Signer as DalekSigner, SigningKey, VerifyingKey,
-};
+use ed25519_dalek::{Signature as DalekSignature, Signer as DalekSigner, SigningKey, VerifyingKey};
 use hkdf::Hkdf;
 // `rand_core 0.10` removed `OsRng` and the `getrandom` feature. We use the
 // `getrandom` crate directly for OS entropy — infallible on the platforms we
@@ -126,7 +129,7 @@ pub trait Verifier {
     fn verify(&self, public_key: &PublicKey, payload: &[u8], signature: &Signature) -> bool;
 }
 
-/// implementation-note-23 C6: probe trait that lets `LocalKeySigner`
+/// implementation-note-27 C6: probe trait that lets `LocalKeySigner`
 /// refuse to sign when the underlying persona's status is anything
 /// other than `active` (revoked, enrolling, archived, …). Injected at
 /// signer construction time so `core-crypto` does not pull a SQLite or
@@ -144,7 +147,7 @@ pub trait PersonaActiveProbe: Send + Sync {
     fn is_active(&self) -> bool;
 }
 
-/// implementation-note-23 C6: error variant returned from
+/// implementation-note-27 C6: error variant returned from
 /// [`LocalKeySigner::try_sign`] when the attached
 /// [`PersonaActiveProbe`] reports the persona is not active. Surfaced as
 /// a fresh error rather than reusing `ValidationError` so call sites
@@ -173,7 +176,7 @@ impl std::error::Error for SignerError {}
 pub struct LocalKeySigner {
     public_key: PublicKey,
     signing_key: SigningKey,
-    /// implementation-note-23 C6 — optional probe consulted by
+    /// implementation-note-27 C6 — optional probe consulted by
     /// [`LocalKeySigner::try_sign`]. `None` for legacy construction
     /// paths (tests + any caller predating C6) which means try_sign
     /// always succeeds. Production callers attach a probe via
@@ -217,19 +220,16 @@ impl LocalKeySigner {
         })
     }
 
-    /// implementation-note-23 C6: attach a [`PersonaActiveProbe`] so
+    /// implementation-note-27 C6: attach a [`PersonaActiveProbe`] so
     /// [`Self::try_sign`] consults it before signing. Returns the same
     /// signer with the probe set — chains naturally off
     /// `from_local_key_pair`.
-    pub fn with_probe(
-        mut self,
-        probe: std::sync::Arc<dyn PersonaActiveProbe>,
-    ) -> Self {
+    pub fn with_probe(mut self, probe: std::sync::Arc<dyn PersonaActiveProbe>) -> Self {
         self.probe = Some(probe);
         self
     }
 
-    /// implementation-note-23 C6: fallible signing entry point.
+    /// implementation-note-27 C6: fallible signing entry point.
     /// Consults the attached [`PersonaActiveProbe`] (if any) and
     /// refuses to sign when the persona is not active. When no probe
     /// is attached, behaves identically to [`Signer::sign`].
@@ -245,7 +245,7 @@ impl LocalKeySigner {
 }
 
 impl Signer for LocalKeySigner {
-    /// implementation-note-23 C6 note: the legacy infallible `sign`
+    /// implementation-note-27 C6 note: the legacy infallible `sign`
     /// remains for call sites that have not migrated to [`Self::try_sign`].
     /// When a probe is attached and reports the persona is inactive,
     /// this method panics with a clear message — fail-loud is preferred
@@ -595,11 +595,9 @@ pub fn wrap_secret_to_recipient_armored(
         age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
             .map_err(|err| ValidationError::new(format!("create recipient encryptor: {err}")))?;
     let mut encrypted = Vec::new();
-    let armored = age::armor::ArmoredWriter::wrap_output(
-        &mut encrypted,
-        age::armor::Format::AsciiArmor,
-    )
-    .map_err(|err| ValidationError::new(format!("open armor wrapper: {err}")))?;
+    let armored =
+        age::armor::ArmoredWriter::wrap_output(&mut encrypted, age::armor::Format::AsciiArmor)
+            .map_err(|err| ValidationError::new(format!("open armor wrapper: {err}")))?;
     let mut writer = encryptor
         .wrap_output(armored)
         .map_err(|err| ValidationError::new(format!("open recipient wrapper: {err}")))?;
@@ -784,7 +782,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    /// implementation-note-23 C6: `LocalKeySigner::try_sign` consults
+    /// implementation-note-27 C6: `LocalKeySigner::try_sign` consults
     /// the attached `PersonaActiveProbe` and refuses to sign when the
     /// persona is not active. The test injects two probes (active and
     /// inactive) and asserts the corresponding outcome.
@@ -961,9 +959,18 @@ mod tests {
         let key_catalog = derive_content_key(&ikm, b"emberlink/v1/content-key/vault-catalog");
         let key_payload = derive_content_key(&ikm, b"emberlink/v1/content-key/vault-payload");
         let key_state = derive_content_key(&ikm, b"emberlink/v1/content-key/local-state");
-        assert_ne!(key_catalog, key_payload, "vault-catalog vs vault-payload must differ");
-        assert_ne!(key_catalog, key_state, "vault-catalog vs local-state must differ");
-        assert_ne!(key_payload, key_state, "vault-payload vs local-state must differ");
+        assert_ne!(
+            key_catalog, key_payload,
+            "vault-catalog vs vault-payload must differ"
+        );
+        assert_ne!(
+            key_catalog, key_state,
+            "vault-catalog vs local-state must differ"
+        );
+        assert_ne!(
+            key_payload, key_state,
+            "vault-payload vs local-state must differ"
+        );
     }
 
     #[test]
@@ -988,7 +995,13 @@ mod tests {
 
         // Each signature verifies in its own domain.
         assert!(
-            verify_with_context(DOMAIN_EVENT, &verifier, &signer.public_key(), payload, &sig_event),
+            verify_with_context(
+                DOMAIN_EVENT,
+                &verifier,
+                &signer.public_key(),
+                payload,
+                &sig_event
+            ),
             "DOMAIN_EVENT signature must verify in DOMAIN_EVENT"
         );
         assert!(
@@ -1016,7 +1029,13 @@ mod tests {
 
         // Cross-domain: DOMAIN_GRANT_OFFER signature must NOT verify under DOMAIN_EVENT.
         assert!(
-            !verify_with_context(DOMAIN_EVENT, &verifier, &signer.public_key(), payload, &sig_grant_offer),
+            !verify_with_context(
+                DOMAIN_EVENT,
+                &verifier,
+                &signer.public_key(),
+                payload,
+                &sig_grant_offer
+            ),
             "DOMAIN_GRANT_OFFER signature must NOT verify under DOMAIN_EVENT"
         );
     }
@@ -1041,7 +1060,10 @@ mod tests {
         let seed = [0x42u8; 32];
         let signing_key = SigningKey::from_bytes(&seed);
         let verifying_key = signing_key.verifying_key();
-        let public_hex = format!("ed25519:{}", core_types::bytes_to_hex(&verifying_key.to_bytes()));
+        let public_hex = format!(
+            "ed25519:{}",
+            core_types::bytes_to_hex(&verifying_key.to_bytes())
+        );
         let public_key = PublicKey(public_hex);
 
         // Known Ed25519 small-order (order-8 torsion) point in compressed form.
@@ -1049,10 +1071,9 @@ mod tests {
         // This point has order 8 on the Edwards curve and is definitively
         // rejected by verify_strict's low-order component check on R.
         let torsion_r_bytes: [u8; 32] = [
-            0xc7, 0x17, 0x6a, 0x70, 0x3d, 0x4d, 0xd8, 0x4f,
-            0xba, 0x3c, 0x0b, 0x76, 0x0d, 0x10, 0x67, 0x0f,
-            0x2a, 0x20, 0x53, 0xfa, 0x2c, 0x39, 0xcc, 0xc6,
-            0x4e, 0xc7, 0xfd, 0x77, 0x92, 0xac, 0x03, 0x7a,
+            0xc7, 0x17, 0x6a, 0x70, 0x3d, 0x4d, 0xd8, 0x4f, 0xba, 0x3c, 0x0b, 0x76, 0x0d, 0x10,
+            0x67, 0x0f, 0x2a, 0x20, 0x53, 0xfa, 0x2c, 0x39, 0xcc, 0xc6, 0x4e, 0xc7, 0xfd, 0x77,
+            0x92, 0xac, 0x03, 0x7a,
         ];
 
         // Craft a 64-byte signature: torsion R || zero S.

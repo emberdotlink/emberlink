@@ -123,9 +123,7 @@ impl SocketTransport {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, TransportError> {
-        let id = REQUEST_COUNTER
-            .fetch_add(1, Ordering::Relaxed)
-            .to_string();
+        let id = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed).to_string();
 
         let req = Request {
             id: id.clone(),
@@ -155,9 +153,8 @@ impl SocketTransport {
             }
 
             let trimmed = response_line.trim_end();
-            let msg: AnyMessage = serde_json::from_str(trimmed).map_err(|e| {
-                TransportError::Protocol(format!("Failed to parse message: {e}"))
-            })?;
+            let msg: AnyMessage = serde_json::from_str(trimmed)
+                .map_err(|e| TransportError::Protocol(format!("Failed to parse message: {e}")))?;
 
             // Notification: no id, has method. Skip and keep reading.
             if msg.id.is_none() && msg.method.is_some() {
@@ -347,7 +344,8 @@ mod tests {
 
     #[test]
     fn response_with_error_deserializes() {
-        let json = r#"{"id":"2","result":null,"error":{"code":-32601,"message":"Method not found"}}"#;
+        let json =
+            r#"{"id":"2","result":null,"error":{"code":-32601,"message":"Method not found"}}"#;
         let resp: Response = serde_json::from_str(json).unwrap();
         assert_eq!(resp.id, "2");
         assert!(resp.result.is_none());
@@ -422,8 +420,7 @@ mod tests {
             let reader = BufReader::new(stream);
             for line in reader.lines() {
                 let line = line.expect("read line");
-                let req: serde_json::Value =
-                    serde_json::from_str(&line).expect("parse request");
+                let req: serde_json::Value = serde_json::from_str(&line).expect("parse request");
                 let id = req["id"].as_str().unwrap_or("0").to_string();
                 let method = req["method"].as_str().unwrap_or("").to_string();
                 let result = if method == "ping" {
@@ -440,8 +437,7 @@ mod tests {
             let _ = std::fs::remove_file(&server_path);
         });
 
-        let mut transport =
-            SocketTransport::connect(&socket_path).expect("connect to mock socket");
+        let mut transport = SocketTransport::connect(&socket_path).expect("connect to mock socket");
         let is_pong = transport.ping().expect("ping");
         assert!(is_pong, "expected pong response");
 

@@ -5,7 +5,13 @@ use core_crypto::{
     decrypt_content, encrypt_content, sha256_digest_hex, unwrap_secret_with_identity,
     wrap_secret_to_recipient,
 };
-use core_event_types::{ChunkReference, ClaimMeta, DurabilityPolicy, EventBody, FileManifest, ManifestDeviceAccess, PayloadKind, PresentationArtifact, PresentationAudienceKind, PresentationTemplate, RetentionPolicy, StorageLedgerEntry, StorageLedgerUpdatedEvent, StorageManifestPublishedEvent, StorageRelationship, StorageRelationshipCreatedEvent, StructuredEncoding, StructuredRecordMeta, VaultCatalog, VaultNamespace, VaultObject, VaultObjectClass, VaultRevision};
+use core_event_types::{
+    ChunkReference, ClaimMeta, DurabilityPolicy, EventBody, FileManifest, ManifestDeviceAccess,
+    PayloadKind, PresentationArtifact, PresentationAudienceKind, PresentationTemplate,
+    RetentionPolicy, StorageLedgerEntry, StorageLedgerUpdatedEvent, StorageManifestPublishedEvent,
+    StorageRelationship, StorageRelationshipCreatedEvent, StructuredEncoding, StructuredRecordMeta,
+    VaultCatalog, VaultNamespace, VaultObject, VaultObjectClass, VaultRevision,
+};
 use core_types::{CanonicalEncode, Validate, ValidationError, bytes_to_hex, hex_to_bytes};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 

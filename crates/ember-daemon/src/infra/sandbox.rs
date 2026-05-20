@@ -1,11 +1,12 @@
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::infra::store::{DaemonStore, StoreError};
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxInfo {
     pub id: String,
     pub name: String,
@@ -21,7 +22,7 @@ pub struct SandboxInfo {
 /// Options carried into `create_sandbox`. Covers all operator-settable flags
 /// that are subject to the MVS-A hardening invariants (design §Hardening
 /// invariants — Refused at sandbox create).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SandboxCreateOpts {
     pub name: String,
     pub image: String,
@@ -45,6 +46,35 @@ pub struct SandboxCreateOpts {
     /// and required to match on subsequent `exec_sandbox` calls. `None`
     /// skips the ownership check for backwards-compat with legacy callers.
     pub owner_persona_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxCreateResult {
+    pub sandbox: SandboxInfo,
+    pub container_id: Option<String>,
+    pub start_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxDeleteResult {
+    pub resolved_id: Option<String>,
+    pub already_absent: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SandboxRunGrantDisposition {
+    NotRequested,
+    PendingApproval { approval_id: String },
+    Minted { grant_id: Option<String> },
+    Failed { message: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxRunResult {
+    pub sandbox: SandboxInfo,
+    pub container_id: Option<String>,
+    pub start_error: Option<String>,
+    pub grant: SandboxRunGrantDisposition,
 }
 
 /// Host paths that must never appear in a mount source, per design
@@ -127,7 +157,8 @@ pub(crate) fn validate_sandbox_opts(opts: &SandboxCreateOpts) -> Result<(), Stor
 
         if let Some(ref h) = home {
             let h_trim = h.trim_end_matches('/');
-            if !h_trim.is_empty() && (as_str == *h_trim || as_str.starts_with(&format!("{h_trim}/")))
+            if !h_trim.is_empty()
+                && (as_str == *h_trim || as_str.starts_with(&format!("{h_trim}/")))
             {
                 // Any mount under $HOME — refused. Covers $HOME itself,
                 // ~/.ssh, ~/.aws, ~/.kube, ~/.gnupg, etc.
@@ -526,7 +557,7 @@ impl DaemonStore {
     /// too. Idempotent: returns `Ok(())` when the sandbox is already gone so
     /// `ember sandbox delete` retries don't fail loudly.
     ///
-    /// implementation-note-219: addresses the "stale `coding-agent` container blocks
+    /// implementation-note-303: addresses the "stale `coding-agent` container blocks
     /// retry" demo failure. `stop_sandbox` leaves the row + persona behind so
     /// a second `sandbox create --name coding-agent` hits the
     /// `personas.name` UNIQUE constraint. `delete_sandbox` is the GC path.
@@ -581,7 +612,7 @@ impl DaemonStore {
         }
 
         // Belt-and-suspenders: also reap any container whose --name matches
-        // the sandbox name. Covers the implementation-note-219 case where the row
+        // the sandbox name. Covers the implementation-note-303 case where the row
         // was inserted but `start_container` failed before recording a
         // container_id, leaving an orphan docker container with the sandbox
         // name. `docker rm -f <name>` is a no-op when the container is gone.
@@ -623,10 +654,8 @@ impl DaemonStore {
         }
 
         // Drop the sandbox row.
-        self.conn().execute(
-            "DELETE FROM sandboxes WHERE id = ?1",
-            rusqlite::params![id],
-        )?;
+        self.conn()
+            .execute("DELETE FROM sandboxes WHERE id = ?1", rusqlite::params![id])?;
 
         // If the auto-created persona has no other refs, delete it. Refs:
         //   - other sandbox rows (persona_id or owner_persona_id)
@@ -697,8 +726,7 @@ impl DaemonStore {
         caller_persona_id: &str,
     ) -> Result<String, StoreError> {
         let (container_id, status, owner_persona_id): (Option<String>, String, Option<String>) =
-            self
-                .conn()
+            self.conn()
                 .query_row(
                     "SELECT container_id, status, owner_persona_id FROM sandboxes WHERE id = ?1",
                     rusqlite::params![id],
@@ -772,12 +800,7 @@ impl DaemonStore {
 /// make the tree readable/writable by UID 1000 inside the container.
 fn clone_workspace(url: &str, target: &Path) -> Result<(), StoreError> {
     let output = std::process::Command::new("git")
-        .args([
-            "clone",
-            "--depth=1",
-            url,
-            target.to_string_lossy().as_ref(),
-        ])
+        .args(["clone", "--depth=1", url, target.to_string_lossy().as_ref()])
         .output()
         .map_err(|e| StoreError::InvalidInput(format!("git not available: {e}")))?;
 
@@ -890,7 +913,7 @@ mod tests {
         assert_eq!(persona.status, "revoked");
     }
 
-    // ---------- implementation-note-219: delete_sandbox ----------
+    // ---------- implementation-note-303: delete_sandbox ----------
 
     #[test]
     fn delete_sandbox_removes_row_and_unreferenced_persona() {
@@ -916,7 +939,7 @@ mod tests {
 
     #[test]
     fn delete_sandbox_unblocks_recreate_with_same_name() {
-        // The whole point of implementation-note-219: after a stale sandbox is
+        // The whole point of implementation-note-303: after a stale sandbox is
         // deleted, the demo can re-create a sandbox with the same name
         // without hitting the `personas.name UNIQUE` constraint.
         let store = DaemonStore::open_in_memory().unwrap();
@@ -947,9 +970,7 @@ mod tests {
         // be retained (the foreign-key would orphan it otherwise) — only the
         // sandbox row itself is deleted.
         let store = DaemonStore::open_in_memory().unwrap();
-        let sandbox = store
-            .create_sandbox("ref-keeper", "alpine:latest")
-            .unwrap();
+        let sandbox = store.create_sandbox("ref-keeper", "alpine:latest").unwrap();
         // Insert a fake grant row referencing the persona.
         store
             .conn()
@@ -1000,7 +1021,9 @@ mod tests {
     #[test]
     fn resolve_sandbox_id_by_id_returns_correct_id() {
         let store = DaemonStore::open_in_memory().unwrap();
-        let sb = store.create_sandbox("id-lookup-box", "alpine:latest").unwrap();
+        let sb = store
+            .create_sandbox("id-lookup-box", "alpine:latest")
+            .unwrap();
         let resolved = store.resolve_sandbox_id(&sb.id).unwrap();
         assert_eq!(resolved, sb.id);
     }
@@ -1017,7 +1040,9 @@ mod tests {
         // The UNIQUE index on sandboxes(name) (REVIEW-F7) means inserting a
         // second sandbox with the same name must fail at the DB layer.
         let store = DaemonStore::open_in_memory().unwrap();
-        store.create_sandbox("unique-check", "alpine:latest").unwrap();
+        store
+            .create_sandbox("unique-check", "alpine:latest")
+            .unwrap();
         let result = store.create_sandbox("unique-check", "alpine:latest");
         assert!(
             result.is_err(),
@@ -1067,17 +1092,23 @@ mod tests {
         let older_id = "sandbox-older-000000000000000000000000000000";
         let newer_id = "sandbox-newer-000000000000000000000000000000";
 
-        store.conn().execute(
-            "INSERT INTO sandboxes (id, name, persona_id, image, status, created_at)
+        store
+            .conn()
+            .execute(
+                "INSERT INTO sandboxes (id, name, persona_id, image, status, created_at)
              VALUES (?1, 'dup-name', 'p1', 'alpine:latest', 'created', '2024-01-01T00:00:00Z')",
-            rusqlite::params![older_id],
-        ).unwrap();
+                rusqlite::params![older_id],
+            )
+            .unwrap();
 
-        store.conn().execute(
-            "INSERT INTO sandboxes (id, name, persona_id, image, status, created_at)
+        store
+            .conn()
+            .execute(
+                "INSERT INTO sandboxes (id, name, persona_id, image, status, created_at)
              VALUES (?1, 'dup-name', 'p2', 'alpine:latest', 'created', '2024-06-01T00:00:00Z')",
-            rusqlite::params![newer_id],
-        ).unwrap();
+                rusqlite::params![newer_id],
+            )
+            .unwrap();
 
         // Resolver must return the newest row.
         let resolved = store.resolve_sandbox_id("dup-name").unwrap();
@@ -1114,7 +1145,8 @@ mod tests {
     fn start_container_applies_user_1000() {
         let args = args_for(&[], Some("none"));
         assert!(
-            args.windows(2).any(|w| w[0] == "--user" && w[1] == "1000:1000"),
+            args.windows(2)
+                .any(|w| w[0] == "--user" && w[1] == "1000:1000"),
             "missing --user 1000:1000 in {args:?}"
         );
     }
@@ -1135,7 +1167,10 @@ mod tests {
             }
         }
         assert!(saw_tmp, "missing tmpfs /tmp with full flags in {args:?}");
-        assert!(saw_home, "missing tmpfs /home/agent with full flags in {args:?}");
+        assert!(
+            saw_home,
+            "missing tmpfs /home/agent with full flags in {args:?}"
+        );
     }
 
     #[test]
@@ -1179,7 +1214,10 @@ mod tests {
                 break;
             }
         }
-        assert!(saw, "missing -v <host>:/run/ember/daemon.sock:ro in {args:?}");
+        assert!(
+            saw,
+            "missing -v <host>:/run/ember/daemon.sock:ro in {args:?}"
+        );
     }
 
     #[test]
@@ -1472,9 +1510,7 @@ mod tests {
         let store = DaemonStore::open_in_memory().unwrap();
         let mut o = opts("ws-box");
         o.workspace_from = Some(bare.to_string_lossy().to_string());
-        let sandbox = store
-            .create_sandbox_with_opts(&o, Some(&data_dir))
-            .unwrap();
+        let sandbox = store.create_sandbox_with_opts(&o, Some(&data_dir)).unwrap();
 
         let ws = sandbox
             .workspace_path
@@ -1500,9 +1536,7 @@ mod tests {
         let store = DaemonStore::open_in_memory().unwrap();
         let mut o = opts("ws-stop-box");
         o.workspace_from = Some(bare.to_string_lossy().to_string());
-        let sandbox = store
-            .create_sandbox_with_opts(&o, Some(&data_dir))
-            .unwrap();
+        let sandbox = store.create_sandbox_with_opts(&o, Some(&data_dir)).unwrap();
         let ws = PathBuf::from(sandbox.workspace_path.unwrap());
         assert!(ws.exists());
 
@@ -1512,15 +1546,36 @@ mod tests {
 
     // ---------- existing docker-gated integration tests ----------
 
+    /// RAII guard that runs `docker rm -f <name>` on drop. Prevents
+    /// hardcoded container-name collisions from leaking across test
+    /// runs when a panic skips the explicit `stop_sandbox` cleanup —
+    /// the failure mode that left `start-test-box` and `exec-test-box`
+    /// pinned "Up 6 hours" before this fix and tripped every subsequent
+    /// cargo-test run with "container name already in use."
+    struct DockerContainerGuard(String);
+    impl Drop for DockerContainerGuard {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("docker")
+                .args(["rm", "-f", &self.0])
+                .output();
+        }
+    }
+
+    /// Unique container name per cargo-test process so two concurrent
+    /// cargo invocations (e.g. orchestrator + dev shell) don't collide.
+    fn unique_container_name(prefix: &str) -> String {
+        format!("{}-{}", prefix, std::process::id())
+    }
+
     #[test]
     fn start_container_docker_available() {
         if !docker_available() {
             return;
         }
+        let name = unique_container_name("start-test-box");
+        let _cleanup = DockerContainerGuard(name.clone());
         let store = DaemonStore::open_in_memory().unwrap();
-        let sandbox = store
-            .create_sandbox("start-test-box", "alpine:latest")
-            .unwrap();
+        let sandbox = store.create_sandbox(&name, "alpine:latest").unwrap();
         let socket_dir = PathBuf::from("/tmp/ember-test/run");
         // Use --network=none so this test doesn't need to pull a bridge image.
         let container_id = store
@@ -1541,16 +1596,18 @@ mod tests {
         if !docker_available() {
             return;
         }
+        let name = unique_container_name("exec-test-box");
+        let _cleanup = DockerContainerGuard(name.clone());
         let store = DaemonStore::open_in_memory().unwrap();
-        let sandbox = store
-            .create_sandbox("exec-test-box", "alpine:latest")
-            .unwrap();
+        let sandbox = store.create_sandbox(&name, "alpine:latest").unwrap();
         let socket_dir = PathBuf::from("/tmp/ember-test/run");
         store
             .start_container(&sandbox.id, &socket_dir, Some("none"), &[])
             .unwrap();
 
-        let output = store.exec_sandbox(&sandbox.id, &["echo", "hello"], "any-persona").unwrap();
+        let output = store
+            .exec_sandbox(&sandbox.id, &["echo", "hello"], "any-persona")
+            .unwrap();
         assert!(output.contains("hello"));
 
         // Clean up
@@ -1715,7 +1772,11 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        assert_eq!(entries.len(), 1, "expected one unauthorized.exec_sandbox audit entry");
+        assert_eq!(
+            entries.len(),
+            1,
+            "expected one unauthorized.exec_sandbox audit entry"
+        );
         let e = &entries[0];
         assert_eq!(e.outcome, "denied");
         assert_eq!(e.agent_id.as_deref(), Some("persona-intruder"));

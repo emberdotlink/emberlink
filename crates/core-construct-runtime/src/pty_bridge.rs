@@ -64,7 +64,12 @@ pub fn encode_winsize_frame(rows: u16, cols: u16, xpixel: u16, ypixel: u16) -> [
 /// Returns (rows, cols, xpixel, ypixel), or (24, 80, 0, 0) as a safe default.
 #[cfg(unix)]
 pub fn current_winsize() -> (u16, u16, u16, u16) {
-    let mut ws = libc::winsize { ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 };
+    let mut ws = libc::winsize {
+        ws_row: 24,
+        ws_col: 80,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
     unsafe {
         libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws);
     }
@@ -108,11 +113,26 @@ extern "C" fn sigcont_handler(_sig: libc::c_int) {
 #[cfg(unix)]
 pub fn install_signal_handlers() {
     unsafe {
-        libc::signal(libc::SIGWINCH, sigwinch_handler as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGINT, sigint_handler as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, sigterm_handler as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGTSTP, sigtstp_handler as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGCONT, sigcont_handler as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGWINCH,
+            sigwinch_handler as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGINT,
+            sigint_handler as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTERM,
+            sigterm_handler as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTSTP,
+            sigtstp_handler as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGCONT,
+            sigcont_handler as *const () as libc::sighandler_t,
+        );
     }
 }
 
@@ -163,7 +183,7 @@ pub fn pty_bridge_client(listener: UnixListener, done: Arc<Mutex<bool>>) {
     // teardown caused `BridgeExit::ShimDisappeared` → SIGTERM cascade
     // on every non-interactive shim invocation (headless scripts run
     // shims with stdin=/dev/null), killing the credential-injected
-    // child mid-flight. See implementation-note-19.
+    // child mid-flight. See implementation-note-21.
     let mut stdin_eof = false;
 
     loop {
@@ -219,12 +239,18 @@ pub fn pty_bridge_client(listener: UnixListener, done: Arc<Mutex<bool>>) {
         {
             let stdin_events = if stdin_eof { 0 } else { libc::POLLIN };
             let mut fds = [
-                libc::pollfd { fd: stream_fd, events: libc::POLLIN, revents: 0 },
-                libc::pollfd { fd: stdin_fd, events: stdin_events, revents: 0 },
+                libc::pollfd {
+                    fd: stream_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: stdin_fd,
+                    events: stdin_events,
+                    revents: 0,
+                },
             ];
-            let r = unsafe {
-                libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 100)
-            };
+            let r = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 100) };
             if r < 0 {
                 let err = io::Error::last_os_error();
                 if err.kind() == io::ErrorKind::Interrupted {
@@ -307,7 +333,7 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    /// Regression for implementation-note-19.
+    /// Regression for implementation-note-21.
     ///
     /// When stdin returns `Ok(0)` (EOF — the steady state for headless
     /// shim invocations whose stdin is `/dev/null`), the previous
@@ -329,7 +355,10 @@ mod tests {
         let mut sink = Vec::<u8>::new();
         let outcome = pump_stdin_once(&mut stdin, &mut buf, &mut sink);
         assert!(matches!(outcome, PumpStdin::Eof));
-        assert!(sink.is_empty(), "no TAG_DATA frame should be emitted for EOF");
+        assert!(
+            sink.is_empty(),
+            "no TAG_DATA frame should be emitted for EOF"
+        );
     }
 
     #[test]

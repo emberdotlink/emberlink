@@ -58,7 +58,10 @@ fn sidecar_path(session_id: &str) -> PathBuf {
 
 fn active_session_id() -> Result<String, Box<dyn std::error::Error>> {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let active = PathBuf::from(home).join(".ember").join("sessions").join("active");
+    let active = PathBuf::from(home)
+        .join(".ember")
+        .join("sessions")
+        .join("active");
     let id = std::fs::read_to_string(&active)
         .map_err(|e| format!("no active session ({}): {e}", active.display()))?;
     Ok(id.trim().to_string())

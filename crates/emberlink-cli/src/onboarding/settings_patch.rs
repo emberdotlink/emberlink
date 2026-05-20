@@ -1,7 +1,7 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// The exact `command` string we look for and write. Exposed for tests
-/// and for implementation-note-290's `--uninstall` path to remove only what we added.
+/// and for implementation-note-410's `--uninstall` path to remove only what we added.
 pub const EMBER_PROXY_HOOK_COMMAND: &str = "ember-proxy hook";
 
 /// Raw tool names that must NOT be invoked outside the shadow PATH shims.
@@ -68,12 +68,12 @@ pub fn add_permissions_deny_outside_shadow(settings: &mut Value) -> Result<(), P
         .entry("deny")
         .or_insert_with(|| json!([]))
         .as_array_mut()
-        .ok_or(PatchError::RootNotObject("permissions.deny is not an array"))?;
+        .ok_or(PatchError::RootNotObject(
+            "permissions.deny is not an array",
+        ))?;
 
     for entry in deny_entries() {
-        let already = deny
-            .iter()
-            .any(|v| v.as_str() == Some(entry.as_str()));
+        let already = deny.iter().any(|v| v.as_str() == Some(entry.as_str()));
         if !already {
             deny.push(json!(entry));
         }
@@ -224,7 +224,9 @@ pub fn add_pretooluse_hook(settings: &mut Value) -> Result<bool, PatchError> {
     let inner = block
         .get_mut("hooks")
         .and_then(|v| v.as_array_mut())
-        .ok_or(PatchError::RootNotObject("wildcard block hooks is not an array"))?;
+        .ok_or(PatchError::RootNotObject(
+            "wildcard block hooks is not an array",
+        ))?;
 
     // Idempotency: skip if our hook is already there
     if inner.iter().any(|h| {
@@ -322,7 +324,7 @@ pub fn remove_pretooluse_hook(settings: &mut Value) -> Result<bool, PatchError> 
 }
 
 /// Top-level convenience: parse → patch (add) → re-serialize.
-/// Used by `ember init --for claude-code` (implementation-note-290).
+/// Used by `ember init --for claude-code` (implementation-note-410).
 pub fn patch_settings_json(input: &str) -> Result<String, PatchError> {
     let mut value = if input.trim().is_empty() {
         json!({})
@@ -393,7 +395,11 @@ mod tests {
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v.get("theme").and_then(|v| v.as_str()), Some("dark"));
         assert_eq!(v.get("model").and_then(|v| v.as_str()), Some("sonnet"));
-        assert!(v.get("mcpServers").and_then(|v| v.get("my-server")).is_some());
+        assert!(
+            v.get("mcpServers")
+                .and_then(|v| v.get("my-server"))
+                .is_some()
+        );
         assert!(v.get("statusline").is_some());
         assert!(v.get("permissions").is_some());
         assert!(has_pretooluse_hook(&v));
@@ -414,15 +420,10 @@ mod tests {
         let out = patch_settings_json(&input).expect("patch");
         let v: Value = serde_json::from_str(&out).unwrap();
         // User's custom hook is still there
-        let pretooluse = v
-            .pointer("/hooks/PreToolUse")
-            .unwrap()
-            .as_array()
-            .unwrap();
+        let pretooluse = v.pointer("/hooks/PreToolUse").unwrap().as_array().unwrap();
         let custom_match = pretooluse.iter().any(|b| {
             b.get("matcher").and_then(|m| m.as_str()) == Some("Bash")
-                && b.pointer("/hooks/0/command")
-                    .and_then(|c| c.as_str())
+                && b.pointer("/hooks/0/command").and_then(|c| c.as_str())
                     == Some("/usr/local/bin/my-custom-hook")
         });
         assert!(custom_match, "user's Bash hook preserved");
@@ -451,7 +452,11 @@ mod tests {
             .as_array()
             .unwrap();
         // Both hooks present in the same wildcard block
-        assert_eq!(inner.len(), 2, "should merge, not duplicate the matcher block");
+        assert_eq!(
+            inner.len(),
+            2,
+            "should merge, not duplicate the matcher block"
+        );
     }
 
     #[test]
@@ -478,17 +483,10 @@ mod tests {
         add_pretooluse_hook(&mut v).unwrap();
         assert!(remove_pretooluse_hook(&mut v).unwrap());
         // User's hook still there
-        let pretooluse = v
-            .pointer("/hooks/PreToolUse")
-            .unwrap()
-            .as_array()
-            .unwrap();
+        let pretooluse = v.pointer("/hooks/PreToolUse").unwrap().as_array().unwrap();
         assert_eq!(pretooluse.len(), 1);
         assert_eq!(
-            pretooluse[0]
-                .pointer("/hooks/0/command")
-                .unwrap()
-                .as_str(),
+            pretooluse[0].pointer("/hooks/0/command").unwrap().as_str(),
             Some("/usr/local/bin/my-custom-hook")
         );
     }
@@ -504,7 +502,7 @@ mod tests {
         assert!(patch_settings_json("{not json").is_err());
     }
 
-    // --- implementation-note-311 tests ---
+    // --- implementation-note-440 tests ---
 
     #[test]
     fn add_deny_to_empty_settings() {
@@ -592,7 +590,9 @@ mod tests {
             for prefix in DENY_PATH_PREFIXES {
                 let our_entry = format!("Bash({prefix}/{tool} *)");
                 assert!(
-                    !deny_after.iter().any(|e| e.as_str() == Some(our_entry.as_str())),
+                    !deny_after
+                        .iter()
+                        .any(|e| e.as_str() == Some(our_entry.as_str())),
                     "our entry {our_entry} must be removed"
                 );
             }

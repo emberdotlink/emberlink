@@ -10,7 +10,7 @@
 
 use rcgen::{
     BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, GeneralSubtree, IsCa,
-    Issuer, KeyPair, NameConstraints, SanType, PKCS_ED25519,
+    Issuer, KeyPair, NameConstraints, PKCS_ED25519, SanType,
 };
 use thiserror::Error;
 use zeroize::Zeroizing;
@@ -64,8 +64,8 @@ pub fn mint_per_agent_ca_with_name_constraints(
         return Err(X509Error::EmptyPermittedNames);
     }
 
-    let key_pair = KeyPair::generate_for(&PKCS_ED25519)
-        .map_err(|e| X509Error::KeyGen(e.to_string()))?;
+    let key_pair =
+        KeyPair::generate_for(&PKCS_ED25519).map_err(|e| X509Error::KeyGen(e.to_string()))?;
 
     let mut params = CertificateParams::new(Vec::<String>::new())
         .map_err(|e| X509Error::CertGen(e.to_string()))?;
@@ -115,7 +115,7 @@ pub fn mint_per_agent_ca_with_name_constraints(
 /// Mint per-agent mTLS client cert signed by daemon's client-auth signer key
 /// (held in emberd mlock'd buffer; never on disk).
 ///
-/// SAN URIs emitted, per design component 2 / implementation-note-24:
+/// SAN URIs emitted, per design component 2 / implementation-note-31:
 /// - Always: `urn:emberlink:agent:<agent_id>` (URN compat, retained one release for downstream consumers).
 /// - When `container_id` is `Some`: also `spiffe://emberd/persona/<agent_id>` and `spiffe://emberd/container/<container_id>` (SPIFFE shape, per KMS-edge precedent in `core_crypto::ca::parse_spiffe_uri`).
 ///
@@ -154,8 +154,8 @@ pub fn mint_per_agent_client_cert(
         return Err(X509Error::InvalidValidity(validity_hours));
     }
 
-    let key_pair = KeyPair::generate_for(&PKCS_ED25519)
-        .map_err(|e| X509Error::KeyGen(e.to_string()))?;
+    let key_pair =
+        KeyPair::generate_for(&PKCS_ED25519).map_err(|e| X509Error::KeyGen(e.to_string()))?;
 
     let mut params = CertificateParams::new(Vec::<String>::new())
         .map_err(|e| X509Error::CertGen(e.to_string()))?;

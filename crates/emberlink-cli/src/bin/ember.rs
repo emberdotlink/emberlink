@@ -1,3 +1,37 @@
+//! `ember` CLI binary.
+//!
+//! open_store_mutator_audit_complete
+//!
+//! Audit of every `open_store(config)` call site in this file, per
+//! implementation-note-385. Under design
+//! separate-uid posture (daemon=ember uid, operator=operator uid) the daemon
+//! owns the SQLite DB and the operator cannot open it for writing — so
+//! every direct-store *mutator* call site needs to route through the
+//! daemon's JSON-RPC socket instead. Read-only paths are tolerable for
+//! local-dev convenience but should also migrate in time.
+//!
+//! Classification key (search "open-store-audit" to find each site):
+//!   * READ-ONLY: only invokes read methods on the store.
+//!   * MUTATOR: invokes a store method that writes the DB AND the daemon
+//!     already exposes an equivalent RPC.
+//!   * MUTATOR-NO-RPC: invokes a store-write method with no existing
+//!     daemon RPC; needs a daemon-side handler before the call site can
+//!     migrate.
+//!   * MUTATOR-MIXED: sub-action match where some arms are read-only and
+//!     others mutate; migrate per-arm.
+//!
+//! Current migration state: `GrantAction::{Create,List,Revoke,Expire,Extend,Budget,Delegate}`,
+//! daemon-present `VaultAction::{List,Get,Add,Put,Export,Import,Remove,Lock,Unlock}`,
+//! installed-path `ReceiptAction::{List,Show,Export,Verify(id-mode)}`,
+//! installed-path `AuditAction::Query`,
+//! installed-path `ApprovalAction::{List,Approve,Deny,Narrow}`,
+//! installed-path `Commands::Status`,
+//! regular `SandboxAction::{Create,List,Stop,Delete,Exec}`, the daemon-owned
+//! sandbox/grant orchestration half of `SandboxAction::Run`, and the live-socket
+//! portions of plain `ember init` route through the daemon socket. The main
+//! remaining mixed operator surface is bootstrap-local init work plus the local
+//! prompt handoff in `SandboxAction::Run`.
+
 use std::fs;
 use std::io::{self, IsTerminal, Read};
 use std::path::Path;
@@ -7,22 +41,31 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
-use core_grant_types::{AccessGrant, Budget, GrantProposal, ResourceSelector, ResourceType, Statement, StatementProposal};
-use ember_daemon::trust::approval::ApprovalOutcome;
+use core_grant_types::{
+    AccessGrant, Budget, GrantProposal, ResourceSelector, ResourceType, Statement,
+    StatementProposal,
+};
 use ember_daemon::infra::audit::AuditFilter;
 use ember_daemon::infra::config::DaemonConfig;
 use ember_daemon::infra::image_registry::ImageRegistry;
-use ember_daemon::infra::runtime::{DaemonRuntime, DashboardBind, GitProxyBind, LlmProxyBind, StartupBinds};
-use ember_daemon::infra::sandbox::SandboxCreateOpts;
+use ember_daemon::infra::runtime::{
+    DaemonRuntime, DashboardBind, GitProxyBind, LlmProxyBind, StartupBinds,
+};
+use ember_daemon::infra::sandbox::{
+    SandboxCreateOpts, SandboxCreateResult, SandboxDeleteResult, SandboxInfo,
+    SandboxRunGrantDisposition, SandboxRunResult,
+};
 use ember_daemon::infra::store::DaemonStore;
 use ember_daemon::infra::vault::{
-    check_production_sentinel, is_cargo_test_binary, keyring_writes_suppressed,
-    migrate_mek_acl, resolve_keyring_account, resolve_keyring_service,
-    try_auto_unseal_from_keyring, validate_credential_name, verify_keyring_roundtrip,
-    AutoUnsealOutcome, Vault, DEFAULT_KEYRING_ACCOUNT, DEFAULT_KEYRING_SERVICE, VaultScope,};
+    AutoUnsealOutcome, DEFAULT_KEYRING_ACCOUNT, DEFAULT_KEYRING_SERVICE, Vault, VaultScope,
+    check_production_sentinel, is_cargo_test_binary, keyring_writes_suppressed, migrate_mek_acl,
+    resolve_keyring_account, resolve_keyring_service, try_auto_unseal_from_keyring,
+    validate_credential_name, verify_keyring_roundtrip,
+};
+use ember_daemon::trust::approval::ApprovalOutcome;
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
-use tracing_subscriber::EnvFilter;
 
 #[path = "daemon_agent.rs"]
 mod daemon_agent;
@@ -32,7 +75,7 @@ mod daemon_agent;
 ///
 /// Format: `ember <semver> (<git-sha-or-(no-git)>) built <rfc3339-utc>`.
 ///
-/// CLI-VERSION-FLAG: the implementation-note-79 root cause was a
+/// CLI-VERSION-FLAG: the implementation-note-101 root cause was a
 /// `v0.2.0` binary running against the `v0.2.17` codebase. Embedding the git
 /// SHA + build timestamp at compile time makes "is the running binary
 /// stale?" a five-second `--version` check.
@@ -142,6 +185,1371 @@ fn resolve_credential_input(
     Err(2)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VaultLockDispatch {
+    DaemonRpc,
+    LocalFallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VaultActionDispatch {
+    DaemonRpc,
+    LocalFallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GrantActionDispatch {
+    DaemonRpc,
+    LocalFallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SandboxActionDispatch {
+    DaemonRpc,
+    LocalFallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceiptActionDispatch {
+    DaemonRpc,
+    LocalFallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuditActionDispatch {
+    DaemonRpc,
+    LocalFallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalActionDispatch {
+    DaemonRpc,
+    LocalFallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusActionDispatch {
+    DaemonRpc,
+    LocalFallback,
+}
+
+struct VaultStoreResult {
+    dispatch: VaultActionDispatch,
+    id: String,
+    name: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GrantBudgetStatusView {
+    id: String,
+    persona_id: String,
+    status: String,
+    expires_at: Option<String>,
+    #[serde(default)]
+    statements: Vec<GrantBudgetStatusStatementView>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GrantBudgetStatusStatementView {
+    sid: String,
+    resource_type: String,
+    resource: ResourceSelector,
+    budget: Option<Budget>,
+    usage: core_grant_types::Usage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GrantCreateSpec {
+    persona: String,
+    credential: String,
+    scope: String,
+    ttl_secs: Option<u64>,
+    max_uses_per_hour: Option<u64>,
+    allowed_hours_start: Option<u32>,
+    allowed_hours_end: Option<u32>,
+    allowed_targets: Option<Vec<String>>,
+    max_delegation_depth: Option<u32>,
+    budget: Option<Budget>,
+    max_children_per_day: Option<u64>,
+    auto_delegate_scope_template: Option<String>,
+}
+
+impl GrantCreateSpec {
+    fn daemon_request(&self) -> serde_json::Value {
+        serde_json::json!({
+            "persona_id": self.persona,
+            "credential_name": self.credential,
+            "scope": self.scope,
+            "ttl_secs": self.ttl_secs,
+            "max_uses_per_hour": self.max_uses_per_hour,
+            "allowed_hours_start": self.allowed_hours_start,
+            "allowed_hours_end": self.allowed_hours_end,
+            "allowed_targets": self.allowed_targets,
+            "max_delegation_depth": self.max_delegation_depth,
+            "budget": self.budget,
+            "max_children_per_day": self.max_children_per_day,
+            "auto_delegate_scope_template": self.auto_delegate_scope_template,
+        })
+    }
+
+    fn allowed_targets_json_string(&self) -> Option<String> {
+        self.allowed_targets
+            .as_ref()
+            .map(|targets| serde_json::to_string(targets).unwrap_or_default())
+    }
+
+    fn allowed_targets_display(&self) -> Option<String> {
+        self.allowed_targets
+            .as_ref()
+            .map(|targets| targets.join(","))
+    }
+}
+
+fn print_created_grant(spec: &GrantCreateSpec, id: &str, expires_at: Option<&str>) {
+    println!("Created grant");
+    println!("  ID:         {id}");
+    println!("  Persona:    {}", spec.persona);
+    println!("  Credential: {}", spec.credential);
+    println!("  Scope:      {}", spec.scope);
+    if let Some(exp) = expires_at {
+        println!("  Expires:    {exp}");
+    } else {
+        println!("  Expires:    never");
+    }
+    if let Some(rl) = spec.max_uses_per_hour {
+        println!("  Rate limit: {rl}/hour");
+    }
+    if let Some(hs) = spec.allowed_hours_start {
+        println!(
+            "  Hours:      {hs}:00-{}:00 UTC",
+            spec.allowed_hours_end.unwrap_or(0)
+        );
+    }
+    if let Some(targets) = spec.allowed_targets_display() {
+        println!("  Targets:    {targets}");
+    }
+    if let Some(depth) = spec.max_delegation_depth {
+        println!("  Delegation: max depth {depth}");
+    }
+    if let Some(ref budget) = spec.budget {
+        if let Some(tokens) = budget.tokens {
+            println!("  Budget:     {} tokens", tokens);
+        }
+        if let Some(cents) = budget.cents {
+            println!("  Budget:     ${:.2}", cents as f64 / 100.0);
+        }
+        if let Some(requests) = budget.requests {
+            println!("  Budget:     {} requests", requests);
+        }
+        if let Some(seconds) = budget.wall_clock_secs {
+            println!("  Budget:     {}s wall-clock", seconds);
+        }
+    }
+    if let Some(limit) = spec.max_children_per_day {
+        println!("  Standing:   yes (max {limit}/day)");
+        if let Some(ref tpl) = spec.auto_delegate_scope_template {
+            println!("  Auto-scope: {tpl}");
+        }
+    }
+}
+
+/// Lock the live vault on the current authority surface.
+///
+/// When a daemon socket is present, `ember vault lock` must act on the daemon's
+/// in-process state rather than only this CLI process. The local fallback is
+/// retained only for CLI-only/dev paths where no daemon socket exists at all.
+fn run_vault_lock(config: &DaemonConfig) -> Result<VaultLockDispatch, core_types::ValidationError> {
+    let socket_path = config.socket_dir.join("daemon.sock");
+    if socket_path.exists() {
+        emberlink_cli::call_daemon_method(&socket_path, "vault_lock", &serde_json::Value::Null)?;
+        Ok(VaultLockDispatch::DaemonRpc)
+    } else {
+        ember_daemon::trust::presence::lock();
+        Ok(VaultLockDispatch::LocalFallback)
+    }
+}
+
+/// Re-open the live vault on the current authority surface.
+///
+/// On the installed daemon-backed path this exercises the explicit
+/// non-session reopen seam. The local fallback is retained only for
+/// CLI-only/dev paths where no daemon socket exists.
+fn run_vault_unlock(
+    config: &DaemonConfig,
+) -> Result<VaultLockDispatch, core_types::ValidationError> {
+    let socket_path = config.socket_dir.join("daemon.sock");
+    if socket_path.exists() {
+        emberlink_cli::call_daemon_method(&socket_path, "vault_unlock", &serde_json::Value::Null)?;
+        Ok(VaultLockDispatch::DaemonRpc)
+    } else {
+        let _ = Vault::open_from_config(config)
+            .map_err(|e| core_types::ValidationError::new(format!("vault open: {e}")))?;
+        Ok(VaultLockDispatch::LocalFallback)
+    }
+}
+
+/// List vault entries on the current authority surface.
+fn run_vault_list(
+    config: &DaemonConfig,
+    prefix: Option<&str>,
+) -> Result<(VaultActionDispatch, Vec<serde_json::Value>), core_types::ValidationError> {
+    let socket_path = config.socket_dir.join("daemon.sock");
+    if socket_path.exists() {
+        let result = emberlink_cli::call_daemon_method(
+            &socket_path,
+            "vault_list",
+            &serde_json::Value::Null,
+        )?;
+        let mut entries = result
+            .as_array()
+            .cloned()
+            .ok_or_else(|| core_types::ValidationError::new("daemon vault_list: expected array"))?;
+        if let Some(p) = prefix
+            && !p.is_empty()
+        {
+            entries.retain(|entry| {
+                entry
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(|name| name.starts_with(p))
+                    .unwrap_or(false)
+            });
+        }
+        Ok((VaultActionDispatch::DaemonRpc, entries))
+    } else {
+        let store = open_store(config);
+        let vault = Vault::open_from_config(config)
+            .map_err(|e| core_types::ValidationError::new(format!("vault open: {e}")))?;
+        let mut creds = vault
+            .list(VaultScope::Interactive, &store)
+            .map_err(|e| core_types::ValidationError::new(e.to_string()))?;
+        if let Some(p) = prefix
+            && !p.is_empty()
+        {
+            creds.retain(|c| c.name.starts_with(p));
+        }
+        let entries = creds
+            .iter()
+            .map(|c| serde_json::json!({"id": c.id, "name": c.name, "metadata": c.metadata}))
+            .collect();
+        Ok((VaultActionDispatch::LocalFallback, entries))
+    }
+}
+
+/// Remove a vault entry on the current authority surface.
+fn run_vault_remove(
+    config: &DaemonConfig,
+    name: &str,
+) -> Result<VaultActionDispatch, core_types::ValidationError> {
+    let socket_path = config.socket_dir.join("daemon.sock");
+    if socket_path.exists() {
+        emberlink_cli::call_daemon_method(
+            &socket_path,
+            "vault_remove",
+            &serde_json::json!({ "name": name }),
+        )?;
+        Ok(VaultActionDispatch::DaemonRpc)
+    } else {
+        let store = open_store(config);
+        let vault = Vault::open_from_config(config)
+            .map_err(|e| core_types::ValidationError::new(format!("vault open: {e}")))?;
+        vault
+            .remove(VaultScope::Interactive, &store, name)
+            .map_err(|e| core_types::ValidationError::new(e.to_string()))?;
+        Ok(VaultActionDispatch::LocalFallback)
+    }
+}
+
+/// Fetch a vault entry on the current authority surface.
+fn run_vault_get(
+    config: &DaemonConfig,
+    name: &str,
+) -> Result<(VaultActionDispatch, Vec<u8>), core_types::ValidationError> {
+    let socket_path = config.socket_dir.join("daemon.sock");
+    if socket_path.exists() {
+        let result = emberlink_cli::call_daemon_method(
+            &socket_path,
+            "vault_get",
+            &serde_json::json!({ "name": name }),
+        )?;
+        if let Some(bytes) = result.get("value_bytes").and_then(|v| v.as_array()) {
+            let mut out = Vec::with_capacity(bytes.len());
+            for item in bytes {
+                let byte = item.as_u64().ok_or_else(|| {
+                    core_types::ValidationError::new(
+                        "daemon vault_get: value_bytes must be an array of integers",
+                    )
+                })?;
+                let byte = u8::try_from(byte).map_err(|_| {
+                    core_types::ValidationError::new(
+                        "daemon vault_get: value_bytes entries must fit in u8",
+                    )
+                })?;
+                out.push(byte);
+            }
+            return Ok((VaultActionDispatch::DaemonRpc, out));
+        }
+
+        let value = result
+            .get("value")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| core_types::ValidationError::new("daemon vault_get: missing value"))?;
+        Ok((VaultActionDispatch::DaemonRpc, value.as_bytes().to_vec()))
+    } else {
+        let store = open_store(config);
+        let vault = Vault::open_from_config(config)
+            .map_err(|e| core_types::ValidationError::new(format!("vault open: {e}")))?;
+        let value = vault
+            .get(VaultScope::Interactive, &store, name)
+            .map_err(|e| core_types::ValidationError::new(e.to_string()))?;
+        Ok((VaultActionDispatch::LocalFallback, value))
+    }
+}
+
+/// Store a vault entry on the current authority surface.
+fn run_vault_store(
+    config: &DaemonConfig,
+    name: &str,
+    value: &[u8],
+    metadata: Option<&str>,
+) -> Result<VaultStoreResult, core_types::ValidationError> {
+    let socket_path = config.socket_dir.join("daemon.sock");
+    if socket_path.exists() {
+        let result = emberlink_cli::call_daemon_method(
+            &socket_path,
+            "vault_add",
+            &serde_json::json!({
+                "name": name,
+                "value_bytes": value,
+                "metadata": metadata,
+            }),
+        )?;
+        let id = result
+            .get("id")
+            .map(|v| match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })
+            .unwrap_or_default();
+        let stored_name = result
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or(name)
+            .to_string();
+        Ok(VaultStoreResult {
+            dispatch: VaultActionDispatch::DaemonRpc,
+            id,
+            name: stored_name,
+        })
+    } else {
+        let store = open_store(config);
+        let vault = Vault::open_from_config(config)
+            .map_err(|e| core_types::ValidationError::new(format!("vault open: {e}")))?;
+        let info = vault
+            .add(VaultScope::Interactive, &store, name, value, metadata)
+            .map_err(|e| core_types::ValidationError::new(e.to_string()))?;
+        Ok(VaultStoreResult {
+            dispatch: VaultActionDispatch::LocalFallback,
+            id: info.id.to_string(),
+            name: info.name,
+        })
+    }
+}
+
+/// Create a grant on the current authority surface.
+fn run_grant_create(
+    config: &DaemonConfig,
+    spec: &GrantCreateSpec,
+) -> Result<(GrantActionDispatch, serde_json::Value), core_types::ValidationError> {
+    let socket_path = config.socket_dir.join("daemon.sock");
+    if socket_path.exists() {
+        let result = emberlink_cli::call_daemon_method(
+            &socket_path,
+            "create_grant",
+            &spec.daemon_request(),
+        )?;
+        Ok((GrantActionDispatch::DaemonRpc, result))
+    } else {
+        let store = open_store(config);
+        let info = store
+            .create_grant_with_budget(
+                &spec.persona,
+                &spec.credential,
+                &spec.scope,
+                spec.ttl_secs,
+                spec.budget.clone(),
+            )
+            .map_err(|e| core_types::ValidationError::new(e.to_string()))?;
+
+        let targets_json = spec.allowed_targets_json_string();
+        if spec.max_uses_per_hour.is_some()
+            || spec.allowed_hours_start.is_some()
+            || targets_json.is_some()
+            || spec.max_delegation_depth.is_some()
+        {
+            store
+                .conn()
+                .execute(
+                    "UPDATE grants SET max_uses_per_hour=?1, allowed_hours_start=?2, allowed_hours_end=?3, allowed_targets=?4, max_delegation_depth=?5 WHERE id=?6",
+                    rusqlite::params![
+                        spec.max_uses_per_hour.map(|v| v as i64),
+                        spec.allowed_hours_start.map(|v| v as i64),
+                        spec.allowed_hours_end.map(|v| v as i64),
+                        targets_json,
+                        spec.max_delegation_depth.map(|v| v as i64),
+                        info.id,
+                    ],
+                )
+                .map_err(|e| core_types::ValidationError::new(e.to_string()))?;
+        }
+        if let Some(limit) = spec.max_children_per_day {
+            store
+                .mark_grant_standing(
+                    &info.id,
+                    limit,
+                    spec.auto_delegate_scope_template.as_deref(),
+                )
+                .map_err(|e| core_types::ValidationError::new(e.to_string()))?;
+        }
+
+        Ok((
+            GrantActionDispatch::LocalFallback,
+            serde_json::json!({
+                "id": info.id,
+                "persona_id": info.persona_id,
+                "credential_name": info.credential_name,
+                "scope": info.scope,
+                "expires_at": info.expires_at,
+                "budget": spec.budget.clone(),
+                "standing": spec.max_children_per_day.map(|limit| serde_json::json!({
+                    "max_children_per_day": limit,
+                    "auto_delegate_scope_template": spec.auto_delegate_scope_template.clone(),
+                })),
+                "conditions": {
+                    "max_uses_per_hour": spec.max_uses_per_hour,
+                    "allowed_hours": spec.allowed_hours_start.map(|start| format!(
+                        "{}:00-{}:00 UTC",
+                        start,
+                        spec.allowed_hours_end.unwrap_or(0)
+                    )),
+                    "allowed_targets": spec.allowed_targets.clone(),
+                    "max_delegation_depth": spec.max_delegation_depth,
+                    "max_children_per_day": spec.max_children_per_day,
+                }
+            }),
+        ))
+    }
+}
+
+/// List grants on the current authority surface.
+fn run_grant_list(
+    config: &DaemonConfig,
+    active_only: bool,
+) -> Result<(GrantActionDispatch, Vec<serde_json::Value>), core_types::ValidationError> {
+    let socket_path = config.socket_dir.join("daemon.sock");
+    if socket_path.exists() {
+        let result = emberlink_cli::call_daemon_method(
+            &socket_path,
+            "list_operator_grants",
+            &serde_json::json!({ "active_only": active_only }),
+        )?;
+        let list = result.as_array().cloned().ok_or_else(|| {
+            core_types::ValidationError::new("daemon list_operator_grants: expected array")
+        })?;
+        Ok((GrantActionDispatch::DaemonRpc, list))
+    } else {
+        let store = open_store(config);
+        let grants = if active_only {
+            store.list_active_grants()
+        } else {
+            store.list_grants()
+        }
+        .map_err(|e| core_types::ValidationError::new(e.to_string()))?;
+        let list = grants
+            .iter()
+            .map(|g| {
+                serde_json::json!({
+                    "id": g.id,
+                    "persona_id": g.persona_id,
+                    "credential_name": g.credential_name,
+                    "scope": g.scope,
+                    "status": g.status,
+                    "expires_at": g.expires_at,
+                })
+            })
+            .collect();
+        Ok((GrantActionDispatch::LocalFallback, list))
+    }
+}
+
+/// Delegate a grant on the current authority surface.
+fn run_grant_delegate(
+    config: &DaemonConfig,
+    parent_grant_id: &str,
+    child_persona_id: &str,
+    scope: &str,
+    ttl_secs: Option<u64>,
+    budget: Option<Budget>,
+) -> Result<(GrantActionDispatch, serde_json::Value), core_types::ValidationError> {
+    let socket_path = config.socket_dir.join("daemon.sock");
+    if socket_path.exists() {
+        let status = emberlink_cli::call_daemon_method(
+            &socket_path,
+            "grant_status",
+            &serde_json::json!({ "id": parent_grant_id }),
+        )?;
+        let caller_persona_id = status
+            .get("persona_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                core_types::ValidationError::new(
+                    "daemon grant_status: missing parent grant persona_id",
+                )
+            })?;
+        let request = serde_json::json!({
+            "parent_grant_id": parent_grant_id,
+            "child_persona_id": child_persona_id,
+            "scope": scope,
+            "ttl_secs": ttl_secs,
+            "budget": budget,
+            "caller_persona_id": caller_persona_id,
+        });
+        let result = emberlink_cli::call_daemon_method(&socket_path, "delegate_grant", &request)?;
+        Ok((GrantActionDispatch::DaemonRpc, result))
+    } else {
+        let store = open_store(config);
+        let info = store
+            .delegate_grant_full(parent_grant_id, child_persona_id, scope, ttl_secs, budget)
+            .map_err(|e| core_types::ValidationError::new(e.to_string()))?;
+        Ok((
+            GrantActionDispatch::LocalFallback,
+            serde_json::json!({
+                "id": info.id,
+                "parent": parent_grant_id,
+                "persona_id": info.persona_id,
+                "scope": info.scope,
+                "expires_at": info.expires_at,
+                "budget": info.budget,
+            }),
+        ))
+    }
+}
+
+/// Expire stale grants on the current authority surface.
+fn run_grant_expire(
+    config: &DaemonConfig,
+) -> Result<(GrantActionDispatch, u64), core_types::ValidationError> {
+    let socket_path = config.socket_dir.join("daemon.sock");
+    if socket_path.exists() {
+        let result = emberlink_cli::call_daemon_method(
+            &socket_path,
+            "expire_grants",
+            &serde_json::Value::Null,
+        )?;
+        let count = result
+            .get("expired_count")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| {
+                core_types::ValidationError::new("daemon expire_grants: missing expired_count")
+            })?;
+        Ok((GrantActionDispatch::DaemonRpc, count))
+    } else {
+        let store = open_store(config);
+        let count = store
+            .expire_stale_grants()
+            .map_err(|e| core_types::ValidationError::new(e.to_string()))?;
+        Ok((GrantActionDispatch::LocalFallback, count as u64))
+    }
+}
+
+/// Extend a grant on the current authority surface.
+fn run_grant_extend(
+    config: &DaemonConfig,
+    grant_id: &str,
+    add_tokens: Option<u64>,
+    add_cents: Option<u64>,
+    add_ttl_secs: Option<u64>,
+) -> Result<GrantActionDispatch, core_types::ValidationError> {
+    let socket_path = config.socket_dir.join("daemon.sock");
+    if socket_path.exists() {
+        emberlink_cli::call_daemon_method(
+            &socket_path,
+            "extend_grant",
+            &serde_json::json!({
+                "grant_id": grant_id,
+                "add_tokens": add_tokens,
+                "add_cents": add_cents,
+                "add_ttl_secs": add_ttl_secs,
+            }),
+        )?;
+        Ok(GrantActionDispatch::DaemonRpc)
+    } else {
+        let store = open_store(config);
+        store
+            .extend_grant(grant_id, add_tokens, add_cents, add_ttl_secs)
+            .map_err(|e| core_types::ValidationError::new(e.to_string()))?;
+        Ok(GrantActionDispatch::LocalFallback)
+    }
+}
+
+fn render_grant_budget_from_status(view: &GrantBudgetStatusView) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    let now = chrono::Utc::now();
+    let now_secs = now.timestamp().max(0) as u64;
+
+    let _ = writeln!(out, "Grant {}", view.id);
+    let _ = writeln!(out, "  Persona: {}", view.persona_id);
+    let _ = writeln!(out, "  Status:  {}", view.status);
+
+    match &view.expires_at {
+        Some(exp) => match chrono::DateTime::parse_from_rfc3339(exp) {
+            Ok(dt) => {
+                let remaining = dt.with_timezone(&chrono::Utc).timestamp() - now.timestamp();
+                if remaining > 0 {
+                    let _ = writeln!(out, "  TTL:     {}m remaining", remaining / 60);
+                } else {
+                    let _ = writeln!(out, "  TTL:     expired");
+                }
+            }
+            Err(_) => {
+                let _ = writeln!(out, "  TTL:     {exp}");
+            }
+        },
+        None => {
+            let _ = writeln!(out, "  TTL:     never");
+        }
+    }
+
+    let is_composite = view.statements.len() > 1;
+    for stmt in &view.statements {
+        if is_composite {
+            let _ = writeln!(
+                out,
+                "  Statement {}  {}  {}",
+                stmt.sid,
+                stmt.resource_type,
+                resource_selector_display(&stmt.resource),
+            );
+        }
+        let indent = if is_composite { "    " } else { "  " };
+
+        match &stmt.budget {
+            None => {
+                let _ = writeln!(out, "{indent}Budget:  (none)");
+            }
+            Some(b) => {
+                let _ = writeln!(out, "{indent}Budget:");
+                if let Some(cap) = b.tokens {
+                    let _ = writeln!(
+                        out,
+                        "  {}",
+                        fmt_budget_line("tokens:", stmt.usage.tokens, cap)
+                    );
+                }
+                if let Some(cap) = b.cents {
+                    let _ = writeln!(
+                        out,
+                        "  {}",
+                        fmt_budget_line("cents:", stmt.usage.cents, cap)
+                    );
+                }
+                if let Some(cap) = b.requests {
+                    let _ = writeln!(
+                        out,
+                        "  {}",
+                        fmt_budget_line("requests:", stmt.usage.requests, cap)
+                    );
+                }
+                if let Some(cap) = b.wall_clock_secs {
+                    let _ = writeln!(
+                        out,
+                        "  {}",
+                        fmt_budget_line("wall-clock:", stmt.usage.wall_clock_secs, cap)
+                    );
+                }
+
+                let last_updated = stmt.usage.last_updated;
+                let age_secs = if last_updated > 0 && now_secs >= last_updated {
+                    now_secs - last_updated
+                } else {
+                    u64::MAX
+                };
+                let stale = age_secs > 300 || last_updated == 0;
+
+                if !stale {
+                    let minutes_elapsed = (age_secs as f64 / 60.0).max(0.001);
+                    let _ = writeln!(out, "{indent}Runway:");
+                    if let Some(cap) = b.tokens {
+                        let used = stmt.usage.tokens;
+                        if used > 0 && cap > used {
+                            let remaining_min =
+                                (cap - used) as f64 / (used as f64 / minutes_elapsed);
+                            let _ = writeln!(
+                                out,
+                                "  {indent}  tokens:      ~{}m",
+                                remaining_min.round() as u64
+                            );
+                        } else {
+                            let _ = writeln!(out, "  {indent}  tokens:      —");
+                        }
+                    }
+                    if let Some(cap) = b.cents {
+                        let used = stmt.usage.cents;
+                        if used > 0 && cap > used {
+                            let remaining_min =
+                                (cap - used) as f64 / (used as f64 / minutes_elapsed);
+                            let _ = writeln!(
+                                out,
+                                "  {indent}  cents:       ~{}m",
+                                remaining_min.round() as u64
+                            );
+                        } else {
+                            let _ = writeln!(out, "  {indent}  cents:       —");
+                        }
+                    }
+                } else if !is_composite {
+                    let _ = writeln!(out, "{indent}Runway:  —");
+                }
+            }
+        }
+    }
+
+    out
+}
+
+fn run_grant_budget(
+    config: &DaemonConfig,
+    grant_id: &str,
+) -> Result<(GrantActionDispatch, String), core_types::ValidationError> {
+    let socket_path = config.socket_dir.join("daemon.sock");
+    if socket_path.exists() {
+        let result = emberlink_cli::call_daemon_method(
+            &socket_path,
+            "grant_status",
+            &serde_json::json!({ "id": grant_id }),
+        )?;
+        if result.get("kind").and_then(|v| v.as_str()) != Some("grant") {
+            return Err(core_types::ValidationError::new(
+                "daemon grant_status: expected a grant result",
+            ));
+        }
+        let view: GrantBudgetStatusView = serde_json::from_value(result)
+            .map_err(|e| core_types::ValidationError::new(format!("daemon grant_status: {e}")))?;
+        Ok((
+            GrantActionDispatch::DaemonRpc,
+            render_grant_budget_from_status(&view),
+        ))
+    } else {
+        let store = open_store(config);
+        let grant = store
+            .get_access_grant(grant_id)
+            .map_err(|e| core_types::ValidationError::new(e.to_string()))?;
+        Ok((
+            GrantActionDispatch::LocalFallback,
+            render_grant_budget(&grant),
+        ))
+    }
+}
+
+fn run_sandbox_create(
+    config: &DaemonConfig,
+    opts: &SandboxCreateOpts,
+) -> Result<(SandboxActionDispatch, SandboxCreateResult), core_types::ValidationError> {
+    let socket_path = config.socket_dir.join("daemon.sock");
+    if socket_path.exists() {
+        let params = serde_json::to_value(opts)
+            .map_err(|e| core_types::ValidationError::new(format!("sandbox_create params: {e}")))?;
+        let result = emberlink_cli::call_daemon_method(&socket_path, "sandbox_create", &params)?;
+        let created: SandboxCreateResult = serde_json::from_value(result)
+            .map_err(|e| core_types::ValidationError::new(format!("daemon sandbox_create: {e}")))?;
+        Ok((SandboxActionDispatch::DaemonRpc, created))
+    } else {
+        let store = open_store(config);
+        let sandbox = store
+            .create_sandbox_with_opts(opts, Some(&config.data_dir))
+            .map_err(|e| core_types::ValidationError::new(e.to_string()))?;
+        let (container_id, start_error) = match store.start_container(
+            &sandbox.id,
+            &config.socket_dir,
+            opts.network.as_deref(),
+            &opts.extra_env,
+        ) {
+            Ok(cid) => (Some(cid), None),
+            Err(e) => (None, Some(e.to_string())),
+        };
+        Ok((
+            SandboxActionDispatch::LocalFallback,
+            SandboxCreateResult {
+                sandbox,
+                container_id,
+                start_error,
+            },
+        ))
+    }
+}
+
+fn run_sandbox_list(
+    config: &DaemonConfig,
+) -> Result<(SandboxActionDispatch, Vec<SandboxInfo>), core_types::ValidationError> {
+    let socket_path = config.socket_dir.join("daemon.sock");
+    if socket_path.exists() {
+        let result = emberlink_cli::call_daemon_method(
+            &socket_path,
+            "sandbox_list",
+            &serde_json::Value::Null,
+        )?;
+        let sandboxes: Vec<SandboxInfo> = serde_json::from_value(result)
+            .map_err(|e| core_types::ValidationError::new(format!("daemon sandbox_list: {e}")))?;
+        Ok((SandboxActionDispatch::DaemonRpc, sandboxes))
+    } else {
+        let store = open_store(config);
+        let sandboxes = store
+            .list_sandboxes()
+            .map_err(|e| core_types::ValidationError::new(e.to_string()))?;
+        Ok((SandboxActionDispatch::LocalFallback, sandboxes))
+    }
+}
+
+fn run_sandbox_stop(
+    config: &DaemonConfig,
+    id_or_name: &str,
+) -> Result<(SandboxActionDispatch, String), core_types::ValidationError> {
+    let socket_path = config.socket_dir.join("daemon.sock");
+    if socket_path.exists() {
+        let result = emberlink_cli::call_daemon_method(
+            &socket_path,
+            "sandbox_stop",
+            &serde_json::json!({ "id_or_name": id_or_name }),
+        )?;
+        let resolved_id = result
+            .get("resolved_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                core_types::ValidationError::new("daemon sandbox_stop: missing resolved_id")
+            })?;
+        Ok((SandboxActionDispatch::DaemonRpc, resolved_id.to_string()))
+    } else {
+        let store = open_store(config);
+        let resolved_id = store
+            .resolve_sandbox_id(id_or_name)
+            .map_err(|e| core_types::ValidationError::new(e.to_string()))?;
+        store
+            .stop_sandbox(&resolved_id)
+            .map_err(|e| core_types::ValidationError::new(e.to_string()))?;
+        Ok((SandboxActionDispatch::LocalFallback, resolved_id))
+    }
+}
+
+fn run_sandbox_delete(
+    config: &DaemonConfig,
+    id_or_name: &str,
+) -> Result<(SandboxActionDispatch, SandboxDeleteResult), core_types::ValidationError> {
+    let socket_path = config.socket_dir.join("daemon.sock");
+    if socket_path.exists() {
+        let result = emberlink_cli::call_daemon_method(
+            &socket_path,
+            "sandbox_delete",
+            &serde_json::json!({ "id_or_name": id_or_name }),
+        )?;
+        let deleted: SandboxDeleteResult = serde_json::from_value(result)
+            .map_err(|e| core_types::ValidationError::new(format!("daemon sandbox_delete: {e}")))?;
+        Ok((SandboxActionDispatch::DaemonRpc, deleted))
+    } else {
+        let deleted = run_sandbox_delete_local(&open_store(config), id_or_name)?;
+        Ok((SandboxActionDispatch::LocalFallback, deleted))
+    }
+}
+
+fn run_sandbox_exec(
+    config: &DaemonConfig,
+    id_or_name: &str,
+    caller_persona_id: Option<String>,
+    command: &[String],
+) -> Result<(SandboxActionDispatch, String), core_types::ValidationError> {
+    let socket_path = config.socket_dir.join("daemon.sock");
+    if socket_path.exists() {
+        let mut params = serde_json::json!({
+            "id_or_name": id_or_name,
+            "command": command,
+        });
+        if let Some(caller) = caller_persona_id.clone() {
+            params["caller_persona_id"] = serde_json::json!(caller);
+        }
+        let result = emberlink_cli::call_daemon_method(&socket_path, "sandbox_exec", &params)?;
+        let output = result
+            .get("output")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                core_types::ValidationError::new("daemon sandbox_exec: missing output")
+            })?;
+        Ok((SandboxActionDispatch::DaemonRpc, output.to_string()))
+    } else {
+        let store = open_store(config);
+        let resolved_id = store
+            .resolve_sandbox_id(id_or_name)
+            .map_err(|e| core_types::ValidationError::new(e.to_string()))?;
+        let caller_persona = caller_persona_id.unwrap_or_default();
+        let refs: Vec<&str> = command.iter().map(String::as_str).collect();
+        let output = store
+            .exec_sandbox(&resolved_id, &refs, &caller_persona)
+            .map_err(|e| core_types::ValidationError::new(e.to_string()))?;
+        Ok((SandboxActionDispatch::LocalFallback, output))
+    }
+}
+
+fn run_sandbox_run(
+    config: &DaemonConfig,
+    opts: &SandboxCreateOpts,
+    statements: &[StatementProposal],
+    ttl_secs: Option<u64>,
+    credential_resource: Option<&str>,
+) -> Result<(SandboxActionDispatch, SandboxRunResult), core_types::ValidationError> {
+    let socket_path = config.socket_dir.join("daemon.sock");
+    if socket_path.exists() {
+        let result = emberlink_cli::call_daemon_method(
+            &socket_path,
+            "sandbox_run",
+            &serde_json::json!({
+                "sandbox": opts,
+                "statements": statements,
+                "ttl_secs": ttl_secs,
+                "credential_resource": credential_resource,
+            }),
+        )?;
+        let prepared: SandboxRunResult = serde_json::from_value(result)
+            .map_err(|e| core_types::ValidationError::new(format!("daemon sandbox_run: {e}")))?;
+        Ok((SandboxActionDispatch::DaemonRpc, prepared))
+    } else {
+        let store = open_store(config);
+        let sandbox = store
+            .create_sandbox_with_opts(opts, Some(&config.data_dir))
+            .map_err(|e| core_types::ValidationError::new(e.to_string()))?;
+        let (container_id, start_error) =
+            match store.start_container(&sandbox.id, &config.socket_dir, None, &opts.extra_env) {
+                Ok(cid) => (Some(cid), None),
+                Err(e) => (None, Some(e.to_string())),
+            };
+
+        let grant = if statements.is_empty() {
+            SandboxRunGrantDisposition::NotRequested
+        } else {
+            let policy_engine = if config.policy_file.exists() {
+                ember_daemon::trust::policy::PolicyEngine::from_file(&config.policy_file)
+                    .unwrap_or_default()
+            } else {
+                ember_daemon::trust::policy::PolicyEngine::default()
+            };
+            let policy_action = "credential.access".to_string();
+            let eval = policy_engine.evaluate(&policy_action);
+            let risk_str = format!("{:?}", eval.risk).to_lowercase();
+            let grant_proposal = GrantProposal {
+                persona_id: sandbox.persona_id.clone(),
+                statements: statements.to_vec(),
+                expires_at: ttl_secs,
+                label: None,
+                skill_ref: None,
+                note: None,
+            };
+
+            match eval.requirement {
+                ember_daemon::trust::policy::ApprovalRequirement::Denied => {
+                    let credential_res = credential_resource.unwrap_or("");
+                    return Err(core_types::ValidationError::new(format!(
+                        "policy denied composite grant mint for {credential_res} (rule: {})",
+                        eval.matched_rule.as_deref().unwrap_or("(default)")
+                    )));
+                }
+                ember_daemon::trust::policy::ApprovalRequirement::Required => {
+                    match store.propose_grant_typed(&grant_proposal, &policy_action, &risk_str) {
+                        Ok(req) => SandboxRunGrantDisposition::PendingApproval {
+                            approval_id: req.id,
+                        },
+                        Err(e) => SandboxRunGrantDisposition::Failed {
+                            message: format!("submitting approval failed: {e}"),
+                        },
+                    }
+                }
+                ember_daemon::trust::policy::ApprovalRequirement::Auto => {
+                    match store.propose_grant_typed(&grant_proposal, &policy_action, &risk_str) {
+                        Ok(req) => match store.auto_resolve(&req.id) {
+                            Ok(()) => {
+                                let grant_id = store
+                                    .get_approval(&req.id)
+                                    .ok()
+                                    .and_then(|r| r.result_grant_id);
+                                SandboxRunGrantDisposition::Minted { grant_id }
+                            }
+                            Err(e) => SandboxRunGrantDisposition::Failed {
+                                message: format!("auto-resolve failed: {e}"),
+                            },
+                        },
+                        Err(e) => SandboxRunGrantDisposition::Failed {
+                            message: format!("submitting approval failed: {e}"),
+                        },
+                    }
+                }
+            }
+        };
+
+        Ok((
+            SandboxActionDispatch::LocalFallback,
+            SandboxRunResult {
+                sandbox,
+                container_id,
+                start_error,
+                grant,
+            },
+        ))
+    }
+}
+
+/// List receipts on the current authority surface.
+fn run_receipt_list(
+    config: &DaemonConfig,
+    persona: Option<&str>,
+) -> Result<
+    (
+        ReceiptActionDispatch,
+        Vec<core_grant_types::grant_receipt::GrantReceipt>,
+    ),
+    core_types::ValidationError,
+> {
+    let socket_path = config.socket_dir.join("daemon.sock");
+    if socket_path.exists() {
+        let result = emberlink_cli::call_daemon_method(
+            &socket_path,
+            "list_receipts",
+            &serde_json::json!({ "persona_id": persona }),
+        )?;
+        let receipts = serde_json::from_value(result)
+            .map_err(|e| core_types::ValidationError::new(format!("daemon list_receipts: {e}")))?;
+        Ok((ReceiptActionDispatch::DaemonRpc, receipts))
+    } else {
+        let store = open_store(config);
+        let receipts = store
+            .list_receipts(persona)
+            .map_err(|e| core_types::ValidationError::new(e.to_string()))?;
+        Ok((ReceiptActionDispatch::LocalFallback, receipts))
+    }
+}
+
+/// Fetch a receipt on the current authority surface.
+///
+/// The installed daemon path preserves the existing CLI contract: callers may
+/// supply either a receipt id or a grant id, and the daemon resolves terminal
+/// grants to their receipt rows.
+fn run_receipt_get(
+    config: &DaemonConfig,
+    id: &str,
+) -> Result<
+    (
+        ReceiptActionDispatch,
+        core_grant_types::grant_receipt::GrantReceipt,
+    ),
+    core_types::ValidationError,
+> {
+    let socket_path = config.socket_dir.join("daemon.sock");
+    if socket_path.exists() {
+        let result = emberlink_cli::call_daemon_method(
+            &socket_path,
+            "get_receipt",
+            &serde_json::json!({ "id": id }),
+        )?;
+        let receipt = serde_json::from_value(result)
+            .map_err(|e| core_types::ValidationError::new(format!("daemon get_receipt: {e}")))?;
+        Ok((ReceiptActionDispatch::DaemonRpc, receipt))
+    } else {
+        let store = open_store(config);
+        let receipt = resolve_receipt(&store, id).map_err(core_types::ValidationError::new)?;
+        Ok((ReceiptActionDispatch::LocalFallback, receipt))
+    }
+}
+
+/// Build the receipt tree export on the current authority surface.
+///
+/// Installed-path tree assembly now belongs to the daemon; the CLI keeps
+/// only the ASCII rendering and optional export-file write.
+fn run_receipt_tree(
+    config: &DaemonConfig,
+    grant_id: &str,
+) -> Result<(ReceiptActionDispatch, emberlink_cli::receipt::TreeExport), core_types::ValidationError>
+{
+    let socket_path = config.socket_dir.join("daemon.sock");
+    if socket_path.exists() {
+        let result = emberlink_cli::call_daemon_method(
+            &socket_path,
+            "receipt_tree",
+            &serde_json::json!({ "grant_id": grant_id }),
+        )?;
+        let tree = serde_json::from_value(result)
+            .map_err(|e| core_types::ValidationError::new(format!("daemon receipt_tree: {e}")))?;
+        Ok((ReceiptActionDispatch::DaemonRpc, tree))
+    } else {
+        let store = open_store(config);
+        let tree = emberlink_cli::receipt::build_tree(&store, &config.data_dir, grant_id)
+            .map_err(|e| core_types::ValidationError::new(e.to_string()))?;
+        Ok((ReceiptActionDispatch::LocalFallback, tree))
+    }
+}
+
+/// Query receipt-backed audit rows on the current authority surface.
+fn run_audit_receipt_query(
+    config: &DaemonConfig,
+    filter: &ember_daemon::infra::receipt::ReceiptFilter,
+) -> Result<
+    (
+        AuditActionDispatch,
+        Vec<ember_daemon::infra::receipt::ReceiptRow>,
+    ),
+    core_types::ValidationError,
+> {
+    let socket_path = config.socket_dir.join("daemon.sock");
+    if socket_path.exists() {
+        let result = emberlink_cli::call_daemon_method(
+            &socket_path,
+            "receipt_query",
+            &serde_json::json!({
+                "actor": filter.persona_id,
+                "kind": filter.kind,
+                "grant_id": filter.grant_id,
+                "resource": filter.resource,
+                "since": filter.since_iso,
+                "limit": filter.limit,
+            }),
+        )?;
+        let rows = serde_json::from_value(result)
+            .map_err(|e| core_types::ValidationError::new(format!("daemon receipt_query: {e}")))?;
+        Ok((AuditActionDispatch::DaemonRpc, rows))
+    } else {
+        let store = open_store(config);
+        let rows = store
+            .list_receipt_rows(filter)
+            .map_err(|e| core_types::ValidationError::new(e.to_string()))?;
+        Ok((AuditActionDispatch::LocalFallback, rows))
+    }
+}
+
+/// Query raw audit-log rows on the current authority surface.
+///
+/// The installed daemon path uses the operator-only `audit_log_query`
+/// seam so raw `details` stay off the broader ConnectOnly summary surface
+/// exposed by `audit_query`.
+fn run_audit_log_query(
+    config: &DaemonConfig,
+    filter: &ember_daemon::infra::audit::AuditFilter,
+) -> Result<
+    (
+        AuditActionDispatch,
+        Vec<ember_daemon::infra::audit::AuditEntry>,
+    ),
+    core_types::ValidationError,
+> {
+    let socket_path = config.socket_dir.join("daemon.sock");
+    if socket_path.exists() {
+        let result = emberlink_cli::call_daemon_method(
+            &socket_path,
+            "audit_log_query",
+            &serde_json::json!({
+                "id": filter.id,
+                "agent_id": filter.agent_id,
+                "action": filter.action,
+                "limit": filter.limit,
+                "action_prefix": filter.action_prefix,
+                "persona_id": filter.persona_id,
+                "scope": filter.scope,
+                "since_ms": filter.since_ms,
+                "before_ms": filter.before_ms,
+            }),
+        )?;
+        let rows = serde_json::from_value(result).map_err(|e| {
+            core_types::ValidationError::new(format!("daemon audit_log_query: {e}"))
+        })?;
+        Ok((AuditActionDispatch::DaemonRpc, rows))
+    } else {
+        let store = open_store(config);
+        let rows = store
+            .query_audit(filter)
+            .map_err(|e| core_types::ValidationError::new(e.to_string()))?;
+        Ok((AuditActionDispatch::LocalFallback, rows))
+    }
+}
+
+/// Load the daemon-owned current-state explanation for one audit event.
+///
+/// The installed daemon path owns both the raw event lookup and the current
+/// grant/policy projections. The no-daemon fallback reuses the same shared
+/// builder so the CLI keeps one explanation shape.
+fn run_audit_explain(
+    config: &DaemonConfig,
+    id: i64,
+) -> Result<
+    (
+        AuditActionDispatch,
+        ember_daemon::infra::audit_explain::AuditExplainView,
+    ),
+    core_types::ValidationError,
+> {
+    let socket_path = config.socket_dir.join("daemon.sock");
+    if socket_path.exists() {
+        let result = emberlink_cli::call_daemon_method(
+            &socket_path,
+            "audit_explain",
+            &serde_json::json!({ "id": id }),
+        )?;
+        let explain = serde_json::from_value(result)
+            .map_err(|e| core_types::ValidationError::new(format!("daemon audit_explain: {e}")))?;
+        Ok((AuditActionDispatch::DaemonRpc, explain))
+    } else {
+        let store = open_store(config);
+        let policy = if config.policy_file.exists() {
+            ember_daemon::trust::policy::PolicyEngine::from_file(&config.policy_file)
+                .unwrap_or_default()
+        } else {
+            ember_daemon::trust::policy::PolicyEngine::default()
+        };
+        let explain = ember_daemon::infra::audit_explain::build_audit_explain(&store, &policy, id)
+            .map_err(|e| core_types::ValidationError::new(e.to_string()))?;
+        Ok((AuditActionDispatch::LocalFallback, explain))
+    }
+}
+
+/// List pending approvals on the current authority surface.
+fn run_approval_list(
+    config: &DaemonConfig,
+) -> Result<
+    (
+        ApprovalActionDispatch,
+        Vec<ember_daemon::trust::approval::ApprovalRequestInfo>,
+    ),
+    core_types::ValidationError,
+> {
+    let socket_path = config.socket_dir.join("daemon.sock");
+    if socket_path.exists() {
+        let result = emberlink_cli::call_daemon_method(
+            &socket_path,
+            "list_pending_approvals",
+            &serde_json::Value::Null,
+        )?;
+        let requests = serde_json::from_value(result).map_err(|e| {
+            core_types::ValidationError::new(format!("daemon list_pending_approvals: {e}"))
+        })?;
+        Ok((ApprovalActionDispatch::DaemonRpc, requests))
+    } else {
+        let store = open_store(config);
+        let requests = store
+            .list_pending_approvals()
+            .map_err(|e| core_types::ValidationError::new(e.to_string()))?;
+        Ok((ApprovalActionDispatch::LocalFallback, requests))
+    }
+}
+
+/// Resolve an approval on the current authority surface.
+fn run_approval_resolve(
+    config: &DaemonConfig,
+    id: &str,
+    outcome: &ApprovalOutcome,
+) -> Result<
+    (
+        ApprovalActionDispatch,
+        ember_daemon::trust::approval::ApprovalRequestInfo,
+    ),
+    core_types::ValidationError,
+> {
+    let socket_path = config.socket_dir.join("daemon.sock");
+    if socket_path.exists() {
+        let params = match outcome {
+            ApprovalOutcome::Approved => {
+                serde_json::json!({ "id": id, "decision": "approve" })
+            }
+            ApprovalOutcome::Denied { reason } => {
+                serde_json::json!({ "id": id, "decision": "deny", "reason": reason })
+            }
+            ApprovalOutcome::Narrowed { new_scope } => serde_json::json!({
+                "id": id,
+                "decision": "narrow",
+                "scope": new_scope,
+            }),
+            ApprovalOutcome::Always { scope, expires_at } => serde_json::json!({
+                "id": id,
+                "decision": "always",
+                "scope": scope,
+                "expires_at": expires_at,
+            }),
+        };
+        let result = emberlink_cli::call_daemon_method(&socket_path, "resolve_approval", &params)?;
+        let resolved = serde_json::from_value(result).map_err(|e| {
+            core_types::ValidationError::new(format!("daemon resolve_approval: {e}"))
+        })?;
+        Ok((ApprovalActionDispatch::DaemonRpc, resolved))
+    } else {
+        let store = open_store(config);
+        store
+            .resolve_approval(id, outcome)
+            .map_err(|e| core_types::ValidationError::new(e.to_string()))?;
+        let resolved = store
+            .get_approval(id)
+            .map_err(|e| core_types::ValidationError::new(e.to_string()))?;
+        Ok((ApprovalActionDispatch::LocalFallback, resolved))
+    }
+}
+
+/// Load the daemon-owned status aggregate on the current authority surface.
+///
+/// When the daemon is running, prefer its read surface so installed-path
+/// operators do not need direct SQLite access. When the daemon is absent, keep
+/// the historical local fallback for dev/no-daemon paths.
+fn run_status_summary(
+    config: &DaemonConfig,
+    daemon_running: bool,
+) -> Result<
+    (
+        StatusActionDispatch,
+        ember_daemon::infra::status::StatusSummary,
+    ),
+    core_types::ValidationError,
+> {
+    let socket_path = config.socket_dir.join("daemon.sock");
+    if daemon_running && socket_path.exists() {
+        let result =
+            emberlink_cli::call_daemon_method(&socket_path, "status", &serde_json::Value::Null)?;
+        let summary = serde_json::from_value(result)
+            .map_err(|e| core_types::ValidationError::new(format!("daemon status: {e}")))?;
+        Ok((StatusActionDispatch::DaemonRpc, summary))
+    } else {
+        let store = open_store(config);
+        let summary = ember_daemon::infra::status::StatusSummary {
+            personas: store
+                .list_personas()
+                .map_err(|e| core_types::ValidationError::new(e.to_string()))?,
+            grants: store
+                .list_active_grants()
+                .map_err(|e| core_types::ValidationError::new(e.to_string()))?,
+            sandboxes: store
+                .list_sandboxes()
+                .map_err(|e| core_types::ValidationError::new(e.to_string()))?,
+            approvals: store
+                .list_pending_approvals()
+                .map_err(|e| core_types::ValidationError::new(e.to_string()))?,
+            recent_activity: store
+                .query_audit(&AuditFilter {
+                    limit: Some(5),
+                    ..Default::default()
+                })
+                .map_err(|e| core_types::ValidationError::new(e.to_string()))?,
+            standing_grants: store
+                .list_standing_grants()
+                .map_err(|e| core_types::ValidationError::new(e.to_string()))?
+                .len(),
+            audit_events_total: store
+                .audit_count()
+                .map_err(|e| core_types::ValidationError::new(e.to_string()))?,
+        };
+        Ok((StatusActionDispatch::LocalFallback, summary))
+    }
+}
+
 /// Resolve the operator's age recipient public key for `ember vault export`.
 ///
 /// Search order:
@@ -208,13 +1616,15 @@ fn resolve_identity_key(explicit: Option<&Path>) -> Result<String, String> {
 /// Returns `Err(exit_code)` if any step failed; the caller exits the
 /// process with that code.
 fn run_vault_export(
-    vault: &Vault,
-    store: &DaemonStore,
+    config: &DaemonConfig,
     json_global: bool,
     args: VaultExportArgs,
 ) -> Result<(), i32> {
     if args.format != "json" {
-        eprintln!("error: unsupported --format {} (only `json` is supported)", args.format);
+        eprintln!(
+            "error: unsupported --format {} (only `json` is supported)",
+            args.format
+        );
         return Err(2);
     }
     let recipient = match resolve_recipient_key(args.recipient_key.as_deref()) {
@@ -224,17 +1634,24 @@ fn run_vault_export(
             return Err(1);
         }
     };
-    let creds = vault.list(VaultScope::Interactive, store).map_err(|e| {
+    let (_, entries) = run_vault_list(config, None).map_err(|e| {
         eprintln!("error: {e}");
         1
     })?;
-    let mut pairs: Vec<(String, Vec<u8>)> = Vec::with_capacity(creds.len());
-    for c in &creds {
-        let value = vault.get(VaultScope::Interactive, store, &c.name).map_err(|e| {
-            eprintln!("error: failed to read {}: {e}", c.name);
+    let mut pairs: Vec<(String, Vec<u8>)> = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        let name = match entry.get("name").and_then(|v| v.as_str()) {
+            Some(name) => name,
+            None => {
+                eprintln!("error: daemon/local vault list returned an entry without a string name");
+                return Err(1);
+            }
+        };
+        let (_, value) = run_vault_get(config, name).map_err(|e| {
+            eprintln!("error: failed to read {name}: {e}");
             1
         })?;
-        pairs.push((c.name.clone(), value));
+        pairs.push((name.to_string(), value));
     }
     let envelope = emberlink_cli::vault_io::encode_export_envelope(
         &recipient,
@@ -259,19 +1676,14 @@ fn run_vault_export(
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if let Err(e) =
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            {
-                eprintln!(
-                    "warn: failed to set 0600 on {}: {e}",
-                    path.display()
-                );
+            if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+                eprintln!("warn: failed to set 0600 on {}: {e}", path.display());
             }
         }
         if !json_global {
             eprintln!(
                 "Exported {} credential(s) to {} (recipient {recipient}).",
-                creds.len(),
+                entries.len(),
                 path.display()
             );
         }
@@ -284,13 +1696,12 @@ fn run_vault_export(
 /// Drive the `ember vault import` flow: read the JSON envelope, decrypt
 /// every entry first (so any failure aborts before any write), then `put`
 /// each restored entry back into the vault.
-fn run_vault_import(
-    vault: &Vault,
-    store: &DaemonStore,
-    args: VaultImportArgs,
-) -> Result<(), i32> {
+fn run_vault_import(config: &DaemonConfig, args: VaultImportArgs) -> Result<(), i32> {
     if args.format != "json" {
-        eprintln!("error: unsupported --format {} (only `json` is supported)", args.format);
+        eprintln!(
+            "error: unsupported --format {} (only `json` is supported)",
+            args.format
+        );
         return Err(2);
     }
     let identity = match resolve_identity_key(args.identity_key.as_deref()) {
@@ -304,31 +1715,34 @@ fn run_vault_import(
         eprintln!("error: failed to read {}: {e}", args.from.display());
         1
     })?;
-    let envelope: emberlink_cli::vault_io::VaultExportEnvelope =
-        serde_json::from_str(&raw).map_err(|e| {
+    let envelope: emberlink_cli::vault_io::VaultExportEnvelope = serde_json::from_str(&raw)
+        .map_err(|e| {
             eprintln!("error: invalid JSON in {}: {e}", args.from.display());
             2
         })?;
     // Atomic decrypt — collect plaintext for every entry first; abort
     // before any vault write if any decryption fails.
-    let decrypted = emberlink_cli::vault_io::decode_import_envelope(&identity, &envelope)
-        .map_err(|e| {
+    let decrypted =
+        emberlink_cli::vault_io::decode_import_envelope(&identity, &envelope).map_err(|e| {
             eprintln!("error: {e}");
             1
         })?;
     // Every entry decrypted cleanly — commit them.
     let count = decrypted.len();
     for (name, value) in decrypted {
-        vault.add(VaultScope::Interactive, store, &name, &value, None).map_err(|e| {
+        run_vault_store(config, &name, &value, None).map_err(|e| {
             eprintln!("error: failed to put {name}: {e}");
             1
         })?;
     }
-    eprintln!("Imported {count} credential(s) from {}.", args.from.display());
+    eprintln!(
+        "Imported {count} credential(s) from {}.",
+        args.from.display()
+    );
     Ok(())
 }
 
-/// Per implementation-note-270: refuse `ember vault add --value <secret>`
+/// Per implementation-note-386: refuse `ember vault add --value <secret>`
 /// argv form because it leaks the secret to shell history, `ps auxww`, and
 /// transcript-capturing harnesses. Centralized so future credential-input
 /// CLI surfaces can call it.
@@ -383,7 +1797,7 @@ enum Commands {
         /// notice and falls back to the passphrase lane.
         #[arg(long)]
         touch_id: bool,
-        /// One-command cohort A onboarding (implementation-note-271).
+        /// One-command cohort A onboarding (implementation-note-387).
         ///
         /// Currently the only accepted value is `claude-code`. When set,
         /// the standard daemon init runs first; then the cohort A
@@ -402,7 +1816,7 @@ enum Commands {
     },
     /// Uninstall ember integrations.
     ///
-    /// Currently supports `--for claude-code` (implementation-note-271),
+    /// Currently supports `--for claude-code` (implementation-note-387),
     /// which removes only the lines `init --for claude-code` added to
     /// `~/.claude/settings.json`. Persona, grant, and vault entries are
     /// left in place — they may be in use by other tools.
@@ -410,6 +1824,22 @@ enum Commands {
         /// Integration target to uninstall. Currently only `claude-code`.
         #[arg(long = "for", value_name = "TARGET")]
         for_target: String,
+    },
+    /// Boot a container-mode session (implementation-note-388 scaffold).
+    Up {
+        /// Profile name selecting the compose service set (`dev` /
+        /// `headless` / `demo`).
+        #[arg(long, value_name = "NAME")]
+        profile: Option<String>,
+    },
+    /// Tear down a container-mode session (implementation-note-388 scaffold).
+    Down {
+        /// Eager-revoke this session's grants instead of letting them expire at TTL.
+        #[arg(long = "revoke-grants")]
+        revoke_grants: bool,
+        /// Remove named compose volumes after teardown.
+        #[arg(long)]
+        purge: bool,
     },
     /// Manage the ember daemon
     Daemon {
@@ -483,7 +1913,7 @@ enum Commands {
         #[command(subcommand)]
         action: emberlink_cli::broker::BrokerCmd,
     },
-    /// Manage daemon-controlled credential bindings (implementation-note-112).
+    /// Manage daemon-controlled credential bindings (implementation-note-150).
     ///
     /// A binding ties `(persona, working-tree, remote)` to a remote URL
     /// the broker is authorized to inject credentials for. This is the
@@ -509,21 +1939,37 @@ enum Commands {
     Status,
     /// Show ember version
     Version,
-    /// Cluster snapshot management (implementation-note-125)
+    /// Cluster snapshot management (implementation-note-174)
     Cluster {
         #[command(subcommand)]
         action: ClusterAction,
     },
-    /// Launch Claude Code with an ember-managed grant + scoped HTTPS_PROXY (implementation-note-272)
+    /// Launch Claude Code with ember-managed env + PATH wiring (design Phase 4).
     ///
-    /// Per design §2 / #2318 (LAUNCHER-SESSION-RPC): resolves the cohort-A
-    /// persona (`$EMBER_PERSONA` or `claude-code-{hostname}`), registers a
-    /// session with the daemon via live Unix-socket RPC, injects
-    /// EMBER_GRANT_ID / EMBER_PROXY_URL / HTTPS_PROXY into the child env,
-    /// spawns `claude` (or `$EMBER_CLAUDE_BIN`), and closes the session
-    /// on exit.
-    #[command(name = "claude-code", trailing_var_arg = true, allow_hyphen_values = true)]
+    /// Selects daemon flavor via `--dev` or `--prod` (default: `--prod`).
+    /// Prepends the correct shadow PATH, injects EMBER_DAEMON_SOCKET /
+    /// EMBER_SESSION_ID / EMBER_STRICT_BROKER / EMBER_DAEMON_FLAVOR into the
+    /// child env, verifies daemon reachability, then exec-replaces this process
+    /// with `claude` (or `$EMBER_CLAUDE_BIN`).
+    ///
+    /// Legacy cohort-A session-RPC behavior (implementation-note-389 / design §2) is
+    /// preserved when neither `--dev` nor `--prod` alter the selected daemon;
+    /// the new flavor flags are design Phase 4 additions.
+    #[command(
+        name = "claude-code",
+        trailing_var_arg = true,
+        allow_hyphen_values = true
+    )]
     ClaudeCode {
+        /// Use the dev daemon flavor (~/.ember/run/daemon.dev.sock).
+        /// Mutually exclusive with --prod.
+        #[arg(long, conflicts_with = "prod")]
+        dev: bool,
+        /// Use the prod daemon flavor (~/.ember/run/daemon.sock). Default when
+        /// neither --dev nor --prod is given.
+        /// Mutually exclusive with --dev.
+        #[arg(long, conflicts_with = "dev")]
+        prod: bool,
         /// Trailing arguments forwarded verbatim to `claude`.
         #[arg(value_name = "CLAUDE_ARGS")]
         args: Vec<String>,
@@ -531,11 +1977,11 @@ enum Commands {
     /// Demo subcommands — canned flows for friendly-dev onboarding and
     /// the May-3 composite-grant recording.
     ///
-    /// `wedge`  — 60-second canned fallback (implementation-note-273,
+    /// `wedge`  — 60-second canned fallback (implementation-note-390,
     ///            design §8). Spins up an isolated daemon + seeded vault
     ///            + MCP server via `qember.sh demo up`.
     /// `bundle` — submit the locked May-3 4-statement composite-grant
-    ///            approval (implementation-note-274). In-process
+    ///            approval (implementation-note-391). In-process
     ///            store call; no socket round-trip.
     Demo {
         #[command(subcommand)]
@@ -575,7 +2021,7 @@ enum Commands {
     },
     /// Manage headless (attested-device) enrollments — variable
     /// duration credential delegation for headless / scheduled jobs
-    /// (implementation-note-275, design).
+    /// (implementation-note-392, design).
     ///
     /// `ember headless enroll [--duration <4h|3d|1w>] [--persona <id>]
     ///                        [--yes]`
@@ -591,7 +2037,7 @@ enum Commands {
         action: HeadlessAction,
     },
     /// Manage the ember KMS edge CA and peer enrollment lifecycle
-    /// (design Amendment 1 v3, implementation-note-257).
+    /// (design Amendment 1 v3, implementation-note-362).
     ///
     /// `ember kms init-edge`
     ///   Generate the self-signed edge CA and persist the seed at
@@ -619,9 +2065,9 @@ enum Commands {
     ///
     /// `ember orchestrator spawn [--max-depth N] [--template T] [--brief TEXT]`
     ///   Mint an orchestrator-class Persona, acquire the single-orchestrator
-    ///   flock guard at `~/.ember/orchestrator.lock`, and launch `ember-scion
-    ///   start`. Only host-side callers may reach this verb; in-container
-    ///   callers are refused at the broker boundary.
+    ///   flock guard at `/tmp/ember-orchestrator-<uid>.lock`, and launch
+    ///   `ember-scion start`. Only host-side callers may reach this verb;
+    ///   in-container callers are refused at the broker boundary.
     ///
     /// `ember orchestrator status [--verbose]`
     ///   Show whether an orchestrator is running, its Persona ID, and
@@ -632,6 +2078,81 @@ enum Commands {
     Orchestrator {
         #[command(subcommand)]
         action: emberlink_cli::orchestrator::OrchestratorAction,
+    },
+    /// Dev daemon install + info + sync (design Phase 4).
+    ///
+    /// `ember dev install` — provision the dev daemon end-to-end (11 phases).
+    ///   Phase 1: generate the dev IdentityRoot Ed25519 keypair and stash the
+    ///   private key in Keychain at `sh.emberlink.dev-identity-root`.
+    ///   Phases 2-4: GH App + uid/group provisioning.
+    ///   Phases 5-10: slice-C helper modules ready (prior change); integration PR wires them.
+    ///
+    /// `ember dev info` — print the current dev install state (fingerprint,
+    ///   paths, socket, daemon reachability).
+    ///
+    /// `ember dev sync` — incremental rebuild + content-hash diff + copy + daemon
+    ///   kickstart. Use this after editing daemon or construct code.
+    Dev {
+        #[command(subcommand)]
+        action: DevAction,
+    },
+    /// Manage the ember mTLS bridge (design Component 1).
+    ///
+    /// `ember bridge endpoint [--emit-file <path>] [--json]`
+    ///   Print or write the bridge endpoint JSON used by in-container agents.
+    ///   The JSON contains `addr` (host.docker.internal:<port>) and
+    ///   `ca_fingerprint_sha256` (hex SHA-256 of the KMS edge CA cert DER).
+    Bridge {
+        #[command(subcommand)]
+        action: BridgeAction,
+    },
+}
+
+/// `ember dev` subcommands (design Phase 4).
+#[derive(Subcommand)]
+enum DevAction {
+    /// Install the dev daemon (11-phase flow — phases 1-4 implemented;
+    /// phases 5-10 helpers ready in slice-C, integration PR wires them).
+    Install,
+    /// Print dev install state (fingerprint, paths, socket, daemon ping).
+    Info,
+    /// Incremental rebuild + content-hash diff + copy + daemon kickstart.
+    ///
+    /// Runs `cargo build --release -p ember-daemon -p ember-construct`,
+    /// diffs each built binary (SHA-256) against the dev install root copy,
+    /// copies any changed binaries, then restarts the dev daemon via
+    /// `launchctl kickstart -k system/sh.emberlink.daemon.dev`.
+    Sync {
+        /// Skip the `launchctl kickstart` step. Use this on hosts that have
+        /// not run `ember dev install` yet, or in CI where launchctl is absent.
+        #[arg(long)]
+        no_launchctl: bool,
+    },
+}
+
+/// `ember bridge` subcommands (design Component 1).
+#[derive(Subcommand)]
+enum BridgeAction {
+    /// Print or write the bridge endpoint JSON.
+    ///
+    /// The JSON shape is:
+    ///   `{"addr": "host.docker.internal:<port>", "ca_fingerprint_sha256": "<hex>"}`
+    ///
+    /// `addr` is derived from the daemon's configured bridge bind address
+    /// (substituting `host.docker.internal` as the host-reachable name for
+    /// in-container callers). `ca_fingerprint_sha256` is the SHA-256 hex of
+    /// the KMS edge CA cert DER (from `~/.ember/kms/edge-ca/ca.seed`).
+    ///
+    /// Exits non-zero if the daemon is not running or the bridge is not bound.
+    Endpoint {
+        /// Write the endpoint JSON to this path instead of stdout.
+        /// Default (when flag absent): `~/.ember/bridge-endpoint.json`.
+        #[arg(long, value_name = "PATH")]
+        emit_file: Option<PathBuf>,
+        /// Print the endpoint JSON to stdout (in addition to writing the file
+        /// when --emit-file is given, or as the sole output when it is not).
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -727,7 +2248,7 @@ enum BinaryPinAction {
 #[derive(Subcommand)]
 enum DemoAction {
     /// 60-second canned fallback demo for friendly devs
-    /// (implementation-note-273, design §8). Shells `qember.sh demo
+    /// (implementation-note-390, design §8). Shells `qember.sh demo
     /// up`/`down` and prints the live-approval-flow next steps.
     Wedge {
         /// Tear down the demo environment (calls `qember.sh demo down`).
@@ -735,7 +2256,7 @@ enum DemoAction {
         teardown: bool,
     },
     /// Mint the locked May-3 4-statement composite-grant bundle
-    /// (implementation-note-274). Submits a single composite
+    /// (implementation-note-391). Submits a single composite
     /// approval entry that bundles credential + session + time +
     /// credential statements via the in-process daemon store.
     Bundle,
@@ -907,7 +2428,7 @@ enum BinaryAction {
 }
 
 /// `ember headless <action>` — attested-device enrollment management
-/// (implementation-note-275, design). Surface for the
+/// (implementation-note-392, design). Surface for the
 /// daemon-side `headless_enroll` / `headless_revoke` / `headless_status`
 /// socket methods.
 #[derive(Subcommand)]
@@ -936,7 +2457,7 @@ enum HeadlessAction {
     /// Show the active headless enrollment (or `none`).
     Status,
     /// Run the Layer-1 pre-flight scope check
-    /// (implementation-note-190, design).
+    /// (implementation-note-261, design).
     ///
     /// Resolves the union of permissions each queued task's declared
     /// Constructs require, diffs against the enrolled persona's
@@ -1114,7 +2635,7 @@ enum VaultAction {
         name: String,
         /// REFUSED — passing secrets via argv leaks them. Kept for argv-parse so we
         /// can emit a structured error pointing at --stdin / --file. Per
-        /// implementation-note-270.
+        /// implementation-note-386.
         #[arg(long, hide = true)]
         value: Option<String>,
         /// Read credential value from stdin (no shell history leak; trailing newline trimmed).
@@ -1141,7 +2662,7 @@ enum VaultAction {
     Get(VaultGetArgs),
     /// Store a credential value (alias for `add`; safe-input flags only).
     ///
-    /// Per implementation-note-276 this is the operator-facing
+    /// Per implementation-note-393 this is the operator-facing
     /// surface for the `CredentialStore::put` trait method shipped in
     /// prior change. Refuses `--value <secret>` argv form (leaks via shell
     /// history); use `--stdin` or `--file <path>`.
@@ -1171,10 +2692,16 @@ enum VaultAction {
     /// create, persona key export) will require fresh user presence
     /// (Touch ID on macOS).
     Lock,
+    /// Re-open the vault session explicitly after `ember vault lock`.
+    ///
+    /// On the daemon-backed path this is the current non-session operator
+    /// reopen seam. It does not yet make the accepted lazy first-session
+    /// unlock posture live; it is an explicit operator action.
+    Unlock,
     /// Re-store the vault MEK passphrase with the platform-current ACL.
     ///
     /// One-shot migration for pre-existing MEK entries created before
-    /// implementation-note-78 shipped. After this runs, vault unlocks
+    /// implementation-note-100 shipped. After this runs, vault unlocks
     /// via Touch ID / device passcode instead of the plain keychain password.
     /// Idempotent: safe to run multiple times.
     MigrateAcl,
@@ -1461,7 +2988,7 @@ enum SandboxAction {
     /// Delete a sandbox: remove container + DB row + (if no other refs)
     /// auto-created persona. Idempotent on already-gone state.
     ///
-    /// implementation-note-219: unblocks `ember sandbox create --name X` retries
+    /// implementation-note-303: unblocks `ember sandbox create --name X` retries
     /// after a previous container start failed and left the persona row +
     /// stale docker container behind. `ember sandbox delete <id|name>` is
     /// the GC path; `stop` only halts (sandbox row + persona stay).
@@ -1703,7 +3230,7 @@ enum AuditAction {
         /// Audit event ID
         id: String,
     },
-    /// Query the receipts table (EMBER-implementation-note-172).
+    /// Query the receipts table (EMBER-implementation-note-244).
     ///
     /// Returns the unified audit view across grant, kms_wrap, and
     /// kms_unwrap receipts. Filters AND-combine. Use `--json` for raw
@@ -1732,7 +3259,7 @@ enum AuditAction {
         #[arg(long)]
         limit: Option<u64>,
     },
-    /// implementation-note-164 (B): walk the audit chain and
+    /// implementation-note-230 (B): walk the audit chain and
     /// verify each row's `blake3(prev_hash || canonical_row_bytes)`
     /// matches its stored `row_hash`. Routes through the daemon's
     /// `audit_verify` socket method so the verdict is authoritative
@@ -1744,7 +3271,7 @@ enum AuditAction {
     },
 }
 
-/// EMBER-implementation-note-172 — parse a `--since` argument.
+/// EMBER-implementation-note-244 — parse a `--since` argument.
 ///
 /// Accepts either an ISO-8601 timestamp (e.g. `2026-04-01T00:00:00Z`) or
 /// a relative duration like `24h` / `7d` / `30m` / `45s`. Relative values
@@ -1771,10 +3298,13 @@ pub(crate) fn parse_since(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 
 /// Print the initial banner lines (version, socket, database, PID) immediately on startup.
 /// Call `print_banner_startup` once the dashboard + git-proxy bind results are known.
-/// implementation-note-277: check whether the ember-init shadow PATH
+/// implementation-note-394: check whether the ember-init shadow PATH
 /// has been installed on this host. Returns `Err(msg)` with a precise
-/// remediation hint if `$HOME/.ember/shadow/` is missing or doesn't contain
-/// the expected shim binaries (`gh`, `git`).
+/// remediation hint if `$HOME/.ember/shadow/bin/` is missing or doesn't
+/// contain the expected shim binaries (`gh`, `git`).
+///
+/// Shim binaries live under `~/.ember/shadow/bin/` (the PATH-prepended
+/// subdirectory); credential and config files live at `~/.ember/shadow/`.
 ///
 /// Without the shadow PATH, raw `gh` / `git` invocations from sequential
 /// agents (headless SKILL, ralph loops, `ship-pr.sh`'s `EMBER_GH_BIN`
@@ -1783,23 +3313,26 @@ pub(crate) fn parse_since(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 /// that closes the gap.
 fn ensure_shadow_path_installed() -> Result<(), String> {
     let home = std::env::var("HOME").map_err(|_| "$HOME not set".to_string())?;
-    let shadow_dir = std::path::Path::new(&home).join(".ember").join("shadow");
-    if !shadow_dir.is_dir() {
+    let shadow_bin_dir = std::path::Path::new(&home)
+        .join(".ember")
+        .join("shadow")
+        .join("bin");
+    if !shadow_bin_dir.is_dir() {
         return Err(format!(
             "shadow path not installed at {}; run `ember init --for claude-code`",
-            shadow_dir.display()
+            shadow_bin_dir.display()
         ));
     }
     let critical = ["gh", "git"];
     let missing: Vec<&str> = critical
         .iter()
-        .filter(|name| !shadow_dir.join(name).exists())
+        .filter(|name| !shadow_bin_dir.join(name).exists())
         .copied()
         .collect();
     if !missing.is_empty() {
         return Err(format!(
             "shadow path at {} is missing shims: {} — run `ember init --for claude-code`",
-            shadow_dir.display(),
+            shadow_bin_dir.display(),
             missing.join(", ")
         ));
     }
@@ -1825,7 +3358,7 @@ fn print_banner_preamble(config: &DaemonConfig) {
 
 /// Print the dashboard + git-proxy banner lines, followed by the "Ctrl+C to stop"
 /// footer. Called after both bind results are known (from the StartupBinds callback).
-/// implementation-note-123 extended this from a single dashboard line to the full
+/// implementation-note-172 extended this from a single dashboard line to the full
 /// startup-binds aggregate.
 fn print_banner_startup(binds: &StartupBinds) {
     // Identity line first — for the camera-clean demo flow, the daemon's
@@ -1858,7 +3391,7 @@ fn print_banner_startup(binds: &StartupBinds) {
     }
     match &binds.llm_proxy {
         LlmProxyBind::Bound(addr) => {
-            // implementation-note-124: the LLM proxy is what the
+            // implementation-note-173: the LLM proxy is what the
             // Anthropic SDK demo posts to via `base_url=$EMBER_PROXY_URL`,
             // so the canonical `EMBER_PROXY_URL=…` line carries this URL.
             // qember.sh + the smoke-runner wrapper read this line.
@@ -1876,7 +3409,7 @@ fn print_banner_startup(binds: &StartupBinds) {
     }
     match &binds.git_proxy {
         GitProxyBind::Bound(addr) => {
-            // implementation-note-124: the git-echo proxy URL now lives
+            // implementation-note-173: the git-echo proxy URL now lives
             // at `EMBER_GIT_PROXY_URL` (was previously `EMBER_PROXY_URL`).
             // ember-git.sh's allowlisted shape still reads `EMBER_PROXY_URL`,
             // so this line is informational; ember-git.sh callers should
@@ -1898,7 +3431,7 @@ fn print_banner_startup(binds: &StartupBinds) {
     eprintln!();
 }
 
-/// implementation-note-278: resolve the user-pinned config path from
+/// implementation-note-395: resolve the user-pinned config path from
 /// the precedence chain (flag → `EMBER_CONFIG` → `EMBER_DEMO_DIR/config.toml`),
 /// returning `None` if none of the inputs point at a config so the caller
 /// falls through to the default (`~/.ember/config.toml`).
@@ -1954,7 +3487,7 @@ fn effective_config_path(cli_config: Option<&PathBuf>) -> PathBuf {
     resolved_user_config_path(cli_config).unwrap_or_else(DaemonConfig::default_config_path)
 }
 
-/// implementation-note-139: probe `/api/status` on the configured
+/// implementation-note-188: probe `/api/status` on the configured
 /// dashboard address and return the daemon's reported `dashboard_addr_bound`.
 ///
 /// `None` means: connect failed, response was malformed, or the daemon
@@ -1969,13 +3502,14 @@ fn effective_config_path(cli_config: Option<&PathBuf>) -> PathBuf {
 fn probe_dashboard_addr_bound(addr: std::net::SocketAddr) -> Option<String> {
     use std::io::{Read as _, Write as _};
 
-    let mut stream = std::net::TcpStream::connect_timeout(
-        &addr,
-        Duration::from_millis(500),
-    )
-    .ok()?;
-    stream.set_read_timeout(Some(Duration::from_millis(500))).ok()?;
-    stream.set_write_timeout(Some(Duration::from_millis(500))).ok()?;
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)).ok()?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .ok()?;
+    stream
+        .set_write_timeout(Some(Duration::from_millis(500)))
+        .ok()?;
 
     let req = b"GET /api/status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
     stream.write_all(req).ok()?;
@@ -2003,7 +3537,11 @@ pub struct LogGuard {
 /// Initialize daemon tracing: rolling JSON file appender always; console fmt layer when
 /// `console` is true (foreground). Returns a `LogGuard` the caller must hold for the
 /// lifetime of the process.
-fn configure_tracing(data_dir: &std::path::Path, log_level: &ember_daemon::infra::config::LogLevel, console: bool) -> LogGuard {
+fn configure_tracing(
+    data_dir: &std::path::Path,
+    log_level: &ember_daemon::infra::config::LogLevel,
+    console: bool,
+) -> LogGuard {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(log_level.as_filter_str()));
 
@@ -2015,9 +3553,7 @@ fn configure_tracing(data_dir: &std::path::Path, log_level: &ember_daemon::infra
         .json()
         .with_writer(non_blocking);
 
-    let registry = tracing_subscriber::registry()
-        .with(filter)
-        .with(file_layer);
+    let registry = tracing_subscriber::registry().with(filter).with(file_layer);
 
     if console {
         let console_layer = tracing_subscriber::fmt::layer();
@@ -2028,11 +3564,13 @@ fn configure_tracing(data_dir: &std::path::Path, log_level: &ember_daemon::infra
 
     tracing::info!(log_dir = %log_dir.display(), log_prefix = "daemon.log", "daemon logging initialized");
 
-    LogGuard { _worker: worker_guard }
+    LogGuard {
+        _worker: worker_guard,
+    }
 }
 
 fn load_config(path: Option<&PathBuf>) -> DaemonConfig {
-    // implementation-note-278: when `--config` is absent, fall back
+    // implementation-note-395: when `--config` is absent, fall back
     // through `EMBER_CONFIG` and `EMBER_DEMO_DIR/config.toml` before the
     // default path. Lets `bash scripts/recording-day.sh prep` export
     // `EMBER_DEMO_DIR=/tmp/ember-demo-<id>` and have every subsequent
@@ -2063,7 +3601,7 @@ fn load_config(path: Option<&PathBuf>) -> DaemonConfig {
             }
         }
     } else {
-        // implementation-note-279: loud-fail instead of silent
+        // implementation-note-396: loud-fail instead of silent
         // DaemonConfig::default() fallback. The May-12 25-hour leaked-daemon
         // incident was rooted in this fallback silently inheriting user-home
         // paths in test contexts where --config / EMBER_CONFIG / EMBER_DEMO_DIR
@@ -2091,7 +3629,7 @@ fn open_store(config: &DaemonConfig) -> DaemonStore {
         }
     };
 
-    // implementation-note-214: in-process CLI subcommands (grant/sandbox/persona) talk to
+    // implementation-note-296: in-process CLI subcommands (grant/sandbox/persona) talk to
     // the same SQLite DB the daemon uses, but without going through the
     // socket — so they need their own attached vault to encrypt/decrypt
     // persona secrets. Best-effort auto-unseal from keyring: if a passphrase
@@ -2126,9 +3664,10 @@ fn open_store(config: &DaemonConfig) -> DaemonStore {
     store
 }
 
-/// implementation-note-280: detect whether a basic `ember init` has
-/// already been run. Returns true if `daemon.db` exists in `config.data_dir`,
-/// which is written by `open_store` during every `cmd_init` run. Used by the
+/// implementation-note-397: detect whether a basic `ember init` has
+/// already been run. Returns true if `daemon.db` exists in `config.data_dir`.
+/// On live daemon-backed runs the daemon owns creating that file; the old
+/// local-store fallback still creates it in-process. Used by the
 /// `--for claude-code` handler to skip re-running basic init (and creating a
 /// duplicate "root" persona) when the daemon DB is already present.
 fn is_ember_initialized(config: &DaemonConfig) -> bool {
@@ -2176,7 +3715,7 @@ pub fn record_image_digest(registry_path: &Path, image: &str, digest: &str) {
 
 /// Default policy seed written by `ember init` when no `policy.toml` exists.
 /// Schema must round-trip through `core_approval::policy::PolicyConfig` —
-/// regression-tested in `tests::default_policy_seed_parses` (implementation-note-281).
+/// regression-tested in `tests::default_policy_seed_parses` (implementation-note-398).
 const DEFAULT_POLICY_TOML: &str = "\
 # Ember daemon policy
 # Rules evaluated in order — first match wins.
@@ -2223,6 +3762,55 @@ fn resolve_init_keyring_value(
         .unwrap_or_else(|| default_value.to_string())
 }
 
+fn emit_first_grant_receipt_after_init(
+    config: &DaemonConfig,
+    socket_path: &Path,
+    persona_id: &str,
+    persona_public_key: &str,
+    direct_store: Option<&DaemonStore>,
+) -> Result<(), String> {
+    if emberlink_cli::onboarding::first_grant::short_circuit_first_grant_receipt_emit(
+        &config.data_dir,
+    )
+    .is_some()
+    {
+        return Ok(());
+    }
+
+    if let Some(store) = direct_store {
+        let signer = store
+            .persona_signer(persona_id)
+            .map_err(|e| format!("persona signer: {e}"))?;
+        emberlink_cli::onboarding::first_grant::emit_first_grant_receipt(
+            &config.data_dir,
+            persona_id,
+            persona_public_key,
+            &signer,
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    let built = emberlink_cli::call_daemon_method(
+        socket_path,
+        "build_init_first_grant_receipt",
+        &serde_json::json!({"persona_id": persona_id}),
+    )
+    .map_err(|e| format!("build init first-grant receipt (rpc): {e}"))?;
+    let file: emberlink_cli::onboarding::first_grant::FirstGrantReceiptFile =
+        serde_json::from_value(built)
+            .map_err(|e| format!("parse init first-grant receipt (rpc): {e}"))?;
+    emberlink_cli::onboarding::first_grant::write_first_grant_receipt_file(
+        &config.data_dir,
+        persona_id,
+        persona_public_key,
+        &file,
+    )
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
 fn cmd_init(
     config: &DaemonConfig,
     name: Option<String>,
@@ -2252,7 +3840,7 @@ fn cmd_init(
         }
     }
     // Respect --config: if the user passed one, use it as the init target;
-    // otherwise consult `EMBER_CONFIG` / `EMBER_DEMO_DIR` (implementation-note-282-
+    // otherwise consult `EMBER_CONFIG` / `EMBER_DEMO_DIR` (implementation-note-399-
     // AUTODISCOVERY) before falling back to the default
     // (`~/.ember/config.toml`).
     let config_path = resolved_user_config_path(cli_config_path)
@@ -2311,15 +3899,18 @@ account = \"{init_keyring_account}\"
         eprintln!("warning: failed to write policy: {e}");
     }
 
-    // V0 schema: persona rows are vault-sealed at rest, so the vault must
-    // be ready before we create the root persona. Order:
+    // `cmd_init` still owns the passphrase/salt bootstrap today so the CLI
+    // can provision first-run keyring state and clear `EMBER_VAULT_PASSPHRASE`
+    // from its own environment. Once the daemon socket is live, persona
+    // creation and first-grant receipt signing move behind daemon RPC.
+    //
+    // V0 schema: persona rows are vault-sealed at rest, so the no-daemon
+    // test fallback still needs a local vault. Order:
     //   1. Write or reuse the salt file.
     //   2. Resolve or provision the passphrase.
-    //   3. Build the vault from passphrase + salt.
-    //   4. Open the store and attach the vault.
-    //   5. Create the root persona.
-    // Prior flow did 5 first and 1–4 after, which broke under V0 because
-    // create_persona now requires an attached vault.
+    //   3. In the test-only no-daemon branch, build the vault from
+    //      passphrase + salt and attach it to the local store.
+    //   4. Otherwise let the daemon own persona-secret access.
     let salt_path = config.data_dir.join("vault.salt");
     let salt: [u8; 16] = if salt_path.exists() {
         match fs::read(&salt_path) {
@@ -2355,142 +3946,255 @@ account = \"{init_keyring_account}\"
     // fallback) → keyring (production provisioning). The first two branches
     // never write to the keyring; the production branch generates a random
     // passphrase and persists it.
-    let (passphrase, vault_status): (String, String) =
-        if let Ok(p) = std::env::var("EMBER_VAULT_PASSPHRASE") {
-            // Capture then immediately zeroize from the process environment so
-            // it cannot be read from /proc/<pid>/environ by a second party.
-            // Called during init before any background threads spawn; the
-            // signal/thread race in remove_var is acceptable here.
-            // Safety: single-threaded init path; no other threads are reading env.
-            unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
-            (p, "passphrase source: EMBER_VAULT_PASSPHRASE".to_string())
-        } else if keyring_writes_suppressed() {
-            // Three-axis gate — `bin/ember.rs` isn't covered by the gate
-            // inside `resolve_passphrase` because it calls `keyring::Entry::new`
-            // directly. Keeps `cargo test` from firing real keychain popups
-            // (the 2026-04-22 leak).
-            (
-                "ember-test-fallback-passphrase".to_string(),
-                "keyring write skipped (test/mock gate)".to_string(),
-            )
-        } else {
-            // Belt-and-suspenders production checkpoint. Mirrors the check
-            // inside `Vault::open_from_config` (vault.rs:102-110) so the
-            // CLI init path cannot bypass it by calling `keyring::Entry::new`
-            // directly.
-            if !is_cargo_test_binary() {
-                let home = match dirs_next::home_dir() {
-                    Some(h) => h,
-                    None => {
-                        eprintln!(
-                            "error: refusing to write to production keyring: home directory not \
+    let (passphrase, vault_status): (String, String) = if let Ok(p) =
+        std::env::var("EMBER_VAULT_PASSPHRASE")
+    {
+        // Capture then immediately zeroize from the process environment so
+        // it cannot be read from /proc/<pid>/environ by a second party.
+        // Called during init before any background threads spawn; the
+        // signal/thread race in remove_var is acceptable here.
+        // Safety: single-threaded init path; no other threads are reading env.
+        unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
+        (p, "passphrase source: EMBER_VAULT_PASSPHRASE".to_string())
+    } else if keyring_writes_suppressed() {
+        // Three-axis gate — `bin/ember.rs` isn't covered by the gate
+        // inside `resolve_passphrase` because it calls `keyring::Entry::new`
+        // directly. Keeps `cargo test` from firing real keychain popups
+        // (the 2026-04-22 leak).
+        (
+            "ember-test-fallback-passphrase".to_string(),
+            "keyring write skipped (test/mock gate)".to_string(),
+        )
+    } else {
+        // Belt-and-suspenders production checkpoint. Mirrors the check
+        // inside `Vault::open_from_config` (vault.rs:102-110) so the
+        // CLI init path cannot bypass it by calling `keyring::Entry::new`
+        // directly.
+        if !is_cargo_test_binary() {
+            let home = match dirs_next::home_dir() {
+                Some(h) => h,
+                None => {
+                    eprintln!(
+                        "error: refusing to write to production keyring: home directory not \
                              resolvable (no $HOME)"
-                        );
-                        process::exit(1);
-                    }
-                };
-                if let Err(e) =
-                    check_production_sentinel(&service, DEFAULT_KEYRING_SERVICE, &home)
-                {
-                    eprintln!("error: {e}");
-                    process::exit(1);
-                }
-            }
-
-            let entry = match keyring::Entry::new(&service, &account) {
-                Ok(e) => e,
-                Err(e) => {
-                    eprintln!("  Vault:    keyring unavailable ({e})");
-                    eprintln!("           Set EMBER_VAULT_PASSPHRASE env var instead");
+                    );
                     process::exit(1);
                 }
             };
-
-            // 32 chars from an alphanumeric alphabet (62 chars) → ~190 bits
-            // of entropy. Rejection-sampled from OS entropy to avoid modulo
-            // bias. Mirrors ember-daemon::vault::generate_passphrase.
-            const ALPHABET: &[u8; 62] =
-                b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-            let mut generated = String::with_capacity(32);
-            let mut scratch = [0u8; 64];
-            while generated.len() < 32 {
-                getrandom::fill(&mut scratch).expect("OS entropy failure");
-                for &b in &scratch {
-                    if generated.len() == 32 {
-                        break;
-                    }
-                    if b < 248 {
-                        generated.push(ALPHABET[(b % 62) as usize] as char);
-                    }
-                }
+            if let Err(e) = check_production_sentinel(&service, DEFAULT_KEYRING_SERVICE, &home) {
+                eprintln!("error: {e}");
+                process::exit(1);
             }
+        }
 
-            if let Err(e) = entry.set_password(&generated) {
+        let entry = match keyring::Entry::new(&service, &account) {
+            Ok(e) => e,
+            Err(e) => {
                 eprintln!("  Vault:    keyring unavailable ({e})");
                 eprintln!("           Set EMBER_VAULT_PASSPHRASE env var instead");
                 process::exit(1);
             }
-
-            let status = match verify_keyring_roundtrip(&service, &account, &generated) {
-                Ok(()) => format!(
-                    "passphrase stored in system keyring (service={service}, account={account})"
-                ),
-                Err(e) => {
-                    eprintln!("  Vault:    keyring write succeeded but read-back failed ({e})");
-                    eprintln!(
-                        "           This usually means the keyring crate is using its in-memory mock backend."
-                    );
-                    eprintln!(
-                        "           Set EMBER_VAULT_PASSPHRASE env var to bypass the keyring."
-                    );
-                    "keyring unavailable (see above)".to_string()
-                }
-            };
-
-            (generated, status)
         };
 
-    let vault = Rc::new(Vault::from_passphrase(&passphrase, &salt));
-    let store = open_store(config);
-    store.set_vault(Rc::clone(&vault));
+        // 32 chars from an alphanumeric alphabet (62 chars) → ~190 bits
+        // of entropy. Rejection-sampled from OS entropy to avoid modulo
+        // bias. Mirrors ember-daemon::vault::generate_passphrase.
+        const ALPHABET: &[u8; 62] =
+            b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        let mut generated = String::with_capacity(32);
+        let mut scratch = [0u8; 64];
+        while generated.len() < 32 {
+            getrandom::fill(&mut scratch).expect("OS entropy failure");
+            for &b in &scratch {
+                if generated.len() == 32 {
+                    break;
+                }
+                if b < 248 {
+                    generated.push(ALPHABET[(b % 62) as usize] as char);
+                }
+            }
+        }
 
-    let root_name = name.as_deref().unwrap_or("root");
-    let persona = match store.create_persona(root_name) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("error: failed to create root persona: {e}");
+        if let Err(e) = entry.set_password(&generated) {
+            eprintln!("  Vault:    keyring unavailable ({e})");
+            eprintln!("           Set EMBER_VAULT_PASSPHRASE env var instead");
             process::exit(1);
         }
+
+        let status = match verify_keyring_roundtrip(&service, &account, &generated) {
+            Ok(()) => format!(
+                "passphrase stored in system keyring (service={service}, account={account})"
+            ),
+            Err(e) => {
+                eprintln!("  Vault:    keyring write succeeded but read-back failed ({e})");
+                eprintln!(
+                    "           This usually means the keyring crate is using its in-memory mock backend."
+                );
+                eprintln!("           Set EMBER_VAULT_PASSPHRASE env var to bypass the keyring.");
+                "keyring unavailable (see above)".to_string()
+            }
+        };
+
+        (generated, status)
     };
+
+    let root_name = name.as_deref().unwrap_or("root");
+
+    // init_persona_rpc_after_autostart_reorder: implementation-note-400
+    // Autostart fires BEFORE the RPC so the socket is live when create_persona dispatches.
+    //
+    // Under design separate-uid posture (daemon=ember uid, operator=operator uid)
+    // the operator cannot write the daemon's SQLite DB, so the prior direct
+    // `store.create_persona(root_name)` call failed. Route through the daemon
+    // JSON-RPC instead. Mirrors the pattern in `cmd_init_for_claude_code`.
+    let socket_path = config.socket_dir.join("daemon.sock");
+    // EMBER_SKIP_DAEMON_INSTALL_CHECK: test-only bypass — same env var as the
+    // daemon-install precheck gate above. When set, skip the autostart block so
+    // binary tests running against isolated tmp dirs don't attempt to spawn a
+    // real daemon or wait for a socket that will never appear.
+    let skip_daemon_autostart = std::env::var("EMBER_SKIP_DAEMON_INSTALL_CHECK").is_ok();
+    if !skip_daemon_autostart && !socket_path.exists() {
+        let autostart_config_path = resolved_user_config_path(cli_config_path);
+        let home = dirs_next::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
+        let use_launch_agent = emberlink_cli::onboarding::claude_code::should_use_launch_agent(
+            &home,
+            autostart_config_path.as_deref(),
+        );
+
+        if use_launch_agent {
+            println!("  Daemon:   not running — starting daemon (install-agent)");
+            match daemon_agent::install_agent(autostart_config_path.as_deref(), false) {
+                Ok(_) => {
+                    println!("  Daemon:   started daemon (background, install-agent)");
+                }
+                Err(daemon_agent::AgentError::UnsupportedPlatform) => {
+                    if let Err(e) = spawn_background_daemon(autostart_config_path.as_deref()) {
+                        eprintln!("error: daemon autostart failed: {e}");
+                        process::exit(1);
+                    }
+                    println!("  Daemon:   started daemon (background process)");
+                }
+                Err(e) => {
+                    eprintln!(
+                        "error: daemon autostart failed: {e}\n\
+                         Run `ember daemon start --background --install-agent` manually first, \
+                         then re-run `ember init`."
+                    );
+                    process::exit(1);
+                }
+            }
+        } else {
+            println!("  Daemon:   not running — starting daemon (background, isolated env)");
+            if let Err(e) = spawn_background_daemon(autostart_config_path.as_deref()) {
+                eprintln!("error: daemon autostart failed: {e}");
+                process::exit(1);
+            }
+            println!("  Daemon:   started daemon (background process)");
+        }
+
+        let timeout_secs =
+            emberlink_cli::onboarding::claude_code::autostart_liveness_timeout_secs();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+        loop {
+            if socket_path.exists() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                eprintln!(
+                    "error: daemon started but socket did not appear within {timeout_secs}s \
+                     (expected at {}); check daemon logs at $HOME/.ember/logs/daemon.out \
+                     and retry. Override the timeout with \
+                     EMBER_DAEMON_AUTOSTART_TIMEOUT_SECS=<seconds>.",
+                    socket_path.display()
+                );
+                process::exit(1);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    // When EMBER_SKIP_DAEMON_INSTALL_CHECK is set (test-only bypass) and no
+    // daemon socket is present, fall back to the old local store path.
+    let daemon_socket_live = socket_path.exists();
+    let mut direct_store: Option<DaemonStore> = None;
+    let (persona_id, persona_name, persona_public_key) =
+        if skip_daemon_autostart && !socket_path.exists() {
+            // [open-store-audit] MUTATOR-MIXED: cmd_init local fallback only.
+            // The installed path now routes both persona creation and
+            // first-grant receipt signing through daemon RPC. A local store is
+            // still needed only for the test/isolated no-daemon branch.
+            let vault = Rc::new(Vault::from_passphrase(&passphrase, &salt));
+            let store = open_store(config);
+            store.set_vault(Rc::clone(&vault));
+            match store.create_persona(root_name) {
+                Ok(info) => {
+                    direct_store = Some(store);
+                    (info.id, info.name, info.public_key)
+                }
+                Err(e) => {
+                    eprintln!("error: failed to create root persona (direct): {e}");
+                    process::exit(1);
+                }
+            }
+        } else {
+            let created = match emberlink_cli::call_daemon_method(
+                &socket_path,
+                "create_persona",
+                &serde_json::json!({"name": root_name}),
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("error: failed to create root persona (rpc): {e}");
+                    process::exit(1);
+                }
+            };
+            (
+                created
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                created
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                created
+                    .get("public_key")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            )
+        };
 
     println!("Initialized ember");
     println!("  Config:   {}", config_path.display());
     println!("  Policy:   {}", policy_path.display());
-    println!("  Database: {}", config.data_dir.join("daemon.db").display());
-    println!("  Root:     {} ({})", persona.id, persona.name);
+    println!(
+        "  Database: {}",
+        config.data_dir.join("daemon.db").display()
+    );
+    println!("  Root:     {persona_id} ({persona_name})");
     println!("  Vault:    {vault_status}");
-    println!();
-    println!("Run `ember daemon start` to start the daemon.");
+    if daemon_socket_live {
+        println!("  Daemon:   running ({})", socket_path.display());
+    } else {
+        println!("  Daemon:   not started (local fallback path)");
+        println!();
+        println!("Run `ember daemon start` to start the daemon.");
+    }
 
-    // EMBER-INIT-FIRST-implementation-note-283 (v2): emit a real signed Grant
-    // Receipt v2 envelope to <data_dir>/receipts/first.json. Signs with the
-    // root persona's Ed25519 key via sign_receipt_v2 (design / design).
-    // Idempotent: skips re-emission when first.json already exists.
+    // EMBER-INIT-FIRST-implementation-note-401 (v2): emit a real signed Grant
+    // Receipt v2 envelope to <data_dir>/receipts/first.json. The installed
+    // path now asks the daemon to build/sign it, while the test-only no-daemon
+    // path still signs locally from the direct fallback store.
     // init_first_grant_receipt_emit
-    let signer = match store.persona_signer(&persona.id) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("warning: could not build persona signer for first-grant receipt: {e}");
-            // Fall back to v1 tips-only path rather than failing init.
-            emberlink_cli::onboarding::first_grant::run(&config.data_dir);
-            return;
-        }
-    };
-    if let Err(e) = emberlink_cli::onboarding::first_grant::emit_first_grant_receipt(
-        &config.data_dir,
-        &persona.id,
-        &persona.public_key,
-        &signer,
+    if let Err(e) = emit_first_grant_receipt_after_init(
+        config,
+        &socket_path,
+        &persona_id,
+        &persona_public_key,
+        direct_store.as_ref(),
     ) {
         eprintln!("warning: first-grant receipt emission failed: {e}");
         // Fall through to v1 tips so the user isn't left with no guidance.
@@ -2498,14 +4202,14 @@ account = \"{init_keyring_account}\"
     }
 }
 
-/// implementation-note-271: cohort A onboarding orchestrator.
+/// implementation-note-387: cohort A onboarding orchestrator.
 ///
 /// Runs after `cmd_init` has set up the keyring/vault/salt/root persona.
 /// Creates the agent persona, writes the scope template, mints a 24h
 /// grant, patches `~/.claude/settings.json`, and optionally captures a
 /// GitHub PAT into the vault. Idempotent — every step is a find-or-create
 /// or atomic-write.
-/// implementation-note-284: spawn `ember daemon start
+/// implementation-note-402: spawn `ember daemon start
 /// --background` directly so the child inherits the current process env
 /// (HOME, EMBER_KEYRING_SERVICE, EMBER_CONFIG, …).
 ///
@@ -2516,8 +4220,8 @@ account = \"{init_keyring_account}\"
 fn spawn_background_daemon(
     config_path: Option<&std::path::Path>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let exe = std::env::current_exe()
-        .map_err(|e| format!("could not resolve ember binary: {e}"))?;
+    let exe =
+        std::env::current_exe().map_err(|e| format!("could not resolve ember binary: {e}"))?;
     let mut cmd = std::process::Command::new(&exe);
     cmd.arg("daemon")
         .arg("start")
@@ -2536,9 +4240,7 @@ fn spawn_background_daemon(
     Ok(())
 }
 
-fn cmd_init_for_claude_code(
-    config: &DaemonConfig,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_init_for_claude_code(config: &DaemonConfig) -> Result<(), Box<dyn std::error::Error>> {
     use emberlink_cli::onboarding::claude_code as cc;
 
     let persona_name = cc::claude_code_persona_name();
@@ -2548,7 +4250,7 @@ fn cmd_init_for_claude_code(
     println!();
     println!("Setting up Claude Code integration:");
 
-    // implementation-note-285: autostart daemon if not running.
+    // implementation-note-403: autostart daemon if not running.
     //
     // `init --for claude-code` opens the vault, which requires the daemon to be
     // running (the vault is AEAD-sealed and the daemon holds the unlock key).
@@ -2556,7 +4258,7 @@ fn cmd_init_for_claude_code(
     // claude-code` BEFORE starting the daemon, causing:
     //   error: vault open: refusing to open production keychain without opt-in checkpoint
     //
-    // implementation-note-284: the LaunchAgent / systemd-user
+    // implementation-note-402: the LaunchAgent / systemd-user
     // path is correct for production (single canonical always-up daemon per
     // login session), but it bakes the operator's *real* HOME into the service
     // file. Under an isolated HOME (T3 walks, CI, QA), the launched daemon
@@ -2572,14 +4274,16 @@ fn cmd_init_for_claude_code(
     {
         let socket_path = config.socket_dir.join("daemon.sock");
         if socket_path.exists() {
-            println!("  Daemon:   already running (socket {})", socket_path.display());
+            println!(
+                "  Daemon:   already running (socket {})",
+                socket_path.display()
+            );
         } else {
             let config_path = resolved_user_config_path(None);
             let home = dirs_next::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
-            // implementation-note-284: branch the autostart
+            // implementation-note-402: branch the autostart
             // path on whether HOME / --config look like a default install.
-            let use_launch_agent =
-                cc::should_use_launch_agent(&home, config_path.as_deref());
+            let use_launch_agent = cc::should_use_launch_agent(&home, config_path.as_deref());
 
             if use_launch_agent {
                 println!("  Daemon:   not running — starting daemon (install-agent)");
@@ -2599,16 +4303,15 @@ fn cmd_init_for_claude_code(
                             "daemon autostart failed: {e}\n\
                              Run `ember daemon start --background --install-agent` manually first, \
                              then re-run `ember init --for claude-code`."
-                        ).into());
+                        )
+                        .into());
                     }
                 }
             } else {
                 // Non-default HOME or --config set — skip LaunchAgent and
                 // spawn a raw background daemon that inherits the current
                 // env (HOME, EMBER_KEYRING_SERVICE, EMBER_CONFIG, …).
-                println!(
-                    "  Daemon:   not running — starting daemon (background, isolated env)"
-                );
+                println!("  Daemon:   not running — starting daemon (background, isolated env)");
                 spawn_background_daemon(config_path.as_deref())?;
                 println!("  Daemon:   started daemon (background process)");
             }
@@ -2618,8 +4321,7 @@ fn cmd_init_for_claude_code(
             // vault.salt + daemon.db has slack on slow disks; override via
             // `EMBER_DAEMON_AUTOSTART_TIMEOUT_SECS`.
             let timeout_secs = cc::autostart_liveness_timeout_secs();
-            let deadline =
-                std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
             loop {
                 if socket_path.exists() {
                     break;
@@ -2639,7 +4341,7 @@ fn cmd_init_for_claude_code(
         }
     }
 
-    // implementation-note-286: security-hardening call-to-action.
+    // implementation-note-404: security-hardening call-to-action.
     //
     // When the daemon is on single-uid posture, offer an inline migration with
     // explicit consent rather than printing a passive warning with internal jargon.
@@ -2696,7 +4398,7 @@ fn cmd_init_for_claude_code(
         }
     }
 
-    // implementation-note-287: route every persona /
+    // implementation-note-405: route every persona /
     // grant / vault operation through the daemon's JSON-RPC instead of
     // opening SQLite + vault directly. Under design separate-uid posture
     // (daemon=ember uid, operator=operator uid) the operator cannot read
@@ -2705,9 +4407,10 @@ fn cmd_init_for_claude_code(
     // The daemon already has DB + vault authority; the CLI proxies.
     //
     // Daemon-autostart fires earlier in this function (lines ~2596-2664),
-    // so the socket is guaranteed live by the time we reach this block —
-    // unlike `cmd_init` at :2482 which still needs autostart-reorder work
-    // (see implementation-note-288).
+    // so the socket is guaranteed live by the time we reach this block. Plain
+    // `cmd_init` now follows the same live-socket ordering for root persona
+    // creation and first-grant receipt signing, but still keeps bootstrap-local
+    // config/keyring/salt work.
     //
     // Anchor: ember_init_for_claude_code_rpc_migration_landed.
     let socket_path = config.socket_dir.join("daemon.sock");
@@ -2715,12 +4418,9 @@ fn cmd_init_for_claude_code(
     // 1. Find or create the persona via daemon RPC. Calling create_persona
     //    twice with the same name returns an error (UNIQUE constraint), so
     //    we list first and reuse.
-    let personas_value = emberlink_cli::call_daemon_method(
-        &socket_path,
-        "list_personas",
-        &serde_json::Value::Null,
-    )
-    .map_err(|e| format!("list personas (rpc): {e}"))?;
+    let personas_value =
+        emberlink_cli::call_daemon_method(&socket_path, "list_personas", &serde_json::Value::Null)
+            .map_err(|e| format!("list personas (rpc): {e}"))?;
     let empty_personas: Vec<serde_json::Value> = Vec::new();
     let personas_array = personas_value.as_array().unwrap_or(&empty_personas);
     let persona_id: String = match personas_array.iter().find(|p| {
@@ -2730,7 +4430,11 @@ fn cmd_init_for_claude_code(
             .unwrap_or(false)
     }) {
         Some(p) => {
-            let id = p.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let id = p
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let name = p
                 .get("name")
                 .and_then(|v| v.as_str())
@@ -2766,7 +4470,10 @@ fn cmd_init_for_claude_code(
     if template_written {
         println!("  Template: wrote {}", template_path.display());
     } else {
-        println!("  Template: kept {} (already present)", template_path.display());
+        println!(
+            "  Template: kept {} (already present)",
+            template_path.display()
+        );
     }
 
     // 3. Mint a 24h grant for the persona, or reuse an active one. The
@@ -2812,11 +4519,15 @@ fn cmd_init_for_claude_code(
     }
 
     // 4. Patch ~/.claude/settings.json (idempotent).
-    let patched = emberlink_cli::onboarding::claude_code::patch_claude_settings_file(&settings_path)?;
+    let patched =
+        emberlink_cli::onboarding::claude_code::patch_claude_settings_file(&settings_path)?;
     if patched {
         println!("  Hook:     patched {}", settings_path.display());
     } else {
-        println!("  Hook:     kept {} (already patched)", settings_path.display());
+        println!(
+            "  Hook:     kept {} (already patched)",
+            settings_path.display()
+        );
     }
 
     // 4b. Add permissions.deny entries for raw gh/git/kubectl outside the
@@ -2824,9 +4535,8 @@ fn cmd_init_for_claude_code(
     {
         use emberlink_cli::onboarding::settings_patch::add_permissions_deny_outside_shadow;
         let raw = if settings_path.exists() {
-            std::fs::read_to_string(&settings_path).map_err(|e| {
-                format!("read {} for deny patch: {e}", settings_path.display())
-            })?
+            std::fs::read_to_string(&settings_path)
+                .map_err(|e| format!("read {} for deny patch: {e}", settings_path.display()))?
         } else {
             String::new()
         };
@@ -2839,10 +4549,12 @@ fn cmd_init_for_claude_code(
             .map_err(|e| format!("add deny rules: {e}"))?;
         let serialized = serde_json::to_string_pretty(&value)
             .map_err(|e| format!("serialize settings.json: {e}"))?;
-        std::fs::write(&settings_path, serialized).map_err(|e| {
-            format!("write {} after deny patch: {e}", settings_path.display())
-        })?;
-        println!("  Deny:     permissions.deny rules added to {}", settings_path.display());
+        std::fs::write(&settings_path, serialized)
+            .map_err(|e| format!("write {} after deny patch: {e}", settings_path.display()))?;
+        println!(
+            "  Deny:     permissions.deny rules added to {}",
+            settings_path.display()
+        );
     }
 
     // 5. Optional GH PAT capture. Cohort A is friendly devs; this is the
@@ -2888,7 +4600,7 @@ fn cmd_init_for_claude_code(
     Ok(())
 }
 
-/// implementation-note-271: reverse the settings.json patch from
+/// implementation-note-387: reverse the settings.json patch from
 /// `init --for claude-code`. Removes only what we added; persona, grant,
 /// and vault entries are left in place because they may be in use.
 fn cmd_uninstall_for_claude_code() -> Result<(), Box<dyn std::error::Error>> {
@@ -2909,12 +4621,11 @@ fn cmd_uninstall_for_claude_code() -> Result<(), Box<dyn std::error::Error>> {
 
     // Remove permissions.deny entries for raw gh/git/kubectl (design §3 step 4).
     if settings_path.exists() {
-        let raw = std::fs::read_to_string(&settings_path).map_err(|e| {
-            format!("read {} for deny removal: {e}", settings_path.display())
-        })?;
+        let raw = std::fs::read_to_string(&settings_path)
+            .map_err(|e| format!("read {} for deny removal: {e}", settings_path.display()))?;
         if !raw.trim().is_empty() {
-            let mut value: serde_json::Value = serde_json::from_str(&raw)
-                .map_err(|e| format!("parse settings.json: {e}"))?;
+            let mut value: serde_json::Value =
+                serde_json::from_str(&raw).map_err(|e| format!("parse settings.json: {e}"))?;
             remove_permissions_deny_outside_shadow(&mut value)
                 .map_err(|e| format!("remove deny rules: {e}"))?;
             let serialized = serde_json::to_string_pretty(&value)
@@ -2922,7 +4633,10 @@ fn cmd_uninstall_for_claude_code() -> Result<(), Box<dyn std::error::Error>> {
             std::fs::write(&settings_path, serialized).map_err(|e| {
                 format!("write {} after deny removal: {e}", settings_path.display())
             })?;
-            println!("  Deny:     permissions.deny rules removed from {}", settings_path.display());
+            println!(
+                "  Deny:     permissions.deny rules removed from {}",
+                settings_path.display()
+            );
         }
     }
 
@@ -2940,13 +4654,17 @@ fn cmd_uninstall_for_claude_code() -> Result<(), Box<dyn std::error::Error>> {
 /// details. Prints a status summary on success; exits non-zero on failure.
 fn cmd_daemon_install_agent(cli_config: Option<&PathBuf>, no_autostart: bool) {
     // Config path lookup: --config wins, then `EMBER_CONFIG` /
-    // `EMBER_DEMO_DIR/config.toml` (implementation-note-278), then the
+    // `EMBER_DEMO_DIR/config.toml` (implementation-note-395), then the
     // default (`~/.ember/config.toml`). We only pass a path through to the
     // plist/unit if the file actually exists — otherwise the service would
     // crash-loop on startup waiting for a config that isn't there.
     let config_path = resolved_user_config_path(cli_config).or_else(|| {
         let default = DaemonConfig::default_config_path();
-        if default.exists() { Some(default) } else { None }
+        if default.exists() {
+            Some(default)
+        } else {
+            None
+        }
     });
 
     match daemon_agent::install_agent(config_path.as_deref(), no_autostart) {
@@ -3244,7 +4962,11 @@ fn migrate_to_separate_uid() {
     #[cfg(target_os = "macos")]
     {
         let _ = std::process::Command::new("launchctl")
-            .args(["bootout", "system", "/Library/LaunchDaemons/sh.emberlink.daemon.plist"])
+            .args([
+                "bootout",
+                "system",
+                "/Library/LaunchDaemons/sh.emberlink.daemon.plist",
+            ])
             .output()
             .map_err(|e| tracing::warn!("launchctl bootout spawn failed: {e}"));
     }
@@ -3379,21 +5101,28 @@ fn cmd_daemon_reload(config: &DaemonConfig, timeout_secs: u64, cli_config: Optio
     if !managed_before {
         // Best-effort: if the daemon was started manually (`--background`), try
         // to stop it and respawn it so the user isn't left with a dead daemon.
-        match daemon_agent::reload_daemon(&pid_file, &socket_path, Duration::from_secs(timeout_secs))
-        {
+        match daemon_agent::reload_daemon(
+            &pid_file,
+            &socket_path,
+            Duration::from_secs(timeout_secs),
+        ) {
             Ok(_) => {
                 // Shouldn't happen — if unmanaged, the daemon can't restart itself.
                 // But if it did come back (e.g. user races install-agent), no harm.
                 println!("Unexpected: unmanaged daemon reappeared after SIGTERM.");
             }
             Err(daemon_agent::AgentError::DaemonNotRunning) => {
-                eprintln!("error: daemon is not running — run `ember daemon start` or `ember daemon install-agent`");
+                eprintln!(
+                    "error: daemon is not running — run `ember daemon start` or `ember daemon install-agent`"
+                );
                 process::exit(1);
             }
             Err(daemon_agent::AgentError::ReloadTimeout { .. }) => {
                 // Expected: unmanaged daemon won't come back on its own.
                 // Respawn it the same way the user originally started it.
-                eprintln!("warning: daemon is not a managed service — spawning a fresh `--background` instance");
+                eprintln!(
+                    "warning: daemon is not a managed service — spawning a fresh `--background` instance"
+                );
                 let exe = match std::env::current_exe() {
                     Ok(p) => p,
                     Err(e) => {
@@ -3403,7 +5132,7 @@ fn cmd_daemon_reload(config: &DaemonConfig, timeout_secs: u64, cli_config: Optio
                 };
                 let mut cmd = std::process::Command::new(exe);
                 cmd.arg("daemon").arg("start").arg("--background");
-                // implementation-note-278: the respawn child inherits
+                // implementation-note-395: the respawn child inherits
                 // the resolved config path so an env-var-pinned demo daemon
                 // comes back on the same config.
                 if let Some(path) = resolved_user_config_path(cli_config) {
@@ -3412,7 +5141,9 @@ fn cmd_daemon_reload(config: &DaemonConfig, timeout_secs: u64, cli_config: Optio
                 match cmd.spawn() {
                     Ok(_child) => {
                         println!("Respawned daemon with `ember daemon start --background`.");
-                        println!("Tip: run `ember daemon install-agent` to make reload-on-SIGTERM automatic.");
+                        println!(
+                            "Tip: run `ember daemon install-agent` to make reload-on-SIGTERM automatic."
+                        );
                     }
                     Err(e) => {
                         eprintln!("error: failed to respawn daemon: {e}");
@@ -3440,7 +5171,9 @@ fn cmd_daemon_reload(config: &DaemonConfig, timeout_secs: u64, cli_config: Optio
             );
         }
         Err(daemon_agent::AgentError::DaemonNotRunning) => {
-            eprintln!("error: daemon is not running — run `ember daemon start` or `ember daemon install-agent`");
+            eprintln!(
+                "error: daemon is not running — run `ember daemon start` or `ember daemon install-agent`"
+            );
             process::exit(1);
         }
         Err(daemon_agent::AgentError::ReloadTimeout { secs }) => {
@@ -3508,11 +5241,7 @@ fn build_budget(
 /// TTY (CI, pipes, headless agents) passing `-t` causes Docker to fail with
 /// "the input device is not a TTY".  In that case only `-i` is emitted.
 fn docker_exec_flags(is_tty: bool) -> Vec<&'static str> {
-    if is_tty {
-        vec!["-i", "-t"]
-    } else {
-        vec!["-i"]
-    }
+    if is_tty { vec!["-i", "-t"] } else { vec!["-i"] }
 }
 
 /// Build the 3-statement composite grant envelope for `ember sandbox run`.
@@ -3541,7 +5270,9 @@ pub fn build_composite_grant_statements(
         resource_type: ResourceType::Credential,
         credential_name: cred_resource.to_string(),
         actions: vec!["credential:read".to_string()],
-        resource: ResourceSelector::Exact { value: cred_resource.to_string() },
+        resource: ResourceSelector::Exact {
+            value: cred_resource.to_string(),
+        },
         budget: None,
         conditions: vec![],
     };
@@ -3560,7 +5291,9 @@ pub fn build_composite_grant_statements(
         resource_type: ResourceType::Session,
         credential_name: String::new(),
         actions: vec!["llm:generate".to_string()],
-        resource: ResourceSelector::Glob { pattern: "anthropic/*".to_string() },
+        resource: ResourceSelector::Glob {
+            pattern: "anthropic/*".to_string(),
+        },
         budget: session_budget,
         conditions: vec![],
     };
@@ -3586,19 +5319,30 @@ pub fn build_composite_grant_statements(
 fn parse_duration(s: &str) -> Result<u64, String> {
     let s = s.trim();
     if let Some(n) = s.strip_suffix('s') {
-        n.parse::<u64>().map_err(|_| format!("invalid duration '{s}'"))
+        n.parse::<u64>()
+            .map_err(|_| format!("invalid duration '{s}'"))
     } else if let Some(n) = s.strip_suffix('m') {
-        let v = n.parse::<u64>().map_err(|_| format!("invalid duration '{s}'"))?;
-        v.checked_mul(60).ok_or_else(|| format!("duration overflow '{s}'"))
+        let v = n
+            .parse::<u64>()
+            .map_err(|_| format!("invalid duration '{s}'"))?;
+        v.checked_mul(60)
+            .ok_or_else(|| format!("duration overflow '{s}'"))
     } else if let Some(n) = s.strip_suffix('h') {
-        let v = n.parse::<u64>().map_err(|_| format!("invalid duration '{s}'"))?;
-        v.checked_mul(3600).ok_or_else(|| format!("duration overflow '{s}'"))
+        let v = n
+            .parse::<u64>()
+            .map_err(|_| format!("invalid duration '{s}'"))?;
+        v.checked_mul(3600)
+            .ok_or_else(|| format!("duration overflow '{s}'"))
     } else if let Some(n) = s.strip_suffix('d') {
-        let v = n.parse::<u64>().map_err(|_| format!("invalid duration '{s}'"))?;
-        v.checked_mul(86400).ok_or_else(|| format!("duration overflow '{s}'"))
+        let v = n
+            .parse::<u64>()
+            .map_err(|_| format!("invalid duration '{s}'"))?;
+        v.checked_mul(86400)
+            .ok_or_else(|| format!("duration overflow '{s}'"))
     } else {
-        s.parse::<u64>()
-            .map_err(|_| format!("invalid duration '{s}' (expected e.g. 15s, 5m, 2h, 1d, or bare seconds)"))
+        s.parse::<u64>().map_err(|_| {
+            format!("invalid duration '{s}' (expected e.g. 15s, 5m, 2h, 1d, or bare seconds)")
+        })
     }
 }
 
@@ -3685,7 +5429,10 @@ fn print_receipt_summary(r: &core_grant_types::grant_receipt::GrantReceipt) {
                 format!("revoked by {actor}: {reason}")
             }
         }
-        TerminalReason::ExhaustedByBudget { statement_sid, axis } => {
+        TerminalReason::ExhaustedByBudget {
+            statement_sid,
+            axis,
+        } => {
             format!("exhausted_by_budget on statement {statement_sid} axis={axis:?}")
         }
         TerminalReason::ParentCascadeRevoked { parent_grant_id } => {
@@ -3714,7 +5461,10 @@ fn print_receipt_summary(r: &core_grant_types::grant_receipt::GrantReceipt) {
     println!();
     println!("  Chain snapshot: {} block(s)", r.approved_chain.len());
     println!("  Approval chain: {} event(s)", r.approval_chain.len());
-    println!("  Actions observed: {} entry(ies)", r.actions_observed.len());
+    println!(
+        "  Actions observed: {} entry(ies)",
+        r.actions_observed.len()
+    );
 }
 
 /// Format a budget axis line: `label: <used> / <cap> (<pct>%)`.
@@ -3728,7 +5478,10 @@ fn resource_selector_display(sel: &ResourceSelector) -> String {
     match sel {
         ResourceSelector::Exact { value } => value.clone(),
         ResourceSelector::Glob { pattern } => pattern.clone(),
-        ResourceSelector::GlobWithSubtarget { primary_glob, subtarget_glob } => {
+        ResourceSelector::GlobWithSubtarget {
+            primary_glob,
+            subtarget_glob,
+        } => {
             format!("{primary_glob}:{subtarget_glob}")
         }
         ResourceSelector::Regex { pattern } => format!("/{pattern}/"),
@@ -3751,7 +5504,11 @@ fn render_grant_budget(grant: &AccessGrant) -> String {
 
     let _ = writeln!(out, "Grant {}", grant.id);
     let _ = writeln!(out, "  Persona: {}", grant.issuing_persona_id);
-    let _ = writeln!(out, "  Status:  {}", grant.effective_status(now_secs).as_str());
+    let _ = writeln!(
+        out,
+        "  Status:  {}",
+        grant.effective_status(now_secs).as_str()
+    );
 
     // Effective TTL from the earliest block expiry.
     match grant.effective_expires_at() {
@@ -3791,16 +5548,32 @@ fn render_grant_budget(grant: &AccessGrant) -> String {
             Some(b) => {
                 let _ = writeln!(out, "{indent}Budget:");
                 if let Some(cap) = b.tokens {
-                    let _ = writeln!(out, "  {}", fmt_budget_line("tokens:", stmt.usage.tokens, cap));
+                    let _ = writeln!(
+                        out,
+                        "  {}",
+                        fmt_budget_line("tokens:", stmt.usage.tokens, cap)
+                    );
                 }
                 if let Some(cap) = b.cents {
-                    let _ = writeln!(out, "  {}", fmt_budget_line("cents:", stmt.usage.cents, cap));
+                    let _ = writeln!(
+                        out,
+                        "  {}",
+                        fmt_budget_line("cents:", stmt.usage.cents, cap)
+                    );
                 }
                 if let Some(cap) = b.requests {
-                    let _ = writeln!(out, "  {}", fmt_budget_line("requests:", stmt.usage.requests, cap));
+                    let _ = writeln!(
+                        out,
+                        "  {}",
+                        fmt_budget_line("requests:", stmt.usage.requests, cap)
+                    );
                 }
                 if let Some(cap) = b.wall_clock_secs {
-                    let _ = writeln!(out, "  {}", fmt_budget_line("wall-clock:", stmt.usage.wall_clock_secs, cap));
+                    let _ = writeln!(
+                        out,
+                        "  {}",
+                        fmt_budget_line("wall-clock:", stmt.usage.wall_clock_secs, cap)
+                    );
                 }
 
                 // Runway (rate-based estimate) — only when usage is fresh (<5 min).
@@ -3818,8 +5591,13 @@ fn render_grant_budget(grant: &AccessGrant) -> String {
                     if let Some(cap) = b.tokens {
                         let used = stmt.usage.tokens;
                         if used > 0 && cap > used {
-                            let remaining_min = (cap - used) as f64 / (used as f64 / minutes_elapsed);
-                            let _ = writeln!(out, "  {indent}  tokens:      ~{}m", remaining_min.round() as u64);
+                            let remaining_min =
+                                (cap - used) as f64 / (used as f64 / minutes_elapsed);
+                            let _ = writeln!(
+                                out,
+                                "  {indent}  tokens:      ~{}m",
+                                remaining_min.round() as u64
+                            );
                         } else {
                             let _ = writeln!(out, "  {indent}  tokens:      —");
                         }
@@ -3827,8 +5605,13 @@ fn render_grant_budget(grant: &AccessGrant) -> String {
                     if let Some(cap) = b.cents {
                         let used = stmt.usage.cents;
                         if used > 0 && cap > used {
-                            let remaining_min = (cap - used) as f64 / (used as f64 / minutes_elapsed);
-                            let _ = writeln!(out, "  {indent}  cents:       ~{}m", remaining_min.round() as u64);
+                            let remaining_min =
+                                (cap - used) as f64 / (used as f64 / minutes_elapsed);
+                            let _ = writeln!(
+                                out,
+                                "  {indent}  cents:       ~{}m",
+                                remaining_min.round() as u64
+                            );
                         } else {
                             let _ = writeln!(out, "  {indent}  cents:       —");
                         }
@@ -3843,36 +5626,161 @@ fn render_grant_budget(grant: &AccessGrant) -> String {
     out
 }
 
-/// Print budget and usage for a grant to stdout.
-fn cmd_grant_budget(grant: &AccessGrant) {
-    print!("{}", render_grant_budget(grant));
+/// Local fallback for `ember sandbox delete <id|name>`.
+///
+/// Resolves the argument to a sandbox UUID, then asks the store to delete the
+/// row + container + auto-created persona (when unreferenced). Idempotent: a
+/// missing sandbox returns `already_absent = true` so callers can preserve the
+/// friendly "already deleted" UX without hard-exiting.
+fn run_sandbox_delete_local(
+    store: &DaemonStore,
+    id_or_name: &str,
+) -> Result<SandboxDeleteResult, core_types::ValidationError> {
+    match store.resolve_sandbox_id(id_or_name) {
+        Ok(resolved_id) => {
+            store
+                .delete_sandbox(&resolved_id)
+                .map_err(|e| core_types::ValidationError::new(e.to_string()))?;
+            Ok(SandboxDeleteResult {
+                resolved_id: Some(resolved_id),
+                already_absent: false,
+            })
+        }
+        Err(ember_daemon::infra::store::StoreError::NotFound) => Ok(SandboxDeleteResult {
+            resolved_id: None,
+            already_absent: true,
+        }),
+        Err(e) => Err(core_types::ValidationError::new(e.to_string())),
+    }
 }
 
-/// Handle `ember sandbox delete <id|name>` — implementation-note-219.
+/// implementation-note-382 — `ember up` body.
 ///
-/// Resolves the argument to a sandbox UUID, then asks the store to delete
-/// the row + container + auto-created persona (when unreferenced).
-/// Idempotent: a missing sandbox prints a friendly note and exits 0 so demo
-/// retries don't fail loudly when the row was already cleaned up.
-fn handle_sandbox_delete(store: &DaemonStore, id_or_name: &str) {
-    let resolved = match store.resolve_sandbox_id(id_or_name) {
-        Ok(uuid) => uuid,
-        Err(ember_daemon::infra::store::StoreError::NotFound) => {
-            println!("sandbox '{id_or_name}' not found (already deleted — ok)");
-            return;
+/// Detects the host's container runtime (Docker / OrbStack / Podman),
+/// renders the bundled compose template at
+/// `crates/headless-runtime/templates/compose.yml.j2` against the operator-selected
+/// profile (`dev` / `headless` / `demo`; defaults to `dev`), writes the
+/// rendered YAML to `~/.ember/run/<run-id>/compose.yml`, and shells out to
+/// `<engine> compose -f <path> --profile <name> up -d`.
+fn cmd_up(profile: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let profile = profile.unwrap_or_else(|| "dev".to_string());
+    if !matches!(profile.as_str(), "dev" | "headless" | "demo") {
+        return Err(
+            format!("unknown profile: {profile}. Supported: dev | headless | demo").into(),
+        );
+    }
+
+    let engine = emberlink_cli::up::detect_runtime_engine()?.ok_or_else(
+        || -> Box<dyn std::error::Error> {
+            emberlink_cli::up::missing_runtime_remediation().into()
+        },
+    )?;
+    println!(
+        "Runtime: {} ({})",
+        engine.display_name(),
+        engine.compose_binary()
+    );
+
+    let workspace_root = std::env::current_dir()?;
+    let template_path = workspace_root.join("crates/headless-runtime/templates/compose.yml.j2");
+    if !template_path.exists() {
+        return Err(format!(
+            "compose template not found at {} — ember up must run from the emberlink workspace root, or set EMBER_COMPOSE_TEMPLATE",
+            template_path.display()
+        )
+        .into());
+    }
+
+    let run_dir = dirs_next::home_dir()
+        .ok_or_else(|| -> Box<dyn std::error::Error> {
+            "could not resolve $HOME for ~/.ember/run".into()
+        })?
+        .join(".ember/run")
+        .join(format!("{}-{}", profile, chrono::Utc::now().timestamp()));
+    std::fs::create_dir_all(&run_dir)?;
+    let bridge_cert_dir = run_dir.join("certs");
+    std::fs::create_dir_all(&bridge_cert_dir)?;
+    let compose_path = run_dir.join("compose.yml");
+
+    let context = emberlink_cli::up::ComposeRenderContext::default_for_profile(
+        profile.clone(),
+        bridge_cert_dir,
+    );
+    let rendered = emberlink_cli::up::render_compose_template(&template_path, &context)?;
+    std::fs::write(&compose_path, &rendered)?;
+    println!("Compose: {}", compose_path.display());
+
+    let (stdout, _stderr) = emberlink_cli::up::compose_up(engine, &compose_path, &profile)?;
+    if !stdout.trim().is_empty() {
+        println!("{}", stdout.trim_end());
+    }
+
+    eprintln!(
+        "note: bridge cert provisioning + `bridge-cli ping` healthcheck land once implementation-note-406 wires the daemon presence RPC. The compose stack is up; the trust handshake is not yet enforced from this verb."
+    );
+    println!("\nember up: session ready (profile={profile})");
+    println!("Tear down with: ember down [--revoke-grants] [--purge]");
+    Ok(())
+}
+
+/// implementation-note-382 — `ember down` body.
+fn cmd_down(revoke_grants: bool, purge: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let engine = emberlink_cli::up::detect_runtime_engine()?.ok_or_else(
+        || -> Box<dyn std::error::Error> {
+            emberlink_cli::up::missing_runtime_remediation().into()
+        },
+    )?;
+
+    let run_root = dirs_next::home_dir()
+        .ok_or_else(|| -> Box<dyn std::error::Error> {
+            "could not resolve $HOME for ~/.ember/run".into()
+        })?
+        .join(".ember/run");
+    let compose_path =
+        latest_compose_yml(&run_root)?.ok_or_else(|| -> Box<dyn std::error::Error> {
+            format!(
+                "no compose stack found under {} — run `ember up` first",
+                run_root.display()
+            )
+            .into()
+        })?;
+    println!("Compose: {}", compose_path.display());
+
+    let (stdout, _stderr) = emberlink_cli::up::compose_down(engine, &compose_path, purge)?;
+    if !stdout.trim().is_empty() {
+        println!("{}", stdout.trim_end());
+    }
+    if purge {
+        println!("Removed named compose volumes (-v).");
+    }
+
+    if revoke_grants {
+        eprintln!(
+            "note: --revoke-grants accepted but not yet wired — grants survive to TTL fallback for this slice. Eager-revoke lands with implementation-note-406."
+        );
+    }
+
+    println!("ember down: session torn down.");
+    Ok(())
+}
+
+fn latest_compose_yml(run_root: &std::path::Path) -> std::io::Result<Option<std::path::PathBuf>> {
+    if !run_root.exists() {
+        return Ok(None);
+    }
+    let mut newest: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    for entry in std::fs::read_dir(run_root)? {
+        let entry = entry?;
+        let compose = entry.path().join("compose.yml");
+        if !compose.is_file() {
+            continue;
         }
-        Err(e) => {
-            eprintln!("error: {e}");
-            process::exit(1);
-        }
-    };
-    match store.delete_sandbox(&resolved) {
-        Ok(()) => println!("Deleted sandbox {resolved}"),
-        Err(e) => {
-            eprintln!("error: {e}");
-            process::exit(1);
+        let mtime = entry.metadata()?.modified()?;
+        if newest.as_ref().is_none_or(|(t, _)| mtime > *t) {
+            newest = Some((mtime, compose));
         }
     }
+    Ok(newest.map(|(_, p)| p))
 }
 
 fn main() {
@@ -3891,52 +5799,71 @@ fn main() {
     let config = load_config(cli.config.as_ref());
 
     match cli.command {
-        Commands::Init { name, keyring_service, keyring_account, touch_id, for_target, non_interactive } => {
-            // implementation-note-289: on a new machine the daemon
+        Commands::Init {
+            name,
+            keyring_service,
+            keyring_account,
+            touch_id,
+            for_target,
+            non_interactive,
+        } => {
+            // implementation-note-407: on a new machine the daemon
             // service will not be installed. Detect this early — before any
             // vault or DB work — and offer to run `sudo ember daemon install`.
             // Skip the check when the daemon is already running or the operator
             // used `--for claude-code` (that path autostarts the daemon itself).
             {
                 let socket_path = config.socket_dir.join("daemon.sock");
-                let install_status =
-                    emberlink_cli::install::detect_daemon_installed(&socket_path);
-                if install_status == emberlink_cli::install::DaemonInstallStatus::NotInstalled {
-                    match emberlink_cli::install::prompt_install_daemon(non_interactive) {
-                        Ok(()) => {
-                            println!("  Daemon:   installed successfully");
-                        }
-                        Err(emberlink_cli::install::DaemonInstallPromptError::Declined) => {
-                            eprintln!(
-                                "note: daemon install skipped — run `sudo ember daemon install` \
-                                 when ready, then re-run `ember init`"
-                            );
-                            process::exit(0);
-                        }
-                        Err(emberlink_cli::install::DaemonInstallPromptError::NonInteractive) => {
-                            eprintln!(
-                                "error: daemon is not installed and --non-interactive is set.\n\
-                                 Run `sudo ember daemon install` first, then re-run `ember init`."
-                            );
-                            process::exit(1);
-                        }
-                        Err(e) => {
-                            eprintln!("error: {e}");
-                            process::exit(1);
+                // EMBER_SKIP_DAEMON_INSTALL_CHECK: test-only bypass for the
+                // daemon-install precheck. Production code never sets this; the
+                // env var lets binary tests construct an isolated config + tmpdir
+                // without tripping the non-interactive `Declined` branch that
+                // process::exit(0)s before downstream init work completes.
+                // See implementation-note-408.
+                // implementation-note-409resolved
+                let skip_check = std::env::var("EMBER_SKIP_DAEMON_INSTALL_CHECK").is_ok();
+                if !skip_check {
+                    let install_status =
+                        emberlink_cli::install::detect_daemon_installed(&socket_path);
+                    if install_status == emberlink_cli::install::DaemonInstallStatus::NotInstalled {
+                        match emberlink_cli::install::prompt_install_daemon(non_interactive) {
+                            Ok(()) => {
+                                println!("  Daemon:   installed successfully");
+                            }
+                            Err(emberlink_cli::install::DaemonInstallPromptError::Declined) => {
+                                eprintln!(
+                                    "note: daemon install skipped — run `sudo ember daemon install` \
+                                     when ready, then re-run `ember init`"
+                                );
+                                process::exit(0);
+                            }
+                            Err(
+                                emberlink_cli::install::DaemonInstallPromptError::NonInteractive,
+                            ) => {
+                                eprintln!(
+                                    "error: daemon is not installed and --non-interactive is set.\n\
+                                     Run `sudo ember daemon install` first, then re-run `ember init`."
+                                );
+                                process::exit(1);
+                            }
+                            Err(e) => {
+                                eprintln!("error: {e}");
+                                process::exit(1);
+                            }
                         }
                     }
                 }
             }
 
-            // implementation-note-280: when `--for claude-code` is set,
+            // implementation-note-397: when `--for claude-code` is set,
             // skip basic init if the daemon DB already exists. Without this guard
             // a friendly who ran `ember init --name "Foo"` and then ran
             // `ember init --for claude-code` ended up with two extra root
             // personas ("root" + their named one) in addition to the claude-code
             // persona. We detect initialization by checking for daemon.db — the
             // file written by `open_store` during every `cmd_init` run.
-            let skip_basic_init = for_target.as_deref() == Some("claude-code")
-                && is_ember_initialized(&config);
+            let skip_basic_init =
+                for_target.as_deref() == Some("claude-code") && is_ember_initialized(&config);
 
             if skip_basic_init {
                 // Already initialized — count existing personas for the log line.
@@ -3947,9 +5874,7 @@ fn main() {
                     .and_then(|s| s.list_personas().ok())
                     .map(|ps| ps.len())
                     .unwrap_or(0);
-                println!(
-                    "Daemon DB: already initialized (existing personas: {persona_count})"
-                );
+                println!("Daemon DB: already initialized (existing personas: {persona_count})");
             } else {
                 cmd_init(
                     &config,
@@ -3960,7 +5885,7 @@ fn main() {
                     touch_id,
                 );
             }
-            // implementation-note-290: layer the claude-code onboarding on top of the
+            // implementation-note-410: layer the claude-code onboarding on top of the
             // base daemon init when `--for claude-code` is set. The base
             // init has already set up the keyring, vault, salt, and root
             // persona — the cohort A flow now creates the agent persona,
@@ -3972,9 +5897,7 @@ fn main() {
                         process::exit(1);
                     }
                 } else {
-                    eprintln!(
-                        "error: unknown --for target: {target}. Supported: claude-code"
-                    );
+                    eprintln!("error: unknown --for target: {target}. Supported: claude-code");
                     process::exit(2);
                 }
             }
@@ -3987,15 +5910,33 @@ fn main() {
                     process::exit(1);
                 }
             } else {
-                eprintln!(
-                    "error: unknown --for target: {for_target}. Supported: claude-code"
-                );
+                eprintln!("error: unknown --for target: {for_target}. Supported: claude-code");
                 process::exit(2);
             }
         }
 
+        Commands::Up { profile } => {
+            if let Err(e) = cmd_up(profile) {
+                eprintln!("error: {e}");
+                process::exit(1);
+            }
+        }
+
+        Commands::Down {
+            revoke_grants,
+            purge,
+        } => {
+            if let Err(e) = cmd_down(revoke_grants, purge) {
+                eprintln!("error: {e}");
+                process::exit(1);
+            }
+        }
+
         Commands::Daemon { action } => match action {
-            DaemonAction::Start { background, foreground: _ } => {
+            DaemonAction::Start {
+                background,
+                foreground: _,
+            } => {
                 if background {
                     if let Err(e) = config.ensure_dirs() {
                         eprintln!("error: {e}");
@@ -4006,7 +5947,7 @@ fn main() {
                     let exe = std::env::current_exe().expect("current exe");
                     let mut cmd = std::process::Command::new(exe);
                     cmd.arg("daemon").arg("start");
-                    // implementation-note-278: propagate the resolved
+                    // implementation-note-395: propagate the resolved
                     // config path (flag → EMBER_CONFIG → EMBER_DEMO_DIR) to
                     // the background child so it pins the same demo dir.
                     if let Some(config_path) = resolved_user_config_path(cli.config.as_ref()) {
@@ -4038,7 +5979,7 @@ fn main() {
                     print_banner_preamble(&config);
                 }
 
-                // implementation-note-277: warn loudly when the
+                // implementation-note-394: warn loudly when the
                 // shadow PATH isn't installed — the agent-routing invariant
                 // fails silently otherwise. Best-effort: a missing shadow
                 // dir doesn't block daemon start, but the WARN must surface
@@ -4051,7 +5992,7 @@ fn main() {
                     tracing::warn!("{msg}");
                 }
 
-                // implementation-note-278: env-var fallback — if the
+                // implementation-note-395: env-var fallback — if the
                 // operator pinned a config via EMBER_CONFIG / EMBER_DEMO_DIR
                 // (e.g. demo/dev tooling), the runtime should track that
                 // same path so reload + dashboard config-show stay coherent.
@@ -4101,7 +6042,8 @@ fn main() {
                     Ok(pid) => {
                         println!("Stopped ember daemon (PID {pid})");
                         if let Some(pubkey) = identity_pubkey {
-                            let fp = ember_daemon::infra::runtime::daemon_identity_fingerprint(&pubkey);
+                            let fp =
+                                ember_daemon::infra::runtime::daemon_identity_fingerprint(&pubkey);
                             println!();
                             println!("  Identity preserved (data dir is intact):");
                             println!("    fingerprint:  {fp}");
@@ -4125,7 +6067,7 @@ fn main() {
                             println!("ember daemon is running");
                             println!("  PID:    {}", status.pid);
                             println!("  Socket: {}", status.socket.display());
-                            // implementation-note-277: warn loudly if
+                            // implementation-note-394: warn loudly if
                             // the shadow PATH isn't installed. Without it,
                             // raw `gh`/`git`/`kubectl` calls from sequential
                             // agents bypass the broker, operator-author the
@@ -4162,21 +6104,19 @@ fn main() {
         },
 
         Commands::Persona { action } => {
-            let store = open_store(&config);
+            // implementation-note-411: all persona
+            // mutations (create, revoke) and reads (list) route through the
+            // daemon RPC socket so the operator uid never touches the DB file
+            // directly. Under design separate-uid posture (daemon=ember uid,
+            // operator=operator uid) the DB is owned by the ember uid and the
+            // operator uid cannot open it for writing — and may not be able
+            // to open it for reading depending on filesystem permissions.
+            // Routing every verb through JSON-RPC lets the daemon own all
+            // store access under its uid while the CLI only needs socket
+            // connect permission.
+            let socket_path = config.socket_dir.join("daemon.sock");
             match action {
-                // implementation-note-291: route through
-                // the daemon's `create_persona` RPC so cross-uid posture (ADR
-                // 131 separate-uid: daemon=ember uid, operator=operator uid) works.
-                // The direct-store write attempt fails with
-                // `attempt to write a readonly database` when the operator uid
-                // can't write the DB file owned by the daemon uid. The daemon
-                // already has its own DB write authority — let it do the write
-                // via JSON-RPC. The local `store` handle is still opened above
-                // for downstream read-only use elsewhere in this command.
-                //
-                // Anchor: persona_create_cmd_rpc_migration_landed.
                 PersonaAction::Create { name } => {
-                    let socket_path = config.socket_dir.join("daemon.sock");
                     let request = serde_json::json!({"name": name});
                     match emberlink_cli::call_daemon_method(
                         &socket_path,
@@ -4184,7 +6124,6 @@ fn main() {
                         &request,
                     ) {
                         Ok(result) => {
-                            let _ = &store; // suppress unused warning on cross-uid path
                             let id = result.get("id").and_then(|v| v.as_str()).unwrap_or("");
                             let display_name =
                                 result.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -4203,43 +6142,54 @@ fn main() {
                         }
                     }
                 }
-                PersonaAction::List => match store.list_personas() {
-                    Ok(personas) => {
-                        if cli.json {
-                            let arr: Vec<_> = personas.iter().map(|p| {
-                                serde_json::json!({
-                                    "id": p.id,
-                                    "name": p.name,
-                                    "status": p.status,
-                                    "public_key": p.public_key,
-                                })
-                            }).collect();
-                            println!("{}", serde_json::to_string_pretty(&arr).unwrap());
-                        } else if personas.is_empty() {
-                            println!("No personas");
-                        } else {
-                            for p in &personas {
-                                let status_marker = if p.status == "revoked" {
-                                    " [revoked]"
-                                } else {
-                                    ""
-                                };
-                                println!("{} ({}){}", p.name, p.id, status_marker);
+                PersonaAction::List => {
+                    match emberlink_cli::call_daemon_method(
+                        &socket_path,
+                        "list_personas",
+                        &serde_json::Value::Null,
+                    ) {
+                        Ok(result) => {
+                            let empty = Vec::new();
+                            let personas = result.as_array().unwrap_or(&empty);
+                            if cli.json {
+                                println!("{}", serde_json::to_string_pretty(&result).unwrap());
+                            } else if personas.is_empty() {
+                                println!("No personas");
+                            } else {
+                                for p in personas {
+                                    let id = p.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                                    let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                    let status =
+                                        p.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                                    let status_marker = if status == "revoked" {
+                                        " [revoked]"
+                                    } else {
+                                        ""
+                                    };
+                                    println!("{} ({}){}", name, id, status_marker);
+                                }
                             }
                         }
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            process::exit(1);
+                        }
                     }
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        process::exit(1);
+                }
+                PersonaAction::Revoke { id } => {
+                    let request = serde_json::json!({"id": id});
+                    match emberlink_cli::call_daemon_method(
+                        &socket_path,
+                        "revoke_persona",
+                        &request,
+                    ) {
+                        Ok(_) => println!("Revoked persona {id}"),
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            process::exit(1);
+                        }
                     }
-                },
-                PersonaAction::Revoke { id } => match store.revoke_persona(&id) {
-                    Ok(()) => println!("Revoked persona {id}"),
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        process::exit(1);
-                    }
-                },
+                }
             }
         }
 
@@ -4312,8 +6262,7 @@ fn main() {
                 if cli.json {
                     println!(
                         "{}",
-                        serde_json::to_string_pretty(&result)
-                            .unwrap_or_else(|_| "{}".to_string())
+                        serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
                     );
                 } else {
                     let signed = result
@@ -4376,6 +6325,190 @@ fn main() {
                 return;
             }
 
+            // These verbs can route through the daemon without changing the
+            // operator-visible data contract, so prefer the daemon surface and
+            // avoid opening the vault in-process when the socket exists.
+            match &action {
+                VaultAction::List(VaultListArgs { prefix }) => {
+                    match run_vault_list(&config, prefix.as_deref()) {
+                        Ok((_, entries)) => {
+                            if cli.json {
+                                println!("{}", serde_json::to_string_pretty(&entries).unwrap());
+                            } else if entries.is_empty() {
+                                println!("No credentials in vault");
+                            } else {
+                                for entry in &entries {
+                                    if let Some(name) = entry.get("name").and_then(|v| v.as_str()) {
+                                        println!("{name}");
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            process::exit(1);
+                        }
+                    }
+                    return;
+                }
+                VaultAction::Add {
+                    name,
+                    value,
+                    stdin,
+                    file,
+                    delete_source,
+                    from_downloads,
+                    metadata,
+                } => {
+                    if let Err(e) = validate_credential_name(name) {
+                        eprintln!("error: invalid credential name: {e}");
+                        eprintln!(
+                            "       see design §5.1 for the path grammar (lowercase \
+                                 + digits + hyphen, 1..=4 path segments separated by '/')"
+                        );
+                        process::exit(2);
+                    }
+                    if value.is_some() {
+                        refuse_value_in_argv("value");
+                    }
+                    let resolved = match resolve_credential_input(
+                        *stdin,
+                        file.as_deref(),
+                        *delete_source,
+                        *from_downloads,
+                    ) {
+                        Ok(bytes) => bytes,
+                        Err(code) => process::exit(code),
+                    };
+                    match run_vault_store(&config, name, &resolved, metadata.as_deref()) {
+                        Ok(info) => {
+                            let _ = info.dispatch;
+                            println!("Stored credential");
+                            println!("  ID:   {}", info.id);
+                            println!("  Name: {}", info.name);
+                        }
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            process::exit(1);
+                        }
+                    }
+                    return;
+                }
+                VaultAction::Get(VaultGetArgs {
+                    name,
+                    unmask,
+                    i_know_what_im_doing,
+                }) => {
+                    match run_vault_get(&config, name) {
+                        Ok((_, value)) => {
+                            if *unmask {
+                                if std::io::stdout().is_terminal() && !i_know_what_im_doing {
+                                    eprintln!(
+                                        "error: --unmask refused on a TTY. Re-run with one of:"
+                                    );
+                                    eprintln!(
+                                        "         ember vault get {name} --unmask | tee /dev/null   # pipe to non-TTY"
+                                    );
+                                    eprintln!(
+                                        "         ember vault get {name} --unmask --i-know-what-im-doing"
+                                    );
+                                    process::exit(2);
+                                }
+                                let text = String::from_utf8_lossy(&value);
+                                println!("{text}");
+                            } else {
+                                println!(
+                                    "{}",
+                                    emberlink_cli::vault_io::mask_credential_for_display(&value)
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            process::exit(1);
+                        }
+                    }
+                    return;
+                }
+                VaultAction::Put(args) => {
+                    if let Err(e) = validate_credential_name(&args.name) {
+                        eprintln!("error: invalid credential name: {e}");
+                        eprintln!(
+                            "       see design §5.1 for the path grammar (lowercase \
+                                 + digits + hyphen, 1..=4 path segments separated by '/')"
+                        );
+                        process::exit(2);
+                    }
+                    if args.value.is_some() {
+                        refuse_value_in_argv("value");
+                    }
+                    let resolved = match resolve_credential_input(
+                        args.stdin,
+                        args.file.as_deref(),
+                        args.delete_source,
+                        args.from_downloads,
+                    ) {
+                        Ok(bytes) => bytes,
+                        Err(code) => process::exit(code),
+                    };
+                    match run_vault_store(&config, &args.name, &resolved, args.metadata.as_deref())
+                    {
+                        Ok(info) => {
+                            let _ = info.dispatch;
+                            println!("Stored credential");
+                            println!("  ID:   {}", info.id);
+                            println!("  Name: {}", info.name);
+                        }
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            process::exit(1);
+                        }
+                    }
+                    return;
+                }
+                VaultAction::Remove { name } => {
+                    match run_vault_remove(&config, name) {
+                        Ok(_) => println!("Removed credential {name}"),
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            process::exit(1);
+                        }
+                    }
+                    return;
+                }
+                _ => {}
+            }
+
+            // Lock/unlock are authority-sensitive but do not need the normal
+            // open_store + Vault::open_from_config data path.
+            if matches!(&action, VaultAction::Lock | VaultAction::Unlock) {
+                let result = match &action {
+                    VaultAction::Lock => run_vault_lock(&config).map(|_| "locked"),
+                    VaultAction::Unlock => run_vault_unlock(&config).map(|_| "unlocked"),
+                    _ => unreachable!("lock/unlock branch must only handle lock-style actions"),
+                };
+                match result {
+                    Ok(state) => {
+                        if cli.json {
+                            println!("{{\"{state}\": true}}");
+                        } else if state == "locked" {
+                            println!(
+                                "Vault session re-locked. Next high-risk op will prompt for user presence."
+                            );
+                        } else {
+                            println!(
+                                "Vault session unlocked. Non-session operator flows may use the daemon vault again."
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        process::exit(1);
+                    }
+                }
+                return;
+            }
+
             // Client-side pre-validation: fail fast on a malformed name before
             // we open the store / unlock the vault (which on macOS would fire
             // a Touch ID prompt). The daemon-side check in `Vault::add` is
@@ -4392,259 +6525,56 @@ fn main() {
                 _ => None,
             };
             if let Some(name) = pre_validate_name
-                && let Err(e) = validate_credential_name(name) {
-                    eprintln!("error: invalid credential name: {e}");
-                    eprintln!(
-                        "       see design §5.1 for the path grammar (lowercase \
+                && let Err(e) = validate_credential_name(name)
+            {
+                eprintln!("error: invalid credential name: {e}");
+                eprintln!(
+                    "       see design §5.1 for the path grammar (lowercase \
                          + digits + hyphen, 1..=4 path segments separated by '/')"
-                    );
-                    process::exit(2);
-                }
+                );
+                process::exit(2);
+            }
 
-            let store = open_store(&config);
-            let vault = Vault::open_from_config(&config)
-                .expect("failed to resolve vault — is the daemon initialized?");
-
+            // [open-store-audit] MUTATOR-MIXED: Commands::Vault.
+            //   Add/Put     → MUTATOR (`vault_add`) when a daemon socket is
+            //                 present; local fallback when no daemon exists.
+            //   Remove      → MUTATOR (`vault_remove`) when a daemon socket is
+            //                 present; local fallback when no daemon exists.
+            //   Import      → MUTATOR. No dedicated batch RPC, but the CLI
+            //                 now commits via per-entry `vault_add` on the
+            //                 current authority surface.
+            //   List        → READ-ONLY (`vault_list`) when a daemon socket is
+            //                 present; local fallback when no daemon exists.
+            //   Get         → READ-ONLY (`vault_get`) when a daemon socket is
+            //                 present; local fallback when no daemon exists.
+            //   Export      → READ-ONLY. No dedicated batch RPC, but the CLI
+            //                 now reads via `vault_list` + `vault_get` on the
+            //                 current authority surface.
+            //   Lock/Unlock → MUTATOR (`vault_lock` / `vault_unlock`) when a
+            //                 daemon socket is present; local fallback when no
+            //                 daemon exists. Handled before `open_store`.
+            // Migration is per-arm and high-traffic; deferred to follow-up.
             match action {
-                VaultAction::Add {
-                    name,
-                    value,
-                    stdin,
-                    file,
-                    delete_source,
-                    from_downloads,
-                    metadata,
-                } => {
-                    if value.is_some() {
-                        refuse_value_in_argv("value");
-                    }
-                    let resolved: Vec<u8> = if stdin {
-                        let mut buf = Vec::new();
-                        if let Err(e) = io::stdin().read_to_end(&mut buf) {
-                            eprintln!("error: failed to read stdin: {e}");
-                            process::exit(1);
-                        }
-                        if buf.last() == Some(&b'\n') {
-                            buf.pop();
-                            if buf.last() == Some(&b'\r') {
-                                buf.pop();
-                            }
-                        }
-                        if buf.is_empty() {
-                            eprintln!("error: --stdin received empty value");
-                            process::exit(1);
-                        }
-                        buf
-                    } else if let Some(path) = file.as_ref() {
-                        // Reject Downloads paths unless explicitly allowed.
-                        let downloads_dir = dirs_next::download_dir();
-                        if !from_downloads
-                            && let Some(dl) = downloads_dir.as_ref()
-                            && path.starts_with(dl)
-                        {
-                            eprintln!(
-                                "error: --file refuses paths under ~/Downloads ({}) — \
-                                 Downloads is a known cleartext-credential leak surface.",
-                                dl.display()
-                            );
-                            eprintln!(
-                                "       Move the file to a non-Downloads path, or pass \
-                                 --from-downloads to acknowledge the risk."
-                            );
-                            process::exit(2);
-                        }
-                        let bytes = match std::fs::read(path) {
-                            Ok(b) => b,
-                            Err(e) => {
-                                eprintln!("error: failed to read --file {}: {e}", path.display());
-                                process::exit(1);
-                            }
-                        };
-                        if bytes.is_empty() {
-                            eprintln!("error: --file {} is empty", path.display());
-                            process::exit(1);
-                        }
-                        if delete_source {
-                            // Best-effort overwrite-then-unlink. We zero the bytes via
-                            // a single write of NULs at the same length. fsync is omitted
-                            // intentionally — page-cache flush is sufficient against
-                            // shell-history-style attacks; cold-disk forensics is out of
-                            // scope for this CLI surface.
-                            let zeros = vec![0u8; bytes.len()];
-                            if let Err(e) = std::fs::write(path, &zeros) {
-                                eprintln!(
-                                    "warn: --delete-source: failed to zero {}: {e}",
-                                    path.display()
-                                );
-                            }
-                            if let Err(e) = std::fs::remove_file(path) {
-                                eprintln!(
-                                    "warn: --delete-source: failed to unlink {}: {e}",
-                                    path.display()
-                                );
-                            }
-                        }
-                        bytes
-                    } else if io::stdin().is_terminal() {
-                        match rpassword::prompt_password("Paste credential value: ") {
-                            Ok(s) if s.is_empty() => {
-                                eprintln!("error: empty value");
-                                process::exit(1);
-                            }
-                            Ok(s) => s.into_bytes(),
-                            Err(e) => {
-                                eprintln!("error: failed to read prompt: {e}");
-                                process::exit(1);
-                            }
-                        }
-                    } else {
-                        eprintln!(
-                            "error: no value source. Pass --stdin (pipe or terminal) or \
-                             --file <path>; --value is refused (leaks via shell history)."
-                        );
-                        process::exit(2);
-                    };
-                    match vault.add(VaultScope::Interactive, &store, &name, &resolved, metadata.as_deref()) {
-                        Ok(info) => {
-                            println!("Stored credential");
-                            println!("  ID:   {}", info.id);
-                            println!("  Name: {}", info.name);
-                        }
-                        Err(e) => {
-                            eprintln!("error: {e}");
-                            process::exit(1);
-                        }
-                    }
-                }
-                VaultAction::List(VaultListArgs { prefix }) => match vault.list(VaultScope::Interactive, &store) {
-                    Ok(mut creds) => {
-                        if let Some(p) = prefix.as_deref()
-                            && !p.is_empty() {
-                            creds.retain(|c| c.name.starts_with(p));
-                        }
-                        if cli.json {
-                            let arr: Vec<_> = creds.iter().map(|c| {
-                                serde_json::json!({
-                                    "id": c.id,
-                                    "name": c.name,
-                                    "metadata": c.metadata,
-                                })
-                            }).collect();
-                            println!("{}", serde_json::to_string_pretty(&arr).unwrap());
-                        } else if creds.is_empty() {
-                            println!("No credentials in vault");
-                        } else {
-                            // Names only — never values. Per
-                            // implementation-note-276.
-                            for c in &creds {
-                                println!("{}", c.name);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        process::exit(1);
-                    }
-                },
-                VaultAction::Get(VaultGetArgs {
-                    name,
-                    unmask,
-                    i_know_what_im_doing,
-                }) => match vault.get(VaultScope::Interactive, &store, &name) {
-                    Ok(value) => {
-                        // Default: mask all but the last 4 chars to protect
-                        // screen-recording demos from accidental leaks.
-                        // `--unmask` opt-in is refused on a TTY unless
-                        // `--i-know-what-im-doing` is also set.
-                        if unmask {
-                            if std::io::stdout().is_terminal() && !i_know_what_im_doing {
-                                eprintln!(
-                                    "error: --unmask refused on a TTY. Re-run with one of:"
-                                );
-                                eprintln!(
-                                    "         ember vault get {name} --unmask | tee /dev/null   # pipe to non-TTY"
-                                );
-                                eprintln!(
-                                    "         ember vault get {name} --unmask --i-know-what-im-doing"
-                                );
-                                process::exit(2);
-                            }
-                            let text = String::from_utf8_lossy(&value);
-                            println!("{text}");
-                        } else {
-                            println!(
-                                "{}",
-                                emberlink_cli::vault_io::mask_credential_for_display(&value)
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        process::exit(1);
-                    }
-                },
-                VaultAction::Put(args) => {
-                    let VaultPutArgs {
-                        name,
-                        value,
-                        stdin,
-                        file,
-                        delete_source,
-                        from_downloads,
-                        metadata,
-                    } = args;
-                    if value.is_some() {
-                        refuse_value_in_argv("value");
-                    }
-                    let resolved = match resolve_credential_input(
-                        stdin,
-                        file.as_deref(),
-                        delete_source,
-                        from_downloads,
-                    ) {
-                        Ok(bytes) => bytes,
-                        Err(code) => process::exit(code),
-                    };
-                    match vault.add(VaultScope::Interactive, &store, &name, &resolved, metadata.as_deref()) {
-                        Ok(info) => {
-                            println!("Stored credential");
-                            println!("  ID:   {}", info.id);
-                            println!("  Name: {}", info.name);
-                        }
-                        Err(e) => {
-                            eprintln!("error: {e}");
-                            process::exit(1);
-                        }
-                    }
-                }
+                VaultAction::Add { .. } => unreachable!("add is handled before vault open"),
+                VaultAction::List(_) => unreachable!("list is handled before vault open"),
+                VaultAction::Get(_) => unreachable!("get is handled before vault open"),
+                VaultAction::Put(_) => unreachable!("put is handled before vault open"),
                 VaultAction::Export(args) => {
-                    if let Err(code) = run_vault_export(&vault, &store, cli.json, args) {
+                    if let Err(code) = run_vault_export(&config, cli.json, args) {
                         process::exit(code);
                     }
                 }
                 VaultAction::Import(args) => {
-                    if let Err(code) = run_vault_import(&vault, &store, args) {
+                    if let Err(code) = run_vault_import(&config, args) {
                         process::exit(code);
                     }
                 }
-                VaultAction::Remove { name } => match vault.remove(VaultScope::Interactive, &store, &name) {
-                    Ok(()) => println!("Removed credential {name}"),
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        process::exit(1);
-                    }
-                },
+                VaultAction::Remove { .. } => unreachable!("remove is handled before vault open"),
                 VaultAction::Lock => {
-                    // Explicit re-lock. Best-effort — both the in-process
-                    // presence state AND the
-                    // SE-keyring session cache get cleared so the next
-                    // high-risk op MUST re-prompt for biometric.
-                    ember_daemon::trust::presence::lock();
-                    if cli.json {
-                        println!("{{\"locked\": true}}");
-                    } else {
-                        println!("Vault session re-locked. Next high-risk op will prompt for user presence.");
-                    }
+                    unreachable!("lock is handled before vault open");
+                }
+                VaultAction::Unlock => {
+                    unreachable!("unlock is handled before vault open");
                 }
                 VaultAction::MigrateAcl => {
                     // Handled above (before vault open) via the early-return path.
@@ -4654,8 +6584,21 @@ fn main() {
         }
 
         Commands::Grant { action } => {
-            let store = open_store(&config);
-            match action {
+            // [open-store-audit] MUTATOR-MIXED: Commands::Grant.
+            //   Create   → MUTATOR (`create_grant`) when a daemon socket is
+            //              present; local fallback when no daemon exists.
+            //   Delegate → MUTATOR (`delegate_grant`) when a daemon socket is
+            //              present; local fallback when no daemon exists.
+            //   List     → READ-ONLY (`list_operator_grants`) when a daemon
+            //              socket is present; local fallback when no daemon exists.
+            //   Revoke   → MUTATOR (`revoke_grant`) on the daemon socket.
+            //   Expire   → MUTATOR (`expire_grants`) when a daemon socket is
+            //              present; local fallback when no daemon exists.
+            //   Budget   → READ-ONLY (`grant_status`) when a daemon socket is
+            //              present; local fallback when no daemon exists.
+            //   Extend   → MUTATOR (`extend_grant`) when a daemon socket is
+            //              present; local fallback when no daemon exists.
+            match &action {
                 GrantAction::Create {
                     persona,
                     credential,
@@ -4670,21 +6613,16 @@ fn main() {
                     budget_usd,
                     budget_requests,
                     budget_seconds,
-                    attestation_runtime,
+                    attestation_runtime: _,
                     standing,
                     max_children_per_day,
                     auto_delegate_scope_template,
                 } => {
-                    // — `--standing` requires `--max-children-per-day`
-                    // and implies a delegation depth, so reject the
-                    // ambiguous combinations up front.
-                    if standing && max_children_per_day.is_none() {
-                        eprintln!(
-                            "error: --standing requires --max-children-per-day"
-                        );
+                    if *standing && max_children_per_day.is_none() {
+                        eprintln!("error: --standing requires --max-children-per-day");
                         process::exit(1);
                     }
-                    if standing && delegation_depth.is_none() {
+                    if *standing && delegation_depth.is_none() {
                         eprintln!(
                             "error: --standing requires --delegation-depth (the parent must allow delegation)"
                         );
@@ -4710,117 +6648,59 @@ fn main() {
                         },
                         None => None,
                     };
-                    let budget = build_budget(budget_tokens, parsed_cents, budget_requests, budget_seconds);
-                    // implementation-note-151 — budget_persists_on_simple_grant.
-                    //
-                    // Pre-fix: this path called `create_grant` (no budget) and
-                    // then UPDATE'd the flat `budget_json` column. But
-                    // `row_to_grant` prefers the composite chain's first-
-                    // statement budget when present, so the chain (which had
-                    // budget=None) shadowed the UPDATE and the budget was
-                    // silently dropped on read — including in `/api/grants`.
-                    //
-                    // Post-fix: route through `create_grant_with_budget` so
-                    // the budget lands in block-zero's statement at mint time.
-                    // The flat `budget_json` column is intentionally NOT
-                    // written here per the function's contract (single source
-                    // of truth = the signed chain).
-                    match store.create_grant_with_budget(&persona, &credential, &scope, ttl_secs, budget.clone()) {
-                    Ok(info) => {
-                        // Apply non-budget conditions via UPDATE if any are set.
-                        let targets_json = allowed_targets.as_ref().map(|t| {
-                            let targets: Vec<&str> = t.split(',').collect();
-                            serde_json::to_string(&targets).unwrap_or_default()
-                        });
-                        let attestation_json = attestation_runtime.as_ref().map(|r| {
-                            serde_json::to_string(&serde_json::json!({"status": "unattested_local_dev", "runtime": r})).unwrap_or_default()
-                        });
-                        if rate_limit.is_some()
-                            || hours_start.is_some()
-                            || targets_json.is_some()
-                            || delegation_depth.is_some()
-                            || attestation_json.is_some()
-                        {
-                            let _ = store.conn().execute(
-                                "UPDATE grants SET max_uses_per_hour=?1, allowed_hours_start=?2, allowed_hours_end=?3, allowed_targets=?4, max_delegation_depth=?5 WHERE id=?6",
-                                rusqlite::params![
-                                    rate_limit.map(|v| v as i64),
-                                    hours_start.map(|v| v as i64),
-                                    hours_end.map(|v| v as i64),
-                                    targets_json,
-                                    delegation_depth.map(|v| v as i64),
-                                    info.id,
-                                ],
-                            );
+                    let spec = GrantCreateSpec {
+                        persona: persona.clone(),
+                        credential: credential.clone(),
+                        scope: scope.clone(),
+                        ttl_secs,
+                        max_uses_per_hour: *rate_limit,
+                        allowed_hours_start: *hours_start,
+                        allowed_hours_end: *hours_end,
+                        allowed_targets: allowed_targets.as_ref().map(|targets| {
+                            targets
+                                .split(',')
+                                .map(str::to_owned)
+                                .collect::<Vec<String>>()
+                        }),
+                        max_delegation_depth: *delegation_depth,
+                        budget: build_budget(
+                            *budget_tokens,
+                            parsed_cents,
+                            *budget_requests,
+                            *budget_seconds,
+                        ),
+                        max_children_per_day: if *standing {
+                            *max_children_per_day
+                        } else {
+                            None
+                        },
+                        auto_delegate_scope_template: if *standing {
+                            auto_delegate_scope_template.clone()
+                        } else {
+                            None
+                        },
+                    };
+                    match run_grant_create(&config, &spec) {
+                        Ok((_, response)) => {
+                            if cli.json {
+                                println!("{}", serde_json::to_string_pretty(&response).unwrap());
+                            } else if response["status"] == serde_json::json!("pending_approval") {
+                                let approval_id =
+                                    response["approval_id"].as_str().unwrap_or("<unknown>");
+                                println!("Grant creation pending approval");
+                                println!("  Approval:   {approval_id}");
+                            } else {
+                                let id = response["id"].as_str().unwrap_or("");
+                                let expires_at = response["expires_at"].as_str();
+                                print_created_grant(&spec, id, expires_at);
+                            }
                         }
-                        // — flip the `is_standing` flag after the
-                        // base grant row exists so `mark_grant_standing`
-                        // can enforce its preconditions (grant must exist;
-                        // ceiling > 0). Depth was already set by the UPDATE
-                        // above when --delegation-depth was passed, which
-                        // the standing precondition requires.
-                        if standing
-                            && let Some(limit) = max_children_per_day
-                            && let Err(e) = store.mark_grant_standing(
-                                &info.id,
-                                limit,
-                                auto_delegate_scope_template.as_deref(),
-                            )
-                        {
-                            eprintln!("error: failed to mark grant standing: {e}");
+                        Err(e) => {
+                            eprintln!("error: {e}");
                             process::exit(1);
                         }
-                        println!("Created grant");
-                        println!("  ID:         {}", info.id);
-                        println!("  Persona:    {}", info.persona_id);
-                        println!("  Credential: {}", info.credential_name);
-                        println!("  Scope:      {}", info.scope);
-                        if let Some(exp) = &info.expires_at {
-                            println!("  Expires:    {exp}");
-                        } else {
-                            println!("  Expires:    never");
-                        }
-                        if let Some(rl) = rate_limit {
-                            println!("  Rate limit: {rl}/hour");
-                        }
-                        if let Some(hs) = hours_start {
-                            println!("  Hours:      {hs}:00-{}:00 UTC", hours_end.unwrap_or(0));
-                        }
-                        if let Some(ref t) = allowed_targets {
-                            println!("  Targets:    {t}");
-                        }
-                        if let Some(d) = delegation_depth {
-                            println!("  Delegation: max depth {d}");
-                        }
-                        if let Some(ref b) = budget {
-                            if let Some(t) = b.tokens {
-                                println!("  Budget:     {} tokens", t);
-                            }
-                            if let Some(c) = b.cents {
-                                println!("  Budget:     ${:.2}", c as f64 / 100.0);
-                            }
-                            if let Some(r) = b.requests {
-                                println!("  Budget:     {} requests", r);
-                            }
-                            if let Some(s) = b.wall_clock_secs {
-                                println!("  Budget:     {}s wall-clock", s);
-                            }
-                        }
-                        if standing {
-                            println!(
-                                "  Standing:   yes (max {}/day)",
-                                max_children_per_day.unwrap_or(0)
-                            );
-                            if let Some(ref tpl) = auto_delegate_scope_template {
-                                println!("  Auto-scope: {tpl}");
-                            }
-                        }
                     }
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        process::exit(1);
-                    }
-                    }
+                    return;
                 }
                 GrantAction::Delegate {
                     parent,
@@ -4853,33 +6733,25 @@ fn main() {
                         None => None,
                     };
                     let child_budget = build_budget(
-                        budget_tokens,
+                        *budget_tokens,
                         parsed_cents,
-                        budget_requests,
-                        budget_seconds,
+                        *budget_requests,
+                        *budget_seconds,
                     );
-                    match store.delegate_grant_full(
-                        &parent,
-                        &persona,
-                        &scope,
+                    match run_grant_delegate(
+                        &config,
+                        parent,
+                        persona,
+                        scope,
                         ttl_secs,
                         child_budget,
                     ) {
-                        Ok(info) => {
+                        Ok((_, info)) => {
                             if cli.json {
-                                println!(
-                                    "{}",
-                                    serde_json::json!({
-                                        "id": info.id,
-                                        "parent_grant_id": parent,
-                                        "persona_id": info.persona_id,
-                                        "scope": info.scope,
-                                        "expires_at": info.expires_at,
-                                        "budget": info.budget,
-                                    })
-                                );
+                                println!("{}", serde_json::to_string_pretty(&info).unwrap());
                             } else {
-                                println!("{}", info.id);
+                                let id = info.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                                println!("{id}");
                             }
                         }
                         Err(e) => {
@@ -4887,35 +6759,35 @@ fn main() {
                             process::exit(1);
                         }
                     }
+                    return;
                 }
                 GrantAction::List { active } => {
-                    let grants = if active {
-                        store.list_active_grants()
-                    } else {
-                        store.list_grants()
-                    };
-                    match grants {
-                        Ok(list) => {
+                    match run_grant_list(&config, *active) {
+                        Ok((_, list)) => {
                             if cli.json {
-                                let arr: Vec<_> = list.iter().map(|g| {
-                                    serde_json::json!({
-                                        "id": g.id,
-                                        "persona_id": g.persona_id,
-                                        "credential_name": g.credential_name,
-                                        "scope": g.scope,
-                                        "status": g.status,
-                                        "expires_at": g.expires_at,
-                                    })
-                                }).collect();
-                                println!("{}", serde_json::to_string_pretty(&arr).unwrap());
+                                println!("{}", serde_json::to_string_pretty(&list).unwrap());
                             } else if list.is_empty() {
                                 println!("No grants");
                             } else {
                                 for g in &list {
-                                    let exp = g.expires_at.as_deref().unwrap_or("never");
+                                    let exp = g
+                                        .get("expires_at")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("never");
+                                    let id = g.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                                    let persona_id =
+                                        g.get("persona_id").and_then(|v| v.as_str()).unwrap_or("");
+                                    let credential_name = g
+                                        .get("credential_name")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let scope =
+                                        g.get("scope").and_then(|v| v.as_str()).unwrap_or("");
+                                    let status =
+                                        g.get("status").and_then(|v| v.as_str()).unwrap_or("");
                                     println!(
                                         "{} {} → {} ({}) expires {} [{}]",
-                                        g.id, g.persona_id, g.credential_name, g.scope, exp, g.status
+                                        id, persona_id, credential_name, scope, exp, status
                                     );
                                 }
                             }
@@ -4925,29 +6797,37 @@ fn main() {
                             process::exit(1);
                         }
                     }
+                    return;
                 }
-                GrantAction::Revoke { id } => match store.revoke_grant(&id) {
-                    Ok(()) => println!("Revoked grant {id}"),
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        process::exit(1);
+                GrantAction::Revoke { id } => {
+                    let socket_path = config.socket_dir.join("daemon.sock");
+                    let request = serde_json::json!({ "id": id });
+                    match emberlink_cli::call_daemon_method(&socket_path, "revoke_grant", &request)
+                    {
+                        Ok(_) => println!("Revoked grant {id}"),
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            process::exit(1);
+                        }
                     }
-                },
-                GrantAction::Expire => match store.expire_stale_grants() {
-                    Ok(count) => println!("Expired {} stale grant(s)", count),
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        process::exit(1);
+                    return;
+                }
+                GrantAction::Expire => {
+                    match run_grant_expire(&config) {
+                        Ok((_, count)) => println!("Expired {} stale grant(s)", count),
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            process::exit(1);
+                        }
                     }
-                },
-                GrantAction::Budget { grant_id } => match store.get_access_grant(&grant_id) {
-                    Ok(grant) => cmd_grant_budget(&grant),
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        process::exit(1);
-                    }
-                },
-                GrantAction::Extend { grant_id, tokens, cents, ttl } => {
+                    return;
+                }
+                GrantAction::Extend {
+                    grant_id,
+                    tokens,
+                    cents,
+                    ttl,
+                } => {
                     let parsed_cents = match cents.as_deref() {
                         Some(s) => match parse_usd_to_cents(s) {
                             Ok(c) => Some(c),
@@ -4968,7 +6848,7 @@ fn main() {
                         },
                         None => None,
                     };
-                    match store.extend_grant(&grant_id, tokens, parsed_cents, ttl_secs) {
+                    match run_grant_extend(&config, grant_id, *tokens, parsed_cents, ttl_secs) {
                         Ok(_) => {
                             let mut parts = Vec::new();
                             if let Some(t) = tokens {
@@ -4991,12 +6871,31 @@ fn main() {
                             process::exit(1);
                         }
                     }
-                },
+                    return;
+                }
+                GrantAction::Budget { grant_id } => {
+                    match run_grant_budget(&config, grant_id) {
+                        Ok((_, rendered)) => print!("{rendered}"),
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            process::exit(1);
+                        }
+                    }
+                    return;
+                }
             }
         }
 
         Commands::Sandbox { action } => {
-            let store = open_store(&config);
+            // [open-store-audit] MUTATOR-MIXED: Commands::Sandbox.
+            //   Create/List/Stop/Delete/Exec → daemon-backed when a live
+            //                socket exists; local fallback only on
+            //                no-daemon/dev paths.
+            //   Run        → daemon-backed for sandbox create/start plus
+            //                composite grant policy/approval orchestration;
+            //                local fallback only on no-daemon/dev paths.
+            //                The final interactive `docker exec` handoff is
+            //                still a local operator terminal step.
             match action {
                 SandboxAction::Create {
                     name,
@@ -5013,11 +6912,12 @@ fn main() {
                     let extra_env: Vec<(String, String)> = env
                         .iter()
                         .filter_map(|kv| {
-                            kv.split_once('=').map(|(k, v)| (k.to_string(), v.to_string()))
+                            kv.split_once('=')
+                                .map(|(k, v)| (k.to_string(), v.to_string()))
                         })
                         .collect();
-                    let owner_persona_id = persona
-                        .or_else(|| std::env::var("EMBER_PERSONA_ID").ok());
+                    let owner_persona_id =
+                        persona.or_else(|| std::env::var("EMBER_PERSONA_ID").ok());
                     let opts = SandboxCreateOpts {
                         name: name.clone(),
                         image: image.clone(),
@@ -5030,27 +6930,16 @@ fn main() {
                         extra_env: extra_env.clone(),
                         owner_persona_id,
                     };
-                    let sandbox = match store
-                        .create_sandbox_with_opts(&opts, Some(&config.data_dir))
-                    {
-                        Ok(s) => s,
+                    let created = match run_sandbox_create(&config, &opts) {
+                        Ok((_, created)) => created,
                         Err(e) => {
                             eprintln!("error: {e}");
                             process::exit(1);
                         }
                     };
-                    let container_id = match store.start_container(
-                        &sandbox.id,
-                        &config.socket_dir,
-                        network.as_deref(),
-                        &extra_env,
-                    ) {
-                        Ok(cid) => cid,
-                        Err(e) => {
-                            eprintln!("warning: sandbox created but container failed: {e}");
-                            "none".to_string()
-                        }
-                    };
+                    if let Some(ref e) = created.start_error {
+                        eprintln!("warning: sandbox created but container failed: {e}");
+                    }
                     // Record image digest to ~/.ember/images.toml
                     let registry_path = config.data_dir.join("images.toml");
                     match resolve_image_digest(&image) {
@@ -5058,9 +6947,13 @@ fn main() {
                             record_image_digest(&registry_path, &image, &digest);
                         }
                         None => {
-                            eprintln!("warning: could not resolve image digest for {image} — docker may not be available");
+                            eprintln!(
+                                "warning: could not resolve image digest for {image} — docker may not be available"
+                            );
                         }
                     }
+                    let container_id = created.container_id.as_deref().unwrap_or("none");
+                    let sandbox = &created.sandbox;
                     println!("Created sandbox");
                     println!("  ID:        {}", sandbox.id);
                     println!("  Persona:   {}", sandbox.persona_id);
@@ -5069,8 +6962,8 @@ fn main() {
                         println!("  Workspace: {ws}");
                     }
                 }
-                SandboxAction::List => match store.list_sandboxes() {
-                    Ok(sandboxes) => {
+                SandboxAction::List => match run_sandbox_list(&config) {
+                    Ok((_, sandboxes)) => {
                         if sandboxes.is_empty() {
                             println!("No sandboxes");
                         } else {
@@ -5088,39 +6981,36 @@ fn main() {
                         process::exit(1);
                     }
                 },
-                SandboxAction::Stop { id } => {
-                    let resolved = match store.resolve_sandbox_id(&id) {
-                        Ok(uuid) => uuid,
-                        Err(e) => {
-                            eprintln!("error: {e}");
-                            process::exit(1);
-                        }
-                    };
-                    match store.stop_sandbox(&resolved) {
-                        Ok(()) => println!("Stopped sandbox {resolved}"),
-                        Err(e) => {
-                            eprintln!("error: {e}");
-                            process::exit(1);
-                        }
+                SandboxAction::Stop { id } => match run_sandbox_stop(&config, &id) {
+                    Ok((_, resolved_id)) => println!("Stopped sandbox {resolved_id}"),
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        process::exit(1);
                     }
-                }
-                SandboxAction::Delete { id } => {
-                    handle_sandbox_delete(&store, &id);
-                }
-                SandboxAction::Exec { id, persona, command } => {
-                    let resolved_id = match store.resolve_sandbox_id(&id) {
-                        Ok(uuid) => uuid,
-                        Err(e) => {
-                            eprintln!("error: {e}");
-                            process::exit(1);
-                        }
-                    };
+                },
+                SandboxAction::Delete { id } => match run_sandbox_delete(&config, &id) {
+                    Ok((_, deleted)) if deleted.already_absent => {
+                        println!("sandbox '{id}' not found (already deleted — ok)");
+                    }
+                    Ok((_, deleted)) => {
+                        let resolved_id = deleted.resolved_id.as_deref().unwrap_or("(unknown)");
+                        println!("Deleted sandbox {resolved_id}");
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        process::exit(1);
+                    }
+                },
+                SandboxAction::Exec {
+                    id,
+                    persona,
+                    command,
+                } => {
                     let caller_persona = persona
                         .or_else(|| std::env::var("EMBER_PERSONA_ID").ok())
-                        .unwrap_or_default();
-                    let refs: Vec<&str> = command.iter().map(String::as_str).collect();
-                    match store.exec_sandbox(&resolved_id, &refs, &caller_persona) {
-                        Ok(output) => print!("{output}"),
+                        .filter(|s| !s.is_empty());
+                    match run_sandbox_exec(&config, &id, caller_persona, &command) {
+                        Ok((_, output)) => print!("{output}"),
                         Err(e) => {
                             eprintln!("error: {e}");
                             process::exit(1);
@@ -5185,8 +7075,7 @@ fn main() {
                         })
                         .collect();
 
-                    let run_owner_persona_id =
-                        std::env::var("EMBER_PERSONA_ID").ok();
+                    let run_owner_persona_id = std::env::var("EMBER_PERSONA_ID").ok();
                     let opts = SandboxCreateOpts {
                         name: name.clone(),
                         image: image.clone(),
@@ -5199,28 +7088,24 @@ fn main() {
                         extra_env: extra_env.clone(),
                         owner_persona_id: run_owner_persona_id,
                     };
-
-                    let sandbox = match store.create_sandbox_with_opts(&opts, Some(&config.data_dir)) {
-                        Ok(s) => s,
+                    let prepared = match run_sandbox_run(
+                        &config,
+                        &opts,
+                        &statements,
+                        ttl_secs,
+                        credential_resource.as_deref(),
+                    ) {
+                        Ok((_, prepared)) => prepared,
                         Err(e) => {
                             eprintln!("error: {e}");
                             process::exit(1);
                         }
                     };
-
-                    // Start the container.
-                    let container_id = match store.start_container(
-                        &sandbox.id,
-                        &config.socket_dir,
-                        None,
-                        &extra_env,
-                    ) {
-                        Ok(cid) => cid,
-                        Err(e) => {
-                            eprintln!("warning: sandbox created but container failed: {e}");
-                            "none".to_string()
-                        }
-                    };
+                    if let Some(ref e) = prepared.start_error {
+                        eprintln!("warning: sandbox created but container failed: {e}");
+                    }
+                    let container_id = prepared.container_id.as_deref().unwrap_or("none");
+                    let sandbox = &prepared.sandbox;
 
                     println!("Started sandbox");
                     println!("  ID:        {}", sandbox.id);
@@ -5232,7 +7117,7 @@ fn main() {
 
                     // Mint the composite grant if a credential resource was supplied.
                     //
-                    // implementation-note-152 — route the composite mint through the policy
+                    // implementation-note-201 — route the composite mint through the policy
                     // engine so `default_decision = "require_approval"` fires
                     // here.
                     //
@@ -5253,142 +7138,70 @@ fn main() {
                     // The policy action name is `credential.access` to match
                     // the daemon's existing credential-access rule shape.
                     let mut sandbox_grant_pending = false;
-                    if statement_count > 0 {
-                        let credential_res = credential_resource.as_deref().unwrap_or("");
-                        let policy_engine = if config.policy_file.exists() {
-                            ember_daemon::trust::policy::PolicyEngine::from_file(&config.policy_file)
-                                .unwrap_or_default()
-                        } else {
-                            ember_daemon::trust::policy::PolicyEngine::default()
-                        };
-                        let policy_action = "credential.access".to_string();
-                        let eval = policy_engine.evaluate(&policy_action);
-                        let risk_str = format!("{:?}", eval.risk).to_lowercase();
-
-                        let grant_proposal = GrantProposal {
-                            persona_id: sandbox.persona_id.clone(),
-                            statements: statements.clone(),
-                            expires_at: ttl_secs,
-                            label: None,
-                            skill_ref: None,
-                            note: None,
-                        };
-
-                        match eval.requirement {
-                            ember_daemon::trust::policy::ApprovalRequirement::Denied => {
-                                eprintln!(
-                                    "error: policy denied composite grant mint for {credential_res} \
-                                     (rule: {})",
-                                    eval.matched_rule.as_deref().unwrap_or("(default)")
+                    let credential_res = credential_resource.as_deref().unwrap_or("");
+                    match &prepared.grant {
+                        SandboxRunGrantDisposition::NotRequested => {
+                            println!("  (no --credential-resource supplied — grant not minted)");
+                        }
+                        SandboxRunGrantDisposition::PendingApproval { approval_id } => {
+                            sandbox_grant_pending = true;
+                            println!("Approval required for composite grant");
+                            println!("  Approval ID: {}", approval_id);
+                            println!("  Statements:  {statement_count}");
+                            println!("    [0] credential:read  on {credential_res}");
+                            if let Some(t) = budget_tokens {
+                                println!(
+                                    "    [1] llm:generate     on anthropic/*  budget={t} tokens"
                                 );
-                                process::exit(1);
+                            } else {
+                                println!(
+                                    "    [1] llm:generate     on anthropic/*  (no token budget)"
+                                );
                             }
-                            ember_daemon::trust::policy::ApprovalRequirement::Required => {
-                                match store.propose_grant_typed(
-                                    &grant_proposal,
-                                    &policy_action,
-                                    &risk_str,
-                                ) {
-                                    Ok(req) => {
-                                        sandbox_grant_pending = true;
-                                        println!("Approval required for composite grant");
-                                        println!("  Approval ID: {}", req.id);
-                                        println!("  Statements:  {statement_count}");
-                                        println!(
-                                            "    [0] credential:read  on {credential_res}"
-                                        );
-                                        if let Some(t) = budget_tokens {
-                                            println!("    [1] llm:generate     on anthropic/*  budget={t} tokens");
-                                        } else {
-                                            println!("    [1] llm:generate     on anthropic/*  (no token budget)");
-                                        }
-                                        if let Some(s) = budget_seconds {
-                                            println!("    [2] time:wall_clock  on *             budget={s}s");
-                                        } else {
-                                            println!("    [2] time:wall_clock  on *             (no time budget)");
-                                        }
-                                        println!();
-                                        println!(
-                                            "  Approve from CLI: ember approval approve {}",
-                                            req.id
-                                        );
-                                        println!(
-                                            "  Or open dashboard: http://localhost:3141/approvals/{}",
-                                            req.id
-                                        );
-                                    }
-                                    Err(e) => {
-                                        eprintln!(
-                                            "warning: sandbox started but submitting approval failed: {e}"
-                                        );
-                                    }
-                                }
+                            if let Some(s) = budget_seconds {
+                                println!("    [2] time:wall_clock  on *             budget={s}s");
+                            } else {
+                                println!(
+                                    "    [2] time:wall_clock  on *             (no time budget)"
+                                );
                             }
-                            ember_daemon::trust::policy::ApprovalRequirement::Auto => {
-                                // COMPOSITE-prior change — collapse the legacy
-                                // AutoApprove fast-path into the daemon-side
-                                // `auto_resolve` lane. Both Auto and Required
-                                // dispatch via `propose_grant` so the mint
-                                // path is single: propose_grant submits a
-                                // pending approval row carrying the typed
-                                // 3-statement envelope (with SHA-256
-                                // integrity binding); `auto_resolve` then
-                                // immediately resolves it as Approved (which
-                                // mints the composite chain through the
-                                // same code path the human-approval flow
-                                // uses) and emits an `approval.auto_resolved`
-                                // audit event so downstream auditors can
-                                // distinguish silent policy-driven approvals
-                                // from human-driven ones.
-                                match store.propose_grant_typed(
-                                    &grant_proposal,
-                                    &policy_action,
-                                    &risk_str,
-                                ) {
-                                    Ok(req) => {
-                                        match store.auto_resolve(&req.id) {
-                                            Ok(()) => {
-                                                let grant_id = store
-                                                    .get_approval(&req.id)
-                                                    .ok()
-                                                    .and_then(|r| r.result_grant_id)
-                                                    .unwrap_or_else(|| "(unknown)".to_string());
-                                                println!("Minted 3-statement composite grant");
-                                                println!("  Grant ID:   {grant_id}");
-                                                println!("  Statements: {statement_count}");
-                                                println!("    [0] credential:read  on {credential_res}");
-                                                if let Some(t) = budget_tokens {
-                                                    println!("    [1] llm:generate     on anthropic/*  budget={t} tokens");
-                                                } else {
-                                                    println!("    [1] llm:generate     on anthropic/*  (no token budget)");
-                                                }
-                                                if let Some(s) = budget_seconds {
-                                                    println!("    [2] time:wall_clock  on *             budget={s}s");
-                                                } else {
-                                                    println!("    [2] time:wall_clock  on *             (no time budget)");
-                                                }
-                                                println!("  One approval. Three meters. One receipt at the end.");
-                                                if let Some(ref p) = prompt {
-                                                    println!("  Prompt: {p}");
-                                                }
-                                            }
-                                            Err(e) => {
-                                                eprintln!(
-                                                    "warning: sandbox started but auto-resolve failed: {e}"
-                                                );
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        eprintln!(
-                                            "warning: sandbox started but submitting approval failed: {e}"
-                                        );
-                                    }
-                                }
+                            println!();
+                            println!("  Approve from CLI: ember approval approve {}", approval_id);
+                            println!(
+                                "  Or open dashboard: http://localhost:3141/approvals/{}",
+                                approval_id
+                            );
+                        }
+                        SandboxRunGrantDisposition::Minted { grant_id } => {
+                            let grant_id = grant_id.as_deref().unwrap_or("(unknown)");
+                            println!("Minted 3-statement composite grant");
+                            println!("  Grant ID:   {grant_id}");
+                            println!("  Statements: {statement_count}");
+                            println!("    [0] credential:read  on {credential_res}");
+                            if let Some(t) = budget_tokens {
+                                println!(
+                                    "    [1] llm:generate     on anthropic/*  budget={t} tokens"
+                                );
+                            } else {
+                                println!(
+                                    "    [1] llm:generate     on anthropic/*  (no token budget)"
+                                );
+                            }
+                            if let Some(s) = budget_seconds {
+                                println!("    [2] time:wall_clock  on *             budget={s}s");
+                            } else {
+                                println!(
+                                    "    [2] time:wall_clock  on *             (no time budget)"
+                                );
+                            }
+                            println!("  One approval. Three meters. One receipt at the end.");
+                            if let Some(ref p) = prompt {
+                                println!("  Prompt: {p}");
                             }
                         }
-                    } else {
-                        println!("  (no --credential-resource supplied — grant not minted)");
+                        SandboxRunGrantDisposition::Failed { message } => {
+                            eprintln!("warning: sandbox started but {message}");
+                        }
                     }
 
                     // If a prompt was given and the container started, hand off to
@@ -5396,7 +7209,7 @@ fn main() {
                     // child process inherits stdin/stdout so Claude Code's output
                     // streams directly to the operator's terminal.
                     //
-                    // implementation-note-152 — when the composite grant is pending approval,
+                    // implementation-note-201 — when the composite grant is pending approval,
                     // skip the agent exec; the operator must approve first
                     // (then re-run / `ember sandbox exec`) to give the agent
                     // its credentials.
@@ -5439,15 +7252,20 @@ fn main() {
         }
 
         Commands::Approval { action } => {
-            let store = open_store(&config);
+            // [open-store-audit] MUTATOR-MIXED: Commands::Approval.
+            //   List              → `list_pending_approvals` when a daemon
+            //                       socket is live.
+            //   Approve/Deny/Narrow → `resolve_approval` when a daemon
+            //                       socket is live.
+            // Direct store fallback remains only for no-daemon/dev paths.
             match action {
-                ApprovalAction::List => match store.list_pending_approvals() {
-                    Ok(requests) => {
+                ApprovalAction::List => match run_approval_list(&config) {
+                    Ok((_, requests)) => {
                         if requests.is_empty() {
                             println!("No pending approvals");
                         } else {
                             for r in &requests {
-                                // implementation-note-152 — composite envelopes render as
+                                // implementation-note-201 — composite envelopes render as
                                 // ONE entry with N statements listed beneath.
                                 if let Some(stmts) = r.composite_statements.as_ref() {
                                     println!(
@@ -5459,26 +7277,38 @@ fn main() {
                                         r.risk_level,
                                         stmts.len(),
                                     );
-                                    // implementation-note-145: shipped
+                                    // implementation-note-194: shipped
                                     for (i, s) in stmts.iter().enumerate() {
                                         let actions = s.actions.join(",");
                                         let resource = match &s.resource {
                                             core_grant_types::ResourceSelector::Exact { value } => {
                                                 value.clone()
                                             }
-                                            core_grant_types::ResourceSelector::Glob { pattern } => {
-                                                pattern.clone()
+                                            core_grant_types::ResourceSelector::Glob {
+                                                pattern,
+                                            } => pattern.clone(),
+                                            core_grant_types::ResourceSelector::Any => {
+                                                "*".to_string()
                                             }
-                                            core_grant_types::ResourceSelector::Any => "*".to_string(),
                                             _ => format!("{:?}", s.resource),
                                         };
                                         // Append per-statement budget caps (tokens + cents + seconds).
                                         let budget_str = if let Some(b) = &s.budget {
                                             let mut parts: Vec<String> = Vec::new();
-                                            if let Some(t) = b.tokens { parts.push(format!("tokens:{t}")); }
-                                            if let Some(c) = b.cents { parts.push(format!("${:.2}", c as f64 / 100.0)); }
-                                            if let Some(sec) = b.wall_clock_secs { parts.push(format!("seconds:{sec}")); }
-                                            if parts.is_empty() { String::new() } else { format!("  [{}]", parts.join(" · ")) }
+                                            if let Some(t) = b.tokens {
+                                                parts.push(format!("tokens:{t}"));
+                                            }
+                                            if let Some(c) = b.cents {
+                                                parts.push(format!("${:.2}", c as f64 / 100.0));
+                                            }
+                                            if let Some(sec) = b.wall_clock_secs {
+                                                parts.push(format!("seconds:{sec}"));
+                                            }
+                                            if parts.is_empty() {
+                                                String::new()
+                                            } else {
+                                                format!("  [{}]", parts.join(" · "))
+                                            }
                                         } else {
                                             String::new()
                                         };
@@ -5487,7 +7317,11 @@ fn main() {
                                 } else {
                                     println!(
                                         "{} {} → {} ({}) [{}]",
-                                        r.id, r.persona_id, r.credential_name, r.action, r.risk_level
+                                        r.id,
+                                        r.persona_id,
+                                        r.credential_name,
+                                        r.action,
+                                        r.risk_level
                                     );
                                 }
                             }
@@ -5512,7 +7346,9 @@ fn main() {
                                         process::exit(1);
                                     })
                                 } else {
-                                    eprintln!("error: invalid --ttl value '{s}'; expected e.g. 7d, 30d, never");
+                                    eprintln!(
+                                        "error: invalid --ttl value '{s}'; expected e.g. 7d, 30d, never"
+                                    );
                                     process::exit(1);
                                 };
                                 let exp = chrono::Utc::now() + chrono::Duration::days(days);
@@ -5531,21 +7367,21 @@ fn main() {
                     } else {
                         ApprovalOutcome::Approved
                     };
-                    match store.resolve_approval(&id, &outcome) {
-                        Ok(()) => {
+                    match run_approval_resolve(&config, &id, &outcome) {
+                        Ok((_, resolved)) => {
                             if always {
                                 println!("Approved {id}");
-                                println!("  Standing grant created: future requests for this action will auto-approve.");
+                                println!(
+                                    "  Standing grant created: future requests for this action will auto-approve."
+                                );
                                 println!("  Review: ember grant standing list");
                             } else {
                                 println!("Approved {id}");
                             }
-                            // implementation-note-152 — surface the grant ID minted by a
+                            // implementation-note-201 — surface the grant ID minted by a
                             // composite-approval resolution so the operator
                             // (or test harness) can use it directly.
-                            if let Ok(resolved) = store.get_approval(&id)
-                                && let Some(grant_id) = resolved.result_grant_id.as_deref()
-                            {
+                            if let Some(grant_id) = resolved.result_grant_id.as_deref() {
                                 println!("  Grant ID: {grant_id}");
                             }
                         }
@@ -5556,10 +7392,14 @@ fn main() {
                     }
                 }
                 ApprovalAction::Deny { id, reason } => {
-                    match store
-                        .resolve_approval(&id, &ApprovalOutcome::Denied { reason: reason.clone() })
-                    {
-                        Ok(()) => println!("Denied {id}: {reason}"),
+                    match run_approval_resolve(
+                        &config,
+                        &id,
+                        &ApprovalOutcome::Denied {
+                            reason: reason.clone(),
+                        },
+                    ) {
+                        Ok(_) => println!("Denied {id}: {reason}"),
                         Err(e) => {
                             eprintln!("error: {e}");
                             process::exit(1);
@@ -5567,13 +7407,14 @@ fn main() {
                     }
                 }
                 ApprovalAction::Narrow { id, scope } => {
-                    match store.resolve_approval(
+                    match run_approval_resolve(
+                        &config,
                         &id,
                         &ApprovalOutcome::Narrowed {
                             new_scope: scope.clone(),
                         },
                     ) {
-                        Ok(()) => println!("Narrowed {id} to scope: {scope}"),
+                        Ok(_) => println!("Narrowed {id} to scope: {scope}"),
                         Err(e) => {
                             eprintln!("error: {e}");
                             process::exit(1);
@@ -5584,26 +7425,39 @@ fn main() {
         }
 
         Commands::Audit { action } => {
-            let store = open_store(&config);
+            // [open-store-audit] DAEMON-BACKED READ-ONLY on the installed path.
+            //   Query   → `receipt_query` when a daemon socket is live.
+            //   Show    → operator-only `audit_log_query` when a daemon
+            //             socket is live.
+            //   Export  → operator-only `audit_log_query` when a daemon
+            //             socket is live.
+            //   Explain → current-state `audit_explain` when a daemon
+            //             socket is live.
+            //   Verify  → daemon-backed via `audit_verify`.
+            // Local direct fallback remains only for no-daemon/dev paths.
             match action {
                 AuditAction::Show { agent, limit } => {
+                    let store = open_store(&config);
                     let filter = AuditFilter {
                         agent_id: agent,
                         limit: Some(limit),
                         ..Default::default()
                     };
-                    match store.query_audit(&filter) {
-                        Ok(entries) => {
+                    match run_audit_log_query(&config, &filter) {
+                        Ok((_, entries)) => {
                             if cli.json {
-                                let arr: Vec<_> = entries.iter().map(|e| {
-                                    serde_json::json!({
-                                        "timestamp": e.timestamp,
-                                        "agent_id": e.agent_id,
-                                        "action": e.action,
-                                        "credential": e.credential,
-                                        "outcome": e.outcome,
+                                let arr: Vec<_> = entries
+                                    .iter()
+                                    .map(|e| {
+                                        serde_json::json!({
+                                            "timestamp": e.timestamp,
+                                            "agent_id": e.agent_id,
+                                            "action": e.action,
+                                            "credential": e.credential,
+                                            "outcome": e.outcome,
+                                        })
                                     })
-                                }).collect();
+                                    .collect();
                                 println!("{}", serde_json::to_string_pretty(&arr).unwrap());
                             } else if entries.is_empty() {
                                 println!("No audit entries");
@@ -5624,19 +7478,36 @@ fn main() {
                         }
                     }
                 }
-                AuditAction::Export { format, limit, agent, output } => {
+                AuditAction::Export {
+                    format,
+                    limit,
+                    agent,
+                    output,
+                } => {
                     let filter = AuditFilter {
                         agent_id: agent,
                         limit,
                         ..Default::default()
                     };
-                    let entries = store.query_audit(&filter).unwrap_or_default();
+                    let entries = match run_audit_log_query(&config, &filter) {
+                        Ok(entries) => {
+                            let (_, entries) = entries;
+                            entries
+                        }
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            process::exit(1);
+                        }
+                    };
 
                     let content = match format.as_str() {
                         "csv" => {
-                            let mut lines = vec!["timestamp,agent_id,action,credential,outcome,details".to_string()];
+                            let mut lines = vec![
+                                "timestamp,agent_id,action,credential,outcome,details".to_string(),
+                            ];
                             for e in &entries {
-                                lines.push(format!("{},{},{},{},{},{}",
+                                lines.push(format!(
+                                    "{},{},{},{},{},{}",
                                     e.timestamp,
                                     e.agent_id.as_deref().unwrap_or(""),
                                     e.action,
@@ -5647,16 +7518,22 @@ fn main() {
                             }
                             lines.join("\n")
                         }
-                        _ => serde_json::to_string_pretty(&entries.iter().map(|e| {
-                            serde_json::json!({
-                                "timestamp": e.timestamp,
-                                "agent_id": e.agent_id,
-                                "action": e.action,
-                                "credential": e.credential,
-                                "outcome": e.outcome,
-                                "details": e.details,
-                            })
-                        }).collect::<Vec<_>>()).unwrap_or_default(),
+                        _ => serde_json::to_string_pretty(
+                            &entries
+                                .iter()
+                                .map(|e| {
+                                    serde_json::json!({
+                                        "timestamp": e.timestamp,
+                                        "agent_id": e.agent_id,
+                                        "action": e.action,
+                                        "credential": e.credential,
+                                        "outcome": e.outcome,
+                                        "details": e.details,
+                                    })
+                                })
+                                .collect::<Vec<_>>(),
+                        )
+                        .unwrap_or_default(),
                     };
 
                     match output {
@@ -5668,12 +7545,17 @@ fn main() {
                     }
                 }
                 AuditAction::Explain { id } => {
-                    let filter = AuditFilter { limit: Some(1000), ..Default::default() };
-                    let entries = store.query_audit(&filter).unwrap_or_default();
-                    let entry = entries.iter().find(|e| e.id.to_string() == id);
+                    let entry_id = match id.parse::<i64>() {
+                        Ok(id) => id,
+                        Err(_) => {
+                            eprintln!("Event {} not found", id);
+                            process::exit(1);
+                        }
+                    };
 
-                    match entry {
-                        Some(e) => {
+                    match run_audit_explain(&config, entry_id) {
+                        Ok((_, explain)) => {
+                            let e = &explain.event;
                             println!("EVENT {}", e.id);
                             println!("  Timestamp:  {}", e.timestamp);
                             println!("  Agent:      {}", e.agent_id.as_deref().unwrap_or("-"));
@@ -5685,40 +7567,43 @@ fn main() {
                             }
                             println!();
 
-                            if let Some(ref cred) = e.credential
-                                && let Some(ref agent) = e.agent_id
-                            {
-                                match store.evaluate_grant(agent, cred) {
-                                    Ok(grant) => {
-                                        println!("GRANT {}", grant.id);
-                                        println!("  Scope:      {}", grant.scope);
-                                        println!("  Created:    {}", grant.created_at);
-                                        println!("  Expires:    {}", grant.expires_at.as_deref().unwrap_or("never"));
-                                        println!("  Status:     {}", grant.status);
-                                    }
-                                    Err(_) => println!("GRANT: no active grant found"),
+                            match explain.current_grant {
+                                Some(grant) => {
+                                    println!("GRANT {}", grant.id);
+                                    println!("  Scope:      {}", grant.scope);
+                                    println!("  Created:    {}", grant.created_at);
+                                    println!(
+                                        "  Expires:    {}",
+                                        grant.expires_at.as_deref().unwrap_or("never")
+                                    );
+                                    println!("  Status:     {}", grant.status);
                                 }
+                                None => println!("GRANT: no active grant found"),
                             }
                             println!();
 
-                            let policy_path = effective_config_path(cli.config.as_ref())
-                                .parent()
-                                .unwrap()
-                                .join("policy.toml");
-                            let engine = if policy_path.exists() {
-                                ember_daemon::trust::policy::PolicyEngine::from_file(&policy_path)
-                                    .unwrap_or_default()
-                            } else {
-                                ember_daemon::trust::policy::PolicyEngine::default()
-                            };
-                            let eval = engine.evaluate(&e.action);
                             println!("POLICY");
-                            println!("  Decision:   {:?}", eval.requirement);
-                            println!("  Risk:       {:?}", eval.risk);
-                            println!("  Rule:       {}", eval.matched_rule.as_deref().unwrap_or("(default)"));
+                            println!("  Decision:   {:?}", explain.current_policy.requirement);
+                            println!("  Risk:       {:?}", explain.current_policy.risk);
+                            println!("  Tier:       {:?}", explain.current_policy.tier);
+                            println!(
+                                "  Rule:       {}",
+                                explain
+                                    .current_policy
+                                    .matched_rule
+                                    .as_deref()
+                                    .unwrap_or("(default)")
+                            );
+                            println!();
+                            println!("NOTE");
+                            println!("  {}", explain.note);
                         }
-                        None => {
-                            eprintln!("Event {} not found", id);
+                        Err(e) => {
+                            if e.to_string().contains("not found") {
+                                eprintln!("Event {} not found", id);
+                            } else {
+                                eprintln!("error: {e}");
+                            }
                             process::exit(1);
                         }
                     }
@@ -5732,9 +7617,15 @@ fn main() {
                     json,
                     limit,
                 } => {
+                    // audit_actions_migrated_to_rpc: routes through the
+                    // daemon's `receipt_query` JSON-RPC rather than opening
+                    // the store directly. The daemon side parses ReceiptFilter
+                    // fields from the params object and returns a JSON array
+                    // of ReceiptRow-shaped objects.
+
                     // Validate `--since` up front — surface a clean usage
                     // error rather than handing a malformed string to the
-                    // store filter.
+                    // RPC params.
                     let since_iso = match since.as_deref() {
                         None => None,
                         Some(s) => match parse_since(s) {
@@ -5758,7 +7649,7 @@ fn main() {
                         limit,
                         ..Default::default()
                     };
-                    let rows = match store.list_receipt_rows(&filter) {
+                    let (_, rows) = match run_audit_receipt_query(&config, &filter) {
                         Ok(rows) => rows,
                         Err(e) => {
                             eprintln!("error: {e}");
@@ -5791,8 +7682,7 @@ fn main() {
                             "{h_kind:<10} {h_actor:<22} {h_resource:<28} {h_grant:<22} {h_at:<28} {h_reason}"
                         );
                         for r in &rows {
-                            let reason_short: String =
-                                r.terminal_reason.chars().take(40).collect();
+                            let reason_short: String = r.terminal_reason.chars().take(40).collect();
                             println!(
                                 "{:<10} {:<22} {:<28} {:<22} {:<28} {}",
                                 truncate(&r.kind, 10),
@@ -5805,23 +7695,22 @@ fn main() {
                         }
                     }
                 }
-                // implementation-note-164 (B): chain verify via
+                // implementation-note-230 (B): chain verify via
                 // daemon socket. Routes through `audit_verify` so the
                 // verdict is the daemon's authoritative answer (same
                 // path startup verify uses). Exit code: 0 on Ok, 2 on
                 // Break (a tampered chain is a distinct signal from
                 // operational error), 1 on transport / RPC failure.
+                //
+                // audit_actions_migrated_to_rpc: routes through the
+                // daemon's `audit_verify` JSON-RPC (via
+                // `emberlink_cli::audit::verify`); no open_store needed.
                 AuditAction::Verify { tail } => {
                     let socket_path = config.socket_dir.join("daemon.sock");
-                    match emberlink_cli::audit::verify::run_audit_verify_cli(
-                        &socket_path,
-                        tail,
-                    ) {
+                    match emberlink_cli::audit::verify::run_audit_verify_cli(&socket_path, tail) {
                         Ok(verdict) => {
                             if cli.json {
-                                let v = emberlink_cli::audit::verify::format_verdict_json(
-                                    &verdict,
-                                );
+                                let v = emberlink_cli::audit::verify::format_verdict_json(&verdict);
                                 println!(
                                     "{}",
                                     serde_json::to_string_pretty(&v).unwrap_or_default()
@@ -5829,9 +7718,7 @@ fn main() {
                             } else {
                                 print!(
                                     "{}",
-                                    emberlink_cli::audit::verify::format_verdict_human(
-                                        &verdict
-                                    )
+                                    emberlink_cli::audit::verify::format_verdict_human(&verdict)
                                 );
                             }
                             if matches!(
@@ -5851,10 +7738,20 @@ fn main() {
         }
 
         Commands::Receipt { action } => {
-            let store = open_store(&config);
+            // [open-store-audit] READ-ONLY: Commands::Receipt.
+            //   List   → `list_receipts` when a daemon socket is live.
+            //   Show   → `get_receipt` when a daemon socket is live.
+            //   Export → `get_receipt` when a daemon socket is live.
+            //   Tree   → `receipt_tree` when a daemon socket is live.
+            //   Verify → `get_receipt` only for the id-mode path; file/tree/
+            //            materialization modes stay daemon-free.
+            // Local direct fallback remains only for no-daemon/dev paths.
             match action {
-                ReceiptAction::List { persona, json: list_json } => {
-                    let receipts = match store.list_receipts(persona.as_deref()) {
+                ReceiptAction::List {
+                    persona,
+                    json: list_json,
+                } => {
+                    let (_, receipts) = match run_receipt_list(&config, persona.as_deref()) {
                         Ok(v) => v,
                         Err(e) => {
                             eprintln!("error: {e}");
@@ -5863,7 +7760,10 @@ fn main() {
                     };
                     if cli.json || list_json {
                         // ember receipt list --json emits full UUIDs
-                        println!("{}", serde_json::to_string_pretty(&receipts).unwrap_or_default());
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&receipts).unwrap_or_default()
+                        );
                     } else if receipts.is_empty() {
                         println!("No receipts found.");
                     } else {
@@ -5871,9 +7771,7 @@ fn main() {
                         let h_grant = "GRANT";
                         let h_persona = "PERSONA";
                         let h_reason = "REASON";
-                        println!(
-                            "{h_receipt:<30} {h_grant:<38} {h_persona:<22} {h_reason}"
-                        );
+                        println!("{h_receipt:<30} {h_grant:<38} {h_persona:<22} {h_reason}");
                         for r in &receipts {
                             let reason_short = match &r.lifecycle.terminal_reason {
                                 core_grant_types::grant_receipt::TerminalReason::Expired => "expired".to_string(),
@@ -5881,7 +7779,8 @@ fn main() {
                                 core_grant_types::grant_receipt::TerminalReason::ExhaustedByBudget { .. } => "exhausted".to_string(),
                                 core_grant_types::grant_receipt::TerminalReason::ParentCascadeRevoked { .. } => "cascaded".to_string(),
                             };
-                            let persona_short: String = r.summary.persona_id.chars().take(20).collect();
+                            let persona_short: String =
+                                r.summary.persona_id.chars().take(20).collect();
                             println!(
                                 "{:<30} {:<38} {:<22} {}",
                                 truncate(&r.id, 28),
@@ -5893,7 +7792,7 @@ fn main() {
                     }
                 }
                 ReceiptAction::Show { id, format, raw } => {
-                    let r = match resolve_receipt(&store, &id) {
+                    let (_, r) = match run_receipt_get(&config, &id) {
                         Ok(r) => r,
                         Err(e) => {
                             eprintln!("error: {e}");
@@ -5901,7 +7800,10 @@ fn main() {
                         }
                     };
                     if format == "md" {
-                        println!("{}", emberlink_cli::receipt::render_receipt_markdown(&r, raw));
+                        println!(
+                            "{}",
+                            emberlink_cli::receipt::render_receipt_markdown(&r, raw)
+                        );
                     } else if cli.json {
                         println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
                     } else {
@@ -5909,7 +7811,7 @@ fn main() {
                     }
                 }
                 ReceiptAction::Export { id, format, raw } => {
-                    let r = match resolve_receipt(&store, &id) {
+                    let (_, r) = match run_receipt_get(&config, &id) {
                         Ok(r) => r,
                         Err(e) => {
                             eprintln!("error: {e}");
@@ -5917,7 +7819,10 @@ fn main() {
                         }
                     };
                     if format == "md" {
-                        println!("{}", emberlink_cli::receipt::render_receipt_markdown(&r, raw));
+                        println!(
+                            "{}",
+                            emberlink_cli::receipt::render_receipt_markdown(&r, raw)
+                        );
                     } else {
                         match serde_json::to_string_pretty(&r) {
                             Ok(s) => println!("{s}"),
@@ -5928,13 +7833,22 @@ fn main() {
                         }
                     }
                 }
-                ReceiptAction::Verify { id, file, pubkey, materialization, events, tree, offline: _ } => {
+                ReceiptAction::Verify {
+                    id,
+                    file,
+                    pubkey,
+                    materialization,
+                    events,
+                    tree,
+                    offline: _,
+                } => {
                     // --tree mode: load a tree-export JSON and run all
                     // signature checks offline. Beat 8 demo close. The
                     // verify path does not touch the daemon socket — the
                     // trust anchor is embedded in the export file.
                     if let Some(tree_path) = tree {
-                        let tree_export = match emberlink_cli::receipt::read_tree_export(&tree_path) {
+                        let tree_export = match emberlink_cli::receipt::read_tree_export(&tree_path)
+                        {
                             Ok(t) => t,
                             Err(e) => {
                                 eprintln!("error: {e}");
@@ -5943,7 +7857,10 @@ fn main() {
                         };
                         match emberlink_cli::receipt::verify_tree_offline(&tree_export) {
                             Ok(outcome) => {
-                                print!("{}", emberlink_cli::receipt::format_verify_outcome(&outcome));
+                                print!(
+                                    "{}",
+                                    emberlink_cli::receipt::format_verify_outcome(&outcome)
+                                );
                                 return;
                             }
                             Err(e) => {
@@ -5958,22 +7875,24 @@ fn main() {
                     // not signed end-to-end (each sub-Receipt is signed
                     // individually); the integrity check is structural.
                     if let Some(mid) = materialization {
-                        let events_path = events.unwrap_or_else(|| {
-                            config.data_dir.join("events.jsonl")
-                        });
-                        let receipts = match emberlink_cli::receipt::rollup::read_receipts_from_jsonl(&events_path) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                eprintln!("error: {e}");
-                                process::exit(1);
-                            }
-                        };
+                        let events_path =
+                            events.unwrap_or_else(|| config.data_dir.join("events.jsonl"));
+                        let receipts =
+                            match emberlink_cli::receipt::rollup::read_receipts_from_jsonl(
+                                &events_path,
+                            ) {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    eprintln!("error: {e}");
+                                    process::exit(1);
+                                }
+                            };
                         match emberlink_cli::receipt::verify_chain(&receipts, &mid) {
                             Ok(rollup) => {
-                                println!("Verified: chain {} ({} sub-receipts, outcome={:?})",
-                                    rollup.materialization_id,
-                                    rollup.receipt_count,
-                                    rollup.outcome);
+                                println!(
+                                    "Verified: chain {} ({} sub-receipts, outcome={:?})",
+                                    rollup.materialization_id, rollup.receipt_count, rollup.outcome
+                                );
                                 return;
                             }
                             Err(e) => {
@@ -5989,11 +7908,13 @@ fn main() {
                             process::exit(2);
                         }
                         (None, None) => {
-                            eprintln!("error: pass either a receipt <id>, --file <PATH>, or --materialization <ID>");
+                            eprintln!(
+                                "error: pass either a receipt <id>, --file <PATH>, or --materialization <ID>"
+                            );
                             process::exit(2);
                         }
-                        (Some(id), None) => match resolve_receipt(&store, &id) {
-                            Ok(r) => r,
+                        (Some(id), None) => match run_receipt_get(&config, &id) {
+                            Ok((_, r)) => r,
                             Err(e) => {
                                 eprintln!("error: {e}");
                                 process::exit(1);
@@ -6004,9 +7925,8 @@ fn main() {
                             let bytes = if path == "-" {
                                 use std::io::Read as _;
                                 let mut buf = Vec::with_capacity(8192);
-                                let mut handle = std::io::stdin().lock().take(
-                                    (MAX_RECEIPT_BYTES + 1) as u64,
-                                );
+                                let mut handle =
+                                    std::io::stdin().lock().take((MAX_RECEIPT_BYTES + 1) as u64);
                                 if let Err(e) = handle.read_to_end(&mut buf) {
                                     eprintln!("error: failed to read stdin: {e}");
                                     process::exit(1);
@@ -6042,13 +7962,14 @@ fn main() {
                                 }
                             };
                             // Detect format: parse as Value first, inspect version field.
-                            let raw_value = match serde_json::from_slice::<serde_json::Value>(&bytes) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    eprintln!("error: not a valid Grant Receipt JSON: {e}");
-                                    process::exit(1);
-                                }
-                            };
+                            let raw_value =
+                                match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        eprintln!("error: not a valid Grant Receipt JSON: {e}");
+                                        process::exit(1);
+                                    }
+                                };
                             let version_field = raw_value
                                 .get("version")
                                 .and_then(|v| v.as_str())
@@ -6058,7 +7979,8 @@ fn main() {
                                 // Dispatch to verify_receipt_v2.
                                 let envelope = match serde_json::from_value::<
                                     core_events::receipt::envelope::ReceiptEnvelope,
-                                >(raw_value) {
+                                >(raw_value)
+                                {
                                     Ok(e) => e,
                                     Err(e) => {
                                         eprintln!("error: not a valid v2 Receipt envelope: {e}");
@@ -6070,7 +7992,10 @@ fn main() {
                                 let pubkey_hex = match pubkey.as_deref() {
                                     Some(p) => p.to_string(),
                                     None => {
-                                        let key_path = ember_daemon::infra::receipt::identity_key_path(&config.data_dir);
+                                        let key_path =
+                                            ember_daemon::infra::receipt::identity_key_path(
+                                                &config.data_dir,
+                                            );
                                         match ember_daemon::infra::receipt::DaemonPersona::load_or_create(&config.data_dir) {
                                             Ok(id) => id.pubkey_hex(),
                                             Err(e) => {
@@ -6103,7 +8028,10 @@ fn main() {
                                 return;
                             }
                             // v1 receipt (or no version field): existing GrantReceipt path.
-                            match serde_json::from_value::<core_grant_types::grant_receipt::GrantReceipt>(raw_value) {
+                            match serde_json::from_value::<
+                                core_grant_types::grant_receipt::GrantReceipt,
+                            >(raw_value)
+                            {
                                 Ok(r) => r,
                                 Err(e) => {
                                     eprintln!("error: not a valid Grant Receipt JSON: {e}");
@@ -6116,8 +8044,11 @@ fn main() {
                         Some(p) => p,
                         None => {
                             // Read pubkey from the identity file.
-                            let path = ember_daemon::infra::receipt::identity_key_path(&config.data_dir);
-                            match ember_daemon::infra::receipt::DaemonPersona::load_or_create(&config.data_dir) {
+                            let path =
+                                ember_daemon::infra::receipt::identity_key_path(&config.data_dir);
+                            match ember_daemon::infra::receipt::DaemonPersona::load_or_create(
+                                &config.data_dir,
+                            ) {
                                 Ok(id) => id.pubkey_hex(),
                                 Err(e) => {
                                     eprintln!(
@@ -6142,10 +8073,14 @@ fn main() {
                         }
                     }
                 }
-                ReceiptAction::Rollup { since, materialization, incomplete_only, events } => {
-                    let events_path = events.unwrap_or_else(|| {
-                        config.data_dir.join("events.jsonl")
-                    });
+                ReceiptAction::Rollup {
+                    since,
+                    materialization,
+                    incomplete_only,
+                    events,
+                } => {
+                    let events_path =
+                        events.unwrap_or_else(|| config.data_dir.join("events.jsonl"));
                     let filters = emberlink_cli::receipt::RollupFilters {
                         since: Some(since),
                         materialization,
@@ -6159,20 +8094,24 @@ fn main() {
                         }
                     }
                 }
-                ReceiptAction::Tree { grant, export } => {
-                    // Beat 8 demo close — walk the grant graph rooted at
-                    // `--grant <id>`, render an ASCII tree, optionally
-                    // emit a JSON export for offline verify.
-                    if let Err(e) = emberlink_cli::receipt::cmd_receipt_tree(
-                        &store,
-                        &config.data_dir,
-                        &grant,
-                        export.as_deref(),
-                    ) {
+                ReceiptAction::Tree { grant, export } => match run_receipt_tree(&config, &grant) {
+                    Ok((_, tree)) => {
+                        print!("{}", emberlink_cli::receipt::render_tree_ascii(&tree));
+                        if let Some(path) = export.as_deref() {
+                            if let Err(e) =
+                                emberlink_cli::receipt::tree::write_tree_export(&tree, path)
+                            {
+                                eprintln!("error: {e}");
+                                process::exit(1);
+                            }
+                            println!("Exported tree to {}", path.display());
+                        }
+                    }
+                    Err(e) => {
                         eprintln!("error: {e}");
                         process::exit(1);
                     }
-                }
+                },
             }
         }
 
@@ -6188,7 +8127,7 @@ fn main() {
         }
 
         Commands::Bind { action } => {
-            // implementation-note-111: admin path for
+            // implementation-note-149: admin path for
             // daemon-controlled credential bindings. Same socket
             // resolution as `Broker` so the two surfaces share the
             // operator-facing daemon-socket invariant.
@@ -6235,41 +8174,47 @@ fn main() {
 
         Commands::Status => {
             let runtime = DaemonRuntime::new(config.clone());
-            let store = open_store(&config);
+            // [open-store-audit] READ-ONLY: Commands::Status. Aggregates
+            // list_personas / list_active_grants / list_sandboxes /
+            // list_pending_approvals / query_audit / audit_count /
+            // list_standing_grants. The installed path now prefers the
+            // daemon-owned `status` RPC when the daemon is live; local direct
+            // fallback remains only for no-daemon/dev paths.
+            let runtime_status = runtime.status().ok();
+            let daemon_running = runtime_status.as_ref().is_some_and(|s| s.running);
+            let summary = match run_status_summary(&config, daemon_running) {
+                Ok((_, summary)) => summary,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
+            };
 
-            let personas = store.list_personas().unwrap_or_default();
+            let personas = summary.personas;
             let active = personas.iter().filter(|p| p.status == "active").count();
             let revoked = personas.iter().filter(|p| p.status == "revoked").count();
 
-            let grants = store.list_active_grants().unwrap_or_default();
+            let grants = summary.grants;
 
-            let sandboxes = store.list_sandboxes().unwrap_or_default();
+            let sandboxes = summary.sandboxes;
             let running = sandboxes.iter().filter(|s| s.status == "running").count();
 
-            let approvals = store.list_pending_approvals().unwrap_or_default();
+            let approvals = summary.approvals;
 
-            let filter = AuditFilter {
-                limit: Some(5),
-                ..Default::default()
-            };
-            let entries = store.query_audit(&filter).unwrap_or_default();
-            let total = store.audit_count().unwrap_or(0);
+            let entries = summary.recent_activity;
+            let total = summary.audit_events_total;
 
-            // implementation-note-215: surface the credential-store backend
+            // implementation-note-297: surface the credential-store backend
             // selector + its addr (or `local-encrypted` for the default local
             // backend) alongside the daemon's other status rows. Sourced from
             // the same `[credential_store]` section the daemon parses at
             // startup so this is honest about what the running daemon is
             // configured to do.
             let (vault_backend, vault_addr) = match config.credential_store.as_ref() {
-                None => (
-                    "local".to_string(),
-                    "local-encrypted".to_string(),
-                ),
-                Some(cs) if cs.backend == "local" => (
-                    "local".to_string(),
-                    "local-encrypted".to_string(),
-                ),
+                None => ("local".to_string(), "local-encrypted".to_string()),
+                Some(cs) if cs.backend == "local" => {
+                    ("local".to_string(), "local-encrypted".to_string())
+                }
                 Some(cs) => (
                     cs.backend.clone(),
                     cs.addr
@@ -6279,29 +8224,28 @@ fn main() {
             };
 
             if cli.json {
-                let (daemon_running, daemon_pid, daemon_socket) = match runtime.status() {
-                    Ok(s) => (s.running, Some(s.pid), Some(s.socket.display().to_string())),
-                    Err(_) => (false, None, None),
+                let (daemon_running, daemon_pid, daemon_socket) = match runtime_status.as_ref() {
+                    Some(s) => (s.running, Some(s.pid), Some(s.socket.display().to_string())),
+                    None => (false, None, None),
                 };
-                let standing_grants = store.list_standing_grants().unwrap_or_default();
                 let status = serde_json::json!({
                     "version": env!("CARGO_PKG_VERSION"),
                     "daemon": { "running": daemon_running, "pid": daemon_pid, "socket": daemon_socket },
                     "personas": active,
                     "grants": { "active": grants.len(), "expired_sweep_interval_sec": 60 },
                     "approvals": { "pending": approvals.len() },
-                    "standing_grants": standing_grants.len(),
+                    "standing_grants": summary.standing_grants,
                     "audit_events": total,
                     "vault": { "backend": vault_backend, "addr": vault_addr },
                 });
                 println!("{}", serde_json::to_string_pretty(&status).unwrap());
             } else {
                 // Check daemon status
-                match runtime.status() {
-                    Ok(status) if status.running => {
+                match runtime_status {
+                    Some(status) if status.running => {
                         println!("DAEMON             running (PID {})", status.pid);
                         println!("  Socket:    {}", status.socket.display());
-                        // implementation-note-139: the configured
+                        // implementation-note-188: the configured
                         // address is the *attempted* port. The daemon may
                         // have failed to bind (port collision) and still
                         // be running. Probe `/api/status` to read the
@@ -6333,23 +8277,27 @@ fn main() {
                                 );
                             }
                         }
-                        // implementation-note-215: show the configured
+                        // implementation-note-297: show the configured
                         // credential-store backend selector. `local` collapses
                         // to `(local-encrypted)` so the line is recognisable
                         // for the default no-config case.
                         println!("  Vault:     {} ({})", vault_backend, vault_addr);
                     }
-                    Ok(status) => {
+                    Some(status) => {
                         println!("DAEMON             stopped (stale PID {})", status.pid);
                     }
-                    Err(_) => {
+                    None => {
                         println!("DAEMON             not running");
                     }
                 }
                 println!();
                 println!("PERSONAS           {} active, {} revoked", active, revoked);
                 for p in &personas {
-                    let st = if p.status == "revoked" { "revoked" } else { "active " };
+                    let st = if p.status == "revoked" {
+                        "revoked"
+                    } else {
+                        "active "
+                    };
                     println!("  {:<18} {}  {}", p.name, st, p.id);
                 }
                 println!();
@@ -6397,7 +8345,10 @@ fn main() {
                 println!("Data dir:    {}", config.data_dir.display());
                 println!("PID file:    {}", config.pid_file.display());
                 println!("Log level:   {}", config.log_level.as_filter_str());
-                println!("Config file: {}", effective_config_path(cli.config.as_ref()).display());
+                println!(
+                    "Config file: {}",
+                    effective_config_path(cli.config.as_ref()).display()
+                );
             }
             ConfigAction::Path => {
                 println!("{}", effective_config_path(cli.config.as_ref()).display());
@@ -6422,15 +8373,24 @@ fn main() {
             cmd_cluster(action, &config, cli.json);
         }
 
-        Commands::ClaudeCode { args } => {
-            let socket_path = config.socket_dir.join("daemon.sock");
-            match emberlink_cli::launcher::claude_code::launch_claude_code(&args, &socket_path) {
-                Ok(code) => process::exit(code),
-                Err(e) => {
-                    eprintln!("ember claude-code: {e}");
-                    process::exit(1);
-                }
+        Commands::ClaudeCode { dev, prod: _, args } => {
+            // When --dev or --prod is given, use the design Phase 4 flavor launcher.
+            // When neither is given, default to --prod (design §4 spec).
+            // Legacy cohort-A RPC path (no flags) is replaced by the flavor launcher
+            // with --prod as the default, giving parity with the old behavior while
+            // adding --dev support.
+            let flavor = if dev {
+                emberlink_cli::claude_code_launcher::Flavor::Dev
+            } else {
+                emberlink_cli::claude_code_launcher::Flavor::Prod
+            };
+            if let Err(e) = emberlink_cli::claude_code_launcher::launch(flavor, &args) {
+                eprintln!("ember claude-code: {e}");
+                process::exit(2);
             }
+            // launch() exec-replaces; if we reach here the exec failed and
+            // the error was already printed above.
+            unreachable!("launch() either exec-replaces or returns Err");
         }
 
         Commands::Demo { action } => match action {
@@ -6497,7 +8457,11 @@ fn main() {
                     process::exit(1);
                 }
             }
-            ConstructAction::Dev { path, list, unregister } => {
+            ConstructAction::Dev {
+                path,
+                list,
+                unregister,
+            } => {
                 let args = emberlink_cli::construct::dev::DevConstructArgs {
                     path,
                     list,
@@ -6511,7 +8475,11 @@ fn main() {
         },
 
         Commands::Binary { action } => match action {
-            BinaryAction::Install { tool_at_version, from_path, publisher } => {
+            BinaryAction::Install {
+                tool_at_version,
+                from_path,
+                publisher,
+            } => {
                 let args = emberlink_cli::binary::install::BinaryInstallArgs {
                     tool_at_version,
                     from_path,
@@ -6554,7 +8522,11 @@ fn main() {
         Commands::Headless { action } => {
             let socket_path = config.socket_dir.join("daemon.sock");
             match action {
-                HeadlessAction::Enroll { duration, persona, yes } => {
+                HeadlessAction::Enroll {
+                    duration,
+                    persona,
+                    yes,
+                } => {
                     let args = emberlink_cli::headless::EnrollArgs {
                         duration,
                         persona,
@@ -6595,32 +8567,52 @@ fn main() {
             let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
             match action {
                 KmsAction::InitEdge => {
-                    if let Err(e) = rt.block_on(emberlink_cli::kms::cmd_kms_init_edge(&config.data_dir)) {
+                    if let Err(e) =
+                        rt.block_on(emberlink_cli::kms::cmd_kms_init_edge(&config.data_dir))
+                    {
                         eprintln!("ember kms init-edge: {e}");
                         process::exit(1);
                     }
                 }
-                KmsAction::Peer { action: peer_action } => match peer_action {
+                KmsAction::Peer {
+                    action: peer_action,
+                } => match peer_action {
                     KmsPeerAction::Prepare { target } => {
-                        if let Err(e) = rt.block_on(emberlink_cli::kms::cmd_kms_peer_prepare(&target)) {
+                        if let Err(e) =
+                            rt.block_on(emberlink_cli::kms::cmd_kms_peer_prepare(&target))
+                        {
                             eprintln!("ember kms peer prepare: {e}");
                             process::exit(1);
                         }
                     }
                     KmsPeerAction::Enroll { csr_file } => {
-                        if let Err(e) = rt.block_on(emberlink_cli::kms::cmd_kms_peer_enroll(&csr_file, &config.data_dir)) {
+                        if let Err(e) = rt.block_on(emberlink_cli::kms::cmd_kms_peer_enroll(
+                            &csr_file,
+                            &config.data_dir,
+                        )) {
                             eprintln!("ember kms peer enroll: {e}");
                             process::exit(1);
                         }
                     }
-                    KmsPeerAction::Install { bundle_file, ca_fingerprint, global } => {
-                        if let Err(e) = rt.block_on(emberlink_cli::kms::cmd_kms_peer_install(&bundle_file, &ca_fingerprint, global)) {
+                    KmsPeerAction::Install {
+                        bundle_file,
+                        ca_fingerprint,
+                        global,
+                    } => {
+                        if let Err(e) = rt.block_on(emberlink_cli::kms::cmd_kms_peer_install(
+                            &bundle_file,
+                            &ca_fingerprint,
+                            global,
+                        )) {
                             eprintln!("ember kms peer install: {e}");
                             process::exit(1);
                         }
                     }
                     KmsPeerAction::Revoke { name } => {
-                        if let Err(e) = rt.block_on(emberlink_cli::kms::cmd_kms_peer_revoke(&name, &config.data_dir)) {
+                        if let Err(e) = rt.block_on(emberlink_cli::kms::cmd_kms_peer_revoke(
+                            &name,
+                            &config.data_dir,
+                        )) {
                             eprintln!("ember kms peer revoke: {e}");
                             process::exit(1);
                         }
@@ -6633,15 +8625,22 @@ fn main() {
             use emberlink_cli::orchestrator::OrchestratorAction;
             let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
             match action {
-                OrchestratorAction::Spawn { max_depth, template, brief, budget_usd } => {
+                OrchestratorAction::Spawn {
+                    max_depth,
+                    template,
+                    brief,
+                    budget_usd,
+                    extra_hosts,
+                } => {
                     match rt.block_on(emberlink_cli::orchestrator::cmd_orchestrator_spawn(
                         &config,
                         max_depth,
                         template,
                         brief,
                         budget_usd,
+                        extra_hosts,
                     )) {
-                        Ok(()) => {}
+                        Ok(_) => {}
                         Err(code) => process::exit(code),
                     }
                 }
@@ -6670,20 +8669,190 @@ fn main() {
                 }
             }
         }
+
+        Commands::Dev { action } => match action {
+            DevAction::Install => {
+                if let Err(e) = emberlink_cli::dev::install::run() {
+                    eprintln!("ember dev install: {e}");
+                    process::exit(1);
+                }
+            }
+            DevAction::Info => {
+                if let Err(e) = emberlink_cli::dev::info::run() {
+                    eprintln!("ember dev info: {e}");
+                    process::exit(1);
+                }
+            }
+            DevAction::Sync { no_launchctl } => {
+                let args = emberlink_cli::dev::sync::SyncArgs {
+                    no_launchctl,
+                    workspace_root: None,
+                };
+                if let Err(e) = emberlink_cli::dev::sync::run(&args) {
+                    eprintln!("ember dev sync: {e}");
+                    process::exit(1);
+                }
+            }
+        },
+
+        Commands::Bridge { action } => match action {
+            // ember_bridge_endpoint_emit_file
+            BridgeAction::Endpoint { emit_file, json } => {
+                use core_crypto::ca::generate_edge_ca;
+
+                // Refuse if daemon not running.
+                let runtime = DaemonRuntime::new(config.clone());
+                match runtime.status() {
+                    Ok(s) if s.running => {}
+                    Ok(_) => {
+                        eprintln!("ember bridge endpoint: daemon not running");
+                        process::exit(1);
+                    }
+                    Err(_) => {
+                        eprintln!("ember bridge endpoint: daemon not running");
+                        process::exit(1);
+                    }
+                }
+
+                // Resolve the port from bridge_bind config; refuse if not configured.
+                let port = match config.bridge_bind {
+                    Some(addr) => {
+                        let p = addr.port();
+                        if p == 0 {
+                            // Port 0 means kernel-assigned — not yet bound/advertised.
+                            eprintln!(
+                                "ember bridge endpoint: bridge not bound (port is 0 — daemon not yet listening)"
+                            );
+                            process::exit(1);
+                        }
+                        p
+                    }
+                    None => {
+                        eprintln!(
+                            "ember bridge endpoint: bridge not bound (bridge_bind not configured)"
+                        );
+                        process::exit(1);
+                    }
+                };
+
+                // Build bridge addr using the host.docker.internal name that
+                // in-container callers use to reach the host.
+                let addr = format!("host.docker.internal:{port}");
+
+                // Derive the CA fingerprint from the KMS edge CA seed on disk.
+                // TODO(bridge-state-rpc): replace with a daemon RPC once
+                // `bridge.endpoint` exists in the JSON-RPC surface. For now we
+                // read the seed file directly — same path the daemon loads at
+                // startup (data_dir/kms/edge-ca/ca.seed).
+                let seed_path = config.data_dir.join("kms").join("edge-ca").join("ca.seed");
+                let ca_fingerprint_sha256: String = if seed_path.exists() {
+                    match fs::read(&seed_path) {
+                        Ok(bytes) if bytes.len() == 32 => {
+                            let mut seed = [0u8; 32];
+                            seed.copy_from_slice(&bytes);
+                            match generate_edge_ca(Some(seed)) {
+                                Ok(edge_ca) => hex::encode(edge_ca.fingerprint),
+                                Err(e) => {
+                                    eprintln!(
+                                        "ember bridge endpoint: failed to derive CA fingerprint: {e}"
+                                    );
+                                    process::exit(1);
+                                }
+                            }
+                        }
+                        Ok(_) => {
+                            eprintln!("ember bridge endpoint: edge CA seed has unexpected size");
+                            process::exit(1);
+                        }
+                        Err(e) => {
+                            eprintln!("ember bridge endpoint: failed to read edge CA seed: {e}");
+                            process::exit(1);
+                        }
+                    }
+                } else {
+                    // Edge CA not initialized yet — emit a placeholder.
+                    // Run `ember kms init-edge` first.
+                    "TODO-bridge-state-rpc-missing".to_string()
+                };
+
+                let endpoint_json = serde_json::json!({
+                    "addr": addr,
+                    "ca_fingerprint_sha256": ca_fingerprint_sha256,
+                });
+                let json_text = serde_json::to_string_pretty(&endpoint_json)
+                    .expect("bridge endpoint JSON serialization is infallible");
+
+                // Resolve output path: --emit-file or default ~/.ember/bridge-endpoint.json.
+                let output_path = emit_file.unwrap_or_else(|| {
+                    dirs_next::home_dir()
+                        .expect("HOME directory must be resolvable")
+                        .join(".ember")
+                        .join("bridge-endpoint.json")
+                });
+
+                // Create parent directory if needed.
+                if let Some(parent) = output_path.parent() {
+                    if let Err(e) = fs::create_dir_all(parent) {
+                        eprintln!(
+                            "ember bridge endpoint: failed to create parent dir {}: {e}",
+                            parent.display()
+                        );
+                        process::exit(1);
+                    }
+                }
+
+                // Write JSON to the output path (mode 0644).
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    let mut opts = fs::OpenOptions::new();
+                    opts.write(true).create(true).truncate(true).mode(0o644);
+                    match opts.open(&output_path) {
+                        Ok(mut f) => {
+                            use std::io::Write;
+                            if let Err(e) = f.write_all(json_text.as_bytes()) {
+                                eprintln!(
+                                    "ember bridge endpoint: failed to write {}: {e}",
+                                    output_path.display()
+                                );
+                                process::exit(1);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "ember bridge endpoint: failed to open {} for writing: {e}",
+                                output_path.display()
+                            );
+                            process::exit(1);
+                        }
+                    }
+                }
+
+                // Print to stdout when --json is given or when no --emit-file was supplied
+                // (emit-file absent means stdout is the primary output).
+                if json {
+                    println!("{json_text}");
+                } else {
+                    println!("bridge endpoint written to {}", output_path.display());
+                }
+            }
+        },
     }
 }
 
 /// `ember cluster <action>` — cluster management subcommands.
 ///
-/// implementation-note-125: lists locally-pulled cluster snapshots.
-/// implementation-note-292: `bootstrap` generates the Daemon
+/// implementation-note-174: lists locally-pulled cluster snapshots.
+/// implementation-note-412: `bootstrap` generates the Daemon
 /// Persona keypair for single-phase EmberSeal bootstrap (design).
 fn cmd_cluster(action: ClusterAction, config: &DaemonConfig, json_output: bool) {
     match action {
         ClusterAction::Snapshots { cluster_id } => {
             cmd_cluster_snapshots(config, cluster_id.as_deref(), json_output);
         }
-        ClusterAction::Bootstrap { cluster_id, two_phase } => {
+        ClusterAction::Bootstrap {
+            cluster_id,
+            two_phase,
+        } => {
             emberlink_cli::cluster::cmd_cluster_bootstrap(
                 &cluster_id,
                 two_phase,
@@ -6691,7 +8860,11 @@ fn cmd_cluster(action: ClusterAction, config: &DaemonConfig, json_output: bool) 
                 json_output,
             );
         }
-        ClusterAction::Restore { cluster_id, verify, seed_out } => {
+        ClusterAction::Restore {
+            cluster_id,
+            verify,
+            seed_out,
+        } => {
             emberlink_cli::cluster::cmd_cluster_restore(
                 &cluster_id,
                 verify,
@@ -6731,26 +8904,31 @@ fn cmd_cluster_snapshots(
     let entries = ember_daemon::snapshot::list_local_snapshots(&vault, &store, cluster_id_filter);
 
     if json_output {
-        println!("{}", serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string()));
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string())
+        );
     } else if entries.is_empty() {
         if let Some(cid) = cluster_id_filter {
             println!("No local snapshots for cluster {cid}.");
         } else {
             println!("No local cluster snapshots found.");
         }
-        println!("Configure snapshot_pull_endpoint + snapshot_pull_cluster_id in config.toml to enable pulling.");
+        println!(
+            "Configure snapshot_pull_endpoint + snapshot_pull_cluster_id in config.toml to enable pulling."
+        );
     } else {
-        println!("{:<18} {:<16} {:<12} {:<10}", "SNAPSHOT_ID", "CLUSTER", "TAKEN_AT", "SIZE");
+        println!(
+            "{:<18} {:<16} {:<12} {:<10}",
+            "SNAPSHOT_ID", "CLUSTER", "TAKEN_AT", "SIZE"
+        );
         println!("{}", "-".repeat(60));
         for e in &entries {
             let id_short: String = e.snapshot_id.chars().take(16).collect();
             let cluster_short: String = e.cluster_id.chars().take(14).collect();
             println!(
                 "{:<18} {:<16} {:<12} {:>8}B",
-                id_short,
-                cluster_short,
-                e.taken_at,
-                e.size_bytes,
+                id_short, cluster_short, e.taken_at, e.size_bytes,
             );
         }
     }
@@ -6762,7 +8940,223 @@ mod tests {
     use core_grant_types::Usage;
     use tempfile::NamedTempFile;
 
-    /// implementation-note-277: `ensure_shadow_path_installed`
+    fn fake_grant_receipt_json(id: &str, grant_id: &str, persona_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "grant_id": grant_id,
+            "summary": {
+                "human_owner": "Operator Example",
+                "persona_id": persona_id,
+                "agent_id": "cli",
+                "service": "github",
+                "resource": "repo:acme/project"
+            },
+            "approved_chain": [],
+            "per_statement_usage": [],
+            "approval_chain": [],
+            "actions_observed": [],
+            "lifecycle": {
+                "issued_at": 1,
+                "last_used_at": null,
+                "terminated_at": 2,
+                "terminal_reason": {
+                    "kind": "revoked",
+                    "by": "operator",
+                    "reason": "test"
+                }
+            },
+            "attestation": {},
+            "evidence": {
+                "hash": "0".repeat(64),
+                "sig": "1".repeat(128),
+                "signer_pubkey": "2".repeat(64),
+                "canonical_version": 1
+            }
+        })
+    }
+
+    fn fake_receipt_row_json(id: &str, actor: &str, grant_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "kind": "grant",
+            "actor": actor,
+            "resource": "repo:acme/project",
+            "grant_id": grant_id,
+            "materialized_at": "2026-05-19T00:00:00Z",
+            "terminal_reason": "revoked",
+            "requested_scope": "repo:read",
+            "granted_scope": "repo:read"
+        })
+    }
+
+    fn fake_receipt_tree_json(grant_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "version": "v2",
+            "root_grant_id": grant_id,
+            "grants": [{
+                "id": grant_id,
+                "parent_grant_id": null,
+                "persona_id": "persona-a",
+                "credential_name": "api-key",
+                "scope": "read",
+                "status": "active",
+                "created_at": "2026-05-19T00:00:00Z",
+                "expires_at": null
+            }],
+            "receipts": [],
+            "spawn_witnesses": [],
+            "daemon_pubkey_hex": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        })
+    }
+
+    fn fake_approval_request_json(id: &str, persona_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "persona_id": persona_id,
+            "credential_name": "api-key",
+            "scope": "read",
+            "ttl_secs": null,
+            "action": "credential.access",
+            "risk_level": "high",
+            "status": "pending",
+            "reason": null,
+            "created_at": "2026-05-19T00:00:00Z",
+            "tool_name": null,
+            "target_host": null,
+            "target_summary": null,
+            "target_url": null,
+            "agent_framework": null,
+            "composite_statements": null,
+            "result_grant_id": null,
+            "skill_ref": null,
+            "max_delegation_depth": null,
+            "max_uses_per_hour": null,
+            "allowed_hours_start": null,
+            "allowed_hours_end": null,
+            "allowed_targets": null,
+            "budget": null,
+            "max_children_per_day": null,
+            "auto_delegate_scope_template": null
+        })
+    }
+
+    fn fake_persona_info_json(id: &str, name: &str, status: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "name": name,
+            "public_key": "ed25519:test",
+            "created_at": "2026-05-19T00:00:00Z",
+            "status": status,
+            "container_id": null,
+            "parent_grant_id": null
+        })
+    }
+
+    fn fake_grant_info_json(id: &str, persona_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "persona_id": persona_id,
+            "credential_name": "api-key",
+            "scope": "read",
+            "created_at": "2026-05-19T00:00:00Z",
+            "expires_at": null,
+            "status": "active",
+            "max_uses_per_hour": null,
+            "allowed_hours_start": null,
+            "allowed_hours_end": null,
+            "allowed_targets": null,
+            "parent_grant_id": null,
+            "max_delegation_depth": null,
+            "spending_limit_cents": null,
+            "budget": null,
+            "usage": {
+                "tokens": 0,
+                "cents": 0,
+                "requests": 0,
+                "workload_hours": 0,
+                "wall_clock_secs": 0,
+                "last_updated": 0
+            },
+            "paused": false,
+            "receipt_id": null,
+            "is_standing": false,
+            "max_children_per_day": null,
+            "auto_delegate_scope_template": null
+        })
+    }
+
+    fn fake_audit_entry_json(id: i64) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "timestamp": "2026-05-19T00:00:00Z",
+            "agent_id": "persona-a",
+            "action": "grant.issued",
+            "credential": "api-key",
+            "outcome": "allowed",
+            "details": null
+        })
+    }
+
+    fn fake_audit_explain_json(id: i64) -> serde_json::Value {
+        serde_json::json!({
+            "event": fake_audit_entry_json(id),
+            "current_grant": {
+                "id": "grant-123",
+                "scope": "read",
+                "created_at": "2026-05-19T00:00:00Z",
+                "expires_at": null,
+                "status": "active"
+            },
+            "current_policy": {
+                "requirement": "required",
+                "risk": "high",
+                "tier": "tier1",
+                "matched_rule": "credential.access"
+            },
+            "note": "Current-state explanation: the event row is historical audit evidence, but grant and policy sections reflect the daemon's current live state."
+        })
+    }
+
+    fn fake_status_summary_json() -> serde_json::Value {
+        serde_json::json!({
+            "personas": [fake_persona_info_json("persona-a", "Alpha", "active")],
+            "grants": [fake_grant_info_json("grant-123", "persona-a")],
+            "sandboxes": [{
+                "id": "sandbox-1",
+                "name": "alpha",
+                "persona_id": "persona-a",
+                "owner_persona_id": "persona-owner",
+                "container_id": "container-1",
+                "image": "ubuntu:24.04",
+                "status": "running",
+                "created_at": "2026-05-19T00:00:00Z",
+                "workspace_path": null
+            }],
+            "approvals": [fake_approval_request_json("approval-123", "persona-a")],
+            "recent_activity": [fake_audit_entry_json(7)],
+            "standing_grants": 2,
+            "audit_events_total": 9
+        })
+    }
+
+    /// bridge_endpoint_emit_file_default_path_when_arg_omitted — verifies that
+    /// the default output path resolves to `~/.ember/bridge-endpoint.json` when
+    /// `--emit-file` is absent.
+    #[test]
+    fn bridge_endpoint_emit_file_default_path_when_arg_omitted() {
+        // Simulate the default-path logic from the BridgeAction::Endpoint handler.
+        let default_path: PathBuf = dirs_next::home_dir()
+            .expect("HOME must be resolvable in test environment")
+            .join(".ember")
+            .join("bridge-endpoint.json");
+        assert!(
+            default_path.ends_with(".ember/bridge-endpoint.json"),
+            "default emit-file path must be ~/.ember/bridge-endpoint.json, got: {}",
+            default_path.display()
+        );
+    }
+
+    /// implementation-note-394: `ensure_shadow_path_installed`
     /// returns `Err` with a remediation hint when the shadow dir is absent.
     #[test]
     fn ensure_shadow_path_installed_errors_when_missing() {
@@ -6893,14 +9287,28 @@ mod tests {
         // Suppress keyring and passphrase side-effects.
         unsafe {
             std::env::set_var("EMBER_VAULT_PASSPHRASE", "test-passphrase");
+            std::env::set_var("EMBER_SKIP_DAEMON_INSTALL_CHECK", "1");
         }
 
-        cmd_init(&config, Some("test".to_string()), Some(&config_path), None, None, false);
+        cmd_init(
+            &config,
+            Some("test".to_string()),
+            Some(&config_path),
+            None,
+            None,
+            false,
+        );
 
-        unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE"); }
+        unsafe {
+            std::env::remove_var("EMBER_VAULT_PASSPHRASE");
+            std::env::remove_var("EMBER_SKIP_DAEMON_INSTALL_CHECK");
+        }
 
         let contents = std::fs::read_to_string(&config_path).unwrap();
-        assert!(contents.contains("[keyring]"), "config must contain [keyring] section");
+        assert!(
+            contents.contains("[keyring]"),
+            "config must contain [keyring] section"
+        );
         // Service/account match the same resolution cmd_init uses — env var
         // (if set by cargo-test.sh) else compile-time default. Using the
         // same resolution instead of hardcoding DEFAULT avoids the race where
@@ -6948,6 +9356,7 @@ mod tests {
 
         unsafe {
             std::env::set_var("EMBER_VAULT_PASSPHRASE", "test-passphrase");
+            std::env::set_var("EMBER_SKIP_DAEMON_INSTALL_CHECK", "1");
         }
 
         cmd_init(
@@ -6959,11 +9368,20 @@ mod tests {
             false,
         );
 
-        unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE"); }
+        unsafe {
+            std::env::remove_var("EMBER_VAULT_PASSPHRASE");
+            std::env::remove_var("EMBER_SKIP_DAEMON_INSTALL_CHECK");
+        }
 
         let contents = std::fs::read_to_string(&config_path).unwrap();
-        assert!(contents.contains("service = \"custom-service\""), "config must use custom service");
-        assert!(contents.contains("account = \"custom-account\""), "config must use custom account");
+        assert!(
+            contents.contains("service = \"custom-service\""),
+            "config must use custom service"
+        );
+        assert!(
+            contents.contains("account = \"custom-account\""),
+            "config must use custom account"
+        );
     }
 
     #[test]
@@ -6981,11 +9399,7 @@ mod tests {
         // Regression guard: 2026-04-23 leak. qember.sh sets
         // EMBER_KEYRING_SERVICE but not --keyring-service; init previously
         // wrote the passphrase to the production service anyway.
-        let v = resolve_init_keyring_value(
-            None,
-            Some("from-env".to_string()),
-            "from-default",
-        );
+        let v = resolve_init_keyring_value(None, Some("from-env".to_string()), "from-default");
         assert_eq!(v, "from-env");
     }
 
@@ -7003,7 +9417,7 @@ mod tests {
 
     #[test]
     fn effective_config_path_with_none_returns_default() {
-        // implementation-note-278: this test asserts the
+        // implementation-note-395: this test asserts the
         // "no env, no flag" baseline, but the live runtime now also
         // consults `EMBER_CONFIG` / `EMBER_DEMO_DIR`. The pure
         // `resolve_config_path` tests below exercise the precedence
@@ -7019,7 +9433,7 @@ mod tests {
         );
     }
 
-    // implementation-note-278: precedence chain for the user-pinned
+    // implementation-note-395: precedence chain for the user-pinned
     // config path: --config flag → EMBER_CONFIG → EMBER_DEMO_DIR/config.toml
     // → None (caller falls through to default). Pure-function tests so we
     // don't touch process-global env vars (race-prone when cargo runs
@@ -7048,16 +9462,15 @@ mod tests {
 
     #[test]
     fn resolve_config_path_demo_dir_resolves_when_env_absent_and_file_exists() {
-        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp = tempfile::Builder::new()
+            .prefix("esb")
+            .tempdir_in("/private/tmp")
+            .expect("tempdir");
         let demo_dir = tmp.path();
         let candidate = demo_dir.join("config.toml");
         std::fs::write(&candidate, "# fixture\n").expect("write config.toml");
 
-        let resolved = resolve_config_path(
-            None,
-            None,
-            Some(demo_dir.display().to_string()),
-        );
+        let resolved = resolve_config_path(None, None, Some(demo_dir.display().to_string()));
         assert_eq!(resolved, Some(candidate));
     }
 
@@ -7066,12 +9479,11 @@ mod tests {
         // Stale `EMBER_DEMO_DIR` pointing at a removed demo session must
         // NOT short-circuit the chain — we fall through to the default
         // path so unrelated `ember` invocations don't fail.
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let resolved = resolve_config_path(
-            None,
-            None,
-            Some(tmp.path().display().to_string()),
-        );
+        let tmp = tempfile::Builder::new()
+            .prefix("esb")
+            .tempdir_in("/private/tmp")
+            .expect("tempdir");
+        let resolved = resolve_config_path(None, None, Some(tmp.path().display().to_string()));
         assert_eq!(resolved, None);
     }
 
@@ -7106,7 +9518,10 @@ mod tests {
         assert!(obj.contains_key("personas"), "missing personas");
         assert!(obj.contains_key("grants"), "missing grants");
         assert!(obj.contains_key("approvals"), "missing approvals");
-        assert!(obj.contains_key("standing_grants"), "missing standing_grants");
+        assert!(
+            obj.contains_key("standing_grants"),
+            "missing standing_grants"
+        );
         assert!(obj.contains_key("audit_events"), "missing audit_events");
         let daemon = obj["daemon"].as_object().unwrap();
         assert!(daemon.contains_key("running"), "daemon missing running");
@@ -7114,10 +9529,19 @@ mod tests {
         assert!(daemon.contains_key("socket"), "daemon missing socket");
         let grants = obj["grants"].as_object().unwrap();
         assert!(grants.contains_key("active"), "grants missing active");
-        assert!(grants.contains_key("expired_sweep_interval_sec"), "grants missing expired_sweep_interval_sec");
+        assert!(
+            grants.contains_key("expired_sweep_interval_sec"),
+            "grants missing expired_sweep_interval_sec"
+        );
         assert!(obj["personas"].is_number(), "personas should be a count");
-        assert!(obj["standing_grants"].is_number(), "standing_grants should be a count");
-        assert!(obj["audit_events"].is_number(), "audit_events should be a count");
+        assert!(
+            obj["standing_grants"].is_number(),
+            "standing_grants should be a count"
+        );
+        assert!(
+            obj["audit_events"].is_number(),
+            "audit_events should be a count"
+        );
     }
 
     #[test]
@@ -7148,15 +9572,24 @@ mod tests {
         // u64::MAX / 86400 + 1 parses fine as u64 but overflows when multiplied by 86400
         let overflow_days = u64::MAX / 86400 + 1;
         let input = format!("{overflow_days}d");
-        assert!(parse_duration(&input).is_err(), "days overflow should return Err");
+        assert!(
+            parse_duration(&input).is_err(),
+            "days overflow should return Err"
+        );
         // Same for hours: u64::MAX / 3600 + 1
         let overflow_hours = u64::MAX / 3600 + 1;
         let input = format!("{overflow_hours}h");
-        assert!(parse_duration(&input).is_err(), "hours overflow should return Err");
+        assert!(
+            parse_duration(&input).is_err(),
+            "hours overflow should return Err"
+        );
         // Same for minutes: u64::MAX / 60 + 1
         let overflow_mins = u64::MAX / 60 + 1;
         let input = format!("{overflow_mins}m");
-        assert!(parse_duration(&input).is_err(), "minutes overflow should return Err");
+        assert!(
+            parse_duration(&input).is_err(),
+            "minutes overflow should return Err"
+        );
     }
 
     #[test]
@@ -7189,18 +9622,28 @@ mod tests {
         assert!(stmts[0].actions.contains(&"credential:read".to_string()));
         assert_eq!(
             stmts[0].resource,
-            ResourceSelector::Exact { value: "obj-github-token".to_string() }
+            ResourceSelector::Exact {
+                value: "obj-github-token".to_string()
+            }
         );
-        assert!(stmts[0].budget.is_none(), "credential statement must have no budget");
+        assert!(
+            stmts[0].budget.is_none(),
+            "credential statement must have no budget"
+        );
 
         // Statement 1: Session
         assert_eq!(stmts[1].resource_type, ResourceType::Session);
         assert!(stmts[1].actions.contains(&"llm:generate".to_string()));
         assert_eq!(
             stmts[1].resource,
-            ResourceSelector::Glob { pattern: "anthropic/*".to_string() }
+            ResourceSelector::Glob {
+                pattern: "anthropic/*".to_string()
+            }
         );
-        let session_budget = stmts[1].budget.as_ref().expect("session must have a budget");
+        let session_budget = stmts[1]
+            .budget
+            .as_ref()
+            .expect("session must have a budget");
         assert_eq!(session_budget.tokens, Some(20_000));
         assert_eq!(session_budget.cents, Some(50));
 
@@ -7215,26 +9658,42 @@ mod tests {
     #[test]
     fn build_composite_grant_statements_no_credential_returns_empty() {
         let stmts = build_composite_grant_statements(None, Some(20_000), Some(50), Some(1800));
-        assert!(stmts.is_empty(), "no credential_resource means no statements");
+        assert!(
+            stmts.is_empty(),
+            "no credential_resource means no statements"
+        );
     }
 
     #[test]
     fn build_composite_grant_statements_no_budgets_still_three_statements() {
-        let stmts =
-            build_composite_grant_statements(Some("obj-github-token"), None, None, None);
+        let stmts = build_composite_grant_statements(Some("obj-github-token"), None, None, None);
         assert_eq!(stmts.len(), 3);
-        assert!(stmts[1].budget.is_none(), "session budget absent when no token/cent flags");
-        assert!(stmts[2].budget.is_none(), "time budget absent when no seconds flag");
+        assert!(
+            stmts[1].budget.is_none(),
+            "session budget absent when no token/cent flags"
+        );
+        assert!(
+            stmts[2].budget.is_none(),
+            "time budget absent when no seconds flag"
+        );
     }
 
     // --- helpers for render_grant_budget tests ---
 
-    fn make_test_statement(sid: &str, rt: ResourceType, resource: &str, budget: Option<Budget>, usage: Usage) -> Statement {
+    fn make_test_statement(
+        sid: &str,
+        rt: ResourceType,
+        resource: &str,
+        budget: Option<Budget>,
+        usage: Usage,
+    ) -> Statement {
         Statement {
             sid: sid.into(),
             resource_type: rt,
             actions: vec!["read".to_string()],
-            resource: ResourceSelector::Glob { pattern: resource.to_string() },
+            resource: ResourceSelector::Glob {
+                pattern: resource.to_string(),
+            },
             budget,
             usage,
             conditions: vec![],
@@ -7242,8 +9701,10 @@ mod tests {
     }
 
     fn make_test_grant(statements_by_block: Vec<Vec<Statement>>) -> AccessGrant {
-        use core_grant_types::{AttestationBinding, Block, GrantMode, GrantStatus, RecipientProfile, SignedBlock};
-        use core_event_types::{PresentationAudienceKind};
+        use core_event_types::PresentationAudienceKind;
+        use core_grant_types::{
+            AttestationBinding, Block, GrantMode, GrantStatus, RecipientProfile, SignedBlock,
+        };
         let blocks: Vec<SignedBlock> = statements_by_block
             .into_iter()
             .map(|stmts| SignedBlock {
@@ -7286,8 +9747,19 @@ mod tests {
             "S0",
             ResourceType::Session,
             "llm:generate",
-            Some(Budget { tokens: Some(20_000), cents: Some(50), requests: None, workload_hours: None, wall_clock_secs: None }),
-            Usage { tokens: 14_342, cents: 37, last_updated: 0, ..Usage::default() },
+            Some(Budget {
+                tokens: Some(20_000),
+                cents: Some(50),
+                requests: None,
+                workload_hours: None,
+                wall_clock_secs: None,
+            }),
+            Usage {
+                tokens: 14_342,
+                cents: 37,
+                last_updated: 0,
+                ..Usage::default()
+            },
         );
         let grant = make_test_grant(vec![vec![stmt]]);
         // Should not panic; budget and usage are populated.
@@ -7302,42 +9774,101 @@ mod tests {
             "S0",
             ResourceType::Session,
             "llm:generate",
-            Some(Budget { tokens: Some(20_000), cents: None, requests: None, workload_hours: None, wall_clock_secs: None }),
-            Usage { tokens: 5_000, last_updated: 0, ..Usage::default() },
+            Some(Budget {
+                tokens: Some(20_000),
+                cents: None,
+                requests: None,
+                workload_hours: None,
+                wall_clock_secs: None,
+            }),
+            Usage {
+                tokens: 5_000,
+                last_updated: 0,
+                ..Usage::default()
+            },
         );
         let grant = make_test_grant(vec![vec![stmt]]);
         // Stale usage — runway should show dash.
         let out = render_grant_budget(&grant);
-        assert!(out.contains("Runway:  —"), "expected stale runway dash: {out}");
+        assert!(
+            out.contains("Runway:  —"),
+            "expected stale runway dash: {out}"
+        );
     }
 
     #[test]
     fn render_single_statement_no_budget() {
-        let stmt = make_test_statement("S0", ResourceType::Credential, "credential:*", None, Usage::default());
+        let stmt = make_test_statement(
+            "S0",
+            ResourceType::Credential,
+            "credential:*",
+            None,
+            Usage::default(),
+        );
         let grant = make_test_grant(vec![vec![stmt]]);
         let out = render_grant_budget(&grant);
         assert!(out.contains("Grant grant-test"), "missing header: {out}");
-        assert!(out.contains("Budget:  (none)"), "expected no-budget line: {out}");
+        assert!(
+            out.contains("Budget:  (none)"),
+            "expected no-budget line: {out}"
+        );
         // Single-statement grants must NOT show per-statement header.
-        assert!(!out.contains("Statement S0"), "should not show stmt header for single: {out}");
+        assert!(
+            !out.contains("Statement S0"),
+            "should not show stmt header for single: {out}"
+        );
     }
 
     #[test]
     fn render_composite_three_statements() {
-        let s0 = make_test_statement("S0", ResourceType::Credential, "credential:*", None, Usage::default());
+        let s0 = make_test_statement(
+            "S0",
+            ResourceType::Credential,
+            "credential:*",
+            None,
+            Usage::default(),
+        );
         let s1 = make_test_statement(
             "S1",
             ResourceType::Session,
             "llm:generate",
-            Some(Budget { tokens: Some(20_000), cents: Some(100), requests: None, workload_hours: None, wall_clock_secs: None }),
-            Usage { tokens: 12_450, cents: 85, requests: 0, workload_hours: 0, wall_clock_secs: 0, last_updated: 0, cents_micro: 85_000_000 },
+            Some(Budget {
+                tokens: Some(20_000),
+                cents: Some(100),
+                requests: None,
+                workload_hours: None,
+                wall_clock_secs: None,
+            }),
+            Usage {
+                tokens: 12_450,
+                cents: 85,
+                requests: 0,
+                workload_hours: 0,
+                wall_clock_secs: 0,
+                last_updated: 0,
+                cents_micro: 85_000_000,
+            },
         );
         let s2 = make_test_statement(
             "S2",
             ResourceType::Time,
             "session:*",
-            Some(Budget { tokens: None, cents: None, requests: None, workload_hours: None, wall_clock_secs: Some(1800) }),
-            Usage { tokens: 0, cents: 0, requests: 0, workload_hours: 0, wall_clock_secs: 240, last_updated: 0, cents_micro: 0 },
+            Some(Budget {
+                tokens: None,
+                cents: None,
+                requests: None,
+                workload_hours: None,
+                wall_clock_secs: Some(1800),
+            }),
+            Usage {
+                tokens: 0,
+                cents: 0,
+                requests: 0,
+                workload_hours: 0,
+                wall_clock_secs: 240,
+                last_updated: 0,
+                cents_micro: 0,
+            },
         );
         let grant = make_test_grant(vec![vec![s0, s1, s2]]);
         let out = render_grant_budget(&grant);
@@ -7348,7 +9879,10 @@ mod tests {
         assert!(out.contains("Statement S2"), "missing S2 header: {out}");
 
         // S0 has no budget.
-        assert!(out.contains("Budget:  (none)"), "expected no-budget for S0: {out}");
+        assert!(
+            out.contains("Budget:  (none)"),
+            "expected no-budget for S0: {out}"
+        );
 
         // S1 shows token and cent usage.
         assert!(out.contains("12450"), "missing token usage: {out}");
@@ -7378,7 +9912,10 @@ mod tests {
         let data_dir = tmp.path();
 
         let guard = configure_tracing(data_dir, &LogLevel::Info, false);
-        tracing::info!(test_marker = "unit-test-probe", "configure_tracing_writes_json_log probe");
+        tracing::info!(
+            test_marker = "unit-test-probe",
+            "configure_tracing_writes_json_log probe"
+        );
         // Drop guard to flush the non-blocking writer before reading the file.
         drop(guard);
 
@@ -7386,11 +9923,7 @@ mod tests {
         let log_file = std::fs::read_dir(data_dir)
             .unwrap()
             .flatten()
-            .find(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with("daemon.log")
-            })
+            .find(|e| e.file_name().to_string_lossy().starts_with("daemon.log"))
             .expect("daemon.log.* should exist after drop");
 
         let file = std::fs::File::open(log_file.path()).unwrap();
@@ -7421,9 +9954,20 @@ mod tests {
 
     #[test]
     fn sandbox_run_parses_required_name_and_image() {
-        let action = parse_sandbox_run(&["agent-coding", "--image", "ember-claude-code:v1", "--prompt", "hello"]);
+        let action = parse_sandbox_run(&[
+            "agent-coding",
+            "--image",
+            "ember-claude-code:v1",
+            "--prompt",
+            "hello",
+        ]);
         match action {
-            SandboxAction::Run { name, image, prompt, .. } => {
+            SandboxAction::Run {
+                name,
+                image,
+                prompt,
+                ..
+            } => {
                 assert_eq!(name, "agent-coding");
                 assert_eq!(image, "ember-claude-code:v1");
                 assert_eq!(prompt.as_deref(), Some("hello"));
@@ -7458,12 +10002,17 @@ mod tests {
     fn sandbox_run_parses_workspace_from() {
         let action = parse_sandbox_run(&[
             "ws-sandbox",
-            "--image", "ember-claude-code:v1",
-            "--workspace-from", "https://github.com/example/repo",
+            "--image",
+            "ember-claude-code:v1",
+            "--workspace-from",
+            "https://github.com/example/repo",
         ]);
         match action {
             SandboxAction::Run { workspace_from, .. } => {
-                assert_eq!(workspace_from.as_deref(), Some("https://github.com/example/repo"));
+                assert_eq!(
+                    workspace_from.as_deref(),
+                    Some("https://github.com/example/repo")
+                );
             }
             _ => panic!("expected SandboxAction::Run"),
         }
@@ -7471,11 +10020,7 @@ mod tests {
 
     #[test]
     fn sandbox_run_parses_env_vars() {
-        let action = parse_sandbox_run(&[
-            "env-sandbox",
-            "--env", "FOO=bar",
-            "--env", "BAZ=qux",
-        ]);
+        let action = parse_sandbox_run(&["env-sandbox", "--env", "FOO=bar", "--env", "BAZ=qux"]);
         match action {
             SandboxAction::Run { env, .. } => {
                 assert!(env.contains(&"FOO=bar".to_string()));
@@ -7487,10 +10032,7 @@ mod tests {
 
     #[test]
     fn sandbox_run_parses_ttl() {
-        let action = parse_sandbox_run(&[
-            "ttl-sandbox",
-            "--ttl", "30m",
-        ]);
+        let action = parse_sandbox_run(&["ttl-sandbox", "--ttl", "30m"]);
         match action {
             SandboxAction::Run { ttl, .. } => {
                 assert_eq!(ttl.as_deref(), Some("30m"));
@@ -7499,7 +10041,7 @@ mod tests {
         }
     }
 
-    // --- docker_exec_flags unit tests (implementation-note-293) ---
+    // --- docker_exec_flags unit tests (implementation-note-413) ---
 
     #[test]
     fn docker_exec_flags_non_tty_returns_only_i() {
@@ -7529,17 +10071,16 @@ mod tests {
 
     #[test]
     fn grant_create_ttl_parses_humantime_and_bare_integer() {
-        for (input, expected_secs) in [
-            ("5s", 5u64),
-            ("5m", 300),
-            ("2h", 7200),
-            ("30", 30),
-        ] {
+        for (input, expected_secs) in [("5s", 5u64), ("5m", 300), ("2h", 7200), ("30", 30)] {
             let action = parse_grant_create(&[
-                "--persona", "p1",
-                "--credential", "cred-x",
-                "--scope", "read",
-                "--ttl", input,
+                "--persona",
+                "p1",
+                "--credential",
+                "cred-x",
+                "--scope",
+                "read",
+                "--ttl",
+                input,
             ]);
             match action {
                 GrantAction::Create { ttl, .. } => {
@@ -7556,11 +10097,17 @@ mod tests {
     fn sandbox_run_parses_budget_tokens_and_usd() {
         let action = parse_sandbox_run(&[
             "budget-sandbox",
-            "--budget-tokens", "20000",
-            "--budget-usd", "0.50",
+            "--budget-tokens",
+            "20000",
+            "--budget-usd",
+            "0.50",
         ]);
         match action {
-            SandboxAction::Run { budget_tokens, budget_usd, .. } => {
+            SandboxAction::Run {
+                budget_tokens,
+                budget_usd,
+                ..
+            } => {
                 assert_eq!(budget_tokens, Some(20_000u64));
                 assert_eq!(budget_usd.as_deref(), Some("0.50"));
             }
@@ -7570,12 +10117,13 @@ mod tests {
 
     #[test]
     fn sandbox_run_parses_credential_resource() {
-        let action = parse_sandbox_run(&[
-            "cred-sandbox",
-            "--credential-resource", "obj-github-token",
-        ]);
+        let action =
+            parse_sandbox_run(&["cred-sandbox", "--credential-resource", "obj-github-token"]);
         match action {
-            SandboxAction::Run { credential_resource, .. } => {
+            SandboxAction::Run {
+                credential_resource,
+                ..
+            } => {
                 assert_eq!(credential_resource.as_deref(), Some("obj-github-token"));
             }
             _ => panic!("expected SandboxAction::Run"),
@@ -7586,15 +10134,24 @@ mod tests {
     fn sandbox_run_full_flags() {
         let action = parse_sandbox_run(&[
             "full-sandbox",
-            "--image", "ember-claude-code:v1",
-            "--prompt", "echo hello",
-            "--workspace-from", "https://github.com/example/repo",
-            "--env", "KEY=val",
-            "--ttl", "60s",
-            "--budget-tokens", "5000",
-            "--budget-usd", "0.25",
-            "--budget-seconds", "3600",
-            "--credential-resource", "obj-anthropic-key",
+            "--image",
+            "ember-claude-code:v1",
+            "--prompt",
+            "echo hello",
+            "--workspace-from",
+            "https://github.com/example/repo",
+            "--env",
+            "KEY=val",
+            "--ttl",
+            "60s",
+            "--budget-tokens",
+            "5000",
+            "--budget-usd",
+            "0.25",
+            "--budget-seconds",
+            "3600",
+            "--credential-resource",
+            "obj-anthropic-key",
         ]);
         match action {
             SandboxAction::Run {
@@ -7612,7 +10169,10 @@ mod tests {
                 assert_eq!(name, "full-sandbox");
                 assert_eq!(image, "ember-claude-code:v1");
                 assert_eq!(prompt.as_deref(), Some("echo hello"));
-                assert_eq!(workspace_from.as_deref(), Some("https://github.com/example/repo"));
+                assert_eq!(
+                    workspace_from.as_deref(),
+                    Some("https://github.com/example/repo")
+                );
                 assert!(env.contains(&"KEY=val".to_string()));
                 assert_eq!(ttl.as_deref(), Some("60s"));
                 assert_eq!(budget_tokens, Some(5_000u64));
@@ -7653,7 +10213,10 @@ mod tests {
         std::fs::write(tmp.path().join(".ember-production"), b"").unwrap();
         let result =
             check_production_sentinel(DEFAULT_KEYRING_SERVICE, DEFAULT_KEYRING_SERVICE, tmp.path());
-        assert!(result.is_ok(), "checkpoint should pass when opt-in file exists");
+        assert!(
+            result.is_ok(),
+            "checkpoint should pass when opt-in file exists"
+        );
     }
 
     #[test]
@@ -7700,14 +10263,161 @@ mod tests {
         // SAFETY: test-only, single-threaded, no other threads reading env vars.
         unsafe {
             std::env::set_var("EMBER_VAULT_PASSPHRASE", "sec14-cli-passphrase");
+            std::env::set_var("EMBER_SKIP_DAEMON_INSTALL_CHECK", "1");
         }
 
-        cmd_init(&config, Some("test".to_string()), Some(&config_path), None, None, false);
+        cmd_init(
+            &config,
+            Some("test".to_string()),
+            Some(&config_path),
+            None,
+            None,
+            false,
+        );
 
         assert!(
             std::env::var("EMBER_VAULT_PASSPHRASE").is_err(),
             "EMBER_VAULT_PASSPHRASE must be absent from the environment after cmd_init"
         );
+        unsafe {
+            std::env::remove_var("EMBER_SKIP_DAEMON_INSTALL_CHECK");
+        }
+    }
+
+    #[test]
+    fn cmd_init_with_live_socket_builds_first_receipt_via_daemon_without_local_db_write() {
+        use core_crypto::Signer as _;
+        use std::io::{BufRead, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::Builder::new()
+            .prefix("esb")
+            .tempdir_in("/private/tmp")
+            .expect("tempdir");
+        let config_path = tmp.path().join("config.toml");
+        let data_dir = tmp.path().join("data");
+        let run_dir = tmp.path().join("run");
+
+        let config = ember_daemon::infra::config::DaemonConfig {
+            socket_dir: run_dir.clone(),
+            data_dir: data_dir.clone(),
+            pid_file: run_dir.join("emberd.pid"),
+            policy_file: tmp.path().join("policy.toml"),
+            log_level: ember_daemon::infra::config::LogLevel::Info,
+            dashboard_addr: None,
+            git_proxy_addr: None,
+            llm_proxy_addr: None,
+            keyring: ember_daemon::infra::config::KeyringConfig::default(),
+            stale_approval_threshold_secs: 3600,
+            presence: ember_daemon::infra::config::PresenceConfigSection::default(),
+            snapshot_interval_secs: 3600,
+            snapshot_pull_interval_secs: 600,
+            snapshot_pull_endpoint: None,
+            snapshot_pull_cluster_id: None,
+            credential_store: None,
+            ..ember_daemon::infra::config::DaemonConfig::for_test(tmp.path())
+        };
+
+        std::fs::create_dir_all(&config.socket_dir).expect("create socket dir");
+        let socket_path = config.socket_dir.join("daemon.sock");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn({
+            let socket_path = socket_path.clone();
+            move || {
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+                ready_tx.send(()).expect("signal ready");
+
+                let signer = core_crypto::FixtureSigner::new("cmd-init-daemon-receipt");
+                let public_key = signer.public_key().0.clone();
+
+                for _ in 0..2 {
+                    let (mut stream, _) = listener.accept().expect("accept client");
+                    let mut reader = std::io::BufReader::new(
+                        stream.try_clone().expect("clone fake daemon stream"),
+                    );
+                    let mut line = String::new();
+                    reader
+                        .read_line(&mut line)
+                        .expect("read fake daemon request");
+                    let request: serde_json::Value =
+                        serde_json::from_str(line.trim()).expect("parse fake daemon request");
+
+                    let response = match request["method"].as_str().unwrap() {
+                        "create_persona" => {
+                            assert_eq!(request["params"]["name"], serde_json::json!("daemon-root"));
+                            serde_json::json!({
+                                "id": request["id"],
+                                "result": {
+                                    "id": "persona-rpc",
+                                    "name": "daemon-root",
+                                    "public_key": public_key,
+                                },
+                            })
+                        }
+                        "build_init_first_grant_receipt" => {
+                            assert_eq!(
+                                request["params"]["persona_id"],
+                                serde_json::json!("persona-rpc")
+                            );
+                            let file = ember_daemon::infra::init_first_grant::build_first_grant_receipt_file(
+                                "persona-rpc",
+                                &signer,
+                            )
+                            .expect("build first-grant receipt");
+                            serde_json::json!({
+                                "id": request["id"],
+                                "result": serde_json::to_value(file).expect("serialize receipt file"),
+                            })
+                        }
+                        other => panic!("unexpected method: {other}"),
+                    };
+
+                    let mut encoded =
+                        serde_json::to_string(&response).expect("encode fake daemon response");
+                    encoded.push('\n');
+                    stream
+                        .write_all(encoded.as_bytes())
+                        .expect("write fake daemon response");
+                }
+            }
+        });
+
+        ready_rx.recv().expect("wait for fake daemon ready");
+        unsafe {
+            std::env::set_var("EMBER_VAULT_PASSPHRASE", "rpc-init-passphrase");
+        }
+
+        cmd_init(
+            &config,
+            Some("daemon-root".to_string()),
+            Some(&config_path),
+            None,
+            None,
+            false,
+        );
+
+        assert!(
+            std::env::var("EMBER_VAULT_PASSPHRASE").is_err(),
+            "EMBER_VAULT_PASSPHRASE must be absent from the environment after cmd_init"
+        );
+        assert!(
+            !data_dir.join("daemon.db").exists(),
+            "live-socket init must not create daemon.db locally when the daemon owns persona + receipt flows"
+        );
+
+        let receipt_path = data_dir.join("receipts/first.json");
+        assert!(
+            receipt_path.exists(),
+            "daemon-built first-grant receipt must be written locally"
+        );
+        let raw = std::fs::read_to_string(&receipt_path).expect("read receipt");
+        let file: emberlink_cli::onboarding::first_grant::FirstGrantReceiptFile =
+            serde_json::from_str(&raw).expect("parse receipt");
+        assert_eq!(file.issuer.persona, "persona-rpc");
+
+        server.join().expect("fake daemon thread");
     }
 
     // --- .C device enroll/pair scaffold parse tests ---
@@ -7770,9 +10480,7 @@ mod tests {
             #[command(subcommand)]
             action: VaultAction,
         }
-        let parsed = T::try_parse_from([
-            "test", "add", "--name", "foo/bar", "--value", "leaky",
-        ]);
+        let parsed = T::try_parse_from(["test", "add", "--name", "foo/bar", "--value", "leaky"]);
         assert!(
             parsed.is_ok(),
             "clap should accept --value at parse-time so dispatch can emit a structured refuse"
@@ -7784,6 +10492,1809 @@ mod tests {
             }
             _ => panic!("expected Add"),
         }
+    }
+
+    #[test]
+    fn vault_lock_routes_through_daemon_when_socket_exists() {
+        use std::io::{BufRead, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::Builder::new()
+            .prefix("esb")
+            .tempdir_in("/private/tmp")
+            .expect("tempdir");
+        let config = DaemonConfig::for_test(tmp.path());
+        std::fs::create_dir_all(&config.socket_dir).expect("create socket dir");
+        let socket_path = config.socket_dir.join("daemon.sock");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn({
+            let socket_path = socket_path.clone();
+            move || {
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+                ready_tx.send(()).expect("signal ready");
+
+                let (mut stream, _) = listener.accept().expect("accept client");
+                let mut reader =
+                    std::io::BufReader::new(stream.try_clone().expect("clone fake daemon stream"));
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .expect("read fake daemon request");
+                let request: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("parse fake daemon request");
+                assert_eq!(request["method"], serde_json::json!("vault_lock"));
+
+                let mut encoded = serde_json::to_string(&serde_json::json!({
+                    "id": request["id"],
+                    "result": {"locked": true},
+                }))
+                .expect("encode fake daemon response");
+                encoded.push('\n');
+                stream
+                    .write_all(encoded.as_bytes())
+                    .expect("write fake daemon response");
+            }
+        });
+
+        ready_rx.recv().expect("wait for fake daemon ready");
+        let dispatch = run_vault_lock(&config).expect("vault lock via daemon");
+        assert_eq!(dispatch, VaultLockDispatch::DaemonRpc);
+        server.join().expect("fake daemon thread");
+    }
+
+    #[test]
+    fn vault_lock_falls_back_to_local_when_socket_is_absent() {
+        let tmp = tempfile::Builder::new()
+            .prefix("esb")
+            .tempdir_in("/private/tmp")
+            .expect("tempdir");
+        let config = DaemonConfig::for_test(tmp.path());
+        let dispatch = run_vault_lock(&config).expect("local fallback lock");
+        assert_eq!(dispatch, VaultLockDispatch::LocalFallback);
+    }
+
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "local macOS sandbox forbids fake daemon UDS bind"
+    )]
+    #[test]
+    fn vault_unlock_routes_through_daemon_when_socket_exists() {
+        use std::io::{BufRead, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::Builder::new()
+            .prefix("esb")
+            .tempdir_in("/private/tmp")
+            .expect("tempdir");
+        let config = DaemonConfig::for_test(tmp.path());
+        std::fs::create_dir_all(&config.socket_dir).expect("create socket dir");
+        let socket_path = config.socket_dir.join("daemon.sock");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn({
+            let socket_path = socket_path.clone();
+            move || {
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+                ready_tx.send(()).expect("signal ready");
+
+                let (mut stream, _) = listener.accept().expect("accept client");
+                let mut reader =
+                    std::io::BufReader::new(stream.try_clone().expect("clone fake daemon stream"));
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .expect("read fake daemon request");
+                let request: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("parse fake daemon request");
+                assert_eq!(request["method"], serde_json::json!("vault_unlock"));
+
+                let mut encoded = serde_json::to_string(&serde_json::json!({
+                    "id": request["id"],
+                    "result": {"unlocked": true},
+                }))
+                .expect("encode fake daemon response");
+                encoded.push('\n');
+                stream
+                    .write_all(encoded.as_bytes())
+                    .expect("write fake daemon response");
+            }
+        });
+
+        ready_rx.recv().expect("wait for fake daemon ready");
+        let dispatch = run_vault_unlock(&config).expect("vault unlock via daemon");
+        assert_eq!(dispatch, VaultLockDispatch::DaemonRpc);
+        server.join().expect("fake daemon thread");
+    }
+
+    #[test]
+    fn vault_unlock_falls_back_to_local_when_socket_is_absent() {
+        // SAFETY: test-only env var scoped to this unit test.
+        unsafe { std::env::set_var("EMBER_VAULT_PASSPHRASE", "vault-unlock-fallback-test") };
+        let tmp = tempfile::Builder::new()
+            .prefix("esb")
+            .tempdir_in("/private/tmp")
+            .expect("tempdir");
+        let config = DaemonConfig::for_test(tmp.path());
+        let dispatch = run_vault_unlock(&config).expect("local fallback unlock");
+        assert_eq!(dispatch, VaultLockDispatch::LocalFallback);
+        // SAFETY: test-only cleanup for the scoped env var above.
+        unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
+    }
+
+    #[test]
+    fn vault_list_routes_through_daemon_when_socket_exists() {
+        use std::io::{BufRead, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = DaemonConfig::for_test(tmp.path());
+        std::fs::create_dir_all(&config.socket_dir).expect("create socket dir");
+        let socket_path = config.socket_dir.join("daemon.sock");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn({
+            let socket_path = socket_path.clone();
+            move || {
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+                ready_tx.send(()).expect("signal ready");
+
+                let (mut stream, _) = listener.accept().expect("accept client");
+                let mut reader =
+                    std::io::BufReader::new(stream.try_clone().expect("clone fake daemon stream"));
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .expect("read fake daemon request");
+                let request: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("parse fake daemon request");
+                assert_eq!(request["method"], serde_json::json!("vault_list"));
+
+                let mut encoded = serde_json::to_string(&serde_json::json!({
+                    "id": request["id"],
+                    "result": [
+                        {"id": 1, "name": "alpha/token", "metadata": null},
+                        {"id": 2, "name": "beta/token", "metadata": "meta"}
+                    ],
+                }))
+                .expect("encode fake daemon response");
+                encoded.push('\n');
+                stream
+                    .write_all(encoded.as_bytes())
+                    .expect("write fake daemon response");
+            }
+        });
+
+        ready_rx.recv().expect("wait for fake daemon ready");
+        let (dispatch, entries) =
+            run_vault_list(&config, Some("alpha")).expect("vault list via daemon");
+        assert_eq!(dispatch, VaultActionDispatch::DaemonRpc);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["name"], serde_json::json!("alpha/token"));
+        server.join().expect("fake daemon thread");
+    }
+
+    #[test]
+    fn vault_remove_routes_through_daemon_when_socket_exists() {
+        use std::io::{BufRead, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = DaemonConfig::for_test(tmp.path());
+        std::fs::create_dir_all(&config.socket_dir).expect("create socket dir");
+        let socket_path = config.socket_dir.join("daemon.sock");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn({
+            let socket_path = socket_path.clone();
+            move || {
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+                ready_tx.send(()).expect("signal ready");
+
+                let (mut stream, _) = listener.accept().expect("accept client");
+                let mut reader =
+                    std::io::BufReader::new(stream.try_clone().expect("clone fake daemon stream"));
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .expect("read fake daemon request");
+                let request: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("parse fake daemon request");
+                assert_eq!(request["method"], serde_json::json!("vault_remove"));
+                assert_eq!(request["params"]["name"], serde_json::json!("alpha/token"));
+
+                let mut encoded = serde_json::to_string(&serde_json::json!({
+                    "id": request["id"],
+                    "result": {"removed": true, "name": "alpha/token"},
+                }))
+                .expect("encode fake daemon response");
+                encoded.push('\n');
+                stream
+                    .write_all(encoded.as_bytes())
+                    .expect("write fake daemon response");
+            }
+        });
+
+        ready_rx.recv().expect("wait for fake daemon ready");
+        let dispatch = run_vault_remove(&config, "alpha/token").expect("vault remove via daemon");
+        assert_eq!(dispatch, VaultActionDispatch::DaemonRpc);
+        server.join().expect("fake daemon thread");
+    }
+
+    #[test]
+    fn vault_get_prefers_exact_value_bytes_from_daemon() {
+        use std::io::{BufRead, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = DaemonConfig::for_test(tmp.path());
+        std::fs::create_dir_all(&config.socket_dir).expect("create socket dir");
+        let socket_path = config.socket_dir.join("daemon.sock");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn({
+            let socket_path = socket_path.clone();
+            move || {
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+                ready_tx.send(()).expect("signal ready");
+
+                let (mut stream, _) = listener.accept().expect("accept client");
+                let mut reader =
+                    std::io::BufReader::new(stream.try_clone().expect("clone fake daemon stream"));
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .expect("read fake daemon request");
+                let request: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("parse fake daemon request");
+                assert_eq!(request["method"], serde_json::json!("vault_get"));
+                assert_eq!(request["params"]["name"], serde_json::json!("alpha/token"));
+
+                let mut encoded = serde_json::to_string(&serde_json::json!({
+                    "id": request["id"],
+                    "result": {
+                        "value": "lossy-placeholder",
+                        "value_bytes": [0, 255, 65]
+                    },
+                }))
+                .expect("encode fake daemon response");
+                encoded.push('\n');
+                stream
+                    .write_all(encoded.as_bytes())
+                    .expect("write fake daemon response");
+            }
+        });
+
+        ready_rx.recv().expect("wait for fake daemon ready");
+        let (dispatch, value) =
+            run_vault_get(&config, "alpha/token").expect("vault get via daemon");
+        assert_eq!(dispatch, VaultActionDispatch::DaemonRpc);
+        assert_eq!(value, vec![0, 255, 65]);
+        server.join().expect("fake daemon thread");
+    }
+
+    #[test]
+    fn vault_store_routes_exact_bytes_through_daemon() {
+        use std::io::{BufRead, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = DaemonConfig::for_test(tmp.path());
+        std::fs::create_dir_all(&config.socket_dir).expect("create socket dir");
+        let socket_path = config.socket_dir.join("daemon.sock");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn({
+            let socket_path = socket_path.clone();
+            move || {
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+                ready_tx.send(()).expect("signal ready");
+
+                let (mut stream, _) = listener.accept().expect("accept client");
+                let mut reader =
+                    std::io::BufReader::new(stream.try_clone().expect("clone fake daemon stream"));
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .expect("read fake daemon request");
+                let request: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("parse fake daemon request");
+                assert_eq!(request["method"], serde_json::json!("vault_add"));
+                assert_eq!(request["params"]["name"], serde_json::json!("alpha/token"));
+                assert_eq!(
+                    request["params"]["value_bytes"],
+                    serde_json::json!([0, 255, 65])
+                );
+                assert_eq!(request["params"]["metadata"], serde_json::json!("meta"));
+
+                let mut encoded = serde_json::to_string(&serde_json::json!({
+                    "id": request["id"],
+                    "result": {"id": 42, "name": "alpha/token"},
+                }))
+                .expect("encode fake daemon response");
+                encoded.push('\n');
+                stream
+                    .write_all(encoded.as_bytes())
+                    .expect("write fake daemon response");
+            }
+        });
+
+        ready_rx.recv().expect("wait for fake daemon ready");
+        let stored = run_vault_store(&config, "alpha/token", &[0, 255, 65], Some("meta"))
+            .expect("vault store via daemon");
+        assert_eq!(stored.dispatch, VaultActionDispatch::DaemonRpc);
+        assert_eq!(stored.id, "42");
+        assert_eq!(stored.name, "alpha/token");
+        server.join().expect("fake daemon thread");
+    }
+
+    #[test]
+    fn grant_create_routes_full_shape_through_daemon_when_socket_exists() {
+        use std::io::{BufRead, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = DaemonConfig::for_test(tmp.path());
+        std::fs::create_dir_all(&config.socket_dir).expect("create socket dir");
+        let socket_path = config.socket_dir.join("daemon.sock");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn({
+            let socket_path = socket_path.clone();
+            move || {
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+                ready_tx.send(()).expect("signal ready");
+
+                let (mut stream, _) = listener.accept().expect("accept client");
+                let mut reader =
+                    std::io::BufReader::new(stream.try_clone().expect("clone fake daemon stream"));
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .expect("read fake daemon request");
+                let request: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("parse fake daemon request");
+                assert_eq!(request["method"], serde_json::json!("create_grant"));
+                assert_eq!(
+                    request["params"]["persona_id"],
+                    serde_json::json!("persona-1")
+                );
+                assert_eq!(
+                    request["params"]["credential_name"],
+                    serde_json::json!("api-key")
+                );
+                assert_eq!(request["params"]["scope"], serde_json::json!("read"));
+                assert_eq!(request["params"]["ttl_secs"], serde_json::json!(600));
+                assert_eq!(request["params"]["max_uses_per_hour"], serde_json::json!(5));
+                assert_eq!(
+                    request["params"]["allowed_hours_start"],
+                    serde_json::json!(9)
+                );
+                assert_eq!(
+                    request["params"]["allowed_hours_end"],
+                    serde_json::json!(17)
+                );
+                assert_eq!(
+                    request["params"]["allowed_targets"],
+                    serde_json::json!(["api.example.com", "uploads.example.com"])
+                );
+                assert_eq!(
+                    request["params"]["max_delegation_depth"],
+                    serde_json::json!(2)
+                );
+                assert_eq!(request["params"]["budget"]["tokens"], serde_json::json!(42));
+                assert_eq!(
+                    request["params"]["max_children_per_day"],
+                    serde_json::json!(3)
+                );
+                assert_eq!(
+                    request["params"]["auto_delegate_scope_template"],
+                    serde_json::json!("github:push:acme/*")
+                );
+
+                let mut encoded = serde_json::to_string(&serde_json::json!({
+                    "id": request["id"],
+                    "result": {
+                        "id": "grant-123",
+                        "expires_at": null,
+                        "budget": {"tokens": 42},
+                    },
+                }))
+                .expect("encode fake daemon response");
+                encoded.push('\n');
+                stream
+                    .write_all(encoded.as_bytes())
+                    .expect("write fake daemon response");
+            }
+        });
+
+        ready_rx.recv().expect("wait for fake daemon ready");
+        let spec = GrantCreateSpec {
+            persona: "persona-1".to_string(),
+            credential: "api-key".to_string(),
+            scope: "read".to_string(),
+            ttl_secs: Some(600),
+            max_uses_per_hour: Some(5),
+            allowed_hours_start: Some(9),
+            allowed_hours_end: Some(17),
+            allowed_targets: Some(vec![
+                "api.example.com".to_string(),
+                "uploads.example.com".to_string(),
+            ]),
+            max_delegation_depth: Some(2),
+            budget: Some(Budget {
+                tokens: Some(42),
+                cents: None,
+                requests: None,
+                workload_hours: None,
+                wall_clock_secs: None,
+            }),
+            max_children_per_day: Some(3),
+            auto_delegate_scope_template: Some("github:push:acme/*".to_string()),
+        };
+
+        let (dispatch, response) =
+            run_grant_create(&config, &spec).expect("grant create via daemon");
+        assert_eq!(dispatch, GrantActionDispatch::DaemonRpc);
+        assert_eq!(response["id"], serde_json::json!("grant-123"));
+        server.join().expect("fake daemon thread");
+    }
+
+    #[test]
+    fn grant_list_routes_through_daemon_when_socket_exists() {
+        use std::io::{BufRead, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = DaemonConfig::for_test(tmp.path());
+        std::fs::create_dir_all(&config.socket_dir).expect("create socket dir");
+        let socket_path = config.socket_dir.join("daemon.sock");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn({
+            let socket_path = socket_path.clone();
+            move || {
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+                ready_tx.send(()).expect("signal ready");
+
+                let (mut stream, _) = listener.accept().expect("accept client");
+                let mut reader =
+                    std::io::BufReader::new(stream.try_clone().expect("clone fake daemon stream"));
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .expect("read fake daemon request");
+                let request: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("parse fake daemon request");
+                assert_eq!(request["method"], serde_json::json!("list_operator_grants"));
+                assert_eq!(request["params"]["active_only"], serde_json::json!(true));
+
+                let mut encoded = serde_json::to_string(&serde_json::json!({
+                    "id": request["id"],
+                    "result": [
+                        {
+                            "id": "grant-1",
+                            "persona_id": "persona-a",
+                            "credential_name": "cred-a",
+                            "scope": "read",
+                            "status": "active",
+                            "expires_at": null
+                        },
+                        {
+                            "id": "grant-2",
+                            "persona_id": "persona-b",
+                            "credential_name": "cred-b",
+                            "scope": "write",
+                            "status": "paused",
+                            "expires_at": "2026-06-01T00:00:00Z"
+                        }
+                    ],
+                }))
+                .expect("encode fake daemon response");
+                encoded.push('\n');
+                stream
+                    .write_all(encoded.as_bytes())
+                    .expect("write fake daemon response");
+            }
+        });
+
+        ready_rx.recv().expect("wait for fake daemon ready");
+        let (dispatch, list) = run_grant_list(&config, true).expect("grant list via daemon");
+        assert_eq!(dispatch, GrantActionDispatch::DaemonRpc);
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0]["id"], serde_json::json!("grant-1"));
+        assert_eq!(list[1]["status"], serde_json::json!("paused"));
+        server.join().expect("fake daemon thread");
+    }
+
+    #[test]
+    fn grant_expire_routes_through_daemon_when_socket_exists() {
+        use std::io::{BufRead, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = DaemonConfig::for_test(tmp.path());
+        std::fs::create_dir_all(&config.socket_dir).expect("create socket dir");
+        let socket_path = config.socket_dir.join("daemon.sock");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn({
+            let socket_path = socket_path.clone();
+            move || {
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+                ready_tx.send(()).expect("signal ready");
+
+                let (mut stream, _) = listener.accept().expect("accept client");
+                let mut reader =
+                    std::io::BufReader::new(stream.try_clone().expect("clone fake daemon stream"));
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .expect("read fake daemon request");
+                let request: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("parse fake daemon request");
+                assert_eq!(request["method"], serde_json::json!("expire_grants"));
+
+                let mut encoded = serde_json::to_string(&serde_json::json!({
+                    "id": request["id"],
+                    "result": {"expired_count": 3},
+                }))
+                .expect("encode fake daemon response");
+                encoded.push('\n');
+                stream
+                    .write_all(encoded.as_bytes())
+                    .expect("write fake daemon response");
+            }
+        });
+
+        ready_rx.recv().expect("wait for fake daemon ready");
+        let (dispatch, count) = run_grant_expire(&config).expect("grant expire via daemon");
+        assert_eq!(dispatch, GrantActionDispatch::DaemonRpc);
+        assert_eq!(count, 3);
+        server.join().expect("fake daemon thread");
+    }
+
+    #[test]
+    fn grant_extend_routes_through_daemon_when_socket_exists() {
+        use std::io::{BufRead, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = DaemonConfig::for_test(tmp.path());
+        std::fs::create_dir_all(&config.socket_dir).expect("create socket dir");
+        let socket_path = config.socket_dir.join("daemon.sock");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn({
+            let socket_path = socket_path.clone();
+            move || {
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+                ready_tx.send(()).expect("signal ready");
+
+                let (mut stream, _) = listener.accept().expect("accept client");
+                let mut reader =
+                    std::io::BufReader::new(stream.try_clone().expect("clone fake daemon stream"));
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .expect("read fake daemon request");
+                let request: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("parse fake daemon request");
+                assert_eq!(request["method"], serde_json::json!("extend_grant"));
+                assert_eq!(
+                    request["params"]["grant_id"],
+                    serde_json::json!("grant-123")
+                );
+                assert_eq!(request["params"]["add_tokens"], serde_json::json!(10));
+                assert_eq!(request["params"]["add_cents"], serde_json::json!(25));
+                assert_eq!(request["params"]["add_ttl_secs"], serde_json::json!(900));
+
+                let mut encoded = serde_json::to_string(&serde_json::json!({
+                    "id": request["id"],
+                    "result": {
+                        "grant_id": "grant-123",
+                        "expires_at": null,
+                        "budget": {"tokens": 10, "cents": 25},
+                    },
+                }))
+                .expect("encode fake daemon response");
+                encoded.push('\n');
+                stream
+                    .write_all(encoded.as_bytes())
+                    .expect("write fake daemon response");
+            }
+        });
+
+        ready_rx.recv().expect("wait for fake daemon ready");
+        let dispatch = run_grant_extend(&config, "grant-123", Some(10), Some(25), Some(900))
+            .expect("grant extend via daemon");
+        assert_eq!(dispatch, GrantActionDispatch::DaemonRpc);
+        server.join().expect("fake daemon thread");
+    }
+
+    #[test]
+    fn grant_delegate_routes_through_daemon_when_socket_exists() {
+        use std::io::{BufRead, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = DaemonConfig::for_test(tmp.path());
+        std::fs::create_dir_all(&config.socket_dir).expect("create socket dir");
+        let socket_path = config.socket_dir.join("daemon.sock");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn({
+            let socket_path = socket_path.clone();
+            move || {
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+                ready_tx.send(()).expect("signal ready");
+
+                let (mut status_stream, _) = listener.accept().expect("accept grant_status");
+                let mut status_reader = std::io::BufReader::new(
+                    status_stream
+                        .try_clone()
+                        .expect("clone fake daemon grant_status stream"),
+                );
+                let mut line = String::new();
+                status_reader
+                    .read_line(&mut line)
+                    .expect("read fake grant_status request");
+                let request: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("parse fake grant_status request");
+                assert_eq!(request["method"], serde_json::json!("grant_status"));
+                assert_eq!(request["params"]["id"], serde_json::json!("grant-parent"));
+                let mut encoded = serde_json::to_string(&serde_json::json!({
+                    "id": request["id"],
+                    "result": {
+                        "kind": "grant",
+                        "id": "grant-parent",
+                        "persona_id": "persona-owner",
+                    },
+                }))
+                .expect("encode fake grant_status response");
+                encoded.push('\n');
+                status_stream
+                    .write_all(encoded.as_bytes())
+                    .expect("write fake grant_status response");
+
+                let (mut delegate_stream, _) = listener.accept().expect("accept delegate_grant");
+                let mut delegate_reader = std::io::BufReader::new(
+                    delegate_stream
+                        .try_clone()
+                        .expect("clone fake daemon delegate_grant stream"),
+                );
+                line.clear();
+                delegate_reader
+                    .read_line(&mut line)
+                    .expect("read fake delegate_grant request");
+                let request: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("parse fake delegate_grant request");
+                assert_eq!(request["method"], serde_json::json!("delegate_grant"));
+                assert_eq!(
+                    request["params"]["parent_grant_id"],
+                    serde_json::json!("grant-parent")
+                );
+                assert_eq!(
+                    request["params"]["child_persona_id"],
+                    serde_json::json!("persona-child")
+                );
+                assert_eq!(request["params"]["scope"], serde_json::json!("read"));
+                assert_eq!(
+                    request["params"]["caller_persona_id"],
+                    serde_json::json!("persona-owner")
+                );
+                assert_eq!(request["params"]["ttl_secs"], serde_json::json!(600));
+                assert_eq!(request["params"]["budget"]["tokens"], serde_json::json!(42));
+
+                let mut encoded = serde_json::to_string(&serde_json::json!({
+                    "id": request["id"],
+                    "result": {
+                        "id": "grant-child",
+                        "parent": "grant-parent",
+                        "persona_id": "persona-child",
+                        "scope": "read",
+                        "expires_at": null,
+                        "budget": {"tokens": 42},
+                    },
+                }))
+                .expect("encode fake delegate_grant response");
+                encoded.push('\n');
+                delegate_stream
+                    .write_all(encoded.as_bytes())
+                    .expect("write fake delegate_grant response");
+            }
+        });
+
+        ready_rx.recv().expect("wait for fake daemon ready");
+        let (dispatch, info) = run_grant_delegate(
+            &config,
+            "grant-parent",
+            "persona-child",
+            "read",
+            Some(600),
+            Some(Budget {
+                tokens: Some(42),
+                cents: None,
+                requests: None,
+                workload_hours: None,
+                wall_clock_secs: None,
+            }),
+        )
+        .expect("grant delegate via daemon");
+        assert_eq!(dispatch, GrantActionDispatch::DaemonRpc);
+        assert_eq!(info["id"], serde_json::json!("grant-child"));
+        server.join().expect("fake daemon thread");
+    }
+
+    #[test]
+    fn grant_budget_routes_through_daemon_when_socket_exists() {
+        use std::io::{BufRead, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = DaemonConfig::for_test(tmp.path());
+        std::fs::create_dir_all(&config.socket_dir).expect("create socket dir");
+        let socket_path = config.socket_dir.join("daemon.sock");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn({
+            let socket_path = socket_path.clone();
+            move || {
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+                ready_tx.send(()).expect("signal ready");
+
+                let (mut stream, _) = listener.accept().expect("accept client");
+                let mut reader =
+                    std::io::BufReader::new(stream.try_clone().expect("clone fake daemon stream"));
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .expect("read fake daemon request");
+                let request: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("parse fake daemon request");
+                assert_eq!(request["method"], serde_json::json!("grant_status"));
+                assert_eq!(request["params"]["id"], serde_json::json!("grant-123"));
+
+                let mut encoded = serde_json::to_string(&serde_json::json!({
+                    "id": request["id"],
+                    "result": {
+                        "kind": "grant",
+                        "id": "grant-123",
+                        "persona_id": "persona-owner",
+                        "status": "active",
+                        "expires_at": null,
+                        "statements": [{
+                            "sid": "S0",
+                            "block_index": 0,
+                            "resource_type": "credential",
+                            "resource": {"kind": "exact", "value": "alpha/token"},
+                            "budget": {"tokens": 100},
+                            "usage": {"tokens": 10, "last_updated": 1},
+                            "conditions": []
+                        }]
+                    },
+                }))
+                .expect("encode fake daemon response");
+                encoded.push('\n');
+                stream
+                    .write_all(encoded.as_bytes())
+                    .expect("write fake daemon response");
+            }
+        });
+
+        ready_rx.recv().expect("wait for fake daemon ready");
+        let (dispatch, rendered) =
+            run_grant_budget(&config, "grant-123").expect("grant budget via daemon");
+        assert_eq!(dispatch, GrantActionDispatch::DaemonRpc);
+        assert!(rendered.contains("Grant grant-123"));
+        assert!(rendered.contains("Persona: persona-owner"));
+        assert!(rendered.contains("tokens:"));
+        server.join().expect("fake daemon thread");
+    }
+
+    #[test]
+    fn receipt_list_routes_through_daemon_when_socket_exists() {
+        use std::io::{BufRead, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = DaemonConfig::for_test(tmp.path());
+        std::fs::create_dir_all(&config.socket_dir).expect("create socket dir");
+        let socket_path = config.socket_dir.join("daemon.sock");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn({
+            let socket_path = socket_path.clone();
+            move || {
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+                ready_tx.send(()).expect("signal ready");
+
+                let (mut stream, _) = listener.accept().expect("accept client");
+                let mut reader =
+                    std::io::BufReader::new(stream.try_clone().expect("clone fake daemon stream"));
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .expect("read fake daemon request");
+                let request: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("parse fake daemon request");
+                assert_eq!(request["method"], serde_json::json!("list_receipts"));
+                assert_eq!(
+                    request["params"]["persona_id"],
+                    serde_json::json!("persona-a")
+                );
+
+                let mut encoded = serde_json::to_string(&serde_json::json!({
+                    "id": request["id"],
+                    "result": [
+                        fake_grant_receipt_json("rct-1", "grant-1", "persona-a"),
+                        fake_grant_receipt_json("rct-2", "grant-2", "persona-a")
+                    ],
+                }))
+                .expect("encode fake daemon response");
+                encoded.push('\n');
+                stream
+                    .write_all(encoded.as_bytes())
+                    .expect("write fake daemon response");
+            }
+        });
+
+        ready_rx.recv().expect("wait for fake daemon ready");
+        let (dispatch, receipts) =
+            run_receipt_list(&config, Some("persona-a")).expect("receipt list via daemon");
+        assert_eq!(dispatch, ReceiptActionDispatch::DaemonRpc);
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(receipts[0].id, "rct-1");
+        assert_eq!(receipts[1].grant_id, "grant-2");
+        server.join().expect("fake daemon thread");
+    }
+
+    #[test]
+    fn receipt_get_routes_through_daemon_when_socket_exists() {
+        use std::io::{BufRead, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = DaemonConfig::for_test(tmp.path());
+        std::fs::create_dir_all(&config.socket_dir).expect("create socket dir");
+        let socket_path = config.socket_dir.join("daemon.sock");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn({
+            let socket_path = socket_path.clone();
+            move || {
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+                ready_tx.send(()).expect("signal ready");
+
+                let (mut stream, _) = listener.accept().expect("accept client");
+                let mut reader =
+                    std::io::BufReader::new(stream.try_clone().expect("clone fake daemon stream"));
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .expect("read fake daemon request");
+                let request: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("parse fake daemon request");
+                assert_eq!(request["method"], serde_json::json!("get_receipt"));
+                assert_eq!(request["params"]["id"], serde_json::json!("grant-123"));
+
+                let mut encoded = serde_json::to_string(&serde_json::json!({
+                    "id": request["id"],
+                    "result": fake_grant_receipt_json("rct-terminal", "grant-123", "persona-owner"),
+                }))
+                .expect("encode fake daemon response");
+                encoded.push('\n');
+                stream
+                    .write_all(encoded.as_bytes())
+                    .expect("write fake daemon response");
+            }
+        });
+
+        ready_rx.recv().expect("wait for fake daemon ready");
+        let (dispatch, receipt) =
+            run_receipt_get(&config, "grant-123").expect("receipt get via daemon");
+        assert_eq!(dispatch, ReceiptActionDispatch::DaemonRpc);
+        assert_eq!(receipt.id, "rct-terminal");
+        assert_eq!(receipt.grant_id, "grant-123");
+        server.join().expect("fake daemon thread");
+    }
+
+    #[test]
+    fn receipt_tree_routes_through_daemon_when_socket_exists() {
+        use std::io::{BufRead, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = DaemonConfig::for_test(tmp.path());
+        std::fs::create_dir_all(&config.socket_dir).expect("create socket dir");
+        let socket_path = config.socket_dir.join("daemon.sock");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn({
+            let socket_path = socket_path.clone();
+            move || {
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+                ready_tx.send(()).expect("signal ready");
+
+                let (mut stream, _) = listener.accept().expect("accept client");
+                let mut reader =
+                    std::io::BufReader::new(stream.try_clone().expect("clone fake daemon stream"));
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .expect("read fake daemon request");
+                let request: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("parse fake daemon request");
+                assert_eq!(request["method"], serde_json::json!("receipt_tree"));
+                assert_eq!(
+                    request["params"]["grant_id"],
+                    serde_json::json!("grant-123")
+                );
+
+                let mut encoded = serde_json::to_string(&serde_json::json!({
+                    "id": request["id"],
+                    "result": fake_receipt_tree_json("grant-123"),
+                }))
+                .expect("encode fake daemon response");
+                encoded.push('\n');
+                stream
+                    .write_all(encoded.as_bytes())
+                    .expect("write fake daemon response");
+            }
+        });
+
+        ready_rx.recv().expect("wait for fake daemon ready");
+        let (dispatch, tree) =
+            run_receipt_tree(&config, "grant-123").expect("receipt tree via daemon");
+        assert_eq!(dispatch, ReceiptActionDispatch::DaemonRpc);
+        assert_eq!(tree.root_grant_id, "grant-123");
+        assert_eq!(tree.grants.len(), 1);
+        server.join().expect("fake daemon thread");
+    }
+
+    #[test]
+    fn audit_query_routes_through_daemon_when_socket_exists() {
+        use std::io::{BufRead, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = DaemonConfig::for_test(tmp.path());
+        std::fs::create_dir_all(&config.socket_dir).expect("create socket dir");
+        let socket_path = config.socket_dir.join("daemon.sock");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn({
+            let socket_path = socket_path.clone();
+            move || {
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+                ready_tx.send(()).expect("signal ready");
+
+                let (mut stream, _) = listener.accept().expect("accept client");
+                let mut reader =
+                    std::io::BufReader::new(stream.try_clone().expect("clone fake daemon stream"));
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .expect("read fake daemon request");
+                let request: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("parse fake daemon request");
+                assert_eq!(request["method"], serde_json::json!("receipt_query"));
+                assert_eq!(request["params"]["actor"], serde_json::json!("persona-a"));
+                assert_eq!(request["params"]["kind"], serde_json::json!("grant"));
+                assert_eq!(
+                    request["params"]["grant_id"],
+                    serde_json::json!("grant-123")
+                );
+                assert_eq!(
+                    request["params"]["resource"],
+                    serde_json::json!("repo:acme")
+                );
+                assert_eq!(
+                    request["params"]["since"],
+                    serde_json::json!("2026-05-01T00:00:00Z")
+                );
+                assert_eq!(request["params"]["limit"], serde_json::json!(5));
+
+                let mut encoded = serde_json::to_string(&serde_json::json!({
+                    "id": request["id"],
+                    "result": [fake_receipt_row_json("rct-1", "persona-a", "grant-123")],
+                }))
+                .expect("encode fake daemon response");
+                encoded.push('\n');
+                stream
+                    .write_all(encoded.as_bytes())
+                    .expect("write fake daemon response");
+            }
+        });
+
+        ready_rx.recv().expect("wait for fake daemon ready");
+        let filter = ember_daemon::infra::receipt::ReceiptFilter {
+            persona_id: Some("persona-a".to_string()),
+            kind: Some("grant".to_string()),
+            grant_id: Some("grant-123".to_string()),
+            resource: Some("repo:acme".to_string()),
+            since_iso: Some("2026-05-01T00:00:00Z".to_string()),
+            limit: Some(5),
+            ..Default::default()
+        };
+        let (dispatch, rows) =
+            run_audit_receipt_query(&config, &filter).expect("audit query via daemon");
+        assert_eq!(dispatch, AuditActionDispatch::DaemonRpc);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "rct-1");
+        assert_eq!(rows[0].grant_id, "grant-123");
+        server.join().expect("fake daemon thread");
+    }
+
+    #[test]
+    fn audit_log_query_routes_through_daemon_when_socket_exists() {
+        use std::io::{BufRead, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = DaemonConfig::for_test(tmp.path());
+        std::fs::create_dir_all(&config.socket_dir).expect("create socket dir");
+        let socket_path = config.socket_dir.join("daemon.sock");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn({
+            let socket_path = socket_path.clone();
+            move || {
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+                ready_tx.send(()).expect("signal ready");
+
+                let (mut stream, _) = listener.accept().expect("accept client");
+                let mut reader =
+                    std::io::BufReader::new(stream.try_clone().expect("clone fake daemon stream"));
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .expect("read fake daemon request");
+                let request: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("parse fake daemon request");
+                assert_eq!(request["method"], serde_json::json!("audit_log_query"));
+                assert_eq!(request["params"]["id"], serde_json::json!(7));
+                assert_eq!(
+                    request["params"]["agent_id"],
+                    serde_json::json!("persona-a")
+                );
+                assert_eq!(request["params"]["limit"], serde_json::json!(3));
+
+                let mut encoded = serde_json::to_string(&serde_json::json!({
+                    "id": request["id"],
+                    "result": [serde_json::json!({
+                        "id": 7,
+                        "timestamp": "2026-05-19T00:00:00Z",
+                        "agent_id": "persona-a",
+                        "action": "grant.issued",
+                        "credential": "api-key",
+                        "outcome": "allowed",
+                        "details": "{\"note\":\"first\"}",
+                    })],
+                }))
+                .expect("encode fake daemon response");
+                encoded.push('\n');
+                stream
+                    .write_all(encoded.as_bytes())
+                    .expect("write fake daemon response");
+            }
+        });
+
+        ready_rx.recv().expect("wait for fake daemon ready");
+        let filter = ember_daemon::infra::audit::AuditFilter {
+            id: Some(7),
+            agent_id: Some("persona-a".to_string()),
+            limit: Some(3),
+            ..Default::default()
+        };
+        let (dispatch, rows) =
+            run_audit_log_query(&config, &filter).expect("audit log query via daemon");
+        assert_eq!(dispatch, AuditActionDispatch::DaemonRpc);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, 7);
+        assert_eq!(rows[0].details.as_deref(), Some("{\"note\":\"first\"}"));
+        server.join().expect("fake daemon thread");
+    }
+
+    #[test]
+    fn audit_explain_routes_through_daemon_when_socket_exists() {
+        use std::io::{BufRead, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = DaemonConfig::for_test(tmp.path());
+        std::fs::create_dir_all(&config.socket_dir).expect("create socket dir");
+        let socket_path = config.socket_dir.join("daemon.sock");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn({
+            let socket_path = socket_path.clone();
+            move || {
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+                ready_tx.send(()).expect("signal ready");
+
+                let (mut stream, _) = listener.accept().expect("accept client");
+                let mut reader =
+                    std::io::BufReader::new(stream.try_clone().expect("clone fake daemon stream"));
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .expect("read fake daemon request");
+                let request: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("parse fake daemon request");
+                assert_eq!(request["method"], serde_json::json!("audit_explain"));
+                assert_eq!(request["params"]["id"], serde_json::json!(7));
+
+                let mut encoded = serde_json::to_string(&serde_json::json!({
+                    "id": request["id"],
+                    "result": fake_audit_explain_json(7),
+                }))
+                .expect("encode fake daemon response");
+                encoded.push('\n');
+                stream
+                    .write_all(encoded.as_bytes())
+                    .expect("write fake daemon response");
+            }
+        });
+
+        ready_rx.recv().expect("wait for fake daemon ready");
+        let (dispatch, explain) = run_audit_explain(&config, 7).expect("audit explain via daemon");
+        assert_eq!(dispatch, AuditActionDispatch::DaemonRpc);
+        assert_eq!(explain.event.id, 7);
+        assert_eq!(
+            explain.current_policy.matched_rule.as_deref(),
+            Some("credential.access")
+        );
+        assert_eq!(
+            explain.current_grant.as_ref().map(|g| g.id.as_str()),
+            Some("grant-123")
+        );
+        server.join().expect("fake daemon thread");
+    }
+
+    #[test]
+    fn approval_list_routes_through_daemon_when_socket_exists() {
+        use std::io::{BufRead, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = DaemonConfig::for_test(tmp.path());
+        std::fs::create_dir_all(&config.socket_dir).expect("create socket dir");
+        let socket_path = config.socket_dir.join("daemon.sock");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn({
+            let socket_path = socket_path.clone();
+            move || {
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+                ready_tx.send(()).expect("signal ready");
+
+                let (mut stream, _) = listener.accept().expect("accept client");
+                let mut reader =
+                    std::io::BufReader::new(stream.try_clone().expect("clone fake daemon stream"));
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .expect("read fake daemon request");
+                let request: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("parse fake daemon request");
+                assert_eq!(
+                    request["method"],
+                    serde_json::json!("list_pending_approvals")
+                );
+
+                let mut encoded = serde_json::to_string(&serde_json::json!({
+                    "id": request["id"],
+                    "result": [fake_approval_request_json("approval-123", "persona-a")],
+                }))
+                .expect("encode fake daemon response");
+                encoded.push('\n');
+                stream
+                    .write_all(encoded.as_bytes())
+                    .expect("write fake daemon response");
+            }
+        });
+
+        ready_rx.recv().expect("wait for fake daemon ready");
+        let (dispatch, requests) = run_approval_list(&config).expect("approval list via daemon");
+        assert_eq!(dispatch, ApprovalActionDispatch::DaemonRpc);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].id, "approval-123");
+        assert_eq!(requests[0].persona_id, "persona-a");
+        server.join().expect("fake daemon thread");
+    }
+
+    #[test]
+    fn approval_resolve_routes_through_daemon_when_socket_exists() {
+        use std::io::{BufRead, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = DaemonConfig::for_test(tmp.path());
+        std::fs::create_dir_all(&config.socket_dir).expect("create socket dir");
+        let socket_path = config.socket_dir.join("daemon.sock");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn({
+            let socket_path = socket_path.clone();
+            move || {
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+                ready_tx.send(()).expect("signal ready");
+
+                let (mut stream, _) = listener.accept().expect("accept client");
+                let mut reader =
+                    std::io::BufReader::new(stream.try_clone().expect("clone fake daemon stream"));
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .expect("read fake daemon request");
+                let request: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("parse fake daemon request");
+                assert_eq!(request["method"], serde_json::json!("resolve_approval"));
+                assert_eq!(request["params"]["id"], serde_json::json!("approval-123"));
+                assert_eq!(request["params"]["decision"], serde_json::json!("always"));
+                assert_eq!(
+                    request["params"]["expires_at"],
+                    serde_json::json!("2026-06-18T00:00:00")
+                );
+
+                let mut resolved = fake_approval_request_json("approval-123", "persona-a");
+                resolved["status"] = serde_json::json!("approved");
+                resolved["result_grant_id"] = serde_json::json!("grant-123");
+
+                let mut encoded = serde_json::to_string(&serde_json::json!({
+                    "id": request["id"],
+                    "result": resolved,
+                }))
+                .expect("encode fake daemon response");
+                encoded.push('\n');
+                stream
+                    .write_all(encoded.as_bytes())
+                    .expect("write fake daemon response");
+            }
+        });
+
+        ready_rx.recv().expect("wait for fake daemon ready");
+        let outcome = ApprovalOutcome::Always {
+            scope: None,
+            expires_at: Some("2026-06-18T00:00:00".to_string()),
+        };
+        let (dispatch, resolved) = run_approval_resolve(&config, "approval-123", &outcome)
+            .expect("approval resolve via daemon");
+        assert_eq!(dispatch, ApprovalActionDispatch::DaemonRpc);
+        assert_eq!(resolved.status, "approved");
+        assert_eq!(resolved.result_grant_id.as_deref(), Some("grant-123"));
+        server.join().expect("fake daemon thread");
+    }
+
+    #[test]
+    fn status_routes_through_daemon_when_pid_is_running_and_socket_exists() {
+        use std::io::{BufRead, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = DaemonConfig::for_test(tmp.path());
+        std::fs::create_dir_all(&config.socket_dir).expect("create socket dir");
+        std::fs::write(&config.pid_file, format!("{}\n", std::process::id()))
+            .expect("write pid file");
+        let socket_path = config.socket_dir.join("daemon.sock");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn({
+            let socket_path = socket_path.clone();
+            move || {
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+                ready_tx.send(()).expect("signal ready");
+
+                let (mut stream, _) = listener.accept().expect("accept client");
+                let mut reader =
+                    std::io::BufReader::new(stream.try_clone().expect("clone fake daemon stream"));
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .expect("read fake daemon request");
+                let request: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("parse fake daemon request");
+                assert_eq!(request["method"], serde_json::json!("status"));
+
+                let mut encoded = serde_json::to_string(&serde_json::json!({
+                    "id": request["id"],
+                    "result": fake_status_summary_json(),
+                }))
+                .expect("encode fake daemon response");
+                encoded.push('\n');
+                stream
+                    .write_all(encoded.as_bytes())
+                    .expect("write fake daemon response");
+            }
+        });
+
+        ready_rx.recv().expect("wait for fake daemon ready");
+        let (dispatch, summary) =
+            run_status_summary(&config, true).expect("status summary via daemon");
+        assert_eq!(dispatch, StatusActionDispatch::DaemonRpc);
+        assert_eq!(summary.personas.len(), 1);
+        assert_eq!(summary.grants.len(), 1);
+        assert_eq!(summary.sandboxes.len(), 1);
+        assert_eq!(summary.approvals.len(), 1);
+        assert_eq!(summary.standing_grants, 2);
+        assert_eq!(summary.audit_events_total, 9);
+        server.join().expect("fake daemon thread");
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "local macOS sandbox forbids fake daemon UDS bind"
+    )]
+    fn sandbox_create_routes_through_daemon_when_socket_exists() {
+        use std::io::{BufRead, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = DaemonConfig::for_test(tmp.path());
+        std::fs::create_dir_all(&config.socket_dir).expect("create socket dir");
+        let socket_path = config.socket_dir.join("daemon.sock");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn({
+            let socket_path = socket_path.clone();
+            move || {
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+                ready_tx.send(()).expect("signal ready");
+
+                let (mut stream, _) = listener.accept().expect("accept client");
+                let mut reader =
+                    std::io::BufReader::new(stream.try_clone().expect("clone fake daemon stream"));
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .expect("read fake daemon request");
+                let request: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("parse fake daemon request");
+                assert_eq!(request["method"], serde_json::json!("sandbox_create"));
+                assert_eq!(request["params"]["name"], serde_json::json!("codebox"));
+                assert_eq!(
+                    request["params"]["image"],
+                    serde_json::json!("ubuntu:24.04")
+                );
+                assert_eq!(
+                    request["params"]["workspace_from"],
+                    serde_json::json!("https://example.test/repo.git")
+                );
+                assert_eq!(
+                    request["params"]["extra_env"],
+                    serde_json::json!([["FOO", "bar"]])
+                );
+                assert_eq!(
+                    request["params"]["owner_persona_id"],
+                    serde_json::json!("persona-owner")
+                );
+
+                let mut encoded = serde_json::to_string(&serde_json::json!({
+                    "id": request["id"],
+                    "result": {
+                        "sandbox": {
+                            "id": "sandbox-123",
+                            "name": "codebox",
+                            "persona_id": "persona-sandbox",
+                            "owner_persona_id": "persona-owner",
+                            "container_id": null,
+                            "image": "ubuntu:24.04",
+                            "status": "created",
+                            "created_at": "2026-05-18T00:00:00Z",
+                            "workspace_path": "/tmp/ws"
+                        },
+                        "container_id": "container-123",
+                        "start_error": null
+                    },
+                }))
+                .expect("encode fake daemon response");
+                encoded.push('\n');
+                stream
+                    .write_all(encoded.as_bytes())
+                    .expect("write fake daemon response");
+            }
+        });
+
+        ready_rx.recv().expect("wait for fake daemon ready");
+        let opts = SandboxCreateOpts {
+            name: "codebox".to_string(),
+            image: "ubuntu:24.04".to_string(),
+            workspace_from: Some("https://example.test/repo.git".to_string()),
+            extra_env: vec![("FOO".to_string(), "bar".to_string())],
+            owner_persona_id: Some("persona-owner".to_string()),
+            ..SandboxCreateOpts::default()
+        };
+        let (dispatch, created) = run_sandbox_create(&config, &opts).expect("sandbox create");
+        assert_eq!(dispatch, SandboxActionDispatch::DaemonRpc);
+        assert_eq!(created.sandbox.id, "sandbox-123");
+        assert_eq!(created.container_id.as_deref(), Some("container-123"));
+        server.join().expect("fake daemon thread");
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "local macOS sandbox forbids fake daemon UDS bind"
+    )]
+    fn sandbox_list_routes_through_daemon_when_socket_exists() {
+        use std::io::{BufRead, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = DaemonConfig::for_test(tmp.path());
+        std::fs::create_dir_all(&config.socket_dir).expect("create socket dir");
+        let socket_path = config.socket_dir.join("daemon.sock");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn({
+            let socket_path = socket_path.clone();
+            move || {
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+                ready_tx.send(()).expect("signal ready");
+
+                let (mut stream, _) = listener.accept().expect("accept client");
+                let mut reader =
+                    std::io::BufReader::new(stream.try_clone().expect("clone fake daemon stream"));
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .expect("read fake daemon request");
+                let request: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("parse fake daemon request");
+                assert_eq!(request["method"], serde_json::json!("sandbox_list"));
+
+                let mut encoded = serde_json::to_string(&serde_json::json!({
+                    "id": request["id"],
+                    "result": [{
+                        "id": "sandbox-1",
+                        "name": "alpha",
+                        "persona_id": "persona-a",
+                        "owner_persona_id": "persona-owner",
+                        "container_id": "container-a",
+                        "image": "ubuntu:24.04",
+                        "status": "running",
+                        "created_at": "2026-05-18T00:00:00Z",
+                        "workspace_path": null
+                    }],
+                }))
+                .expect("encode fake daemon response");
+                encoded.push('\n');
+                stream
+                    .write_all(encoded.as_bytes())
+                    .expect("write fake daemon response");
+            }
+        });
+
+        ready_rx.recv().expect("wait for fake daemon ready");
+        let (dispatch, sandboxes) = run_sandbox_list(&config).expect("sandbox list");
+        assert_eq!(dispatch, SandboxActionDispatch::DaemonRpc);
+        assert_eq!(sandboxes.len(), 1);
+        assert_eq!(sandboxes[0].name, "alpha");
+        server.join().expect("fake daemon thread");
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "local macOS sandbox forbids fake daemon UDS bind"
+    )]
+    fn sandbox_stop_routes_through_daemon_when_socket_exists() {
+        use std::io::{BufRead, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = DaemonConfig::for_test(tmp.path());
+        std::fs::create_dir_all(&config.socket_dir).expect("create socket dir");
+        let socket_path = config.socket_dir.join("daemon.sock");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn({
+            let socket_path = socket_path.clone();
+            move || {
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+                ready_tx.send(()).expect("signal ready");
+
+                let (mut stream, _) = listener.accept().expect("accept client");
+                let mut reader =
+                    std::io::BufReader::new(stream.try_clone().expect("clone fake daemon stream"));
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .expect("read fake daemon request");
+                let request: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("parse fake daemon request");
+                assert_eq!(request["method"], serde_json::json!("sandbox_stop"));
+                assert_eq!(
+                    request["params"]["id_or_name"],
+                    serde_json::json!("sandbox-1")
+                );
+
+                let mut encoded = serde_json::to_string(&serde_json::json!({
+                    "id": request["id"],
+                    "result": {"resolved_id": "sandbox-1", "stopped": true},
+                }))
+                .expect("encode fake daemon response");
+                encoded.push('\n');
+                stream
+                    .write_all(encoded.as_bytes())
+                    .expect("write fake daemon response");
+            }
+        });
+
+        ready_rx.recv().expect("wait for fake daemon ready");
+        let (dispatch, resolved_id) = run_sandbox_stop(&config, "sandbox-1").expect("sandbox stop");
+        assert_eq!(dispatch, SandboxActionDispatch::DaemonRpc);
+        assert_eq!(resolved_id, "sandbox-1");
+        server.join().expect("fake daemon thread");
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "local macOS sandbox forbids fake daemon UDS bind"
+    )]
+    fn sandbox_delete_routes_through_daemon_when_socket_exists() {
+        use std::io::{BufRead, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = DaemonConfig::for_test(tmp.path());
+        std::fs::create_dir_all(&config.socket_dir).expect("create socket dir");
+        let socket_path = config.socket_dir.join("daemon.sock");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn({
+            let socket_path = socket_path.clone();
+            move || {
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+                ready_tx.send(()).expect("signal ready");
+
+                let (mut stream, _) = listener.accept().expect("accept client");
+                let mut reader =
+                    std::io::BufReader::new(stream.try_clone().expect("clone fake daemon stream"));
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .expect("read fake daemon request");
+                let request: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("parse fake daemon request");
+                assert_eq!(request["method"], serde_json::json!("sandbox_delete"));
+                assert_eq!(
+                    request["params"]["id_or_name"],
+                    serde_json::json!("codebox")
+                );
+
+                let mut encoded = serde_json::to_string(&serde_json::json!({
+                    "id": request["id"],
+                    "result": {"resolved_id": "sandbox-1", "already_absent": false},
+                }))
+                .expect("encode fake daemon response");
+                encoded.push('\n');
+                stream
+                    .write_all(encoded.as_bytes())
+                    .expect("write fake daemon response");
+            }
+        });
+
+        ready_rx.recv().expect("wait for fake daemon ready");
+        let (dispatch, deleted) = run_sandbox_delete(&config, "codebox").expect("sandbox delete");
+        assert_eq!(dispatch, SandboxActionDispatch::DaemonRpc);
+        assert_eq!(deleted.resolved_id.as_deref(), Some("sandbox-1"));
+        assert!(!deleted.already_absent);
+        server.join().expect("fake daemon thread");
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "local macOS sandbox forbids fake daemon UDS bind"
+    )]
+    fn sandbox_exec_routes_through_daemon_when_socket_exists() {
+        use std::io::{BufRead, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = DaemonConfig::for_test(tmp.path());
+        std::fs::create_dir_all(&config.socket_dir).expect("create socket dir");
+        let socket_path = config.socket_dir.join("daemon.sock");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn({
+            let socket_path = socket_path.clone();
+            move || {
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+                ready_tx.send(()).expect("signal ready");
+
+                let (mut stream, _) = listener.accept().expect("accept client");
+                let mut reader =
+                    std::io::BufReader::new(stream.try_clone().expect("clone fake daemon stream"));
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .expect("read fake daemon request");
+                let request: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("parse fake daemon request");
+                assert_eq!(request["method"], serde_json::json!("sandbox_exec"));
+                assert_eq!(
+                    request["params"]["id_or_name"],
+                    serde_json::json!("sandbox-1")
+                );
+                assert_eq!(
+                    request["params"]["caller_persona_id"],
+                    serde_json::json!("persona-owner")
+                );
+                assert_eq!(
+                    request["params"]["command"],
+                    serde_json::json!(["echo", "hello"])
+                );
+
+                let mut encoded = serde_json::to_string(&serde_json::json!({
+                    "id": request["id"],
+                    "result": {"resolved_id": "sandbox-1", "output": "hello\n"},
+                }))
+                .expect("encode fake daemon response");
+                encoded.push('\n');
+                stream
+                    .write_all(encoded.as_bytes())
+                    .expect("write fake daemon response");
+            }
+        });
+
+        ready_rx.recv().expect("wait for fake daemon ready");
+        let (dispatch, output) = run_sandbox_exec(
+            &config,
+            "sandbox-1",
+            Some("persona-owner".to_string()),
+            &["echo".to_string(), "hello".to_string()],
+        )
+        .expect("sandbox exec");
+        assert_eq!(dispatch, SandboxActionDispatch::DaemonRpc);
+        assert_eq!(output, "hello\n");
+        server.join().expect("fake daemon thread");
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "local macOS sandbox forbids fake daemon UDS bind"
+    )]
+    fn sandbox_run_routes_orchestration_through_daemon_when_socket_exists() {
+        use std::io::{BufRead, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::Builder::new()
+            .prefix("esb")
+            .tempdir_in("/private/tmp")
+            .expect("tempdir");
+        let config = DaemonConfig::for_test(tmp.path());
+        std::fs::create_dir_all(&config.socket_dir).expect("create socket dir");
+        let socket_path = config.socket_dir.join("daemon.sock");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+        let server = std::thread::spawn({
+            let socket_path = socket_path.clone();
+            move || {
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+                ready_tx.send(()).expect("signal ready");
+
+                let (mut stream, _) = listener.accept().expect("accept client");
+                let mut reader =
+                    std::io::BufReader::new(stream.try_clone().expect("clone fake daemon stream"));
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .expect("read fake daemon request");
+                let request: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("parse fake daemon request");
+                assert_eq!(request["method"], serde_json::json!("sandbox_run"));
+                assert_eq!(
+                    request["params"]["sandbox"]["name"],
+                    serde_json::json!("codebox")
+                );
+                assert_eq!(
+                    request["params"]["sandbox"]["image"],
+                    serde_json::json!("ubuntu:24.04")
+                );
+                assert_eq!(
+                    request["params"]["credential_resource"],
+                    serde_json::json!("obj-github-token")
+                );
+                assert_eq!(request["params"]["ttl_secs"], serde_json::json!(1800));
+                assert_eq!(
+                    request["params"]["statements"]
+                        .as_array()
+                        .expect("statements array")
+                        .len(),
+                    3
+                );
+
+                let mut encoded = serde_json::to_string(&serde_json::json!({
+                    "id": request["id"],
+                    "result": {
+                        "sandbox": {
+                            "id": "sandbox-123",
+                            "name": "codebox",
+                            "persona_id": "persona-sandbox",
+                            "owner_persona_id": "persona-owner",
+                            "container_id": null,
+                            "image": "ubuntu:24.04",
+                            "status": "created",
+                            "created_at": "2026-05-18T00:00:00Z",
+                            "workspace_path": null
+                        },
+                        "container_id": "container-123",
+                        "start_error": null,
+                        "grant": {
+                            "PendingApproval": {
+                                "approval_id": "approval-123"
+                            }
+                        }
+                    },
+                }))
+                .expect("encode fake daemon response");
+                encoded.push('\n');
+                stream
+                    .write_all(encoded.as_bytes())
+                    .expect("write fake daemon response");
+            }
+        });
+
+        ready_rx.recv().expect("wait for fake daemon ready");
+        let opts = SandboxCreateOpts {
+            name: "codebox".to_string(),
+            image: "ubuntu:24.04".to_string(),
+            owner_persona_id: Some("persona-owner".to_string()),
+            ..SandboxCreateOpts::default()
+        };
+        let statements =
+            build_composite_grant_statements(Some("obj-github-token"), Some(42), None, Some(1800));
+        let (dispatch, prepared) = run_sandbox_run(
+            &config,
+            &opts,
+            &statements,
+            Some(1800),
+            Some("obj-github-token"),
+        )
+        .expect("sandbox run via daemon");
+        assert_eq!(dispatch, SandboxActionDispatch::DaemonRpc);
+        assert_eq!(prepared.sandbox.id, "sandbox-123");
+        assert_eq!(prepared.container_id.as_deref(), Some("container-123"));
+        match prepared.grant {
+            SandboxRunGrantDisposition::PendingApproval { approval_id } => {
+                assert_eq!(approval_id, "approval-123");
+            }
+            other => panic!("expected pending approval, got {other:?}"),
+        }
+        server.join().expect("fake daemon thread");
     }
 
     /// Helper: parse a `daemon` subcommand argv into a `DaemonAction`.
@@ -7801,7 +12312,7 @@ mod tests {
             .action
     }
 
-    /// implementation-note-294: `ember daemon install` (no flags) must
+    /// implementation-note-414: `ember daemon install` (no flags) must
     /// take the separate-uid path. clap default for `bool` is false — we
     /// pin the surface so a future rename to `single_uid: Option<bool>` or
     /// a flipped default is intentional, not accidental.
@@ -7819,7 +12330,7 @@ mod tests {
         }
     }
 
-    /// implementation-note-294: `ember daemon install --single-uid`
+    /// implementation-note-414: `ember daemon install --single-uid`
     /// must opt into the dev-mode path. Pins the flag spelling so future
     /// renames stay intentional.
     #[test]
@@ -7867,7 +12378,7 @@ mod tests {
         }
     }
 
-    /// implementation-note-295: `ember daemon migrate --to separate-uid`
+    /// implementation-note-415: `ember daemon migrate --to separate-uid`
     /// must parse to `DaemonAction::Migrate { to: "separate-uid" }`.
     #[test]
     fn daemon_migrate_to_separate_uid_parses() {
@@ -7883,7 +12394,7 @@ mod tests {
         }
     }
 
-    /// implementation-note-295: `ember daemon migrate` without `--to`
+    /// implementation-note-415: `ember daemon migrate` without `--to`
     /// must be rejected by clap (required arg).
     #[test]
     fn daemon_migrate_without_to_is_rejected() {
@@ -7900,7 +12411,7 @@ mod tests {
         );
     }
 
-    /// implementation-note-295: `is_separate_uid_posture` returns
+    /// implementation-note-415: `is_separate_uid_posture` returns
     /// false when the ember user does not exist (T1 posture-detection
     /// function test — probes the live system user database).
     ///
@@ -7918,7 +12429,9 @@ mod tests {
         if ember_daemon::install::is_separate_uid_posture() {
             // ember user already exists on this host — skip assertion to
             // avoid false positive. Document the environment assumption.
-            eprintln!("note: ember user already exists on this host; skipping absent-user assertion");
+            eprintln!(
+                "note: ember user already exists on this host; skipping absent-user assertion"
+            );
         } else {
             // Confirm the return type is bool and the probe ran without panic.
             assert!(
@@ -7928,7 +12441,7 @@ mod tests {
         }
     }
 
-    /// implementation-note-280 T1: `is_ember_initialized` returns false
+    /// implementation-note-397 T1: `is_ember_initialized` returns false
     /// for a fresh temp dir, and true once `cmd_init` has run and written daemon.db.
     ///
     /// Verifies the detection logic that `init --for claude-code` uses to decide
@@ -7970,9 +12483,22 @@ mod tests {
 
         // Run basic init to simulate a friendly who already ran `ember init`.
         let config_path = tmp.path().join("config.toml");
-        unsafe { std::env::set_var("EMBER_VAULT_PASSPHRASE", "test-passphrase-t3-t1") };
-        cmd_init(&config, Some("Foo".to_string()), Some(&config_path), None, None, false);
-        unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
+        unsafe {
+            std::env::set_var("EMBER_VAULT_PASSPHRASE", "test-passphrase-t3-t1");
+            std::env::set_var("EMBER_SKIP_DAEMON_INSTALL_CHECK", "1");
+        };
+        cmd_init(
+            &config,
+            Some("Foo".to_string()),
+            Some(&config_path),
+            None,
+            None,
+            false,
+        );
+        unsafe {
+            std::env::remove_var("EMBER_VAULT_PASSPHRASE");
+            std::env::remove_var("EMBER_SKIP_DAEMON_INSTALL_CHECK");
+        };
 
         // After init: daemon.db exists → is_ember_initialized returns true.
         assert!(
@@ -7998,10 +12524,13 @@ mod tests {
             "exactly one persona expected after a single cmd_init; got: {:?}",
             personas.iter().map(|p| &p.name).collect::<Vec<_>>()
         );
-        assert_eq!(personas[0].name, "Foo", "persona name must match --name argument");
+        assert_eq!(
+            personas[0].name, "Foo",
+            "persona name must match --name argument"
+        );
     }
 
-    /// implementation-note-280 T2: `is_ember_initialized` returns false
+    /// implementation-note-397 T2: `is_ember_initialized` returns false
     /// for an empty temp dir, confirming that the `init --for claude-code` path
     /// would run basic init (not skip it) when starting fresh.
     #[test]
@@ -8038,12 +12567,21 @@ mod tests {
 
         // Simulate the basic init step that `init --for claude-code` would run.
         let config_path = tmp.path().join("config.toml");
-        unsafe { std::env::set_var("EMBER_VAULT_PASSPHRASE", "test-passphrase-t3-t2") };
+        unsafe {
+            std::env::set_var("EMBER_VAULT_PASSPHRASE", "test-passphrase-t3-t2");
+            std::env::set_var("EMBER_SKIP_DAEMON_INSTALL_CHECK", "1");
+        };
         cmd_init(&config, None, Some(&config_path), None, None, false);
-        unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
+        unsafe {
+            std::env::remove_var("EMBER_VAULT_PASSPHRASE");
+            std::env::remove_var("EMBER_SKIP_DAEMON_INSTALL_CHECK");
+        };
 
         // After init: config.toml and daemon.db must exist.
-        assert!(config_path.exists(), "config.toml must exist after cmd_init");
+        assert!(
+            config_path.exists(),
+            "config.toml must exist after cmd_init"
+        );
         assert!(
             data_dir.join("daemon.db").exists(),
             "daemon.db must exist after cmd_init"
@@ -8056,7 +12594,7 @@ mod tests {
         );
     }
 
-    /// T1 — implementation-note-286: the new posture-hardening
+    /// T1 — implementation-note-404: the new posture-hardening
     /// prompt text must contain the expected call-to-action copy (no jargon,
     /// no "Wedge claim", no "design" visible to friendly users).
     ///
@@ -8077,22 +12615,25 @@ mod tests {
 
         // Read the source of this binary at runtime from the file path
         // baked in at compile time via file!().
-        let source = std::fs::read_to_string(file!())
-            .unwrap_or_else(|_| std::fs::read_to_string(
-                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("src/bin/ember.rs")
-            ).expect("could not read ember.rs source for CTA text assertions"));
+        let source = std::fs::read_to_string(file!()).unwrap_or_else(|_| {
+            std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/ember.rs"),
+            )
+            .expect("could not read ember.rs source for CTA text assertions")
+        });
 
         // T1a: prompt must contain the friendly call-to-action label.
         assert!(
             source.contains(SECURITY_HARDENING_LABEL),
-            "prompt must contain \"{}\"", SECURITY_HARDENING_LABEL
+            "prompt must contain \"{}\"",
+            SECURITY_HARDENING_LABEL
         );
 
         // T1b: prompt must contain the [Y/n] harden question.
         assert!(
             source.contains(HARDEN_NOW_PROMPT),
-            "prompt must contain \"{}\"", HARDEN_NOW_PROMPT
+            "prompt must contain \"{}\"",
+            HARDEN_NOW_PROMPT
         );
 
         // T1c: jargon that scared friendly users must not appear in the
@@ -8101,31 +12642,44 @@ mod tests {
         // functions — check that the user-visible strings are clean).
         // These assertions guard against regression where someone adds
         // jargon back to the user-facing println! lines.
-        let cta_block_start = source.find("implementation-note-286")
-            .expect("checkpoint implementation-note-286 must be in source");
+        let cta_block_start = source
+            .find("implementation-note-404")
+            .expect("checkpoint implementation-note-404 must be in source");
         // The CTA block ends at the closing brace of the if-body (~60 lines).
         // Grab 3000 bytes after the checkpoint to cover the entire block.
-        let cta_region = &source[cta_block_start..cta_block_start + source[cta_block_start..].len().min(3000)];
+        let cta_region =
+            &source[cta_block_start..cta_block_start + source[cta_block_start..].len().min(3000)];
 
         // "Wedge claim" must not appear in user-visible println! lines.
         // (It may appear in comments; we only forbid it in the region
         // between the checkpoint and end of the CTA block.)
-        for line in cta_region.lines().filter(|l| l.trim_start().starts_with("println!")) {
+        for line in cta_region
+            .lines()
+            .filter(|l| l.trim_start().starts_with("println!"))
+        {
             assert!(
                 !line.contains(NO_JARGON_WEDGE),
-                "println! in CTA block must not contain jargon \"{}\": {}", NO_JARGON_WEDGE, line
+                "println! in CTA block must not contain jargon \"{}\": {}",
+                NO_JARGON_WEDGE,
+                line
             );
             assert!(
                 !line.contains(NO_JARGON_ADR_131),
-                "println! in CTA block must not contain jargon \"{}\": {}", NO_JARGON_ADR_131, line
+                "println! in CTA block must not contain jargon \"{}\": {}",
+                NO_JARGON_ADR_131,
+                line
             );
             assert!(
                 !line.contains(NO_JARGON_SINGLE_UID_POSTURE),
-                "println! in CTA block must not contain jargon \"{}\": {}", NO_JARGON_SINGLE_UID_POSTURE, line
+                "println! in CTA block must not contain jargon \"{}\": {}",
+                NO_JARGON_SINGLE_UID_POSTURE,
+                line
             );
             assert!(
                 !line.contains(NO_JARGON_KERNEL_ISOLATION),
-                "println! in CTA block must not contain jargon \"{}\": {}", NO_JARGON_KERNEL_ISOLATION, line
+                "println! in CTA block must not contain jargon \"{}\": {}",
+                NO_JARGON_KERNEL_ISOLATION,
+                line
             );
         }
     }

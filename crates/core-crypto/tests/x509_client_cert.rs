@@ -5,7 +5,7 @@
 
 use core_crypto::x509::{X509Error, mint_per_agent_client_cert};
 use proptest::prelude::*;
-use rcgen::{CertificateParams, IsCa, BasicConstraints, KeyPair, PKCS_ED25519};
+use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, PKCS_ED25519};
 use x509_parser::prelude::*;
 
 /// Decode a PEM block and return the contained DER bytes.
@@ -17,8 +17,7 @@ fn pem_to_der(pem_str: &str) -> Vec<u8> {
 /// Build a self-signed CA key + cert for use as a client-auth signer in tests.
 fn make_signer_ca() -> (KeyPair, rcgen::Certificate) {
     let key = KeyPair::generate_for(&PKCS_ED25519).expect("keygen must succeed");
-    let mut params = CertificateParams::new(Vec::<String>::new())
-        .expect("params must succeed");
+    let mut params = CertificateParams::new(Vec::<String>::new()).expect("params must succeed");
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
     params.not_before = rcgen::date_time_ymd(1970, 1, 1);
     params.not_after = rcgen::date_time_ymd(9999, 12, 31);
@@ -104,7 +103,7 @@ proptest! {
 // ─── prop_client_cert_subject_cn_matches_persona ─────────────────────────────
 
 proptest! {
-    /// Subject CN must be ember-persona-<agent_id> (implementation-note-24).
+    /// Subject CN must be ember-persona-<agent_id> (implementation-note-31).
     #[test]
     fn prop_client_cert_subject_cn_matches_persona(
         agent_id in "[a-z][a-z0-9-]{1,15}",
@@ -187,7 +186,7 @@ fn mint_rejects_invalid_validity_over_limit() {
 
 // ─── prop_client_cert_san_has_spiffe_persona_container ───────────────────────
 //
-// implementation-note-24: when container_id is Some, the cert
+// implementation-note-31: when container_id is Some, the cert
 // MUST carry both SPIFFE URI SANs in addition to the URN compat URI.
 
 proptest! {

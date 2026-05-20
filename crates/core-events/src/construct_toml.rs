@@ -11,8 +11,8 @@
 //! all 8 schema invariants; the cargo build-time hook + daemon manifest
 //! integration land in follow-up PRs.
 
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use thiserror::Error;
 
 /// Result alias for validator errors.
@@ -26,23 +26,41 @@ pub enum ConstructTomlError {
     Parse(String),
     #[error("invariant 1 violated: schema_version must be \"1\", got {0:?}")]
     UnknownSchemaVersion(String),
-    #[error("invariant 2 violated: meta.publisher must be a valid DID (did:method:identifier), got {0:?}")]
+    #[error(
+        "invariant 2 violated: meta.publisher must be a valid DID (did:method:identifier), got {0:?}"
+    )]
     InvalidPublisherDid(String),
     #[error("invariant 3 violated: action identifier {0:?} appears in two [actions.X] blocks")]
     ActionIdCollision(String),
-    #[error("invariant 4 violated: action {action} mode {mode:?} not in {{auto_approve_if_pregranted, jit_approval, deny, auto_approve}}")]
+    #[error(
+        "invariant 4 violated: action {action} mode {mode:?} not in {{auto_approve_if_pregranted, jit_approval, deny, auto_approve}}"
+    )]
     InvalidMode { action: String, mode: String },
-    #[error("invariant 5 violated: action {action} classify_argv {argv:?} contains chars outside [a-zA-Z0-9._\\-* ]")]
+    #[error(
+        "invariant 5 violated: action {action} classify_argv {argv:?} contains chars outside [a-zA-Z0-9._\\-* ]"
+    )]
     InvalidClassifyArgv { action: String, argv: String },
-    #[error("invariant 6 violated: bundled publisher {0:?} cannot set unknown_action=auto_approve at top level (use tier_overrides.dev0)")]
+    #[error(
+        "invariant 6 violated: bundled publisher {0:?} cannot set unknown_action=auto_approve at top level (use tier_overrides.dev0)"
+    )]
     BundledAutoApproveTopLevel(String),
     #[error("invariant 7 violated: meta.wraps_binary_min_version {0:?} is not parseable as semver")]
     InvalidMinVersion(String),
-    #[error("invariant 8 violated: action {action} budget_caps.{key} value {value} outside [1, 10000]")]
-    BudgetCapOutOfBounds { action: String, key: String, value: i64 },
-    #[error("invariant 9 violated: action {action} on_shim_eof {value:?} not in {{sigterm, drain}}")]
+    #[error(
+        "invariant 8 violated: action {action} budget_caps.{key} value {value} outside [1, 10000]"
+    )]
+    BudgetCapOutOfBounds {
+        action: String,
+        key: String,
+        value: i64,
+    },
+    #[error(
+        "invariant 9 violated: action {action} on_shim_eof {value:?} not in {{sigterm, drain}}"
+    )]
     InvalidShimEofPolicy { action: String, value: String },
-    #[error("invariant 10 violated: action {action} env_passthrough name {name:?} fails ^[A-Z_][A-Z0-9_]*$ shape")]
+    #[error(
+        "invariant 10 violated: action {action} env_passthrough name {name:?} fails ^[A-Z_][A-Z0-9_]*$ shape"
+    )]
     InvalidEnvPassthroughName { action: String, name: String },
 }
 
@@ -189,8 +207,8 @@ const BUDGET_CAP_MAX: i64 = 10000;
 /// from `docs/construct-toml-schema.md`; on `Err`, the violated invariant
 /// is named in the error message.
 pub fn parse_and_validate(text: &str) -> Result<ConstructToml> {
-    let parsed: ConstructToml = toml::from_str(text)
-        .map_err(|e| ConstructTomlError::Parse(e.to_string()))?;
+    let parsed: ConstructToml =
+        toml::from_str(text).map_err(|e| ConstructTomlError::Parse(e.to_string()))?;
     validate(&parsed)?;
     Ok(parsed)
 }
@@ -200,12 +218,16 @@ pub fn parse_and_validate(text: &str) -> Result<ConstructToml> {
 pub fn validate(c: &ConstructToml) -> Result<()> {
     // Invariant 1: schema_version must be "1".
     if c.schema_version != "1" {
-        return Err(ConstructTomlError::UnknownSchemaVersion(c.schema_version.clone()));
+        return Err(ConstructTomlError::UnknownSchemaVersion(
+            c.schema_version.clone(),
+        ));
     }
 
     // Invariant 2: meta.publisher must be a valid DID.
     if !is_valid_did(&c.meta.publisher) {
-        return Err(ConstructTomlError::InvalidPublisherDid(c.meta.publisher.clone()));
+        return Err(ConstructTomlError::InvalidPublisherDid(
+            c.meta.publisher.clone(),
+        ));
     }
 
     // Invariant 3: action ID collision is impossible by HashMap construction
@@ -241,14 +263,16 @@ pub fn validate(c: &ConstructToml) -> Result<()> {
     // Invariant 6: bundled publisher can't set unknown_action=auto_approve at
     // top level (must use tier_overrides.dev0 if needed).
     if c.meta.publisher == BUNDLED_PUBLISHER && c.default.unknown_action == "auto_approve" {
-        return Err(ConstructTomlError::BundledAutoApproveTopLevel(c.meta.publisher.clone()));
+        return Err(ConstructTomlError::BundledAutoApproveTopLevel(
+            c.meta.publisher.clone(),
+        ));
     }
 
     // Invariant 7: wraps_binary_min_version, if set, must parse as semver.
-    if let Some(v) = &c.meta.wraps_binary_min_version {
-        if !is_semver_parseable(v) {
-            return Err(ConstructTomlError::InvalidMinVersion(v.clone()));
-        }
+    if let Some(v) = &c.meta.wraps_binary_min_version
+        && !is_semver_parseable(v)
+    {
+        return Err(ConstructTomlError::InvalidMinVersion(v.clone()));
     }
 
     // Invariant 8: every budget_caps value is in [1, 10000].
@@ -298,7 +322,9 @@ pub fn validate(c: &ConstructToml) -> Result<()> {
 /// check and the runtime broker_exec check can never disagree.
 fn is_valid_env_name(name: &str) -> bool {
     let mut chars = name.chars();
-    let Some(first) = chars.next() else { return false };
+    let Some(first) = chars.next() else {
+        return false;
+    };
     if !(first.is_ascii_uppercase() || first == '_') {
         return false;
     }
@@ -340,8 +366,9 @@ fn is_valid_did(s: &str) -> bool {
 /// `classify_argv` allowed char class: `[a-zA-Z0-9._\- *]`. Defends regex
 /// injection through the classifier.
 fn is_safe_classify_argv(s: &str) -> bool {
-    s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' || c == '*' || c == ' ')
+    s.chars().all(|c| {
+        c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' || c == '*' || c == ' '
+    })
 }
 
 /// Minimal semver parser: `MAJOR.MINOR.PATCH` with each component a
@@ -352,7 +379,9 @@ fn is_semver_parseable(s: &str) -> bool {
     if parts.len() != 3 {
         return false;
     }
-    parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+    parts
+        .iter()
+        .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
 }
 
 #[cfg(test)]
@@ -406,14 +435,20 @@ budget_caps = { runs_per_session = 5, runs_per_hour = 30 }
 
     #[test]
     fn invariant_2_invalid_publisher_did() {
-        let s = valid_template().replace(r#"publisher = "did:emberlink""#, r#"publisher = "ember-systems""#);
+        let s = valid_template().replace(
+            r#"publisher = "did:emberlink""#,
+            r#"publisher = "ember-systems""#,
+        );
         let err = parse_and_validate(&s).expect_err("expected InvalidPublisherDid");
         assert!(matches!(err, ConstructTomlError::InvalidPublisherDid(_)));
     }
 
     #[test]
     fn invariant_2_did_with_uppercase_method_rejected() {
-        let s = valid_template().replace(r#"publisher = "did:emberlink""#, r#"publisher = "did:Ember-Systems""#);
+        let s = valid_template().replace(
+            r#"publisher = "did:emberlink""#,
+            r#"publisher = "did:Ember-Systems""#,
+        );
         let err = parse_and_validate(&s).expect_err("expected InvalidPublisherDid");
         assert!(matches!(err, ConstructTomlError::InvalidPublisherDid(_)));
     }
@@ -421,7 +456,10 @@ budget_caps = { runs_per_session = 5, runs_per_hour = 30 }
     #[test]
     fn invariant_3_action_id_collision_caught_by_toml_parser() {
         // toml's own parser rejects duplicate keys before our validator runs.
-        let s = format!("{}\n[actions.pr_create]\nmode = \"deny\"\nclassify_argv = \"pr create *\"\n", valid_template());
+        let s = format!(
+            "{}\n[actions.pr_create]\nmode = \"deny\"\nclassify_argv = \"pr create *\"\n",
+            valid_template()
+        );
         let err = parse_and_validate(&s).expect_err("expected duplicate-key parse error");
         assert!(matches!(err, ConstructTomlError::Parse(_)));
     }
@@ -430,43 +468,71 @@ budget_caps = { runs_per_session = 5, runs_per_hour = 30 }
     fn invariant_4_invalid_mode_rejected() {
         let s = valid_template().replace(r#"mode = "jit_approval""#, r#"mode = "yolo""#);
         let err = parse_and_validate(&s).expect_err("expected InvalidMode");
-        assert!(matches!(err, ConstructTomlError::InvalidMode { ref action, ref mode }
-            if action == "pr_merge" && mode == "yolo"));
+        assert!(
+            matches!(err, ConstructTomlError::InvalidMode { ref action, ref mode }
+            if action == "pr_merge" && mode == "yolo")
+        );
     }
 
     #[test]
     fn invariant_5_classify_argv_with_pipe_rejected() {
-        let s = valid_template().replace(r#"classify_argv = "pr merge *""#, r#"classify_argv = "pr merge|exec""#);
+        let s = valid_template().replace(
+            r#"classify_argv = "pr merge *""#,
+            r#"classify_argv = "pr merge|exec""#,
+        );
         let err = parse_and_validate(&s).expect_err("expected InvalidClassifyArgv");
-        assert!(matches!(err, ConstructTomlError::InvalidClassifyArgv { ref action, .. } if action == "pr_merge"));
+        assert!(
+            matches!(err, ConstructTomlError::InvalidClassifyArgv { ref action, .. } if action == "pr_merge")
+        );
     }
 
     #[test]
     fn invariant_5_classify_argv_with_dollar_rejected() {
-        let s = valid_template().replace(r#"classify_argv = "pr merge *""#, r#"classify_argv = "pr merge $arg""#);
+        let s = valid_template().replace(
+            r#"classify_argv = "pr merge *""#,
+            r#"classify_argv = "pr merge $arg""#,
+        );
         let err = parse_and_validate(&s).expect_err("expected InvalidClassifyArgv");
-        assert!(matches!(err, ConstructTomlError::InvalidClassifyArgv { .. }));
+        assert!(matches!(
+            err,
+            ConstructTomlError::InvalidClassifyArgv { .. }
+        ));
     }
 
     #[test]
     fn invariant_6_bundled_auto_approve_top_level_rejected() {
-        let s = valid_template().replace(r#"unknown_action = "deny""#, r#"unknown_action = "auto_approve""#);
+        let s = valid_template().replace(
+            r#"unknown_action = "deny""#,
+            r#"unknown_action = "auto_approve""#,
+        );
         let err = parse_and_validate(&s).expect_err("expected BundledAutoApproveTopLevel");
-        assert!(matches!(err, ConstructTomlError::BundledAutoApproveTopLevel(_)));
+        assert!(matches!(
+            err,
+            ConstructTomlError::BundledAutoApproveTopLevel(_)
+        ));
     }
 
     #[test]
     fn invariant_6_third_party_auto_approve_top_level_allowed() {
         // Third-party publishers can choose dangerous defaults — that's their call.
         let s = valid_template()
-            .replace(r#"publisher = "did:emberlink""#, r#"publisher = "did:wrangler-team""#)
-            .replace(r#"unknown_action = "deny""#, r#"unknown_action = "auto_approve""#);
+            .replace(
+                r#"publisher = "did:emberlink""#,
+                r#"publisher = "did:wrangler-team""#,
+            )
+            .replace(
+                r#"unknown_action = "deny""#,
+                r#"unknown_action = "auto_approve""#,
+            );
         let _ = parse_and_validate(&s).expect("third-party auto_approve should be allowed");
     }
 
     #[test]
     fn invariant_7_invalid_min_version_rejected() {
-        let s = valid_template().replace(r#"wraps_binary_min_version = "2.40.0""#, r#"wraps_binary_min_version = "2.4""#);
+        let s = valid_template().replace(
+            r#"wraps_binary_min_version = "2.40.0""#,
+            r#"wraps_binary_min_version = "2.4""#,
+        );
         let err = parse_and_validate(&s).expect_err("expected InvalidMinVersion");
         assert!(matches!(err, ConstructTomlError::InvalidMinVersion(v) if v == "2.4"));
     }
@@ -484,8 +550,10 @@ budget_caps = { runs_per_session = 5, runs_per_hour = 30 }
             "budget_caps = { runs_per_session = 0, runs_per_hour = 30 }",
         );
         let err = parse_and_validate(&s).expect_err("expected BudgetCapOutOfBounds");
-        assert!(matches!(err, ConstructTomlError::BudgetCapOutOfBounds { ref key, value, .. }
-            if key == "runs_per_session" && value == 0));
+        assert!(
+            matches!(err, ConstructTomlError::BudgetCapOutOfBounds { ref key, value, .. }
+            if key == "runs_per_session" && value == 0)
+        );
     }
 
     #[test]
@@ -495,7 +563,9 @@ budget_caps = { runs_per_session = 5, runs_per_hour = 30 }
             "budget_caps = { runs_per_session = 99999, runs_per_hour = 30 }",
         );
         let err = parse_and_validate(&s).expect_err("expected BudgetCapOutOfBounds");
-        assert!(matches!(err, ConstructTomlError::BudgetCapOutOfBounds { value, .. } if value == 99999));
+        assert!(
+            matches!(err, ConstructTomlError::BudgetCapOutOfBounds { value, .. } if value == 99999)
+        );
     }
 
     #[test]
@@ -506,7 +576,8 @@ budget_caps = { runs_per_session = 5, runs_per_hour = 30 }
 
     #[test]
     fn missing_required_field_returns_parse_error() {
-        let err = parse_and_validate(r#"schema_version = "1""#).expect_err("expected Parse (missing meta)");
+        let err = parse_and_validate(r#"schema_version = "1""#)
+            .expect_err("expected Parse (missing meta)");
         assert!(matches!(err, ConstructTomlError::Parse(_)));
     }
 
@@ -542,8 +613,10 @@ on_shim_eof = "ignore"
 mode = "jit_approval""#,
         );
         let err = parse_and_validate(&s).expect_err("expected InvalidShimEofPolicy");
-        assert!(matches!(err, ConstructTomlError::InvalidShimEofPolicy { ref action, ref value }
-            if action == "pr_merge" && value == "ignore"));
+        assert!(
+            matches!(err, ConstructTomlError::InvalidShimEofPolicy { ref action, ref value }
+            if action == "pr_merge" && value == "ignore")
+        );
     }
 
     #[test]
@@ -564,7 +637,10 @@ mode = "jit_approval""#,
         );
         let c = parse_and_validate(&s).expect("env_passthrough should validate");
         let pr_merge = c.actions.get("pr_merge").unwrap();
-        assert_eq!(pr_merge.env_passthrough, vec!["GH_TOKEN", "GITHUB_TOKEN", "GH_HOST"]);
+        assert_eq!(
+            pr_merge.env_passthrough,
+            vec!["GH_TOKEN", "GITHUB_TOKEN", "GH_HOST"]
+        );
     }
 
     #[test]
@@ -577,8 +653,10 @@ env_passthrough = ["gh_token"]
 mode = "jit_approval""#,
         );
         let err = parse_and_validate(&s).expect_err("expected InvalidEnvPassthroughName");
-        assert!(matches!(err, ConstructTomlError::InvalidEnvPassthroughName { ref action, ref name }
-            if action == "pr_merge" && name == "gh_token"));
+        assert!(
+            matches!(err, ConstructTomlError::InvalidEnvPassthroughName { ref action, ref name }
+            if action == "pr_merge" && name == "gh_token")
+        );
     }
 
     #[test]
@@ -591,20 +669,29 @@ env_passthrough = ["1BAD"]
 mode = "jit_approval""#,
         );
         let err = parse_and_validate(&s).expect_err("expected InvalidEnvPassthroughName");
-        assert!(matches!(err, ConstructTomlError::InvalidEnvPassthroughName { .. }));
+        assert!(matches!(
+            err,
+            ConstructTomlError::InvalidEnvPassthroughName { .. }
+        ));
     }
 
     // -----------------------------------------------------------------------
-    // needs_credentials + credential_types tests (implementation-note-25)
+    // needs_credentials + credential_types tests (implementation-note-32)
     // -----------------------------------------------------------------------
 
     #[test]
     fn needs_credentials_defaults_to_false() {
         let c = parse_and_validate(valid_template()).expect("valid template");
         let pr_create = c.actions.get("pr_create").expect("pr_create block");
-        assert!(!pr_create.needs_credentials, "needs_credentials should default to false");
+        assert!(
+            !pr_create.needs_credentials,
+            "needs_credentials should default to false"
+        );
         let pr_merge = c.actions.get("pr_merge").expect("pr_merge block");
-        assert!(!pr_merge.needs_credentials, "needs_credentials should default to false");
+        assert!(
+            !pr_merge.needs_credentials,
+            "needs_credentials should default to false"
+        );
     }
 
     #[test]
@@ -626,7 +713,10 @@ mode = "jit_approval""#,
     #[test]
     fn credential_types_absent_defaults_to_empty_map() {
         let c = parse_and_validate(valid_template()).expect("valid template");
-        assert!(c.credential_types.is_empty(), "credential_types should default to empty map");
+        assert!(
+            c.credential_types.is_empty(),
+            "credential_types should default to empty map"
+        );
     }
 
     #[test]
@@ -645,12 +735,18 @@ broker_impl = \"aws_iam_env\"\n",
         let c = parse_and_validate(&s).expect("credential_types table should validate");
         assert_eq!(c.credential_types.len(), 2);
 
-        let gh = c.credential_types.get("github_token").expect("github_token type");
+        let gh = c
+            .credential_types
+            .get("github_token")
+            .expect("github_token type");
         assert_eq!(gh.vault_entries, vec!["secret/data/github/*"]);
         assert_eq!(gh.broker_impl, "gh_token_env");
 
         let aws = c.credential_types.get("aws_iam").expect("aws_iam type");
-        assert_eq!(aws.vault_entries, vec!["secret/data/aws/access_key", "secret/data/aws/secret_key"]);
+        assert_eq!(
+            aws.vault_entries,
+            vec!["secret/data/aws/access_key", "secret/data/aws/secret_key"]
+        );
         assert_eq!(aws.broker_impl, "aws_iam_env");
     }
 
@@ -662,7 +758,8 @@ broker_impl = \"aws_iam_env\"\n",
 broker_impl = \"noop\"\n",
             valid_template()
         );
-        let c = parse_and_validate(&s).expect("credential_type with no vault_entries should validate");
+        let c =
+            parse_and_validate(&s).expect("credential_type with no vault_entries should validate");
         let minimal = c.credential_types.get("minimal").expect("minimal type");
         assert!(minimal.vault_entries.is_empty());
         assert_eq!(minimal.broker_impl, "noop");
@@ -714,7 +811,8 @@ mode = "jit_approval""#,
         // The valid_template() fixture has no needs_credentials or credential_types —
         // this is the backward-compatibility contract: existing construct.toml files
         // that omit these fields must continue to parse and validate without error.
-        let c = parse_and_validate(valid_template()).expect("back-compat: existing toml must still parse");
+        let c = parse_and_validate(valid_template())
+            .expect("back-compat: existing toml must still parse");
         assert!(c.credential_types.is_empty());
         for (_id, block) in &c.actions {
             assert!(!block.needs_credentials);

@@ -32,7 +32,5 @@
 mod server;
 pub mod transit;
 
-pub use server::{
-    DEFAULT_KMS_PORT, KmsServer, KmsServerError, NoopReceiptSink, ReceiptSink, run,
-};
+pub use server::{DEFAULT_KMS_PORT, KmsServer, KmsServerError, NoopReceiptSink, ReceiptSink, run};
 pub use transit::TransitKeyring;

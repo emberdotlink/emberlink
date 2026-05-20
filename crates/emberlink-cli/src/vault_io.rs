@@ -1,6 +1,6 @@
 //! Operator-facing vault I/O — `ember vault list/get/put/export/import`.
 //!
-//! Per implementation-note-276 this module hosts the testable
+//! Per implementation-note-393 this module hosts the testable
 //! core of the new `ember vault` subcommands (sub-piece E of design).
 //! The argv-parsing surface lives in `bin/ember.rs`; the binary forwards
 //! into these helpers so they can be exercised from T2 integration tests
@@ -21,7 +21,6 @@
 use core_crypto::{unwrap_armored_with_identity, wrap_secret_to_recipient_armored};
 use core_types::ValidationError;
 use serde::{Deserialize, Serialize};
-use ember_daemon::infra::vault::VaultScope;
 
 /// Mask a credential value for display, keeping only the trailing 4 chars.
 ///
@@ -90,10 +89,12 @@ pub fn encode_export_envelope(
 ) -> Result<VaultExportEnvelope, VaultIoError> {
     let mut out: Vec<VaultExportEntry> = Vec::with_capacity(entries.len());
     for (name, value) in entries {
-        let armored = wrap_secret_to_recipient_armored(recipient_age_pub, value)
-            .map_err(|source| VaultIoError::Encrypt {
-                name: name.clone(),
-                source,
+        let armored =
+            wrap_secret_to_recipient_armored(recipient_age_pub, value).map_err(|source| {
+                VaultIoError::Encrypt {
+                    name: name.clone(),
+                    source,
+                }
             })?;
         out.push(VaultExportEntry {
             name: name.clone(),

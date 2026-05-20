@@ -59,8 +59,8 @@ const KEY_DEFAULT_TARGET: &str = "GCP_DEFAULT_TARGET_SERVICE_ACCOUNT";
 ///
 /// The receiving const is reserved here; load_from_dir() does not yet
 /// read it (full daemon-side wireup follows in
-/// implementation-note-90 — the broker accepts an
-/// already-resolved [`GcpAuthMethod`] per the implementation-note-91-
+/// implementation-note-113 — the broker accepts an
+/// already-resolved [`GcpAuthMethod`] per the implementation-note-114-
 /// IDENTITY brief, mirroring the AWS-STS WI groundwork).
 #[allow(dead_code)]
 const KEY_OIDC_TOKEN_PATH: &str = "GCP_OIDC_TOKEN_PATH";
@@ -163,9 +163,11 @@ pub async fn gcp_config_from_store(
         key: &str,
     ) -> Result<Option<String>, StoreError> {
         match store.get(key).await {
-            Ok(bytes) => Ok(Some(String::from_utf8(bytes).map_err(|e| {
-                StoreError::Other(format!("non-utf8 in {}: {e}", key))
-            })?)),
+            Ok(bytes) => {
+                Ok(Some(String::from_utf8(bytes).map_err(|e| {
+                    StoreError::Other(format!("non-utf8 in {}: {e}", key))
+                })?))
+            }
             Err(StoreError::NotFound(_)) => Ok(None),
             Err(other) => Err(other),
         }
@@ -177,9 +179,7 @@ pub async fn gcp_config_from_store(
     let default_target = get_opt(store, STORE_KEY_DEFAULT_TARGET).await?;
 
     let (client_email, private_key, project_id) = match (client_email, private_key, project_id) {
-        (Some(c), Some(k), Some(p)) if !c.is_empty() && !k.is_empty() && !p.is_empty() => {
-            (c, k, p)
-        }
+        (Some(c), Some(k), Some(p)) if !c.is_empty() && !k.is_empty() && !p.is_empty() => (c, k, p),
         _ => return Ok(None),
     };
 
@@ -190,7 +190,7 @@ pub async fn gcp_config_from_store(
             project_id,
             // Mirrors load_from_dir: SA-key path is the historical
             // default for backward compat. Full WIF wireup follows in
-            // implementation-note-90.
+            // implementation-note-113.
             auth_method: GcpAuthMethod::ServiceAccountKey,
         },
         default_target,
@@ -270,7 +270,11 @@ mod tests {
             "ember-broker@test-project.iam.gserviceaccount.com"
         );
         assert_eq!(key.project_id, "test-project");
-        assert!(key.private_key.expose_secret().contains("BEGIN PRIVATE KEY"));
+        assert!(
+            key.private_key
+                .expose_secret()
+                .contains("BEGIN PRIVATE KEY")
+        );
         assert_eq!(default_target, None);
     }
 
@@ -347,8 +351,7 @@ mod tests {
 
     #[test]
     fn parse_env_var_strips_quotes() {
-        let env =
-            "GCP_SERVICE_ACCOUNT_KEY_PATH=\"/path/to/key.json\"\nGCP_DEFAULT_TARGET_SERVICE_ACCOUNT='x@y'\n";
+        let env = "GCP_SERVICE_ACCOUNT_KEY_PATH=\"/path/to/key.json\"\nGCP_DEFAULT_TARGET_SERVICE_ACCOUNT='x@y'\n";
         assert_eq!(
             parse_env_var(env, "GCP_SERVICE_ACCOUNT_KEY_PATH"),
             Some("/path/to/key.json".to_string())
@@ -361,8 +364,8 @@ mod tests {
 
     #[tokio::test]
     async fn gcp_config_from_store_happy_path() {
-        use crate::infra::credential_store::test_helpers::MockCredentialStore;
         use crate::infra::credential_store::CredentialStore;
+        use crate::infra::credential_store::test_helpers::MockCredentialStore;
 
         let mock = MockCredentialStore::new();
         mock.put(
@@ -388,7 +391,11 @@ mod tests {
             "ember-broker@test-project.iam.gserviceaccount.com"
         );
         assert_eq!(key.project_id, "test-project");
-        assert!(key.private_key.expose_secret().contains("BEGIN PRIVATE KEY"));
+        assert!(
+            key.private_key
+                .expose_secret()
+                .contains("BEGIN PRIVATE KEY")
+        );
         assert_eq!(default_target, None);
     }
 }

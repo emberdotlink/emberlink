@@ -1,4 +1,6 @@
-use core_event_types::{EventBody, PersonaCreatedEvent, PersonaKeyRotatedEvent, PersonaRevokedEvent};
+use core_event_types::{
+    EventBody, PersonaCreatedEvent, PersonaKeyRotatedEvent, PersonaRevokedEvent,
+};
 use core_principals::{Persona, PublicKeyMaterial, SurvivalMode};
 
 pub fn create_persona(
@@ -19,7 +21,7 @@ pub fn create_persona(
     }
 }
 
-/// implementation-note-40 (design §9 + §6) — factory for
+/// implementation-note-53 (design §9 + §6) — factory for
 /// a workload Persona bound to a SCION agent's container identity.
 ///
 /// Returns the persona alongside the container_id + parent_grant_id
@@ -30,7 +32,7 @@ pub fn create_persona(
 ///
 /// This is the pure factory — it does not touch the event store or
 /// the SQLite layer. The two-phase commit (`enrolling -> active`)
-/// + container-id uniqueness enforcement happens at the daemon
+/// and container-id uniqueness enforcement happens at the daemon
 /// boundary, where the SQLite transaction lives.
 #[allow(clippy::too_many_arguments)]
 pub fn create_agent_persona(
@@ -57,7 +59,7 @@ pub fn create_agent_persona(
     }
 }
 
-/// implementation-note-40 — workload Persona + container
+/// implementation-note-53 — workload Persona + container
 /// binding metadata. Returned by [`create_agent_persona`] so the
 /// daemon can persist the binding atomically with the persona row.
 ///
@@ -75,6 +77,35 @@ pub struct AgentPersona {
     /// persona's child grant. Lets the reconciler + receipt pipeline
     /// correlate the agent's grant lineage without walking the chain.
     pub parent_grant_id: String,
+}
+
+/// design component 4 — kernel-attested-equivalent principal resolved
+/// from an mTLS client certificate presented on the cross-uid bridge
+/// listener. `MtlsPrincipal` is to the mTLS lane what
+/// `EnrolledPrincipal` (in `ember-daemon::infra::handler`) is to the
+/// per-agent UDS lane: an identity-claim binding that the dispatcher
+/// trusts in place of wire-claimed `caller_persona_id`.
+///
+/// DO NOT redefine this type. It MUST live in `core-personas` so the
+/// daemon, the bridge listener, and any future consumer (dashboard
+/// extract, audit replay, fed-relay) all import a single canonical
+/// definition. A CI grep-lint refuses `pub struct MtlsPrincipal`
+/// declarations outside this crate; redefinitions silently fork the
+/// identity model and would let a downstream consumer over-trust a
+/// look-alike struct that does NOT carry the cert-fingerprint binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MtlsPrincipal {
+    /// Persona id resolved from the SPIFFE URI SAN of the client cert
+    /// (design component 1 — see `implementation-note-31`).
+    pub persona_id: String,
+    /// Container id resolved from the secondary SAN entry. Cross-checked
+    /// against the persona's `agent_personas.container_id` binding to
+    /// refuse mismatched-SAN certs at dispatch time (design ESC-3).
+    pub container_id: String,
+    /// SHA-256 of the DER-encoded client cert. Stored in the audit log
+    /// per call so a revoked cert can be retroactively correlated to
+    /// its bridge-lane traffic.
+    pub cert_fingerprint: [u8; 32],
 }
 
 pub fn persona_created_event(
@@ -131,8 +162,8 @@ pub fn revoke_persona(personas: &mut Vec<Persona>, persona_id: &str) -> Option<P
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_event_types::{EventType};
-    use core_principals::{KeyAlgorithm};
+    use core_event_types::EventType;
+    use core_principals::KeyAlgorithm;
 
     #[test]
     fn revoke_persona_removes_matching_entry() {
@@ -274,7 +305,7 @@ mod tests {
         assert_eq!(personas.len(), 1);
     }
 
-    // implementation-note-40 tests.
+    // implementation-note-53 tests.
 
     #[test]
     fn create_agent_persona_carries_container_binding() {

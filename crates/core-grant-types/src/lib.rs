@@ -17,6 +17,7 @@
 //! No globbed re-exports at the crate root.
 
 pub mod approval;
+pub mod capabilities;
 pub mod grant_chain;
 pub mod grant_conditions;
 pub mod grant_link;

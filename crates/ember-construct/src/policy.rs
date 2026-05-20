@@ -47,9 +47,7 @@ pub enum CredentialInjection {
     ///
     /// `hosts` lists git hosts the rewrite applies to. Example:
     /// `GitHttpRewrite { hosts: ["github.com"] }` for `git.push`.
-    GitHttpRewrite {
-        hosts: &'static [&'static str],
-    },
+    GitHttpRewrite { hosts: &'static [&'static str] },
 
     /// Split a JSON-encoded AWS credential bundle (issued by the AWS
     /// STS broker as `{access_key_id, secret_access_key, session_token,
@@ -140,21 +138,19 @@ pub struct CredentialPolicy {
 pub fn credential_policy(action_key: &str) -> Option<CredentialPolicy> {
     match action_key {
         // ───── gh — GitHub App installation token, delivered via GH_TOKEN ─────
-        "gh.pr_create"
-        | "gh.pr_close"
-        | "gh.pr_view"
-        | "gh.pr_list"
-        | "gh.workflow_run" => Some(CredentialPolicy {
-            provider: BrokerProvider::Github,
-            scope: serde_json::json!({
-                "permissions": [
-                    ["pull_requests", "write"],
-                    ["contents", "write"],
-                    ["actions", "read"],
-                ],
-            }),
-            injection: CredentialInjection::Env("GH_TOKEN"),
-        }),
+        "gh.pr_create" | "gh.pr_close" | "gh.pr_view" | "gh.pr_list" | "gh.workflow_run" => {
+            Some(CredentialPolicy {
+                provider: BrokerProvider::Github,
+                scope: serde_json::json!({
+                    "permissions": [
+                        ["pull_requests", "write"],
+                        ["contents", "write"],
+                        ["actions", "read"],
+                    ],
+                }),
+                injection: CredentialInjection::Env("GH_TOKEN"),
+            })
+        }
 
         "gh.pr_merge" => Some(CredentialPolicy {
             // pr_merge requires the wider "write" scope on contents and PRs
@@ -244,7 +240,10 @@ mod tests {
     #[test]
     fn git_push_has_write_scope() {
         let policy = credential_policy("git.push").expect("git.push must have policy");
-        let perms = policy.scope.get("permissions").expect("permissions present");
+        let perms = policy
+            .scope
+            .get("permissions")
+            .expect("permissions present");
         let perms = perms.as_array().expect("permissions is array");
         let first = perms.first().expect("at least one permission");
         let pair = first.as_array().expect("permission entry is array");
@@ -261,15 +260,18 @@ mod tests {
         // fetch_pull_clone_use_read_scope: read-only verbs must NOT mint
         // contents:write — principle of least privilege.
         for verb in ["git.fetch", "git.clone", "git.pull"] {
-            let policy = credential_policy(verb)
-                .unwrap_or_else(|| panic!("{verb} must have policy"));
+            let policy =
+                credential_policy(verb).unwrap_or_else(|| panic!("{verb} must have policy"));
             match &policy.injection {
                 CredentialInjection::GitHttpRewrite { hosts } => {
                     assert_eq!(*hosts, &["github.com"], "{verb} hosts");
                 }
                 other => panic!("{verb} expected GitHttpRewrite, got {other:?}"),
             }
-            let perms = policy.scope.get("permissions").expect("permissions present");
+            let perms = policy
+                .scope
+                .get("permissions")
+                .expect("permissions present");
             let perms = perms.as_array().expect("permissions is array");
             let first = perms.first().expect("at least one permission");
             let pair = first.as_array().expect("permission entry is array");

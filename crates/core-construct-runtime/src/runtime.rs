@@ -11,7 +11,7 @@
 //!   broker_exec RPC → PTY bridge → exit). Takes a [`ConstructConfig`] impl.
 //!   This is the entry point used by production Construct shims (ember-gh etc.).
 //!
-//! ## Resolve → exec two-phase invariant (implementation-note-20)
+//! ## Resolve → exec two-phase invariant (implementation-note-22)
 //!
 //! Per design §9, the construct shim MUST call `broker.resolve` BEFORE
 //! `broker.exec`. Resolve returns a [`SpawnHandle`] binding the four
@@ -90,7 +90,7 @@ fn build_broker_exec_params(
 }
 
 // ---------------------------------------------------------------------------
-// Two-phase resolve → exec (implementation-note-20)
+// Two-phase resolve → exec (implementation-note-22)
 // ---------------------------------------------------------------------------
 
 /// Opaque spawn handle returned by [`resolve_via_broker`].
@@ -153,9 +153,7 @@ impl From<crate::rpc::RpcError> for BrokerTransactionError {
     fn from(e: crate::rpc::RpcError) -> Self {
         match e {
             crate::rpc::RpcError::DaemonUnavailable(s) => Self::DaemonUnavailable(s),
-            crate::rpc::RpcError::DaemonRpc { code, message } => {
-                Self::DaemonRpc { code, message }
-            }
+            crate::rpc::RpcError::DaemonRpc { code, message } => Self::DaemonRpc { code, message },
             crate::rpc::RpcError::Protocol(s) => Self::Protocol(s),
             crate::rpc::RpcError::Io(s) => Self::Io(s),
         }
@@ -251,7 +249,7 @@ pub trait BrokerTransport {
 /// construct_toml_bytes) and receives a [`SpawnHandle`] binding
 /// (binary, env_allowlist, materialization_id, target_uid). The
 /// `materialization_id` carries the daemon's credential reference;
-/// plaintext is NEVER returned over this RPC (per implementation-note-21-
+/// plaintext is NEVER returned over this RPC (per implementation-note-23-
 /// SECRETREF-CONTRACT — only `handle_broker_resolve`'s legacy
 /// secret-ref → plaintext path returns raw credentials, and that path
 /// is gated to trust-boundary callers).
@@ -351,10 +349,7 @@ impl BrokerTransport for DaemonRpcTransport {
             })
             .unwrap_or_else(|| env_passthrough.to_vec());
 
-        let target_uid = resp
-            .get("target_uid")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
+        let target_uid = resp.get("target_uid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
         Ok(SpawnHandle {
             binary: resolved_binary,
@@ -398,11 +393,7 @@ impl BrokerTransport for DaemonRpcTransport {
             "materialization_id": handle.materialization_id,
             "reason": "shim_aborted_before_exec",
         });
-        match crate::rpc::call_daemon_rpc(
-            &self.socket_path,
-            "broker_resolve_release",
-            &params,
-        ) {
+        match crate::rpc::call_daemon_rpc(&self.socket_path, "broker_resolve_release", &params) {
             Ok(_) => {
                 tracing::debug!(
                     materialization_id = %handle.materialization_id,
@@ -526,9 +517,7 @@ pub fn run_construct_with_transport<C: ClassifyArgv, T: BrokerTransport>(
             // Resolve succeeded, exec did not. Emit credential_resolve_
             // aborted instead of credential_provisioned.
             transport.abort_resolve(&abort_handle);
-            eprintln!(
-                "core-construct-runtime: broker_exec failed (action_key={action_key}): {e}"
-            );
+            eprintln!("core-construct-runtime: broker_exec failed (action_key={action_key}): {e}");
             return ExitCode::from(1);
         }
     };
@@ -639,9 +628,7 @@ pub fn run_construct_full<C: ConstructConfig>(argv: &[String], config: &C) -> Ex
             std::process::id()
         )))
     } else {
-        tracing::debug!(
-            "ember-construct: parent has no TTY; skipping PTY allocation"
-        );
+        tracing::debug!("ember-construct: parent has no TTY; skipping PTY allocation");
         None
     };
 
@@ -661,10 +648,7 @@ pub fn run_construct_full<C: ConstructConfig>(argv: &[String], config: &C) -> Ex
                 return ExitCode::from(1u8);
             }
         };
-        let _ = std::fs::set_permissions(
-            pty_sock_path,
-            std::fs::Permissions::from_mode(0o600),
-        );
+        let _ = std::fs::set_permissions(pty_sock_path, std::fs::Permissions::from_mode(0o600));
 
         // Install signal handlers.
         #[cfg(unix)]
@@ -691,7 +675,7 @@ pub fn run_construct_full<C: ConstructConfig>(argv: &[String], config: &C) -> Ex
     };
 
     // 6. Translate emberlink-shaped argv to wrapped-tool-native argv
-    //    (implementation-note-22 / Q5 grill-pair LOCK):
+    //    (implementation-note-24 / Q5 grill-pair LOCK):
     //    `ConstructConfig::translate_argv` strips/renames emberlink-specific
     //    flags the upstream binary doesn't understand. Default is identity;
     //    scion strips `--persona`/`--max-depth`/`--brief`, renames
@@ -741,10 +725,7 @@ pub fn run_construct_full<C: ConstructConfig>(argv: &[String], config: &C) -> Ex
                 eprint!("{stderr_tail}");
             }
 
-            let exit_code = resp
-                .get("exit_code")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
+            let exit_code = resp.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(0);
 
             tracing::info!(
                 exit_code = exit_code,
@@ -927,10 +908,13 @@ mod tests {
             _env_passthrough: &[String],
             _construct_toml_bytes: &[u8],
         ) -> Result<SpawnHandle, BrokerTransactionError> {
-            self.recorded.lock().unwrap().push(MockEvent::ResolveCalled {
-                action_key: action_key.0.clone(),
-                binary: binary.to_string(),
-            });
+            self.recorded
+                .lock()
+                .unwrap()
+                .push(MockEvent::ResolveCalled {
+                    action_key: action_key.0.clone(),
+                    binary: binary.to_string(),
+                });
             match self.resolve_outcome.lock().unwrap().clone() {
                 ResolveOutcome::Ok(h) => Ok(h),
                 ResolveOutcome::Err(e) => Err(e),
@@ -972,7 +956,7 @@ mod tests {
         }
     }
 
-    /// implementation-note-20 acceptance 1+2:
+    /// implementation-note-22 acceptance 1+2:
     /// run_construct calls resolve_via_broker before exec_via_broker.
     /// The mock transport records the call order and the spawn handle
     /// must bind binary + env + credential + target_uid.
@@ -1009,7 +993,11 @@ mod tests {
 
         // Resolve must come first, exec must follow.
         let events = transport.events();
-        assert_eq!(events.len(), 2, "expected resolve+exec only, got {events:?}");
+        assert_eq!(
+            events.len(),
+            2,
+            "expected resolve+exec only, got {events:?}"
+        );
         match &events[0] {
             MockEvent::ResolveCalled { action_key, binary } => {
                 assert_eq!(action_key, "git.push");
@@ -1031,7 +1019,7 @@ mod tests {
         );
     }
 
-    /// implementation-note-20 acceptance 3:
+    /// implementation-note-22 acceptance 3:
     /// Receipt emitted only on resolve+exec succeeding as a transaction.
     /// When exec fails after a successful resolve, the audit kind is
     /// `credential_resolve_aborted`, never `credential_provisioned`.
@@ -1089,7 +1077,7 @@ mod tests {
         assert_eq!(kind.map(|k| k.as_str()), Some("credential_resolve_aborted"));
     }
 
-    /// implementation-note-20 acceptance 2:
+    /// implementation-note-22 acceptance 2:
     /// spawn_handle binds binary + env + credential + target_uid.
     /// Constructs a handle directly and asserts the four fields exist
     /// with the expected types — guards against accidental field drops
@@ -1110,7 +1098,7 @@ mod tests {
         assert_eq!(handle.target_uid, 1500);
     }
 
-    /// implementation-note-20: resolve failure short-
+    /// implementation-note-22: resolve failure short-
     /// circuits before exec is reached. No audit kind is emitted
     /// because resolve never produced a credential to begin with.
     #[test]
@@ -1291,9 +1279,7 @@ mod tests {
             // here without redirecting stdio, which is fragile inside cargo
             // test. The test is meaningful in CI / non-interactive runs and
             // serves as a regression checkpoint there.
-            eprintln!(
-                "run_construct_full_no_tty_skips_pty_bind: skipped (parent has TTY)"
-            );
+            eprintln!("run_construct_full_no_tty_skips_pty_bind: skipped (parent has TTY)");
             return;
         }
 

@@ -109,9 +109,11 @@ pub fn trust_network(
     // Build adjacency from public attestations only.
     let mut adj: BTreeMap<&str, Vec<(&str, &str, f32)>> = BTreeMap::new();
     for a in public_attestations(attestations) {
-        adj.entry(a.attester.as_str())
-            .or_default()
-            .push((a.subject.as_str(), a.domain.as_str(), a.score));
+        adj.entry(a.attester.as_str()).or_default().push((
+            a.subject.as_str(),
+            a.domain.as_str(),
+            a.score,
+        ));
     }
 
     let mut visited: BTreeSet<&str> = BTreeSet::new();

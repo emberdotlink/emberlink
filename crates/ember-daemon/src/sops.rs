@@ -1,6 +1,6 @@
 //! SOPS DEK-unwrap (Path 1, -B-collapsed).
 //!
-//! Phase 1 of implementation-note-181 — pure DEK-unwrap function. The age private
+//! Phase 1 of implementation-note-253 — pure DEK-unwrap function. The age private
 //! key is consumed inside this function (Zeroizing buffer); never crosses
 //! the IPC boundary in plaintext form. Phase 2 wires the daemon RPC +
 //! receipt emission + rate-limit; Phase 3 ships the orch-only
@@ -28,14 +28,13 @@ pub fn unwrap_dek_userspace(
     age_private_key: &[u8],
     encrypted_dek_blob: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>> {
-    let key_str = std::str::from_utf8(age_private_key)
-        .context("age private key not valid UTF-8")?;
+    let key_str =
+        std::str::from_utf8(age_private_key).context("age private key not valid UTF-8")?;
     let identity: age::x25519::Identity = key_str
         .trim()
         .parse()
         .map_err(|e: &'static str| anyhow::anyhow!("parse age identity: {e}"))?;
-    let decryptor = age::Decryptor::new(encrypted_dek_blob)
-        .context("create age decryptor")?;
+    let decryptor = age::Decryptor::new(encrypted_dek_blob).context("create age decryptor")?;
     let mut reader = decryptor
         .decrypt(std::iter::once(&identity as &dyn age::Identity))
         .context("decrypt DEK with persona key")?;
@@ -54,43 +53,40 @@ pub fn unwrap_dek_userspace(
     anyhow::bail!("age feature not enabled; build with --features age")
 }
 
-// SOPS-MODULE-SCAFFOLD — implementation-note-243. Real impl lands in implementation-note-184.
+// SOPS-MODULE-SCAFFOLD — implementation-note-339. Real impl lands in implementation-note-256.
 //
-// These three stubs reserve the public surface that implementation-note-244
-// will route to and that implementation-note-245 will implement. Until
+// These three stubs reserve the public surface that implementation-note-340
+// will route to and that implementation-note-341 will implement. Until
 // then, every call returns NotImplementedError so the SOPS Go-fork
-// (implementation-note-185) can develop against the real RPC shape.
+// (implementation-note-257) can develop against the real RPC shape.
 
 use crate::infra::store::StoreError;
 
 /// Stub — returns the persona's age public key as an `age1...` recipient string.
-/// Real impl in implementation-note-184.
+/// Real impl in implementation-note-256.
 pub fn sops_pubkey(persona_id: &str) -> Result<String, StoreError> {
     let _ = persona_id;
     Err(StoreError::InvalidInput(
-        "sops_pubkey: not implemented (implementation-note-184)".into(),
+        "sops_pubkey: not implemented (implementation-note-256)".into(),
     ))
 }
 
 /// Stub — wraps a DEK to a persona's public key (no private key required).
-/// Real impl in implementation-note-184.
+/// Real impl in implementation-note-256.
 pub fn sops_wrap_dek(persona_id: &str, dek: &[u8]) -> Result<Vec<u8>, StoreError> {
     let _ = (persona_id, dek);
     Err(StoreError::InvalidInput(
-        "sops_wrap_dek: not implemented (implementation-note-184)".into(),
+        "sops_wrap_dek: not implemented (implementation-note-256)".into(),
     ))
 }
 
 /// Stub — unwraps an encrypted DEK using the persona's age private key
 /// fetched from vault internally. Private key never leaves vault process.
-/// Real impl in implementation-note-184.
-pub fn sops_unwrap_in_vault(
-    persona_id: &str,
-    encrypted_dek: &[u8],
-) -> Result<Vec<u8>, StoreError> {
+/// Real impl in implementation-note-256.
+pub fn sops_unwrap_in_vault(persona_id: &str, encrypted_dek: &[u8]) -> Result<Vec<u8>, StoreError> {
     let _ = (persona_id, encrypted_dek);
     Err(StoreError::InvalidInput(
-        "sops_unwrap_in_vault: not implemented (implementation-note-184)".into(),
+        "sops_unwrap_in_vault: not implemented (implementation-note-256)".into(),
     ))
 }
 

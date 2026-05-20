@@ -1,9 +1,9 @@
 // Event authorization matrix — see module docs in this file for the
 // per-event-kind decision logic.
 use core_crypto::PublicKey;
-use core_events::EventEnvelope;
 use core_event_types::{EventBody, KeyRole, SignerBinding, SubjectKind};
-use core_types::{ValidationError};
+use core_events::EventEnvelope;
+use core_types::ValidationError;
 
 use crate::{
     DeviceStatus, GrantOfferStatus, MaterializedState, PersonaStatus, RecoveryRequestStatus,
@@ -306,9 +306,10 @@ impl IdentityAuthorizer {
                 // still treat unknown-relay notices as untrusted and only act
                 // on notices whose peer is in the trust graph.
                 if let Some(endpoint) = state.endpoints_current.get(&body.relay_peer_id) {
-                    let device = state.devices_current.get(&endpoint.device_id).ok_or_else(
-                        || ValidationError::not_found("device", &endpoint.device_id),
-                    )?;
+                    let device = state
+                        .devices_current
+                        .get(&endpoint.device_id)
+                        .ok_or_else(|| ValidationError::not_found("device", &endpoint.device_id))?;
                     if device.active_key.key_id != event.signer_binding.key_id
                         || device.active_key.public_key != signer_pk.0
                     {
@@ -759,86 +760,62 @@ fn check_signer_subject_coherence(
     };
     match body {
         EventBody::RootCreated(b) => {
-            if binding.signer.kind != SubjectKind::Root
-                || binding.signer.subject_id != b.root_id
-            {
+            if binding.signer.kind != SubjectKind::Root || binding.signer.subject_id != b.root_id {
                 return Err(mismatch(SubjectKind::Root, &b.root_id));
             }
         }
         EventBody::RootKeyRotated(b) => {
-            if binding.signer.kind != SubjectKind::Root
-                || binding.signer.subject_id != b.root_id
-            {
+            if binding.signer.kind != SubjectKind::Root || binding.signer.subject_id != b.root_id {
                 return Err(mismatch(SubjectKind::Root, &b.root_id));
             }
         }
         EventBody::RootRevoked(b) => {
-            if binding.signer.kind != SubjectKind::Root
-                || binding.signer.subject_id != b.root_id
-            {
+            if binding.signer.kind != SubjectKind::Root || binding.signer.subject_id != b.root_id {
                 return Err(mismatch(SubjectKind::Root, &b.root_id));
             }
         }
         EventBody::DeviceAdded(b) => {
-            if binding.signer.kind != SubjectKind::Root
-                || binding.signer.subject_id != b.root_id
-            {
+            if binding.signer.kind != SubjectKind::Root || binding.signer.subject_id != b.root_id {
                 return Err(mismatch(SubjectKind::Root, &b.root_id));
             }
         }
         EventBody::PersonaCreated(b) => {
-            if binding.signer.kind != SubjectKind::Root
-                || binding.signer.subject_id != b.root_id
-            {
+            if binding.signer.kind != SubjectKind::Root || binding.signer.subject_id != b.root_id {
                 return Err(mismatch(SubjectKind::Root, &b.root_id));
             }
         }
         EventBody::RecoveryPolicyCreated(b) => {
-            if binding.signer.kind != SubjectKind::Root
-                || binding.signer.subject_id != b.root_id
-            {
+            if binding.signer.kind != SubjectKind::Root || binding.signer.subject_id != b.root_id {
                 return Err(mismatch(SubjectKind::Root, &b.root_id));
             }
         }
         EventBody::RecoveryRequested(b) => {
-            if binding.signer.kind != SubjectKind::Root
-                || binding.signer.subject_id != b.root_id
-            {
+            if binding.signer.kind != SubjectKind::Root || binding.signer.subject_id != b.root_id {
                 return Err(mismatch(SubjectKind::Root, &b.root_id));
             }
         }
         EventBody::GuardianEnrolled(b) => {
-            if binding.signer.kind != SubjectKind::Root
-                || binding.signer.subject_id != b.root_id
-            {
+            if binding.signer.kind != SubjectKind::Root || binding.signer.subject_id != b.root_id {
                 return Err(mismatch(SubjectKind::Root, &b.root_id));
             }
         }
         EventBody::DeviceReplaced(b) => {
-            if binding.signer.kind != SubjectKind::Root
-                || binding.signer.subject_id != b.root_id
-            {
+            if binding.signer.kind != SubjectKind::Root || binding.signer.subject_id != b.root_id {
                 return Err(mismatch(SubjectKind::Root, &b.root_id));
             }
         }
         EventBody::StorageRelationshipCreated(b) => {
-            if binding.signer.kind != SubjectKind::Root
-                || binding.signer.subject_id != b.root_id
-            {
+            if binding.signer.kind != SubjectKind::Root || binding.signer.subject_id != b.root_id {
                 return Err(mismatch(SubjectKind::Root, &b.root_id));
             }
         }
         EventBody::StorageLedgerUpdated(b) => {
-            if binding.signer.kind != SubjectKind::Root
-                || binding.signer.subject_id != b.root_id
-            {
+            if binding.signer.kind != SubjectKind::Root || binding.signer.subject_id != b.root_id {
                 return Err(mismatch(SubjectKind::Root, &b.root_id));
             }
         }
         EventBody::StorageManifestPublished(b) => {
-            if binding.signer.kind != SubjectKind::Root
-                || binding.signer.subject_id != b.root_id
-            {
+            if binding.signer.kind != SubjectKind::Root || binding.signer.subject_id != b.root_id {
                 return Err(mismatch(SubjectKind::Root, &b.root_id));
             }
         }
@@ -969,8 +946,8 @@ fn check_signer_subject_coherence(
         // root OR the subject device/persona — we accept either and let the
         // per-branch authorize check enforce the rest.
         EventBody::DeviceRevoked(b) => {
-            let matches_root = binding.signer.kind == SubjectKind::Root
-                && binding.signer.subject_id == b.root_id;
+            let matches_root =
+                binding.signer.kind == SubjectKind::Root && binding.signer.subject_id == b.root_id;
             let matches_device = binding.signer.kind == SubjectKind::Device
                 && binding.signer.subject_id == b.device_id;
             if !matches_root && !matches_device {
@@ -978,8 +955,8 @@ fn check_signer_subject_coherence(
             }
         }
         EventBody::DeviceFrozen(b) => {
-            let matches_root = binding.signer.kind == SubjectKind::Root
-                && binding.signer.subject_id == b.root_id;
+            let matches_root =
+                binding.signer.kind == SubjectKind::Root && binding.signer.subject_id == b.root_id;
             let matches_device = binding.signer.kind == SubjectKind::Device
                 && binding.signer.subject_id == b.device_id;
             if !matches_root && !matches_device {
@@ -987,8 +964,8 @@ fn check_signer_subject_coherence(
             }
         }
         EventBody::PersonaRevoked(b) => {
-            let matches_root = binding.signer.kind == SubjectKind::Root
-                && binding.signer.subject_id == b.root_id;
+            let matches_root =
+                binding.signer.kind == SubjectKind::Root && binding.signer.subject_id == b.root_id;
             let matches_persona = binding.signer.kind == SubjectKind::Persona
                 && binding.signer.subject_id == b.persona_id;
             if !matches_root && !matches_persona {
@@ -1022,8 +999,11 @@ fn check_signer_subject_coherence(
 mod tests {
     use super::*;
     use core_crypto::{DOMAIN_EVENT, FixtureSigner, Signer as _, Verifier as _};
+    use core_event_types::{
+        DeviceFrozenEvent, DeviceRevokedEvent, EventBody, PersonaRevokedEvent, RootCreatedEvent,
+        SignerBinding,
+    };
     use core_events::EventEnvelope;
-    use core_event_types::{DeviceFrozenEvent, DeviceRevokedEvent, EventBody, PersonaRevokedEvent, RootCreatedEvent, SignerBinding};
     use core_principals::{KeyAlgorithm, PublicKeyMaterial, SurvivalMode};
 
     use crate::{DeviceRecord, PersonaRecord, RootRecord};
@@ -1048,11 +1028,7 @@ mod tests {
         }
     }
 
-    fn make_event(
-        event_id: &str,
-        body: EventBody,
-        signer_binding: SignerBinding,
-    ) -> EventEnvelope {
+    fn make_event(event_id: &str, body: EventBody, signer_binding: SignerBinding) -> EventEnvelope {
         let signer = FixtureSigner::new(signer_binding.key_id.clone());
         EventEnvelope::from_body(event_id, body, vec![], signer_binding, &signer).unwrap()
     }
@@ -1432,7 +1408,10 @@ mod tests {
         let result = auth.authorize_raw(&event, &state, 100);
         assert!(result.is_err(), "non-issuer offer revoke must fail");
         assert!(
-            result.unwrap_err().to_string().contains("does not match original issuer"),
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("does not match original issuer"),
             "error should mention issuer mismatch"
         );
     }
@@ -1442,7 +1421,8 @@ mod tests {
         let state = state_with_pending_offer(9999);
         let auth = IdentityAuthorizer;
         // persona-a is the issuer — should succeed
-        let event = make_revoke_offer_event("offer-1", "persona-a", "key-persona-a", "changed mind");
+        let event =
+            make_revoke_offer_event("offer-1", "persona-a", "key-persona-a", "changed mind");
         assert!(
             auth.authorize(&event, &state, 100).is_ok(),
             "issuer may revoke their own offer"
@@ -1496,7 +1476,10 @@ mod tests {
         let result = auth.authorize_raw(&event, &state, 0);
         assert!(result.is_err(), "non-issuer badge revoke must fail");
         assert!(
-            result.unwrap_err().to_string().contains("does not match original issuer"),
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("does not match original issuer"),
             "error should mention issuer mismatch"
         );
     }
@@ -1961,17 +1944,19 @@ mod tests {
         let auth = IdentityAuthorizer;
         let event = make_event(
             "evt-device-enc-rotate-mismatch",
-            EventBody::DeviceEncryptionKeyRotated(core_event_types::DeviceEncryptionKeyRotatedEvent {
-                root_id: "root-b".into(),
-                device_id: "device-a".into(),
-                previous_encryption_key_id: "enc-device-a".into(),
-                new_encryption_key: make_enc_key("device-a-v2"),
-            }),
+            EventBody::DeviceEncryptionKeyRotated(
+                core_event_types::DeviceEncryptionKeyRotatedEvent {
+                    root_id: "root-b".into(),
+                    device_id: "device-a".into(),
+                    previous_encryption_key_id: "enc-device-a".into(),
+                    new_encryption_key: make_enc_key("device-a-v2"),
+                },
+            ),
             SignerBinding::device("device-a", "key-device-a"),
         );
-        let err = auth.authorize_raw(&event, &state, 0).expect_err(
-            "DeviceEncryptionKeyRotated must reject mismatched body.root_id",
-        );
+        let err = auth
+            .authorize_raw(&event, &state, 0)
+            .expect_err("DeviceEncryptionKeyRotated must reject mismatched body.root_id");
         assert!(
             err.to_string().contains("belongs to root"),
             "error should mention ownership mismatch: {err}"
@@ -2029,9 +2014,9 @@ mod tests {
             }),
             SignerBinding::device("device-b", "key-device-b"),
         );
-        let err = auth.authorize_raw(&event, &state, 0).expect_err(
-            "shutdown notice from non-endpoint device must be rejected",
-        );
+        let err = auth
+            .authorize_raw(&event, &state, 0)
+            .expect_err("shutdown notice from non-endpoint device must be rejected");
         assert!(
             err.to_string().contains("endpoint device"),
             "error should mention endpoint device mismatch: {err}"
@@ -2107,9 +2092,9 @@ mod tests {
             }),
             SignerBinding::root("root-c", "key-root-c"),
         );
-        let err = auth.authorize_raw(&event, &state, 0).expect_err(
-            "RootCreated with colliding pubkey material must be rejected",
-        );
+        let err = auth
+            .authorize_raw(&event, &state, 0)
+            .expect_err("RootCreated with colliding pubkey material must be rejected");
         assert!(
             err.to_string().contains("collides with existing root"),
             "error should mention collision: {err}"
@@ -2266,14 +2251,8 @@ mod tests {
     #[test]
     fn check_time_window_not_before_blocks() {
         // cooldown semantics: now < not_before → error.
-        let err = check_time_window(
-            50,
-            Some(100),
-            None,
-            "before-window",
-            "after-window",
-        )
-        .expect_err("now < not_before must error");
+        let err = check_time_window(50, Some(100), None, "before-window", "after-window")
+            .expect_err("now < not_before must error");
         assert!(err.to_string().contains("before-window"));
     }
 
@@ -2289,14 +2268,8 @@ mod tests {
     #[test]
     fn check_time_window_not_after_blocks() {
         // expiry semantics: now >= not_after → error.
-        let err = check_time_window(
-            200,
-            None,
-            Some(200),
-            "before-window",
-            "after-window",
-        )
-        .expect_err("now >= not_after must error");
+        let err = check_time_window(200, None, Some(200), "before-window", "after-window")
+            .expect_err("now >= not_after must error");
         assert!(err.to_string().contains("after-window"));
     }
 
@@ -2325,8 +2298,7 @@ mod tests {
 
     #[test]
     fn sanitize_collapses_state_violation() {
-        let err =
-            ValidationError::state_violation("device device-a is not active");
+        let err = ValidationError::state_violation("device device-a is not active");
         let sanitized = super::sanitize_authorize_error(err);
         assert_eq!(
             sanitized.kind,
@@ -2338,8 +2310,7 @@ mod tests {
 
     #[test]
     fn sanitize_collapses_unauthorized_detail() {
-        let err =
-            ValidationError::unauthorized("signer key foo does not match active device key");
+        let err = ValidationError::unauthorized("signer key foo does not match active device key");
         let sanitized = super::sanitize_authorize_error(err);
         assert!(!sanitized.message.contains("signer key"));
         assert_eq!(
@@ -2465,8 +2436,14 @@ mod tests {
             }),
             SignerBinding::root("root-a", "key-root-a"),
         );
-        assert!(auth.authorize(&event, &state, 0).is_ok(), "Ok is not affected by sanitizer");
-        assert!(auth.authorize_raw(&event, &state, 0).is_ok(), "authorize_raw also passes Ok");
+        assert!(
+            auth.authorize(&event, &state, 0).is_ok(),
+            "Ok is not affected by sanitizer"
+        );
+        assert!(
+            auth.authorize_raw(&event, &state, 0).is_ok(),
+            "authorize_raw also passes Ok"
+        );
     }
 
     #[test]
@@ -2564,7 +2541,10 @@ mod tests {
         let sanitized = auth
             .authorize(&event, &state, 0)
             .expect_err("public authorize must also reject");
-        assert_eq!(sanitized.kind, core_types::ValidationErrorKind::Unauthorized);
+        assert_eq!(
+            sanitized.kind,
+            core_types::ValidationErrorKind::Unauthorized
+        );
         assert!(!sanitized.to_string().contains("only the original issuer"));
     }
 

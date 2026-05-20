@@ -2,10 +2,11 @@ pub mod chain;
 pub mod grant;
 pub mod scope;
 pub mod state;
+pub mod workflow;
 
 pub use grant::{
-    Grant, GrantError, GrantSpec, GrantState, PrincipalId, Scope, Usage, UsageDelta, UsageReceipt,
-    GRANT_SCHEMA_VERSION_PIN, MAX_DELEGATION_DEPTH, create, delegate, extend, pause, resume,
+    GRANT_SCHEMA_VERSION_PIN, Grant, GrantError, GrantSpec, GrantState, MAX_DELEGATION_DEPTH,
+    PrincipalId, Scope, Usage, UsageDelta, UsageReceipt, create, delegate, extend, pause, resume,
     revoke, use_grant,
 };
 pub use scope::{
@@ -16,3 +17,5 @@ pub use state::{TransitionEvent, apply_event, can_transition};
 
 pub mod store;
 pub use store::{GrantStore, StoreError};
+
+pub use workflow::{PregrantPath, WorkflowGrant, WorkflowGrantError, WorkflowId};

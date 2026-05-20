@@ -1,4 +1,4 @@
-//! implementation-note-76 — T2 round-trip test for the
+//! implementation-note-95 — T2 round-trip test for the
 //! emberd-side `send_spawn_directive` sender.
 //!
 //! Stands up a mock `ember-exec` listener on a tempfile UDS, calls
@@ -22,7 +22,7 @@
 use std::time::Duration;
 
 use ember_daemon::spawn::scion::send_spawn_directive;
-use ember_exec::uds::{read_frame, ExecFrame, SpawnDirective};
+use ember_exec::uds::{ExecFrame, SpawnDirective, read_frame};
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixListener;
@@ -48,8 +48,14 @@ async fn test_send_spawn_directive_round_trip() {
         ],
         env_allowlist: vec!["PATH".to_string(), "HOME".to_string()],
         credential_env: vec![
-            ("GITHUB_TOKEN".to_string(), "ghs_test_token_value".to_string()),
-            ("AWS_SESSION_TOKEN".to_string(), "aws_test_sts_token".to_string()),
+            (
+                "GITHUB_TOKEN".to_string(),
+                "ghs_test_token_value".to_string(),
+            ),
+            (
+                "AWS_SESSION_TOKEN".to_string(),
+                "aws_test_sts_token".to_string(),
+            ),
         ],
         target_uid: 1234,
         target_gid: 5678,
@@ -64,11 +70,10 @@ async fn test_send_spawn_directive_round_trip() {
     // trailer."
     let expected_directive = directive.clone();
     let mock_handle = tokio::spawn(async move {
-        let (mut stream, _addr) =
-            tokio::time::timeout(Duration::from_secs(5), listener.accept())
-                .await
-                .expect("accept timeout")
-                .expect("accept failed");
+        let (mut stream, _addr) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("accept timeout")
+            .expect("accept failed");
 
         // Read exactly one frame — must be SpawnDirective.
         let frame = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut stream))
@@ -88,12 +93,9 @@ async fn test_send_spawn_directive_round_trip() {
         // writable; that byte arrives here.
         use tokio::io::AsyncReadExt as _;
         let mut trailer = Vec::new();
-        let _ = tokio::time::timeout(
-            Duration::from_secs(2),
-            stream.read_to_end(&mut trailer),
-        )
-        .await
-        .expect("drain timeout");
+        let _ = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut trailer))
+            .await
+            .expect("drain timeout");
         trailer
     });
 

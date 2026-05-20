@@ -38,6 +38,11 @@ fn deterministic_envelope_broker_mint() -> ReceiptEnvelope {
         presence_kind: None,
         body: serde_json::to_value(&body).unwrap(),
         signature: None,
+        calling_principal: None,
+        presence_reason: None,
+        handle_id: None,
+        challenge_hash: None,
+        verifier_aaguid: None,
     };
     let signer = FixtureSigner::new("receipt-v2-vector-broker-mint");
     sign_receipt_v2(&mut env, &signer).unwrap();
@@ -63,6 +68,11 @@ fn deterministic_envelope_binding_registered() -> ReceiptEnvelope {
         presence_kind: None,
         body: serde_json::to_value(&body).unwrap(),
         signature: None,
+        calling_principal: None,
+        presence_reason: None,
+        handle_id: None,
+        challenge_hash: None,
+        verifier_aaguid: None,
     };
     let signer = FixtureSigner::new("receipt-v2-vector-binding-registered");
     sign_receipt_v2(&mut env, &signer).unwrap();
@@ -82,6 +92,7 @@ fn deterministic_envelope_session_claude_code() -> ReceiptEnvelope {
             }],
             permits_merkle_root: "blake3:fixture-merkle-root".to_string(),
             device_id: Some("device-fixture".to_string()),
+            ..Default::default()
         },
         audit_gaps: vec![],
         termination_reason: None,
@@ -98,6 +109,11 @@ fn deterministic_envelope_session_claude_code() -> ReceiptEnvelope {
         presence_kind: None,
         body: serde_json::to_value(&body).unwrap(),
         signature: None,
+        calling_principal: None,
+        presence_reason: None,
+        handle_id: None,
+        challenge_hash: None,
+        verifier_aaguid: None,
     };
     let signer = FixtureSigner::new("receipt-v2-vector-session-claude-code");
     sign_receipt_v2(&mut env, &signer).unwrap();
@@ -177,8 +193,7 @@ fn session_claude_code_vector_determinism() {
     maybe_print_regen("session_claude_code.json", &env);
 
     let stored: ReceiptEnvelope =
-        serde_json::from_str(include_str!("fixtures/receipt_v2/session_claude_code.json"))
-            .unwrap();
+        serde_json::from_str(include_str!("fixtures/receipt_v2/session_claude_code.json")).unwrap();
     assert_eq!(stored.receipt_id, env.receipt_id);
     assert_eq!(stored.signature, env.signature);
     assert_eq!(stored.kind, env.kind);

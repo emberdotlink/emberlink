@@ -1,4 +1,4 @@
-//! implementation-note-74: server-side WebAuthn relying-party.
+//! implementation-note-91: server-side WebAuthn relying-party.
 //!
 //! Wraps `webauthn-rs` with a `DaemonStore`-backed credential and
 //! ceremony-state persistence so the dashboard's Approve flow can
@@ -94,9 +94,9 @@ pub enum WebauthnError {
 impl std::fmt::Display for WebauthnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotEnrolled => f.write_str(
-                "no passkey enrolled for this persona — visit /settings/passkeys",
-            ),
+            Self::NotEnrolled => {
+                f.write_str("no passkey enrolled for this persona — visit /settings/passkeys")
+            }
             Self::UnknownChallenge => f.write_str("challenge expired or not found"),
             Self::ChallengeMismatch => f.write_str("challenge does not match this ceremony"),
             Self::VerifyFailed(why) => write!(f, "assertion did not verify: {why}"),
@@ -181,10 +181,7 @@ impl WebauthnGate {
     /// **Recording-day requirement:** the operator MUST access the
     /// dashboard via `http://localhost:<port>` (not `127.0.0.1`) for
     /// TouchID to fire. The runbook calls this out.
-    pub fn new(
-        expected_origin: &str,
-        store: Arc<DaemonStore>,
-    ) -> Result<Self, WebauthnError> {
+    pub fn new(expected_origin: &str, store: Arc<DaemonStore>) -> Result<Self, WebauthnError> {
         let parsed = Url::parse(expected_origin)
             .map_err(|e| WebauthnError::Storage(format!("invalid origin url: {e}")))?;
         // Hardcoded rp_id for the localhost-bound daemon. See doc-comment.
@@ -244,12 +241,7 @@ impl WebauthnGate {
 
         let (ccr, reg_state) = self
             .inner
-            .start_passkey_registration(
-                user_uuid,
-                persona_id,
-                OPERATOR_DISPLAY_NAME,
-                Some(exclude),
-            )
+            .start_passkey_registration(user_uuid, persona_id, OPERATOR_DISPLAY_NAME, Some(exclude))
             .map_err(|e| WebauthnError::Storage(format!("start register: {e}")))?;
 
         let challenge_id = uuid::Uuid::new_v4().to_string();
@@ -521,7 +513,7 @@ impl WebauthnGate {
 /// disabled biometric gating via the same env gate the CLI honors.
 /// The dashboard handler treats this as "skip the gate, record
 /// `biometric=false` in the audit log, proceed with the approval"
-/// — same posture as the pre-implementation-note-74 behavior so qember
+/// — same posture as the pre-implementation-note-91 behavior so qember
 /// headless smoke stays green without a real authenticator.
 pub fn bio_disabled_via_env() -> bool {
     std::env::var("EMBER_DISABLE_BIO").is_ok()
@@ -543,8 +535,7 @@ fn unix_now() -> i64 {
 }
 
 fn base64url_encode(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let b0 = chunk[0];

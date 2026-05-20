@@ -1,7 +1,7 @@
 //! T2 integration tests for `ember claude-code` launcher wiring.
 //!
 //!
-//! Verifies implementation-note-316 acceptance criteria:
+//! Verifies implementation-note-448 acceptance criteria:
 //! - `EMBER_SESSION_ID` is injected into the child env from the daemon RPC response.
 //! - Child `PATH` starts with the shadow directory.
 //! - `close_session` is called with the same session_id on child exit.
@@ -150,12 +150,25 @@ fn assert_shadow_dir_created(shadow_dir: &Path) {
     );
     let meta = std::fs::metadata(shadow_dir).expect("stat shadow_dir");
     assert!(meta.is_dir(), "shadow_dir must be a directory");
+    // `install_path_shadow`'s contract is "creates `<shadow_dir>/bin/` (mode
+    // 0700)" — the chmod 0700 is applied to the `bin/` subdirectory, not
+    // the shadow root (which inherits the process umask, typically 0755).
+    // This matches the in-crate unit test at
+    // `crates/emberlink-cli/src/launcher/path_shadow.rs:167`.
+    let bin_dir = shadow_dir.join("bin");
+    assert!(
+        bin_dir.exists(),
+        "shadow_dir/bin must be created: {}",
+        bin_dir.display()
+    );
+    let bin_meta = std::fs::metadata(&bin_dir).expect("stat shadow_dir/bin");
+    assert!(bin_meta.is_dir(), "shadow_dir/bin must be a directory");
     {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(
-            meta.permissions().mode() & 0o777,
+            bin_meta.permissions().mode() & 0o777,
             0o700,
-            "shadow_dir must have mode 0700"
+            "shadow_dir/bin must have mode 0700"
         );
     }
 }
@@ -203,9 +216,7 @@ fn run_with_registration_injects_session_id_and_shadow_path() {
     // Use a shell snippet as the child binary: write $PATH to a temp file
     // and exit 0. We pass the capture file path as an argument to /bin/sh.
     let capture_path_str = env_capture_file.display().to_string();
-    let child_script = format!(
-        "printf '%s' \"$PATH\" > '{capture_path_str}'; exit 0"
-    );
+    let child_script = format!("printf '%s' \"$PATH\" > '{capture_path_str}'; exit 0");
 
     let code = run_with_registration(
         "/bin/sh",
@@ -269,9 +280,14 @@ fn install_path_shadow_creates_shadow_dir_with_discovered_specs() {
 
     assert_shadow_dir_created(&shadow_dir);
 
-    // The "gh" symlink must exist and point to our fake binary.
-    let shim = shadow_dir.join("gh");
-    assert!(shim.symlink_metadata().is_ok(), "shim 'gh' must exist in shadow_dir");
+    // The "gh" symlink must exist under bin/ and point to our fake binary.
+    // (`install_path_shadow` places shims under `<shadow_dir>/bin/<tool>`,
+    // not at the shadow root — matches the in-crate unit test.)
+    let shim = shadow_dir.join("bin").join("gh");
+    assert!(
+        shim.symlink_metadata().is_ok(),
+        "shim 'gh' must exist in shadow_dir/bin"
+    );
     let target = std::fs::read_link(&shim).expect("read_link on gh shim");
     assert_eq!(target, fake_bin_dir.join("ember-gh"));
 }
@@ -303,9 +319,7 @@ fn child_env_contains_ember_session_id() {
     };
 
     let capture_path_str = env_capture_file.display().to_string();
-    let child_script = format!(
-        "printf '%s' \"$EMBER_SESSION_ID\" > '{capture_path_str}'; exit 0"
-    );
+    let child_script = format!("printf '%s' \"$EMBER_SESSION_ID\" > '{capture_path_str}'; exit 0");
 
     let code = run_with_registration(
         "/bin/sh",

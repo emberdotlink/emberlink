@@ -29,13 +29,15 @@ impl DaemonStore {
         let mut stmt = self.conn().prepare(
             "SELECT id, event_type, payload, created_at FROM notifications WHERE persona_id = ?1 AND read_at IS NULL ORDER BY created_at",
         ).map_err(StoreError::Sqlite)?;
-        let rows = stmt.query_map(rusqlite::params![persona_id], |row| {
-            let id: String = row.get(0)?;
-            let event_type: String = row.get(1)?;
-            let payload: String = row.get(2)?;
-            let created_at: String = row.get(3)?;
-            Ok((id, event_type, payload, created_at))
-        }).map_err(StoreError::Sqlite)?;
+        let rows = stmt
+            .query_map(rusqlite::params![persona_id], |row| {
+                let id: String = row.get(0)?;
+                let event_type: String = row.get(1)?;
+                let payload: String = row.get(2)?;
+                let created_at: String = row.get(3)?;
+                Ok((id, event_type, payload, created_at))
+            })
+            .map_err(StoreError::Sqlite)?;
 
         let mut results = Vec::new();
         for row in rows {
@@ -67,7 +69,11 @@ mod tests {
     fn push_and_poll_returns_notification() {
         let store = DaemonStore::open_in_memory().unwrap();
         store
-            .push_notification("persona-1", "grant.revoked", &json!({"grant_id": "grant-abc"}))
+            .push_notification(
+                "persona-1",
+                "grant.revoked",
+                &json!({"grant_id": "grant-abc"}),
+            )
             .unwrap();
 
         let notifs = store.poll_notifications("persona-1").unwrap();
@@ -80,7 +86,11 @@ mod tests {
     fn poll_marks_as_read() {
         let store = DaemonStore::open_in_memory().unwrap();
         store
-            .push_notification("persona-2", "grant.revoked", &json!({"grant_id": "grant-xyz"}))
+            .push_notification(
+                "persona-2",
+                "grant.revoked",
+                &json!({"grant_id": "grant-xyz"}),
+            )
             .unwrap();
 
         let first = store.poll_notifications("persona-2").unwrap();

@@ -19,6 +19,7 @@ name = "ember-aws"
 version = "0.1.0"
 publisher = "did:emberlink"
 description = "AWS CLI v2 Construct. Mediates `aws` invocations through ember's credential broker: IAM privilege removal (delete-*, detach-*) and KMS key/secret destruction (schedule-key-deletion, decrypt) require biometric approval; S3 destructive ops (rm, delete-object) gate by default and require biometric when targeting a grant's production_buckets; secretsmanager.delete-secret and ec2.terminate-instances require biometric. STS credentials inject via AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN / AWS_DEFAULT_REGION."
+authority_refs = ["aws_sts"]
 
 # Default policy for unlisted action keys.
 default = "deny"

@@ -9,7 +9,10 @@ use ember_daemon::binary_manifest::load_manifest;
 
 fn manifest_path() -> PathBuf {
     if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home).join(".ember").join("binaries").join("manifest.toml")
+        PathBuf::from(home)
+            .join(".ember")
+            .join("binaries")
+            .join("manifest.toml")
     } else {
         PathBuf::from("/usr/local/lib/ember/binaries/manifest.toml")
     }
@@ -24,7 +27,10 @@ pub fn binary_list() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    println!("{:<20} {:<12} {:<26} PATH", "TOOL_NAME", "VERSION", "CONTENT_HASH");
+    println!(
+        "{:<20} {:<12} {:<26} PATH",
+        "TOOL_NAME", "VERSION", "CONTENT_HASH"
+    );
     println!("{}", "-".repeat(80));
 
     for entry in &manifest.entries {
@@ -76,7 +82,9 @@ mod tests {
 
         // SAFETY: test sets HOME to a tempdir before invoking binary_list.
         // Single-threaded test; no concurrent env access.
-        unsafe { std::env::set_var("HOME", dir.path()); }
+        unsafe {
+            std::env::set_var("HOME", dir.path());
+        }
 
         // binary_list writes to stdout; verify it doesn't error.
         binary_list().expect("list should succeed");

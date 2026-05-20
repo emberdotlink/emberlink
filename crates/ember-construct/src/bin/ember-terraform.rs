@@ -1,2 +1,4 @@
 use std::process::ExitCode;
-fn main() -> ExitCode { ember_construct::run("terraform") }
+fn main() -> ExitCode {
+    ember_construct::run("terraform")
+}

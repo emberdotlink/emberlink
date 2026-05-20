@@ -92,9 +92,7 @@ pub(crate) fn strip_global_flags(argv: &[String]) -> Vec<String> {
         // shouldn't have `=value` but accept it tolerantly).
         if let Some(eq) = tok.find('=') {
             let name = &tok[..eq];
-            if VALUE_BEARING_GLOBAL_FLAGS.contains(&name)
-                || BOOLEAN_GLOBAL_FLAGS.contains(&name)
-            {
+            if VALUE_BEARING_GLOBAL_FLAGS.contains(&name) || BOOLEAN_GLOBAL_FLAGS.contains(&name) {
                 i += 1;
                 continue;
             }
@@ -227,9 +225,7 @@ pub fn classify_gcloud_argv(argv: &[String]) -> Option<ActionKey> {
         "secrets" => match (g1, g2) {
             // secrets versions <verb>
             ("versions", Some(verb)) => match verb {
-                "add" | "access" => {
-                    Some(ActionKey(format!("gcloud.secrets.versions.{verb}")))
-                }
+                "add" | "access" => Some(ActionKey(format!("gcloud.secrets.versions.{verb}"))),
                 v if is_read_only_verb(v) => None,
                 _ => None,
             },
@@ -296,73 +292,39 @@ mod tests {
 
     #[test]
     fn compute_instances_create_classified() {
-        let r = classify_gcloud_argv(&args(&[
-            "compute",
-            "instances",
-            "create",
-            "my-vm",
-        ]))
-        .unwrap();
+        let r = classify_gcloud_argv(&args(&["compute", "instances", "create", "my-vm"])).unwrap();
         assert_eq!(r.0, "gcloud.compute.instances.create");
     }
 
     #[test]
     fn compute_instances_delete_classified() {
-        let r = classify_gcloud_argv(&args(&[
-            "compute",
-            "instances",
-            "delete",
-            "my-vm",
-        ]))
-        .unwrap();
+        let r = classify_gcloud_argv(&args(&["compute", "instances", "delete", "my-vm"])).unwrap();
         assert_eq!(r.0, "gcloud.compute.instances.delete");
     }
 
     #[test]
     fn compute_instances_start_classified() {
-        let r = classify_gcloud_argv(&args(&[
-            "compute",
-            "instances",
-            "start",
-            "my-vm",
-        ]))
-        .unwrap();
+        let r = classify_gcloud_argv(&args(&["compute", "instances", "start", "my-vm"])).unwrap();
         assert_eq!(r.0, "gcloud.compute.instances.start");
     }
 
     #[test]
     fn compute_instances_stop_classified() {
-        let r = classify_gcloud_argv(&args(&[
-            "compute",
-            "instances",
-            "stop",
-            "my-vm",
-        ]))
-        .unwrap();
+        let r = classify_gcloud_argv(&args(&["compute", "instances", "stop", "my-vm"])).unwrap();
         assert_eq!(r.0, "gcloud.compute.instances.stop");
     }
 
     #[test]
     fn compute_instances_reset_classified() {
-        let r = classify_gcloud_argv(&args(&[
-            "compute",
-            "instances",
-            "reset",
-            "my-vm",
-        ]))
-        .unwrap();
+        let r = classify_gcloud_argv(&args(&["compute", "instances", "reset", "my-vm"])).unwrap();
         assert_eq!(r.0, "gcloud.compute.instances.reset");
     }
 
     #[test]
     fn compute_instances_describe_passthrough() {
-        assert!(classify_gcloud_argv(&args(&[
-            "compute",
-            "instances",
-            "describe",
-            "my-vm"
-        ]))
-        .is_none());
+        assert!(
+            classify_gcloud_argv(&args(&["compute", "instances", "describe", "my-vm"])).is_none()
+        );
     }
 
     #[test]
@@ -374,13 +336,8 @@ mod tests {
 
     #[test]
     fn iam_service_accounts_create_classified() {
-        let r = classify_gcloud_argv(&args(&[
-            "iam",
-            "service-accounts",
-            "create",
-            "sa-name",
-        ]))
-        .unwrap();
+        let r =
+            classify_gcloud_argv(&args(&["iam", "service-accounts", "create", "sa-name"])).unwrap();
         assert_eq!(r.0, "gcloud.iam.service-accounts.create");
     }
 
@@ -410,13 +367,8 @@ mod tests {
 
     #[test]
     fn iam_policies_add_binding_classified() {
-        let r = classify_gcloud_argv(&args(&[
-            "iam",
-            "policies",
-            "add-iam-policy-binding",
-            "p",
-        ]))
-        .unwrap();
+        let r = classify_gcloud_argv(&args(&["iam", "policies", "add-iam-policy-binding", "p"]))
+            .unwrap();
         assert_eq!(r.0, "gcloud.iam.policies.add-iam-policy-binding");
     }
 
@@ -435,9 +387,7 @@ mod tests {
     #[test]
     fn iam_get_iam_policy_passthrough() {
         // This one is on `projects` — hitting the read-only verb match.
-        assert!(
-            classify_gcloud_argv(&args(&["projects", "get-iam-policy", "my-proj"])).is_none()
-        );
+        assert!(classify_gcloud_argv(&args(&["projects", "get-iam-policy", "my-proj"])).is_none());
     }
 
     // --- storage ---
@@ -456,8 +406,7 @@ mod tests {
 
     #[test]
     fn storage_mv_classified() {
-        let r = classify_gcloud_argv(&args(&["storage", "mv", "gs://a/k", "gs://b/k"]))
-            .unwrap();
+        let r = classify_gcloud_argv(&args(&["storage", "mv", "gs://a/k", "gs://b/k"])).unwrap();
         assert_eq!(r.0, "gcloud.storage.mv");
     }
 
@@ -514,15 +463,13 @@ mod tests {
 
     #[test]
     fn secrets_versions_add_classified() {
-        let r = classify_gcloud_argv(&args(&["secrets", "versions", "add", "my-secret"]))
-            .unwrap();
+        let r = classify_gcloud_argv(&args(&["secrets", "versions", "add", "my-secret"])).unwrap();
         assert_eq!(r.0, "gcloud.secrets.versions.add");
     }
 
     #[test]
     fn secrets_versions_access_classified() {
-        let r =
-            classify_gcloud_argv(&args(&["secrets", "versions", "access", "latest"])).unwrap();
+        let r = classify_gcloud_argv(&args(&["secrets", "versions", "access", "latest"])).unwrap();
         assert_eq!(r.0, "gcloud.secrets.versions.access");
     }
 
@@ -568,22 +515,19 @@ mod tests {
 
     #[test]
     fn container_clusters_create_classified() {
-        let r = classify_gcloud_argv(&args(&["container", "clusters", "create", "c"]))
-            .unwrap();
+        let r = classify_gcloud_argv(&args(&["container", "clusters", "create", "c"])).unwrap();
         assert_eq!(r.0, "gcloud.container.clusters.create");
     }
 
     #[test]
     fn container_clusters_delete_classified() {
-        let r = classify_gcloud_argv(&args(&["container", "clusters", "delete", "c"]))
-            .unwrap();
+        let r = classify_gcloud_argv(&args(&["container", "clusters", "delete", "c"])).unwrap();
         assert_eq!(r.0, "gcloud.container.clusters.delete");
     }
 
     #[test]
     fn container_clusters_update_classified() {
-        let r = classify_gcloud_argv(&args(&["container", "clusters", "update", "c"]))
-            .unwrap();
+        let r = classify_gcloud_argv(&args(&["container", "clusters", "update", "c"])).unwrap();
         assert_eq!(r.0, "gcloud.container.clusters.update");
     }
 
@@ -615,9 +559,7 @@ mod tests {
 
     #[test]
     fn config_get_value_passthrough() {
-        assert!(
-            classify_gcloud_argv(&args(&["config", "get-value", "project"])).is_none()
-        );
+        assert!(classify_gcloud_argv(&args(&["config", "get-value", "project"])).is_none());
     }
 
     // --- global flag stripping ---
@@ -705,14 +647,8 @@ mod tests {
 
     #[test]
     fn quiet_boolean_flag_stripped() {
-        let r = classify_gcloud_argv(&args(&[
-            "--quiet",
-            "compute",
-            "instances",
-            "delete",
-            "vm",
-        ]))
-        .unwrap();
+        let r = classify_gcloud_argv(&args(&["--quiet", "compute", "instances", "delete", "vm"]))
+            .unwrap();
         assert_eq!(r.0, "gcloud.compute.instances.delete");
     }
 
@@ -732,8 +668,7 @@ mod tests {
 
     #[test]
     fn flag_position_stable() {
-        let a =
-            classify_gcloud_argv(&args(&["compute", "instances", "delete", "vm"])).unwrap();
+        let a = classify_gcloud_argv(&args(&["compute", "instances", "delete", "vm"])).unwrap();
         let b = classify_gcloud_argv(&args(&[
             "--project",
             "p",
@@ -775,9 +710,7 @@ mod tests {
 
     #[test]
     fn only_global_flags_passthrough() {
-        assert!(
-            classify_gcloud_argv(&args(&["--project", "p", "--quiet"])).is_none()
-        );
+        assert!(classify_gcloud_argv(&args(&["--project", "p", "--quiet"])).is_none());
     }
 
     #[test]
@@ -858,7 +791,7 @@ mod tests {
     // contract slice this Construct depends on: the broker registry can
     // hold a `MockBroker::new(BrokerProvider::Gcp)`, and a request that
     // declares `provider = Gcp` round-trips through issue → revoke
-    // without panicking. Real GCP impl is implementation-note-69 (separate task).
+    // without panicking. Real GCP impl is implementation-note-85 (separate task).
 
     use core_broker::{Broker, BrokerError, BrokerProvider, BrokerRequest, MockBroker};
     use std::time::Duration;

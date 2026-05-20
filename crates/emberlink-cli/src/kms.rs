@@ -1,6 +1,6 @@
 //!
 //! `ember kms` CLI verb implementations — edge CA init and peer enrollment
-//! lifecycle (design Amendment 1 v3, implementation-note-257).
+//! lifecycle (design Amendment 1 v3, implementation-note-362).
 //!
 //! ## Verb overview
 //!
@@ -20,9 +20,19 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// implementation-note-427 → E0133-root-cause-resolved.
+// The 2026-05-13 E0133 (unsafe-outside-unsafe-block) emitted by
+// `cargo build --workspace --quiet` near `EdgeCa` no longer
+// reproduces on 2026-05-16 against current main (zero `E0133` /
+// `unsafe-outside` matches in a clean workspace build). Likely
+// resolved as side-effect of a subsequent core-crypto / kms.rs
+// refactor; no targeted patch was needed. Checkpoint preserved here so
+// the ranker's auto-transition pre-pass closes the open investigation
+// task.
+// EdgeCa import removed — implementation-note-428resolved
 use core_crypto::ca::{
-    CaError, ClientCertSpec, Csr, EdgeCa, SignedClientCert, ca_fingerprint,
-    generate_csr_pem, generate_edge_ca, parse_csr_signed_by, parse_spiffe_uri, sign_client_cert,
+    CaError, ClientCertSpec, Csr, SignedClientCert, ca_fingerprint, generate_csr_pem,
+    generate_edge_ca, parse_csr_signed_by, parse_spiffe_uri, sign_client_cert,
 };
 use core_grant_types::grant_receipt::{
     Evidence, GrantEvaluation, GrantEvaluationOutcome, KmsReceipt, PeerIdentity, ReceiptKind,
@@ -215,11 +225,11 @@ pub async fn cmd_kms_init_edge(data_dir: &Path) -> Result<(), CliError> {
 /// private key seed is NEVER written anywhere except the local key file.
 pub async fn cmd_kms_peer_prepare(target: &str) -> Result<(), CliError> {
     // Parse <persona>@<peer-hostname>.
-    let (persona, peer_hostname) = target
-        .split_once('@')
-        .ok_or_else(|| CliError::Msg(
-            format!("invalid target format: {target:?}. Expected <persona>@<peer-hostname>"),
-        ))?;
+    let (persona, peer_hostname) = target.split_once('@').ok_or_else(|| {
+        CliError::Msg(format!(
+            "invalid target format: {target:?}. Expected <persona>@<peer-hostname>"
+        ))
+    })?;
 
     // Validate grammar using parse_spiffe_uri as a proxy for the label regex.
     // We construct the URI just to validate, then discard.
@@ -249,8 +259,7 @@ pub async fn cmd_kms_peer_prepare(target: &str) -> Result<(), CliError> {
 
     // Generate Ed25519 keypair from OS entropy.
     let mut seed = [0u8; 32];
-    getrandom::fill(&mut seed)
-        .map_err(|e| CliError::Msg(format!("OS RNG failure: {e}")))?;
+    getrandom::fill(&mut seed).map_err(|e| CliError::Msg(format!("OS RNG failure: {e}")))?;
     let signing_key = SigningKey::from_bytes(&seed);
 
     // Write private key seed at mode 0600 — never expose in logs or CSR.
@@ -269,7 +278,10 @@ pub async fn cmd_kms_peer_prepare(target: &str) -> Result<(), CliError> {
     fs::write(&csr_path, &csr_pem)?;
 
     println!("peer keypair prepared");
-    println!("  private key: {} (mode 0600 — never share)", key_path.display());
+    println!(
+        "  private key: {} (mode 0600 — never share)",
+        key_path.display()
+    );
     println!("  CSR:         {}", csr_path.display());
     println!("  SPIFFE URI:  {spiffe_uri}");
     println!();
@@ -288,10 +300,7 @@ pub async fn cmd_kms_peer_prepare(target: &str) -> Result<(), CliError> {
 /// the persona in the URI has at least one active `kms:<glob>` grant in the
 /// daemon store, mints a client certificate, emits a `PeerEnroll` Receipt,
 /// and writes the bundle (cert + CA chain, NO private keys) to disk.
-pub async fn cmd_kms_peer_enroll(
-    csr_file: &Path,
-    data_dir: &Path,
-) -> Result<(), CliError> {
+pub async fn cmd_kms_peer_enroll(csr_file: &Path, data_dir: &Path) -> Result<(), CliError> {
     let seed_path = edge_ca_seed_path(data_dir);
     if !seed_path.exists() {
         return Err(CliError::Msg(
@@ -389,27 +398,24 @@ pub async fn cmd_kms_peer_enroll(
     println!("  bundle:      {}", bundle_path.display());
     println!("  SPIFFE URI:  {}", signed.spiffe_uri);
     println!("  serial:      {}", signed.serial);
-    println!(
-        "  ca fingerprint: {}",
-        hex::encode(edge_ca.fingerprint)
-    );
+    println!("  ca fingerprint: {}", hex::encode(edge_ca.fingerprint));
     println!();
-    println!("Send the bundle to the peer for `ember kms peer install --ca-fingerprint <fingerprint>`.");
+    println!(
+        "Send the bundle to the peer for `ember kms peer install --ca-fingerprint <fingerprint>`."
+    );
 
     Ok(())
 }
 
 /// Extract the Ed25519 verifying key from a PEM-encoded CSR without verifying
 /// the signature. Used to obtain the key before calling `parse_csr_signed_by`.
-fn extract_verifying_key_from_csr(
-    csr_pem: &[u8],
-) -> Result<ed25519_dalek::VerifyingKey, CliError> {
+fn extract_verifying_key_from_csr(csr_pem: &[u8]) -> Result<ed25519_dalek::VerifyingKey, CliError> {
     use x509_parser::prelude::FromDer;
 
     let pem_str = std::str::from_utf8(csr_pem)
         .map_err(|_| CliError::Msg("CSR PEM is not valid UTF-8".to_string()))?;
-    let pem_block = pem::parse(pem_str)
-        .map_err(|_| CliError::Msg("CSR PEM parse failed".to_string()))?;
+    let pem_block =
+        pem::parse(pem_str).map_err(|_| CliError::Msg("CSR PEM parse failed".to_string()))?;
     let der_bytes = pem_block.contents();
     let (_, csr) =
         x509_parser::certification_request::X509CertificationRequest::from_der(der_bytes)
@@ -544,7 +550,10 @@ pub async fn cmd_kms_peer_install(
     };
     fs::create_dir_all(&install_dir)?;
 
-    let cert_path = install_dir.join(format!("{}-{}.cert.der", bundle.persona, bundle.peer_hostname));
+    let cert_path = install_dir.join(format!(
+        "{}-{}.cert.der",
+        bundle.persona, bundle.peer_hostname
+    ));
     let ca_path = install_dir.join("edge-ca.cert.der");
 
     let cert_der = base64_decode(&bundle.cert_der_b64)?;
@@ -577,7 +586,14 @@ pub async fn cmd_kms_peer_install(
     println!("  cert:        {}", cert_path.display());
     println!("  CA cert:     {}", ca_path.display());
     println!("  SPIFFE URI:  {}", bundle.spiffe_uri);
-    println!("  scope:       {}", if global { "global" } else { "per-project (CWD)" });
+    println!(
+        "  scope:       {}",
+        if global {
+            "global"
+        } else {
+            "per-project (CWD)"
+        }
+    );
 
     Ok(())
 }

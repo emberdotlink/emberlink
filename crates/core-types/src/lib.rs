@@ -1458,13 +1458,15 @@ mod proptest_canonical {
                         claimed_at: claimed,
                     })
                 }),
-            (any::<String>(), any::<String>(), any::<String>()).prop_map(|(oid, issuer, reason)| {
-                EventBody::GrantOfferRevoked(GrantOfferRevokedEvent {
-                    offer_id: oid,
-                    issuer_persona_id: issuer,
-                    reason,
-                })
-            }),
+            (any::<String>(), any::<String>(), any::<String>()).prop_map(
+                |(oid, issuer, reason)| {
+                    EventBody::GrantOfferRevoked(GrantOfferRevokedEvent {
+                        offer_id: oid,
+                        issuer_persona_id: issuer,
+                        reason,
+                    })
+                }
+            ),
             // Badge events
             (
                 any::<String>(),
@@ -1476,28 +1478,32 @@ mod proptest_canonical {
                 any::<u64>(),
                 proptest::option::of(any::<u64>())
             )
-                .prop_map(|(bid, issuer, recipient, btype, dname, evidence, issued, expires)| {
-                    EventBody::BadgeIssued(BadgeIssuedEvent {
+                .prop_map(
+                    |(bid, issuer, recipient, btype, dname, evidence, issued, expires)| {
+                        EventBody::BadgeIssued(BadgeIssuedEvent {
+                            badge_id: bid,
+                            issuer_persona_id: issuer,
+                            recipient_persona_id: recipient,
+                            badge_type: btype,
+                            display_name: dname,
+                            evidence: evidence.map(|(et, ph)| BadgeEvidence {
+                                evidence_type: et,
+                                payload_hex: ph,
+                            }),
+                            issued_at: issued,
+                            expires_at: expires,
+                        })
+                    }
+                ),
+            (any::<String>(), any::<String>(), any::<String>()).prop_map(
+                |(bid, revoker, reason)| {
+                    EventBody::BadgeRevoked(BadgeRevokedEvent {
                         badge_id: bid,
-                        issuer_persona_id: issuer,
-                        recipient_persona_id: recipient,
-                        badge_type: btype,
-                        display_name: dname,
-                        evidence: evidence.map(|(et, ph)| BadgeEvidence {
-                            evidence_type: et,
-                            payload_hex: ph,
-                        }),
-                        issued_at: issued,
-                        expires_at: expires,
+                        revoker_persona_id: revoker,
+                        reason,
                     })
-                }),
-            (any::<String>(), any::<String>(), any::<String>()).prop_map(|(bid, revoker, reason)| {
-                EventBody::BadgeRevoked(BadgeRevokedEvent {
-                    badge_id: bid,
-                    revoker_persona_id: revoker,
-                    reason,
-                })
-            }),
+                }
+            ),
         ]
     }
 

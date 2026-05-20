@@ -10,25 +10,54 @@ pub enum UiAction {
     /// Return the current state snapshot (no mutation).
     GetState,
     /// Return full detail for a specific grant.
-    GetGrantDetail { grant_id: String },
+    GetGrantDetail {
+        grant_id: String,
+    },
 
     // --- Identity setup ---
     /// First-launch init: create root + device + persona in one shot.
-    Init { name: String, device_label: String, persona_label: String },
+    Init {
+        name: String,
+        device_label: String,
+        persona_label: String,
+    },
     /// Create a new identity root.
-    CreateRoot { name: String },
+    CreateRoot {
+        name: String,
+    },
     /// Create a new persona under an existing root.
-    CreatePersona { root: String, label: String, template: String },
+    CreatePersona {
+        root: String,
+        label: String,
+        template: String,
+    },
     /// Add a device to an existing root.
-    AddDevice { root: String, label: String },
+    AddDevice {
+        root: String,
+        label: String,
+    },
 
     // --- Revocation ---
-    RevokeRoot { root_id: String, reason: String },
-    RevokePersona { root_id: String, persona_id: String, reason: String },
-    RevokeDevice { root_id: String, device_id: String, reason: String },
+    RevokeRoot {
+        root_id: String,
+        reason: String,
+    },
+    RevokePersona {
+        root_id: String,
+        persona_id: String,
+        reason: String,
+    },
+    RevokeDevice {
+        root_id: String,
+        device_id: String,
+        reason: String,
+    },
 
     // --- Access grants ---
-    RevokeGrant { grant_id: String, reason: String },
+    RevokeGrant {
+        grant_id: String,
+        reason: String,
+    },
 
     /// Create a new access grant.
     /// `recipient_kind`: "peer" | "service"
@@ -75,13 +104,20 @@ pub enum UiAction {
     },
 
     /// List credential summaries for a persona (metadata only, no payload).
-    ListCredentials { persona_id: String },
+    ListCredentials {
+        persona_id: String,
+    },
 
     /// Get a single credential's metadata. Returns `CredentialView`.
-    GetCredential { object_id: String, persona_id: String },
+    GetCredential {
+        object_id: String,
+        persona_id: String,
+    },
 
     /// List service bindings (passkeys, OAuth, password-import, etc.) for a persona.
-    ListServiceBindings { persona_id: String },
+    ListServiceBindings {
+        persona_id: String,
+    },
 
     /// List credential summaries across all personas. Returns `Vec<CredentialView>`.
     ListAllCredentials,

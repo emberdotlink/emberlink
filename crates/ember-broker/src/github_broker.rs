@@ -22,19 +22,16 @@
 //! upstream DELETE call when shorter-than-TTL exposure windows matter.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::SystemTime;
 
-use core_broker::{
-    Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential,
-};
+use core_broker::{Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 
 use crate::github_app::{
-    mint_installation_token_with_client, GhAppCredentials, GhAppError, HttpClient,
-    ReqwestClient,
+    GhAppCredentials, GhAppError, HttpClient, ReqwestClient, mint_installation_token_with_client,
 };
 
 /// Provider-specific scope payload for the GitHub broker.
@@ -149,11 +146,8 @@ impl Broker for GitHubBroker {
         // without echoing the bearer in logs / receipts. Falls back to a
         // time-only ID if the token is shorter than expected.
         let token_prefix: String = token.token.chars().take(12).collect();
-        let materialization_id = format!(
-            "gh-app-{}-{}",
-            token.expires_at.timestamp(),
-            token_prefix,
-        );
+        let materialization_id =
+            format!("gh-app-{}-{}", token.expires_at.timestamp(), token_prefix,);
 
         self.state
             .lock()
@@ -250,7 +244,9 @@ mod tests {
             3600,
         );
 
-        let cred = Broker::issue(&broker, req).await.expect("issue must succeed");
+        let cred = Broker::issue(&broker, req)
+            .await
+            .expect("issue must succeed");
         assert!(cred.materialization_id.starts_with("gh-app-"));
         assert!(cred.token.expose_secret().starts_with("ghs_test_token_xyz"));
         assert_eq!(broker.active_count(), 1);
@@ -266,7 +262,9 @@ mod tests {
             }),
         );
         let req = gh_request(serde_json::json!({}), 3600);
-        Broker::issue(&broker, req).await.expect("empty scope must succeed");
+        Broker::issue(&broker, req)
+            .await
+            .expect("empty scope must succeed");
     }
 
     #[tokio::test]
@@ -278,10 +276,7 @@ mod tests {
                 body: ok_token_body(),
             }),
         );
-        let req = gh_request(
-            serde_json::json!({"repositories": "not-a-list"}),
-            3600,
-        );
+        let req = gh_request(serde_json::json!({"repositories": "not-a-list"}), 3600);
         let err = Broker::issue(&broker, req).await.unwrap_err();
         assert!(
             matches!(err, BrokerError::InvalidScope(_)),

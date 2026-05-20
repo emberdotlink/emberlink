@@ -22,7 +22,11 @@ impl AppConfig {
         let data_dir = data_dir.into();
         let db_path = data_dir.join("local-state.sqlite");
         let state_path = data_dir.join("local-state.enc");
-        Self { data_dir, db_path, state_path }
+        Self {
+            data_dir,
+            db_path,
+            state_path,
+        }
     }
 
     /// Resolve the data directory from env vars or fall back to `fallback`.
@@ -47,7 +51,11 @@ impl AppConfig {
             .map(PathBuf::from)
             .unwrap_or_else(|_| data_dir.join("local-state.enc"));
 
-        Self { data_dir, db_path, state_path }
+        Self {
+            data_dir,
+            db_path,
+            state_path,
+        }
     }
 }
 

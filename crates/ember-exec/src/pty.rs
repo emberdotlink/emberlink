@@ -25,6 +25,7 @@
 //!
 //! See `lib.rs` §"Open questions" for known limitations and follow-up work.
 
+#[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::Path;
 use std::process::ExitStatus;
@@ -80,11 +81,7 @@ impl PtyBridge {
         socket_path: &Path,
         cmd: tokio::process::Command,
     ) -> Result<ExitStatus, PtyError> {
-        let prog = cmd
-            .as_std()
-            .get_program()
-            .to_string_lossy()
-            .into_owned();
+        let prog = cmd.as_std().get_program().to_string_lossy().into_owned();
         let args: Vec<String> = cmd
             .as_std()
             .get_args()
@@ -115,7 +112,7 @@ impl PtyBridge {
 /// then run the fork+pty+pump body via [`pump_connection`] until the child
 /// exits.
 ///
-/// Refactored in implementation-note-265: the per-connection body now
+/// Refactored in implementation-note-371: the per-connection body now
 /// lives in [`pump_connection`] so `handle_spawn_directive` in `spawn.rs`
 /// can reuse it over an in-flight stream without re-binding a socket.
 /// `serve_inner` keeps its original shape (open listener, accept one client,
@@ -130,12 +127,14 @@ pub async fn serve_inner(
 
     // Bind and accept on a blocking thread so we keep the async runtime free
     // while waiting for the single client connection.
-    let std_stream = tokio::task::spawn_blocking(move || -> Result<std::os::unix::net::UnixStream, PtyError> {
-        use std::os::unix::net::UnixListener;
-        let listener = UnixListener::bind(&socket_path).map_err(PtyError::Io)?;
-        let (stream, _) = listener.accept().map_err(PtyError::Io)?;
-        Ok(stream)
-    })
+    let std_stream = tokio::task::spawn_blocking(
+        move || -> Result<std::os::unix::net::UnixStream, PtyError> {
+            use std::os::unix::net::UnixListener;
+            let listener = UnixListener::bind(&socket_path).map_err(PtyError::Io)?;
+            let (stream, _) = listener.accept().map_err(PtyError::Io)?;
+            Ok(stream)
+        },
+    )
     .await
     .map_err(|e| PtyError::Io(std::io::Error::other(e.to_string())))??;
 
@@ -160,7 +159,7 @@ pub async fn serve_inner(
 // pump_connection — fork+pty+pump over a pre-bound async stream
 // ---------------------------------------------------------------------------
 
-/// implementation-note-265: fork a child with a controlling pty, exec
+/// implementation-note-371: fork a child with a controlling pty, exec
 /// `prog argv` in the child, and pump bytes between the pty master and the
 /// pre-bound `stream` until the child exits.
 ///
@@ -197,57 +196,64 @@ where
     // syscall in the middle of an async runtime, and the child path cannot
     // return to async land. The parent path returns master_fd + pid back to
     // the caller for async pumping.
-    let (master_fd, pid) = tokio::task::spawn_blocking(move || -> Result<(RawFd, libc::pid_t), PtyError> {
-        let prog_c = CString::new(prog_string.as_str())
-            .map_err(|e| PtyError::PtyAlloc(format!("program CString: {e}")))?;
-        // `argv_owned` is the full argv vector (argv[0] is the conventional
-        // program name). Empty argv falls back to `[prog]` so execvp gets at
-        // least one entry; this matches conventional execvp(3) usage.
-        let mut argv_c: Vec<CString> = Vec::with_capacity(argv_owned.len().max(1));
-        if argv_owned.is_empty() {
-            argv_c.push(prog_c.clone());
-        } else {
-            for a in &argv_owned {
-                argv_c.push(
-                    CString::new(a.as_str())
-                        .map_err(|e| PtyError::PtyAlloc(format!("arg CString: {e}")))?,
-                );
+    let (master_fd, pid) =
+        tokio::task::spawn_blocking(move || -> Result<(RawFd, libc::pid_t), PtyError> {
+            let prog_c = CString::new(prog_string.as_str())
+                .map_err(|e| PtyError::PtyAlloc(format!("program CString: {e}")))?;
+            // `argv_owned` is the full argv vector (argv[0] is the conventional
+            // program name). Empty argv falls back to `[prog]` so execvp gets at
+            // least one entry; this matches conventional execvp(3) usage.
+            let mut argv_c: Vec<CString> = Vec::with_capacity(argv_owned.len().max(1));
+            if argv_owned.is_empty() {
+                argv_c.push(prog_c.clone());
+            } else {
+                for a in &argv_owned {
+                    argv_c.push(
+                        CString::new(a.as_str())
+                            .map_err(|e| PtyError::PtyAlloc(format!("arg CString: {e}")))?,
+                    );
+                }
             }
-        }
-        let mut argv_ptrs: Vec<*const libc::c_char> = argv_c.iter().map(|s| s.as_ptr()).collect();
-        argv_ptrs.push(std::ptr::null());
+            let mut argv_ptrs: Vec<*const libc::c_char> =
+                argv_c.iter().map(|s| s.as_ptr()).collect();
+            argv_ptrs.push(std::ptr::null());
 
-        let mut master_fd: libc::c_int = -1;
-        let ws = libc::winsize { ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 };
-        let pid = unsafe {
-            libc::forkpty(
-                &mut master_fd,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &ws,
-            )
-        };
+            let mut master_fd: libc::c_int = -1;
+            let ws = libc::winsize {
+                ws_row: 24,
+                ws_col: 80,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            };
+            let pid = unsafe {
+                libc::forkpty(
+                    &mut master_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &ws,
+                )
+            };
 
-        if pid < 0 {
-            let err = std::io::Error::last_os_error();
-            return Err(PtyError::PtyAlloc(format!("forkpty: {err}")));
-        }
-
-        if pid == 0 {
-            // ---- CHILD ----
-            // exec immediately; _exit on failure so we don't run any Drop
-            // glue from the parent's async runtime.
-            unsafe {
-                libc::execvp(prog_c.as_ptr(), argv_ptrs.as_ptr());
-                libc::_exit(127);
+            if pid < 0 {
+                let err = std::io::Error::last_os_error();
+                return Err(PtyError::PtyAlloc(format!("forkpty: {err}")));
             }
-        }
 
-        // ---- PARENT ----
-        Ok((master_fd, pid))
-    })
-    .await
-    .map_err(|e| PtyError::Io(std::io::Error::other(e.to_string())))??;
+            if pid == 0 {
+                // ---- CHILD ----
+                // exec immediately; _exit on failure so we don't run any Drop
+                // glue from the parent's async runtime.
+                unsafe {
+                    libc::execvp(prog_c.as_ptr(), argv_ptrs.as_ptr());
+                    libc::_exit(127);
+                }
+            }
+
+            // ---- PARENT ----
+            Ok((master_fd, pid))
+        })
+        .await
+        .map_err(|e| PtyError::Io(std::io::Error::other(e.to_string())))??;
 
     set_nonblocking(master_fd).map_err(|e| {
         // Close master and reap the child on setup error.
@@ -310,11 +316,7 @@ impl Drop for MasterFd {
 /// the pty master and `tokio::select!` to multiplex against the async
 /// stream.
 #[cfg(target_os = "linux")]
-async fn async_bridge<S>(
-    master_fd: RawFd,
-    pid: libc::pid_t,
-    stream: S,
-) -> Result<i32, PtyError>
+async fn async_bridge<S>(master_fd: RawFd, pid: libc::pid_t, stream: S) -> Result<i32, PtyError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -567,6 +569,7 @@ fn apply_winsize(master_fd: RawFd, rows: u16, cols: u16, xpixel: u16, ypixel: u1
 // fd helpers
 // ---------------------------------------------------------------------------
 
+#[cfg(target_os = "linux")]
 fn set_nonblocking(fd: RawFd) -> Result<(), std::io::Error> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 {
@@ -633,7 +636,11 @@ fn decode_exit(raw_code: i32) -> Result<ExitStatus, PtyError> {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
-        let wait_status = if raw_code >= 0 { (raw_code & 0xff) << 8 } else { 9 };
+        let wait_status = if raw_code >= 0 {
+            (raw_code & 0xff) << 8
+        } else {
+            9
+        };
         Ok(ExitStatus::from_raw(wait_status))
     }
     #[cfg(not(unix))]

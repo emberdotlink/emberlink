@@ -34,6 +34,21 @@ pub struct GrantReceipt {
     pub lifecycle: Lifecycle,
     /// Attestation posture snapshot from the grant envelope at terminal time.
     pub attestation: AttestationBinding,
+    /// design §Component 5 (reaffirms design R9 / ) — `true` when
+    /// the emitting daemon's trust set includes any non-release root
+    /// (i.e. operator supplied `EMBER_TRUST_ROOTS`). `false` for
+    /// production daemons running with release-only trust. This is the
+    /// ONLY runtime artifact that distinguishes a dev daemon from a
+    /// prod daemon — an audit signal, not a behavior switch.
+    ///
+    /// Additive field — older verifiers ignore it; new verifiers can
+    /// refuse to honor dev-mode receipts in production contexts.
+    /// `#[serde(default)]` makes deserialization of pre-design
+    /// receipts non-breaking; `skip_serializing_if` keeps the
+    /// canonical-hash stable for receipts emitted by prod daemons
+    /// (default `false` → field omitted from the JSON).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dev_mode_active: bool,
     pub evidence: Evidence,
 }
 
@@ -211,10 +226,10 @@ impl Default for Evidence {
 /// - `Grant` — legacy `GrantReceipt` (grant termination).
 /// - `KmsWrap` / `KmsUnwrap` — `ember-kms` encrypt / decrypt (design).
 /// - `VaultRetrieval` — `ember vault get` retrieval Receipt (per
-///   `RECEIPT-COVERAGE-FIX-implementation-note-33`; emission lands in a
+///   `RECEIPT-COVERAGE-FIX-implementation-note-46`; emission lands in a
 ///   follow-up task — this variant is the type-system seat).
 /// - `BrokerMaterialization` / `BrokerRevocation` — `ember broker`
-///   typed Receipts (per `RECEIPT-COVERAGE-FIX-implementation-note-34`; today
+///   typed Receipts (per `RECEIPT-COVERAGE-FIX-implementation-note-47`; today
 ///   broker emits an audit-log row only — these variants are the
 ///   type-system seats for the typed-Receipt promotion).
 ///
@@ -380,7 +395,7 @@ pub struct BrokerReceipt {
 }
 
 // ---------------------------------------------------------------------------
-// Vault receipts (RECEIPT-COVERAGE-FIX-implementation-note-33 — vault_retrieval)
+// Vault receipts (RECEIPT-COVERAGE-FIX-implementation-note-46 — vault_retrieval)
 // ---------------------------------------------------------------------------
 //
 // Receipts emitted by the vault-get handler. Carry NON-SENSITIVE metadata
@@ -425,7 +440,7 @@ pub struct VaultReceipt {
 /// Signed by the Daemon Persona Ed25519 key — same signing path as [`KmsReceipt`]
 /// and [`BrokerReceipt`].
 ///
-/// **Snapshot scope** per the recovery inventory (implementation-note-35):
+/// **Snapshot scope** per the recovery inventory (implementation-note-48):
 /// includes `credentials`, `vault.salt`, `personas`, `grants`, `standing_grants`,
 /// `audit_log`, `receipts`. Excludes `policy.toml` (config, recovered via GitOps)
 /// and active broker materializations (ephemeral, re-issued on restart).
@@ -511,6 +526,7 @@ mod tests {
                 },
             },
             attestation: AttestationBinding::default(),
+            dev_mode_active: false,
             evidence: Evidence::default(),
         }
     }
@@ -588,7 +604,11 @@ mod tests {
 
         // Structural stability: 32-byte output, non-zero for non-trivial input.
         assert_eq!(hash.len(), 32);
-        assert_ne!(hash, vec![0u8; 32], "hash of non-trivial receipt should not be all zeros");
+        assert_ne!(
+            hash,
+            vec![0u8; 32],
+            "hash of non-trivial receipt should not be all zeros"
+        );
 
         // Pin the hex so a future encoding change triggers a visible failure.
         // Re-derive pinned value from the fixture so it stays in sync with the type.
@@ -607,7 +627,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------------
-    // KMS receipt tests (implementation-note-36)
+    // KMS receipt tests (implementation-note-49)
     // ----------------------------------------------------------------------
 
     fn minimal_kms_wrap_receipt() -> KmsReceipt {
@@ -695,9 +715,18 @@ mod tests {
         let json = serde_json::to_string(&receipt).expect("serialize failure");
         // Belt-and-braces: the serialised JSON does not contain any field
         // name that could be a plaintext / ciphertext smuggling channel.
-        assert!(!json.contains("plaintext"), "receipt JSON contains 'plaintext': {json}");
-        assert!(!json.contains("ciphertext"), "receipt JSON contains 'ciphertext': {json}");
-        assert!(!json.contains("\"body\""), "receipt JSON contains '\"body\"': {json}");
+        assert!(
+            !json.contains("plaintext"),
+            "receipt JSON contains 'plaintext': {json}"
+        );
+        assert!(
+            !json.contains("ciphertext"),
+            "receipt JSON contains 'ciphertext': {json}"
+        );
+        assert!(
+            !json.contains("\"body\""),
+            "receipt JSON contains '\"body\"': {json}"
+        );
         // Denied evaluations omit `grant_id` from the JSON via skip_serializing_if.
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["outcome"], "failure");
@@ -710,8 +739,14 @@ mod tests {
 
     #[test]
     fn receipt_kind_serialises_snake_case() {
-        assert_eq!(serde_json::to_string(&ReceiptKind::Grant).unwrap(), "\"grant\"");
-        assert_eq!(serde_json::to_string(&ReceiptKind::KmsWrap).unwrap(), "\"kms_wrap\"");
+        assert_eq!(
+            serde_json::to_string(&ReceiptKind::Grant).unwrap(),
+            "\"grant\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ReceiptKind::KmsWrap).unwrap(),
+            "\"kms_wrap\""
+        );
         assert_eq!(
             serde_json::to_string(&ReceiptKind::KmsUnwrap).unwrap(),
             "\"kms_unwrap\""
@@ -737,7 +772,10 @@ mod tests {
             (ReceiptKind::KmsWrap, "\"kms_wrap\""),
             (ReceiptKind::KmsUnwrap, "\"kms_unwrap\""),
             (ReceiptKind::VaultRetrieval, "\"vault_retrieval\""),
-            (ReceiptKind::BrokerMaterialization, "\"broker_materialization\""),
+            (
+                ReceiptKind::BrokerMaterialization,
+                "\"broker_materialization\"",
+            ),
             (ReceiptKind::BrokerRevocation, "\"broker_revocation\""),
         ] {
             let s = serde_json::to_string(&variant).unwrap();

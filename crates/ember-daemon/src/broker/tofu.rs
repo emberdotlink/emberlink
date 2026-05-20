@@ -1,6 +1,6 @@
 //! TOFU (Trust-On-First-Use) credential binding confirmation.
 //!
-//! implementation-note-115 — replaces the DCC-3A stub with real
+//! implementation-note-162 — replaces the DCC-3A stub with real
 //! design biometric prompt integration. The flow:
 //!
 //! 1. `submit_approval` writes a pending row into the approvals table
@@ -107,7 +107,7 @@ pub async fn tofu_confirm_binding(
 /// outcome mapping. Lives under `cfg(not(test))` so unit tests bypass
 /// it through the mock-outcome short-circuit above.
 ///
-/// implementation-note-115: biometric_prompt_for_binding checkpoint.
+/// implementation-note-162: biometric_prompt_for_binding checkpoint.
 #[cfg(not(test))]
 async fn biometric_prompt_for_binding(
     store: &DaemonStore,
@@ -124,9 +124,7 @@ async fn biometric_prompt_for_binding(
     // `action` so the renderer can show a single human-readable line
     // without schema changes.
     let credential_name = format!("credential-binding:{remote_name}");
-    let action = format!(
-        "bind:{remote_name} @ {remote_url} (tree={working_tree_id})"
-    );
+    let action = format!("bind:{remote_name} @ {remote_url} (tree={working_tree_id})");
 
     let info = store
         .submit_approval(

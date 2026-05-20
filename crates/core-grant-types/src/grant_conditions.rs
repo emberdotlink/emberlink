@@ -135,10 +135,8 @@ impl TryFrom<GrantConditionRepr> for GrantCondition {
             }
             GrantConditionRepr::Any(sub) => {
                 if sub.is_empty() {
-                    return Err(
-                        "empty Any combinator is not allowed: an empty Any has no \
-                         alternatives and would silently disable gating (GC-H1)",
-                    );
+                    return Err("empty Any combinator is not allowed: an empty Any has no \
+                         alternatives and would silently disable gating (GC-H1)");
                 }
                 Ok(Self::Any(sub))
             }
@@ -203,24 +201,32 @@ impl GrantCondition {
                         continue;
                     }
                     if let Some(val) = opt.strip_prefix("min-convergence=") {
-                        min_convergence = Some(val.parse::<f64>().map_err(|_| {
-                            format!("invalid min-convergence value: {val}")
-                        })?);
+                        min_convergence = Some(
+                            val.parse::<f64>()
+                                .map_err(|_| format!("invalid min-convergence value: {val}"))?,
+                        );
                     } else if let Some(val) = opt.strip_prefix("max-distance=") {
-                        max_distance = Some(val.parse::<u32>().map_err(|_| {
-                            format!("invalid max-distance value: {val}")
-                        })?);
+                        max_distance = Some(
+                            val.parse::<u32>()
+                                .map_err(|_| format!("invalid max-distance value: {val}"))?,
+                        );
                     } else if let Some(val) = opt.strip_prefix("min-authority=") {
-                        min_authority = Some(val.parse::<f64>().map_err(|_| {
-                            format!("invalid min-authority value: {val}")
-                        })?);
+                        min_authority = Some(
+                            val.parse::<f64>()
+                                .map_err(|_| format!("invalid min-authority value: {val}"))?,
+                        );
                     } else {
                         return Err(format!("unknown condition option: {opt}"));
                     }
                 }
             }
 
-            Ok(Self::BadgeGate { badge_type, min_convergence, max_distance, min_authority })
+            Ok(Self::BadgeGate {
+                badge_type,
+                min_convergence,
+                max_distance,
+                min_authority,
+            })
         } else {
             Err(format!(
                 "unknown condition format: '{s}'. Expected 'badge:<type>[,min-convergence=<f>][,max-distance=<n>][,min-authority=<f>]'"
@@ -255,7 +261,12 @@ impl GrantCondition {
     /// Serialize this condition to a compact human-readable string (for display).
     pub fn display(&self) -> String {
         match self {
-            Self::BadgeGate { badge_type, min_convergence, max_distance, min_authority } => {
+            Self::BadgeGate {
+                badge_type,
+                min_convergence,
+                max_distance,
+                min_authority,
+            } => {
                 let mut s = format!("badge:{badge_type}");
                 if let Some(c) = min_convergence {
                     s.push_str(&format!(",min-convergence={c:.2}"));
@@ -397,14 +408,12 @@ mod tests {
     /// rejected — the validator must run recursively, not just at the top.
     #[test]
     fn deserialize_rejects_nested_empty_combinator() {
-        let nested_all =
-            r#"{"type":"all","value":[{"type":"all","value":[]}]}"#;
+        let nested_all = r#"{"type":"all","value":[{"type":"all","value":[]}]}"#;
         let err = serde_json::from_str::<GrantCondition>(nested_all)
             .expect_err("nested empty All must be rejected");
         assert!(err.to_string().contains("empty All"));
 
-        let nested_any =
-            r#"{"type":"any","value":[{"type":"any","value":[]}]}"#;
+        let nested_any = r#"{"type":"any","value":[{"type":"any","value":[]}]}"#;
         let err = serde_json::from_str::<GrantCondition>(nested_any)
             .expect_err("nested empty Any must be rejected");
         assert!(err.to_string().contains("empty Any"));
@@ -416,18 +425,17 @@ mod tests {
     #[test]
     fn deserialize_rejects_unknown_variant() {
         // Single unknown top-level condition.
-        let err = serde_json::from_str::<GrantCondition>(
-            r#"{"type":"future_variant","value":{}}"#,
-        )
-        .expect_err("unknown variant must be rejected");
+        let err = serde_json::from_str::<GrantCondition>(r#"{"type":"future_variant","value":{}}"#)
+            .expect_err("unknown variant must be rejected");
         assert!(
             !err.to_string().is_empty(),
             "expected a non-empty error for unknown variant"
         );
 
         // Unknown variant inside a Vec — must not produce an empty Vec.
-        let result =
-            serde_json::from_str::<Vec<GrantCondition>>(r#"[{"type":"future_variant","value":{}}]"#);
+        let result = serde_json::from_str::<Vec<GrantCondition>>(
+            r#"[{"type":"future_variant","value":{}}]"#,
+        );
         assert!(
             result.is_err(),
             "Vec containing unknown variant must error, not produce empty Vec"

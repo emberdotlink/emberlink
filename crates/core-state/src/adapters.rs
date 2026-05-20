@@ -4,7 +4,9 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use core_crypto::{
     LocalKeySigner, Signer as CryptoSigner, public_key_raw_bytes, sha256_digest_raw,
 };
-use core_event_types::{ClaimType, ImportedClaim, PresentationResult, ServiceAdapter, ServiceBinding};
+use core_event_types::{
+    ClaimType, ImportedClaim, PresentationResult, ServiceAdapter, ServiceBinding,
+};
 use core_types::{Validate, ValidationError};
 use csv::{ReaderBuilder, StringRecord, Trim};
 use serde_json::json;
@@ -216,8 +218,7 @@ fn build_password_claim(
 /// First 16 bytes of SHA-256("emberlink-virtual-authenticator-v1").
 // Pre-computed: sha256("emberlink-virtual-authenticator-v1")[..16]
 const EMBERLINK_AAGUID: [u8; 16] = [
-    0x8b, 0x3a, 0x4e, 0xf1, 0xc7, 0x02, 0xd9, 0x5b, 0xa1, 0x6e, 0x33, 0xf8, 0x7c, 0x49, 0x10,
-    0xdd,
+    0x8b, 0x3a, 0x4e, 0xf1, 0xc7, 0x02, 0xd9, 0x5b, 0xa1, 0x6e, 0x33, 0xf8, 0x7c, 0x49, 0x10, 0xdd,
 ];
 
 /// COSE algorithm identifier for EdDSA.
@@ -297,17 +298,20 @@ impl PasskeyAdapter {
         let cose_key = build_cose_ed25519_public_key(&pk_bytes)?;
 
         // Build attested credential data.
-        let attested_cred_data = build_attested_credential_data(&EMBERLINK_AAGUID, &credential_id, &cose_key);
+        let attested_cred_data =
+            build_attested_credential_data(&EMBERLINK_AAGUID, &credential_id, &cose_key);
 
         // Build authenticator data (with attested credential data).
-        let auth_data = build_authenticator_data(rp_id, AUTH_FLAG_UP_AT, 0, Some(&attested_cred_data));
+        let auth_data =
+            build_authenticator_data(rp_id, AUTH_FLAG_UP_AT, 0, Some(&attested_cred_data));
 
         // Build attestation object (fmt=none).
         let attestation_object = build_attestation_object(&auth_data)?;
 
         // Build clientDataJSON.
         let challenge_b64url = URL_SAFE_NO_PAD.encode(challenge);
-        let client_data_json = build_client_data_json("webauthn.create", &challenge_b64url, rp_origin);
+        let client_data_json =
+            build_client_data_json("webauthn.create", &challenge_b64url, rp_origin);
 
         let meta = PasskeyBindingMeta {
             rp_id: rp_id.to_string(),
@@ -445,7 +449,7 @@ pub fn verify_passkey_assertion(
     client_data_json: &[u8],
     signature: &[u8],
 ) -> Result<bool, ValidationError> {
-    use ed25519_dalek::{Signature as DalekSig, VerifyingKey, Verifier as DalekVerifier};
+    use ed25519_dalek::{Signature as DalekSig, Verifier as DalekVerifier, VerifyingKey};
 
     let verifying_key = VerifyingKey::from_bytes(public_key_bytes)
         .map_err(|err| ValidationError::new(format!("invalid public key: {err}")))?;
@@ -484,7 +488,7 @@ fn build_authenticator_data(
     let rp_id_hash = sha256_digest_raw(rp_id.as_bytes());
     let mut data = Vec::with_capacity(37 + attested_cred_data.map_or(0, |d| d.len()));
     data.extend_from_slice(&rp_id_hash); // 32 bytes
-    data.push(flags);                     // 1 byte
+    data.push(flags); // 1 byte
     data.extend_from_slice(&sign_count.to_be_bytes()); // 4 bytes
     if let Some(acd) = attested_cred_data {
         data.extend_from_slice(acd);
@@ -544,10 +548,7 @@ fn build_attestation_object(auth_data: &[u8]) -> Result<Vec<u8>, ValidationError
             CborValue::Text("fmt".into()),
             CborValue::Text("none".into()),
         ),
-        (
-            CborValue::Text("attStmt".into()),
-            CborValue::Map(vec![]),
-        ),
+        (CborValue::Text("attStmt".into()), CborValue::Map(vec![])),
         (
             CborValue::Text("authData".into()),
             CborValue::Bytes(auth_data.to_vec()),
@@ -666,14 +667,10 @@ impl OAuthAdapter {
         code_verifier: &str,
     ) -> Result<OAuthTokenExchangeRequest, ValidationError> {
         if code.is_empty() {
-            return Err(ValidationError::new(
-                "authorization code must not be empty",
-            ));
+            return Err(ValidationError::new("authorization code must not be empty"));
         }
         if code_verifier.is_empty() {
-            return Err(ValidationError::new(
-                "code_verifier must not be empty",
-            ));
+            return Err(ValidationError::new("code_verifier must not be empty"));
         }
 
         let mut body_params = BTreeMap::new();
@@ -691,9 +688,7 @@ impl OAuthAdapter {
 
     /// Parse the claims portion of an OIDC ID token (JWT payload, already base64url-decoded).
     /// This does NOT verify the JWT signature — the caller should verify with the provider's JWK.
-    pub fn parse_id_token_claims(
-        id_token_jwt: &str,
-    ) -> Result<OAuthTokenClaims, ValidationError> {
+    pub fn parse_id_token_claims(id_token_jwt: &str) -> Result<OAuthTokenClaims, ValidationError> {
         // JWT format: header.payload.signature — we extract the payload.
         let parts: Vec<&str> = id_token_jwt.split('.').collect();
         if parts.len() != 3 {
@@ -775,14 +770,11 @@ impl ServiceAdapter for OAuthAdapter {
                 let code_verifier = request["code_verifier"].as_str().ok_or_else(|| {
                     ValidationError::new("missing 'code_verifier' in exchange request")
                 })?;
-                let exchange_req =
-                    Self::build_token_exchange_request(&meta, code, code_verifier)?;
+                let exchange_req = Self::build_token_exchange_request(&meta, code, code_verifier)?;
                 Ok(PresentationResult::Accepted {
-                    response_payload: Some(
-                        serde_json::to_string(&exchange_req).map_err(|err| {
-                            ValidationError::new(format!("serialize exchange response: {err}"))
-                        })?,
-                    ),
+                    response_payload: Some(serde_json::to_string(&exchange_req).map_err(
+                        |err| ValidationError::new(format!("serialize exchange response: {err}")),
+                    )?),
                 })
             }
             other => Ok(PresentationResult::Rejected {
@@ -955,9 +947,10 @@ impl ServiceAdapter for OidcClaimAdapter {
         let oidc_claims = Self::map_to_oidc_claims(&fields)?;
 
         Ok(PresentationResult::Accepted {
-            response_payload: Some(serde_json::to_string(&oidc_claims).map_err(|err| {
-                ValidationError::new(format!("serialize oidc claims: {err}"))
-            })?),
+            response_payload: Some(
+                serde_json::to_string(&oidc_claims)
+                    .map_err(|err| ValidationError::new(format!("serialize oidc claims: {err}")))?,
+            ),
         })
     }
 
@@ -1044,15 +1037,14 @@ mod tests {
     fn fixture_passkey_adapter() -> (PasskeyAdapter, String) {
         let signer = core_crypto::FixtureSigner::new("passkey-test-device");
         let key_id = "key-passkey-test-device".to_string();
-        let local_signer = core_crypto::LocalKeySigner::from_local_key_pair(
-            &core_crypto::LocalKeyPair {
+        let local_signer =
+            core_crypto::LocalKeySigner::from_local_key_pair(&core_crypto::LocalKeyPair {
                 key_id: key_id.clone(),
                 algorithm: core_principals::KeyAlgorithm::Ed25519,
                 public_key: signer.public_key().0.clone(),
                 private_key: fixture_private_key("passkey-test-device"),
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
         (PasskeyAdapter::new(local_signer, key_id.clone()), key_id)
     }
 
@@ -1085,7 +1077,13 @@ mod tests {
         let challenge = b"test-challenge-32-bytes-padding!";
 
         let (result, meta) = adapter
-            .register("github.com", "https://github.com", b"user1", "alice", challenge)
+            .register(
+                "github.com",
+                "https://github.com",
+                b"user1",
+                "alice",
+                challenge,
+            )
             .unwrap();
 
         // Credential ID should be non-empty base64url.
@@ -1127,7 +1125,13 @@ mod tests {
         let challenge = b"registration-challenge-padding!!";
 
         let (_reg_result, mut meta) = adapter
-            .register("github.com", "https://github.com", b"user1", "alice", challenge)
+            .register(
+                "github.com",
+                "https://github.com",
+                b"user1",
+                "alice",
+                challenge,
+            )
             .unwrap();
 
         let auth_challenge = b"authentication-challenge-pad!!!!";
@@ -1156,7 +1160,13 @@ mod tests {
         let challenge = b"registration-challenge-padding!!";
 
         let (_reg_result, meta) = adapter
-            .register("github.com", "https://github.com", b"user1", "alice", challenge)
+            .register(
+                "github.com",
+                "https://github.com",
+                b"user1",
+                "alice",
+                challenge,
+            )
             .unwrap();
 
         let binding = passkey_binding(&meta);
@@ -1205,18 +1215,32 @@ mod tests {
         let (adapter, _key_id) = fixture_passkey_adapter();
         let challenge = b"registration-challenge-padding!!";
         let (_reg_result, mut meta) = adapter
-            .register("github.com", "https://github.com", b"user1", "alice", challenge)
+            .register(
+                "github.com",
+                "https://github.com",
+                b"user1",
+                "alice",
+                challenge,
+            )
             .unwrap();
 
         assert_eq!(meta.sign_count, 0);
 
         adapter
-            .authenticate(&mut meta, b"challenge-1-padding-bytes!!!!!!!", "https://github.com")
+            .authenticate(
+                &mut meta,
+                b"challenge-1-padding-bytes!!!!!!!",
+                "https://github.com",
+            )
             .unwrap();
         assert_eq!(meta.sign_count, 1);
 
         adapter
-            .authenticate(&mut meta, b"challenge-2-padding-bytes!!!!!!!", "https://github.com")
+            .authenticate(
+                &mut meta,
+                b"challenge-2-padding-bytes!!!!!!!",
+                "https://github.com",
+            )
             .unwrap();
         assert_eq!(meta.sign_count, 2);
     }
@@ -1226,10 +1250,22 @@ mod tests {
         let (adapter, _key_id) = fixture_passkey_adapter();
 
         let (_r1, meta1) = adapter
-            .register("github.com", "https://github.com", b"u1", "alice", b"c1-padding-bytes!!!")
+            .register(
+                "github.com",
+                "https://github.com",
+                b"u1",
+                "alice",
+                b"c1-padding-bytes!!!",
+            )
             .unwrap();
         let (_r2, meta2) = adapter
-            .register("gitlab.com", "https://gitlab.com", b"u1", "alice", b"c2-padding-bytes!!!")
+            .register(
+                "gitlab.com",
+                "https://gitlab.com",
+                b"u1",
+                "alice",
+                b"c2-padding-bytes!!!",
+            )
             .unwrap();
 
         assert_eq!(meta1.rp_id, "github.com");
@@ -1268,11 +1304,17 @@ mod tests {
         let meta = oauth_binding_meta();
         let req = OAuthAdapter::build_authorize_request(&meta).unwrap();
 
-        assert!(req.authorization_url.starts_with("https://auth.example.com/authorize?"));
+        assert!(
+            req.authorization_url
+                .starts_with("https://auth.example.com/authorize?")
+        );
         assert!(req.authorization_url.contains("response_type=code"));
         assert!(req.authorization_url.contains("client_id=test-client-id"));
         assert!(req.authorization_url.contains("code_challenge_method=S256"));
-        assert!(req.authorization_url.contains("scope=openid%20profile%20email"));
+        assert!(
+            req.authorization_url
+                .contains("scope=openid%20profile%20email")
+        );
         assert!(!req.code_verifier.is_empty());
         assert!(!req.state.is_empty());
     }
@@ -1541,8 +1583,16 @@ mod tests {
         let claims = OidcClaimAdapter::import_id_token(&jwt, "google").unwrap();
 
         assert_eq!(claims.len(), 3); // email, name, subject
-        assert!(claims.iter().any(|c| c.payload_json.contains("bob@example.com")));
-        assert!(claims.iter().any(|c| c.payload_json.contains("Bob Example")));
+        assert!(
+            claims
+                .iter()
+                .any(|c| c.payload_json.contains("bob@example.com"))
+        );
+        assert!(
+            claims
+                .iter()
+                .any(|c| c.payload_json.contains("Bob Example"))
+        );
         assert!(claims.iter().any(|c| c.payload_json.contains("user-456")));
         assert!(claims.iter().all(|c| c.external_issuer == "google"));
         assert!(claims.iter().all(|c| c.claim_type == "service-issued"));

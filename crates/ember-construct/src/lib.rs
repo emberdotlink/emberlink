@@ -21,12 +21,14 @@ pub mod scion;
 pub mod terraform;
 pub mod tofu;
 pub mod vercel;
+pub mod workflow_template_schema;
 pub mod wrangler;
 
 pub use gh::GhClassifier;
 pub use git::GitClassifier;
 pub use kubectl::KubectlClassifier;
-pub use policy::{credential_policy, CredentialInjection, CredentialPolicy};
+pub use policy::{CredentialInjection, CredentialPolicy, credential_policy};
+pub use workflow_template_schema::{Capability, WorkflowTemplate, WorkflowTemplateError};
 
 use std::process::ExitCode;
 
@@ -235,11 +237,18 @@ pub static VENDORS: &[VendorManifest] = &[
     },
     VendorManifest {
         name: "scion",
-        binary_name: "ember-scion",
+        // Upstream binary name is "scion" (not "ember-scion"). When
+        // EMBER_SESSION_ID is absent the shim passthrough-execs the real
+        // scion binary via pick_binary_from_path, which skips self (the
+        // ember-scion shim binary) and finds the upstream "scion" downstream
+        // on PATH. Using "ember-scion" here would cause pick_binary_from_path
+        // to fall through (only one ember-scion on PATH — the shim itself)
+        // and the fallback would re-exec the shim → infinite loop.
+        binary_name: "scion",
         binary_env_var: "EMBER_SCION_BINARY",
         classifier: scion::classify_scion_argv_key,
         // Scion overrides the default identity translator per design §4
-        // (implementation-note-70): emberlink-shaped argv
+        // (implementation-note-86): emberlink-shaped argv
         // (`--persona X --max-depth N --template emberlink-worker --brief ...`)
         // becomes scion-native (`--type emberlink-worker --non-interactive`).
         argv_translator: scion::translate_scion_argv,
@@ -304,9 +313,7 @@ impl ConstructConfig for ManifestConfig<'_> {
         let env_var = self.0.binary_env_var;
         let binary_name = self.0.binary_name;
         std::env::var(env_var).unwrap_or_else(|_| {
-            let self_path = std::env::current_exe()
-                .and_then(std::fs::canonicalize)
-                .ok();
+            let self_path = std::env::current_exe().and_then(std::fs::canonicalize).ok();
             let path = std::env::var("PATH").unwrap_or_default();
             pick_binary_from_path(&path, binary_name, self_path.as_deref())
                 .unwrap_or_else(|| binary_name.to_string())
@@ -409,7 +416,7 @@ mod resolve_binary_tests {
 }
 
 // ---------------------------------------------------------------------------
-// translate_argv hook tests (implementation-note-22)
+// translate_argv hook tests (implementation-note-24)
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -488,9 +495,12 @@ mod translate_argv_tests {
         // 15-vendor enumeration explicit so the "set on every entry"
         // invariant is testable from a single site.
         assert!(VENDORS.iter().all(|v| (v.argv_translator as usize) != 0));
-        assert!(VENDORS.len() >= 15, "expected at least 15 vendor manifests; got {}", VENDORS.len());
+        assert!(
+            VENDORS.len() >= 15,
+            "expected at least 15 vendor manifests; got {}",
+            VENDORS.len()
+        );
     }
 }
 
 // construct_config_translate_argv_hook_landed
-

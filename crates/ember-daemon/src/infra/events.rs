@@ -10,52 +10,38 @@
 //! not carry scope, credential name, timestamps, or revocation reason — those
 //! could constitute a timing or metadata leak to an agent that merely holds
 //! a cached handle. Agents can re-query `list_grants` if they need more.
+//!
+//! implementation-note-212: the `GrantEvent` type itself now lives in
+//! `core-proxy-forward` so the EventSink trait (also in that crate) can take
+//! it as its native event type. This module re-exports it for back-compat
+//! with existing call sites (`use crate::infra::events::GrantEvent;`) and
+//! provides an extension trait `GrantEventExt` for the daemon-side helper
+//! methods that can't live on the foreign type.
 
-use serde::{Deserialize, Serialize};
+pub use core_proxy_forward::GrantEvent;
 
-/// Server-initiated grant-state event broadcast to connected clients.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum GrantEvent {
-    /// A grant has been revoked. Connected agents should zeroize any cached
-    /// credential material tied to `grant_id` for `persona_id`.
-    Revoked {
-        grant_id: String,
-        persona_id: String,
-    },
-    /// A Statement's per-axis usage crossed an 80% or 95% threshold band.
-    /// Informational — the grant stays active. Agents MAY surface the warning
-    /// to the user or pre-request a budget extension.
-    BudgetWarning {
-        grant_id: String,
-        statement_sid: String,
-        axis: &'static str,
-        used: u64,
-        budget: u64,
-        /// Band label crossed, one of `"80"` or `"95"`.
-        percent: &'static str,
-    },
-    /// A Statement's per-axis usage reached 100%. The proxy will reject
-    /// subsequent calls that depend on that statement with a
-    /// `budget_exhausted` 429; the grant as a whole flips to
-    /// `ExhaustedByBudget` only when every applicable statement is exhausted.
-    BudgetExhausted {
-        grant_id: String,
-        statement_sid: String,
-        axis: &'static str,
-        used: u64,
-        budget: u64,
-    },
-}
-
-impl GrantEvent {
+/// Daemon-side helpers on `GrantEvent` — the wire-format method name and
+/// JSON-RPC params shape. Lives as an extension trait because Rust forbids
+/// inherent `impl` blocks on foreign types (`GrantEvent` now ships from
+/// `core-proxy-forward`).
+///
+/// Bring into scope with `use crate::infra::events::GrantEventExt;` at any
+/// call site that needs `.method_name()` / `.params()`.
+pub trait GrantEventExt {
     /// The JSON-RPC method name used when this event is forwarded to a client
     /// over the unix socket.
     ///
     /// Budget events use dot-separated names (`budget.warning`,
     /// `budget.exhausted`) because the TS/Py agent SDKs demultiplex on those
     /// exact strings; revocation keeps the historical `grant_revoked` shape.
-    pub fn method_name(&self) -> &'static str {
+    fn method_name(&self) -> &'static str;
+
+    /// JSON params payload for the notification wire format.
+    fn params(&self) -> serde_json::Value;
+}
+
+impl GrantEventExt for GrantEvent {
+    fn method_name(&self) -> &'static str {
         match self {
             GrantEvent::Revoked { .. } => "grant_revoked",
             GrantEvent::BudgetWarning { .. } => "budget.warning",
@@ -63,8 +49,7 @@ impl GrantEvent {
         }
     }
 
-    /// JSON params payload for the notification wire format.
-    pub fn params(&self) -> serde_json::Value {
+    fn params(&self) -> serde_json::Value {
         match self {
             GrantEvent::Revoked {
                 grant_id,

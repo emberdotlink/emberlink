@@ -1,4 +1,4 @@
-//! Receipt redaction rule engine (implementation-note-44).
+//! Receipt redaction rule engine (implementation-note-59).
 //!
 //! Receipts contain raw tool outputs that may include secrets, PII, or PHI;
 //! redaction is applied before a receipt is exported (e.g. to a third party
@@ -56,7 +56,14 @@ pub fn apply_redactions(receipt: &mut Value, rules: &[RedactionRule]) -> Redacti
         if segments.is_empty() {
             continue;
         }
-        apply_rule_inner(receipt, &segments, 0, &rule.strategy, &mut Vec::new(), &mut report);
+        apply_rule_inner(
+            receipt,
+            &segments,
+            0,
+            &rule.strategy,
+            &mut Vec::new(),
+            &mut report,
+        );
     }
     report
 }
@@ -153,7 +160,8 @@ fn apply_rule_inner(
             };
             // Track which keys to drop entirely (for terminal Drop strategy).
             let mut drop_keys: Vec<String> = Vec::new();
-            let is_terminal_drop = idx + 1 == segments.len() && matches!(strategy, RedactionStrategy::Drop);
+            let is_terminal_drop =
+                idx + 1 == segments.len() && matches!(strategy, RedactionStrategy::Drop);
             for k in keys {
                 path_so_far.push(k.clone());
                 if is_terminal_drop {
@@ -175,11 +183,7 @@ fn apply_rule_inner(
             let indices: Vec<usize> = if seg == "*" {
                 (0..arr.len()).collect()
             } else if let Ok(i) = seg.parse::<usize>() {
-                if i < arr.len() {
-                    vec![i]
-                } else {
-                    Vec::new()
-                }
+                if i < arr.len() { vec![i] } else { Vec::new() }
             } else {
                 Vec::new()
             };
@@ -266,8 +270,14 @@ mod tests {
         }];
         let report = apply_redactions(&mut v, &rules);
         assert_eq!(report.total_matches, 2);
-        assert_eq!(v["events"][0]["tool_output"]["password"], json!("<REDACTED>"));
-        assert_eq!(v["events"][1]["tool_output"]["password"], json!("<REDACTED>"));
+        assert_eq!(
+            v["events"][0]["tool_output"]["password"],
+            json!("<REDACTED>")
+        );
+        assert_eq!(
+            v["events"][1]["tool_output"]["password"],
+            json!("<REDACTED>")
+        );
     }
 
     #[test]

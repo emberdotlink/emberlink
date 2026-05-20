@@ -198,14 +198,8 @@ pub fn render_systemd_unit(
     unit.push_str(&format!("ExecStart={exec}\n"));
     unit.push_str("Restart=always\n");
     unit.push_str("RestartSec=1s\n");
-    unit.push_str(&format!(
-        "StandardOutput=append:{}\n",
-        stdout_log.display()
-    ));
-    unit.push_str(&format!(
-        "StandardError=append:{}\n",
-        stderr_log.display()
-    ));
+    unit.push_str(&format!("StandardOutput=append:{}\n", stdout_log.display()));
+    unit.push_str(&format!("StandardError=append:{}\n", stderr_log.display()));
     for (k, v) in env {
         // systemd Environment= accepts key=value; values with whitespace must be quoted.
         unit.push_str(&format!("Environment={}={}\n", k, systemd_quote(v)));
@@ -461,7 +455,11 @@ fn macos_bootstrap(plist_path: &Path) -> Result<(), AgentError> {
     // Report the richer of the two error messages.
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let load_stderr = String::from_utf8_lossy(&load_out.stderr).to_string();
-    let combined = if load_stderr.is_empty() { stderr } else { format!("{stderr}\nload: {load_stderr}") };
+    let combined = if load_stderr.is_empty() {
+        stderr
+    } else {
+        format!("{stderr}\nload: {load_stderr}")
+    };
     Err(AgentError::CommandFailed {
         tool: "launchctl",
         status: output.status.to_string(),
@@ -914,7 +912,10 @@ mod tests {
     fn tail_file_returns_last_n_lines() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("log.txt");
-        let content = (1..=10).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let content = (1..=10)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         fs::write(&path, &content).unwrap();
         let tail = tail_file(&path, 3);
         assert_eq!(tail, "line 8\nline 9\nline 10");

@@ -19,7 +19,10 @@ fn format_terminal_reason(reason: &TerminalReason) -> String {
             };
             format!("revoked (by {actor}: {reason})")
         }
-        TerminalReason::ExhaustedByBudget { statement_sid, axis } => {
+        TerminalReason::ExhaustedByBudget {
+            statement_sid,
+            axis,
+        } => {
             let axis_str = match axis {
                 BudgetAxis::Tokens => "tokens",
                 BudgetAxis::Cents => "cents",
@@ -78,7 +81,7 @@ fn render_actions_observed(entries: &[AuditEntry]) -> String {
 /// Per design §7: output targets <80 lines for a typical receipt.
 ///
 /// The `raw` parameter is reserved for design v2 sidecar compatibility and is
-/// a no-op today. When the v2 schema lands (implementation-note-28), `raw = true` will
+/// a no-op today. When the v2 schema lands (implementation-note-35), `raw = true` will
 /// include the full sidecar tier-mapping and tool-aware redaction fields.
 pub fn render_receipt_markdown(receipt: &GrantReceipt, _raw: bool) -> String {
     let mut out = String::new();
@@ -206,6 +209,7 @@ mod tests {
                 terminal_reason: TerminalReason::Expired,
             },
             attestation: AttestationBinding::default(),
+            dev_mode_active: false,
             evidence: Evidence::default(),
         }
     }
@@ -221,7 +225,10 @@ mod tests {
     fn renders_iso8601_timestamps() {
         let md = render_receipt_markdown(&fixture(), false);
         // 1714492800 = 2024-04-30T16:00:00Z
-        assert!(md.contains("2024-04-30T16:00:00Z"), "should render ISO-8601: {md}");
+        assert!(
+            md.contains("2024-04-30T16:00:00Z"),
+            "should render ISO-8601: {md}"
+        );
     }
 
     #[test]
@@ -241,12 +248,15 @@ mod tests {
     fn renders_under_80_lines_for_minimal_receipt() {
         let md = render_receipt_markdown(&fixture(), false);
         let lines = md.lines().count();
-        assert!(lines < 80, "minimal receipt rendered to {lines} lines (target <80)");
+        assert!(
+            lines < 80,
+            "minimal receipt rendered to {lines} lines (target <80)"
+        );
     }
 
     #[test]
     fn raw_flag_currently_noop() {
-        // design v2 sidecar lands in implementation-note-28; today the flag is parsed
+        // design v2 sidecar lands in implementation-note-35; today the flag is parsed
         // but the rendering is identical regardless of value.
         let md_default = render_receipt_markdown(&fixture(), false);
         let md_raw = render_receipt_markdown(&fixture(), true);
@@ -274,7 +284,10 @@ mod tests {
             axis: BudgetAxis::Tokens,
         };
         let md = render_receipt_markdown(&f, false);
-        assert!(md.contains("exhausted_by_budget"), "expected exhausted variant: {md}");
+        assert!(
+            md.contains("exhausted_by_budget"),
+            "expected exhausted variant: {md}"
+        );
         assert!(md.contains("tokens"), "expected axis: {md}");
     }
 }

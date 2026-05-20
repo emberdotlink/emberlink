@@ -99,6 +99,7 @@ pub(crate) enum SeKeyInner {
 
     /// Stub for T1 unit tests — holds raw P-256 key bytes so the SSH
     /// framing code can be tested without requiring Touch ID hardware.
+    #[allow(dead_code)]
     Stub {
         /// Raw 32-byte P-256 private scalar (never exported outside tests).
         private_bytes: Vec<u8>,
@@ -159,7 +160,10 @@ pub(crate) enum SeKeyInner {
 /// # target_state_anchor
 ///
 /// `fn generate_secure_enclave_key`
-pub fn generate_secure_enclave_key(label: &str, target: SeKeychainTarget) -> Result<SeKeyHandle, SeError> {
+pub fn generate_secure_enclave_key(
+    label: &str,
+    target: SeKeychainTarget,
+) -> Result<SeKeyHandle, SeError> {
     // -------------------------------------------------------------------------
     // Real path — enabled only when compiled with `--features se-real` on a
     // signed macOS binary. The `security-framework` crate wraps the FFI.
@@ -189,19 +193,19 @@ pub fn generate_secure_enclave_key(label: &str, target: SeKeychainTarget) -> Res
         // keychain lookup framework treats biometric-only items as
         // unenumerable from a non-GUI context (the daemon got
         // `errSecItemNotFound` even though the key existed; see
-        // implementation-note-51 shipped checkpoint
+        // implementation-note-69 shipped checkpoint
         // below).
         //
         // The user-presence property the original
         // `BIOMETRY_CURRENT_SET` was reaching for is recovered at a higher
-        // layer by `implementation-note-52` — the daemon-MEK
+        // layer by `implementation-note-70` — the daemon-MEK
         // unwrap is autonomous (no Touch ID per daemon-start, which would be
         // terrible UX anyway), but the FIRST per-session vault operation
         // prompts Touch ID via cross-uid SecurityAgent. The SE-blob is still
         // hardware-bound: the SE key cannot be exported off the device, so
         // root-on-this-device is required to use it.
         //
-        // Anchor: implementation-note-53
+        // Anchor: implementation-note-71
         let flags = AccessControlOptions::PRIVATE_KEY_USAGE.bits();
         let access = SecAccessControl::create_with_protection(
             Some(ProtectionMode::AccessibleAfterFirstUnlockThisDeviceOnly),
@@ -219,8 +223,7 @@ pub fn generate_secure_enclave_key(label: &str, target: SeKeychainTarget) -> Res
             opts.set_location(Location::DataProtectionKeychain);
         }
 
-        let key = SecKey::new(&opts)
-            .map_err(|e| SeError::KeyGenFailed(e.to_string()))?;
+        let key = SecKey::new(&opts).map_err(|e| SeError::KeyGenFailed(e.to_string()))?;
 
         return Ok(SeKeyHandle {
             label: label.to_string(),
@@ -370,8 +373,9 @@ fn find_se_key_by_label(label: &str) -> Result<security_framework::key::SecKey, 
 ///
 /// On the stub path: derives a 32-byte key from `SHA-256(label || private_bytes)`,
 /// then produces `nonce(16) || auth_tag(32) || xor_stream(plaintext)` where the
-/// auth tag is `SHA-256(nonce || key || plaintext)` and the stream key is
-/// `SHA-256(nonce || key)` repeated as needed.
+/// auth tag is `SHA-256(0xFF || nonce || key || ciphertext)` (encrypt-then-MAC,
+/// per implementation-note-63 -B) and the stream key is
+/// `SHA-256(counter || nonce || key)` per 32-byte block.
 ///
 /// # Errors
 ///
@@ -379,14 +383,10 @@ fn find_se_key_by_label(label: &str) -> Result<security_framework::key::SecKey, 
 /// the underlying cryptographic operation fails.
 pub fn se_wrap(label: &str, plaintext: &[u8]) -> Result<Vec<u8>, SeError> {
     // Look up the thread-local stub key registry first (test path).
-    let maybe_key = STUB_KEY_STORE.with(|store| {
-        store.borrow().get(label).cloned()
-    });
+    let maybe_key = STUB_KEY_STORE.with(|store| store.borrow().get(label).cloned());
 
     match maybe_key {
-        Some(private_bytes) => {
-            stub_wrap(&private_bytes, label, plaintext)
-        }
+        Some(private_bytes) => stub_wrap(&private_bytes, label, plaintext),
         None => {
             // Real ECIES path via security-framework's SecKey::encrypt_data,
             // routed through the SE-resident public key derived from the
@@ -435,29 +435,27 @@ pub fn se_wrap(label: &str, plaintext: &[u8]) -> Result<Vec<u8>, SeError> {
 
 /// Unwrap (decrypt) `ciphertext` using the SE key identified by `label`.
 ///
-/// Inverse of [`se_wrap`]. On the stub path, validates the auth tag and
-/// XOR-decrypts the payload.
+/// Inverse of [`se_wrap`]. On the stub path, **verifies the auth tag
+/// constant-time first, then XOR-decrypts** (encrypt-then-MAC + verify-
+/// then-decrypt; see [`stub_unwrap`] for the per-byte invariant and the
+/// implementation-note-63 -B rationale).
 ///
 /// # Errors
 ///
 /// Returns [`SeError::UnwrapFailed`] if authentication fails, if no key is
 /// registered for `label`, or if the ciphertext is malformed.
 pub fn se_unwrap(label: &str, ciphertext: &[u8]) -> Result<Vec<u8>, SeError> {
-    let maybe_key = STUB_KEY_STORE.with(|store| {
-        store.borrow().get(label).cloned()
-    });
+    let maybe_key = STUB_KEY_STORE.with(|store| store.borrow().get(label).cloned());
 
     match maybe_key {
-        Some(private_bytes) => {
-            stub_unwrap(&private_bytes, label, ciphertext)
-        }
+        Some(private_bytes) => stub_unwrap(&private_bytes, label, ciphertext),
         None => {
             // Real ECIES path. SecKey::decrypt_data routes through the SE for
             // the ECDH-derive step; any SAC attached to the key (e.g. the
             // BiometryCurrentSet protection set by `generate_secure_enclave_key`)
             // triggers a biometric prompt here. For the daemon's separate-uid
             // posture (design) the install-side followup
-            // (implementation-note-54) pins the key to
+            // (implementation-note-63) pins the key to
             // the SystemKeychain without biometric protection so the daemon
             // can decrypt at startup without operator presence.
             #[cfg(feature = "se-real")]
@@ -501,7 +499,9 @@ thread_local! {
 pub fn se_register_stub_key(label: &str, handle: &SeKeyHandle) {
     if let SeKeyInner::Stub { private_bytes, .. } = &handle.inner {
         STUB_KEY_STORE.with(|store| {
-            store.borrow_mut().insert(label.to_string(), private_bytes.clone());
+            store
+                .borrow_mut()
+                .insert(label.to_string(), private_bytes.clone());
         });
     }
 }
@@ -529,18 +529,53 @@ fn keystream_block(counter: u8, nonce: &[u8; 16], key: &[u8; 32]) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// Compute auth tag: SHA-256(0xFF || nonce || key || plaintext).
-fn auth_tag(nonce: &[u8; 16], key: &[u8; 32], plaintext: &[u8]) -> [u8; 32] {
+/// Compute encrypt-then-MAC auth tag: `SHA-256(0xFF || nonce || key || ciphertext)`.
+///
+/// implementation-note-63 -B — the tag MUST be
+/// computed over the CIPHERTEXT (encrypt-then-MAC), not the plaintext.
+/// Tag-over-plaintext requires decryption before verification, which
+/// turned `stub_unwrap` into a padding/timing oracle on a malformed
+/// blob (the XOR stream is decrypted unconditionally, then the tag
+/// compares against attacker-influenced bytes). Tag-over-ciphertext
+/// lets `stub_unwrap` verify-then-decrypt: an attacker who tampers
+/// with `nonce || ciphertext` triggers the tag-mismatch return BEFORE
+/// any decryption happens.
+fn auth_tag(nonce: &[u8; 16], key: &[u8; 32], ciphertext: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update([0xFFu8]);
     h.update(nonce);
     h.update(key);
-    h.update(plaintext);
+    h.update(ciphertext);
     h.finalize().into()
 }
 
+/// Internal: XOR-encrypt/decrypt `input` against the keystream derived
+/// from `(counter, nonce, key)`. Symmetric — same function on the wrap
+/// (plaintext → ciphertext) and unwrap (ciphertext → plaintext) sides.
+fn xor_keystream(nonce: &[u8; 16], key: &[u8; 32], input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut counter: u8 = 0;
+    let mut block = keystream_block(counter, nonce, key);
+    let mut block_pos = 0usize;
+    for &b in input {
+        if block_pos == 32 {
+            counter = counter.wrapping_add(1);
+            block = keystream_block(counter, nonce, key);
+            block_pos = 0;
+        }
+        out.push(b ^ block[block_pos]);
+        block_pos += 1;
+    }
+    out
+}
+
 /// Stub wrap: `nonce(16) || tag(32) || xor_encrypt(plaintext)`.
+///
+/// Encrypt-then-MAC: encrypt the plaintext to ciphertext via the
+/// SHA-256-keystream XOR, then MAC `(nonce, key, ciphertext)`. The
+/// inverse path (`stub_unwrap`) can verify-then-decrypt without ever
+/// exposing tampered plaintext.
 fn stub_wrap(private_bytes: &[u8], label: &str, plaintext: &[u8]) -> Result<Vec<u8>, SeError> {
     let key = derive_stub_key(label, private_bytes);
 
@@ -548,22 +583,11 @@ fn stub_wrap(private_bytes: &[u8], label: &str, plaintext: &[u8]) -> Result<Vec<
     let mut nonce = [0u8; 16];
     getrandom::fill(&mut nonce).map_err(|e| SeError::WrapFailed(e.to_string()))?;
 
-    let tag = auth_tag(&nonce, &key, plaintext);
+    // Encrypt first (encrypt-then-MAC).
+    let ciphertext = xor_keystream(&nonce, &key, plaintext);
 
-    // XOR encrypt plaintext using a keystream derived from SHA-256 blocks.
-    let mut ciphertext = Vec::with_capacity(plaintext.len());
-    let mut counter: u8 = 0;
-    let mut block = keystream_block(counter, &nonce, &key);
-    let mut block_pos = 0usize;
-    for &b in plaintext {
-        if block_pos == 32 {
-            counter = counter.wrapping_add(1);
-            block = keystream_block(counter, &nonce, &key);
-            block_pos = 0;
-        }
-        ciphertext.push(b ^ block[block_pos]);
-        block_pos += 1;
-    }
+    // MAC over the ciphertext, not the plaintext.
+    let tag = auth_tag(&nonce, &key, &ciphertext);
 
     let mut out = Vec::with_capacity(16 + 32 + ciphertext.len());
     out.extend_from_slice(&nonce);
@@ -572,8 +596,34 @@ fn stub_wrap(private_bytes: &[u8], label: &str, plaintext: &[u8]) -> Result<Vec<
     Ok(out)
 }
 
-/// Stub unwrap: verify tag then XOR-decrypt.
+/// Stub unwrap: verify tag (constant-time, against ciphertext) **then**
+/// XOR-decrypt.
+///
+/// implementation-note-63 -B — the prior
+/// implementation decrypted before verifying, which:
+///   1. Did work the attacker controlled (touched every ciphertext byte
+///      before the tag check), and
+///   2. Verified the tag against the freshly-decrypted plaintext
+///      (tag-over-plaintext format), which means a malicious blob with
+///      a matching plaintext-MAC would still decrypt despite arbitrary
+///      ciphertext tampering.
+///
+/// The fix is two paired changes:
+///   - Wrap-side now MACs over ciphertext (encrypt-then-MAC; see
+///     [`auth_tag`] and [`stub_wrap`]).
+///   - Unwrap-side recomputes the expected tag from the *received*
+///     ciphertext, compares constant-time via `subtle::ConstantTimeEq`,
+///     and only on success runs the XOR decryption pass.
+///
+/// `subtle::ConstantTimeEq` is the canonical Rust primitive for
+/// constant-time byte-slice comparison; it is audited by the crypto
+/// community and replaces the prior `core::hint::black_box` /
+/// XOR-accumulate hand-rolled barrier (whose constant-time guarantee
+/// depended on LLVM honoring the black_box hint at every optimization
+/// level — best-effort, not guaranteed).
 fn stub_unwrap(private_bytes: &[u8], label: &str, ciphertext: &[u8]) -> Result<Vec<u8>, SeError> {
+    use subtle::ConstantTimeEq;
+
     if ciphertext.len() < 16 + 32 {
         return Err(SeError::UnwrapFailed("ciphertext too short".to_string()));
     }
@@ -584,38 +634,19 @@ fn stub_unwrap(private_bytes: &[u8], label: &str, ciphertext: &[u8]) -> Result<V
     let stored_tag: [u8; 32] = ciphertext[16..48].try_into().unwrap();
     let body = &ciphertext[48..];
 
-    // Decrypt body first, then verify tag.
-    let mut plaintext = Vec::with_capacity(body.len());
-    let mut counter: u8 = 0;
-    let mut block = keystream_block(counter, &nonce, &key);
-    let mut block_pos = 0usize;
-    for &b in body {
-        if block_pos == 32 {
-            counter = counter.wrapping_add(1);
-            block = keystream_block(counter, &nonce, &key);
-            block_pos = 0;
-        }
-        plaintext.push(b ^ block[block_pos]);
-        block_pos += 1;
+    // Verify-then-decrypt: compute expected tag from the received
+    // ciphertext (encrypt-then-MAC format), constant-time-compare
+    // against the stored tag, and reject BEFORE any decryption work.
+    let expected_tag = auth_tag(&nonce, &key, body);
+    if expected_tag.ct_eq(&stored_tag).unwrap_u8() != 1 {
+        return Err(SeError::UnwrapFailed(
+            "authentication tag mismatch".to_string(),
+        ));
     }
 
-    // Constant-time tag comparison (implementation-note-55--
-    // FOLLOWUPS -B). XOR-accumulate every byte pair into a single
-    // diff byte so the comparison loop never short-circuits on the
-    // first mismatch. core::hint::black_box wraps each operand AND the
-    // result so LLVM cannot reconstitute the loop as memcmp or elide
-    // the dead-store; without these barriers the constant-time claim
-    // holds only at -O0 (self-review finding on #2984).
-    let expected_tag = auth_tag(&nonce, &key, &plaintext);
-    let mut diff: u8 = 0;
-    for i in 0..32 {
-        diff |= core::hint::black_box(expected_tag[i]) ^ core::hint::black_box(stored_tag[i]);
-    }
-    if core::hint::black_box(diff) != 0 {
-        return Err(SeError::UnwrapFailed("authentication tag mismatch".to_string()));
-    }
-
-    Ok(plaintext)
+    // Tag verified — safe to run the XOR decryption pass. Mirrors the
+    // wrap-side `xor_keystream` (symmetric).
+    Ok(xor_keystream(&nonce, &key, body))
 }
 
 // ---------------------------------------------------------------------------
@@ -722,5 +753,61 @@ mod tests {
         let ct = se_wrap("test", b"hello").expect("wrap");
         let pt = se_unwrap("test", &ct).expect("unwrap");
         assert_eq!(pt, b"hello");
+    }
+
+    /// T1 — implementation-note-63 -B: stub_unwrap
+    /// must reject tampered ciphertext via the auth tag before producing
+    /// any plaintext. Exercises the encrypt-then-MAC + verify-then-decrypt
+    /// invariant on the stub path (deterministic, no SE hardware needed).
+    #[test]
+    fn stub_unwrap_rejects_ciphertext_tamper_before_decrypt() {
+        let handle = new_stub_key("tamper-reject");
+        se_register_stub_key("tamper-reject", &handle);
+
+        // Round-trip baseline so we know the wrap output format is stable.
+        let mut ct = se_wrap("tamper-reject", b"sensitive-payload").expect("wrap");
+        let baseline = se_unwrap("tamper-reject", &ct).expect("baseline unwrap");
+        assert_eq!(baseline, b"sensitive-payload");
+
+        // Flip a bit in the ciphertext body (past the 16-byte nonce +
+        // 32-byte tag prefix). Any single-bit flip in the encrypted bytes
+        // must cause the tag verification to fail.
+        let body_idx = 48usize;
+        assert!(ct.len() > body_idx, "ciphertext must include body bytes");
+        ct[body_idx] ^= 0x01;
+
+        let result = se_unwrap("tamper-reject", &ct);
+        match result {
+            Err(SeError::UnwrapFailed(msg)) => {
+                assert!(
+                    msg.contains("authentication tag mismatch"),
+                    "expected tag-mismatch diagnostic, got: {msg}"
+                );
+            }
+            Ok(pt) => {
+                panic!("expected UnwrapFailed for tampered ciphertext, got plaintext: {pt:?}")
+            }
+            Err(other) => panic!("expected UnwrapFailed for tampered ciphertext, got: {other:?}"),
+        }
+    }
+
+    /// T1 — implementation-note-63 -B: tampering
+    /// with the stored auth-tag region (offset 16..48) must also be
+    /// rejected. Complement to the body-tamper test — both attacker-
+    /// reachable regions of the blob are covered.
+    #[test]
+    fn stub_unwrap_rejects_tag_tamper() {
+        let handle = new_stub_key("tag-tamper");
+        se_register_stub_key("tag-tamper", &handle);
+
+        let mut ct = se_wrap("tag-tamper", b"tag-tamper-payload").expect("wrap");
+        // Flip a bit in the auth-tag region.
+        ct[20] ^= 0x80;
+
+        let result = se_unwrap("tag-tamper", &ct);
+        assert!(
+            matches!(result, Err(SeError::UnwrapFailed(_))),
+            "tampering with the tag region must produce UnwrapFailed, got: {result:?}"
+        );
     }
 }

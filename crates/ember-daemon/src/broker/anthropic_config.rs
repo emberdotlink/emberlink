@@ -21,7 +21,7 @@
 //!   A partial triple is an operator misconfiguration and we surface
 //!   it loudly rather than silently picking up the env fallback.
 //!
-//! This file exists for implementation-note-85;
+//! This file exists for implementation-note-108;
 //! the runtime wireup that consumes it lands in PR4B alongside the
 //! `EMBER_VAULT_FIRST` flag.
 
@@ -78,9 +78,11 @@ pub async fn anthropic_config_from_store(
         key: &str,
     ) -> Result<Option<String>, StoreError> {
         match store.get(key).await {
-            Ok(bytes) => Ok(Some(String::from_utf8(bytes).map_err(|e| {
-                StoreError::Other(format!("non-utf8 in {}: {e}", key))
-            })?)),
+            Ok(bytes) => {
+                Ok(Some(String::from_utf8(bytes).map_err(|e| {
+                    StoreError::Other(format!("non-utf8 in {}: {e}", key))
+                })?))
+            }
             Err(StoreError::NotFound(_)) => Ok(None),
             Err(other) => Err(other),
         }
@@ -142,8 +144,8 @@ mod tests {
     /// "reads anthropic/workspace/<tier>/{api-key,key-id}".
     #[tokio::test]
     async fn anthropic_config_from_store_reads_tier() {
-        use crate::infra::credential_store::test_helpers::MockCredentialStore;
         use crate::infra::credential_store::CredentialStore;
+        use crate::infra::credential_store::test_helpers::MockCredentialStore;
 
         let mock = MockCredentialStore::new();
         mock.put(
@@ -159,9 +161,7 @@ mod tests {
         .await
         .unwrap();
 
-        let result = anthropic_config_from_store(&mock, "default")
-            .await
-            .unwrap();
+        let result = anthropic_config_from_store(&mock, "default").await.unwrap();
         let creds = result.expect("credentials should be present");
         assert_eq!(creds.key_id, "workspace-key-abc123");
         assert_eq!(creds.api_key.expose_secret(), "sk-ant-fake-key-value");
@@ -187,8 +187,8 @@ mod tests {
     /// misconfiguration and must surface as `Err`.
     #[tokio::test]
     async fn anthropic_config_from_store_partial_pair_is_err() {
-        use crate::infra::credential_store::test_helpers::MockCredentialStore;
         use crate::infra::credential_store::CredentialStore;
+        use crate::infra::credential_store::test_helpers::MockCredentialStore;
 
         let mock = MockCredentialStore::new();
         mock.put(
@@ -214,8 +214,8 @@ mod tests {
     /// credentials for a different tier.
     #[tokio::test]
     async fn anthropic_config_from_store_tier_isolation() {
-        use crate::infra::credential_store::test_helpers::MockCredentialStore;
         use crate::infra::credential_store::CredentialStore;
+        use crate::infra::credential_store::test_helpers::MockCredentialStore;
 
         let mock = MockCredentialStore::new();
         mock.put(
@@ -232,9 +232,7 @@ mod tests {
         .unwrap();
 
         // The "default" tier is empty even though "agents-headless" is populated.
-        let result = anthropic_config_from_store(&mock, "default")
-            .await
-            .unwrap();
+        let result = anthropic_config_from_store(&mock, "default").await.unwrap();
         assert!(result.is_none(), "default tier must be empty");
 
         // The "agents-headless" tier resolves cleanly.

@@ -1,4 +1,4 @@
-//! implementation-note-258 regression coverage.
+//! implementation-note-363 regression coverage.
 //!
 //! Reproduces the bug where the TTL-expiry sweep silently failed to emit
 //! a Grant Receipt: the sweep call site discarded the wrapper's return
@@ -21,9 +21,7 @@
 
 use std::rc::Rc;
 
-use ember_daemon::infra::receipt::{
-    current_identity, init_identity, verify_receipt,
-};
+use ember_daemon::infra::receipt::{current_identity, init_identity, verify_receipt};
 use ember_daemon::infra::store::DaemonStore;
 use ember_daemon::infra::vault::Vault;
 use tempfile::TempDir;
@@ -57,14 +55,19 @@ fn ttl_expiry_sweep_emits_signed_receipt() {
     let identity = current_identity().expect("identity must be loaded for receipt emission");
 
     let store = store_with_vault();
-    let persona = store.create_persona("agent-receipt-emit").expect("create_persona");
+    let persona = store
+        .create_persona("agent-receipt-emit")
+        .expect("create_persona");
 
     // Mint a grant with a 1-second TTL — well under the sweep window.
     let grant = store
         .create_grant(&persona.id, "github-token", "repo:read", Some(1))
         .expect("create_grant with TTL");
     assert_eq!(grant.status, "active");
-    assert!(grant.expires_at.is_some(), "TTL grant must carry expires_at");
+    assert!(
+        grant.expires_at.is_some(),
+        "TTL grant must carry expires_at"
+    );
 
     // Pre-condition: zero receipts before the sweep.
     assert_eq!(
@@ -117,8 +120,7 @@ fn ttl_expiry_sweep_emits_signed_receipt() {
 #[test]
 fn ttl_expiry_sweep_is_idempotent() {
     let _id_dir = init_test_identity();
-    let _identity =
-        current_identity().expect("identity must be loaded for receipt emission");
+    let _identity = current_identity().expect("identity must be loaded for receipt emission");
 
     let store = store_with_vault();
     let persona = store

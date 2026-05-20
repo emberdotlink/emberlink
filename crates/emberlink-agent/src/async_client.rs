@@ -97,7 +97,8 @@ impl From<std::io::Error> for ClientError {
 // Client
 // ---------------------------------------------------------------------------
 
-type PendingMap = Arc<Mutex<HashMap<String, oneshot::Sender<Result<serde_json::Value, ClientError>>>>>;
+type PendingMap =
+    Arc<Mutex<HashMap<String, oneshot::Sender<Result<serde_json::Value, ClientError>>>>>;
 
 /// Payload pushed by the daemon when a Statement's budget crosses a 80% or
 /// 95% warning threshold. Mirrors the `budget.warning` JSON-RPC notification
@@ -126,11 +127,9 @@ pub struct BudgetExhaustedNotification {
 /// User-supplied callback for `budget.warning` notifications. Boxed as a
 /// trait object so a single reader task can invoke whatever the agent
 /// registers without a generic parameter leaking into the client type.
-pub type BudgetWarningCallback =
-    Arc<dyn Fn(BudgetWarningNotification) + Send + Sync + 'static>;
+pub type BudgetWarningCallback = Arc<dyn Fn(BudgetWarningNotification) + Send + Sync + 'static>;
 /// User-supplied callback for `budget.exhausted` notifications.
-pub type BudgetExhaustedCallback =
-    Arc<dyn Fn(BudgetExhaustedNotification) + Send + Sync + 'static>;
+pub type BudgetExhaustedCallback = Arc<dyn Fn(BudgetExhaustedNotification) + Send + Sync + 'static>;
 
 /// Set of push-notification callbacks wired into the reader task. Held in a
 /// `Mutex` so `on_budget_warning` / `on_budget_exhausted` setters can update
@@ -177,13 +176,8 @@ impl AsyncSocketClient {
             loop {
                 match lines.next_line().await {
                     Ok(Some(line)) => {
-                        dispatch_line(
-                            &line,
-                            &pending_reader,
-                            &cache_reader,
-                            &callbacks_reader,
-                        )
-                        .await;
+                        dispatch_line(&line, &pending_reader, &cache_reader, &callbacks_reader)
+                            .await;
                     }
                     Ok(None) => {
                         // EOF: fail any pending waiters.
@@ -196,9 +190,8 @@ impl AsyncSocketClient {
                     Err(e) => {
                         let mut guard = pending_reader.lock().await;
                         for (_, tx) in guard.drain() {
-                            let _ = tx.send(Err(ClientError::Io(std::io::Error::other(
-                                e.to_string(),
-                            ))));
+                            let _ =
+                                tx.send(Err(ClientError::Io(std::io::Error::other(e.to_string()))));
                         }
                         break;
                     }
@@ -521,10 +514,9 @@ mod tests {
         let received_cb = Arc::clone(&received);
         {
             let mut guard = callbacks.lock().await;
-            guard.on_budget_warning =
-                Some(Arc::new(move |p: BudgetWarningNotification| {
-                    received_cb.lock().unwrap().push(p);
-                }));
+            guard.on_budget_warning = Some(Arc::new(move |p: BudgetWarningNotification| {
+                received_cb.lock().unwrap().push(p);
+            }));
         }
         let notif = IncomingNotification {
             method: "budget.warning".into(),
@@ -556,10 +548,9 @@ mod tests {
         let received_cb = Arc::clone(&received);
         {
             let mut guard = callbacks.lock().await;
-            guard.on_budget_exhausted =
-                Some(Arc::new(move |p: BudgetExhaustedNotification| {
-                    received_cb.lock().unwrap().push(p);
-                }));
+            guard.on_budget_exhausted = Some(Arc::new(move |p: BudgetExhaustedNotification| {
+                received_cb.lock().unwrap().push(p);
+            }));
         }
         let notif = IncomingNotification {
             method: "budget.exhausted".into(),

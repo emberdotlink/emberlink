@@ -89,7 +89,8 @@ impl DemoApp {
             .objects
             .iter()
             .filter(|object| {
-                object.class == core_event_types::VaultObjectClass::PersonaCredential && !object.deleted
+                object.class == core_event_types::VaultObjectClass::PersonaCredential
+                    && !object.deleted
             })
             .collect::<Vec<_>>();
         if claims.is_empty() {
@@ -187,7 +188,8 @@ impl DemoApp {
             );
         };
         let payload = match self
-            .app_runtime.store
+            .app_runtime
+            .store
             .local_manifest_payload_bytes(&revision.manifest_id)
         {
             Ok(payload) => payload,
@@ -583,7 +585,8 @@ impl DemoApp {
             );
         };
         match self
-            .app_runtime.store
+            .app_runtime
+            .store
             .local_manifest_payload_bytes(&revision.manifest_id)
         {
             Ok(payload) => format!(
@@ -671,7 +674,11 @@ impl DemoApp {
         let Some(artifact_id) = artifact_id else {
             return usage.to_string();
         };
-        let record = match self.app_runtime.store.local_presentation_artifact(&artifact_id) {
+        let record = match self
+            .app_runtime
+            .store
+            .local_presentation_artifact(&artifact_id)
+        {
             Ok(Some(record)) => record,
             Ok(None) => {
                 return format!("Vault artifact unavailable: unknown artifact: {artifact_id}\n");
@@ -679,7 +686,8 @@ impl DemoApp {
             Err(err) => return format!("Failed to load vault artifacts: {}\n", err),
         };
         match self
-            .app_runtime.store
+            .app_runtime
+            .store
             .local_manifest_payload_bytes(&record.artifact.manifest_id)
         {
             Ok(payload) => format!(
@@ -770,7 +778,8 @@ impl DemoApp {
             Err(err) => return format!("Failed to resolve vault recipients: {}\n", err),
         };
         let catalog_manifest_id = self
-            .app_runtime.store
+            .app_runtime
+            .store
             .plan_local_vault_gc(&namespace)
             .ok()
             .flatten()
@@ -849,11 +858,15 @@ impl DemoApp {
         };
 
         match self
-            .app_runtime.store
+            .app_runtime
+            .store
             .local_received_presentation_artifact(&artifact_id)
         {
             Ok(Some(record)) => {
-                let verification = self.app_runtime.store.verify_disclosure_issuer(&record.envelope);
+                let verification = self
+                    .app_runtime
+                    .store
+                    .verify_disclosure_issuer(&record.envelope);
                 format!(
                     "Received Disclosure\n-------------------\nArtifact: {}\nStatus: {}\nVerification: {}\nIssuer: {}\nIssuer key: {}\nRecipient: {}\t{}\nSchema: {}\nManifest: {}\nReceipts: {}\nFirst received: {}\nLast received: {}\nFirst source: {}\t{}\nLast source: {}\t{}\nPayload:\n{}\n",
                     record.envelope.artifact.id,
@@ -905,7 +918,8 @@ impl DemoApp {
                     i += 2;
                 }
                 "--audience" if i + 1 < tokens.len() => {
-                    audience_kind = core_event_types::PresentationAudienceKind::parse(tokens[i + 1]);
+                    audience_kind =
+                        core_event_types::PresentationAudienceKind::parse(tokens[i + 1]);
                     i += 2;
                 }
                 "--namespace" if i + 1 < tokens.len() => {
@@ -957,7 +971,8 @@ impl DemoApp {
             expires_after_secs,
         ) {
             Ok(template) => match self
-                .app_runtime.store
+                .app_runtime
+                .store
                 .upsert_local_presentation_template(&template)
             {
                 Ok(()) => {
@@ -1019,7 +1034,11 @@ impl DemoApp {
             return usage.to_string();
         };
 
-        let template = match self.app_runtime.store.local_presentation_template(&template_id) {
+        let template = match self
+            .app_runtime
+            .store
+            .local_presentation_template(&template_id)
+        {
             Ok(Some(template)) => template,
             Ok(None) => {
                 return format!(
@@ -1155,7 +1174,11 @@ impl DemoApp {
                 );
             }
         };
-        let record = match self.app_runtime.store.local_presentation_artifact(&artifact_id) {
+        let record = match self
+            .app_runtime
+            .store
+            .local_presentation_artifact(&artifact_id)
+        {
             Ok(Some(record)) => record,
             Ok(None) => {
                 return format!(
@@ -1226,7 +1249,11 @@ impl DemoApp {
             return usage.to_string();
         };
 
-        let record = match self.app_runtime.store.local_presentation_artifact(&artifact_id) {
+        let record = match self
+            .app_runtime
+            .store
+            .local_presentation_artifact(&artifact_id)
+        {
             Ok(Some(record)) => record,
             Ok(None) => {
                 return format!(
@@ -1239,7 +1266,8 @@ impl DemoApp {
         let issuer_ref = match issuer_ref {
             Some(issuer_ref) => issuer_ref,
             None => match self
-                .app_runtime.store
+                .app_runtime
+                .store
                 .default_local_presentation_artifact_issuer_persona_id(&record.artifact.id)
             {
                 Ok(Some(persona_id)) => persona_id,
@@ -1339,7 +1367,8 @@ impl DemoApp {
             Err(err) => return format!("Failed to read disclosure artifact export: {}\n", err),
         };
         if let Err(err) = self
-            .app_runtime.store
+            .app_runtime
+            .store
             .validate_received_presentation_artifact(&envelope)
         {
             return format!("Failed to import disclosure artifact export: {}\n", err);
@@ -1393,7 +1422,8 @@ impl DemoApp {
             );
         }
         if let Err(err) = self
-            .app_runtime.store
+            .app_runtime
+            .store
             .validate_received_presentation_artifact(&envelope)
         {
             return format!("Failed to import disclosure message: {}\n", err);
@@ -1420,7 +1450,8 @@ impl DemoApp {
         let mut imported = 0;
         let cursor = self.disclosure_import_cursor;
         let new_messages: Vec<_> = self
-            .app_runtime.store
+            .app_runtime
+            .store
             .events_of_type(core_event_types::EventType::MessageSent)
             .skip(cursor)
             .collect();
@@ -1450,7 +1481,8 @@ impl DemoApp {
 
         for (message_id, envelope) in candidates {
             if self
-                .app_runtime.store
+                .app_runtime
+                .store
                 .local_received_presentation_artifact(&envelope.artifact.id)
                 .ok()
                 .flatten()
@@ -1459,14 +1491,16 @@ impl DemoApp {
                 continue;
             }
             if self
-                .app_runtime.store
+                .app_runtime
+                .store
                 .validate_received_presentation_artifact(&envelope)
                 .is_err()
             {
                 continue;
             }
             if self
-                .app_runtime.store
+                .app_runtime
+                .store
                 .receive_presentation_artifact(
                     &envelope,
                     core_state::ReceivedDisclosureSourceKind::Message,
@@ -1486,7 +1520,8 @@ impl DemoApp {
         message_ref: &str,
     ) -> Option<(String, String, core_storage::PresentationArtifactEnvelope)> {
         for event in self
-            .app_runtime.store
+            .app_runtime
+            .store
             .events_of_type_rev(core_event_types::EventType::MessageSent)
         {
             if let EventBody::MessageSent(body) = &event.body {
@@ -1543,7 +1578,11 @@ impl DemoApp {
         };
 
         // Look up the artifact to find the issuer persona
-        let record = match self.app_runtime.store.local_presentation_artifact(&artifact_id) {
+        let record = match self
+            .app_runtime
+            .store
+            .local_presentation_artifact(&artifact_id)
+        {
             Ok(Some(record)) => record,
             Ok(None) => {
                 return format!("Failed to revoke disclosure: unknown artifact: {artifact_id}\n");
@@ -1563,7 +1602,12 @@ impl DemoApp {
                     .to_string()
             }
         };
-        let persona = match self.app_runtime.store.materialized().persona(&issuer_persona_id) {
+        let persona = match self
+            .app_runtime
+            .store
+            .materialized()
+            .persona(&issuer_persona_id)
+        {
             Some(persona) => persona.clone(),
             None => {
                 return format!(
@@ -1774,7 +1818,8 @@ impl DemoApp {
             Err(err) => return format!("Failed to resolve vault recipients: {}\n", err),
         };
         let catalog_manifest_id = self
-            .app_runtime.store
+            .app_runtime
+            .store
             .plan_local_vault_gc(&namespace)
             .ok()
             .flatten()
@@ -1878,7 +1923,8 @@ impl DemoApp {
             );
         };
         let payload_bytes = match self
-            .app_runtime.store
+            .app_runtime
+            .store
             .local_manifest_payload_bytes(&revision.manifest_id)
         {
             Ok(bytes) => bytes,
@@ -1890,14 +1936,19 @@ impl DemoApp {
             // The payload is [header_chunk, file_content_chunk...]
             // Header format: "emberlink-file-header\nfilename=...\n"
             // We need to split on the header boundary
-            let manifest = match self.app_runtime.store.local_file_manifest(&revision.manifest_id) {
+            let manifest = match self
+                .app_runtime
+                .store
+                .local_file_manifest(&revision.manifest_id)
+            {
                 Ok(Some(m)) => m,
                 _ => return "Export failed: cannot load manifest\n".to_string(),
             };
             if manifest.chunks.len() >= 2 {
                 // Re-read just the file content chunks (skip first chunk which is the header)
                 match self
-                    .app_runtime.store
+                    .app_runtime
+                    .store
                     .local_manifest_payload_chunks(&revision.manifest_id)
                 {
                     Ok(chunks) if chunks.len() >= 2 => {
@@ -2020,7 +2071,11 @@ impl DemoApp {
                 Ok(p) => p,
                 Err(err) => return format!("Failed to resolve persona: {}\n", err),
             };
-            match self.app_runtime.store.service_bindings_for_persona(&persona.id) {
+            match self
+                .app_runtime
+                .store
+                .service_bindings_for_persona(&persona.id)
+            {
                 Ok(b) => b,
                 Err(err) => return format!("Failed to load service bindings: {}\n", err),
             }
@@ -2123,7 +2178,11 @@ impl DemoApp {
         let import_format = match format_str.as_str() {
             "bitwarden" => core_state::PasswordImportFormat::BitwardenCsv,
             "1password" => core_state::PasswordImportFormat::OnePasswordCsv,
-            _ => return format!("Unknown import format: {format_str}. Use 'bitwarden' or '1password'.\n"),
+            _ => {
+                return format!(
+                    "Unknown import format: {format_str}. Use 'bitwarden' or '1password'.\n"
+                );
+            }
         };
 
         let csv_text = match std::fs::read_to_string(&file_path) {
@@ -2177,10 +2236,15 @@ impl DemoApp {
         let now = now_epoch_secs();
 
         for claim in &imported_claims {
-            let service_name: String = serde_json::from_str::<serde_json::Value>(&claim.payload_json)
-                .ok()
-                .and_then(|v| v.get("service_name").and_then(|s| s.as_str()).map(String::from))
-                .unwrap_or_else(|| format!("credential-{}", stored + 1));
+            let service_name: String =
+                serde_json::from_str::<serde_json::Value>(&claim.payload_json)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("service_name")
+                            .and_then(|s| s.as_str())
+                            .map(String::from)
+                    })
+                    .unwrap_or_else(|| format!("credential-{}", stored + 1));
 
             let object_id = format!(
                 "pw-{}",
@@ -2235,7 +2299,10 @@ impl DemoApp {
         }
 
         if let Err(err) = self.persist_to_disk() {
-            return format!("Imported {} credentials but failed to persist: {}\n", stored, err);
+            return format!(
+                "Imported {} credentials but failed to persist: {}\n",
+                stored, err
+            );
         }
 
         let mut out = format!(
@@ -2303,19 +2370,13 @@ impl DemoApp {
         let origin = origin.unwrap_or_else(|| format!("https://{rp_id}"));
 
         // Get the persona's signing key for the passkey.
-        let key_record = match self.find_local_key(
-            "persona",
-            &persona.id,
-            &persona.active_key.key_id,
-        ) {
-            Some(r) => r.clone(),
-            None => {
-                return format!(
-                    "No local signing key for persona {}\n",
-                    persona.id
-                );
-            }
-        };
+        let key_record =
+            match self.find_local_key("persona", &persona.id, &persona.active_key.key_id) {
+                Some(r) => r.clone(),
+                None => {
+                    return format!("No local signing key for persona {}\n", persona.id);
+                }
+            };
 
         let local_signer =
             match core_crypto::LocalKeySigner::from_local_key_pair(&key_record.key_pair) {
@@ -2366,18 +2427,8 @@ impl DemoApp {
                     binding_id, rp_name, rp_id
                 )
                 .unwrap();
-                writeln!(
-                    &mut out,
-                    "  credential_id: {}",
-                    result.credential_id_b64url
-                )
-                .unwrap();
-                writeln!(
-                    &mut out,
-                    "  persona: {} ({})",
-                    persona.id, persona.label
-                )
-                .unwrap();
+                writeln!(&mut out, "  credential_id: {}", result.credential_id_b64url).unwrap();
+                writeln!(&mut out, "  persona: {} ({})", persona.id, persona.label).unwrap();
                 writeln!(&mut out, "  origin: {}", origin).unwrap();
                 writeln!(
                     &mut out,
@@ -2422,11 +2473,7 @@ impl DemoApp {
         let passkey_bindings: Vec<_> = bindings
             .iter()
             .filter(|b| b.descriptor.adapter_kind == "passkey")
-            .filter(|b| {
-                persona_id
-                    .as_ref()
-                    .is_none_or(|pid| &b.persona_id == pid)
-            })
+            .filter(|b| persona_id.as_ref().is_none_or(|pid| &b.persona_id == pid))
             .collect();
 
         if passkey_bindings.is_empty() {
@@ -2463,8 +2510,7 @@ impl DemoApp {
     }
 
     pub(crate) fn handle_passkey_authenticate(&mut self, tokens: &[&str]) -> String {
-        let usage =
-            "Usage: passkey authenticate --id <binding-id> [--challenge <base64url>]\n";
+        let usage = "Usage: passkey authenticate --id <binding-id> [--challenge <base64url>]\n";
         let mut binding_id = None;
         let mut challenge_b64 = None;
         let mut i = 0;
@@ -2514,19 +2560,13 @@ impl DemoApp {
             Err(err) => return format!("Failed to resolve persona: {}\n", err),
         };
 
-        let key_record = match self.find_local_key(
-            "persona",
-            &persona.id,
-            &persona.active_key.key_id,
-        ) {
-            Some(r) => r.clone(),
-            None => {
-                return format!(
-                    "No local signing key for persona {}\n",
-                    persona.id
-                );
-            }
-        };
+        let key_record =
+            match self.find_local_key("persona", &persona.id, &persona.active_key.key_id) {
+                Some(r) => r.clone(),
+                None => {
+                    return format!("No local signing key for persona {}\n", persona.id);
+                }
+            };
 
         let local_signer =
             match core_crypto::LocalKeySigner::from_local_key_pair(&key_record.key_pair) {
@@ -2561,7 +2601,11 @@ impl DemoApp {
             external_account_id: serde_json::to_string(&meta).unwrap_or_default(),
             ..binding
         };
-        if let Err(err) = self.app_runtime.store.upsert_service_binding(&updated_binding) {
+        if let Err(err) = self
+            .app_runtime
+            .store
+            .upsert_service_binding(&updated_binding)
+        {
             return format!("Warning: failed to update sign count: {}\n", err);
         }
 
@@ -2591,12 +2635,7 @@ impl DemoApp {
             assertion.authenticator_data.len()
         )
         .unwrap();
-        writeln!(
-            &mut out,
-            "  signature: {} bytes",
-            assertion.signature.len()
-        )
-        .unwrap();
+        writeln!(&mut out, "  signature: {} bytes", assertion.signature.len()).unwrap();
         writeln!(
             &mut out,
             "  local_verify: {}",

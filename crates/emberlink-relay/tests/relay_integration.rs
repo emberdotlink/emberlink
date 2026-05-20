@@ -4,8 +4,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use emberlink_relay::{
-    AdmittedRequest, Command, RelayConfig, RelayState, ShutdownNotice, StoredOffer,
-    admission, admit_submission_payload, handle_claim_offer, handle_deposit_offer,
+    AdmittedRequest, Command, RelayConfig, RelayState, ShutdownNotice, StoredOffer, admission,
+    admit_submission_payload, handle_claim_offer, handle_deposit_offer,
     handle_fetch_and_claim_offer, handle_fetch_grant_requests, handle_fetch_offer,
     handle_request_grant, handle_respond_grant_request, now_epoch_secs, offer_admission_ok,
     parse_command, run_health_server, run_ws_listener,
@@ -16,9 +16,9 @@ fn test_admitted(persona: &str, scope: &str) -> AdmittedRequest {
     admission::gate(None, Some(persona), Some(scope)).expect("test gate admits")
 }
 use core_crypto::{FixtureSigner, Signer as CryptoSigner};
-use core_sync::wrap_for_relay;
+use core_principals::AdmissionToken;
 use core_principals::{RelayMode, TrustThreshold};
-use core_principals::{AdmissionToken};
+use core_sync::wrap_for_relay;
 
 fn signed_admission_token(
     signer: &FixtureSigner,
@@ -166,25 +166,44 @@ fn parse_drain_requires_token_when_configured() {
         Command::AdminRequired
     ));
     // No admin token configured — still works without token
-    assert!(
-        matches!(parse_command(b"DRAIN my-peer", None), Command::Drain(id) if id == "my-peer")
-    );
+    assert!(matches!(parse_command(b"DRAIN my-peer", None), Command::Drain(id) if id == "my-peer"));
 }
 
 #[test]
 fn parse_stats_requires_token_when_configured() {
     assert!(matches!(parse_command(b"STATS", None), Command::Stats));
-    assert!(matches!(parse_command(b"STATS tok", Some("tok")), Command::Stats));
-    assert!(matches!(parse_command(b"STATS wrong", Some("tok")), Command::AdminRequired));
-    assert!(matches!(parse_command(b"STATS", Some("tok")), Command::AdminRequired));
+    assert!(matches!(
+        parse_command(b"STATS tok", Some("tok")),
+        Command::Stats
+    ));
+    assert!(matches!(
+        parse_command(b"STATS wrong", Some("tok")),
+        Command::AdminRequired
+    ));
+    assert!(matches!(
+        parse_command(b"STATS", Some("tok")),
+        Command::AdminRequired
+    ));
 }
 
 #[test]
 fn parse_shutdown_requires_token_when_configured() {
-    assert!(matches!(parse_command(b"SHUTDOWN", None), Command::Shutdown));
-    assert!(matches!(parse_command(b"SHUTDOWN tok", Some("tok")), Command::Shutdown));
-    assert!(matches!(parse_command(b"SHUTDOWN wrong", Some("tok")), Command::AdminRequired));
-    assert!(matches!(parse_command(b"SHUTDOWN", Some("tok")), Command::AdminRequired));
+    assert!(matches!(
+        parse_command(b"SHUTDOWN", None),
+        Command::Shutdown
+    ));
+    assert!(matches!(
+        parse_command(b"SHUTDOWN tok", Some("tok")),
+        Command::Shutdown
+    ));
+    assert!(matches!(
+        parse_command(b"SHUTDOWN wrong", Some("tok")),
+        Command::AdminRequired
+    ));
+    assert!(matches!(
+        parse_command(b"SHUTDOWN", Some("tok")),
+        Command::AdminRequired
+    ));
 }
 
 #[test]
@@ -408,23 +427,36 @@ fn plain_tls_config_returns_none() {
 #[test]
 fn parse_shutdown_notice_extracts_reason_and_deadline() {
     let cmd = parse_command(b"SHUTDOWN-NOTICE legal-compliance 1700000000", None);
-    let Command::ShutdownNotice(notice) = cmd else { panic!("expected ShutdownNotice") };
+    let Command::ShutdownNotice(notice) = cmd else {
+        panic!("expected ShutdownNotice")
+    };
     assert_eq!(notice.reason, "legal-compliance");
     assert_eq!(notice.deadline_epoch, 1700000000);
 }
 
 #[test]
 fn parse_shutdown_notice_allows_multi_word_reason() {
-    let cmd = parse_command(b"SHUTDOWN-NOTICE server maintenance window 1700000000", None);
-    let Command::ShutdownNotice(notice) = cmd else { panic!("expected ShutdownNotice") };
+    let cmd = parse_command(
+        b"SHUTDOWN-NOTICE server maintenance window 1700000000",
+        None,
+    );
+    let Command::ShutdownNotice(notice) = cmd else {
+        panic!("expected ShutdownNotice")
+    };
     assert_eq!(notice.reason, "server maintenance window");
     assert_eq!(notice.deadline_epoch, 1700000000);
 }
 
 #[test]
 fn parse_shutdown_notice_rejects_missing_deadline() {
-    assert!(matches!(parse_command(b"SHUTDOWN-NOTICE", None), Command::Submission));
-    assert!(matches!(parse_command(b"SHUTDOWN-NOTICE ", None), Command::Submission));
+    assert!(matches!(
+        parse_command(b"SHUTDOWN-NOTICE", None),
+        Command::Submission
+    ));
+    assert!(matches!(
+        parse_command(b"SHUTDOWN-NOTICE ", None),
+        Command::Submission
+    ));
 }
 
 #[test]
@@ -447,7 +479,9 @@ fn parse_shutdown_notice_rejects_empty_reason() {
 fn parse_shutdown_notice_requires_token_when_configured() {
     // Authenticated format: SHUTDOWN-NOTICE <token> <reason> <deadline>
     let cmd = parse_command(b"SHUTDOWN-NOTICE tok maintenance 1700000000", Some("tok"));
-    let Command::ShutdownNotice(notice) = cmd else { panic!("expected ShutdownNotice") };
+    let Command::ShutdownNotice(notice) = cmd else {
+        panic!("expected ShutdownNotice")
+    };
     assert_eq!(notice.reason, "maintenance");
     assert_eq!(notice.deadline_epoch, 1700000000);
 
@@ -519,9 +553,11 @@ fn parse_deposit_offer_valid() {
         format!("DEPOSIT_OFFER offer-abc 9999999999 {hex}").as_bytes(),
         None,
     );
-    assert!(matches!(cmd, Command::DepositOffer { offer_id, expires_at, payload }
-        if offer_id == "offer-abc" && expires_at == 9999999999 && payload == b"sealed-bytes"
-    ));
+    assert!(
+        matches!(cmd, Command::DepositOffer { offer_id, expires_at, payload }
+            if offer_id == "offer-abc" && expires_at == 9999999999 && payload == b"sealed-bytes"
+        )
+    );
 }
 
 #[test]
@@ -661,17 +697,36 @@ fn deposit_duplicate_offer_is_rejected() {
     let cfg = Arc::new(test_offer_config());
     let c = Arc::clone(&cfg);
     let buf = with_loopback(move |stream| {
-        handle_deposit_offer(stream, &s, &c, "offer-dup".to_string(), far_future, b"payload".to_vec(), "test-peer");
+        handle_deposit_offer(
+            stream,
+            &s,
+            &c,
+            "offer-dup".to_string(),
+            far_future,
+            b"payload".to_vec(),
+            "test-peer",
+        );
     });
     assert!(read_response(&buf).starts_with("OK deposited"));
 
     // Second deposit with same ID is rejected.
     let c = Arc::clone(&cfg);
     let buf = with_loopback(move |stream| {
-        handle_deposit_offer(stream, &state, &c, "offer-dup".to_string(), far_future, b"payload".to_vec(), "test-peer");
+        handle_deposit_offer(
+            stream,
+            &state,
+            &c,
+            "offer-dup".to_string(),
+            far_future,
+            b"payload".to_vec(),
+            "test-peer",
+        );
     });
     let resp = read_response(&buf);
-    assert!(resp.starts_with("REJECTED offer already exists"), "got: {resp}");
+    assert!(
+        resp.starts_with("REJECTED offer already exists"),
+        "got: {resp}"
+    );
 }
 
 #[test]
@@ -681,10 +736,21 @@ fn deposit_already_expired_offer_is_rejected() {
 
     let cfg = Arc::new(test_offer_config());
     let buf = with_loopback(move |stream| {
-        handle_deposit_offer(stream, &state, &cfg, "offer-expired".to_string(), past, b"payload".to_vec(), "test-peer");
+        handle_deposit_offer(
+            stream,
+            &state,
+            &cfg,
+            "offer-expired".to_string(),
+            past,
+            b"payload".to_vec(),
+            "test-peer",
+        );
     });
     let resp = read_response(&buf);
-    assert!(resp.starts_with("REJECTED offer already expired"), "got: {resp}");
+    assert!(
+        resp.starts_with("REJECTED offer already expired"),
+        "got: {resp}"
+    );
 }
 
 #[test]
@@ -722,11 +788,21 @@ fn purge_expired_offers_removes_only_expired() {
 
     state.offers.insert(
         "expired".to_string(),
-        StoredOffer { payload: vec![], expires_at: now.saturating_sub(1), claimed: false, source: "test".into() },
+        StoredOffer {
+            payload: vec![],
+            expires_at: now.saturating_sub(1),
+            claimed: false,
+            source: "test".into(),
+        },
     );
     state.offers.insert(
         "live".to_string(),
-        StoredOffer { payload: vec![], expires_at: now + 3600, claimed: false, source: "test".into() },
+        StoredOffer {
+            payload: vec![],
+            expires_at: now + 3600,
+            claimed: false,
+            source: "test".into(),
+        },
     );
 
     state.purge_expired_offers(now);
@@ -746,7 +822,12 @@ fn claim_offer_during_shutdown_notice_is_allowed() {
         let mut s = state.lock().unwrap();
         s.offers.insert(
             "offer-pre".to_string(),
-            StoredOffer { payload: b"blob".to_vec(), expires_at: far_future, claimed: false, source: "test".into() },
+            StoredOffer {
+                payload: b"blob".to_vec(),
+                expires_at: far_future,
+                claimed: false,
+                source: "test".into(),
+            },
         );
     }
 
@@ -774,7 +855,12 @@ fn fetch_and_claim_returns_payload_and_marks_claimed() {
         let mut s = state.lock().unwrap();
         s.offers.insert(
             "offer-atomic".to_string(),
-            StoredOffer { payload: payload.clone(), expires_at: far_future, claimed: false, source: "test".into() },
+            StoredOffer {
+                payload: payload.clone(),
+                expires_at: far_future,
+                claimed: false,
+                source: "test".into(),
+            },
         );
     }
 
@@ -791,7 +877,15 @@ fn fetch_and_claim_returns_payload_and_marks_claimed() {
     );
 
     // Offer is now claimed.
-    assert!(state.lock().unwrap().offers.get("offer-atomic").unwrap().claimed);
+    assert!(
+        state
+            .lock()
+            .unwrap()
+            .offers
+            .get("offer-atomic")
+            .unwrap()
+            .claimed
+    );
 }
 
 /// Second FETCH_AND_CLAIM on the same offer returns CLAIMED.
@@ -804,7 +898,12 @@ fn fetch_and_claim_second_attempt_returns_claimed() {
         let mut s = state.lock().unwrap();
         s.offers.insert(
             "offer-once".to_string(),
-            StoredOffer { payload: b"blob".to_vec(), expires_at: far_future, claimed: false, source: "test".into() },
+            StoredOffer {
+                payload: b"blob".to_vec(),
+                expires_at: far_future,
+                claimed: false,
+                source: "test".into(),
+            },
         );
     }
 
@@ -846,7 +945,12 @@ fn fetch_and_claim_race_condition_only_one_wins() {
         let mut s = state.lock().unwrap();
         s.offers.insert(
             "offer-race".to_string(),
-            StoredOffer { payload: b"secret".to_vec(), expires_at: far_future, claimed: false, source: "test".into() },
+            StoredOffer {
+                payload: b"secret".to_vec(),
+                expires_at: far_future,
+                claimed: false,
+                source: "test".into(),
+            },
         );
     }
 
@@ -869,8 +973,14 @@ fn fetch_and_claim_race_condition_only_one_wins() {
     let winners = results.iter().filter(|r| r.starts_with("OFFER")).count();
     let losers = results.iter().filter(|r| *r == "CLAIMED").count();
 
-    assert_eq!(winners, 1, "exactly one client should get the payload, got: {results:?}");
-    assert_eq!(losers, 1, "exactly one client should be rejected, got: {results:?}");
+    assert_eq!(
+        winners, 1,
+        "exactly one client should get the payload, got: {results:?}"
+    );
+    assert_eq!(
+        losers, 1,
+        "exactly one client should be rejected, got: {results:?}"
+    );
 }
 
 #[test]
@@ -897,7 +1007,10 @@ fn deposit_offer_blocked_during_shutdown_notice() {
         );
     });
     let resp = read_response(&buf);
-    assert!(resp.starts_with("REJECTED relay is shutting down"), "got: {resp}");
+    assert!(
+        resp.starts_with("REJECTED relay is shutting down"),
+        "got: {resp}"
+    );
 }
 
 // ── R-H1: Offer admission gating tests ──────────────────────────────────
@@ -940,25 +1053,58 @@ fn deposit_rejected_when_per_peer_quota_exceeded() {
     let s = Arc::clone(&state);
     let c = Arc::clone(&cfg);
     let buf = with_loopback(move |stream| {
-        handle_deposit_offer(stream, &s, &c, "offer-1".into(), far_future, b"a".to_vec(), "peer-a");
+        handle_deposit_offer(
+            stream,
+            &s,
+            &c,
+            "offer-1".into(),
+            far_future,
+            b"a".to_vec(),
+            "peer-a",
+        );
     });
-    assert!(read_response(&buf).starts_with("OK deposited"), "first deposit should succeed");
+    assert!(
+        read_response(&buf).starts_with("OK deposited"),
+        "first deposit should succeed"
+    );
 
     // Second deposit from same source is rejected.
     let s = Arc::clone(&state);
     let c = Arc::clone(&cfg);
     let buf = with_loopback(move |stream| {
-        handle_deposit_offer(stream, &s, &c, "offer-2".into(), far_future, b"b".to_vec(), "peer-a");
+        handle_deposit_offer(
+            stream,
+            &s,
+            &c,
+            "offer-2".into(),
+            far_future,
+            b"b".to_vec(),
+            "peer-a",
+        );
     });
     let resp = read_response(&buf);
-    assert!(resp.starts_with("REJECTED offer quota exceeded"), "got: {resp}");
+    assert!(
+        resp.starts_with("REJECTED offer quota exceeded"),
+        "got: {resp}"
+    );
 
     // Different source succeeds.
     let c = Arc::clone(&cfg);
     let buf = with_loopback(move |stream| {
-        handle_deposit_offer(stream, &state, &c, "offer-3".into(), far_future, b"c".to_vec(), "peer-b");
+        handle_deposit_offer(
+            stream,
+            &state,
+            &c,
+            "offer-3".into(),
+            far_future,
+            b"c".to_vec(),
+            "peer-b",
+        );
     });
-    assert!(read_response(&buf).starts_with("OK deposited"), "different peer should succeed");
+    assert!(
+        read_response(&buf).starts_with("OK deposited"),
+        "different peer should succeed"
+    );
 }
 
 #[test]
@@ -973,17 +1119,36 @@ fn deposit_rejected_when_byte_quota_exceeded() {
     let s = Arc::clone(&state);
     let c = Arc::clone(&cfg);
     let buf = with_loopback(move |stream| {
-        handle_deposit_offer(stream, &s, &c, "offer-1".into(), far_future, vec![0u8; 8], "p");
+        handle_deposit_offer(
+            stream,
+            &s,
+            &c,
+            "offer-1".into(),
+            far_future,
+            vec![0u8; 8],
+            "p",
+        );
     });
     assert!(read_response(&buf).starts_with("OK deposited"));
 
     // Second deposit with 5 bytes exceeds the 10-byte limit.
     let c = Arc::clone(&cfg);
     let buf = with_loopback(move |stream| {
-        handle_deposit_offer(stream, &state, &c, "offer-2".into(), far_future, vec![0u8; 5], "p");
+        handle_deposit_offer(
+            stream,
+            &state,
+            &c,
+            "offer-2".into(),
+            far_future,
+            vec![0u8; 5],
+            "p",
+        );
     });
     let resp = read_response(&buf);
-    assert!(resp.starts_with("REJECTED offer store byte quota"), "got: {resp}");
+    assert!(
+        resp.starts_with("REJECTED offer store byte quota"),
+        "got: {resp}"
+    );
 }
 
 #[test]
@@ -998,14 +1163,26 @@ fn deposit_ttl_capped_to_max() {
     let s = Arc::clone(&state);
     let c = Arc::clone(&cfg);
     let buf = with_loopback(move |stream| {
-        handle_deposit_offer(stream, &s, &c, "offer-ttl".into(), far_future, b"x".to_vec(), "p");
+        handle_deposit_offer(
+            stream,
+            &s,
+            &c,
+            "offer-ttl".into(),
+            far_future,
+            b"x".to_vec(),
+            "p",
+        );
     });
     assert!(read_response(&buf).starts_with("OK deposited"));
 
     // The stored expires_at should be capped to now + 60.
     let s = state.lock().unwrap();
     let offer = s.offers.get("offer-ttl").unwrap();
-    assert!(offer.expires_at <= now + 60 + 1, "TTL should be capped; got expires_at={}", offer.expires_at);
+    assert!(
+        offer.expires_at <= now + 60 + 1,
+        "TTL should be capped; got expires_at={}",
+        offer.expires_at
+    );
 }
 
 #[test]
@@ -1064,7 +1241,15 @@ fn expired_offer_does_not_block_new_deposit_with_same_id() {
     let cfg = Arc::new(test_offer_config());
     let far_future = now_epoch_secs() + 3600;
     let buf = with_loopback(move |stream| {
-        handle_deposit_offer(stream, &state, &cfg, "offer-reuse".into(), far_future, b"new".to_vec(), "test");
+        handle_deposit_offer(
+            stream,
+            &state,
+            &cfg,
+            "offer-reuse".into(),
+            far_future,
+            b"new".to_vec(),
+            "test",
+        );
     });
     let resp = read_response(&buf);
     assert!(resp.starts_with("OK deposited offer-reuse"), "got: {resp}");
@@ -1087,15 +1272,28 @@ fn health_endpoint_returns_ok_json() {
     thread::sleep(Duration::from_millis(50));
 
     let mut conn = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
-    conn.write_all(b"GET /health HTTP/1.0\r\nHost: localhost\r\n\r\n").unwrap();
+    conn.write_all(b"GET /health HTTP/1.0\r\nHost: localhost\r\n\r\n")
+        .unwrap();
 
     let mut response = String::new();
     conn.read_to_string(&mut response).unwrap();
 
-    assert!(response.starts_with("HTTP/1.1 200 OK"), "unexpected response: {response}");
-    assert!(response.contains("\"status\":\"ok\""), "missing status field: {response}");
-    assert!(response.contains("\"mode\":\"open\""), "missing mode field: {response}");
-    assert!(response.contains("\"uptime_secs\":"), "missing uptime field: {response}");
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "unexpected response: {response}"
+    );
+    assert!(
+        response.contains("\"status\":\"ok\""),
+        "missing status field: {response}"
+    );
+    assert!(
+        response.contains("\"mode\":\"open\""),
+        "missing mode field: {response}"
+    );
+    assert!(
+        response.contains("\"uptime_secs\":"),
+        "missing uptime field: {response}"
+    );
 }
 
 #[test]
@@ -1118,7 +1316,10 @@ fn health_endpoint_returns_404_for_unknown_path() {
     let mut response = String::new();
     conn.read_to_string(&mut response).unwrap();
 
-    assert!(response.starts_with("HTTP/1.1 404"), "expected 404, got: {response}");
+    assert!(
+        response.starts_with("HTTP/1.1 404"),
+        "expected 404, got: {response}"
+    );
 }
 
 /// WebSocket: send a STATS command over WS Binary, receive a valid STATS response.
@@ -1126,7 +1327,7 @@ fn health_endpoint_returns_404_for_unknown_path() {
 fn ws_stats_command_returns_valid_response() {
     use std::net::TcpListener;
     use std::sync::atomic::AtomicUsize;
-    use tungstenite::{connect, Message};
+    use tungstenite::{Message, connect};
 
     let state = Arc::new(Mutex::new(RelayState::default()));
     let config = Arc::new(RelayConfig {
@@ -1147,8 +1348,7 @@ fn ws_stats_command_returns_valid_response() {
     thread::sleep(Duration::from_millis(50));
 
     // Connect via tungstenite client.
-    let (mut ws, _resp) =
-        connect(format!("ws://127.0.0.1:{port}")).expect("ws connect failed");
+    let (mut ws, _resp) = connect(format!("ws://127.0.0.1:{port}")).expect("ws connect failed");
 
     // Send STATS as a Binary message (no length prefix — WS provides framing).
     ws.send(Message::Binary(b"STATS".to_vec().into()))
@@ -1193,7 +1393,10 @@ fn health_endpoint_includes_ws_port() {
     let mut response = String::new();
     conn.read_to_string(&mut response).unwrap();
 
-    assert!(response.contains("\"ws_port\":9200"), "missing ws_port: {response}");
+    assert!(
+        response.contains("\"ws_port\":9200"),
+        "missing ws_port: {response}"
+    );
 }
 
 // ── Grant request protocol tests ────────────────────────────────────────
@@ -1229,15 +1432,19 @@ fn parse_fetch_grant_requests_valid() {
 #[test]
 fn parse_respond_grant_request_approved() {
     let cmd = parse_command(b"RESPOND_GRANT_REQUEST gr-0 approved", None);
-    assert!(matches!(cmd, Command::RespondGrantRequest { request_id, approved }
-        if request_id == "gr-0" && approved));
+    assert!(
+        matches!(cmd, Command::RespondGrantRequest { request_id, approved }
+        if request_id == "gr-0" && approved)
+    );
 }
 
 #[test]
 fn parse_respond_grant_request_denied() {
     let cmd = parse_command(b"RESPOND_GRANT_REQUEST gr-0 denied", None);
-    assert!(matches!(cmd, Command::RespondGrantRequest { request_id, approved }
-        if request_id == "gr-0" && !approved));
+    assert!(
+        matches!(cmd, Command::RespondGrantRequest { request_id, approved }
+        if request_id == "gr-0" && !approved)
+    );
 }
 
 #[test]
@@ -1272,7 +1479,10 @@ fn grant_request_deposit_fetch_lifecycle() {
     });
     let resp = read_response(&buf);
     assert!(resp.contains("\"request_id\":\"gr-"), "got: {resp}");
-    assert!(resp.contains("\"scope\":\"netflix-password\""), "got: {resp}");
+    assert!(
+        resp.contains("\"scope\":\"netflix-password\""),
+        "got: {resp}"
+    );
     assert!(resp.contains("\"status\":\"pending\""), "got: {resp}");
     assert!(resp.ends_with("\nEND"), "got: {resp}");
 }
@@ -1344,17 +1554,166 @@ fn grant_request_ids_are_unique() {
     // Deposit two requests.
     let s = Arc::clone(&state);
     let buf = with_loopback(move |stream| {
-        handle_request_grant(stream, &s, "alice".into(), "bot-a".into(), "s1".into(), "j1".into());
+        handle_request_grant(
+            stream,
+            &s,
+            "alice".into(),
+            "bot-a".into(),
+            "s1".into(),
+            "j1".into(),
+        );
     });
     let resp1 = read_response(&buf);
 
     let s = Arc::clone(&state);
     let buf = with_loopback(move |stream| {
-        handle_request_grant(stream, &s, "bob".into(), "bot-b".into(), "s2".into(), "j2".into());
+        handle_request_grant(
+            stream,
+            &s,
+            "bob".into(),
+            "bot-b".into(),
+            "s2".into(),
+            "j2".into(),
+        );
     });
     let resp2 = read_response(&buf);
 
-    assert_ne!(resp1, resp2, "request IDs should differ: {resp1} vs {resp2}");
+    assert_ne!(
+        resp1, resp2,
+        "request IDs should differ: {resp1} vs {resp2}"
+    );
     assert!(resp1.starts_with("OK gr-"), "got: {resp1}");
     assert!(resp2.starts_with("OK gr-"), "got: {resp2}");
+}
+
+// ── design §2.b DID resolver — JWKS endpoint integration tests ─────────────
+//
+// Anchor: `did_emberlink_resolver_phase2` — design-PHASE2-RELAY-RESOLVER-IMPL.
+// These tests exercise the JWKS handler installed in `run_health_server`,
+// covering the success path (200 + `application/jwk-set+json` body with the
+// expected OKP shape), the invalid-DID path (400), and the no-`did` path
+// (404). The body matches the round-trip pattern in
+// `core_crypto::did::tests::parse_did_then_resolve_jwks_round_trip`.
+
+#[test]
+fn jwks_endpoint_returns_okp_jwks_for_valid_did() {
+    use core_crypto::{did_from_root_pubkey, parse_did, resolve_did_jwks};
+    use ed25519_dalek::SigningKey;
+    use std::io::Read as IoRead;
+    use std::io::Write as IoWrite;
+    use std::net::{TcpListener, TcpStream};
+
+    let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let start = Instant::now();
+    thread::spawn(move || run_health_server(port, RelayMode::Open, start, None));
+    thread::sleep(Duration::from_millis(50));
+
+    // Build a fresh Ed25519 key and the corresponding DID identifier.
+    let signing = SigningKey::from_bytes(&[0x11u8; 32]);
+    let did = did_from_root_pubkey(&signing.verifying_key());
+    let did_str = did.as_str();
+
+    let mut conn = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+    conn.write_all(
+        format!("GET /.well-known/jwks.json?did={did_str} HTTP/1.0\r\nHost: localhost\r\n\r\n")
+            .as_bytes(),
+    )
+    .unwrap();
+
+    let mut response = String::new();
+    conn.read_to_string(&mut response).unwrap();
+
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "expected 200, got: {response}"
+    );
+    assert!(
+        response.contains("Content-Type: application/jwk-set+json"),
+        "missing jwk-set content type: {response}"
+    );
+
+    // The body should serialize-equal to the resolver's JSON. Cross-check
+    // via `parse_did → resolve_did_jwks` so the test fails if the relay
+    // ever drifts off the core-crypto contract.
+    let body_start = response.find("\r\n\r\n").unwrap() + 4;
+    let body = &response[body_start..];
+    let parsed: serde_json::Value = serde_json::from_str(body).expect("body must be JSON");
+    let expected = resolve_did_jwks(&parse_did(&did_str).unwrap());
+    assert_eq!(parsed, expected, "relay JWKS must equal core-crypto JWKS");
+
+    // The decoded `x` field must equal the original key bytes — the
+    // EIC-pod-auth-via-DID-OIDC-federation scenario depends on this.
+    let x = parsed["keys"][0]["x"].as_str().unwrap();
+    let decoded = base64::Engine::decode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        x.as_bytes(),
+    )
+    .unwrap();
+    assert_eq!(decoded.as_slice(), &signing.verifying_key().to_bytes()[..]);
+}
+
+#[test]
+fn jwks_endpoint_returns_400_for_invalid_did() {
+    use std::io::Read as IoRead;
+    use std::io::Write as IoWrite;
+    use std::net::{TcpListener, TcpStream};
+
+    let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let start = Instant::now();
+    thread::spawn(move || run_health_server(port, RelayMode::Open, start, None));
+    thread::sleep(Duration::from_millis(50));
+
+    let mut conn = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+    // Wrong DID method — should be rejected by `parse_did` with
+    // `DidError::MissingPrefix`, surfacing as a 400.
+    conn.write_all(b"GET /.well-known/jwks.json?did=did:web:example.com HTTP/1.0\r\n\r\n")
+        .unwrap();
+
+    let mut response = String::new();
+    conn.read_to_string(&mut response).unwrap();
+
+    assert!(
+        response.starts_with("HTTP/1.1 400"),
+        "expected 400, got: {response}"
+    );
+    assert!(
+        response.contains(r#""error":"invalid_did""#),
+        "missing error tag: {response}"
+    );
+}
+
+#[test]
+fn jwks_endpoint_returns_404_when_did_query_missing() {
+    use std::io::Read as IoRead;
+    use std::io::Write as IoWrite;
+    use std::net::{TcpListener, TcpStream};
+
+    let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let start = Instant::now();
+    thread::spawn(move || run_health_server(port, RelayMode::Open, start, None));
+    thread::sleep(Duration::from_millis(50));
+
+    let mut conn = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+    // Path matches but no `did` query — parse_jwks_request returns None,
+    // so the handler falls through to the 404 branch (the JWKS path is
+    // an extension of the catch-all, not a standalone endpoint).
+    conn.write_all(b"GET /.well-known/jwks.json HTTP/1.0\r\n\r\n")
+        .unwrap();
+
+    let mut response = String::new();
+    conn.read_to_string(&mut response).unwrap();
+
+    assert!(
+        response.starts_with("HTTP/1.1 404"),
+        "expected 404, got: {response}"
+    );
 }

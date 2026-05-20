@@ -1,11 +1,11 @@
 use crate::storage::{FileManifest, StorageLedgerEntry, StorageRelationship};
+use core_principals::{PublicKeyMaterial, RecoveryScope, SurvivalMode, parse_public_key_material};
 use core_types::encoding::*;
 use core_types::size_limits::{
     MAX_BADGE_PAYLOAD_HEX_BYTES, MAX_CIPHERTEXT_HEX_BYTES, MAX_CONDITIONS_JSON_BYTES,
     MAX_LABEL_BYTES, MAX_PUBLIC_KEY_HEX_BYTES, MAX_REASON_BYTES, MAX_SEALED_PAYLOAD_HEX_BYTES,
     MAX_TRANSPORT_HINT_BYTES, validate_optional_size, validate_size,
 };
-use core_principals::{PublicKeyMaterial, RecoveryScope, SurvivalMode, parse_public_key_material};
 use core_types::{CanonicalEncode, Validate, ValidationError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,7 +191,6 @@ impl SignerBinding {
             role: KeyRole::Guardian,
         }
     }
-
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1150,7 +1149,10 @@ impl EventBody {
             "badge-issued" => {
                 let evidence = {
                     let etype = fields.get("evidence_type").cloned().unwrap_or_default();
-                    let payload = fields.get("evidence_payload_hex").cloned().unwrap_or_default();
+                    let payload = fields
+                        .get("evidence_payload_hex")
+                        .cloned()
+                        .unwrap_or_default();
                     if etype.is_empty() && payload.is_empty() {
                         None
                     } else {
@@ -1771,7 +1773,11 @@ impl Validate for RelayHintUpdatedEvent {
         validate_non_empty(&self.peer_id, "peer id")?;
         validate_non_empty(&self.device_id, "device id")?;
         validate_non_empty(&self.transport_hint, "transport hint")?;
-        validate_size(&self.transport_hint, "transport hint", MAX_TRANSPORT_HINT_BYTES)
+        validate_size(
+            &self.transport_hint,
+            "transport hint",
+            MAX_TRANSPORT_HINT_BYTES,
+        )
     }
 }
 
@@ -2440,10 +2446,7 @@ impl CanonicalEncode for EventBody {
                         body.ephemeral_public_key_hex.clone(),
                     ),
                     ("sealed_payload_hex", body.sealed_payload_hex.clone()),
-                    (
-                        "relay_hint",
-                        body.relay_hint.clone().unwrap_or_default(),
-                    ),
+                    ("relay_hint", body.relay_hint.clone().unwrap_or_default()),
                     ("expires_at", body.expires_at.to_string()),
                     ("conditions_json", body.conditions_json.clone()),
                 ],
@@ -2946,9 +2949,7 @@ mod trust_score_canonical_tests {
         // already excludes NaN but the error message would be
         // misleading without the dedicated guard).
         let nan_body = valid_trust_attested(f32::NAN);
-        let err = nan_body
-            .validate()
-            .expect_err("NaN score must be rejected");
+        let err = nan_body.validate().expect_err("NaN score must be rejected");
         assert!(
             err.to_string().contains("NaN"),
             "expected NaN rejection, got: {err}"
@@ -3070,4 +3071,3 @@ mod trust_score_canonical_tests {
         }
     }
 }
-

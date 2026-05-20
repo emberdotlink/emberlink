@@ -64,7 +64,7 @@ pub enum InstallError {
 /// row to the table above, widen the substring set below, and extend the
 /// unit tests.
 ///
-/// Anchor: `implementation-note-232`
+/// Anchor: `implementation-note-324`
 fn already_exists(stderr: &str) -> bool {
     let s = stderr.to_lowercase();
     s.contains("already exists")
@@ -76,19 +76,17 @@ fn already_exists(stderr: &str) -> bool {
 ///
 /// `tolerate_already_exists`: when true, a non-zero exit whose stderr
 /// matches [`already_exists`] is treated as success (idempotency).
-fn run(
-    program: &str,
-    args: &[&str],
-    tolerate_already_exists: bool,
-) -> Result<(), InstallError> {
+fn run(program: &str, args: &[&str], tolerate_already_exists: bool) -> Result<(), InstallError> {
     let cmd_string = format!("{} {}", program, args.join(" "));
-    let output = Command::new(program).args(args).output().map_err(|e| {
-        InstallError::Subprocess {
-            cmd: cmd_string.clone(),
-            stderr: format!("spawn failed: {e}"),
-            exit_code: None,
-        }
-    })?;
+    let output =
+        Command::new(program)
+            .args(args)
+            .output()
+            .map_err(|e| InstallError::Subprocess {
+                cmd: cmd_string.clone(),
+                stderr: format!("spawn failed: {e}"),
+                exit_code: None,
+            })?;
 
     if output.status.success() {
         return Ok(());
@@ -139,6 +137,395 @@ pub fn is_separate_uid_posture() -> bool {
     user_exists("ember")
 }
 
+/// Add `user` to the `group` via `dseditgroup -o edit`, then verify membership.
+///
+/// ## Why a dedicated wrapper (not `run(..., tolerate_already_exists: true)`)
+///
+/// On macOS 26 (26.4 confirmed), `dseditgroup -o edit -a <user> -t user <group>`
+/// can exit non-zero with stderr `"Operation cancelled because record could not be
+/// replaced"` on a path where the user was **not** actually added to the group.
+/// prior change widened [`already_exists`] to match `"could not be replaced"` — which
+/// correctly handles `-o create` idempotency — but that same tolerance was
+/// inherited by the `-o edit` (add-member) call inside [`provision_ember_user`].
+/// The result: the installer returned `Ok(())` even though the operator was never
+/// added, then `ember vault list` failed with `Permission denied` because the
+/// socket is `0660 root:ember-clients`.
+///
+/// This function mirrors the [`bootout_tolerant_inner`] discipline:
+/// 1. Accept the dseditgroup runner and a checkmember runner as injected closures
+///    (testability — no real subprocess required in unit tests).
+/// 2. Tolerate a non-zero exit ONLY when exit_code == 73 AND stderr contains
+///    `"could not be replaced"` (macOS 26 shape). Any other failure propagates.
+/// 3. After ANY tolerance (or on success), run the post-condition check:
+///    `dseditgroup -o checkmember -m <user> <group>`. If membership is NOT
+///    confirmed, surface a clear `InstallError::Subprocess` rather than
+///    returning `Ok(())` silently.
+///
+/// ## Checkpoint
+///
+/// implementation-note-325
+#[cfg(target_os = "macos")]
+fn dseditgroup_tolerant_inner<R, C>(
+    cmd_string: &str,
+    runner: R,
+    checkmember: C,
+) -> Result<(), InstallError>
+where
+    R: FnOnce() -> Result<(Option<i32>, String, bool), InstallError>,
+    C: FnOnce() -> bool,
+{
+    let (exit_code, stderr, success) = runner()?;
+
+    if !success {
+        // Tolerate macOS 26+ "could not be replaced" ONLY when exit code is 73.
+        // exit 73 is dseditgroup's "record manipulation failed" surface; any
+        // other exit code is an unrelated failure we must not swallow.
+        let is_macos26_already_member =
+            exit_code == Some(73) && stderr.to_lowercase().contains("could not be replaced");
+
+        if !is_macos26_already_member {
+            tracing::warn!(
+                cmd = %cmd_string,
+                exit = exit_code.unwrap_or(-1),
+                stderr = %stderr,
+                "dseditgroup add-member failed"
+            );
+            return Err(InstallError::Subprocess {
+                cmd: cmd_string.to_string(),
+                stderr,
+                exit_code,
+            });
+        }
+
+        tracing::debug!(
+            cmd = %cmd_string,
+            "dseditgroup returned 'could not be replaced' (exit 73, macOS 26+ already-member shape); \
+             verifying post-condition"
+        );
+    }
+
+    // Post-condition: confirm the user is actually a member regardless of
+    // which path we took (success OR tolerated). On macOS 26 the tolerated
+    // path is the dangerous one — the user may not have been added.
+    if !checkmember() {
+        return Err(InstallError::Subprocess {
+            cmd: cmd_string.to_string(),
+            stderr: format!(
+                "dseditgroup reported success (or tolerated macOS 26 'could not be replaced') \
+                 but post-condition check failed: user is NOT a member of the group. \
+                 Run `sudo dseditgroup -o edit -a \"$USER\" -t user ember-clients` manually."
+            ),
+            exit_code,
+        });
+    }
+
+    Ok(())
+}
+
+/// Canonical macOS `ember` user shape constants. See
+/// `inspect_and_heal_ember_user_inner` for the policy that consumes these.
+///
+/// `EMBER_USER_HOME` and `EMBER_USER_SHELL` mirror the literals fed to
+/// `sysadminctl -addUser` in [`provision_ember_user`]; they are the
+/// post-condition the installer asserts when an `ember` user already
+/// exists from an earlier (possibly partial) install run.
+#[cfg(target_os = "macos")]
+const EMBER_USER_HOME: &str = "/var/empty";
+#[cfg(target_os = "macos")]
+const EMBER_USER_SHELL: &str = "/usr/bin/false";
+
+/// macOS uses uids `< 500` for system users (Apple convention; the
+/// Login window in `/System/Library/.../loginwindow.plist` hides
+/// `Hide500Users=YES` by default). `sysadminctl -addUser` without
+/// `-UID` picks from this range. A uid `>= 500` means the existing
+/// `ember` record came from a different package or a manual `dscl`
+/// invocation — renumbering it would orphan every file the existing
+/// daemon already owns, so we refuse to heal it and surface a
+/// remediation command instead.
+#[cfg(target_os = "macos")]
+const EMBER_USER_MAX_SYSTEM_UID: u32 = 500;
+
+/// Snapshot of the `ember` user's directory-services record.
+///
+/// Returned by [`read_ember_user_shape_inner`]. `None` from the reader
+/// distinguishes "property is unset" from "property is wrong" — the
+/// inspector treats unset shell/home as a fixable divergence (run
+/// `dscl . -change` to set it), while it treats a present-but-wrong uid
+/// as a hard error (the "too wide" branch).
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EmberUserShape {
+    uid: u32,
+    home: Option<String>,
+    shell: Option<String>,
+}
+
+/// Outcome of the pre-create inspect step that
+/// [`inspect_and_heal_ember_user_inner`] returns.
+///
+/// Drives the macOS `provision_ember_user` flow:
+/// - `Create` — the inspector confirmed the user is absent; run the
+///   normal `sysadminctl -addUser` path.
+/// - `SkipHealthy` — the user is already present and matches the
+///   canonical shape exactly; skip the create step.
+/// - `HealedThenSkip` — the user is present but had narrow,
+///   healable divergence (wrong shell, wrong home); the inspector
+///   applied `dscl . -change` corrective ops listed in `changes` and
+///   skipped the create step.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EmberUserInspectAction {
+    Create,
+    SkipHealthy,
+    HealedThenSkip { changes: Vec<String> },
+}
+
+/// Read the `ember` user's shape via an injected dscl property reader.
+///
+/// The reader closure receives the property name (e.g. `"UniqueID"`,
+/// `"NFSHomeDirectory"`, `"UserShell"`) and returns:
+/// - `Ok(Some(value))` — property is set; `value` is the trimmed
+///   single-line value (stripped of the `<prop>: ` prefix dscl emits).
+/// - `Ok(None)` — the property is unset OR the **user does not exist**.
+///   The caller distinguishes these two cases by probing `UniqueID`
+///   first: if `UniqueID` is `None`, the user is absent and the helper
+///   returns `Ok(None)`.
+/// - `Err(InstallError)` — the dscl invocation itself failed for an
+///   unrelated reason (e.g. permission denied, command not found).
+///
+/// Real-subprocess wrapper: `dscl . -read /Users/ember <prop>` exits 0
+/// when the user exists and emits `<prop>: <value>` on stdout; exits
+/// non-zero with `eDSRecordNotFound` (`-14136`) when the user does not
+/// exist.
+///
+/// Closure injection means unit tests can simulate any shape (canonical,
+/// missing-shell, wrong-uid, absent) without touching real Open Directory.
+///
+/// Anchor: `implementation-note-326`
+#[cfg(target_os = "macos")]
+fn read_ember_user_shape_inner<R>(mut reader: R) -> Result<Option<EmberUserShape>, InstallError>
+where
+    R: FnMut(&str) -> Result<Option<String>, InstallError>,
+{
+    let Some(uid_raw) = reader("UniqueID")? else {
+        // UniqueID absent → user does not exist. (A user record without
+        // a UniqueID is not a valid macOS user record; treat the same as
+        // absent and let `provision_ember_user` run the create path.)
+        return Ok(None);
+    };
+    let uid: u32 = uid_raw
+        .trim()
+        .parse::<u32>()
+        .map_err(|e| InstallError::Subprocess {
+            cmd: "dscl . -read /Users/ember UniqueID".to_string(),
+            stderr: format!("UniqueID is not a valid u32 ({uid_raw:?}): {e}"),
+            exit_code: None,
+        })?;
+    let home = reader("NFSHomeDirectory")?;
+    let shell = reader("UserShell")?;
+    Ok(Some(EmberUserShape { uid, home, shell }))
+}
+
+/// Inspect the existing `ember` user record and either confirm it is
+/// canonical, heal narrow divergence, or surface a clear error.
+///
+/// Policy:
+/// 1. **User absent** (`read_ember_user_shape_inner` returns `Ok(None)`):
+///    return `EmberUserInspectAction::Create` so the caller runs the
+///    normal create path.
+/// 2. **User present + canonical** (uid in system range, home ==
+///    `/var/empty`, shell == `/usr/bin/false`): return
+///    `EmberUserInspectAction::SkipHealthy`.
+/// 3. **User present + wrong shell or home**: apply narrow
+///    `dscl . -change /Users/ember <prop> <current> <canonical>` ops
+///    via the injected `changer` closure. On success return
+///    `EmberUserInspectAction::HealedThenSkip` with the list of changes
+///    applied (for the operator's logs). If `changer` returns an error
+///    for any one corrective op, propagate it.
+/// 4. **User present + wrong UID** (uid >= [`EMBER_USER_MAX_SYSTEM_UID`]):
+///    refuse to heal — re-numbering the uid would orphan every file the
+///    existing daemon already owns. Surface a clear
+///    `InstallError::Subprocess` with the exact remediation command
+///    (`sudo dseditgroup -o delete -g ember && sudo dscl . -delete
+///    /Users/ember`) in the stderr field.
+///
+/// Closure injection on `changer` keeps the function testable without
+/// real dscl mutation. `changer(prop, current, desired)` is invoked
+/// once per divergent property.
+///
+/// Anchor: `implementation-note-326`
+#[cfg(target_os = "macos")]
+fn inspect_and_heal_ember_user_inner<R, C>(
+    reader: R,
+    mut changer: C,
+) -> Result<EmberUserInspectAction, InstallError>
+where
+    R: FnMut(&str) -> Result<Option<String>, InstallError>,
+    C: FnMut(&str, &str, &str) -> Result<(), InstallError>,
+{
+    let Some(shape) = read_ember_user_shape_inner(reader)? else {
+        return Ok(EmberUserInspectAction::Create);
+    };
+
+    // Hard error: uid is outside the system range. Renumbering would
+    // orphan any file the existing daemon owns, so we refuse and surface
+    // the manual remediation.
+    if shape.uid >= EMBER_USER_MAX_SYSTEM_UID {
+        return Err(InstallError::Subprocess {
+            cmd: "inspect_and_heal_ember_user (uid out of system range)".to_string(),
+            stderr: format!(
+                "existing `ember` user has uid {} (>= {}), which is outside the macOS \
+                 system-user range. This record came from a different package or a manual \
+                 `dscl` install — renumbering it would orphan files the existing daemon \
+                 already owns. Remediation: \
+                 `sudo dseditgroup -o delete -g ember && sudo dscl . -delete /Users/ember`, \
+                 then re-run `sudo ember daemon install`.",
+                shape.uid, EMBER_USER_MAX_SYSTEM_UID
+            ),
+            exit_code: None,
+        });
+    }
+
+    let mut changes = Vec::new();
+
+    // Narrow corrective op: UserShell.
+    let shell_current = shape.shell.as_deref().unwrap_or("");
+    if shell_current != EMBER_USER_SHELL {
+        changer("UserShell", shell_current, EMBER_USER_SHELL)?;
+        changes.push(format!(
+            "dscl . -change /Users/ember UserShell {shell_current:?} {EMBER_USER_SHELL:?}"
+        ));
+    }
+
+    // Narrow corrective op: NFSHomeDirectory.
+    let home_current = shape.home.as_deref().unwrap_or("");
+    if home_current != EMBER_USER_HOME {
+        changer("NFSHomeDirectory", home_current, EMBER_USER_HOME)?;
+        changes.push(format!(
+            "dscl . -change /Users/ember NFSHomeDirectory {home_current:?} {EMBER_USER_HOME:?}"
+        ));
+    }
+
+    if changes.is_empty() {
+        tracing::info!(
+            uid = shape.uid,
+            "ember user already present + canonical; skipping create"
+        );
+        Ok(EmberUserInspectAction::SkipHealthy)
+    } else {
+        tracing::info!(
+            uid = shape.uid,
+            changes = ?changes,
+            "ember user present with narrow divergence; healed via dscl -change and skipping create"
+        );
+        Ok(EmberUserInspectAction::HealedThenSkip { changes })
+    }
+}
+
+/// Real-subprocess wrapper: probe `ember` user shape via `dscl . -read`
+/// then heal-or-surface via [`inspect_and_heal_ember_user_inner`].
+///
+/// Used by [`provision_ember_user`] to decide whether to run
+/// `sysadminctl -addUser` (user absent) or skip the create step
+/// (user present + canonical, possibly after healing).
+///
+/// Anchor: `implementation-note-326`
+#[cfg(target_os = "macos")]
+fn inspect_and_heal_ember_user() -> Result<EmberUserInspectAction, InstallError> {
+    inspect_and_heal_ember_user_inner(
+        |prop| {
+            let output = Command::new("dscl")
+                .args([".", "-read", "/Users/ember", prop])
+                .output()
+                .map_err(|e| InstallError::Subprocess {
+                    cmd: format!("dscl . -read /Users/ember {prop}"),
+                    stderr: format!("spawn failed: {e}"),
+                    exit_code: None,
+                })?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                // eDSRecordNotFound / "DS Node not found" → user absent.
+                // Treat as Ok(None) per the reader contract.
+                if stderr.to_lowercase().contains("not found")
+                    || stderr.contains("eDSRecordNotFound")
+                {
+                    return Ok(None);
+                }
+                return Err(InstallError::Subprocess {
+                    cmd: format!("dscl . -read /Users/ember {prop}"),
+                    stderr,
+                    exit_code: output.status.code(),
+                });
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // dscl emits `<prop>: <value>` on a single line; multi-line
+            // properties are emitted with `\n <value>` on subsequent lines.
+            // For the three properties we read (UniqueID, NFSHomeDirectory,
+            // UserShell), the value is always single-line.
+            let value = stdout
+                .lines()
+                .next()
+                .and_then(|first| first.strip_prefix(&format!("{prop}: ")))
+                .map(|s| s.trim().to_string());
+            Ok(value)
+        },
+        |prop, current, desired| {
+            // `dscl . -change <path> <prop> <oldvalue> <newvalue>` — the
+            // old-value argument is required even when we just want to
+            // overwrite; passing the current value (possibly empty) is
+            // the canonical pattern.
+            run(
+                "dscl",
+                &[".", "-change", "/Users/ember", prop, current, desired],
+                false,
+            )
+        },
+    )
+}
+
+/// Real-subprocess wrapper: add `user` to `group` via `dseditgroup -o edit`,
+/// then verify with `dseditgroup -o checkmember -m <user> <group>`.
+#[cfg(target_os = "macos")]
+fn dseditgroup_add_operator_to_group(user: &str, group: &str) -> Result<(), InstallError> {
+    let cmd_string = format!("dseditgroup -o edit -a {user} -t user {group}");
+    let cmd_for_runner = cmd_string.clone();
+    let user_owned = user.to_string();
+    let group_owned = group.to_string();
+    let group_for_checker = group.to_string();
+    let user_for_checker = user.to_string();
+    dseditgroup_tolerant_inner(
+        &cmd_string,
+        move || {
+            let output = Command::new("dseditgroup")
+                .args(["-o", "edit", "-a", &user_owned, "-t", "user", &group_owned])
+                .output()
+                .map_err(|e| InstallError::Subprocess {
+                    cmd: cmd_for_runner.clone(),
+                    stderr: format!("spawn failed: {e}"),
+                    exit_code: None,
+                })?;
+            let exit_code = output.status.code();
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            Ok((exit_code, stderr, output.status.success()))
+        },
+        move || {
+            // `dseditgroup -o checkmember -m <user> <group>` exits 0 when the
+            // user is a member, non-zero otherwise.
+            Command::new("dseditgroup")
+                .args([
+                    "-o",
+                    "checkmember",
+                    "-m",
+                    &user_for_checker,
+                    &group_for_checker,
+                ])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        },
+    )
+}
+
 /// Provision the `ember` system user + the `ember-clients` connect group.
 ///
 /// **Idempotent.** Re-running on an already-provisioned machine returns
@@ -147,8 +534,15 @@ pub fn is_separate_uid_posture() -> bool {
 ///
 /// On macOS:
 /// - `dseditgroup -o create ember` — group create (idempotent).
-/// - `sysadminctl -addUser ember -fullName "Emberlink Daemon" -home /var/empty -shell /usr/bin/false`
-///   only when `id ember` reports the user is missing.
+/// - **Inspect-and-heal step** (see [`inspect_and_heal_ember_user_inner`]):
+///   probe the existing `ember` user via `dscl . -read /Users/ember`; if
+///   absent run `sysadminctl -addUser ember ...`; if present + canonical
+///   skip the create; if present with narrow divergence (wrong shell, wrong
+///   home) heal via `dscl . -change`; if present with wide divergence
+///   (uid outside the system range) surface a hard `InstallError` with the
+///   manual remediation command. Replaces the naive `if !id ember` check
+///   that silently kept divergent records around — see
+///   `implementation-note-326`.
 /// - `dseditgroup -o create ember-clients` — connect-group create.
 /// - `dseditgroup -o edit -a "$USER" -t user ember-clients` — add the
 ///   invoking operator to the connect group.
@@ -169,8 +563,25 @@ pub fn provision_ember_user() -> Result<(), InstallError> {
     // 1) ember group
     run("dseditgroup", &["-o", "create", "ember"], true)?;
 
-    // 2) ember user (only if missing)
-    if !user_exists("ember") {
+    // 2) ember user — inspect-and-heal before any create.
+    //
+    // implementation-note-326: a previous
+    // partial install (or a different package that also created an `ember`
+    // record) can leave the user present with wrong shape (e.g. shell !=
+    // /usr/bin/false). The naive `if !user_exists` check skipped sysadminctl
+    // but never normalized the divergent fields; downstream consumers
+    // (launchd plist, vault sockets) then hit cryptic permission errors.
+    //
+    // `inspect_and_heal_ember_user` returns one of three actions:
+    // - Create        → user absent, fall through to sysadminctl -addUser
+    // - SkipHealthy   → user present + canonical shape, skip create
+    // - HealedThenSkip → user present with narrow divergence; dscl . -change
+    //                    ops applied; skip create
+    //
+    // Wide divergence (uid outside the system range) surfaces an
+    // InstallError with the manual remediation command.
+    let action = inspect_and_heal_ember_user()?;
+    if matches!(action, EmberUserInspectAction::Create) {
         run(
             "sysadminctl",
             &[
@@ -192,7 +603,7 @@ pub fn provision_ember_user() -> Result<(), InstallError> {
 
     // 4) add the ember user to ember-clients
     //
-    // implementation-note-233: the
+    // implementation-note-327: the
     // launchd plist's `GroupName=ember-clients` (formerly `ember` — a group
     // that was never created on macOS, falling back silently to `staff`)
     // requires the ember user to be a member of `ember-clients` so launchd's
@@ -206,21 +617,16 @@ pub fn provision_ember_user() -> Result<(), InstallError> {
     )?;
 
     // 5) add invoking operator to ember-clients
+    //
+    // Use `dseditgroup_add_operator_to_group` instead of the generic `run`
+    // helper: the generic helper's `tolerate_already_exists=true` flag matched
+    // "could not be replaced" (macOS 26 surface) even when the user was NOT
+    // actually added to the group. The dedicated wrapper tightens the tolerance
+    // to exit_code==73 && stderr contains "could not be replaced" AND verifies
+    // membership via a post-condition checkmember call before returning Ok.
     let invoking_user = std::env::var("USER").unwrap_or_default();
     if !invoking_user.is_empty() {
-        run(
-            "dseditgroup",
-            &[
-                "-o",
-                "edit",
-                "-a",
-                &invoking_user,
-                "-t",
-                "user",
-                "ember-clients",
-            ],
-            true,
-        )?;
+        dseditgroup_add_operator_to_group(&invoking_user, "ember-clients")?;
     }
 
     Ok(())
@@ -253,11 +659,7 @@ pub fn provision_ember_user() -> Result<(), InstallError> {
     // 4) add invoking operator to ember-clients
     let invoking_user = std::env::var("USER").unwrap_or_default();
     if !invoking_user.is_empty() {
-        run(
-            "usermod",
-            &["-aG", "ember-clients", &invoking_user],
-            true,
-        )?;
+        run("usermod", &["-aG", "ember-clients", &invoking_user], true)?;
     }
 
     Ok(())
@@ -270,10 +672,789 @@ pub fn provision_ember_user() -> Result<(), InstallError> {
 pub fn provision_ember_user() -> Result<(), InstallError> {
     Err(InstallError::Subprocess {
         cmd: "provision_ember_user".to_string(),
-        stderr: "unsupported platform: ember user provisioning is implemented only for macOS and Linux"
+        stderr:
+            "unsupported platform: ember user provisioning is implemented only for macOS and Linux"
+                .to_string(),
+        exit_code: None,
+    })
+}
+
+// implementation-note-140 — per-spawn uid pool provisioning.
+// The installer creates N `ember-spawn-<i>` system users with
+// pre-assigned uids in the 10010-10099 range. The daemon's
+// `[spawn_pool]` config references this set. See design (amendment
+// to design) for rationale.
+
+/// Default size of the per-spawn uid pool. Matches the headless
+/// fanout cap (8 concurrent agents) — production deployments can
+/// raise this via `--spawn-pool-size <N>` on `ember daemon install`.
+pub const DEFAULT_SPAWN_POOL_SIZE: usize = 8;
+
+/// First uid in the reserved per-spawn range. Chosen above the
+/// typical Linux `useradd --system` default (100-999) and above
+/// macOS's reserved-user range (501-999 for ordinary users) but
+/// well below 60000 (the LDAP/AD threshold many sites use).
+pub const SPAWN_POOL_UID_BASE: u32 = 10010;
+
+/// Last allowed uid in the reserved per-spawn range (exclusive).
+/// 10010..10100 gives 90 slots — far more than any realistic
+/// fanout depth.
+pub const SPAWN_POOL_UID_MAX: u32 = 10100;
+
+/// design Component 2 modern-Linux subuid range start. Chosen above
+/// the typical Linux `useradd --system` default (100-999) and the
+/// reserved-user range (1000-65535) most distros use, but below the
+/// 60000 LDAP/AD threshold many sites enforce. 100000 is the
+/// `newuidmap` / `shadow-utils` convention for unprivileged user
+/// namespace base.
+pub const SUBUID_RANGE_START: u32 = 100_000;
+
+/// design Component 2 modern-Linux subuid range size — 8192-slot
+/// pool. Matches the headless fanout build target and the
+/// `unprivileged_userns_clone` clone3-spawn module's pool size.
+pub const SUBUID_RANGE_SLOTS: u32 = 8192;
+
+/// Result of spawn-pool provisioning. Captures the three modes the
+/// installer can land in:
+///
+/// 1. **`Subuid`** — design Component 2 modern-Linux path. The
+///    installer wrote a `/etc/subuid` + `/etc/subgid` entry granting
+///    `ember` an unprivileged subuid range; the daemon uses
+///    `clone3(CLONE_NEWUSER | ...)` at spawn time and maps the
+///    subuid range into the new namespace. No system users to
+///    create — the range is purely a kernel-side mapping.
+///
+/// 2. **`SystemUsers`** — design separate-uid posture (the
+///    pre-design path) and design's hardened-Linux + macOS path.
+///    The installer creates `ember-spawn-<N>` system users with
+///    pre-assigned uids in [`SPAWN_POOL_UID_BASE`]..
+///    [`SPAWN_POOL_UID_MAX`] and the daemon `setresuid`'s into one
+///    of those uids before exec.
+///
+/// 3. **`ManualCommands`** — non-root install path (typically macOS
+///    without admin). The installer could not provision the pool
+///    itself; the operator must run the surfaced `sudo ...`
+///    commands. The installer surfaces both the commands and the
+///    uids the operator should end up with so the resulting
+///    `config.toml` is correct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpawnPoolProvisioning {
+    /// Modern-Linux subuid range path (design Component 2). The
+    /// installer wrote `ember:{range_start}:{slot_count}` to
+    /// `/etc/subuid` and `/etc/subgid`.
+    Subuid {
+        /// First uid in the granted subuid range (inclusive).
+        range_start: u32,
+        /// Number of consecutive uids granted in the range.
+        slot_count: u32,
+    },
+    /// System-user pool (design + design hardened-Linux/macOS
+    /// paths). The installer created `ember-spawn-<N>` system users.
+    SystemUsers {
+        /// Uids that were provisioned (or are already present + verified).
+        uids: Vec<u32>,
+        /// Shared gid for the pool. The installer ensures every
+        /// `ember-spawn-<i>` user has this gid as their primary group.
+        gid: u32,
+    },
+    /// Non-root install path: installer surfaces the `sudo ...`
+    /// commands the operator must run manually, plus the expected
+    /// pool layout the resulting config should reflect.
+    ManualCommands {
+        /// Expected uids once the operator runs the manual commands.
+        uids: Vec<u32>,
+        /// Expected gid once the operator runs the manual commands.
+        gid: u32,
+        /// Commands the operator should run with sudo.
+        commands: Vec<String>,
+    },
+}
+
+/// Provision a pool of `pool_size` ephemeral spawn users. Idempotent:
+/// existing pool users with matching uids in the reserved range are
+/// detected via `getpwnam` and skipped.
+///
+/// Linux path: creates `ember-spawn-<i>` system users via `useradd`,
+/// each with the same `ember-spawn` primary group + `ember-clients`
+/// supplementary group.
+///
+/// macOS path: uses `dscl . -create /Users/ember-spawn-<i>` with a
+/// pre-assigned `UniqueID` (uid). Falls back to surfacing the
+/// dscl commands as `manual_commands` when the installer is not
+/// running as root.
+///
+/// implementation-note-140 — checkpoint for callers that grep
+/// for the install integration point.
+pub fn provision_spawn_pool(pool_size: usize) -> Result<SpawnPoolProvisioning, InstallError> {
+    if pool_size == 0 {
+        return Err(InstallError::Subprocess {
+            cmd: "provision_spawn_pool".to_string(),
+            stderr: "pool_size must be > 0".to_string(),
+            exit_code: None,
+        });
+    }
+    let last_uid = SPAWN_POOL_UID_BASE + pool_size as u32;
+    if last_uid > SPAWN_POOL_UID_MAX {
+        return Err(InstallError::Subprocess {
+            cmd: "provision_spawn_pool".to_string(),
+            stderr: format!(
+                "pool_size {pool_size} exceeds reserved uid range ({SPAWN_POOL_UID_BASE}..{SPAWN_POOL_UID_MAX})"
+            ),
+            exit_code: None,
+        });
+    }
+    provision_spawn_pool_impl(pool_size)
+}
+
+#[cfg(target_os = "linux")]
+fn provision_spawn_pool_impl(pool_size: usize) -> Result<SpawnPoolProvisioning, InstallError> {
+    // 1) Create the shared `ember-spawn` primary group. We use a
+    //    dedicated group (not `ember-clients`) so the pool users
+    //    don't pick up ember-clients' connect-group authority.
+    run("groupadd", &["--system", "--force", "ember-spawn"], true)?;
+
+    let mut uids = Vec::with_capacity(pool_size);
+    for i in 0..pool_size {
+        let uid = SPAWN_POOL_UID_BASE + i as u32;
+        let user = format!("ember-spawn-{i}");
+        if user_exists(&user) {
+            // Already provisioned. Trust the existing uid assignment;
+            // the installer is idempotent.
+            uids.push(uid);
+            continue;
+        }
+        let uid_str = uid.to_string();
+        run(
+            "useradd",
+            &[
+                "--system",
+                "--shell",
+                "/usr/sbin/nologin",
+                "--no-create-home",
+                "--uid",
+                &uid_str,
+                "--gid",
+                "ember-spawn",
+                &user,
+            ],
+            true,
+        )?;
+        uids.push(uid);
+    }
+
+    // Resolve the gid for `ember-spawn` via getent group.
+    let output = Command::new("getent")
+        .args(["group", "ember-spawn"])
+        .output()
+        .map_err(|e| InstallError::Subprocess {
+            cmd: "getent group ember-spawn".to_string(),
+            stderr: format!("spawn failed: {e}"),
+            exit_code: None,
+        })?;
+    let line = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    // Format: `ember-spawn:x:<gid>:`
+    let gid = line
+        .split(':')
+        .nth(2)
+        .and_then(|s| s.parse::<u32>().ok())
+        .ok_or_else(|| InstallError::Subprocess {
+            cmd: "getent group ember-spawn".to_string(),
+            stderr: format!("unexpected getent output: {line:?}"),
+            exit_code: None,
+        })?;
+
+    Ok(SpawnPoolProvisioning::SystemUsers { uids, gid })
+}
+
+#[cfg(target_os = "macos")]
+fn provision_spawn_pool_impl(pool_size: usize) -> Result<SpawnPoolProvisioning, InstallError> {
+    // macOS lacks `useradd` — we go through `dscl`. The pool's
+    // shared group is `ember-spawn`, created idempotently via
+    // `dseditgroup -o create`. dscl needs admin to mutate
+    // `/Users` and `/Groups`; when not running as root we surface
+    // the commands as `manual_commands` for the operator instead
+    // of half-shipping a broken state.
+    let running_as_root = unsafe { libc::geteuid() } == 0;
+    let mut manual = Vec::new();
+
+    if running_as_root {
+        run("dseditgroup", &["-o", "create", "ember-spawn"], true)?;
+    } else {
+        manual.push("sudo dseditgroup -o create ember-spawn".to_string());
+    }
+
+    let mut uids = Vec::with_capacity(pool_size);
+    for i in 0..pool_size {
+        let uid = SPAWN_POOL_UID_BASE + i as u32;
+        let user = format!("ember-spawn-{i}");
+        uids.push(uid);
+
+        if user_exists(&user) {
+            continue;
+        }
+
+        let uid_str = uid.to_string();
+        let user_path = format!("/Users/{user}");
+        if running_as_root {
+            run("dscl", &[".", "-create", &user_path], false)?;
+            run(
+                "dscl",
+                &[".", "-create", &user_path, "UniqueID", &uid_str],
+                false,
+            )?;
+            // PrimaryGroupID — gid 0 (wheel) is safe as long as the
+            // user has no shell. Real production hosts should add a
+            // matching numeric gid; we surface that as a follow-up.
+            run(
+                "dscl",
+                &[".", "-create", &user_path, "PrimaryGroupID", "0"],
+                false,
+            )?;
+            run(
+                "dscl",
+                &[".", "-create", &user_path, "UserShell", "/usr/bin/false"],
+                false,
+            )?;
+            run(
+                "dscl",
+                &[".", "-create", &user_path, "NFSHomeDirectory", "/var/empty"],
+                false,
+            )?;
+        } else {
+            manual.push(format!("sudo dscl . -create {user_path}"));
+            manual.push(format!(
+                "sudo dscl . -create {user_path} UniqueID {uid_str}"
+            ));
+            manual.push(format!("sudo dscl . -create {user_path} PrimaryGroupID 0"));
+            manual.push(format!(
+                "sudo dscl . -create {user_path} UserShell /usr/bin/false"
+            ));
+            manual.push(format!(
+                "sudo dscl . -create {user_path} NFSHomeDirectory /var/empty"
+            ));
+        }
+    }
+
+    // dscl exposes the gid via a follow-up read. We use the wheel gid
+    // (0) here for simplicity — the production Linux path uses a
+    // dedicated `ember-spawn` gid. macOS is a development surface for
+    // this feature; design limits the separate-uid posture to Linux
+    // production hosts.
+    let gid = 0;
+
+    if manual.is_empty() {
+        Ok(SpawnPoolProvisioning::SystemUsers { uids, gid })
+    } else {
+        Ok(SpawnPoolProvisioning::ManualCommands {
+            uids,
+            gid,
+            commands: manual,
+        })
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn provision_spawn_pool_impl(_pool_size: usize) -> Result<SpawnPoolProvisioning, InstallError> {
+    Err(InstallError::Subprocess {
+        cmd: "provision_spawn_pool".to_string(),
+        stderr:
+            "unsupported platform: spawn pool provisioning is implemented only for macOS and Linux"
+                .to_string(),
+        exit_code: None,
+    })
+}
+
+/// Render the `[spawn_pool]` TOML section for the daemon config.
+/// Returns a string the installer can append to `~/.ember/config.toml`
+/// (or write into a fresh config when the operator has none).
+///
+/// Three shapes depending on the provisioning variant:
+///
+/// - [`SpawnPoolProvisioning::Subuid`] — renders an
+///   `subuid_range_start` + `subuid_range_slots` pair (design
+///   Component 2). The daemon's clone3-spawn module reads these and
+///   maps the range into the user namespace at spawn time.
+/// - [`SpawnPoolProvisioning::SystemUsers`] — renders the
+///   `uids = [...]` + `gid = N` shape (design + design
+///   hardened-Linux/macOS).
+/// - [`SpawnPoolProvisioning::ManualCommands`] — renders the same
+///   shape as `SystemUsers` (the expected end-state); the
+///   installer surfaces the manual commands separately.
+pub fn render_spawn_pool_toml(provisioning: &SpawnPoolProvisioning) -> String {
+    match provisioning {
+        SpawnPoolProvisioning::Subuid {
+            range_start,
+            slot_count,
+        } => format!(
+            "\n[spawn_pool]\n# implementation-note-163 — design Component 2\n# modern-Linux subuid range. The daemon calls `clone3(CLONE_NEWUSER \\\n# | ...)` at spawn time, becomes namespace-owner (kernel grants all\n# caps inside the new namespace), then setresuid's to a uid mapped\n# from this range. No system users to provision — the kernel-side\n# `/etc/subuid` entry IS the pool.\nsubuid_range_start = {range_start}\nsubuid_range_slots = {slot_count}\n"
+        ),
+        SpawnPoolProvisioning::SystemUsers { uids, gid }
+        | SpawnPoolProvisioning::ManualCommands { uids, gid, .. } => {
+            let uids_str = uids
+                .iter()
+                .map(|u| u.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "\n[spawn_pool]\n# implementation-note-140 — per-spawn uid pool. The daemon\n# leases a uid from this set before fork+execve in `broker_exec`.\nuids = [{uids_str}]\ngid = {gid}\n"
+            )
+        }
+    }
+}
+
+// implementation-note-163 — checkpoint for callers that grep
+// for the modern-Linux subuid install integration point. design
+// Component 2.
+//
+// implementation-note-328
+
+/// Detect whether the running kernel supports unprivileged user
+/// namespace clone (design Component 2 modern-Linux gate). Reads
+/// `/proc/sys/kernel/unprivileged_userns_clone`. Returns:
+///
+/// - `Ok(true)` — modern-Linux path: `clone3(CLONE_NEWUSER | ...)`
+///   from the `ember` uid will succeed. Installer should provision
+///   `/etc/subuid` + `/etc/subgid` entries.
+/// - `Ok(false)` — hardened-Linux path: namespace clone is gated to
+///   root. Installer should fall through to the system-user pool +
+///   sibling spawn-helper daemon (the [`provision_spawn_pool`]
+///   path).
+/// - `Err(InstallError::Io)` — `/proc/sys/kernel/unprivileged_userns_clone`
+///   is missing or unreadable. On non-Linux this is expected
+///   (caller filters by `cfg!(target_os = "linux")` before calling).
+///
+/// ## Why a string parse not `procfs`
+///
+/// The sysctl file contains a single ASCII digit followed by
+/// newline. We avoid adding a procfs dependency for one byte.
+pub fn detect_modern_linux_userns() -> Result<bool, InstallError> {
+    let path = "/proc/sys/kernel/unprivileged_userns_clone";
+    let contents = std::fs::read_to_string(path).map_err(InstallError::Io)?;
+    let trimmed = contents.trim();
+    match trimmed {
+        "1" => Ok(true),
+        "0" => Ok(false),
+        other => Err(InstallError::Subprocess {
+            cmd: format!("read {path}"),
+            stderr: format!("unexpected value: {other:?} (want \"0\" or \"1\")"),
+            exit_code: None,
+        }),
+    }
+}
+
+/// Outcome of parsing an `/etc/subuid` (or `/etc/subgid`) entry for
+/// `ember`. The four variants direct the install path:
+///
+/// - `None` — no `ember:...` entry exists; safe to append.
+/// - `Some(Match { .. })` — exactly one `ember:{start}:{count}` line
+///   exists and matches what we would write; no-op (idempotent).
+/// - `Some(Conflict { .. })` — exactly one `ember:` line exists with
+///   different `(start, count)`; refuse to overwrite. Operator must
+///   decide which range is canonical and edit `/etc/subuid` manually.
+/// - `Some(MultipleEntries { .. })` — TWO OR MORE `ember:` lines
+///   exist (regardless of whether any of them match our desired
+///   range). `shadow-utils`' `newuidmap` reads ALL lines for a name
+///   and unions the ranges, so a hostile or careless second line
+///   can grant authority outside what the daemon expects. We refuse
+///   to operate on the file until the operator consolidates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EmberSubuidEntry {
+    /// Existing entry matches the desired `(start, count)` exactly.
+    Match,
+    /// Existing entry conflicts with the desired range.
+    Conflict {
+        existing_start: u32,
+        existing_count: u32,
+    },
+    /// Multiple `ember:` entries detected (≥2 lines). Refusal is
+    /// defense-in-depth against shadow-utils' "union all ranges for
+    /// a name" semantics, which would otherwise let a second line
+    /// silently expand the authority the daemon is granted.
+    MultipleEntries { count: usize, lines: Vec<String> },
+}
+
+/// Scan `/etc/subuid`-shaped content for existing `ember:...:...`
+/// entries. Lines are colon-separated triples `name:start:count` per
+/// the `shadow-utils` man page; we collect ALL lines where
+/// `name == "ember"` because `newuidmap` unions ranges across every
+/// matching line for a user.
+///
+/// Return semantics:
+/// - 0 `ember:` lines → `None`
+/// - 1 `ember:` line matching `(desired_start, desired_count)` →
+///   `Some(Match)`
+/// - 1 `ember:` line with different `(start, count)` →
+///   `Some(Conflict { existing_start, existing_count })`
+/// - ≥2 `ember:` lines → `Some(MultipleEntries { count, lines })`,
+///   regardless of any individual line's values (the union of two
+///   ranges is structurally ambiguous and we refuse to operate)
+///
+/// Garbage/comment/blank lines and malformed `ember:` lines (non-
+/// numeric start/count) are skipped silently. A malformed line
+/// does NOT count toward the multiple-entries threshold.
+fn find_ember_subuid_entry(
+    contents: &str,
+    desired_start: u32,
+    desired_count: u32,
+) -> Option<EmberSubuidEntry> {
+    let mut matched_lines: Vec<(String, u32, u32)> = Vec::new();
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split(':');
+        let Some(name) = parts.next() else { continue };
+        if name != "ember" {
+            continue;
+        }
+        let Some(start_str) = parts.next() else {
+            continue;
+        };
+        let Some(count_str) = parts.next() else {
+            continue;
+        };
+        let Ok(start) = start_str.parse::<u32>() else {
+            continue;
+        };
+        let Ok(count) = count_str.parse::<u32>() else {
+            continue;
+        };
+        matched_lines.push((line.to_string(), start, count));
+    }
+
+    match matched_lines.len() {
+        0 => None,
+        1 => {
+            let (_line, start, count) = &matched_lines[0];
+            if *start == desired_start && *count == desired_count {
+                Some(EmberSubuidEntry::Match)
+            } else {
+                Some(EmberSubuidEntry::Conflict {
+                    existing_start: *start,
+                    existing_count: *count,
+                })
+            }
+        }
+        n => Some(EmberSubuidEntry::MultipleEntries {
+            count: n,
+            lines: matched_lines.into_iter().map(|(line, _, _)| line).collect(),
+        }),
+    }
+}
+
+/// Idempotently append `ember:{range_start}:{slot_count}` to the
+/// shadow-utils file at `path`. Used for both `/etc/subuid` and
+/// `/etc/subgid` (identical line format).
+///
+/// Returns:
+/// - `Ok(true)` — entry was written (file did not previously have
+///   an `ember:` line).
+/// - `Ok(false)` — entry already existed with matching values
+///   (idempotent no-op).
+/// - `Err(InstallError::Subprocess { .. })` — a conflicting
+///   `ember:{other_start}:{other_count}` already exists; operator
+///   must resolve manually. The error message includes both the
+///   existing and desired ranges so the operator can decide.
+fn ensure_subuid_entry(
+    path: &Path,
+    range_start: u32,
+    slot_count: u32,
+) -> Result<bool, InstallError> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(InstallError::Io(e)),
+    };
+
+    match find_ember_subuid_entry(&contents, range_start, slot_count) {
+        Some(EmberSubuidEntry::Match) => Ok(false),
+        Some(EmberSubuidEntry::Conflict {
+            existing_start,
+            existing_count,
+        }) => Err(InstallError::Subprocess {
+            cmd: format!("ensure_subuid_entry {}", path.display()),
+            stderr: format!(
+                "refusing to overwrite existing entry: \
+                     ember:{existing_start}:{existing_count} already in {} — \
+                     desired ember:{range_start}:{slot_count}. Operator must \
+                     edit {} manually to resolve.",
+                path.display(),
+                path.display()
+            ),
+            exit_code: None,
+        }),
+        Some(EmberSubuidEntry::MultipleEntries { count, lines }) => {
+            // shadow-utils' `newuidmap` reads ALL `ember:` lines and
+            // unions their ranges. A second line (whether legacy,
+            // misconfiguration, or hostile insertion by an attacker
+            // with root) silently expands the authority the daemon is
+            // granted past what this installer expects. Refusing for
+            // defense-in-depth: operator must consolidate to a single
+            // line before the installer will operate on the file.
+            Err(InstallError::Subprocess {
+                cmd: format!("ensure_subuid_entry {}", path.display()),
+                stderr: format!(
+                    "refusing to operate on {}: {count} `ember:` lines \
+                     detected. shadow-utils unions ALL `ember:` ranges \
+                     when newuidmap runs, so a second line silently \
+                     expands the authority granted to the daemon. \
+                     Operator must consolidate {} to a single ember \
+                     line before rerunning install. Existing lines: {:?}",
+                    path.display(),
+                    path.display(),
+                    lines
+                ),
+                exit_code: None,
+            })
+        }
+        None => {
+            // Append (don't rewrite): preserves other entries (other
+            // system users, container runtime subuid allocations like
+            // dockerd) without disturbing them.
+            let mut new_contents = contents.clone();
+            if !new_contents.is_empty() && !new_contents.ends_with('\n') {
+                new_contents.push('\n');
+            }
+            new_contents.push_str(&format!("ember:{range_start}:{slot_count}\n"));
+            std::fs::write(path, new_contents).map_err(InstallError::Io)?;
+            Ok(true)
+        }
+    }
+}
+
+/// design Component 2 modern-Linux subuid provisioning. Writes
+/// `ember:{SUBUID_RANGE_START}:{SUBUID_RANGE_SLOTS}` to both
+/// `/etc/subuid` and `/etc/subgid` so the daemon's clone3-spawn
+/// path (CLONE_NEWUSER) can map the range into per-call user
+/// namespaces without runtime root.
+///
+/// **Idempotent.** Detects an existing `ember:` entry via
+/// [`find_ember_subuid_entry`]; matching values are a no-op,
+/// conflicting values surface a refusal so the operator can
+/// resolve manually.
+///
+/// **Why `usermod` first, file-edit fallback second:**
+///
+/// `usermod --add-subuids 100000-108191 ember` is the canonical
+/// shadow-utils path (locking semantics, audit hooks). However:
+///
+/// - Older shadow-utils (Debian 10 / RHEL 7) do not implement
+///   `--add-subuids`/`--add-subgids`; the flag is rejected.
+/// - Some distros symlink `usermod` to a busybox shim that lacks
+///   the flag entirely.
+/// - The `usermod` path is unprivileged-namespace-aware on modern
+///   distros but the file-edit fallback is what `useradd` itself
+///   uses internally.
+///
+/// We try `usermod` first; on flag-not-found we fall back to a
+/// direct read-merge-write on `/etc/subuid` + `/etc/subgid`. The
+/// direct path produces byte-identical results for the common
+/// case.
+///
+/// Requires elevated privileges (writing `/etc/subuid` +
+/// `/etc/subgid` needs root). Typically invoked under `sudo` from
+/// the installer entry point.
+///
+/// ## Output
+///
+/// On success, returns [`SpawnPoolProvisioning::Subuid`] with the
+/// `(range_start, slot_count)` the installer wrote. Caller renders
+/// this into the daemon's `[spawn_pool]` config via
+/// [`render_spawn_pool_toml`].
+///
+/// implementation-note-163 — checkpoint for callers that
+/// grep for the modern-Linux subuid install integration point.
+#[cfg(target_os = "linux")]
+pub fn provision_subuid_range() -> Result<SpawnPoolProvisioning, InstallError> {
+    // Install-time probe: refuse install when the setuid newuidmap /
+    // newgidmap binaries are missing or not setuid-root. The clone3
+    // spawn path invokes them via their absolute canonical paths
+    // (`/usr/bin/newuidmap`, `/usr/bin/newgidmap`) and depends on
+    // their setuid-root mode to write `/proc/<pid>/uid_map` —
+    // installing the daemon on a host without them produces a
+    // post-install regression at first-spawn time that's hard to
+    // diagnose from the broker_exec stderr alone. Surface it here.
+    verify_newuidmap_binary(Path::new("/usr/bin/newuidmap"))?;
+    verify_newuidmap_binary(Path::new("/usr/bin/newgidmap"))?;
+
+    provision_subuid_range_at(
+        Path::new("/etc/subuid"),
+        Path::new("/etc/subgid"),
+        SUBUID_RANGE_START,
+        SUBUID_RANGE_SLOTS,
+    )
+}
+
+/// Non-Linux fallback. design Component 2 is Linux-only; the
+/// modern-Linux subuid range is a Linux kernel concept (unprivileged
+/// user namespaces). macOS uses the system-user pool path
+/// (Component 3); other platforms are unsupported.
+#[cfg(not(target_os = "linux"))]
+pub fn provision_subuid_range() -> Result<SpawnPoolProvisioning, InstallError> {
+    Err(InstallError::Subprocess {
+        cmd: "provision_subuid_range".to_string(),
+        stderr: "unsupported platform: subuid range provisioning is Linux-only \
+                 (design Component 2). macOS uses the system-user pool path."
             .to_string(),
         exit_code: None,
     })
+}
+
+/// Testable variant — same logic, caller supplies subuid/subgid
+/// paths + the desired range. Production callers use
+/// [`provision_subuid_range`] which targets `/etc/subuid` +
+/// `/etc/subgid` with [`SUBUID_RANGE_START`] / [`SUBUID_RANGE_SLOTS`].
+///
+/// **This variant does NOT run the `newuidmap`/`newgidmap` setuid-root
+/// install-time probe** so test code can drive it against tempdir-
+/// scoped `subuid`/`subgid` files without depending on a real
+/// shadow-utils install. Production code paths route through
+/// [`provision_subuid_range`] which runs the probe before delegating
+/// here. See the `verify_newuidmap_binary` helper (module-private)
+/// for the probe rationale.
+pub fn provision_subuid_range_at(
+    subuid_path: &Path,
+    subgid_path: &Path,
+    range_start: u32,
+    slot_count: u32,
+) -> Result<SpawnPoolProvisioning, InstallError> {
+    // Try the canonical `usermod` path first if the binary supports
+    // the `--add-subuids`/`--add-subgids` flags. We probe by checking
+    // help output; if missing, we fall through to the direct file
+    // edit which is what `useradd` does internally anyway.
+    //
+    // The probe is best-effort — any failure (binary missing, help
+    // parsing failed, permissions, etc.) falls through to the direct
+    // edit. Idempotency is enforced by `ensure_subuid_entry`, not by
+    // `usermod`'s own dedup (older `usermod` does not dedup on append).
+    let usermod_supports_subuids = usermod_supports_subuid_flags();
+
+    if usermod_supports_subuids {
+        // Use `usermod --add-subuids ... ember` + `--add-subgids` when
+        // available. Even with `usermod` we still verify the resulting
+        // file via `ensure_subuid_entry` to make conflict detection
+        // uniform across paths.
+        let range_arg = format!("{range_start}-{}", range_start + slot_count - 1);
+        let uid_result = run("usermod", &["--add-subuids", &range_arg, "ember"], true);
+        let gid_result = run("usermod", &["--add-subgids", &range_arg, "ember"], true);
+        // Tolerate failures; fall through to direct edit. The
+        // `ensure_subuid_entry` calls below will surface conflicts.
+        if let Err(e) = uid_result {
+            tracing::debug!(error = ?e, "usermod --add-subuids fell back to direct file edit");
+        }
+        if let Err(e) = gid_result {
+            tracing::debug!(error = ?e, "usermod --add-subgids fell back to direct file edit");
+        }
+    }
+
+    // Always verify+repair via direct file edit. This is the
+    // load-bearing path; `usermod` is purely an optimization for the
+    // happy case where shadow-utils is modern enough.
+    ensure_subuid_entry(subuid_path, range_start, slot_count)?;
+    ensure_subuid_entry(subgid_path, range_start, slot_count)?;
+
+    Ok(SpawnPoolProvisioning::Subuid {
+        range_start,
+        slot_count,
+    })
+}
+
+/// Install-time probe for the shadow-utils setuid helpers. Verifies
+/// that the binary at `path` exists and is setuid-root — both
+/// preconditions for the clone3 spawn path's `newuidmap` /
+/// `newgidmap` invocation.
+///
+/// The clone3 spawn path (`crates/ember-daemon/src/spawn/exec_domain.rs::
+/// invoke_idmap_helper`) executes the helper via its absolute canonical
+/// path (`/usr/bin/newuidmap` or `/usr/bin/newgidmap`) with
+/// `.env_clear()` defense-in-depth. The helper writes
+/// `/proc/<child_pid>/uid_map` (or `gid_map`) — that write is gated by
+/// CAP_SETUID/CAP_SETGID via the setuid-root mode bit. A missing or
+/// non-setuid helper means the spawn path will fail at first invocation
+/// with a cryptic `newuidmap: write to uid_map failed: Operation not
+/// permitted`; surfacing the refusal at install time gives the operator
+/// a clear actionable diagnostic before any agent invocation hits the
+/// failure mode.
+///
+/// Returns an `InstallError::Subprocess` with operator-facing install
+/// hints (the package names per distro) when the probe fails.
+///
+/// Compiled on all unix-family platforms — production callers live in
+/// the `#[cfg(target_os = "linux")]` `provision_subuid_range`, but
+/// portable tests on macOS / dev hosts must be able to call the probe
+/// against tempdir paths to verify the refusal contracts.
+#[cfg(any(target_os = "linux", test))]
+fn verify_newuidmap_binary(path: &Path) -> Result<(), InstallError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(InstallError::Subprocess {
+                cmd: format!("verify_newuidmap_binary {}", path.display()),
+                stderr: format!(
+                    "shadow-utils helper {} not installed — the modern-Linux \
+                     spawn path (design Component 2) requires this binary at \
+                     its canonical absolute path. Install: \
+                     `apt install uidmap` (Debian/Ubuntu) or \
+                     `dnf install shadow-utils` (RHEL/Fedora), then rerun \
+                     `ember daemon install`.",
+                    path.display()
+                ),
+                exit_code: None,
+            });
+        }
+        Err(e) => return Err(InstallError::Io(e)),
+    };
+
+    // Setuid bit (0o4000) AND owner uid 0. The helper must be setuid
+    // SO it can write /proc/<pid>/uid_map (which is root-only). A
+    // copy of the helper without setuid is functionally broken even
+    // if the file exists.
+    let mode = metadata.mode();
+    let owner_uid = metadata.uid();
+    let is_setuid = (mode & 0o4000) != 0;
+    let is_root_owned = owner_uid == 0;
+
+    if !is_setuid || !is_root_owned {
+        return Err(InstallError::Subprocess {
+            cmd: format!("verify_newuidmap_binary {}", path.display()),
+            stderr: format!(
+                "shadow-utils helper {} is not setuid-root \
+                 (mode={mode:o}, owner_uid={owner_uid}; need mode \
+                 with 0o4000 set + owner_uid=0). The modern-Linux \
+                 spawn path (design Component 2) requires setuid \
+                 mode because the helper writes /proc/<pid>/uid_map \
+                 which is gated by CAP_SETUID. Reinstall the package: \
+                 `apt install --reinstall uidmap` (Debian/Ubuntu) or \
+                 `dnf reinstall shadow-utils` (RHEL/Fedora).",
+                path.display()
+            ),
+            exit_code: None,
+        });
+    }
+
+    Ok(())
+}
+
+/// Probe whether `usermod` supports `--add-subuids`. Returns `false`
+/// on any error (binary missing, exec failed, help output unrecognized)
+/// so the caller falls through to the direct file-edit path.
+fn usermod_supports_subuid_flags() -> bool {
+    let output = match Command::new("usermod").arg("--help").output() {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    // `--help` exits 0 on most usermod variants; on busybox it may
+    // exit non-zero. We don't gate on exit code, only on the help
+    // text.
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    combined.contains("--add-subuids") || combined.contains("-v, --add-subuids")
 }
 
 /// Root-owned directory that holds the GH App credentials the daemon
@@ -347,7 +1528,7 @@ pub fn install_pem_to_etc(operator_home: &Path) -> Result<(), InstallError> {
         })?;
 
         run("chmod", &["0440", dst_path], false)?;
-        // implementation-note-233:
+        // implementation-note-327:
         // `root:ember-clients` (formerly `root:ember`) so the daemon — running
         // with `ember-clients` as primary group per the matching plist change
         // in `render_launchd_plist_body` — can read the credential.
@@ -357,15 +1538,10 @@ pub fn install_pem_to_etc(operator_home: &Path) -> Result<(), InstallError> {
     Ok(())
 }
 
-/// Destination path for the `emberd` daemon binary. The LaunchDaemon plist's
-/// `ProgramArguments` and the systemd unit's `ExecStart` both reference this
-/// path; if the binary is missing the bootstrap silently exec-fails with
-/// ENOENT and no `ember`-uid daemon process ever materializes.
-const EMBERD_INSTALL_PATH: &str = "/usr/local/bin/emberd";
-
-/// Parent directory of [`EMBERD_INSTALL_PATH`]. `mkdir -p` covers the rare
-/// case where `/usr/local/` exists without `/usr/local/bin/` (fresh user
-/// directories on some macOS images, minimal Linux base images).
+/// Parent directory of the `emberd` install path (`/usr/local/bin/emberd`).
+/// `mkdir -p` covers the rare case where `/usr/local/` exists without
+/// `/usr/local/bin/` (fresh user directories on some macOS images, minimal
+/// Linux base images).
 const EMBERD_INSTALL_DIR: &str = "/usr/local/bin";
 
 /// Env-var override naming an explicit path to the `emberd` binary that
@@ -387,29 +1563,28 @@ const ENV_EMBERD_BIN_PATH: &str = "EMBER_EMBERD_BIN_PATH";
 /// operators see "build `emberd` first with `cargo build --release -p
 /// ember-daemon --bin emberd`, or set EMBER_EMBERD_BIN_PATH".
 pub fn resolve_emberd_source() -> Result<PathBuf, InstallError> {
-    if let Ok(raw) = std::env::var(ENV_EMBERD_BIN_PATH) {
-        if !raw.is_empty() {
-            let path = PathBuf::from(&raw);
-            if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
-                return Err(InstallError::Subprocess {
-                    cmd: "resolve_emberd_source".to_string(),
-                    stderr: format!(
-                        "{ENV_EMBERD_BIN_PATH}={raw:?} contains `..` segment — refused"
-                    ),
-                    exit_code: None,
-                });
-            }
-            if !path.exists() {
-                return Err(InstallError::Subprocess {
-                    cmd: "resolve_emberd_source".to_string(),
-                    stderr: format!(
-                        "{ENV_EMBERD_BIN_PATH}={raw:?} does not exist"
-                    ),
-                    exit_code: None,
-                });
-            }
-            return Ok(path);
+    if let Ok(raw) = std::env::var(ENV_EMBERD_BIN_PATH)
+        && !raw.is_empty()
+    {
+        let path = PathBuf::from(&raw);
+        if path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(InstallError::Subprocess {
+                cmd: "resolve_emberd_source".to_string(),
+                stderr: format!("{ENV_EMBERD_BIN_PATH}={raw:?} contains `..` segment — refused"),
+                exit_code: None,
+            });
         }
+        if !path.exists() {
+            return Err(InstallError::Subprocess {
+                cmd: "resolve_emberd_source".to_string(),
+                stderr: format!("{ENV_EMBERD_BIN_PATH}={raw:?} does not exist"),
+                exit_code: None,
+            });
+        }
+        return Ok(path);
     }
 
     let current = std::env::current_exe().map_err(|e| InstallError::Subprocess {
@@ -488,14 +1663,14 @@ pub fn install_emberd_binary_at(
     // daemon install` from a host where the install previously
     // succeeded). Skipping the unlink avoids the brief gap where the
     // file disappears.
-    if let (Ok(sc), Ok(dc)) = (src.canonicalize(), dst.canonicalize()) {
-        if sc == dc {
-            // Still re-apply mode + ownership so they converge if they
-            // drifted (operator manually chmod-ed the file).
-            run("chmod", &["0755", &dst_str], false)?;
-            chown_emberd_binary(&dst_str)?;
-            return Ok(());
-        }
+    if let (Ok(sc), Ok(dc)) = (src.canonicalize(), dst.canonicalize())
+        && sc == dc
+    {
+        // Still re-apply mode + ownership so they converge if they
+        // drifted (operator manually chmod-ed the file).
+        run("chmod", &["0755", &dst_str], false)?;
+        chown_emberd_binary(&dst_str)?;
+        return Ok(());
     }
 
     // Remove existing dst (unlinks inode; running process keeps fd to
@@ -567,22 +1742,18 @@ fn chown_emberd_binary(dst_str: &str) -> Result<(), InstallError> {
 ///
 /// ## Checkpoint
 ///
-/// implementation-note-234
+/// implementation-note-329
 pub fn chown_ember_data_dirs(home: &Path) -> Result<(), InstallError> {
     chown_ember_data_dirs_inner(home, &mut |path, is_dir| {
         let path_str = path.to_string_lossy().into_owned();
         run("chown", &["ember:ember-clients", &path_str], false)?;
         // Signing-key material (daemon_identity.key, daemon_persona.key)
         // must be 0600 (owner-only) per the daemon's fail-closed check
-        // in `infra::runtime` (implementation-note-164 F-S5-013).
+        // in `infra::runtime` (implementation-note-230 F-S5-013).
         // The default 0640 lets the ember-clients group read non-secret
         // state (SQLite, snapshots, vault.salt, etc.) but is too
         // permissive for private keys.
-        let is_private_key = !is_dir
-            && path
-                .extension()
-                .and_then(|s| s.to_str())
-                .map_or(false, |ext| ext == "key");
+        let is_private_key = !is_dir && (path.extension().and_then(|s| s.to_str()) == Some("key"));
         let mode = if is_dir {
             "0750"
         } else if is_private_key {
@@ -617,8 +1788,20 @@ where
     // This covers data/ (SQLite + WAL + journal), vault/, grants/, sessions/,
     // run/, binaries/, and any future directories DaemonConfig introduces —
     // without requiring a parallel update to this list.
+    //
+    // Exception: `orchestrator.lock` is skipped. That file is created by the
+    // CLI running as the operator uid (not by the daemon). Since design moves
+    // `~/.ember/` to `ember:ember-clients` ownership, chowning the lock file
+    // would hand it to the daemon uid and prevent the CLI from acquiring it
+    // on subsequent `ember orchestrator spawn` runs. The lock path has moved
+    // to `/tmp/ember-orchestrator-<uid>.lock` (see orchestrator.rs), but we
+    // preserve this exclusion as defence-in-depth for any stale copy that
+    // might exist from an earlier install.
     for entry in std::fs::read_dir(&ember_root)? {
         let entry = entry?;
+        if entry.file_name() == "orchestrator.lock" {
+            continue;
+        }
         chown_chmod_recursive_inner(&entry.path(), apply_ownership)?;
     }
 
@@ -711,13 +1894,13 @@ const VAULT_MEK_FILENAME: &str = "vault-mek.bin";
 ///
 /// ## Known follow-up
 ///
-/// `implementation-note-235`: the shell-out to
+/// `implementation-note-330`: the shell-out to
 /// `/usr/bin/security` passes the passphrase in `argv` for the duration
 /// of the subprocess (~50ms on a single-user dev box). Long-term fix is
 /// raw FFI to `SecKeychainAddGenericPassword` + `SecAccessCreate` with
 /// an explicit permissive ACL, which avoids the argv leak entirely.
 ///
-/// Anchor: `implementation-note-236`
+/// Anchor: `implementation-note-331`
 pub fn provision_se_mek(home: &Path) -> Result<(), InstallError> {
     let data_dir = home.join(".ember").join("data");
 
@@ -804,7 +1987,7 @@ pub fn provision_se_mek(home: &Path) -> Result<(), InstallError> {
 /// root, the audience is "processes I'm already trusting." Acceptable
 /// for the dev0 wedge. Long-term: raw FFI to
 /// `SecKeychainAddGenericPassword` + `SecAccessCreate` with an explicit
-/// permissive ACL. Filed as `implementation-note-235`.
+/// permissive ACL. Filed as `implementation-note-330`.
 #[cfg(target_os = "macos")]
 fn provision_vault_mek_in_system_keychain() -> Result<(), InstallError> {
     use crate::infra::vault_macos_se::{
@@ -815,11 +1998,12 @@ fn provision_vault_mek_in_system_keychain() -> Result<(), InstallError> {
     // Idempotency check — if the item is already present, do NOT
     // overwrite (would orphan any vault data encrypted under the
     // existing MEK).
-    let keychain = SecKeychain::open(SYSTEM_KEYCHAIN_PATH).map_err(|e| InstallError::Subprocess {
-        cmd: format!("SecKeychain::open({SYSTEM_KEYCHAIN_PATH})"),
-        stderr: format!("{e}"),
-        exit_code: None,
-    })?;
+    let keychain =
+        SecKeychain::open(SYSTEM_KEYCHAIN_PATH).map_err(|e| InstallError::Subprocess {
+            cmd: format!("SecKeychain::open({SYSTEM_KEYCHAIN_PATH})"),
+            stderr: format!("{e}"),
+            exit_code: None,
+        })?;
     if keychain
         .find_generic_password(VAULT_MEK_SERVICE, VAULT_MEK_ACCOUNT)
         .is_ok()
@@ -888,7 +2072,6 @@ fn provision_vault_mek_in_system_keychain() -> Result<(), InstallError> {
     );
     Ok(())
 }
-
 
 // Plist + systemd unit bodies are rendered with the operator's home dir
 // baked in as the daemon's HOME env var. The daemon resolves
@@ -1162,7 +2345,7 @@ fn is_launchd_service_loaded() -> bool {
 ///
 /// ## Checkpoint
 ///
-/// implementation-note-237
+/// implementation-note-332
 #[cfg(target_os = "macos")]
 fn bootout_tolerant() -> Result<(), InstallError> {
     let cmd_string = format!("launchctl bootout system {LAUNCHD_PLIST_PATH}");
@@ -1256,21 +2439,22 @@ const EMBERD_LOG_OUT: &str = "/var/log/emberd.out";
 ///
 /// ## Checkpoint
 ///
-/// implementation-note-238
+/// implementation-note-333
 #[cfg(target_os = "macos")]
 pub fn ensure_emberd_log_paths() -> Result<(), InstallError> {
     ensure_emberd_log_paths_inner(
         Path::new(EMBERD_LOG_ERR),
         Path::new(EMBERD_LOG_OUT),
-        || ember_user_uid_gid(),
+        ember_user_uid_gid,
         |path, uid, gid| {
             use std::ffi::CString;
-            let path_c = CString::new(path.as_os_str().as_encoded_bytes())
-                .map_err(|e| InstallError::Subprocess {
+            let path_c = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|e| {
+                InstallError::Subprocess {
                     cmd: format!("chown {}", path.display()),
                     stderr: format!("path contains NUL: {e}"),
                     exit_code: None,
-                })?;
+                }
+            })?;
             // SAFETY: path_c is a valid NUL-terminated C string; uid/gid are
             // valid system-user values returned by getpwnam_r above.
             let rc = unsafe { libc::chown(path_c.as_ptr(), uid, gid) };
@@ -1362,12 +2546,13 @@ where
 
         // Mode 0644: daemon (ember uid) can append; world can read (useful for
         // operator `tail -f /var/log/emberd.err` without sudo).
-        std::fs::set_permissions(path, Permissions::from_mode(0o644))
-            .map_err(|e| InstallError::Subprocess {
+        std::fs::set_permissions(path, Permissions::from_mode(0o644)).map_err(|e| {
+            InstallError::Subprocess {
                 cmd: format!("chmod 0644 {}", path.display()),
                 stderr: format!("set_permissions failed: {e}"),
                 exit_code: None,
-            })?;
+            }
+        })?;
 
         chown_file(path, uid, gid)?;
     }
@@ -1382,8 +2567,7 @@ where
 pub fn install_launchd_plist(_operator_home: &Path) -> Result<(), InstallError> {
     Err(InstallError::Subprocess {
         cmd: "install_launchd_plist".to_string(),
-        stderr: "unsupported platform: launchd plist install is macOS-only"
-            .to_string(),
+        stderr: "unsupported platform: launchd plist install is macOS-only".to_string(),
         exit_code: None,
     })
 }
@@ -1445,10 +2629,549 @@ pub fn install_systemd_unit(operator_home: &Path) -> Result<(), InstallError> {
 pub fn install_systemd_unit(_operator_home: &Path) -> Result<(), InstallError> {
     Err(InstallError::Subprocess {
         cmd: "install_systemd_unit".to_string(),
-        stderr: "unsupported platform: systemd unit install is Linux-only"
+        stderr: "unsupported platform: systemd unit install is Linux-only".to_string(),
+        exit_code: None,
+    })
+}
+
+// ============================================================================
+// design Components 2 + 3 + MACOS-PRIMITIVES Decision 5 —
+// spawn-helper + spawn-shim install integration.
+// ============================================================================
+//
+// implementation-note-160
+// implementation-note-159
+// implementation-note-161
+//
+// The spawn-helper is a root-privileged sibling daemon (LaunchDaemon
+// on macOS, systemd unit on hardened Linux) that accepts
+// SpawnDirective frames from the main `ember`-uid daemon over a UDS
+// and performs setuid → chroot → sandbox/seccomp → exec. On macOS,
+// the helper does NOT do the privileged setup directly (per MACOS-
+// PRIMITIVES Decision 5): it `posix_spawn`s a tiny shim binary
+// (`emberd-spawn-shim`) which performs the sandbox_init + chroot +
+// setuid + execve dance in a fresh process image.
+//
+// Platform routing:
+//   - macOS              → install_spawn_helper_plist() — LaunchDaemon
+//                          + ALSO install_spawn_shim() — shim binary
+//   - Hardened Linux     → install_spawn_helper_unit()  — systemd unit
+//   - Modern Linux       → SKIP — in-daemon clone3 path handles spawn
+//
+// The detection-and-route decision lives in `broker::spawn_helper_
+// client::should_use_spawn_helper()` (read once at process start;
+// cached).
+
+/// Where the spawn-helper LaunchDaemon plist lives on disk (macOS).
+#[cfg(target_os = "macos")]
+const SPAWN_HELPER_PLIST_PATH: &str = "/Library/LaunchDaemons/sh.emberlink.spawn-helper.plist";
+
+/// Where the spawn-helper binaries are installed (macOS).
+/// `/usr/local/libexec/` is the standard "system service binary not
+/// on operator PATH" location.
+#[cfg(target_os = "macos")]
+const SPAWN_HELPER_BINARY_DIR: &str = "/usr/local/libexec";
+#[cfg(target_os = "macos")]
+const SPAWN_HELPER_BINARY_NAME: &str = "emberd-spawn-helper-macos";
+#[cfg(target_os = "macos")]
+const SPAWN_SHIM_BINARY_NAME: &str = "emberd-spawn-shim";
+
+/// Path on disk for the hardened-Linux spawn-helper systemd unit.
+#[cfg(target_os = "linux")]
+pub const SPAWN_HELPER_UNIT_PATH: &str = "/etc/systemd/system/emberd-spawn-helper.service";
+
+/// Path on disk for the installed spawn-helper binary on Linux.
+#[cfg(target_os = "linux")]
+pub const SPAWN_HELPER_LINUX_BIN_PATH: &str = "/usr/local/libexec/emberd-spawn-helper-linux";
+
+// ─── Hardened-Linux: systemd unit ──────────────────────────────────
+
+/// Detects whether the running Linux kernel is in "hardened" posture:
+/// `kernel.unprivileged_userns_clone=0`. RHEL 8 ships this default;
+/// AppArmor-hardened Ubuntu derivatives often set it.
+///
+/// Returns:
+/// - `Ok(true)` — hardened kernel; spawn-helper install is required.
+/// - `Ok(false)` — modern kernel; spawn-helper install must be
+///   skipped.
+/// - `Err` — the sysctl could not be read; surface to caller. Caller
+///   should treat this as "hardened" (fail-closed).
+#[cfg(target_os = "linux")]
+pub fn detect_hardened_linux() -> Result<bool, InstallError> {
+    const SYSCTL_PATH: &str = "/proc/sys/kernel/unprivileged_userns_clone";
+    let raw = std::fs::read_to_string(SYSCTL_PATH).map_err(|e| InstallError::Subprocess {
+        cmd: format!("read {SYSCTL_PATH}"),
+        stderr: format!("{e}"),
+        exit_code: None,
+    })?;
+    let trimmed = raw.trim();
+    Ok(trimmed == "0")
+}
+
+/// Non-Linux stub. Other platforms have their own privilege-drop path
+/// (macOS LaunchDaemon, modern Linux clone3) — the hardened-Linux
+/// detection only applies on Linux.
+#[cfg(not(target_os = "linux"))]
+pub fn detect_hardened_linux() -> Result<bool, InstallError> {
+    Ok(false)
+}
+
+/// Render the spawn-helper systemd unit body with `{{EMBER_UID}}`,
+/// `{{POOL_UID_BASE}}`, and `{{POOL_SIZE}}` substituted. The template
+/// lives at `infra/systemd/emberd-spawn-helper.service` as a
+/// reference; this function emits the canonical production-shape body
+/// in-code so the install path doesn't depend on disk-side template
+/// files at deploy time.
+///
+/// Pool args are written into `ExecStart` per design + the Decision
+/// 5 brief: the helper bin REQUIRES `--pool-uid-base` and `--pool-
+/// size` with no defaults; this renderer is the single producer of
+/// those values for production systemd.
+///
+/// implementation-note-160
+#[allow(dead_code)]
+pub(crate) fn render_spawn_helper_unit_body(
+    ember_uid: u32,
+    pool_uid_base: u32,
+    pool_size: u32,
+) -> String {
+    format!(
+        "[Unit]\n\
+         Description=Emberlink spawn-helper (design Component 2 hardened-Linux)\n\
+         Documentation=https://github.com/emberlink/emberlink/blob/main/project design notes\n\
+         After=network.target\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         User=root\n\
+         Group=root\n\
+         NoNewPrivileges=no\n\
+         AmbientCapabilities=CAP_SETUID CAP_SETGID CAP_CHOWN CAP_SYS_CHROOT\n\
+         CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_CHOWN CAP_SYS_CHROOT\n\
+         ProtectSystem=strict\n\
+         ProtectHome=true\n\
+         PrivateTmp=true\n\
+         ReadWritePaths=/var/run /tmp/emberd-spawn-quarantine\n\
+         PrivateDevices=true\n\
+         ProtectKernelTunables=true\n\
+         ProtectKernelModules=true\n\
+         ProtectControlGroups=true\n\
+         RestrictNamespaces=true\n\
+         RestrictRealtime=true\n\
+         LockPersonality=true\n\
+         MemoryDenyWriteExecute=true\n\
+         RuntimeDirectory=emberd-spawn-helper\n\
+         RuntimeDirectoryMode=0750\n\
+         Restart=on-failure\n\
+         RestartSec=5\n\
+         StartLimitBurst=5\n\
+         StartLimitIntervalSec=60\n\
+         ExecStart=/usr/local/libexec/emberd-spawn-helper-linux --socket /var/run/emberd-spawn-helper.sock --daemon-uid {ember_uid} --pool-uid-base {pool_uid_base} --pool-size {pool_size}\n\
+         KillSignal=SIGTERM\n\
+         TimeoutStopSec=10\n\
+         \n\
+         [Install]\n\
+         WantedBy=multi-user.target\n"
+    )
+}
+
+/// Install the hardened-Linux spawn-helper systemd unit and enable
+/// it.
+///
+/// `ember_uid` is the numeric uid of the main daemon (`ember`). The
+/// helper enforces SO_PEERCRED uid matching this value at accept
+/// time — incoming connections from any other uid are refused.
+///
+/// **Idempotent.** Re-running on a host with the unit already
+/// installed rewrites only when the body differs; `daemon-reload` +
+/// `enable --now` are always issued so the active state converges.
+///
+/// implementation-note-160
+#[cfg(target_os = "linux")]
+pub fn install_spawn_helper_unit(
+    ember_uid: u32,
+    pool_uid_base: u32,
+    pool_size: u32,
+) -> Result<(), InstallError> {
+    let path = Path::new(SPAWN_HELPER_UNIT_PATH);
+    let body = render_spawn_helper_unit_body(ember_uid, pool_uid_base, pool_size);
+
+    let already_matches = std::fs::read_to_string(path)
+        .map(|existing| existing == body)
+        .unwrap_or(false);
+
+    if !already_matches {
+        std::fs::write(path, &body).map_err(|e| InstallError::Subprocess {
+            cmd: format!("write {SPAWN_HELPER_UNIT_PATH}"),
+            stderr: format!("write failed: {e}"),
+            exit_code: None,
+        })?;
+
+        run("chmod", &["0644", SPAWN_HELPER_UNIT_PATH], false)?;
+    }
+
+    run("systemctl", &["daemon-reload"], false)?;
+    run(
+        "systemctl",
+        &["enable", "--now", "emberd-spawn-helper.service"],
+        false,
+    )?;
+
+    Ok(())
+}
+
+/// Non-Linux fallback. The hardened-Linux helper unit is meaningful
+/// only on Linux; other platforms have their own privilege-drop path.
+#[cfg(not(target_os = "linux"))]
+pub fn install_spawn_helper_unit(
+    _ember_uid: u32,
+    _pool_uid_base: u32,
+    _pool_size: u32,
+) -> Result<(), InstallError> {
+    Err(InstallError::Subprocess {
+        cmd: "install_spawn_helper_unit".to_string(),
+        stderr: "unsupported platform: spawn-helper systemd unit is Linux-only".to_string(),
+        exit_code: None,
+    })
+}
+
+// ─── macOS: LaunchDaemon plist + shim binary ───────────────────────
+
+/// Probe the `ember-clients` connect group via `getgrnam_r`. Returns
+/// `true` when the group exists.
+///
+/// The spawn-helper's UDS lives at `0660 root:ember-clients` —
+/// without the group, the daemon's `ember` uid cannot connect. The
+/// install path refuses to write the plist when this probe fails.
+#[cfg(target_os = "macos")]
+fn ember_clients_group_exists() -> bool {
+    let Ok(c_name) = std::ffi::CString::new("ember-clients") else {
+        return false;
+    };
+    let mut buf = vec![0 as libc::c_char; 4096];
+    // SAFETY: grp + result are out-params; getgrnam_r fills them on
+    // success.
+    let mut grp: libc::group = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::group = std::ptr::null_mut();
+    // SAFETY: c_name is valid; buf is writable.
+    let rc = unsafe {
+        libc::getgrnam_r(
+            c_name.as_ptr(),
+            &mut grp,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut result,
+        )
+    };
+    rc == 0 && !result.is_null()
+}
+
+/// Render the spawn-helper LaunchDaemon plist body, substituting:
+/// - `{{EMBER_UID}}` → numeric uid of the `ember` system user
+/// - `{{POOL_UID_BASE}}` → first uid in the spawn-helper pool
+/// - `{{POOL_SIZE}}` → number of slots in the pool
+/// - `{{EXPECTED_SHIM_HASH}}` → blake3 hex of the shipped shim
+///
+/// implementation-note-159
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+pub(crate) fn render_spawn_helper_plist_body(
+    ember_uid: u32,
+    pool_uid_base: u32,
+    pool_size: u32,
+    expected_shim_hash: &str,
+) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+         <plist version=\"1.0\">\n\
+         <dict>\n  \
+           <key>Label</key>           <string>sh.emberlink.spawn-helper</string>\n  \
+           <key>UserName</key>        <string>root</string>\n  \
+           <key>GroupName</key>       <string>ember-clients</string>\n  \
+           <key>ProgramArguments</key>\n  \
+           <array>\n    \
+             <string>/usr/local/libexec/emberd-spawn-helper-macos</string>\n    \
+             <string>--socket</string>\n    \
+             <string>/var/run/emberd-spawn-helper.sock</string>\n    \
+             <string>--daemon-uid</string>\n    \
+             <string>{ember_uid}</string>\n    \
+             <string>--pool-uid-base</string>\n    \
+             <string>{pool_uid_base}</string>\n    \
+             <string>--pool-size</string>\n    \
+             <string>{pool_size}</string>\n    \
+             <string>--shim-path</string>\n    \
+             <string>/usr/local/libexec/emberd-spawn-shim</string>\n  \
+           </array>\n  \
+           <key>EnvironmentVariables</key>\n  \
+           <dict>\n    \
+             <key>EXPECTED_SHIM_HASH</key>\n    \
+             <string>{expected_shim_hash}</string>\n  \
+           </dict>\n  \
+           <key>KeepAlive</key>       <true/>\n  \
+           <key>RunAtLoad</key>       <true/>\n  \
+           <key>StandardErrorPath</key><string>/var/log/emberd-spawn-helper.err</string>\n  \
+           <key>StandardOutPath</key> <string>/var/log/emberd-spawn-helper.out</string>\n\
+         </dict>\n\
+         </plist>\n"
+    )
+}
+
+/// Install the `sh.emberlink.spawn-helper` LaunchDaemon, the
+/// `emberd-spawn-helper-macos` binary, and the
+/// `emberd-spawn-shim` binary; bootstrap the LaunchDaemon into the
+/// system domain.
+///
+/// **Idempotent.** Skips the bootout/bootstrap cycle when the on-disk
+/// plist matches AND the service is currently loaded.
+///
+/// Steps:
+/// 1. Verify the `ember-clients` connect group exists (the plist
+///    sets `GroupName=ember-clients`; an absent group would block
+///    daemon connectivity).
+/// 2. Resolve the `ember` system uid.
+/// 3. Publish both the helper binary and the shim binary to
+///    `/usr/local/libexec/`.
+/// 4. Compute blake3 of the on-disk shim; render it into the plist's
+///    `EXPECTED_SHIM_HASH` env var.
+/// 5. Pre-create `/var/log/emberd-spawn-helper.{err,out}` for
+///    launchd's fd handoff.
+/// 6. Write the plist (mode 0644), `launchctl bootout`-tolerant,
+///    `launchctl bootstrap system`.
+///
+/// implementation-note-159
+/// implementation-note-161
+#[cfg(target_os = "macos")]
+pub fn install_spawn_helper_plist(pool_uid_base: u32, pool_size: u32) -> Result<(), InstallError> {
+    // 1) Probe ember-clients group. Refuse install if missing — the
+    //    plist's GroupName=ember-clients would land on a non-
+    //    existent group and the helper's socket would inherit gid
+    //    0 (wheel), blocking the daemon's connect(2).
+    if !ember_clients_group_exists() {
+        return Err(InstallError::Subprocess {
+            cmd: "getgrnam_r(ember-clients)".to_string(),
+            stderr: "the `ember-clients` connect group is not provisioned — \
+                     run `ember daemon install` (or `provision_ember_user`) first"
+                .to_string(),
+            exit_code: None,
+        });
+    }
+
+    // 2) Resolve ember uid.
+    let (ember_uid, _ember_gid) = ember_user_uid_gid().ok_or_else(|| InstallError::Subprocess {
+        cmd: "getpwnam_r ember".to_string(),
+        stderr: "the `ember` system user is not provisioned — run \
+                 `ember daemon install` (or `provision_ember_user`) first"
+            .to_string(),
+        exit_code: None,
+    })?;
+
+    // 3) Publish helper binary + shim binary.
+    install_spawn_helper_binary()?;
+    let shim_dest = install_spawn_shim_binary()?;
+
+    // 4) Compute on-disk shim hash for the plist env var.
+    let shim_hash = ember_spawn_helper::hash::blake3_hex_of_file(&shim_dest).map_err(|e| {
+        InstallError::Subprocess {
+            cmd: format!("blake3 {}", shim_dest.display()),
+            stderr: format!("hash failed: {e}"),
+            exit_code: None,
+        }
+    })?;
+
+    let path = Path::new(SPAWN_HELPER_PLIST_PATH);
+    let body = render_spawn_helper_plist_body(ember_uid, pool_uid_base, pool_size, &shim_hash);
+
+    let already_matches = std::fs::read_to_string(path)
+        .map(|existing| existing == body)
+        .unwrap_or(false);
+
+    if !already_matches || !is_spawn_helper_service_loaded() {
+        std::fs::write(path, &body).map_err(|e| InstallError::Subprocess {
+            cmd: format!("write {SPAWN_HELPER_PLIST_PATH}"),
+            stderr: format!("write failed: {e}"),
+            exit_code: None,
+        })?;
+        run("chmod", &["0644", SPAWN_HELPER_PLIST_PATH], false)?;
+
+        spawn_helper_bootout_tolerant()?;
+
+        ensure_spawn_helper_log_paths()?;
+
+        run(
+            "launchctl",
+            &["bootstrap", "system", SPAWN_HELPER_PLIST_PATH],
+            false,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Non-macOS fallback for [`install_spawn_helper_plist`].
+#[cfg(not(target_os = "macos"))]
+pub fn install_spawn_helper_plist(
+    _pool_uid_base: u32,
+    _pool_size: u32,
+) -> Result<(), InstallError> {
+    Err(InstallError::Subprocess {
+        cmd: "install_spawn_helper_plist".to_string(),
+        stderr: "unsupported platform: spawn-helper LaunchDaemon is macOS-only \
+                 (Linux hardened variant lives in install_spawn_helper_unit)"
             .to_string(),
         exit_code: None,
     })
+}
+
+/// True iff `launchctl print system/sh.emberlink.spawn-helper` exits
+/// 0 (service is currently loaded into the system domain).
+#[cfg(target_os = "macos")]
+fn is_spawn_helper_service_loaded() -> bool {
+    let label = "system/sh.emberlink.spawn-helper";
+    Command::new("launchctl")
+        .args(["print", label])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// `launchctl bootout system <plist>` that tolerates "not currently
+/// bootstrapped" the same way `bootout_tolerant` does for the main
+/// daemon plist.
+#[cfg(target_os = "macos")]
+fn spawn_helper_bootout_tolerant() -> Result<(), InstallError> {
+    let cmd_string = format!("launchctl bootout system {SPAWN_HELPER_PLIST_PATH}");
+    bootout_tolerant_inner(&cmd_string, || {
+        let output = Command::new("launchctl")
+            .args(["bootout", "system", SPAWN_HELPER_PLIST_PATH])
+            .output()
+            .map_err(|e| InstallError::Subprocess {
+                cmd: cmd_string.clone(),
+                stderr: format!("spawn failed: {e}"),
+                exit_code: None,
+            })?;
+        let exit_code = output.status.code();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Ok((exit_code, stderr, output.status.success()))
+    })
+}
+
+/// Publish the `emberd-spawn-helper-macos` binary into
+/// `/usr/local/libexec/`. Idempotent.
+///
+/// The helper is mode `0755 root:wheel`. It's NOT setuid (per ADR
+/// 155 Component 4) — launchd starts it as root via
+/// `UserName=root`.
+#[cfg(target_os = "macos")]
+fn install_spawn_helper_binary() -> Result<(), InstallError> {
+    install_libexec_binary(SPAWN_HELPER_BINARY_NAME)?;
+    Ok(())
+}
+
+/// Publish the `emberd-spawn-shim` binary into `/usr/local/libexec/`.
+/// Mode `0755 root:wheel`. NOT setuid — the shim receives its root
+/// identity through the helper's `posix_spawn` (which runs the shim
+/// in a clean post-execve image inheriting the helper's effective
+/// uid), not via a kernel-evaluated suid bit.
+///
+/// Returns the install destination so the caller can hash it for
+/// `EXPECTED_SHIM_HASH`.
+///
+/// implementation-note-161
+#[cfg(target_os = "macos")]
+fn install_spawn_shim_binary() -> Result<PathBuf, InstallError> {
+    install_libexec_binary(SPAWN_SHIM_BINARY_NAME)
+}
+
+/// Shared helper-binary install routine. Copies the named binary
+/// from the current_exe's directory to `/usr/local/libexec/` with
+/// mode `0755`. Idempotent — skips the copy when the destination's
+/// bytes already match.
+#[cfg(target_os = "macos")]
+fn install_libexec_binary(name: &str) -> Result<PathBuf, InstallError> {
+    let cur_exe = std::env::current_exe().map_err(|e| InstallError::Subprocess {
+        cmd: "current_exe".to_string(),
+        stderr: format!("current_exe failed: {e}"),
+        exit_code: None,
+    })?;
+    let src = cur_exe
+        .parent()
+        .ok_or_else(|| InstallError::Subprocess {
+            cmd: "current_exe.parent".to_string(),
+            stderr: "current_exe has no parent dir".to_string(),
+            exit_code: None,
+        })?
+        .join(name);
+
+    if !src.exists() {
+        return Err(InstallError::Subprocess {
+            cmd: format!("locate {name}"),
+            stderr: format!(
+                "{name} not found next to current_exe ({}); \
+                 build with `cargo build -p ember-spawn-helper --release` and re-run install",
+                src.display()
+            ),
+            exit_code: None,
+        });
+    }
+
+    let dest_dir = Path::new(SPAWN_HELPER_BINARY_DIR);
+    let dest = dest_dir.join(name);
+    std::fs::create_dir_all(dest_dir).map_err(|e| InstallError::Subprocess {
+        cmd: format!("mkdir -p {}", dest_dir.display()),
+        stderr: format!("create_dir_all failed: {e}"),
+        exit_code: None,
+    })?;
+
+    let need_copy = match (std::fs::read(&src), std::fs::read(&dest)) {
+        (Ok(a), Ok(b)) => a != b,
+        _ => true,
+    };
+    if need_copy {
+        std::fs::copy(&src, &dest).map_err(|e| InstallError::Subprocess {
+            cmd: format!("cp {} {}", src.display(), dest.display()),
+            stderr: format!("copy failed: {e}"),
+            exit_code: None,
+        })?;
+    }
+
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).map_err(|e| {
+        InstallError::Subprocess {
+            cmd: format!("chmod 0755 {}", dest.display()),
+            stderr: format!("set_permissions failed: {e}"),
+            exit_code: None,
+        }
+    })?;
+
+    Ok(dest)
+}
+
+/// Pre-create `/var/log/emberd-spawn-helper.{err,out}` so launchd's
+/// fd handoff succeeds at bootstrap.
+#[cfg(target_os = "macos")]
+fn ensure_spawn_helper_log_paths() -> Result<(), InstallError> {
+    for path in &[
+        "/var/log/emberd-spawn-helper.err",
+        "/var/log/emberd-spawn-helper.out",
+    ] {
+        if !Path::new(path).exists() {
+            std::fs::File::create(path).map_err(|e| InstallError::Subprocess {
+                cmd: format!("create {path}"),
+                stderr: format!("create failed: {e}"),
+                exit_code: None,
+            })?;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).map_err(|e| {
+            InstallError::Subprocess {
+                cmd: format!("chmod 0644 {path}"),
+                stderr: format!("set_permissions failed: {e}"),
+                exit_code: None,
+            }
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1525,17 +3248,19 @@ mod tests {
         std::fs::create_dir_all(&data_dir).expect("mkdir .ember/data");
         // Simulate the SQLite DB file and WAL file that the daemon creates
         // inside data/.
-        std::fs::write(data_dir.join("ember.db"), b"fake-sqlite-header")
-            .expect("write ember.db");
-        std::fs::write(data_dir.join("ember.db-wal"), b"fake-wal")
-            .expect("write ember.db-wal");
+        std::fs::write(data_dir.join("ember.db"), b"fake-sqlite-header").expect("write ember.db");
+        std::fs::write(data_dir.join("ember.db-wal"), b"fake-wal").expect("write ember.db-wal");
 
         let mut visited: Vec<std::path::PathBuf> = Vec::new();
         let result = chown_ember_data_dirs_inner(tmp.path(), &mut |path, _is_dir| {
             visited.push(path.to_path_buf());
             Ok(())
         });
-        assert!(result.is_ok(), "chown_ember_data_dirs_inner failed: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "chown_ember_data_dirs_inner failed: {:?}",
+            result
+        );
 
         // data/ itself must be visited.
         assert!(
@@ -1580,7 +3305,11 @@ mod tests {
             visited.push(path.to_path_buf());
             Ok(())
         });
-        assert!(result.is_ok(), "chown_ember_data_dirs_inner failed: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "chown_ember_data_dirs_inner failed: {:?}",
+            result
+        );
 
         for name in legacy.iter() {
             let dir = ember_root.join(name);
@@ -1596,6 +3325,50 @@ mod tests {
                 visited
             );
         }
+    }
+
+    /// T1 — chown_ember_data_dirs_inner does NOT visit `orchestrator.lock`.
+    ///
+    /// The orchestrator lock is created by the CLI running as the operator uid.
+    /// Under design, `~/.ember/` is chowned to `ember:ember-clients` so the
+    /// operator uid cannot write there after install. To avoid double-locking
+    /// the problem, the chown walk explicitly skips `orchestrator.lock` so a
+    /// stale copy (from before the lock path moved to `/tmp`) would be left in
+    /// operator-owned state rather than reassigned to the daemon uid.
+    #[test]
+    fn chown_ember_data_dirs_skips_orchestrator_lock() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ember_root = tmp.path().join(".ember");
+        std::fs::create_dir_all(&ember_root).expect("mkdir .ember");
+
+        // Populate the lock file alongside a normal data directory.
+        let lock_path = ember_root.join("orchestrator.lock");
+        std::fs::write(&lock_path, b"").expect("write orchestrator.lock");
+        let data_dir = ember_root.join("data");
+        std::fs::create_dir_all(&data_dir).expect("mkdir .ember/data");
+        std::fs::write(data_dir.join("ember.db"), b"x").expect("write ember.db");
+
+        let mut visited: Vec<std::path::PathBuf> = Vec::new();
+        let result = chown_ember_data_dirs_inner(tmp.path(), &mut |path, _is_dir| {
+            visited.push(path.to_path_buf());
+            Ok(())
+        });
+        assert!(
+            result.is_ok(),
+            "chown_ember_data_dirs_inner failed: {result:?}"
+        );
+
+        // The normal data dir must be visited.
+        assert!(
+            visited.contains(&data_dir),
+            "data/ was not visited; visited={visited:?}"
+        );
+
+        // orchestrator.lock must NOT be visited (it is operator-uid owned).
+        assert!(
+            !visited.contains(&lock_path),
+            "orchestrator.lock was visited but should be skipped; visited={visited:?}"
+        );
     }
 
     /// Integration-tier — exercises the real `provision_ember_user`
@@ -1847,10 +3620,7 @@ mod tests {
     /// Testable version of install_pem_to_etc — same logic but with a
     /// caller-supplied destination directory instead of `/etc/emberlink`.
     /// Allows assertions on mode bits and file presence without root.
-    fn install_pem_to_etc_into(
-        operator_home: &Path,
-        dest_dir: &Path,
-    ) -> Result<(), InstallError> {
+    fn install_pem_to_etc_into(operator_home: &Path, dest_dir: &Path) -> Result<(), InstallError> {
         std::fs::create_dir_all(dest_dir)?;
 
         // Set mode 0750 on the destination dir.
@@ -1957,15 +3727,12 @@ mod tests {
 
         let src_config = operator_tmp.path().join(".config").join("emberlink");
         std::fs::create_dir_all(&src_config).expect("create src config dir");
-        std::fs::write(src_config.join("ember-engine-app.pem"), b"PEM v1")
-            .expect("write pem");
-        std::fs::write(src_config.join("ember-engine.env"), b"ENV=1")
-            .expect("write env");
+        std::fs::write(src_config.join("ember-engine-app.pem"), b"PEM v1").expect("write pem");
+        std::fs::write(src_config.join("ember-engine.env"), b"ENV=1").expect("write env");
 
         let dest_dir = dest_tmp.path().join("etc-emberlink");
 
-        install_pem_to_etc_into(operator_tmp.path(), &dest_dir)
-            .expect("first call");
+        install_pem_to_etc_into(operator_tmp.path(), &dest_dir).expect("first call");
 
         // Simulate operator chmod drift — relax the PEM to 0644.
         let pem_dst = dest_dir.join("ember-engine-app.pem");
@@ -2002,7 +3769,10 @@ mod tests {
         );
 
         // Destination dir was created (step 1 always runs).
-        assert!(dest_dir.exists(), "dest dir must be created even when source is missing");
+        assert!(
+            dest_dir.exists(),
+            "dest dir must be created even when source is missing"
+        );
 
         // No PEM/env file written.
         assert!(
@@ -2053,7 +3823,7 @@ mod tests {
         );
     }
 
-    // ── implementation-note-239 — resolve_emberd_source + install_emberd_binary_at ────
+    // ── implementation-note-334 — resolve_emberd_source + install_emberd_binary_at ────
 
     /// Serialize tests that mutate process env. `EMBER_EMBERD_BIN_PATH`
     /// is process-global; two override tests racing under cargo's
@@ -2123,8 +3893,7 @@ mod tests {
                     "empty env var leaked into override path: {stderr}"
                 );
                 assert!(
-                    stderr.contains("could not find `emberd`")
-                        || stderr.contains("current_exe"),
+                    stderr.contains("could not find `emberd`") || stderr.contains("current_exe"),
                     "empty env var should fall through to sibling lookup, got: {stderr}"
                 );
             }
@@ -2349,10 +4118,21 @@ mod tests {
         // chown closure must have been called for each file with the mocked uid/gid.
         assert_eq!(chowned.len(), 2, "chown must be called for both log files");
         for (path, uid, gid) in &chowned {
-            assert_eq!(*uid, mock_uid, "uid must match mocked ember uid for {}", path.display());
-            assert_eq!(*gid, mock_gid, "gid must match mocked ember gid for {}", path.display());
+            assert_eq!(
+                *uid,
+                mock_uid,
+                "uid must match mocked ember uid for {}",
+                path.display()
+            );
+            assert_eq!(
+                *gid,
+                mock_gid,
+                "gid must match mocked ember gid for {}",
+                path.display()
+            );
         }
-        let chowned_paths: Vec<&std::path::Path> = chowned.iter().map(|(p, _, _)| p.as_path()).collect();
+        let chowned_paths: Vec<&std::path::Path> =
+            chowned.iter().map(|(p, _, _)| p.as_path()).collect();
         assert!(
             chowned_paths.contains(&err_path.as_path()),
             "chown must be called for emberd.err"
@@ -2375,7 +4155,7 @@ mod tests {
         let result = ensure_emberd_log_paths_inner(
             &err_path,
             &out_path,
-            || None, // ember user does not exist
+            || None,                    // ember user does not exist
             |_path, _uid, _gid| Ok(()), // chown should never be called
         );
 
@@ -2388,5 +4168,824 @@ mod tests {
             err_msg.contains("provision_ember_user"),
             "error must point at provision_ember_user, got: {err_msg}"
         );
+    }
+
+    // ── implementation-note-163 — T2 tests ───────────────────────
+    //
+    // design Component 2 modern-Linux subuid install path. Tests use
+    // `provision_subuid_range_at` against tempdir-scoped `subuid` /
+    // `subgid` files so no root or `/etc/` mutation is required.
+
+    /// T2 — fresh install: empty (nonexistent) subuid/subgid files
+    /// get an `ember:100000:8192` line appended. Returns the
+    /// `Subuid` provisioning variant with matching values.
+    #[test]
+    fn provision_subuid_range_writes_to_fresh_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let subuid = tmp.path().join("subuid");
+        let subgid = tmp.path().join("subgid");
+
+        // Don't pre-create — provision_subuid_range_at must tolerate
+        // missing files (treated as empty content).
+        let result = provision_subuid_range_at(&subuid, &subgid, 100_000, 8192);
+        let prov = result.expect("fresh install must succeed");
+
+        // Verify return value matches.
+        match prov {
+            SpawnPoolProvisioning::Subuid {
+                range_start,
+                slot_count,
+            } => {
+                assert_eq!(range_start, 100_000);
+                assert_eq!(slot_count, 8192);
+            }
+            other => panic!("expected Subuid variant, got: {other:?}"),
+        }
+
+        // Verify the file contents.
+        let subuid_contents =
+            std::fs::read_to_string(&subuid).expect("subuid file must be written");
+        assert!(
+            subuid_contents.contains("ember:100000:8192"),
+            "subuid must contain ember:100000:8192, got: {subuid_contents:?}"
+        );
+        let subgid_contents =
+            std::fs::read_to_string(&subgid).expect("subgid file must be written");
+        assert!(
+            subgid_contents.contains("ember:100000:8192"),
+            "subgid must contain ember:100000:8192, got: {subgid_contents:?}"
+        );
+    }
+
+    /// T2 — idempotency: running provision twice produces the same
+    /// file contents. The second call detects the existing matching
+    /// entry and returns Ok without re-writing.
+    #[test]
+    fn provision_subuid_range_idempotent_on_second_call() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let subuid = tmp.path().join("subuid");
+        let subgid = tmp.path().join("subgid");
+
+        provision_subuid_range_at(&subuid, &subgid, 100_000, 8192).expect("first call");
+        let first_subuid = std::fs::read_to_string(&subuid).expect("read after first");
+        let first_subgid = std::fs::read_to_string(&subgid).expect("read after first");
+
+        provision_subuid_range_at(&subuid, &subgid, 100_000, 8192)
+            .expect("second call must be a no-op");
+        let second_subuid = std::fs::read_to_string(&subuid).expect("read after second");
+        let second_subgid = std::fs::read_to_string(&subgid).expect("read after second");
+
+        assert_eq!(
+            first_subuid, second_subuid,
+            "second call must not modify subuid (got drift: {first_subuid:?} -> {second_subuid:?})"
+        );
+        assert_eq!(
+            first_subgid, second_subgid,
+            "second call must not modify subgid (got drift: {first_subgid:?} -> {second_subgid:?})"
+        );
+
+        // Exactly one ember: entry — no duplicates from re-append.
+        let ember_lines: Vec<&str> = second_subuid
+            .lines()
+            .filter(|l| l.trim_start().starts_with("ember:"))
+            .collect();
+        assert_eq!(
+            ember_lines.len(),
+            1,
+            "must have exactly one ember: entry, got: {ember_lines:?}"
+        );
+    }
+
+    /// T2 — range collision: an existing `ember:OTHER:OTHER` entry
+    /// causes provision to refuse rather than silently overwrite.
+    /// The error message names both the existing and desired ranges
+    /// so the operator can resolve manually.
+    #[test]
+    fn provision_subuid_range_refuses_conflicting_entry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let subuid = tmp.path().join("subuid");
+        let subgid = tmp.path().join("subgid");
+
+        // Pre-populate with a conflicting entry (different range).
+        std::fs::write(&subuid, b"ember:200000:65536\n").expect("write conflicting subuid");
+        std::fs::write(&subgid, b"ember:200000:65536\n").expect("write conflicting subgid");
+
+        let result = provision_subuid_range_at(&subuid, &subgid, 100_000, 8192);
+        let err = match result {
+            Err(e) => e,
+            Ok(prov) => panic!("must refuse conflicting entry; got Ok({prov:?})"),
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("200000"),
+            "error must name the existing range: {msg}"
+        );
+        assert!(
+            msg.contains("100000"),
+            "error must name the desired range: {msg}"
+        );
+        assert!(
+            msg.contains("ember:"),
+            "error must reference the ember subuid entry: {msg}"
+        );
+
+        // Files must be unchanged on conflict — we refused to write.
+        let subuid_after = std::fs::read_to_string(&subuid).expect("read subuid after refusal");
+        assert_eq!(
+            subuid_after, "ember:200000:65536\n",
+            "subuid must be unchanged on conflict; got: {subuid_after:?}"
+        );
+    }
+
+    /// T2 — preserves unrelated entries: provision appends to a
+    /// file that already has entries for other users (typical
+    /// real-world `/etc/subuid` content). Idempotency check
+    /// against the line count after both calls.
+    #[test]
+    fn provision_subuid_range_preserves_unrelated_entries() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let subuid = tmp.path().join("subuid");
+        let subgid = tmp.path().join("subgid");
+
+        // Pre-populate with realistic content from a typical Linux
+        // host (dockerd subuid, regular user subuid).
+        let pre_existing = "docker:165536:65536\nalice:100000:65536\n";
+        std::fs::write(&subuid, pre_existing).expect("write pre-existing");
+        std::fs::write(&subgid, pre_existing).expect("write pre-existing");
+
+        provision_subuid_range_at(&subuid, &subgid, 500_000, 8192).expect("provision must succeed");
+
+        let after = std::fs::read_to_string(&subuid).expect("read after");
+        assert!(
+            after.contains("docker:165536:65536"),
+            "docker entry must be preserved, got: {after:?}"
+        );
+        assert!(
+            after.contains("alice:100000:65536"),
+            "alice entry must be preserved, got: {after:?}"
+        );
+        assert!(
+            after.contains("ember:500000:8192"),
+            "ember entry must be appended, got: {after:?}"
+        );
+    }
+
+    /// T2 — find_ember_subuid_entry: matching shape returns Match.
+    #[test]
+    fn find_ember_subuid_entry_matches_exact() {
+        let contents = "docker:165536:65536\nember:100000:8192\nalice:200000:65536\n";
+        let found = find_ember_subuid_entry(contents, 100_000, 8192);
+        assert_eq!(found, Some(EmberSubuidEntry::Match));
+    }
+
+    /// T2 — find_ember_subuid_entry: different range returns Conflict.
+    #[test]
+    fn find_ember_subuid_entry_detects_conflict() {
+        let contents = "ember:200000:16384\n";
+        let found = find_ember_subuid_entry(contents, 100_000, 8192);
+        assert_eq!(
+            found,
+            Some(EmberSubuidEntry::Conflict {
+                existing_start: 200_000,
+                existing_count: 16_384,
+            })
+        );
+    }
+
+    /// T2 — find_ember_subuid_entry: no ember line returns None.
+    #[test]
+    fn find_ember_subuid_entry_returns_none_when_absent() {
+        let contents = "docker:165536:65536\nalice:200000:65536\n";
+        let found = find_ember_subuid_entry(contents, 100_000, 8192);
+        assert_eq!(found, None);
+    }
+
+    /// T2 — find_ember_subuid_entry: empty content returns None.
+    #[test]
+    fn find_ember_subuid_entry_handles_empty() {
+        assert_eq!(find_ember_subuid_entry("", 100_000, 8192), None);
+    }
+
+    /// T2 — find_ember_subuid_entry: skips comment lines and blank lines.
+    #[test]
+    fn find_ember_subuid_entry_skips_comments_and_blanks() {
+        let contents = "# header comment\n\n# another comment\nember:100000:8192\n";
+        let found = find_ember_subuid_entry(contents, 100_000, 8192);
+        assert_eq!(found, Some(EmberSubuidEntry::Match));
+    }
+
+    /// T2 — find_ember_subuid_entry: garbage lines (wrong column
+    /// count, non-numeric) are skipped silently.
+    #[test]
+    fn find_ember_subuid_entry_skips_malformed_lines() {
+        let contents = "malformed line\nember:abc:def\nember:100000:8192\n";
+        let found = find_ember_subuid_entry(contents, 100_000, 8192);
+        assert_eq!(found, Some(EmberSubuidEntry::Match));
+    }
+
+    /// T2 — find_ember_subuid_entry: TWO `ember:` lines, both
+    /// well-formed, return `MultipleEntries` regardless of whether
+    /// the values match. Defense-in-depth against shadow-utils'
+    /// "union all matching lines" newuidmap semantics — an attacker
+    /// with root who appends a second `ember:0:65536` line would
+    /// silently grant uid 0 mapping authority while a single-line
+    /// check would see only the first line. The install path
+    /// refuses; operator must consolidate.
+    #[test]
+    fn find_ember_subuid_entry_detects_multiple_entries() {
+        let contents = "ember:100000:8192\nember:0:65536\n";
+        let found = find_ember_subuid_entry(contents, 100_000, 8192);
+        match found {
+            Some(EmberSubuidEntry::MultipleEntries { count, lines }) => {
+                assert_eq!(count, 2, "expected 2 ember entries, got {count}");
+                assert_eq!(
+                    lines.len(),
+                    2,
+                    "lines vec must carry both entries, got: {lines:?}"
+                );
+                assert!(
+                    lines.iter().any(|l| l.contains("100000")),
+                    "lines must include the first entry: {lines:?}"
+                );
+                assert!(
+                    lines.iter().any(|l| l.contains(":0:")),
+                    "lines must include the hostile second entry: {lines:?}"
+                );
+            }
+            other => panic!("expected MultipleEntries; got {other:?}"),
+        }
+    }
+
+    /// T2 — find_ember_subuid_entry_multiple_entries_refused (named
+    /// per the brief): a file with two ember lines triggers a
+    /// refusal at `ensure_subuid_entry`/`provision_subuid_range_at`
+    /// boundary, not just at the lower-level parser. End-to-end
+    /// regression guard.
+    #[test]
+    fn find_ember_subuid_entry_multiple_entries_refused() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let subuid = tmp.path().join("subuid");
+        let subgid = tmp.path().join("subgid");
+
+        // Pre-populate the subuid file with TWO ember lines — the
+        // legit install line + a hostile second line.
+        let two_lines = "ember:100000:8192\nember:0:65536\n";
+        std::fs::write(&subuid, two_lines).expect("write 2-line subuid");
+        std::fs::write(&subgid, two_lines).expect("write 2-line subgid");
+
+        let result = provision_subuid_range_at(&subuid, &subgid, 100_000, 8192);
+        let err = match result {
+            Err(e) => e,
+            Ok(prov) => panic!("provision must refuse 2-line subuid; got Ok({prov:?})"),
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("2 `ember:`") || msg.contains("2 ember"),
+            "error must name the line count: {msg}"
+        );
+        assert!(
+            msg.contains("shadow-utils unions") || msg.contains("union"),
+            "error must explain shadow-utils union semantics: {msg}"
+        );
+        assert!(
+            msg.contains("consolidate"),
+            "error must surface the actionable remediation: {msg}"
+        );
+
+        // Files unchanged on refusal — we must not silently truncate
+        // even one of the hostile lines.
+        let after = std::fs::read_to_string(&subuid).expect("read after refusal");
+        assert_eq!(
+            after, two_lines,
+            "subuid must be untouched on multi-entry refusal; got: {after:?}"
+        );
+    }
+
+    /// T2 — verify_newuidmap_binary: missing binary surfaces a
+    /// clear refusal with install hints for both Debian/Ubuntu and
+    /// RHEL/Fedora package managers.
+    #[test]
+    fn newuidmap_install_probe_refuses_missing_binary() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Path doesn't exist — verify_newuidmap_binary must refuse.
+        let missing = tmp.path().join("does-not-exist-newuidmap");
+
+        let result = verify_newuidmap_binary(&missing);
+        let err = result.expect_err("missing binary must surface InstallError");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not installed"),
+            "error must surface the install hint: {msg}"
+        );
+        assert!(
+            msg.contains("apt install uidmap") || msg.contains("dnf install shadow-utils"),
+            "error must name at least one distro install command: {msg}"
+        );
+    }
+
+    /// T2 — verify_newuidmap_binary: non-setuid file at the path
+    /// surfaces a clear refusal pointing at the setuid-root
+    /// requirement.
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn newuidmap_install_probe_refuses_non_setuid_binary() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let fake_binary = tmp.path().join("fake-newuidmap");
+        // Create a file with mode 0755 (executable but NOT setuid).
+        // owner_uid = test process's uid (definitely != 0 in
+        // sandboxed CI).
+        std::fs::write(&fake_binary, b"#!/bin/sh\nexit 0\n").expect("write fake binary");
+        let mut perms = std::fs::metadata(&fake_binary)
+            .expect("stat fake binary")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_binary, perms).expect("chmod fake binary");
+
+        let result = verify_newuidmap_binary(&fake_binary);
+        let err = result.expect_err("non-setuid binary must surface InstallError");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("setuid"),
+            "error must name the setuid-root requirement: {msg}"
+        );
+        assert!(
+            msg.contains("0o4000") || msg.contains("CAP_SETUID"),
+            "error must surface the underlying mechanism (mode or capability): {msg}"
+        );
+    }
+
+    /// T2 — render_spawn_pool_toml emits the subuid shape for the
+    /// Subuid variant. The rendered TOML must be parseable by the
+    /// daemon's SpawnPoolConfig deserializer.
+    #[test]
+    fn render_spawn_pool_toml_emits_subuid_shape() {
+        let prov = SpawnPoolProvisioning::Subuid {
+            range_start: 100_000,
+            slot_count: 8192,
+        };
+        let rendered = render_spawn_pool_toml(&prov);
+        assert!(
+            rendered.contains("subuid_range_start = 100000"),
+            "rendered TOML must contain subuid_range_start, got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("subuid_range_slots = 8192"),
+            "rendered TOML must contain subuid_range_slots, got: {rendered:?}"
+        );
+        // No `uids = [...]` line on the Subuid path — the kernel-side
+        // subuid range IS the pool.
+        assert!(
+            !rendered.contains("uids = ["),
+            "Subuid render must not emit uids list, got: {rendered:?}"
+        );
+    }
+
+    /// T2 — render_spawn_pool_toml emits the system-user shape for the
+    /// SystemUsers variant. Regression guard against the enum refactor
+    /// changing the legacy shape.
+    #[test]
+    fn render_spawn_pool_toml_emits_system_users_shape() {
+        let prov = SpawnPoolProvisioning::SystemUsers {
+            uids: vec![10010, 10011, 10012],
+            gid: 10020,
+        };
+        let rendered = render_spawn_pool_toml(&prov);
+        assert!(
+            rendered.contains("uids = [10010, 10011, 10012]"),
+            "rendered TOML must contain uids list, got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("gid = 10020"),
+            "rendered TOML must contain gid, got: {rendered:?}"
+        );
+    }
+
+    /// T2 — render_spawn_pool_toml emits the same system-user shape
+    /// for ManualCommands as for SystemUsers (the rendered config is
+    /// the operator's expected end-state once they run the manual
+    /// commands; the commands themselves are surfaced separately by
+    /// the installer).
+    #[test]
+    fn render_spawn_pool_toml_manual_commands_emits_system_users_shape() {
+        let prov = SpawnPoolProvisioning::ManualCommands {
+            uids: vec![10010, 10011],
+            gid: 0,
+            commands: vec!["sudo dscl . -create /Users/ember-spawn-0".to_string()],
+        };
+        let rendered = render_spawn_pool_toml(&prov);
+        assert!(
+            rendered.contains("uids = [10010, 10011]"),
+            "ManualCommands render must contain uids list, got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("gid = 0"),
+            "ManualCommands render must contain gid, got: {rendered:?}"
+        );
+    }
+
+    // ─── design + MACOS-PRIMITIVES Decision 5 install renderers ──
+
+    /// T1 — Linux unit body renders pool args into `ExecStart`. The
+    /// MACOS-PRIMITIVES Decision 5 brief locks `--pool-uid-base` and
+    /// `--pool-size` as required helper-bin args; this test pins the
+    /// install path as the producer.
+    #[test]
+    fn render_spawn_helper_unit_body_includes_pool_args() {
+        let body = render_spawn_helper_unit_body(302, 10010, 8);
+        assert!(
+            body.contains("--pool-uid-base 10010"),
+            "unit body must pass --pool-uid-base; got: {body}"
+        );
+        assert!(
+            body.contains("--pool-size 8"),
+            "unit body must pass --pool-size; got: {body}"
+        );
+        assert!(
+            body.contains("--daemon-uid 302"),
+            "unit body must pass --daemon-uid; got: {body}"
+        );
+        assert!(
+            body.contains("emberd-spawn-helper-linux"),
+            "unit body must reference Linux helper bin"
+        );
+    }
+
+    /// T1 — macOS plist body renders pool args, ember-clients group,
+    /// shim path, and expected shim hash. All four are load-bearing
+    /// for production connectivity (Fix #1 — pool args), Fix #2 —
+    /// group, and Fix #5 — shim hash from the brief.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn render_spawn_helper_plist_body_includes_all_load_bearing_fields() {
+        let body = render_spawn_helper_plist_body(302, 10010, 8, "deadbeef");
+        assert!(
+            body.contains("<string>--pool-uid-base</string>"),
+            "plist must declare --pool-uid-base ProgramArguments entry"
+        );
+        assert!(
+            body.contains("<string>10010</string>"),
+            "plist must pass pool_uid_base value"
+        );
+        assert!(
+            body.contains("<string>--pool-size</string>"),
+            "plist must declare --pool-size ProgramArguments entry"
+        );
+        assert!(
+            body.contains("<string>8</string>"),
+            "plist must pass pool_size value"
+        );
+        assert!(
+            body.contains("<string>ember-clients</string>"),
+            "plist GroupName must be ember-clients (NOT wheel — Fix #2)"
+        );
+        assert!(
+            !body.contains("<string>wheel</string>"),
+            "plist must not contain GroupName=wheel; that was the Fix #2 bug"
+        );
+        assert!(
+            body.contains("<string>--shim-path</string>"),
+            "plist must pass --shim-path to helper"
+        );
+        assert!(
+            body.contains("<string>/usr/local/libexec/emberd-spawn-shim</string>"),
+            "plist must reference shim install location"
+        );
+        assert!(
+            body.contains("<key>EXPECTED_SHIM_HASH</key>"),
+            "plist must declare EXPECTED_SHIM_HASH env var"
+        );
+        assert!(
+            body.contains("<string>deadbeef</string>"),
+            "plist must render the supplied shim hash value"
+        );
+    }
+
+    /// T1 — Linux unit body uses `ember_uid` (NOT `wheel`) and
+    /// references the canonical socket path.
+    #[test]
+    fn render_spawn_helper_unit_body_references_canonical_socket() {
+        let body = render_spawn_helper_unit_body(302, 10010, 8);
+        assert!(
+            body.contains("/var/run/emberd-spawn-helper.sock"),
+            "unit body must bind canonical socket path"
+        );
+    }
+
+    // ── T2: dseditgroup_tolerant_inner — mock-runner unit tests ──────────────
+    //
+    // These tests exercise `dseditgroup_tolerant_inner` directly, injecting
+    // canned (exit_code, stderr, success) tuples and a checkmember closure
+    // so no real `dseditgroup` subprocess is required.  All tests are
+    // macOS-only because the function is `#[cfg(target_os = "macos")]`.
+
+    /// T2 — happy path: dseditgroup exits 0, checkmember returns true.
+    /// No tolerance branch is taken; Ok(()) is returned.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn dseditgroup_tolerant_success_calls_postcondition_and_returns_ok() {
+        let mut postcondition_called = false;
+        let result = dseditgroup_tolerant_inner(
+            "dseditgroup -o edit -a alice -t user ember-clients",
+            || Ok((Some(0), String::new(), true)),
+            || {
+                postcondition_called = true;
+                true // user IS a member
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "exit 0 + checkmember=true must succeed, got: {result:?}"
+        );
+        assert!(
+            postcondition_called,
+            "post-condition checker must be invoked even on clean success"
+        );
+    }
+
+    /// T2 — macOS 26 "could not be replaced" surface (exit 73): the tolerance
+    /// branch fires, the post-condition checker IS called, and because it
+    /// returns true (user was already a member), Ok(()) is returned.
+    ///
+    /// This is the idempotent case: the operator was already in ember-clients
+    /// from a previous install run; dseditgroup says "could not be replaced"
+    /// because the record already exists, but membership is confirmed.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn dseditgroup_tolerant_macos26_already_member_calls_postcondition_ok() {
+        let mut postcondition_called = false;
+        let result = dseditgroup_tolerant_inner(
+            "dseditgroup -o edit -a alice -t user ember-clients",
+            || {
+                Ok((
+                    Some(73),
+                    "Operation cancelled because record could not be replaced".to_string(),
+                    false,
+                ))
+            },
+            || {
+                postcondition_called = true;
+                true // checkmember confirms membership
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "exit 73 + 'could not be replaced' + checkmember=true must be Ok, got: {result:?}"
+        );
+        assert!(
+            postcondition_called,
+            "post-condition checker must be called on the tolerated path"
+        );
+    }
+
+    /// T2 — macOS 26 "could not be replaced" surface (exit 73) but the
+    /// post-condition check returns false: the user was NOT actually added.
+    /// Must return a clear InstallError, NOT Ok(()).
+    ///
+    /// This is the regression the fix targets: on macOS 26.4, dseditgroup
+    /// can return this stderr+exit even when the add failed. Without the
+    /// post-condition check the installer silently returned Ok(()), leaving
+    /// the operator outside ember-clients.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn dseditgroup_tolerant_macos26_postcondition_fails_returns_error() {
+        let mut postcondition_called = false;
+        let result = dseditgroup_tolerant_inner(
+            "dseditgroup -o edit -a alice -t user ember-clients",
+            || {
+                Ok((
+                    Some(73),
+                    "Operation cancelled because record could not be replaced".to_string(),
+                    false,
+                ))
+            },
+            || {
+                postcondition_called = true;
+                false // checkmember: user is NOT a member
+            },
+        );
+        assert!(
+            result.is_err(),
+            "exit 73 + 'could not be replaced' + checkmember=false must be Err, got: {result:?}"
+        );
+        assert!(
+            postcondition_called,
+            "post-condition checker must be called before returning"
+        );
+        // Error message must direct the operator to the manual fix.
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("dseditgroup -o edit") || msg.contains("ember-clients"),
+            "error must reference the remediation command or group name, got: {msg}"
+        );
+    }
+
+    /// T2 — unrelated non-zero exit (exit 1, generic failure) is NOT tolerated.
+    /// The tolerance gate is exit_code==73 AND "could not be replaced"; a plain
+    /// exit 1 from dseditgroup must propagate as a hard error without calling
+    /// the post-condition checker.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn dseditgroup_tolerant_unrelated_failure_propagates_without_postcondition() {
+        let mut postcondition_called = false;
+        let result = dseditgroup_tolerant_inner(
+            "dseditgroup -o edit -a alice -t user ember-clients",
+            || Ok((Some(1), "permission denied".to_string(), false)),
+            || {
+                postcondition_called = true;
+                true
+            },
+        );
+        assert!(
+            result.is_err(),
+            "exit 1 + unrelated stderr must be a hard error, got: {result:?}"
+        );
+        // Post-condition must NOT be called on unrelated failures — we don't
+        // want to mask the real error with a checkmember output.
+        assert!(
+            !postcondition_called,
+            "post-condition must NOT be called when the runner returns a hard failure"
+        );
+    }
+
+    /// T2 — exit 73 alone (without "could not be replaced" in stderr) is NOT
+    /// tolerated.  The check requires BOTH conditions so an unrelated exit-73
+    /// path from dseditgroup doesn't get swallowed.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn dseditgroup_tolerant_exit73_wrong_stderr_not_tolerated() {
+        let mut postcondition_called = false;
+        let result = dseditgroup_tolerant_inner(
+            "dseditgroup -o edit -a alice -t user ember-clients",
+            || Ok((Some(73), "some other error at exit 73".to_string(), false)),
+            || {
+                postcondition_called = true;
+                true
+            },
+        );
+        assert!(
+            result.is_err(),
+            "exit 73 with wrong stderr must not be tolerated, got: {result:?}"
+        );
+        assert!(
+            !postcondition_called,
+            "post-condition must not be called for non-tolerated failure"
+        );
+    }
+
+    // ── T3: inspect_and_heal_ember_user_inner — partial-state collision ──────
+    //
+    // implementation-note-326.
+    //
+    // These tests exercise the inspect-and-heal step that gates the
+    // sysadminctl -addUser call. They use injected closures (mirroring
+    // the dseditgroup_tolerant_inner pattern shipped in #3470) so no
+    // real `dscl` subprocess is required.
+
+    /// T3 — user absent: reader returns Ok(None) for UniqueID → action
+    /// is Create. Changer is never invoked.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn inspect_and_heal_user_absent_returns_create() {
+        let mut changer_calls: Vec<(String, String, String)> = Vec::new();
+        let result = inspect_and_heal_ember_user_inner(
+            |_prop| Ok(None), // UniqueID absent → user does not exist
+            |prop, current, desired| {
+                changer_calls.push((prop.to_string(), current.to_string(), desired.to_string()));
+                Ok(())
+            },
+        );
+        assert_eq!(
+            result.expect("inspect must succeed when user is absent"),
+            EmberUserInspectAction::Create,
+            "absent user must yield Create action so caller runs sysadminctl -addUser"
+        );
+        assert!(
+            changer_calls.is_empty(),
+            "changer must NOT be called when the user is absent; got {changer_calls:?}"
+        );
+    }
+
+    /// T3 — user present + canonical (uid in system range, home ==
+    /// `/var/empty`, shell == `/usr/bin/false`): action is SkipHealthy
+    /// and changer is NOT called.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn inspect_and_heal_user_canonical_returns_skip_healthy() {
+        let mut changer_calls: Vec<(String, String, String)> = Vec::new();
+        let result = inspect_and_heal_ember_user_inner(
+            |prop| match prop {
+                "UniqueID" => Ok(Some("261".to_string())),
+                "NFSHomeDirectory" => Ok(Some(EMBER_USER_HOME.to_string())),
+                "UserShell" => Ok(Some(EMBER_USER_SHELL.to_string())),
+                other => panic!("unexpected dscl property probe: {other}"),
+            },
+            |prop, current, desired| {
+                changer_calls.push((prop.to_string(), current.to_string(), desired.to_string()));
+                Ok(())
+            },
+        );
+        assert_eq!(
+            result.expect("canonical shape must succeed"),
+            EmberUserInspectAction::SkipHealthy,
+            "canonical shape must yield SkipHealthy so caller does NOT re-run sysadminctl"
+        );
+        assert!(
+            changer_calls.is_empty(),
+            "changer must NOT be called when the shape is already canonical; got {changer_calls:?}"
+        );
+    }
+
+    /// T3 — user present + UID outside the system range: surface a hard
+    /// InstallError with the manual remediation command in the message.
+    /// Changer is NOT called (renumbering would orphan files).
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn inspect_and_heal_user_wrong_uid_returns_error_with_remediation() {
+        let mut changer_calls: Vec<(String, String, String)> = Vec::new();
+        let result = inspect_and_heal_ember_user_inner(
+            |prop| match prop {
+                // uid 503 → above EMBER_USER_MAX_SYSTEM_UID; came from a
+                // different package or manual install
+                "UniqueID" => Ok(Some("503".to_string())),
+                "NFSHomeDirectory" => Ok(Some(EMBER_USER_HOME.to_string())),
+                "UserShell" => Ok(Some(EMBER_USER_SHELL.to_string())),
+                other => panic!("unexpected dscl property probe: {other}"),
+            },
+            |prop, current, desired| {
+                changer_calls.push((prop.to_string(), current.to_string(), desired.to_string()));
+                Ok(())
+            },
+        );
+        let err = result.expect_err("uid out of system range must be a hard error");
+        let msg = format!("{err}");
+        // Remediation command must be in the message so the operator can
+        // copy-paste it from the install failure surface.
+        assert!(
+            msg.contains("sudo dscl . -delete /Users/ember"),
+            "error must include the dscl delete remediation; got: {msg}"
+        );
+        assert!(
+            msg.contains("sudo dseditgroup -o delete -g ember"),
+            "error must include the dseditgroup delete remediation; got: {msg}"
+        );
+        assert!(
+            changer_calls.is_empty(),
+            "changer must NOT be called when uid is out of range; got {changer_calls:?}"
+        );
+    }
+
+    /// T3 — user present + wrong shell (other fields canonical): narrow
+    /// corrective op fires via the changer closure, action is
+    /// HealedThenSkip (so caller does NOT re-run sysadminctl), and the
+    /// returned `changes` list mentions the UserShell edit.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn inspect_and_heal_user_wrong_shell_calls_corrective_op_and_skips_create() {
+        let mut changer_calls: Vec<(String, String, String)> = Vec::new();
+        let result = inspect_and_heal_ember_user_inner(
+            |prop| match prop {
+                "UniqueID" => Ok(Some("261".to_string())),
+                "NFSHomeDirectory" => Ok(Some(EMBER_USER_HOME.to_string())),
+                // Wrong shell — divergence the inspector must heal.
+                "UserShell" => Ok(Some("/bin/bash".to_string())),
+                other => panic!("unexpected dscl property probe: {other}"),
+            },
+            |prop, current, desired| {
+                changer_calls.push((prop.to_string(), current.to_string(), desired.to_string()));
+                Ok(())
+            },
+        );
+        let action = result.expect("narrow divergence must be healable");
+        match action {
+            EmberUserInspectAction::HealedThenSkip { changes } => {
+                assert_eq!(
+                    changes.len(),
+                    1,
+                    "exactly one corrective op expected (UserShell); got {changes:?}"
+                );
+                assert!(
+                    changes[0].contains("UserShell"),
+                    "change log must mention UserShell; got {:?}",
+                    changes[0]
+                );
+                assert!(
+                    changes[0].contains(EMBER_USER_SHELL),
+                    "change log must mention canonical /usr/bin/false; got {:?}",
+                    changes[0]
+                );
+            }
+            other => panic!("expected HealedThenSkip, got {other:?}"),
+        }
+        assert_eq!(
+            changer_calls.len(),
+            1,
+            "changer must be called exactly once (UserShell); got {changer_calls:?}"
+        );
+        let (prop, current, desired) = &changer_calls[0];
+        assert_eq!(prop, "UserShell");
+        assert_eq!(current, "/bin/bash");
+        assert_eq!(desired, EMBER_USER_SHELL);
     }
 }

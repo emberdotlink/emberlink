@@ -6,9 +6,9 @@ use std::rc::Rc;
 use core_state::EventStore;
 
 use crate::protocol::{
-    methods, AgentRequest, AgentResponse, GrantInfo, GrantStatusParams, RelayGrantStatusParams,
+    AgentRequest, AgentResponse, GrantInfo, GrantStatusParams, RelayGrantStatusParams,
     RelayRequestGrantParams, RequestGrantParams, RequestGrantResponse, UseCredentialParams,
-    WhoamiResponse,
+    WhoamiResponse, methods,
 };
 
 /// Extract the host (authority) component from a URL string.
@@ -220,15 +220,16 @@ impl AgentRuntime {
             }
         };
 
-        let entries = result
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
+        let entries = result.as_array().cloned().unwrap_or_default();
 
         let infos: Vec<GrantInfo> = entries
             .into_iter()
             .map(|g| GrantInfo {
-                grant_id: g.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                grant_id: g
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
                 issuer_id: "daemon".to_string(),
                 capability: g
                     .get("scope")
@@ -356,11 +357,7 @@ impl AgentRuntime {
                 );
             }
             Err(DaemonClientError::Daemon) => {
-                return AgentResponse::err(
-                    &request.id,
-                    "ACCESS_DENIED",
-                    "access denied",
-                );
+                return AgentResponse::err(&request.id, "ACCESS_DENIED", "access denied");
             }
         };
 
@@ -592,8 +589,7 @@ impl AgentRuntime {
     }
 
     fn handle_relay_request_grant(&self, request: &AgentRequest) -> AgentResponse {
-        let params: RelayRequestGrantParams = match serde_json::from_value(request.params.clone())
-        {
+        let params: RelayRequestGrantParams = match serde_json::from_value(request.params.clone()) {
             Ok(p) => p,
             Err(e) => {
                 return AgentResponse::err(
@@ -792,7 +788,11 @@ mod tests {
                 method: "request_access",
                 params: params.clone(),
             });
-            respond_or_default("request_access", &self.request_access_response, &self.error_on)
+            respond_or_default(
+                "request_access",
+                &self.request_access_response,
+                &self.error_on,
+            )
         }
 
         fn list_grants(
@@ -825,7 +825,11 @@ mod tests {
                 method: "use_credential",
                 params: params.clone(),
             });
-            respond_or_default("use_credential", &self.use_credential_response, &self.error_on)
+            respond_or_default(
+                "use_credential",
+                &self.use_credential_response,
+                &self.error_on,
+            )
         }
     }
 
@@ -884,7 +888,11 @@ mod tests {
         let line = r#"{"id":"4","method":"request_grant","params":{"scope":"repo:read","resource_id":"github-token","duration_secs":3600,"reason":"test"}}"#;
         let resp_json = process_line(&rt, line);
         let resp: AgentResponse = serde_json::from_str(&resp_json).unwrap();
-        assert!(resp.error.is_none(), "expected success, got: {:?}", resp.error);
+        assert!(
+            resp.error.is_none(),
+            "expected success, got: {:?}",
+            resp.error
+        );
 
         let sent = first_request_access_call(&captured).expect("daemon was not called");
         assert_eq!(sent["persona_id"], "agent-test-001");
@@ -924,7 +932,8 @@ mod tests {
             Rc::new(EventStore::open_in_memory().unwrap()),
             daemon,
         );
-        let line = r#"{"id":"5","method":"request_grant","params":{"scope":"s","resource_id":"c"}}"#;
+        let line =
+            r#"{"id":"5","method":"request_grant","params":{"scope":"s","resource_id":"c"}}"#;
         let resp_json = process_line(&rt, line);
         let resp: AgentResponse = serde_json::from_str(&resp_json).unwrap();
         let result = resp.result.unwrap();
@@ -944,7 +953,8 @@ mod tests {
             },
             Rc::clone(&store),
         );
-        let line = r#"{"id":"6","method":"request_grant","params":{"scope":"s","resource_id":"c"}}"#;
+        let line =
+            r#"{"id":"6","method":"request_grant","params":{"scope":"s","resource_id":"c"}}"#;
         let resp_json = process_line(&rt, line);
         let resp: AgentResponse = serde_json::from_str(&resp_json).unwrap();
         assert!(resp.result.is_none(), "must not succeed without a daemon");
@@ -977,7 +987,8 @@ mod tests {
             Rc::clone(&store),
             daemon,
         );
-        let line = r#"{"id":"7","method":"request_grant","params":{"scope":"s","resource_id":"c"}}"#;
+        let line =
+            r#"{"id":"7","method":"request_grant","params":{"scope":"s","resource_id":"c"}}"#;
         let resp_json = process_line(&rt, line);
         let resp: AgentResponse = serde_json::from_str(&resp_json).unwrap();
         let err = resp.error.unwrap();
@@ -1146,7 +1157,11 @@ mod tests {
         }"#;
         let resp_json = process_line(&rt, line);
         let resp: AgentResponse = serde_json::from_str(&resp_json).unwrap();
-        assert!(resp.error.is_none(), "expected success, got: {:?}", resp.error);
+        assert!(
+            resp.error.is_none(),
+            "expected success, got: {:?}",
+            resp.error
+        );
 
         let sent = first_request_access_call(&captured).expect("daemon must be called");
 
@@ -1170,10 +1185,22 @@ mod tests {
 
     #[test]
     fn extract_host_strips_scheme_and_path() {
-        assert_eq!(extract_host("https://api.github.com/repos/x/y"), Some("api.github.com".to_string()));
-        assert_eq!(extract_host("http://example.com:8080/path?q=1"), Some("example.com:8080".to_string()));
-        assert_eq!(extract_host("https://example.com"), Some("example.com".to_string()));
-        assert_eq!(extract_host("example.com/path"), Some("example.com".to_string()));
+        assert_eq!(
+            extract_host("https://api.github.com/repos/x/y"),
+            Some("api.github.com".to_string())
+        );
+        assert_eq!(
+            extract_host("http://example.com:8080/path?q=1"),
+            Some("example.com:8080".to_string())
+        );
+        assert_eq!(
+            extract_host("https://example.com"),
+            Some("example.com".to_string())
+        );
+        assert_eq!(
+            extract_host("example.com/path"),
+            Some("example.com".to_string())
+        );
         assert_eq!(extract_host(""), None);
         assert_eq!(extract_host("https://"), None);
     }
@@ -1256,7 +1283,11 @@ mod tests {
         let rt = runtime_with_mock(mock);
         let line = r#"{"id":"1","method":"list_grants","params":{}}"#;
         let resp: AgentResponse = serde_json::from_str(&process_line(&rt, line)).unwrap();
-        assert!(resp.error.is_none(), "expected success, got {:?}", resp.error);
+        assert!(
+            resp.error.is_none(),
+            "expected success, got {:?}",
+            resp.error
+        );
         let arr = resp.result.unwrap();
         let arr = arr.as_array().unwrap();
         assert_eq!(arr.len(), 2);
@@ -1379,7 +1410,11 @@ mod tests {
         let rt = runtime_with_mock(mock);
         let line = r#"{"id":"1","method":"use_credential","params":{"grant_id":"grant-xyz","credential_id":"github-token"}}"#;
         let resp: AgentResponse = serde_json::from_str(&process_line(&rt, line)).unwrap();
-        assert!(resp.error.is_none(), "expected success, got {:?}", resp.error);
+        assert!(
+            resp.error.is_none(),
+            "expected success, got {:?}",
+            resp.error
+        );
         let result = resp.result.unwrap();
         assert_eq!(result["status"], "ok");
         assert_eq!(result["credential"]["value"], "ghp_realsecretvalue");
@@ -1399,7 +1434,8 @@ mod tests {
         mock.use_credential_response = Some(serde_json::json!({}));
         mock.error_on = Some("use_credential");
         let rt = runtime_with_mock(mock);
-        let line = r#"{"id":"1","method":"use_credential","params":{"grant_id":"g","credential_id":"c"}}"#;
+        let line =
+            r#"{"id":"1","method":"use_credential","params":{"grant_id":"g","credential_id":"c"}}"#;
         let resp: AgentResponse = serde_json::from_str(&process_line(&rt, line)).unwrap();
         let err = resp.error.unwrap();
         assert_eq!(err.code, "ACCESS_DENIED");
@@ -1409,7 +1445,8 @@ mod tests {
     fn use_credential_fails_closed_when_daemon_unreachable() {
         let mock = MockDaemon::new();
         let rt = runtime_with_mock(mock);
-        let line = r#"{"id":"1","method":"use_credential","params":{"grant_id":"g","credential_id":"c"}}"#;
+        let line =
+            r#"{"id":"1","method":"use_credential","params":{"grant_id":"g","credential_id":"c"}}"#;
         let resp: AgentResponse = serde_json::from_str(&process_line(&rt, line)).unwrap();
         let err = resp.error.unwrap();
         assert_eq!(err.code, "DAEMON_UNAVAILABLE");
@@ -1504,9 +1541,18 @@ mod tests {
         // Every step hit the daemon — none fell back to the local store.
         let calls = captured.borrow();
         let methods: Vec<&str> = calls.iter().map(|c| c.method).collect();
-        assert!(methods.contains(&"request_access"), "step 1 should call request_access");
-        assert!(methods.contains(&"grant_status"), "step 3 should call grant_status");
-        assert!(methods.contains(&"use_credential"), "step 4 should call use_credential");
+        assert!(
+            methods.contains(&"request_access"),
+            "step 1 should call request_access"
+        );
+        assert!(
+            methods.contains(&"grant_status"),
+            "step 3 should call grant_status"
+        );
+        assert!(
+            methods.contains(&"use_credential"),
+            "step 4 should call use_credential"
+        );
 
         // Nothing was written to the agent's local store on the
         // side-channel that this fix closes.

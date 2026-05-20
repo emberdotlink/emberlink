@@ -120,7 +120,9 @@ fn has_privileged_flag(args: &[String]) -> bool {
         {
             return true;
         }
-        if let Some(spec) = a.strip_prefix("--volume=").or_else(|| a.strip_prefix("-v="))
+        if let Some(spec) = a
+            .strip_prefix("--volume=")
+            .or_else(|| a.strip_prefix("-v="))
             && mounts_root(spec)
         {
             return true;
@@ -311,7 +313,7 @@ mod tests {
         assert!(classify_docker_argv(&[]).is_none());
     }
 
-    // T1: container lifecycle verbs (implementation-note-67)
+    // T1: container lifecycle verbs (implementation-note-83)
 
     #[test]
     fn stop_classified() {
@@ -381,7 +383,8 @@ mod tests {
 
     #[test]
     fn tag_classified() {
-        let r = classify_docker_argv(&args(&["tag", "source_image:v1", "target_image:v2"])).unwrap();
+        let r =
+            classify_docker_argv(&args(&["tag", "source_image:v1", "target_image:v2"])).unwrap();
         assert_eq!(r.0, "docker.tag");
     }
 

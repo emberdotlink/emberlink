@@ -27,7 +27,7 @@
 //! `GET /daemon/identity.json` as hex so external verifiers can compare
 //! against their trust anchor.
 
-// implementation-note-204: Receipt v2 issuance helper for cohort-A
+// implementation-note-279: Receipt v2 issuance helper for cohort-A
 // `session.claude_code` Receipts. Lives in the `receipt/` sibling
 // directory; this `pub mod` declaration wires it under the existing
 // `receipt` module path so callers see `ember_daemon::receipt::issue`.
@@ -42,16 +42,16 @@ use chrono::{DateTime, Utc};
 use core_broker::{BrokerRequest, BrokeredCredential};
 use core_events::receipt::envelope::{ReceiptEnvelope, ReceiptVersion, TerminationAuthority};
 use core_grant_types::grant_receipt::{
-    ApprovalActor, ApprovalEvent, ApprovalOutcome, AuditEntry as ReceiptAuditEntry,
-    BrokerReceipt, BudgetAxis, Evidence, GrantReceipt, KmsReceipt, Lifecycle, ReceiptKind,
-    ReceiptSummary, RevokeActor, TerminalReason, VaultReceipt,
+    ApprovalActor, ApprovalEvent, ApprovalOutcome, AuditEntry as ReceiptAuditEntry, BrokerReceipt,
+    BudgetAxis, Evidence, GrantReceipt, KmsReceipt, Lifecycle, ReceiptKind, ReceiptSummary,
+    RevokeActor, TerminalReason, VaultReceipt,
 };
 use core_grant_types::{AttestationBinding, StatementId, Usage};
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use once_cell::sync::OnceCell;
-use zeroize::{ZeroizeOnDrop, Zeroizing};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+use zeroize::{ZeroizeOnDrop, Zeroizing};
 
 use crate::infra::audit::AuditFilter;
 // TODO: GrantInfo retained because emit_receipt, build_receipt_body,
@@ -59,8 +59,8 @@ use crate::infra::audit::AuditFilter;
 // created_at, expires_at as Strings, budget, parent_grant_id, status, persona_id).
 // Migrate these functions to walk AccessGrant.blocks[].statements[] natively once
 // the scalar-projection columns are removed from the SQLite schema.
-use crate::trust::grant::{derive_wall_clock_secs, GrantInfo};
 use crate::infra::store::{DaemonStore, StoreError};
+use crate::trust::grant::{GrantInfo, derive_wall_clock_secs};
 
 /// Canonical-encoding prefix. Bump version AND
 /// `Evidence::canonical_version` together if the encoding ever changes.
@@ -161,18 +161,24 @@ impl DaemonPersona {
             }
             let mut seed = Zeroizing::new([0u8; 32]);
             seed.copy_from_slice(&bytes);
-            let signing_key = SigningKey::from_bytes(&*seed);
+            let signing_key = SigningKey::from_bytes(&seed);
             let verifying_key = signing_key.verifying_key();
-            Ok(Self { signing_key, verifying_key })
+            Ok(Self {
+                signing_key,
+                verifying_key,
+            })
         } else {
             let mut seed = Zeroizing::new([0u8; 32]);
             getrandom::fill(&mut *seed).map_err(|e| {
                 StoreError::InvalidInput(format!("OS RNG failure generating identity: {e}"))
             })?;
-            write_identity_file(&path, &*seed)?;
-            let signing_key = SigningKey::from_bytes(&*seed);
+            write_identity_file(&path, &seed)?;
+            let signing_key = SigningKey::from_bytes(&seed);
             let verifying_key = signing_key.verifying_key();
-            Ok(Self { signing_key, verifying_key })
+            Ok(Self {
+                signing_key,
+                verifying_key,
+            })
         }
     }
 
@@ -212,7 +218,10 @@ impl DaemonPersona {
 /// Write the 32-byte secret to `path` with permissions 0600.
 fn write_identity_file(path: &Path, secret: &[u8; 32]) -> Result<(), StoreError> {
     fs::write(path, secret).map_err(|e| {
-        StoreError::InvalidInput(format!("write daemon identity key to {}: {e}", path.display()))
+        StoreError::InvalidInput(format!(
+            "write daemon identity key to {}: {e}",
+            path.display()
+        ))
     })?;
     #[cfg(unix)]
     {
@@ -266,7 +275,7 @@ pub fn canonical_hash_receipt(receipt: &GrantReceipt) -> [u8; 32] {
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-36 — kms receipt canonical-encoding + signing helpers
+// implementation-note-49 — kms receipt canonical-encoding + signing helpers
 // ---------------------------------------------------------------------------
 
 /// Canonical-encoding prefix for kms receipts. Distinct from
@@ -303,14 +312,14 @@ pub fn sign_kms_receipt(receipt: &mut KmsReceipt, identity: &DaemonPersona) {
     let sig_bytes = identity.sign(hash_hex.as_bytes());
     receipt.evidence = Evidence {
         hash: hash_hex,
-        sig: hex::encode(&*sig_bytes),
+        sig: hex::encode(*sig_bytes),
         signer_pubkey: identity.pubkey_hex(),
         canonical_version: CANONICAL_VERSION,
     };
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-205 — broker receipt canonical-encoding + signing helpers
+// implementation-note-280 — broker receipt canonical-encoding + signing helpers
 // ---------------------------------------------------------------------------
 
 /// Canonical-encoding prefix for broker receipts. Distinct from
@@ -347,15 +356,15 @@ pub fn sign_broker_receipt(receipt: &mut BrokerReceipt, identity: &DaemonPersona
     let sig_bytes = identity.sign(hash_hex.as_bytes());
     receipt.evidence = Evidence {
         hash: hash_hex,
-        sig: hex::encode(&*sig_bytes),
+        sig: hex::encode(*sig_bytes),
         signer_pubkey: identity.pubkey_hex(),
         canonical_version: CANONICAL_VERSION,
     };
 }
 
 // ---------------------------------------------------------------------------
-// v2 broker envelope builders — Phase A substrate for implementation-note-101-
-// implementation-note-206. Per design §Envelope + design §receipt-kind
+// v2 broker envelope builders — Phase A substrate for implementation-note-131-
+// implementation-note-281. Per design §Envelope + design §receipt-kind
 // catalog ("broker.materialization", "broker.revocation").
 //
 // Returned envelopes are unsigned: callers wrap a Signer (e.g.
@@ -372,10 +381,21 @@ pub const RECEIPT_KIND_BROKER_REVOCATION: &str = "broker.revocation";
 /// Build an unsigned v2 [`ReceiptEnvelope`] for a broker materialization
 /// event. `termination_authority` is `DaemonPersona` (daemon-emitted per
 /// design §F5).
+///
+/// `mock_broker` (implementation-note-122 / design §Component 2):
+/// `true` iff the registered broker for `req.provider` is a `MockBroker`
+/// instance (opted in via `EMBER_ALLOW_MOCK_BROKERS`). The flag is
+/// stamped onto every `broker.materialization` Receipt body so any audit
+/// trail can distinguish "the credential came from a real upstream" from
+/// "the credential came from a Mock that returned a plausible-looking
+/// fake token." Receipts from real brokers stamp `mock_broker: false`
+/// — the field is always present (omit-when-default would create a
+/// silent-absence ambiguity that defeats the audit signal).
 pub fn build_broker_materialization_envelope(
     req: &BrokerRequest,
     cred: &BrokeredCredential,
     daemon_root_id: &str,
+    mock_broker: bool,
 ) -> ReceiptEnvelope {
     let now_epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -398,6 +418,10 @@ pub fn build_broker_materialization_envelope(
         "grants_file_rev": req.grants_file_rev,
         "credential_name": req.grants_file_credential_name,
         "reason": req.reason,
+        // implementation-note-122 / design §Component 2.
+        // Always present (never omit-when-false) so absent==unknown rather
+        // than absent==implicitly-false.
+        "mock_broker": mock_broker,
     });
     ReceiptEnvelope {
         version: ReceiptVersion::default(),
@@ -409,6 +433,11 @@ pub fn build_broker_materialization_envelope(
         presence_kind: None,
         body,
         signature: None,
+        calling_principal: None,
+        presence_reason: None,
+        handle_id: None,
+        challenge_hash: None,
+        verifier_aaguid: None,
     }
 }
 
@@ -416,10 +445,17 @@ pub fn build_broker_materialization_envelope(
 /// `summary` is optional so the envelope can still be emitted when the
 /// materialization is unknown to the daemon (matches v1's `Option`
 /// posture in [`crate::broker::handler::emit_revocation_receipt`]).
+///
+/// `mock_broker` (implementation-note-122 / design §Component 2):
+/// `true` iff the registered broker for the provider revoking the
+/// credential is a `MockBroker` instance. Stamped onto every
+/// `broker.revocation` Receipt body for the same audit-signal reason as
+/// the materialization envelope.
 pub fn build_broker_revocation_envelope(
     materialization_id: &str,
     summary: Option<&crate::broker::handler::MaterializationSummary>,
     daemon_root_id: &str,
+    mock_broker: bool,
 ) -> ReceiptEnvelope {
     let now_epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -434,6 +470,8 @@ pub fn build_broker_revocation_envelope(
         "materialization_id": materialization_id,
         "revoked_at_epoch_secs": now_epoch,
         "reason": reason,
+        // implementation-note-122 / design §Component 2.
+        "mock_broker": mock_broker,
     });
     ReceiptEnvelope {
         version: ReceiptVersion::default(),
@@ -445,6 +483,11 @@ pub fn build_broker_revocation_envelope(
         presence_kind: None,
         body,
         signature: None,
+        calling_principal: None,
+        presence_reason: None,
+        handle_id: None,
+        challenge_hash: None,
+        verifier_aaguid: None,
     }
 }
 
@@ -500,7 +543,7 @@ pub fn verify_broker_receipt(
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-207 — vault receipt canonical-encoding + signing helpers
+// implementation-note-282 — vault receipt canonical-encoding + signing helpers
 // ---------------------------------------------------------------------------
 
 /// Canonical-encoding prefix for vault receipts. Distinct from
@@ -538,7 +581,7 @@ pub fn sign_vault_receipt(receipt: &mut VaultReceipt, identity: &DaemonPersona) 
     let sig_bytes = identity.sign(hash_hex.as_bytes());
     receipt.evidence = Evidence {
         hash: hash_hex,
-        sig: hex::encode(&*sig_bytes),
+        sig: hex::encode(*sig_bytes),
         signer_pubkey: identity.pubkey_hex(),
         canonical_version: CANONICAL_VERSION,
     };
@@ -616,7 +659,11 @@ pub fn verify_receipt(
             got: receipt.evidence.canonical_version,
         });
     }
-    if !receipt.evidence.signer_pubkey.eq_ignore_ascii_case(expected_pubkey_hex) {
+    if !receipt
+        .evidence
+        .signer_pubkey
+        .eq_ignore_ascii_case(expected_pubkey_hex)
+    {
         return Err(ReceiptVerifyError::SignerMismatch {
             got: receipt.evidence.signer_pubkey.clone(),
             expected: expected_pubkey_hex.to_string(),
@@ -674,7 +721,7 @@ pub enum ReceiptVerifyError {
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-208 — append-only receipts journal
+// implementation-note-283 — append-only receipts journal
 // ---------------------------------------------------------------------------
 
 /// Errors specific to the `receipts.log` journal append path.
@@ -710,6 +757,28 @@ pub enum JournalError {
 /// # target_state_anchor
 ///
 /// `fn append_receipts_journal`
+///
+/// # FSYNC CONTRACT (implementation-note-284 — fsync_contract_ADR155_C8_P3)
+///
+/// design §Component 8 Prerequisites : **fail-atomic audit emission**.
+/// If the pre-exec `broker.execution_domain` Receipt cannot be persisted,
+/// `broker_exec` MUST fail before the construct runs and before any
+/// credential is minted. The structural defense against "we minted a token
+/// but lost the audit record."
+///
+/// On `Ok(())` return, the receipt is durable: power-loss after this
+/// function returns cannot lose it. Both file contents AND inode metadata
+/// (size, mtime) are flushed via `sync_all()` — the conservative audit-
+/// chain posture. `sync_data` (fdatasync) would suffice for content
+/// recovery of an append-only journal but does not guarantee size-metadata
+/// durability; for a security-product audit chain the stronger promise is
+/// worth the extra IO.
+///
+/// On `Err` return, the caller MUST treat the failure as "audit not
+/// persisted" and abort any credentialed call that depended on the
+/// receipt's existence. Specifically: the broker_exec critical path
+/// awaits this function synchronously (no `tokio::spawn`), `?`-propagates
+/// the IoError, and aborts the credential mint on any non-`Ok` outcome.
 pub fn append_receipts_journal<T: serde::Serialize>(
     data_dir: &Path,
     receipt: &T,
@@ -752,7 +821,10 @@ pub fn append_receipts_journal<T: serde::Serialize>(
     // between writer and reader gets normalized at parse time.
     let line = serde_json::to_string(receipt)?;
     writeln!(file, "{}", line)?;
-    file.sync_data()?;
+    // design §Component 8 Prerequisites (FSYNC CONTRACT): sync_all
+    // not sync_data — guarantee size-metadata durability alongside content.
+    // See doc-comment "FSYNC CONTRACT" above (fsync_contract_ADR155_C8_P3).
+    file.sync_all()?;
     Ok(())
 }
 
@@ -802,7 +874,7 @@ pub fn trigger_receipt_if_terminal(
 /// Derive a terminal reason from grant status alone.
 ///
 /// For `exhausted_by_budget`, the axis is read from the `budget.exhausted`
-/// audit row (T-implementation-note-209) instead of guessed from which
+/// audit row (T-implementation-note-285) instead of guessed from which
 /// axes the grant's budget configures. The audit row carries the
 /// authoritative axis that actually tripped the cap.
 fn derive_reason(store: &DaemonStore, info: &GrantInfo) -> TerminalReason {
@@ -819,7 +891,10 @@ fn derive_reason(store: &DaemonStore, info: &GrantInfo) -> TerminalReason {
                 .map(|_| StatementId::from("S0"))
                 .unwrap_or_else(|| "S0".to_string());
             let axis = exhausted_axis_from_audit(store, info).unwrap_or(BudgetAxis::Requests);
-            TerminalReason::ExhaustedByBudget { statement_sid: sid, axis }
+            TerminalReason::ExhaustedByBudget {
+                statement_sid: sid,
+                axis,
+            }
         }
         "parent_cascade_revoked" => TerminalReason::ParentCascadeRevoked {
             parent_grant_id: info.parent_grant_id.clone().unwrap_or_default(),
@@ -832,7 +907,7 @@ fn derive_reason(store: &DaemonStore, info: &GrantInfo) -> TerminalReason {
 }
 
 /// Read the exhaustion axis from the `budget.exhausted` audit row for this
-/// grant (T-implementation-note-209).
+/// grant (T-implementation-note-285).
 ///
 /// `budget.exhausted` rows are emitted by the proxy meter when a Statement
 /// usage tally crosses a budget cap. The row's `details` column carries the
@@ -904,7 +979,12 @@ pub fn generate_receipt(
             info.status
         )));
     }
-    Ok(build_receipt_body(store, &info, terminal_reason, now_epoch_secs))
+    Ok(build_receipt_body(
+        store,
+        &info,
+        terminal_reason,
+        now_epoch_secs,
+    ))
 }
 
 /// Body-assembly helper shared by [`generate_receipt`] (public, error-returning)
@@ -918,7 +998,7 @@ fn build_receipt_body(
     now_epoch_secs: u64,
 ) -> GrantReceipt {
     // 1. Pull the canonical composite chain + envelope-level attestation.
-    //    AUDIT Decision 2 #4 (T-implementation-note-210): the
+    //    AUDIT Decision 2 #4 (T-implementation-note-286): the
     //    AccessGrant envelope carries the live attestation posture
     //    (sandbox / spiffe / tee status). Capture it here alongside the
     //    chain so step 7 can pass it through into the signed receipt
@@ -929,13 +1009,13 @@ fn build_receipt_body(
     };
 
     // 2. Per-statement usage tallies from the block-0 statements.
-    // implementation-note-159: derive wall_clock_secs at receipt-build
+    // implementation-note-208: derive wall_clock_secs at receipt-build
     // time so signed receipts record actual time used rather than the stored 0.
     let created_at_secs = parse_rfc3339_epoch(&info.created_at);
     let expires_at_secs = info
         .expires_at
         .as_deref()
-        .map(|s| parse_rfc3339_epoch(s))
+        .map(parse_rfc3339_epoch)
         .filter(|&v| v != 0);
     let per_statement_usage: Vec<(StatementId, Usage)> = chain
         .first()
@@ -979,7 +1059,10 @@ fn build_receipt_body(
     //    references this grant_id. Keeps the receipt self-contained and
     //    avoids a schema for grant-id→event mapping.
     let raw_audit: Vec<crate::infra::audit::AuditEntry> = store
-        .query_audit(&AuditFilter { limit: Some(500), ..Default::default() })
+        .query_audit(&AuditFilter {
+            limit: Some(500),
+            ..Default::default()
+        })
         .unwrap_or_default()
         .into_iter()
         .filter(|e| {
@@ -1026,8 +1109,7 @@ fn build_receipt_body(
         .filter(|e| e.action == "grant.issued")
         .filter_map(|e| {
             let details_str = e.details.as_deref().unwrap_or("{}");
-            let details: serde_json::Value =
-                serde_json::from_str(details_str).unwrap_or_default();
+            let details: serde_json::Value = serde_json::from_str(details_str).unwrap_or_default();
             // Only include entries that explicitly name this grant_id to avoid
             // pulling in issuance events for other grants that share the same
             // credential_name.
@@ -1038,9 +1120,10 @@ fn build_receipt_body(
             let source = details["source"].as_str().unwrap_or("");
             let (actor, outcome) = match source {
                 "approval" => (ApprovalActor::HumanDashboard, ApprovalOutcome::Approved),
-                "approval_narrowed" => {
-                    (ApprovalActor::HumanDashboard, ApprovalOutcome::ApprovedWithNarrowing)
-                }
+                "approval_narrowed" => (
+                    ApprovalActor::HumanDashboard,
+                    ApprovalOutcome::ApprovedWithNarrowing,
+                ),
                 "approval_always" => (ApprovalActor::HumanDashboard, ApprovalOutcome::Approved),
                 "standing_grant" => (ApprovalActor::StandingGrant, ApprovalOutcome::Approved),
                 _ => (ApprovalActor::Policy, ApprovalOutcome::Approved),
@@ -1063,7 +1146,7 @@ fn build_receipt_body(
         .first()
         .map(|sb| sb.block.issued_at)
         .unwrap_or_else(|| parse_rfc3339_epoch(&info.created_at));
-    // Per AUDIT Decision 2 #5 (T-implementation-note-211):
+    // Per AUDIT Decision 2 #5 (T-implementation-note-287):
     // last_used_at reflects the most recent moment ANY statement was
     // touched. Aggregate Usage.last_updated was a stand-in that swallowed
     // per-statement granularity in the audit trail. Source of truth is the
@@ -1092,7 +1175,7 @@ fn build_receipt_body(
     };
 
     // 7. Attestation — passes through from the live grant. Per AUDIT
-    //    Decision 2 #4 (T-implementation-note-210): the previous
+    //    Decision 2 #4 (T-implementation-note-286): the previous
     //    `chain.first().and_then(|_| None).unwrap_or_default()` was a
     //    dead-code default that erased sandbox/spiffe/tee status from the
     //    grant before signing. Source of truth is the AccessGrant
@@ -1102,6 +1185,16 @@ fn build_receipt_body(
 
     // 8. Assemble receipt body (Evidence zeroed for hash stability — caller
     //    signs and repopulates evidence if needed).
+    //
+    //    design §Component 5 — stamp `dev_mode_active` from the
+    //    process-global flag set during daemon startup
+    //    (`binary_manifest::set_dev_mode_active`). `false` for prod
+    //    daemons running with release-only trust; `true` when the
+    //    operator supplied any additional root via `EMBER_TRUST_ROOTS`.
+    //    The field has `#[serde(skip_serializing_if = "std::ops::Not::not")]`
+    //    so the JSON for prod-mode receipts is byte-identical to
+    //    pre-design receipts (preserves canonical hash stability for
+    //    operators not using trust-root extension).
     let receipt_id = format!("rct-{}", Uuid::new_v4());
     GrantReceipt {
         id: receipt_id,
@@ -1113,6 +1206,7 @@ fn build_receipt_body(
         actions_observed,
         lifecycle,
         attestation,
+        dev_mode_active: crate::binary_manifest::dev_mode_active(),
         evidence: Evidence::default(),
     }
 }
@@ -1133,7 +1227,7 @@ pub fn emit_receipt(
     let sig_bytes = identity.sign(hash_hex.as_bytes());
     receipt.evidence = Evidence {
         hash: hash_hex,
-        sig: hex::encode(&*sig_bytes),
+        sig: hex::encode(*sig_bytes),
         signer_pubkey: identity.pubkey_hex(),
         canonical_version: CANONICAL_VERSION,
     };
@@ -1181,18 +1275,18 @@ pub struct ReceiptFilter {
     pub since_iso: Option<String>,
     /// Maximum rows to return. Defaults to 100 when `None`.
     pub limit: Option<u64>,
-    /// EMBER-implementation-note-172 — kind discriminator (`grant`, `kms_wrap`,
+    /// EMBER-implementation-note-244 — kind discriminator (`grant`, `kms_wrap`,
     /// `kms_unwrap`). Mapped 1:1 to the `kind` column.
     pub kind: Option<String>,
-    /// EMBER-implementation-note-172 — restrict to receipts whose `grant_id` matches.
+    /// EMBER-implementation-note-244 — restrict to receipts whose `grant_id` matches.
     pub grant_id: Option<String>,
-    /// EMBER-implementation-note-172 — substring filter on the receipt's `summary.resource`
+    /// EMBER-implementation-note-244 — substring filter on the receipt's `summary.resource`
     /// (grant receipts) or top-level `key_name` (kms receipts). Applied
     /// post-fetch so the JSON1 index can still serve exact-match callers.
     pub resource: Option<String>,
 }
 
-/// EMBER-implementation-note-172 — flat audit row returned by [`DaemonStore::list_receipt_rows`].
+/// EMBER-implementation-note-244 — flat audit row returned by [`DaemonStore::list_receipt_rows`].
 ///
 /// Joins receipt fields with [`crate::trust::grant::GrantInfo`] when the row is a
 /// grant receipt so callers see `requested_scope` / `granted_scope` without
@@ -1233,9 +1327,8 @@ impl DaemonStore {
     /// Persist a fully-signed receipt to the `receipts` table.
     pub fn store_receipt(&self, receipt: &GrantReceipt) -> Result<(), StoreError> {
         let now = Utc::now().to_rfc3339();
-        let receipt_json = serde_json::to_string(receipt).map_err(|e| {
-            StoreError::InvalidInput(format!("serialize receipt: {e}"))
-        })?;
+        let receipt_json = serde_json::to_string(receipt)
+            .map_err(|e| StoreError::InvalidInput(format!("serialize receipt: {e}")))?;
         let persona_id = receipt.summary.persona_id.clone();
         let terminal_reason = serde_json::to_string(&receipt.lifecycle.terminal_reason)
             .unwrap_or_else(|_| "\"unknown\"".to_string());
@@ -1265,16 +1358,15 @@ impl DaemonStore {
     /// **No plaintext / ciphertext bytes appear in the row.** Sizes only.
     pub fn store_kms_receipt(&self, receipt: &KmsReceipt) -> Result<(), StoreError> {
         let now = Utc::now().to_rfc3339();
-        let receipt_json = serde_json::to_string(receipt).map_err(|e| {
-            StoreError::InvalidInput(format!("serialize kms receipt: {e}"))
-        })?;
+        let receipt_json = serde_json::to_string(receipt)
+            .map_err(|e| StoreError::InvalidInput(format!("serialize kms receipt: {e}")))?;
         let kind_str = match receipt.kind {
             ReceiptKind::KmsWrap => "kms_wrap",
             ReceiptKind::KmsUnwrap => "kms_unwrap",
             // Non-kms variants must never reach this sink — they have
             // their own (planned) typed-Receipt persistence paths per
-            // RECEIPT-COVERAGE-FIX-implementation-note-33 and
-            // RECEIPT-COVERAGE-FIX-implementation-note-34. Reject explicitly so a
+            // RECEIPT-COVERAGE-FIX-implementation-note-46 and
+            // RECEIPT-COVERAGE-FIX-implementation-note-47. Reject explicitly so a
             // mis-routed call surfaces immediately rather than landing
             // a non-kms row in the kms-shaped storage path.
             ReceiptKind::Grant
@@ -1302,8 +1394,8 @@ impl DaemonStore {
             .grant_id
             .clone()
             .unwrap_or_default();
-        let outcome_str = serde_json::to_string(&receipt.outcome)
-            .unwrap_or_else(|_| "\"unknown\"".to_string());
+        let outcome_str =
+            serde_json::to_string(&receipt.outcome).unwrap_or_else(|_| "\"unknown\"".to_string());
         self.conn().execute(
             "INSERT OR REPLACE INTO receipts \
              (id, grant_id, persona_id, terminal_reason, created_at, receipt_json, signer_pubkey, kind) \
@@ -1329,9 +1421,8 @@ impl DaemonStore {
     /// opaque labels and timing metadata.
     pub fn store_broker_receipt(&self, receipt: &BrokerReceipt) -> Result<(), StoreError> {
         let now = Utc::now().to_rfc3339();
-        let receipt_json = serde_json::to_string(receipt).map_err(|e| {
-            StoreError::InvalidInput(format!("serialize broker receipt: {e}"))
-        })?;
+        let receipt_json = serde_json::to_string(receipt)
+            .map_err(|e| StoreError::InvalidInput(format!("serialize broker receipt: {e}")))?;
         let kind_str = match receipt.kind {
             ReceiptKind::BrokerMaterialization => "broker_materialization",
             ReceiptKind::BrokerRevocation => "broker_revocation",
@@ -1378,10 +1469,7 @@ impl DaemonStore {
     /// `signer_pubkey` column is left empty for v2 — callers verify via
     /// [`core_events::receipt::sign::verify_receipt_v2`] using a
     /// caller-supplied pubkey (typically `current_identity().pubkey_hex()`).
-    pub fn store_broker_receipt_v2(
-        &self,
-        envelope: &ReceiptEnvelope,
-    ) -> Result<(), StoreError> {
+    pub fn store_broker_receipt_v2(&self, envelope: &ReceiptEnvelope) -> Result<(), StoreError> {
         if !envelope.kind.starts_with("broker.") {
             return Err(StoreError::InvalidInput(format!(
                 "store_broker_receipt_v2 called with non-broker kind '{}' — \
@@ -1454,6 +1542,194 @@ impl DaemonStore {
         raw.ok_or(StoreError::NotFound)
     }
 
+    /// implementation-note-94 — persist a v2 `spawn.witness`
+    /// [`ReceiptEnvelope`] from the spawn path
+    /// (`crate::trust::grant::delegate_grant_full_sql`). Companion to
+    /// [`Self::store_broker_receipt_v2`]; rejects envelopes whose `kind` is
+    /// not exactly `"spawn.witness"`.
+    ///
+    /// Reuses the unified `receipts` table:
+    /// - `id` ← `envelope.receipt_id` (blake3 over the canonical envelope,
+    ///   recomputed by `sign_receipt_v2` before persistence).
+    /// - `grant_id` ← the parent grant authorizing the spawn (extracted from
+    ///   `body.spawn_grant_id`); this lets the tree CLI's
+    ///   `list_spawn_witnesses_for_grants` index witnesses by the parent
+    ///   grant edge.
+    /// - `persona_id` ← `body.spawned_persona_id` (the child) so per-persona
+    ///   listings surface the witness alongside the child's other artifacts.
+    /// - `terminal_reason` ← `body.parent_persona_id` so the parent persona
+    ///   is retrievable in a flat row scan without re-parsing JSON.
+    /// - `signer_pubkey` is empty (per v2 convention — the envelope's
+    ///   signature is the canonical artifact; the daemon pubkey is looked
+    ///   up at verification time via the trust anchor on disk).
+    pub fn store_spawn_witness_receipt(
+        &self,
+        envelope: &ReceiptEnvelope,
+    ) -> Result<(), StoreError> {
+        if envelope.kind != core_events::receipt::RECEIPT_KIND_SPAWN_WITNESS {
+            return Err(StoreError::InvalidInput(format!(
+                "store_spawn_witness_receipt called with kind '{}' — \
+                 expected '{}'",
+                envelope.kind,
+                core_events::receipt::RECEIPT_KIND_SPAWN_WITNESS,
+            )));
+        }
+        if envelope.receipt_id.is_empty() {
+            return Err(StoreError::InvalidInput(
+                "store_spawn_witness_receipt called with empty receipt_id — \
+                 caller must invoke sign_receipt_v2 before persistence"
+                    .to_string(),
+            ));
+        }
+        let envelope_json = serde_json::to_string(envelope).map_err(|e| {
+            StoreError::InvalidInput(format!("serialize spawn.witness envelope: {e}"))
+        })?;
+        let now = Utc::now().to_rfc3339();
+        let spawned_persona = envelope
+            .body
+            .get("spawned_persona_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let parent_persona = envelope
+            .body
+            .get("parent_persona_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let spawn_grant_id = envelope
+            .body
+            .get("spawn_grant_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        self.conn().execute(
+            "INSERT OR REPLACE INTO receipts \
+             (id, grant_id, persona_id, terminal_reason, created_at, receipt_json, signer_pubkey, kind) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', ?7)",
+            rusqlite::params![
+                envelope.receipt_id,
+                spawn_grant_id,
+                spawned_persona,
+                parent_persona,
+                now,
+                envelope_json,
+                envelope.kind,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// implementation-note-94 — load every persisted
+    /// `spawn.witness` envelope whose `grant_id` (== `body.spawn_grant_id`)
+    /// matches one of the supplied parent grant ids. Used by the tree CLI
+    /// (`emberlink-cli::receipt::tree::build_tree`) to assemble the
+    /// `spawn_witnesses` array from the store instead of synthesising it
+    /// per-edge at export time.
+    ///
+    /// Returns parsed `(ReceiptEnvelope, parent_persona_id)` pairs ordered
+    /// by `created_at ASC` (oldest first — matches the BFS order the tree
+    /// already produces for grant nodes). `parent_persona_id` is sourced
+    /// from the row's `terminal_reason` column (where `store_spawn_witness_receipt`
+    /// recorded it) so verifiers can resolve the parent persona's pubkey
+    /// without re-parsing the envelope body twice.
+    pub fn list_spawn_witnesses_for_grants(
+        &self,
+        grant_ids: &[String],
+    ) -> Result<Vec<(ReceiptEnvelope, String)>, StoreError> {
+        if grant_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // SQLite has a SQLITE_MAX_VARIABLE_NUMBER ceiling (default 999) on
+        // positional binds. A grant tree with >999 nodes is well beyond
+        // demo-scale; we still defend by chunking. For typical demo sizes
+        // (≤100s of grants) this is a single pass.
+        const CHUNK: usize = 512;
+        let mut out: Vec<(ReceiptEnvelope, String)> = Vec::new();
+        for chunk in grant_ids.chunks(CHUNK) {
+            let placeholders = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT receipt_json, terminal_reason FROM receipts \
+                 WHERE kind = '{}' AND grant_id IN ({}) \
+                 ORDER BY created_at ASC",
+                core_events::receipt::RECEIPT_KIND_SPAWN_WITNESS,
+                placeholders,
+            );
+            let mut stmt = self.conn().prepare(&sql)?;
+            let params: Vec<&dyn rusqlite::ToSql> =
+                chunk.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+            let rows: Vec<(String, String)> = stmt
+                .query_map(params.as_slice(), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<_, _>>()?;
+            for (raw, parent_persona) in rows {
+                let env: ReceiptEnvelope = serde_json::from_str(&raw).map_err(|e| {
+                    StoreError::InvalidInput(format!("corrupt spawn.witness row: {e}"))
+                })?;
+                out.push((env, parent_persona));
+            }
+        }
+        Ok(out)
+    }
+
+    /// implementation-note-288 — list v2 [`ReceiptEnvelope`]
+    /// rows from the `receipts` table whose `grant_id` is in `grant_ids`.
+    ///
+    /// V2 rows are identified by a dotted `kind` discriminator
+    /// (e.g. `broker.materialization`, `broker.revocation`, `spawn.witness`).
+    /// `spawn.witness` envelopes are excluded here — the tree CLI
+    /// surfaces them through `list_spawn_witnesses_for_grants` which also
+    /// carries the dual-signature metadata required for offline verify.
+    ///
+    /// Returns `(receipt_id, kind, grant_id, ReceiptEnvelope)` tuples ordered
+    /// by `created_at ASC`.
+    pub fn list_receipts_v2_envelopes(
+        &self,
+        grant_ids: &[String],
+    ) -> Result<Vec<(String, String, String, ReceiptEnvelope)>, StoreError> {
+        if grant_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        const CHUNK: usize = 512;
+        let mut out: Vec<(String, String, String, ReceiptEnvelope)> = Vec::new();
+        for chunk in grant_ids.chunks(CHUNK) {
+            let placeholders = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT id, kind, grant_id, receipt_json FROM receipts \
+                 WHERE kind LIKE '%.%' \
+                   AND kind != '{}' \
+                   AND grant_id IN ({}) \
+                 ORDER BY created_at ASC",
+                core_events::receipt::RECEIPT_KIND_SPAWN_WITNESS,
+                placeholders,
+            );
+            let mut stmt = self.conn().prepare(&sql)?;
+            let params: Vec<&dyn rusqlite::ToSql> =
+                chunk.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+            let rows: Vec<(String, String, String, String)> = stmt
+                .query_map(params.as_slice(), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })?
+                .collect::<Result<_, _>>()?;
+            for (id, kind, grant_id, raw) in rows {
+                let env: ReceiptEnvelope = serde_json::from_str(&raw).map_err(|e| {
+                    StoreError::InvalidInput(format!("corrupt v2 envelope row {id}: {e}"))
+                })?;
+                out.push((id, kind, grant_id, env));
+            }
+        }
+        Ok(out)
+    }
+
     /// Load a broker receipt by id. Returns `NotFound` if the row is not a
     /// broker_materialization / broker_revocation kind.
     pub fn get_broker_receipt(&self, id: &str) -> Result<BrokerReceipt, StoreError> {
@@ -1468,9 +1744,8 @@ impl DaemonStore {
             )
             .optional()?;
         let raw = raw.ok_or(StoreError::NotFound)?;
-        serde_json::from_str(&raw).map_err(|e| {
-            StoreError::InvalidInput(format!("corrupt broker receipt row {id}: {e}"))
-        })
+        serde_json::from_str(&raw)
+            .map_err(|e| StoreError::InvalidInput(format!("corrupt broker receipt row {id}: {e}")))
     }
 
     /// Persist a vault retrieval receipt (`vault_retrieval`).
@@ -1480,9 +1755,8 @@ impl DaemonStore {
     /// opaque key name and timing metadata.
     pub fn store_vault_receipt(&self, receipt: &VaultReceipt) -> Result<(), StoreError> {
         let now = Utc::now().to_rfc3339();
-        let receipt_json = serde_json::to_string(receipt).map_err(|e| {
-            StoreError::InvalidInput(format!("serialize vault receipt: {e}"))
-        })?;
+        let receipt_json = serde_json::to_string(receipt)
+            .map_err(|e| StoreError::InvalidInput(format!("serialize vault receipt: {e}")))?;
         match receipt.kind {
             ReceiptKind::VaultRetrieval => {}
             other => {
@@ -1497,8 +1771,8 @@ impl DaemonStore {
         //   - persona_id stores the caller persona
         //   - terminal_reason stores the outcome string
         //   - signer_pubkey is the daemon identity (or zero placeholder)
-        let outcome_str = serde_json::to_string(&receipt.outcome)
-            .unwrap_or_else(|_| "\"unknown\"".to_string());
+        let outcome_str =
+            serde_json::to_string(&receipt.outcome).unwrap_or_else(|_| "\"unknown\"".to_string());
         self.conn().execute(
             "INSERT OR REPLACE INTO receipts \
              (id, grant_id, persona_id, terminal_reason, created_at, receipt_json, signer_pubkey, kind) \
@@ -1529,9 +1803,8 @@ impl DaemonStore {
             )
             .optional()?;
         let raw = raw.ok_or(StoreError::NotFound)?;
-        serde_json::from_str(&raw).map_err(|e| {
-            StoreError::InvalidInput(format!("corrupt vault receipt row {id}: {e}"))
-        })
+        serde_json::from_str(&raw)
+            .map_err(|e| StoreError::InvalidInput(format!("corrupt vault receipt row {id}: {e}")))
     }
 
     /// Load a kms receipt by id. Returns `NotFound` if the row is not a
@@ -1548,9 +1821,8 @@ impl DaemonStore {
             )
             .optional()?;
         let raw = raw.ok_or(StoreError::NotFound)?;
-        serde_json::from_str(&raw).map_err(|e| {
-            StoreError::InvalidInput(format!("corrupt kms receipt row {id}: {e}"))
-        })
+        serde_json::from_str(&raw)
+            .map_err(|e| StoreError::InvalidInput(format!("corrupt kms receipt row {id}: {e}")))
     }
 
     /// List ember-kms receipts for a given key, most-recent first. Both
@@ -1593,16 +1865,12 @@ impl DaemonStore {
             )
             .optional()?;
         let raw = raw.ok_or(StoreError::NotFound)?;
-        serde_json::from_str(&raw).map_err(|e| {
-            StoreError::InvalidInput(format!("corrupt receipt row {id}: {e}"))
-        })
+        serde_json::from_str(&raw)
+            .map_err(|e| StoreError::InvalidInput(format!("corrupt receipt row {id}: {e}")))
     }
 
     /// List receipts, most-recent first. Optionally filter by persona.
-    pub fn list_receipts(
-        &self,
-        persona_id: Option<&str>,
-    ) -> Result<Vec<GrantReceipt>, StoreError> {
+    pub fn list_receipts(&self, persona_id: Option<&str>) -> Result<Vec<GrantReceipt>, StoreError> {
         self.list_receipts_filtered(&ReceiptFilter {
             persona_id: persona_id.map(|s| s.to_string()),
             ..Default::default()
@@ -1615,9 +1883,7 @@ impl DaemonStore {
         &self,
         filter: &ReceiptFilter,
     ) -> Result<Vec<GrantReceipt>, StoreError> {
-        let mut sql = String::from(
-            "SELECT receipt_json, signer_pubkey FROM receipts WHERE 1=1",
-        );
+        let mut sql = String::from("SELECT receipt_json, signer_pubkey FROM receipts WHERE 1=1");
         let mut binds: Vec<String> = Vec::new();
         if let Some(ref pid) = filter.persona_id {
             sql.push_str(&format!(" AND persona_id = ?{}", binds.len() + 1));
@@ -1637,10 +1903,9 @@ impl DaemonStore {
         sql.push_str(&format!(" LIMIT {limit}"));
 
         let mut stmt = self.conn().prepare(&sql)?;
-        let mapper =
-            |row: &rusqlite::Row<'_>| -> rusqlite::Result<(String, String)> {
-                Ok((row.get(0)?, row.get(1)?))
-            };
+        let mapper = |row: &rusqlite::Row<'_>| -> rusqlite::Result<(String, String)> {
+            Ok((row.get(0)?, row.get(1)?))
+        };
 
         // rusqlite doesn't support dynamic param slices without unsafe tricks;
         // match on the number of bound params instead.
@@ -1668,7 +1933,7 @@ impl DaemonStore {
         Ok(out)
     }
 
-    /// EMBER-implementation-note-172 — flat audit-row listing for the `ember audit`
+    /// EMBER-implementation-note-244 — flat audit-row listing for the `ember audit`
     /// query CLI. Joins the receipts table with `grants` so the row carries
     /// both the receipt fields and the parent grant's scope.
     ///
@@ -1677,10 +1942,7 @@ impl DaemonStore {
     /// substring match against `summary.resource` (grant receipts) or
     /// `key_name` (kms receipts) — applied post-fetch so the SQL stays
     /// index-friendly for exact-match callers.
-    pub fn list_receipt_rows(
-        &self,
-        filter: &ReceiptFilter,
-    ) -> Result<Vec<ReceiptRow>, StoreError> {
+    pub fn list_receipt_rows(&self, filter: &ReceiptFilter) -> Result<Vec<ReceiptRow>, StoreError> {
         // Indexed columns first (kind / persona_id / grant_id / created_at).
         // Build the parameterised SQL with positional binds; keep the bind
         // vector aligned with the params slice we hand to rusqlite.
@@ -1748,10 +2010,7 @@ impl DaemonStore {
                 .query_map(rusqlite::params![binds[0], binds[1]], mapper)?
                 .collect::<Result<Vec<_>, _>>()?,
             3 => stmt
-                .query_map(
-                    rusqlite::params![binds[0], binds[1], binds[2]],
-                    mapper,
-                )?
+                .query_map(rusqlite::params![binds[0], binds[1], binds[2]], mapper)?
                 .collect::<Result<Vec<_>, _>>()?,
             _ => stmt
                 .query_map(
@@ -1768,24 +2027,30 @@ impl DaemonStore {
             .filter(|s| !s.is_empty());
 
         let mut out = Vec::with_capacity(rows.len());
-        for (id, kind, persona_id, grant_id, terminal_reason, created_at, receipt_json, granted_scope) in
-            rows
+        for (
+            id,
+            kind,
+            persona_id,
+            grant_id,
+            terminal_reason,
+            created_at,
+            receipt_json,
+            granted_scope,
+        ) in rows
         {
             // Pull the resource label out of the receipt body. Grant
             // receipts: `$.summary.resource`. Kms receipts: `$.key_name`.
             // Fall back to empty string when the field is missing.
             let resource = match kind.as_str() {
-                "grant" => {
-                    serde_json::from_str::<serde_json::Value>(&receipt_json)
-                        .ok()
-                        .and_then(|v| {
-                            v.get("summary")
-                                .and_then(|s| s.get("resource"))
-                                .and_then(|r| r.as_str())
-                                .map(|s| s.to_string())
-                        })
-                        .unwrap_or_default()
-                }
+                "grant" => serde_json::from_str::<serde_json::Value>(&receipt_json)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("summary")
+                            .and_then(|s| s.get("resource"))
+                            .and_then(|r| r.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .unwrap_or_default(),
                 "kms_wrap" | "kms_unwrap" => {
                     serde_json::from_str::<serde_json::Value>(&receipt_json)
                         .ok()
@@ -1899,7 +2164,7 @@ mod tests {
         current_identity().expect("identity was just initialised")
     }
 
-    /// implementation-note-208 — journal append + mode-drift refusal.
+    /// implementation-note-283 — journal append + mode-drift refusal.
     #[test]
     fn receipts_journal_appends_line_at_mode_0600() {
         use std::os::unix::fs::PermissionsExt;
@@ -1916,7 +2181,11 @@ mod tests {
         let path = dir.path().join("receipts.log");
         let meta = std::fs::metadata(&path).expect("metadata");
         let mode = meta.permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "receipts.log must be mode 0600, got {:#o}", mode);
+        assert_eq!(
+            mode, 0o600,
+            "receipts.log must be mode 0600, got {:#o}",
+            mode
+        );
 
         let body = std::fs::read_to_string(&path).expect("read");
         assert!(body.ends_with('\n'), "line terminator must be \\n");
@@ -1939,7 +2208,12 @@ mod tests {
             .expect("chmod 0644");
         match append_receipts_journal(dir.path(), &serde_json::json!({"kind": "x"})) {
             Err(JournalError::InsecureMode { mode }) => {
-                assert_eq!(mode & 0o777, 0o644, "expected 0644 in error, got {:#o}", mode);
+                assert_eq!(
+                    mode & 0o777,
+                    0o644,
+                    "expected 0644 in error, got {:#o}",
+                    mode
+                );
             }
             other => panic!("expected InsecureMode error, got {:?}", other),
         }
@@ -1976,6 +2250,77 @@ mod tests {
         assert_eq!(r.evidence.hash.len(), 64);
         assert_eq!(r.evidence.signer_pubkey, identity.pubkey_hex());
         verify_receipt(&r, &identity.pubkey_hex()).expect("own-signed receipt verifies");
+    }
+
+    // -----------------------------------------------------------------
+    // design §Component 5 — `dev_mode_active` Receipt stamp tests.
+    // T2-shape (integration across binary_manifest's process-global
+    // flag + the receipt builder).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn receipt_stamps_dev_mode_active_false_in_prod_mode() {
+        // Pre-condition: prod daemon (no `EMBER_TRUST_ROOTS` supplied)
+        // leaves the process-global flag at its default `false`. Receipts
+        // emitted during this run carry `dev_mode_active: false`.
+        //
+        // Defensive: explicitly set the flag to false in case a prior
+        // test in the same binary flipped it to true.
+        let _guard = crate::PROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::binary_manifest::set_dev_mode_active(false);
+
+        let _identity = ensure_identity();
+        let store = DaemonStore::open_in_memory().unwrap();
+        let persona = store.create_persona("agent-prod").unwrap();
+        let grant = store
+            .create_grant(&persona.id, "github-token", "push", None)
+            .unwrap();
+        store.revoke_grant(&grant.id).unwrap();
+        let rid = store.get_grant(&grant.id).unwrap().receipt_id.unwrap();
+        let r = store.get_receipt(&rid).unwrap();
+        assert!(
+            !r.dev_mode_active,
+            "prod-mode receipt must stamp dev_mode_active: false; got {}",
+            r.dev_mode_active
+        );
+    }
+
+    #[test]
+    fn receipt_stamps_dev_mode_active_true_under_dev_trust_root_config() {
+        // Pre-condition: dev daemon (operator supplied
+        // `EMBER_TRUST_ROOTS=<dev>`) flips the process-global flag to
+        // `true` at startup via `binary_manifest::set_dev_mode_active`.
+        // Every Receipt this daemon emits carries the stamp.
+        //
+        // This is the T2 acceptance criterion ("Receipt body includes
+        // dev_mode_active: true under dev trust-root config") routed
+        // through the in-process flag rather than spawning a real
+        // daemon — the flag IS the canonical surface that
+        // `infra/runtime.rs` writes once at startup.
+        let _guard = crate::PROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::binary_manifest::set_dev_mode_active(true);
+
+        let _identity = ensure_identity();
+        let store = DaemonStore::open_in_memory().unwrap();
+        let persona = store.create_persona("agent-dev").unwrap();
+        let grant = store
+            .create_grant(&persona.id, "github-token", "push", None)
+            .unwrap();
+        store.revoke_grant(&grant.id).unwrap();
+        let rid = store.get_grant(&grant.id).unwrap().receipt_id.unwrap();
+        let r = store.get_receipt(&rid).unwrap();
+        assert!(
+            r.dev_mode_active,
+            "dev-trust-root-config receipt must stamp dev_mode_active: true; got {}",
+            r.dev_mode_active
+        );
+
+        // Clear the flag so subsequent tests don't inherit the dev posture.
+        crate::binary_manifest::set_dev_mode_active(false);
     }
 
     #[test]
@@ -2068,7 +2413,9 @@ mod tests {
 
     #[test]
     fn three_statement_receipt_preserves_per_statement_usage() {
-        use core_grant_types::{Block, Budget, ResourceSelector, ResourceType, SignedBlock, Statement};
+        use core_grant_types::{
+            Block, Budget, ResourceSelector, ResourceType, SignedBlock, Statement,
+        };
 
         let identity = ensure_identity();
         let store = DaemonStore::open_in_memory().unwrap();
@@ -2088,7 +2435,10 @@ mod tests {
                 actions: vec!["credential:use".into()],
                 resource: ResourceSelector::Any,
                 budget: None,
-                usage: Usage { requests: 3, ..Default::default() },
+                usage: Usage {
+                    requests: 3,
+                    ..Default::default()
+                },
                 conditions: vec![],
             },
             Statement {
@@ -2096,8 +2446,14 @@ mod tests {
                 resource_type: ResourceType::Session,
                 actions: vec!["llm:generate".into()],
                 resource: ResourceSelector::Any,
-                budget: Some(Budget { tokens: Some(1000), ..Default::default() }),
-                usage: Usage { tokens: 250, ..Default::default() },
+                budget: Some(Budget {
+                    tokens: Some(1000),
+                    ..Default::default()
+                }),
+                usage: Usage {
+                    tokens: 250,
+                    ..Default::default()
+                },
                 conditions: vec![],
             },
             Statement {
@@ -2105,8 +2461,14 @@ mod tests {
                 resource_type: ResourceType::Time,
                 actions: vec!["session:run".into()],
                 resource: ResourceSelector::Any,
-                budget: Some(Budget { wall_clock_secs: Some(3600), ..Default::default() }),
-                usage: Usage { wall_clock_secs: 120, ..Default::default() },
+                budget: Some(Budget {
+                    wall_clock_secs: Some(3600),
+                    ..Default::default()
+                }),
+                usage: Usage {
+                    wall_clock_secs: 120,
+                    ..Default::default()
+                },
                 conditions: vec![],
             },
         ];
@@ -2190,26 +2552,44 @@ mod tests {
         // resolve_approval creates the grant and logs "grant.issued" with
         // source = "approval".
         let req = store
-            .submit_approval(&persona.id, "github-token", "push", None, "credential.access.github-token", "medium")
+            .submit_approval(
+                &persona.id,
+                "github-token",
+                "push",
+                None,
+                "credential.access.github-token",
+                "medium",
+            )
             .unwrap();
-        store.resolve_approval(&req.id, &StoreApprovalOutcome::Approved).unwrap();
+        store
+            .resolve_approval(&req.id, &StoreApprovalOutcome::Approved)
+            .unwrap();
 
         // Retrieve the grant that was created by resolve_approval.
         let grants = store.list_grants().unwrap();
-        assert_eq!(grants.len(), 1, "resolve_approval must have created a grant");
+        assert_eq!(
+            grants.len(),
+            1,
+            "resolve_approval must have created a grant"
+        );
         let grant = &grants[0];
 
         store.revoke_grant(&grant.id).unwrap();
         let rid = store.get_grant(&grant.id).unwrap().receipt_id.unwrap();
         let r = store.get_receipt(&rid).unwrap();
 
-        assert_eq!(r.approval_chain.len(), 1, "expected exactly one approval event");
+        assert_eq!(
+            r.approval_chain.len(),
+            1,
+            "expected exactly one approval event"
+        );
         let ev = &r.approval_chain[0];
         assert_eq!(ev.actor, ApprovalActor::HumanDashboard);
         assert_eq!(ev.outcome, ApprovalOutcome::Approved);
         assert!(ev.at > 0, "approval event must have a non-zero timestamp");
 
-        verify_receipt(&r, &identity.pubkey_hex()).expect("receipt with approval_chain must verify");
+        verify_receipt(&r, &identity.pubkey_hex())
+            .expect("receipt with approval_chain must verify");
     }
 
     /// Approval chain entries are ordered ascending by timestamp regardless
@@ -2226,9 +2606,7 @@ mod tests {
         // order t1 < t2 < t3 to verify the chain sorts ascending.
         // We use a fixed grant (created but never touched by the standard
         // flow) so there is no race with revoke_grant's own log events.
-        let grant = store
-            .create_grant(&persona.id, "tok", "r", None)
-            .unwrap();
+        let grant = store.create_grant(&persona.id, "tok", "r", None).unwrap();
         let grant_id = grant.id.clone();
 
         // Seed three audit entries with distinct timestamps by using
@@ -2239,9 +2617,16 @@ mod tests {
                 "grant_id": grant_id,
                 "scope": "r",
                 "source": "approval",
-            }).to_string();
+            })
+            .to_string();
             store
-                .log_event(Some(&persona.id), "grant.issued", Some("tok"), "allowed", Some(&details))
+                .log_event(
+                    Some(&persona.id),
+                    "grant.issued",
+                    Some("tok"),
+                    "allowed",
+                    Some(&details),
+                )
                 .unwrap();
             // Brief pause so RFC-3339 timestamps differ (SQLite stores TEXT).
             std::thread::sleep(std::time::Duration::from_millis(10 + i * 2));
@@ -2254,7 +2639,11 @@ mod tests {
         // We seeded 3 approval entries; revoke_grant does not add a
         // grant.issued so the count should be exactly 3.
         assert_eq!(r.approval_chain.len(), 3, "expected 3 approval events");
-        assert!(r.approval_chain.iter().all(|ev| ev.actor == ApprovalActor::HumanDashboard));
+        assert!(
+            r.approval_chain
+                .iter()
+                .all(|ev| ev.actor == ApprovalActor::HumanDashboard)
+        );
 
         // Verify ascending order.
         for w in r.approval_chain.windows(2) {
@@ -2298,12 +2687,14 @@ mod tests {
         force_status(&store, &grant.id, "expired");
 
         let now = 1_700_000_000u64;
-        let receipt =
-            generate_receipt(&store, &grant.id, TerminalReason::Expired, now).unwrap();
+        let receipt = generate_receipt(&store, &grant.id, TerminalReason::Expired, now).unwrap();
 
         assert_eq!(receipt.grant_id, grant.id);
         assert_eq!(receipt.lifecycle.terminated_at, now);
-        assert!(matches!(receipt.lifecycle.terminal_reason, TerminalReason::Expired));
+        assert!(matches!(
+            receipt.lifecycle.terminal_reason,
+            TerminalReason::Expired
+        ));
         // Evidence must stay zeroed on the pure-logic path — signing is a
         // separate concern.
         assert_eq!(receipt.evidence, Evidence::default());
@@ -2324,8 +2715,7 @@ mod tests {
             reason: "voluntary release".into(),
         };
         let now = 1_700_000_050u64;
-        let receipt =
-            generate_receipt(&store, &grant.id, reason.clone(), now).unwrap();
+        let receipt = generate_receipt(&store, &grant.id, reason.clone(), now).unwrap();
 
         match receipt.lifecycle.terminal_reason {
             TerminalReason::Revoked { by, reason: r } => {
@@ -2360,7 +2750,10 @@ mod tests {
                 actions: vec!["credential:use".into()],
                 resource: ResourceSelector::Any,
                 budget: None,
-                usage: Usage { requests: 7, ..Default::default() },
+                usage: Usage {
+                    requests: 7,
+                    ..Default::default()
+                },
                 conditions: vec![],
             },
             Statement {
@@ -2368,8 +2761,14 @@ mod tests {
                 resource_type: ResourceType::Session,
                 actions: vec!["llm:generate".into()],
                 resource: ResourceSelector::Any,
-                budget: Some(Budget { tokens: Some(10_000), ..Default::default() }),
-                usage: Usage { tokens: 4_321, ..Default::default() },
+                budget: Some(Budget {
+                    tokens: Some(10_000),
+                    ..Default::default()
+                }),
+                usage: Usage {
+                    tokens: 4_321,
+                    ..Default::default()
+                },
                 conditions: vec![],
             },
         ];
@@ -2445,13 +2844,8 @@ mod tests {
             .create_grant(&persona.id, "cred", "read", None)
             .unwrap();
         // Grant is active; generate_receipt must refuse.
-        let err = generate_receipt(
-            &store,
-            &grant.id,
-            TerminalReason::Expired,
-            1_700_000_000,
-        )
-        .unwrap_err();
+        let err = generate_receipt(&store, &grant.id, TerminalReason::Expired, 1_700_000_000)
+            .unwrap_err();
         assert!(
             matches!(err, StoreError::InvalidInput(_)),
             "expected InvalidInput for active grant, got {err:?}"
@@ -2469,8 +2863,7 @@ mod tests {
         force_status(&store, &grant.id, "expired");
 
         let now = 1_700_000_123u64;
-        let r1 =
-            generate_receipt(&store, &grant.id, TerminalReason::Expired, now).unwrap();
+        let r1 = generate_receipt(&store, &grant.id, TerminalReason::Expired, now).unwrap();
         let mut r2 = r1.clone();
         // Deterministic: identical content → identical hash, even though
         // generate_receipt mints a fresh uuid for the id on each call.
@@ -2497,8 +2890,7 @@ mod tests {
         force_status(&store, &grant.id, "expired");
 
         let now = 1_700_000_456u64;
-        let base =
-            generate_receipt(&store, &grant.id, TerminalReason::Expired, now).unwrap();
+        let base = generate_receipt(&store, &grant.id, TerminalReason::Expired, now).unwrap();
         let baseline_hash = canonical_hash_receipt(&base);
 
         // Mutate ONLY evidence fields. The canonical hash must stay stable.
@@ -2603,8 +2995,7 @@ mod tests {
         let r = store.get_receipt(&rid).unwrap();
 
         let json_bytes = serde_json::to_vec(&r).expect("receipt serializes");
-        let r2: GrantReceipt =
-            serde_json::from_slice(&json_bytes).expect("receipt deserializes");
+        let r2: GrantReceipt = serde_json::from_slice(&json_bytes).expect("receipt deserializes");
         verify_receipt(&r2, &identity.pubkey_hex())
             .expect("receipt verifies after JSON round-trip");
     }
@@ -2682,10 +3073,16 @@ mod tests {
 
         let mut sig: Zeroizing<[u8; 64]> = id.sign(payload);
         // A real Ed25519 signature must have non-zero bytes.
-        assert!(sig.iter().any(|b| *b != 0), "signature must have non-zero bytes");
+        assert!(
+            sig.iter().any(|b| *b != 0),
+            "signature must have non-zero bytes"
+        );
         // Explicitly invoke zeroize (same code path as ZeroizeOnDrop).
         sig.zeroize();
-        assert!(sig.iter().all(|b| *b == 0), "Zeroizing::zeroize() must clear all bytes");
+        assert!(
+            sig.iter().all(|b| *b == 0),
+            "Zeroizing::zeroize() must clear all bytes"
+        );
     }
 
     /// T1 zeroize: `seed_bytes()` returns a `Zeroizing<[u8;32]>` wrapper.
@@ -2697,9 +3094,15 @@ mod tests {
         let id = DaemonPersona::load_or_create(dir.path()).unwrap();
 
         let mut seed: Zeroizing<[u8; 32]> = id.seed_bytes();
-        assert!(seed.iter().any(|b| *b != 0), "seed must have non-zero bytes");
+        assert!(
+            seed.iter().any(|b| *b != 0),
+            "seed must have non-zero bytes"
+        );
         seed.zeroize();
-        assert!(seed.iter().all(|b| *b == 0), "Zeroizing::zeroize() must clear all bytes");
+        assert!(
+            seed.iter().all(|b| *b == 0),
+            "Zeroizing::zeroize() must clear all bytes"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -2722,8 +3125,8 @@ mod tests {
         perms.set_mode(0o644);
         fs::set_permissions(&key_path, perms).unwrap();
         // A second load_or_create must refuse.
-        let err = DaemonPersona::load_or_create(dir.path())
-            .expect_err("should refuse 0644 key file");
+        let err =
+            DaemonPersona::load_or_create(dir.path()).expect_err("should refuse 0644 key file");
         assert!(
             matches!(err, StoreError::KeyInsecureMode { .. }),
             "expected KeyInsecureMode, got: {err:?}"
@@ -2732,8 +3135,14 @@ mod tests {
         // includes the 644 octal digits (the full mode includes file-type bits
         // on some platforms, e.g. 0o100644, so we search for "644").
         let msg = err.to_string();
-        assert!(msg.contains("daemon_persona.key"), "error must name the file: {msg}");
-        assert!(msg.contains("644"), "error must report the insecure mode: {msg}");
+        assert!(
+            msg.contains("daemon_persona.key"),
+            "error must name the file: {msg}"
+        );
+        assert!(
+            msg.contains("644"),
+            "error must report the insecure mode: {msg}"
+        );
     }
 
     /// T2 mode-check 0600: a correctly-permissioned key file loads without error.
@@ -2746,14 +3155,18 @@ mod tests {
         let pk1 = id1.pubkey_hex();
         // Second call reads the key — must succeed and return the same pubkey.
         let id2 = DaemonPersona::load_or_create(dir.path()).unwrap();
-        assert_eq!(id2.pubkey_hex(), pk1, "0600 key must load cleanly and return same pubkey");
+        assert_eq!(
+            id2.pubkey_hex(),
+            pk1,
+            "0600 key must load cleanly and return same pubkey"
+        );
     }
 }
 
 #[cfg(test)]
 mod broker_v2_tests {
     //! Phase A substrate tests for v2 broker envelope builders +
-    //! `store_broker_receipt_v2` (implementation-note-212).
+    //! `store_broker_receipt_v2` (implementation-note-289).
 
     use super::*;
     use crate::infra::store::DaemonStore;
@@ -2787,14 +3200,23 @@ mod broker_v2_tests {
     fn build_materialization_envelope_has_v2_shape() {
         let req = fixture_request();
         let cred = fixture_credential();
-        let env = build_broker_materialization_envelope(&req, &cred, "daemon-root-test");
+        let env = build_broker_materialization_envelope(&req, &cred, "daemon-root-test", false);
         assert_eq!(env.kind, RECEIPT_KIND_BROKER_MATERIALIZATION);
         assert_eq!(env.kind, "broker.materialization");
         assert_eq!(env.version.0, "2");
         assert_eq!(env.daemon_root_id, "daemon-root-test");
-        assert!(env.receipt_id.is_empty(), "unsigned envelope has empty receipt_id");
-        assert!(env.signature.is_none(), "unsigned envelope has no signature");
-        assert!(matches!(env.termination_authority, TerminationAuthority::DaemonPersona));
+        assert!(
+            env.receipt_id.is_empty(),
+            "unsigned envelope has empty receipt_id"
+        );
+        assert!(
+            env.signature.is_none(),
+            "unsigned envelope has no signature"
+        );
+        assert!(matches!(
+            env.termination_authority,
+            TerminationAuthority::DaemonPersona
+        ));
         // Body shape — discriminator fields present.
         assert_eq!(
             env.body.get("provider").and_then(|v| v.as_str()),
@@ -2804,25 +3226,72 @@ mod broker_v2_tests {
             env.body.get("materialization_id").and_then(|v| v.as_str()),
             Some("mat-fixture-1")
         );
-        assert_eq!(env.body.get("ttl_seconds").and_then(|v| v.as_u64()), Some(3600));
+        assert_eq!(
+            env.body.get("ttl_seconds").and_then(|v| v.as_u64()),
+            Some(3600)
+        );
         assert_eq!(
             env.body.get("caller_persona").and_then(|v| v.as_str()),
             Some("persona-fixture")
+        );
+        // implementation-note-122: mock_broker stamp.
+        assert_eq!(
+            env.body.get("mock_broker").and_then(|v| v.as_bool()),
+            Some(false),
+            "real-broker envelope must stamp mock_broker: false"
+        );
+    }
+
+    /// implementation-note-122 (design §Component 2):
+    /// Receipts from Mock-registered brokers stamp `mock_broker: true`.
+    #[test]
+    fn build_materialization_envelope_stamps_mock_broker_true() {
+        let req = fixture_request();
+        let cred = fixture_credential();
+        let env = build_broker_materialization_envelope(&req, &cred, "daemon-root-test", true);
+        assert_eq!(
+            env.body.get("mock_broker").and_then(|v| v.as_bool()),
+            Some(true),
+            "mock-registered envelope must stamp mock_broker: true"
         );
     }
 
     #[test]
     fn build_revocation_envelope_has_v2_shape() {
-        let env = build_broker_revocation_envelope("mat-revoked-1", None, "daemon-root-test");
+        let env =
+            build_broker_revocation_envelope("mat-revoked-1", None, "daemon-root-test", false);
         assert_eq!(env.kind, RECEIPT_KIND_BROKER_REVOCATION);
         assert_eq!(env.kind, "broker.revocation");
         assert_eq!(env.daemon_root_id, "daemon-root-test");
-        assert!(matches!(env.termination_authority, TerminationAuthority::DaemonPersona));
+        assert!(matches!(
+            env.termination_authority,
+            TerminationAuthority::DaemonPersona
+        ));
         // Body shape — unknown-summary path defaults to provider="unknown".
-        assert_eq!(env.body.get("provider").and_then(|v| v.as_str()), Some("unknown"));
+        assert_eq!(
+            env.body.get("provider").and_then(|v| v.as_str()),
+            Some("unknown")
+        );
         assert_eq!(
             env.body.get("materialization_id").and_then(|v| v.as_str()),
             Some("mat-revoked-1")
+        );
+        assert_eq!(
+            env.body.get("mock_broker").and_then(|v| v.as_bool()),
+            Some(false),
+            "real-broker revocation envelope must stamp mock_broker: false"
+        );
+    }
+
+    /// implementation-note-122: revocation receipt also
+    /// carries the mock_broker stamp.
+    #[test]
+    fn build_revocation_envelope_stamps_mock_broker_true() {
+        let env = build_broker_revocation_envelope("mat-revoked-mock", None, "daemon-root", true);
+        assert_eq!(
+            env.body.get("mock_broker").and_then(|v| v.as_bool()),
+            Some(true),
+            "mock-registered revocation envelope must stamp mock_broker: true"
         );
     }
 
@@ -2833,13 +3302,15 @@ mod broker_v2_tests {
         let req = fixture_request();
         let cred = fixture_credential();
 
-        let mut env = build_broker_materialization_envelope(&req, &cred, "daemon-root-rt");
+        let mut env = build_broker_materialization_envelope(&req, &cred, "daemon-root-rt", false);
         sign_receipt_v2(&mut env, &signer).expect("sign v2 envelope");
         assert!(!env.receipt_id.is_empty(), "sign populates receipt_id");
         assert!(env.signature.is_some(), "sign populates signature");
 
         let store = DaemonStore::open_in_memory().expect("in-memory store");
-        store.store_broker_receipt_v2(&env).expect("store v2 envelope");
+        store
+            .store_broker_receipt_v2(&env)
+            .expect("store v2 envelope");
 
         // Verify the in-memory envelope round-trips through verification.
         verify_receipt_v2(&env, &pk, &FixtureVerifier).expect("envelope verifies");
@@ -2858,6 +3329,11 @@ mod broker_v2_tests {
             presence_kind: None,
             body: serde_json::json!({}),
             signature: Some("ed25519sig:00".to_string()),
+            calling_principal: None,
+            presence_reason: None,
+            handle_id: None,
+            challenge_hash: None,
+            verifier_aaguid: None,
         };
         let r = store.store_broker_receipt_v2(&bad);
         assert!(
@@ -2872,12 +3348,151 @@ mod broker_v2_tests {
         let req = fixture_request();
         let cred = fixture_credential();
         // Built but not signed — receipt_id is empty.
-        let env = build_broker_materialization_envelope(&req, &cred, "daemon-root");
+        let env = build_broker_materialization_envelope(&req, &cred, "daemon-root", false);
         let r = store.store_broker_receipt_v2(&env);
         assert!(
             matches!(r, Err(StoreError::InvalidInput(_))),
             "unsigned envelope must be rejected: {r:?}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v2 envelope listing tests (implementation-note-288)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod v2_envelope_listing_tests {
+    use super::*;
+    use crate::infra::store::DaemonStore;
+    use core_events::receipt::envelope::{ReceiptEnvelope, ReceiptVersion, TerminationAuthority};
+
+    fn insert_v2_row(
+        store: &DaemonStore,
+        id: &str,
+        kind: &str,
+        grant_id: &str,
+        envelope: &ReceiptEnvelope,
+    ) {
+        let json = serde_json::to_string(envelope).unwrap();
+        store
+            .conn()
+            .execute(
+                "INSERT INTO receipts (id, grant_id, persona_id, terminal_reason, \
+                 created_at, receipt_json, signer_pubkey, kind) \
+                 VALUES (?1, ?2, '', '', '2026-01-01T00:00:00Z', ?3, '', ?4)",
+                rusqlite::params![id, grant_id, json, kind],
+            )
+            .unwrap();
+    }
+
+    fn minimal_envelope(kind: &str) -> ReceiptEnvelope {
+        ReceiptEnvelope {
+            version: ReceiptVersion::default(),
+            kind: kind.to_string(),
+            receipt_id: format!("rct-{kind}-test"),
+            daemon_root_id: "daemon-root-test".to_string(),
+            traceparent: None,
+            termination_authority: TerminationAuthority::DaemonPersona,
+            presence_kind: None,
+            body: serde_json::json!({"test": true}),
+            signature: None,
+            calling_principal: None,
+            presence_reason: None,
+            handle_id: None,
+            challenge_hash: None,
+            verifier_aaguid: None,
+        }
+    }
+
+    #[test]
+    fn list_receipts_v2_envelopes_returns_matching_grant() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let envelope = minimal_envelope("broker.materialization");
+        insert_v2_row(
+            &store,
+            "rct-v2-1",
+            "broker.materialization",
+            "grant-abc",
+            &envelope,
+        );
+
+        let results = store
+            .list_receipts_v2_envelopes(&["grant-abc".to_string()])
+            .unwrap();
+        assert_eq!(results.len(), 1, "expected one v2 envelope");
+        let (id, kind, grant_id, _env) = &results[0];
+        assert_eq!(id, "rct-v2-1");
+        assert_eq!(kind, "broker.materialization");
+        assert_eq!(grant_id, "grant-abc");
+    }
+
+    #[test]
+    fn list_receipts_v2_envelopes_excludes_spawn_witness() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let sw_envelope = minimal_envelope(core_events::receipt::RECEIPT_KIND_SPAWN_WITNESS);
+        insert_v2_row(
+            &store,
+            "rct-sw-1",
+            core_events::receipt::RECEIPT_KIND_SPAWN_WITNESS,
+            "grant-xyz",
+            &sw_envelope,
+        );
+        // spawn.witness row must be excluded even though grant_id matches.
+        let results = store
+            .list_receipts_v2_envelopes(&["grant-xyz".to_string()])
+            .unwrap();
+        assert!(
+            results.is_empty(),
+            "spawn.witness must be excluded from list_receipts_v2_envelopes"
+        );
+    }
+
+    #[test]
+    fn list_receipts_v2_envelopes_excludes_v1_rows() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        // Insert a v1-style row (kind without a dot).
+        store
+            .conn()
+            .execute(
+                "INSERT INTO receipts (id, grant_id, persona_id, terminal_reason, \
+                 created_at, receipt_json, signer_pubkey, kind) \
+                 VALUES ('rct-v1-1', 'grant-v1', '', '', '2026-01-01T00:00:00Z', '{}', '', 'grant')",
+                [],
+            )
+            .unwrap();
+        let results = store
+            .list_receipts_v2_envelopes(&["grant-v1".to_string()])
+            .unwrap();
+        assert!(
+            results.is_empty(),
+            "v1 rows (underscore/bare kind) must not appear in v2 listing"
+        );
+    }
+
+    #[test]
+    fn list_receipts_v2_envelopes_empty_grant_ids_returns_empty() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let results = store.list_receipts_v2_envelopes(&[]).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn list_receipts_v2_envelopes_ignores_non_matching_grant() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let envelope = minimal_envelope("broker.materialization");
+        insert_v2_row(
+            &store,
+            "rct-v2-miss",
+            "broker.materialization",
+            "grant-other",
+            &envelope,
+        );
+
+        let results = store
+            .list_receipts_v2_envelopes(&["grant-abc".to_string()])
+            .unwrap();
+        assert!(results.is_empty(), "non-matching grant_id must not appear");
     }
 }
 
@@ -2986,7 +3601,7 @@ pub fn trigger_receipt_if_terminal_current(
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-36 — kms receipt sink wiring
+// implementation-note-49 — kms receipt sink wiring
 // ---------------------------------------------------------------------------
 //
 // `core_kms::ReceiptSink` requires `Send + Sync`, but `DaemonStore` is
@@ -3208,7 +3823,7 @@ mod kms_tests {
         current_identity().expect("identity was just initialised")
     }
 
-    /// EMBER-implementation-note-172 — mixed-kind audit query. Seed two kms receipts for
+    /// EMBER-implementation-note-244 — mixed-kind audit query. Seed two kms receipts for
     /// the same persona (one wrap, one unwrap) plus one for a different
     /// persona; the actor filter must return only the matching pair, and
     /// the rows must be sorted `materialized_at DESC`.
@@ -3253,7 +3868,7 @@ mod kms_tests {
         );
     }
 
-    /// EMBER-implementation-note-172 — kind filter narrows to a single discriminator.
+    /// EMBER-implementation-note-244 — kind filter narrows to a single discriminator.
     #[test]
     fn list_receipt_rows_filters_by_kind() {
         let _ = ensure_identity_for_kms_test();
@@ -3275,7 +3890,7 @@ mod kms_tests {
         assert_eq!(wraps[0].resource, "k1");
     }
 
-    /// EMBER-implementation-note-172 — resource substring filter (post-fetch) narrows
+    /// EMBER-implementation-note-244 — resource substring filter (post-fetch) narrows
     /// matches without forcing exact equality.
     #[test]
     fn list_receipt_rows_filters_by_resource_substring() {
@@ -3299,7 +3914,7 @@ mod kms_tests {
         assert!(rows.iter().all(|r| r.resource.contains("tokens")));
     }
 
-    /// EMBER-implementation-note-172 — index existence sanity check. Inspect the
+    /// EMBER-implementation-note-244 — index existence sanity check. Inspect the
     /// sqlite_master catalog and confirm the new audit-CLI indexes were
     /// created by the migration.
     #[test]
@@ -3439,7 +4054,10 @@ mod kms_tests {
             .unwrap();
         assert_eq!(rows.len(), 1, "only broker row expected");
         assert_eq!(rows[0].kind, "broker_materialization");
-        assert_eq!(rows[0].resource, "cloudflare", "resource is provider name for broker rows");
+        assert_eq!(
+            rows[0].resource, "cloudflare",
+            "resource is provider name for broker rows"
+        );
         assert!(
             rows[0].requested_scope.is_some(),
             "requested_scope should be populated from broker receipt JSON"

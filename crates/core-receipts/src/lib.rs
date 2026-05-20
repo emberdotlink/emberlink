@@ -1,5 +1,5 @@
 //! `core-receipts` — receipt v2 surface for verify dispatch + redaction +
-//! tool registry (implementation-note-44).
+//! tool registry (implementation-note-59).
 //!
 //! This crate is the home for *behavior* applied to receipts:
 //!
@@ -9,7 +9,7 @@
 //! - [`ReceiptV2`] + [`verify_v2`] — the v2 receipt struct used by
 //!   `ember receipt verify` to route based on the on-disk `version` field.
 //! - [`SpawnWitness`] — body shape for `spawn.witness` Receipt v2 kind
-//!   (implementation-note-30, CRIT-7): the parent-persona dual
+//!   (implementation-note-38, CRIT-7): the parent-persona dual
 //!   signature that binds a spawned persona to its parent's authorization.
 //!
 //! v1 (`core_grant_types::grant_receipt::GrantReceipt`) is preserved for
@@ -51,7 +51,11 @@ pub struct ReceiptV2 {
 impl ReceiptV2 {
     /// Construct a fresh receipt with `version` pinned to v2 and no redactions
     /// applied yet.
-    pub fn new(id: impl Into<String>, grant_id: impl Into<String>, tool_id: impl Into<String>) -> Self {
+    pub fn new(
+        id: impl Into<String>,
+        grant_id: impl Into<String>,
+        tool_id: impl Into<String>,
+    ) -> Self {
         Self {
             version: RECEIPT_VERSION_V2,
             id: id.into(),
@@ -63,7 +67,7 @@ impl ReceiptV2 {
     }
 }
 
-/// Body for `spawn.witness` Receipt v2 kind (implementation-note-30).
+/// Body for `spawn.witness` Receipt v2 kind (implementation-note-38).
 ///
 /// Binds a spawned persona to its parent's authorization: the parent persona
 /// signs `JCS(body)` with `parent_signature` excluded, then the issuer
@@ -73,6 +77,17 @@ impl ReceiptV2 {
 /// could forge a fresh `spawned_persona_id` and present it as legitimate. The
 /// dual-signature binding requires the parent to have authorized the spawn,
 /// preventing unilateral persona fabrication.
+///
+/// **bridge_ca_fingerprint_in_spawn_receipt** — Slice C (design component 3,
+/// implementation-note-60): the
+/// [`Self::ca_fingerprint`] field binds the spawn to the daemon's
+/// SE-sealed Bridge CA (blake3-256 of the CA verifying-key bytes). Slice D
+/// compares the connecting client cert's issuer fingerprint against the
+/// fingerprint embedded in the corresponding spawn receipt; a mismatch raises
+/// `bridge.ca_fingerprint_mismatch`. The field is appended at the END of the
+/// struct with `#[serde(default)]` so pre-Slice-C receipts on disk
+/// deserialize with a zeroed fingerprint (Slice D treats `[0u8; 32]` as
+/// "fingerprint not asserted" and falls back to legacy verification).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SpawnWitness {
     /// Persona id created by `emberd` for the spawned child.
@@ -87,6 +102,15 @@ pub struct SpawnWitness {
     /// `parent_signature` excluded. Wire form: `ed25519sig:<hex>` (matches
     /// `core_crypto::Signature`'s canonical representation).
     pub parent_signature: String,
+    /// Bridge-CA fingerprint (blake3-256 of the daemon's Bridge CA verifying
+    /// key SPKI bytes). Appended at the END of the struct with
+    /// `#[serde(default)]` so pre-Slice-C receipts deserialize with a zeroed
+    /// fingerprint. `[0u8; 32]` is the checkpoint for "fingerprint not
+    /// asserted" — Slice D's verification path treats that as "skip the
+    /// fingerprint comparison" rather than rejecting the receipt outright.
+    /// See design component 3 / implementation-note-61.
+    #[serde(default)]
+    pub ca_fingerprint: [u8; 32],
 }
 
 impl SpawnWitness {
@@ -107,7 +131,21 @@ impl SpawnWitness {
             container_id: container_id.into(),
             spawn_grant_id: spawn_grant_id.into(),
             parent_signature: String::new(),
+            ca_fingerprint: [0u8; 32],
         }
+    }
+
+    /// Builder-style setter for the Bridge-CA fingerprint. Callers that
+    /// know the daemon's Bridge CA fingerprint (i.e. the daemon spawn
+    /// emission path on `emit_spawn_witness_receipt`) chain this onto
+    /// [`Self::new`] before computing the parent signature so the parent
+    /// attests to the CA binding alongside the persona/container/grant
+    /// fields. Pre-Slice-C callers that have no fingerprint to bind leave
+    /// the field at its `[0u8; 32]` default — Slice D treats that checkpoint
+    /// as "fingerprint not asserted". See `bridge_ca_fingerprint_in_spawn_receipt`.
+    pub fn with_ca_fingerprint(mut self, ca_fingerprint: [u8; 32]) -> Self {
+        self.ca_fingerprint = ca_fingerprint;
+        self
     }
 
     /// Return the JSON representation of this body with `parent_signature`
@@ -238,6 +276,7 @@ mod tests {
             container_id: "container-abc".into(),
             spawn_grant_id: "grant-spawn-001".into(),
             parent_signature: "ed25519sig:deadbeef".into(),
+            ca_fingerprint: [0u8; 32],
         };
         let s = serde_json::to_string(&w).unwrap();
         let back: SpawnWitness = serde_json::from_str(&s).unwrap();
@@ -252,6 +291,7 @@ mod tests {
             container_id: "container-abc".into(),
             spawn_grant_id: "grant-spawn-001".into(),
             parent_signature: "ed25519sig:deadbeef".into(),
+            ca_fingerprint: [0u8; 32],
         };
         let v = w.body_for_parent_signature();
         let obj = v.as_object().expect("body serializes to object");
@@ -260,7 +300,11 @@ mod tests {
         assert!(obj.contains_key("parent_persona_id"));
         assert!(obj.contains_key("container_id"));
         assert!(obj.contains_key("spawn_grant_id"));
-        assert_eq!(obj.len(), 4);
+        // ca_fingerprint is included in the parent-signed body — the parent
+        // attests to the CA binding alongside the persona/container/grant
+        // fields (Slice C, bridge_ca_fingerprint_in_spawn_receipt).
+        assert!(obj.contains_key("ca_fingerprint"));
+        assert_eq!(obj.len(), 5);
     }
 
     #[test]
@@ -286,5 +330,46 @@ mod tests {
         assert_eq!(w.parent_persona_id, "p");
         assert_eq!(w.container_id, "ctr");
         assert_eq!(w.spawn_grant_id, "grt");
+        // Pre-Slice-C default: callers that don't know the CA fingerprint
+        // leave the field zeroed (Slice D treats it as "not asserted").
+        assert_eq!(w.ca_fingerprint, [0u8; 32]);
+    }
+
+    /// implementation-note-60 — Slice C.
+    ///
+    /// A SpawnWitness with a populated `ca_fingerprint` round-trips through
+    /// serde JSON without losing or mutating the fingerprint bytes.
+    /// `#[serde(default)]` on the field also means pre-Slice-C wire forms
+    /// (no `ca_fingerprint` key) deserialize cleanly into `[0u8; 32]` — that
+    /// branch is asserted in the second half of this test.
+    #[test]
+    fn spawn_witness_ca_fingerprint() {
+        // Distinctive non-zero fingerprint so a zero-fill bug would surface.
+        let known_fp: [u8; 32] = [
+            0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+            0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14,
+            0x15, 0x16, 0x17, 0x18,
+        ];
+        let w = SpawnWitness::new("child", "parent", "container", "grant")
+            .with_ca_fingerprint(known_fp);
+        assert_eq!(w.ca_fingerprint, known_fp);
+
+        let serialized = serde_json::to_string(&w).expect("serialize");
+        let back: SpawnWitness = serde_json::from_str(&serialized).expect("deserialize");
+        assert_eq!(back.ca_fingerprint, known_fp);
+        assert_eq!(w, back);
+
+        // Pre-Slice-C wire form (no ca_fingerprint key) must deserialize
+        // with a zeroed fingerprint via #[serde(default)].
+        let legacy_json = serde_json::json!({
+            "spawned_persona_id": "child",
+            "parent_persona_id": "parent",
+            "container_id": "container",
+            "spawn_grant_id": "grant",
+            "parent_signature": "ed25519sig:deadbeef",
+        });
+        let legacy: SpawnWitness =
+            serde_json::from_value(legacy_json).expect("legacy receipts deserialize");
+        assert_eq!(legacy.ca_fingerprint, [0u8; 32]);
     }
 }

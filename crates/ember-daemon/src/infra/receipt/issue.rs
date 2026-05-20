@@ -11,8 +11,8 @@ use std::path::Path;
 use core_crypto::Signer;
 use core_events::receipt::sign::{SignError, sign_receipt_v2};
 use core_events::receipt::{
-    AuditGap, ClaimEvent, ClaudeCodeBody, ReceiptBody, ReceiptEnvelope, ReceiptVersion,
-    RECEIPT_KIND_CLAUDE_CODE, TerminationAuthority, TerminationReason, merkle_leaf, merkle_root,
+    AuditGap, ClaimEvent, ClaudeCodeBody, RECEIPT_KIND_CLAUDE_CODE, ReceiptBody, ReceiptEnvelope,
+    ReceiptVersion, TerminationAuthority, TerminationReason, merkle_leaf, merkle_root,
 };
 
 /// Errors raised by [`issue_cohort_a_receipt`].
@@ -31,7 +31,7 @@ pub enum IssueError {
 }
 
 /// Optional termination metadata injected into the `ClaudeCodeBody` by the
-/// dirty-exit path (implementation-note-29). Pass `None` for
+/// dirty-exit path (implementation-note-36). Pass `None` for
 /// clean-exit / TTL-expiry / explicit-revoke issuance paths where the reason
 /// is not yet known at build time.
 pub struct TerminationMeta {
@@ -45,7 +45,7 @@ pub struct TerminationMeta {
 /// Steps per design §"Envelope" + design §"Daemon Persona signing":
 /// 1. Build [`ClaudeCodeBody`] from `claim_events` + parsed `audit_gaps.jsonl`
 ///    (lines parsed individually, malformed lines skipped — fail-open shape
-///    matches implementation-note-11's writer). Optional `termination_meta` injects the
+///    matches implementation-note-13's writer). Optional `termination_meta` injects the
 ///    reason/heartbeat/pid fields into the body in the same step.
 /// 2. Compute `permits_merkle_root` over `claim_events[].input_hash` blake3
 ///    leaves (design §"Merkle leaf format" — leaf form simplified for now;
@@ -95,16 +95,16 @@ pub fn issue_cohort_a_receipt(
 
     // 3. Build the body including optional termination metadata so the
     //    signed envelope captures the full body in one atomic step.
-    let (termination_reason, last_heartbeat_at, pid_alive_at_check) =
-        match termination_meta {
-            Some(m) => (Some(m.reason), m.last_heartbeat_at, m.pid_alive_at_check),
-            None => (None, None, None),
-        };
+    let (termination_reason, last_heartbeat_at, pid_alive_at_check) = match termination_meta {
+        Some(m) => (Some(m.reason), m.last_heartbeat_at, m.pid_alive_at_check),
+        None => (None, None, None),
+    };
     let body = ClaudeCodeBody {
         base: ReceiptBody {
             claim_events,
             permits_merkle_root,
             device_id: None,
+            ..Default::default()
         },
         audit_gaps,
         termination_reason,
@@ -125,6 +125,11 @@ pub fn issue_cohort_a_receipt(
         body: body_value,
         // sign_receipt_v2 populates both receipt_id and signature below.
         signature: None,
+        calling_principal: None,
+        presence_reason: None,
+        handle_id: None,
+        challenge_hash: None,
+        verifier_aaguid: None,
     };
 
     // 5. Sign the envelope per design (Daemon Persona signing).
@@ -143,7 +148,7 @@ pub fn issue_cohort_a_receipt(
 }
 
 /// Parse `~/.ember/sessions/<id>/audit-gaps.jsonl` line-by-line, skipping
-/// malformed lines (matches the fail-open posture of implementation-note-11's writer).
+/// malformed lines (matches the fail-open posture of implementation-note-13's writer).
 fn parse_audit_gaps(path: &Path) -> Result<Vec<AuditGap>, IssueError> {
     let raw = fs::read_to_string(path).map_err(|source| IssueError::AuditGapsRead {
         path: path.display().to_string(),
@@ -312,7 +317,7 @@ mod tests {
 
     /// T1 round-trip — `issue_cohort_a_receipt` now signs in-place.
     /// The returned envelope must verify against the signer's public key.
-    /// Pins implementation-note-202 + implementation-note-203.
+    /// Pins implementation-note-277 + implementation-note-278.
     #[test]
     fn receipt_id_matches_canonical_compute_and_verifies_after_signing() {
         let signer = FixtureSigner::new("issue-rs-roundtrip");

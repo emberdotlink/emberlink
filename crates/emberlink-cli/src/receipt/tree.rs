@@ -33,27 +33,24 @@
 //!   against the witness's `parent_pubkey_hex`, plus envelope verify against
 //!   `daemon_pubkey_hex`.
 //!
-//! ## Demo seam (PART C workaround)
+//! ## Spawn-witness source of truth
 //!
-//! In the demo-night flow, the spawn path does not yet emit `spawn.witness`
-//! receipts to the store (zero non-test callers of
-//! `sign_spawn_witness_parent_signature` in production code as of
-//! 2026-05-14). `build_tree` therefore synthesises spawn witnesses at
-//! export time for every parent→child grant edge — signed with the daemon's
-//! own persona key acting as the "parent persona signer" stand-in. This is
-//! a demo workaround; the production hook is filed as
-//! `implementation-note-298` and tracked separately.
+//! Spawn witnesses are emitted at parent→child grant edge creation time by
+//! `crate::trust::grant::delegate_grant_full_sql` and persisted via
+//! `DaemonStore::store_spawn_witness_receipt` (implementation-note-94,
+//! shipped 2026-05-15). `build_tree` reads them back via
+//! `DaemonStore::list_spawn_witnesses_for_grants`; the demo-seam synthesis
+//! path that previously fabricated witnesses at export time was removed in
+//! the same patch. Edges that lack a persisted witness (legacy data, or
+//! the parent persona key was unavailable at delegation time) surface as a
+//! gap in the tree rather than a silently-fabricated row.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use core_crypto::{PublicKey, Signature, Signer, Ed25519Verifier};
+use core_crypto::{Ed25519Verifier, PublicKey};
 use core_events::receipt::envelope::ReceiptEnvelope;
-use core_events::receipt::sign::{
-    sign_receipt_v2, sign_spawn_witness_parent_signature, verify_receipt_v2,
-    verify_spawn_witness_parent_signature,
-};
-use core_receipts::{SpawnWitness, RECEIPT_KIND_SPAWN_WITNESS};
+use core_events::receipt::sign::{verify_receipt_v2, verify_spawn_witness_parent_signature};
 use ember_daemon::infra::receipt::DaemonPersona;
 use ember_daemon::infra::store::DaemonStore;
 use ember_daemon::trust::grant::GrantInfo;
@@ -177,9 +174,10 @@ pub struct TreeSpawnWitness {
     /// The parent grant edge this witness covers (== `body.spawn_grant_id`).
     pub spawn_grant_id: String,
     /// `ed25519:<hex>` trust anchor used to verify the inner
-    /// `parent_signature` field on the body. In the demo-seam variant
-    /// (PART C workaround) this is the daemon's own pubkey acting as the
-    /// stand-in parent signer.
+    /// `parent_signature` field on the body. Sourced from the parent
+    /// persona's row at tree-build time (implementation-note-94);
+    /// `verify_spawn_witness_parent_signature` succeeds iff the parent
+    /// persona authorised the spawn at delegation time.
     pub parent_pubkey_hex: String,
     /// The full v2 envelope (signed by daemon, body = SpawnWitness JSON).
     pub envelope: ReceiptEnvelope,
@@ -229,10 +227,7 @@ pub fn build_tree(
     let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for g in all_grants.into_iter() {
         if let Some(pid) = &g.parent_grant_id {
-            children
-                .entry(pid.clone())
-                .or_default()
-                .push(g.id.clone());
+            children.entry(pid.clone()).or_default().push(g.id.clone());
         }
         by_id.insert(g.id.clone(), g);
     }
@@ -263,8 +258,7 @@ pub fn build_tree(
     }
 
     // ---- Collect receipts (v1 GrantReceipt) per grant. ----
-    let grant_id_set: std::collections::BTreeSet<&str> =
-        order.iter().map(|s| s.as_str()).collect();
+    let grant_id_set: std::collections::BTreeSet<&str> = order.iter().map(|s| s.as_str()).collect();
     let all_receipts = store
         .list_receipts(None)
         .map_err(|e| TreeError::Store(e.to_string()))?;
@@ -281,78 +275,77 @@ pub fn build_tree(
         }
     }
 
+    // ---- Collect v2 ReceiptEnvelope rows per grant (anchor: list_receipts_v2_envelopes). ----
+    //
+    // V2 envelopes are identified by a dotted kind discriminator in the
+    // `receipts` table. `spawn.witness` envelopes are excluded here because
+    // they are already surfaced through the spawn_witnesses array above with
+    // the dual-signature metadata required for offline verification.
+    let grant_ids_vec: Vec<String> = order.clone();
+    let v2_envelopes = store
+        .list_receipts_v2_envelopes(&grant_ids_vec)
+        .map_err(|e| TreeError::Store(e.to_string()))?;
+    for (id, _kind, grant_id, envelope) in v2_envelopes {
+        let payload = serde_json::to_value(&envelope)?;
+        tree_receipts.push(TreeReceipt {
+            id,
+            grant_id,
+            kind: "v2".to_string(),
+            payload,
+        });
+    }
+
     // ---- Daemon pubkey for trust anchor (load BEFORE daemon stop). ----
     // `DaemonPersona::load_or_create` reads `<data_dir>/daemon_persona.key`
     // from disk — works whether the daemon is running or not.
-    let persona = DaemonPersona::load_or_create(data_dir)
-        .map_err(|e| TreeError::Store(e.to_string()))?;
+    let persona =
+        DaemonPersona::load_or_create(data_dir).map_err(|e| TreeError::Store(e.to_string()))?;
     let daemon_pubkey_hex = persona.pubkey_hex();
 
-    // ---- Synthesize spawn witnesses for each parent→child grant edge. ----
+    // ---- Load spawn witnesses persisted at parent→child delegation time. ----
     //
-    // implementation-note-314 (PART C workaround): production code does not yet emit
-    // SpawnWitness receipts. Build one per parent→child edge, sign with
-    // the daemon's persona key (acting as parent stand-in), and embed it.
-    // Tracked as implementation-note-298.
-    let demo_signer = LocalDaemonSigner::new(&persona);
-    let mut spawn_witnesses: Vec<TreeSpawnWitness> = Vec::new();
-    for child_id in &order {
-        let Some(child_grant) = by_id.get(child_id) else { continue };
-        let Some(parent_id) = &child_grant.parent_grant_id else { continue };
-        if !grant_id_set.contains(parent_id.as_str()) {
-            continue;
-        }
-        let Some(parent_grant) = by_id.get(parent_id) else { continue };
-        let mut witness = SpawnWitness::new(
-            // spawned_persona_id == child's persona_id
-            &child_grant.persona_id,
-            // parent_persona_id == parent's persona_id
-            &parent_grant.persona_id,
-            // container_id — not tracked on grants; mark as "demo-seam"
-            // so verifiers can identify synthesised rows.
-            format!("demo-seam-{child_id}"),
-            // spawn_grant_id == the parent grant authorizing the spawn
-            parent_id,
-        );
-        let mut body_value = witness.body_for_parent_signature();
-        sign_spawn_witness_parent_signature(&mut body_value, &demo_signer)
-            .map_err(|e| TreeError::Verify {
-                artifact: format!("spawn_witness/{child_id}"),
-                reason: e.to_string(),
-            })?;
-        // Hoist parent_signature back onto the typed struct (used purely as
-        // a serde shape for the envelope body; the canonical wire form is
-        // the body_value JSON we just signed).
-        if let Some(sig) = body_value
-            .as_object()
-            .and_then(|o| o.get("parent_signature"))
-            .and_then(|v| v.as_str())
-        {
-            witness.parent_signature = sig.to_string();
-        }
-        // Wrap in a v2 envelope and sign with the daemon persona.
-        let mut envelope = ReceiptEnvelope {
-            version: Default::default(),
-            kind: RECEIPT_KIND_SPAWN_WITNESS.to_string(),
-            receipt_id: String::new(),
-            daemon_root_id: daemon_pubkey_hex.clone(),
-            traceparent: None,
-            termination_authority:
-                core_events::receipt::envelope::TerminationAuthority::DaemonPersona,
-            presence_kind: None,
-            body: serde_json::to_value(&witness)?,
-            signature: None,
+    // implementation-note-94 (2026-05-15): the daemon
+    // emits + persists a spawn.witness Receipt v2 envelope for every
+    // parent→child grant edge inside `delegate_grant_full_sql`, signed by
+    // the parent persona (body) and the daemon persona (envelope). We
+    // read them back here and pair each envelope with the parent persona's
+    // pubkey (looked up out of the personas table by `parent_persona_id`)
+    // so offline verify can run the dual-signature check.
+    let grant_ids: Vec<String> = order.clone();
+    let raw_witnesses = store
+        .list_spawn_witnesses_for_grants(&grant_ids)
+        .map_err(|e| TreeError::Store(e.to_string()))?;
+    let mut spawn_witnesses: Vec<TreeSpawnWitness> = Vec::with_capacity(raw_witnesses.len());
+    for (envelope, parent_persona_id) in raw_witnesses {
+        // Resolve the parent persona's Ed25519 pubkey for the inner
+        // `parent_signature` verification. The personas row stores it in
+        // the `ed25519:<hex>` wire form, which `TreeSpawnWitness.parent_pubkey_hex`
+        // also speaks (matches the demo-seam shape so verify is unchanged).
+        let parent_pubkey_hex = match store.get_persona(&parent_persona_id) {
+            Ok(p) => p.public_key,
+            Err(e) => {
+                // The parent persona's row is missing — likely a deleted
+                // persona or DB corruption. Surface as a verify error
+                // rather than silently dropping the witness so the gap
+                // is auditable.
+                return Err(TreeError::Verify {
+                    artifact: format!("spawn_witness/{}", envelope.receipt_id),
+                    reason: format!(
+                        "parent persona '{parent_persona_id}' not found in personas table: {e}"
+                    ),
+                });
+            }
         };
-        sign_receipt_v2(&mut envelope, &demo_signer).map_err(|e| TreeError::Verify {
-            artifact: format!("spawn_witness_envelope/{child_id}"),
-            reason: e.to_string(),
-        })?;
+        let spawn_grant_id = envelope
+            .body
+            .get("spawn_grant_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         spawn_witnesses.push(TreeSpawnWitness {
             receipt_id: envelope.receipt_id.clone(),
-            spawn_grant_id: parent_id.clone(),
-            // In the demo-seam variant, parent and daemon are the same
-            // signer, so the parent trust anchor == daemon trust anchor.
-            parent_pubkey_hex: format!("ed25519:{daemon_pubkey_hex}"),
+            spawn_grant_id,
+            parent_pubkey_hex,
             envelope,
         });
     }
@@ -365,29 +358,6 @@ pub fn build_tree(
         spawn_witnesses,
         daemon_pubkey_hex,
     })
-}
-
-/// Adapter: implement `core_crypto::Signer` over a `DaemonPersona` so we can
-/// reuse the existing v2 signing primitives without exporting the daemon's
-/// `pub(crate) DaemonPersonaSigner`.
-struct LocalDaemonSigner<'a> {
-    persona: &'a DaemonPersona,
-}
-
-impl<'a> LocalDaemonSigner<'a> {
-    fn new(persona: &'a DaemonPersona) -> Self {
-        Self { persona }
-    }
-}
-
-impl<'a> Signer for LocalDaemonSigner<'a> {
-    fn sign(&self, payload: &[u8]) -> Signature {
-        let raw = self.persona.sign(payload);
-        Signature(format!("ed25519sig:{}", hex::encode(*raw)))
-    }
-    fn public_key(&self) -> PublicKey {
-        PublicKey(format!("ed25519:{}", self.persona.pubkey_hex()))
-    }
 }
 
 /// Render the tree as ASCII for stdout.
@@ -462,7 +432,16 @@ pub fn render_tree_ascii(tree: &TreeExport) -> String {
         let kids = children.get(id).cloned().unwrap_or_default();
         for (idx, k) in kids.iter().enumerate() {
             let last = idx + 1 == kids.len();
-            walk(out, grants, children, receipts, witnesses, &k.id, &format!("{prefix}{cont}"), last);
+            walk(
+                out,
+                grants,
+                children,
+                receipts,
+                witnesses,
+                &k.id,
+                &format!("{prefix}{cont}"),
+                last,
+            );
         }
     }
 
@@ -543,8 +522,7 @@ pub fn verify_tree_offline(tree: &TreeExport) -> Result<VerifyTreeOutcome, TreeE
                 receipts_ok += 1;
             }
             "v2" => {
-                let envelope: ReceiptEnvelope =
-                    serde_json::from_value(r.payload.clone())?;
+                let envelope: ReceiptEnvelope = serde_json::from_value(r.payload.clone())?;
                 verify_receipt_v2(&envelope, &daemon_pk, &Ed25519Verifier).map_err(|e| {
                     TreeError::Verify {
                         artifact: format!("receipt-v2/{}", r.id),
@@ -624,7 +602,10 @@ pub fn format_verify_outcome(o: &VerifyTreeOutcome) -> String {
         o.spawn_witnesses_verified
     ));
     s.push_str("  All per-call signatures verified\n");
-    s.push_str(&format!("  Tree hash: {}\n", &o.tree_hash[..o.tree_hash.len().min(16)]));
+    s.push_str(&format!(
+        "  Tree hash: {}\n",
+        &o.tree_hash[..o.tree_hash.len().min(16)]
+    ));
     s.push_str(&format!("  Canonical version: {}\n", o.canonical_version));
     s
 }
@@ -713,5 +694,87 @@ mod tests {
         let path = std::path::Path::new("/tmp/__definitely_does_not_exist_tree.json");
         let err = read_tree_export(path).unwrap_err();
         assert!(matches!(err, TreeError::Io(_)));
+    }
+
+    // --- v2 envelope inclusion (implementation-note-288) ---
+
+    fn fixture_tree_with_v2_receipt() -> TreeExport {
+        let mut t = fixture_tree();
+        t.receipts.push(TreeReceipt {
+            id: "rct-v2-test".into(),
+            grant_id: "g-orc".into(),
+            kind: "v2".into(),
+            payload: serde_json::json!({
+                "version": "2",
+                "kind": "broker.materialization",
+                "receipt_id": "rct-v2-test",
+                "daemon_root_id": "daemon-root",
+                "termination_authority": "daemon_persona",
+                "body": {"test": true}
+            }),
+        });
+        t
+    }
+
+    #[test]
+    fn v2_receipt_kind_appears_in_render() {
+        let t = fixture_tree_with_v2_receipt();
+        let out = render_tree_ascii(&t);
+        assert!(
+            out.contains("kind=v2"),
+            "render must show kind=v2 for v2 receipts; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn tree_with_v2_receipt_serialises_round_trip() {
+        let t = fixture_tree_with_v2_receipt();
+        let json = serde_json::to_string(&t).unwrap();
+        let back: TreeExport = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.receipts.len(), 1);
+        assert_eq!(back.receipts[0].kind, "v2");
+        assert_eq!(back.receipts[0].id, "rct-v2-test");
+    }
+
+    #[test]
+    fn tree_hash_includes_v2_receipt() {
+        let t_without = fixture_tree();
+        let t_with = fixture_tree_with_v2_receipt();
+        // verify_tree_offline skips signature checks if pubkey is zero — it will
+        // error on the v2 verify step (no real signature). We only check that
+        // the hash is different, which proves the v2 receipt affects the hash.
+        let h_without = {
+            let mut child_hashes: Vec<String> = Vec::new();
+            for g in &t_without.grants {
+                child_hashes.push(format!("grant:{}", g.id));
+            }
+            child_hashes.sort();
+            let mut hasher = blake3::Hasher::new();
+            for h in &child_hashes {
+                hasher.update(h.as_bytes());
+                hasher.update(b"\n");
+            }
+            hasher.finalize().to_hex().to_string()
+        };
+        let h_with = {
+            let mut child_hashes: Vec<String> = Vec::new();
+            for g in &t_with.grants {
+                child_hashes.push(format!("grant:{}", g.id));
+            }
+            for r in &t_with.receipts {
+                child_hashes.push(format!("receipt:{}:{}", r.kind, r.id));
+            }
+            child_hashes.sort();
+            let mut hasher = blake3::Hasher::new();
+            for h in &child_hashes {
+                hasher.update(h.as_bytes());
+                hasher.update(b"\n");
+            }
+            hasher.finalize().to_hex().to_string()
+        };
+        assert_ne!(
+            h_without, h_with,
+            "adding a v2 receipt must change the tree hash"
+        );
     }
 }

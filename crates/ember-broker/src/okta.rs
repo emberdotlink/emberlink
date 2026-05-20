@@ -20,6 +20,7 @@
 //!    - `exp = now + 300`
 //!    - `iat = now`
 //!    - `jti = <random hex>`
+//!
 //!    Header: `{ alg: "RS256", kid: <key_id> }`.
 //! 2. POST `<org_url>/oauth2/v1/token` with form body:
 //!    ```text
@@ -43,9 +44,7 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
-use core_broker::{
-    Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential,
-};
+use core_broker::{Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
@@ -96,11 +95,7 @@ pub struct OktaScope {
 pub trait OktaHttpClient: Send + Sync {
     /// POST a `application/x-www-form-urlencoded` body to `url`. Used
     /// for both the OAuth token endpoint and the revoke endpoint.
-    async fn post_form(
-        &self,
-        url: &str,
-        body: String,
-    ) -> Result<(u16, String), String>;
+    async fn post_form(&self, url: &str, body: String) -> Result<(u16, String), String>;
 }
 
 /// Production [`OktaHttpClient`] backed by `reqwest`.
@@ -126,11 +121,7 @@ impl Default for ReqwestOktaClient {
 
 #[async_trait::async_trait]
 impl OktaHttpClient for ReqwestOktaClient {
-    async fn post_form(
-        &self,
-        url: &str,
-        body: String,
-    ) -> Result<(u16, String), String> {
+    async fn post_form(&self, url: &str, body: String) -> Result<(u16, String), String> {
         let resp = self
             .inner
             .post(url)
@@ -318,9 +309,7 @@ fn map_okta_error(status: u16, body: &str) -> BrokerError {
     }
 
     if error_code == "invalid_scope" {
-        return BrokerError::Upstream(format!(
-            "Okta invalid scope (status={status}): {combined}"
-        ));
+        return BrokerError::Upstream(format!("Okta invalid scope (status={status}): {combined}"));
     }
 
     if (error_code == "invalid_grant" || error_code == "invalid_request")
@@ -333,7 +322,9 @@ fn map_okta_error(status: u16, body: &str) -> BrokerError {
         ));
     }
 
-    BrokerError::Upstream(format!("Okta token endpoint error (status={status}): {combined}"))
+    BrokerError::Upstream(format!(
+        "Okta token endpoint error (status={status}): {combined}"
+    ))
 }
 
 const TOKEN_PATH: &str = "/oauth2/v1/token";
@@ -598,11 +589,7 @@ impl Default for MockOktaClient {
 
 #[async_trait::async_trait]
 impl OktaHttpClient for MockOktaClient {
-    async fn post_form(
-        &self,
-        url: &str,
-        body: String,
-    ) -> Result<(u16, String), String> {
+    async fn post_form(&self, url: &str, body: String) -> Result<(u16, String), String> {
         self.calls
             .lock()
             .expect("mock okta mutex")
@@ -690,8 +677,7 @@ mod tests {
 
     #[test]
     fn provider_returns_okta() {
-        let broker =
-            OktaBroker::with_client(fixture_app(), Arc::new(MockOktaClient::new()));
+        let broker = OktaBroker::with_client(fixture_app(), Arc::new(MockOktaClient::new()));
         assert_eq!(broker.provider(), BrokerProvider::Okta);
     }
 
@@ -743,8 +729,7 @@ mod tests {
 
     #[test]
     fn build_okta_jwt_bad_pem_returns_other_error() {
-        let err =
-            build_okta_jwt("c", "not-a-pem", "kid", "aud", 0, "jti").unwrap_err();
+        let err = build_okta_jwt("c", "not-a-pem", "kid", "aud", 0, "jti").unwrap_err();
         assert!(
             matches!(err, BrokerError::Other(_)),
             "expected Other for jwt key parse failure, got {err:?}"
@@ -762,14 +747,17 @@ mod tests {
             }),
             3600,
         );
-        let cred = Broker::issue(&broker, req).await.expect("issue must succeed");
+        let cred = Broker::issue(&broker, req)
+            .await
+            .expect("issue must succeed");
         assert_eq!(
             cred.token.expose_secret(),
             "00okta_access_token_for_tests",
             "token must be the bearer Okta returned"
         );
         assert!(
-            cred.materialization_id.starts_with("okta-0oa-test-service-app-"),
+            cred.materialization_id
+                .starts_with("okta-0oa-test-service-app-"),
             "materialization_id includes client_id: {}",
             cred.materialization_id
         );
@@ -785,7 +773,8 @@ mod tests {
             call.body
         );
         assert!(
-            call.body.contains("scope=okta.users.manage%20okta.groups.manage"),
+            call.body
+                .contains("scope=okta.users.manage%20okta.groups.manage"),
             "body must include space-separated scopes: {}",
             call.body
         );
@@ -805,9 +794,7 @@ mod tests {
 
     #[tokio::test]
     async fn issue_401_invalid_client_returns_policy_rejected() {
-        let mock = Arc::new(
-            MockOktaClient::new().with_response(401, invalid_client_body()),
-        );
+        let mock = Arc::new(MockOktaClient::new().with_response(401, invalid_client_body()));
         let broker = OktaBroker::with_client(fixture_app(), mock);
         let req = okta_request(
             serde_json::json!({
@@ -825,9 +812,7 @@ mod tests {
 
     #[tokio::test]
     async fn issue_400_invalid_scope_returns_upstream_with_descriptive_message() {
-        let mock = Arc::new(
-            MockOktaClient::new().with_response(400, invalid_scope_body()),
-        );
+        let mock = Arc::new(MockOktaClient::new().with_response(400, invalid_scope_body()));
         let broker = OktaBroker::with_client(fixture_app(), mock);
         let req = okta_request(
             serde_json::json!({
@@ -850,8 +835,7 @@ mod tests {
 
     #[tokio::test]
     async fn issue_400_expired_key_returns_upstream_with_key_expired_message() {
-        let mock =
-            Arc::new(MockOktaClient::new().with_response(400, expired_key_body()));
+        let mock = Arc::new(MockOktaClient::new().with_response(400, expired_key_body()));
         let broker = OktaBroker::with_client(fixture_app(), mock);
         let req = okta_request(
             serde_json::json!({
@@ -875,8 +859,7 @@ mod tests {
 
     #[tokio::test]
     async fn issue_with_wrong_provider_in_request_is_rejected() {
-        let broker =
-            OktaBroker::with_client(fixture_app(), Arc::new(MockOktaClient::new()));
+        let broker = OktaBroker::with_client(fixture_app(), Arc::new(MockOktaClient::new()));
         let mut req = okta_request(
             serde_json::json!({
                 "scopes": ["okta.users.manage"],
@@ -891,8 +874,7 @@ mod tests {
 
     #[tokio::test]
     async fn issue_with_empty_scopes_returns_invalid_scope() {
-        let broker =
-            OktaBroker::with_client(fixture_app(), Arc::new(MockOktaClient::new()));
+        let broker = OktaBroker::with_client(fixture_app(), Arc::new(MockOktaClient::new()));
         let req = okta_request(
             serde_json::json!({
                 "scopes": [],
@@ -906,8 +888,7 @@ mod tests {
 
     #[tokio::test]
     async fn issue_with_zero_ttl_returns_invalid_scope() {
-        let broker =
-            OktaBroker::with_client(fixture_app(), Arc::new(MockOktaClient::new()));
+        let broker = OktaBroker::with_client(fixture_app(), Arc::new(MockOktaClient::new()));
         let req = okta_request(
             serde_json::json!({
                 "scopes": ["okta.users.manage"],
@@ -990,8 +971,7 @@ mod tests {
 
     #[tokio::test]
     async fn revoke_unknown_id_returns_unknown_materialization() {
-        let broker =
-            OktaBroker::with_client(fixture_app(), Arc::new(MockOktaClient::new()));
+        let broker = OktaBroker::with_client(fixture_app(), Arc::new(MockOktaClient::new()));
         let err = Broker::revoke(&broker, "does-not-exist").await.unwrap_err();
         assert!(matches!(err, BrokerError::UnknownMaterialization(_)));
     }
@@ -999,7 +979,10 @@ mod tests {
     #[test]
     fn okta_scope_round_trips_through_json() {
         let scope = OktaScope {
-            scopes: vec!["okta.users.manage".to_string(), "okta.groups.manage".to_string()],
+            scopes: vec![
+                "okta.users.manage".to_string(),
+                "okta.groups.manage".to_string(),
+            ],
             ttl_seconds: 1800,
         };
         let s = serde_json::to_string(&scope).expect("serialize");
@@ -1057,8 +1040,7 @@ mod tests {
         let a = random_jti();
         let b = random_jti();
         assert!(
-            a.chars().all(|c| c.is_ascii_hexdigit())
-                || a.starts_with("ember-okta-"),
+            a.chars().all(|c| c.is_ascii_hexdigit()) || a.starts_with("ember-okta-"),
             "jti must be hex (or fallback prefixed): {a}"
         );
         assert_ne!(

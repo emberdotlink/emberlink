@@ -66,7 +66,10 @@ impl std::fmt::Display for ManifestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnsupportedSchemaVersion { found, expected } => {
-                write!(f, "unsupported schema version {found} (expected {expected})")
+                write!(
+                    f,
+                    "unsupported schema version {found} (expected {expected})"
+                )
             }
             Self::Parse(e) => write!(f, "parse: {e}"),
         }
@@ -122,7 +125,9 @@ impl GrantsManifest {
                 }
             }
 
-            if let Credential::Sealed { name, sealed_blob, .. } = cred
+            if let Credential::Sealed {
+                name, sealed_blob, ..
+            } = cred
                 && sealed_blob.is_empty()
             {
                 errors.push(ValidationError::EmptySealedBlob {
@@ -166,7 +171,10 @@ impl std::fmt::Display for ValidationError {
                 write!(f, "credential[{index}] ({name:?}): sealed_blob is empty")
             }
             Self::UnknownKind { index } => {
-                write!(f, "credential[{index}]: unknown kind (forward-compat warning)")
+                write!(
+                    f,
+                    "credential[{index}]: unknown kind (forward-compat warning)"
+                )
             }
         }
     }
@@ -224,7 +232,13 @@ name = "x"
     #[test]
     fn major_version_mismatch_rejected() {
         let err = GrantsManifest::from_toml("grants_schema_version = 2").unwrap_err();
-        assert!(matches!(err, ManifestError::UnsupportedSchemaVersion { found: 2, expected: 1 }));
+        assert!(matches!(
+            err,
+            ManifestError::UnsupportedSchemaVersion {
+                found: 2,
+                expected: 1
+            }
+        ));
     }
 
     fn manifest(toml_str: &str) -> GrantsManifest {
@@ -233,30 +247,38 @@ name = "x"
 
     #[test]
     fn validate_clean_manifest_passes() {
-        let m = manifest(r#"
+        let m = manifest(
+            r#"
             grants_schema_version = 1
             [[credential]]
             kind = "credential.ephemeral"
             name = "vault-token"
             ttl_secs = 300
-        "#);
+        "#,
+        );
         assert_eq!(m.validate(), Ok(()));
     }
 
     #[test]
     fn validate_rejects_empty_name() {
-        let m = manifest(r#"
+        let m = manifest(
+            r#"
             grants_schema_version = 1
             [[credential]]
             kind = "credential.ephemeral"
             name = ""
-        "#);
-        assert_eq!(m.validate(), Err(vec![ValidationError::EmptyName { index: 0 }]));
+        "#,
+        );
+        assert_eq!(
+            m.validate(),
+            Err(vec![ValidationError::EmptyName { index: 0 }])
+        );
     }
 
     #[test]
     fn validate_rejects_duplicate_name() {
-        let m = manifest(r#"
+        let m = manifest(
+            r#"
             grants_schema_version = 1
             [[credential]]
             kind = "credential.ephemeral"
@@ -264,7 +286,8 @@ name = "x"
             [[credential]]
             kind = "credential.static"
             name = "shared-name"
-        "#);
+        "#,
+        );
         assert_eq!(
             m.validate(),
             Err(vec![ValidationError::DuplicateName {
@@ -276,13 +299,15 @@ name = "x"
 
     #[test]
     fn validate_rejects_empty_sealed_blob() {
-        let m = manifest(r#"
+        let m = manifest(
+            r#"
             grants_schema_version = 1
             [[credential]]
             kind = "credential.sealed"
             name = "vault-secret"
             sealed_blob = ""
-        "#);
+        "#,
+        );
         assert_eq!(
             m.validate(),
             Err(vec![ValidationError::EmptySealedBlob {
@@ -294,12 +319,14 @@ name = "x"
 
     #[test]
     fn validate_warns_on_unknown_kind() {
-        let m = manifest(r#"
+        let m = manifest(
+            r#"
             grants_schema_version = 1
             [[credential]]
             kind = "credential.future-kind"
             some_field = "ignored"
-        "#);
+        "#,
+        );
         assert_eq!(
             m.validate(),
             Err(vec![ValidationError::UnknownKind { index: 0 }])

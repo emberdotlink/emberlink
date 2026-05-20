@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 use clap::Parser;
-use emberlink_cli::{default_data_dir, output, Args, Cmd, DemoApp};
+use emberlink_cli::{Args, Cmd, DemoApp, default_data_dir, output};
 
 fn main() {
     let raw: Vec<String> = env::args().skip(1).collect();
@@ -343,58 +343,43 @@ mod tests {
 
     #[test]
     fn launch_options_from_clap_show_state() {
-        let args = Args::try_parse_from([
-            "emberlink-cli",
-            "--state",
-            "/tmp/x.tsv",
-            "show",
-            "state",
-        ])
-        .unwrap();
+        let args =
+            Args::try_parse_from(["emberlink-cli", "--state", "/tmp/x.tsv", "show", "state"])
+                .unwrap();
         let options = LaunchOptions::from_clap(args);
         assert_eq!(options.state_file, Some(PathBuf::from("/tmp/x.tsv")));
-        assert_eq!(options.command, vec!["show".to_string(), "state".to_string()]);
+        assert_eq!(
+            options.command,
+            vec!["show".to_string(), "state".to_string()]
+        );
         assert!(!options.no_demo);
     }
 
     #[test]
     fn launch_options_from_clap_legacy_passthrough() {
-        let args = Args::try_parse_from([
-            "emberlink-cli",
-            "totally-unknown",
-            "foo",
-            "bar",
-        ])
-        .unwrap();
+        let args =
+            Args::try_parse_from(["emberlink-cli", "totally-unknown", "foo", "bar"]).unwrap();
         let options = LaunchOptions::from_clap(args);
         assert_eq!(
             options.command,
-            vec!["totally-unknown".to_string(), "foo".to_string(), "bar".to_string()]
+            vec![
+                "totally-unknown".to_string(),
+                "foo".to_string(),
+                "bar".to_string()
+            ]
         );
     }
 
     #[test]
     fn launch_options_from_clap_propagates_json_mode() {
-        let args = Args::try_parse_from([
-            "emberlink-cli",
-            "--json",
-            "grant",
-            "list",
-        ])
-        .unwrap();
+        let args = Args::try_parse_from(["emberlink-cli", "--json", "grant", "list"]).unwrap();
         let options = LaunchOptions::from_clap(args);
         assert_eq!(options.output_mode, output::Mode::Json);
     }
 
     #[test]
     fn launch_options_from_clap_propagates_quiet_mode() {
-        let args = Args::try_parse_from([
-            "emberlink-cli",
-            "--quiet",
-            "grant",
-            "list",
-        ])
-        .unwrap();
+        let args = Args::try_parse_from(["emberlink-cli", "--quiet", "grant", "list"]).unwrap();
         let options = LaunchOptions::from_clap(args);
         assert_eq!(options.output_mode, output::Mode::Quiet);
     }
@@ -414,8 +399,7 @@ mod tests {
         let listed = app.handle_command("grant list");
         // Each non-empty line is parseable JSON.
         for line in listed.lines().filter(|l| !l.is_empty()) {
-            let v: serde_json::Value =
-                serde_json::from_str(line).expect("ndjson line parses");
+            let v: serde_json::Value = serde_json::from_str(line).expect("ndjson line parses");
             assert!(v.get("id").is_some());
         }
         // No human heading.
@@ -491,11 +475,7 @@ mod tests {
         assert!(output.contains("created grant\tgrant-"));
 
         // Extract grant ID from output
-        let grant_id = output
-            .split('\t')
-            .nth(1)
-            .unwrap()
-            .trim();
+        let grant_id = output.split('\t').nth(1).unwrap().trim();
 
         // List grants — should include it
         let output = app.handle_command("grant list");

@@ -5,22 +5,35 @@
 //! `spawn` is the only place that can mint an orchestrator-class Persona.
 //! In-container callers invoking `ember-scion start role=orchestrator` MUST
 //! be refused at the broker boundary (privilege-escalation surface). The
-//! flock guard at `~/.ember/orchestrator.lock` closes MED-3 (two simultaneous
-//! orchestrators cannot acquire the exclusive lock).
+//! flock guard at `/tmp/ember-orchestrator-<uid>.lock` closes MED-3 (two
+//! simultaneous orchestrators cannot acquire the exclusive lock). The lock lives
+//! in `/tmp` rather than `~/.ember/` so the operator uid can always create it
+//! even after `~/.ember/` has been chowned to `ember:ember-clients` (design).
 
 use std::ffi::CString;
-use std::io::{BufRead, BufReader, Write as IoWrite};
+use std::io::{BufRead, Write as IoWrite};
 use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use clap::Subcommand;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tracing::debug;
 
 use ember_daemon::infra::config::DaemonConfig;
-use ember_daemon::spawn::checkpoint::{emit_checkpoint, SpawnCheckpoint, SpawnCheckpointResult};
+use ember_daemon::spawn::checkpoint::{SpawnCheckpoint, SpawnCheckpointResult, emit_checkpoint};
 use ember_daemon::spawn::scion::mint_per_agent_proxy_ca;
+
+/// Result of a successful `ember orchestrator spawn`.
+///
+/// `grant_id` is the attenuated child grant delegated onto the orchestrator
+/// persona for this specific spawn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrchestratorSpawnResult {
+    pub persona_id: String,
+    pub grant_id: String,
+    pub container_id: String,
+}
 
 // ---------------------------------------------------------------------------
 // Clap enum
@@ -46,6 +59,12 @@ pub enum OrchestratorAction {
         /// Drives Beat 5 ("Enforcement 1: spend cap") of the SCION demo.
         #[arg(long)]
         budget_usd: Option<String>,
+        /// Extra host entries to inject into the container's /etc/hosts
+        /// (passed as `extra_hosts:` in the inline SCION spawn config).
+        /// Each entry must be in `hostname:ip` form (Docker compose syntax).
+        /// Anchor: scion_extra_hosts_declarative.
+        #[arg(long, value_name = "HOST:IP")]
+        extra_hosts: Vec<String>,
     },
     /// Print the current orchestrator status.
     Status {
@@ -83,12 +102,11 @@ pub async fn cmd_orchestrator_spawn(
     template: String,
     brief: Option<String>,
     budget_usd: Option<String>,
-) -> Result<(), i32> {
+    extra_hosts: Vec<String>,
+) -> Result<OrchestratorSpawnResult, i32> {
     // 1. Validate max_depth ∈ [1, 8].
     if max_depth == 0 || max_depth > 8 {
-        eprintln!(
-            "ember orchestrator spawn: --max-depth must be in [1, 8], got {max_depth}"
-        );
+        eprintln!("ember orchestrator spawn: --max-depth must be in [1, 8], got {max_depth}");
         return Err(1);
     }
 
@@ -109,18 +127,18 @@ pub async fn cmd_orchestrator_spawn(
     //    TODO: wire PAM/polkit (design dev0)
     debug!("presence_proof stub — broker host-socket enforcement is the dev0 guard");
 
-    // 3. Flock guard — acquire ~/.ember/orchestrator.lock exclusively and
-    //    non-blocking. If the lock is contended, another orchestrator is
+    // 3. Flock guard — acquire /tmp/ember-orchestrator-<uid>.lock exclusively
+    //    and non-blocking. If the lock is contended, another orchestrator is
     //    already running.
     let lock_path = orchestrator_lock_path()?;
     // Ensure the parent directory exists.
-    if let Some(parent) = lock_path.parent() {
-        if !parent.exists() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                eprintln!("ember orchestrator spawn: create lock dir: {e}");
-                1i32
-            })?;
-        }
+    if let Some(parent) = lock_path.parent()
+        && !parent.exists()
+    {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            eprintln!("ember orchestrator spawn: create lock dir: {e}");
+            1i32
+        })?;
     }
     let _lock_guard = FlockGuard::acquire_nb(&lock_path).map_err(|e| match e {
         FlockError::Contended => {
@@ -148,13 +166,10 @@ pub async fn cmd_orchestrator_spawn(
     // 4b. Find or create the canonical operator persona (parent in
     //     delegation chain). Per design §3 emberd owns this persona and
     //     uses it as the trust anchor for all orchestrator spawns.
-    let operator_persona_id = daemon_find_operator_persona(&socket_path)
-        .map_err(|e| {
-            eprintln!(
-                "ember orchestrator spawn: operator persona lookup failed: {e}"
-            );
-            1i32
-        })?;
+    let operator_persona_id = daemon_find_operator_persona(&socket_path).map_err(|e| {
+        eprintln!("ember orchestrator spawn: operator persona lookup failed: {e}");
+        1i32
+    })?;
 
     // 4c. Find or mint the operator's root grant. The mint path triggers
     //     operator-presence proof via the daemon's approval queue — the
@@ -162,9 +177,7 @@ pub async fn cmd_orchestrator_spawn(
     //     If a current root grant exists and is active, reuse it.
     let root_grant_id = daemon_find_or_mint_root_grant(&socket_path, &operator_persona_id)
         .map_err(|e| {
-            eprintln!(
-                "ember orchestrator spawn: root grant lookup/mint failed: {e}"
-            );
+            eprintln!("ember orchestrator spawn: root grant lookup/mint failed: {e}");
             1i32
         })?;
 
@@ -172,7 +185,7 @@ pub async fn cmd_orchestrator_spawn(
     //     bound to the container UUID. The child_scope is the maximal-permissive
     //     "*" under cohort A dev0 defaults; design's destination work narrows
     //     this to the per-method authority table.
-    let persona_id = daemon_create_agent_persona(
+    let spawn = daemon_create_agent_persona(
         &socket_path,
         &container_id,
         &root_grant_id,
@@ -182,20 +195,20 @@ pub async fn cmd_orchestrator_spawn(
         budget_cents,
     )
     .map_err(|e| {
-        eprintln!(
-            "ember orchestrator spawn: orchestrator persona delegation failed: {e}"
-        );
+        eprintln!("ember orchestrator spawn: orchestrator persona delegation failed: {e}");
         1i32
     })?;
+    let persona_id = spawn.persona_id.clone();
 
     println!(
         "orchestrator persona minted: {persona_id} (container={container_id}, parent_grant={root_grant_id})"
     );
 
-    // Emit OrchestratorAgentReady checkpoint so `ember orchestrator status
-    // --verbose` (Beat 3 of the SCION demo) can render the spawn-tree
-    // build live. Failure is best-effort; observability writes must not
-    // block the spawn flow.
+    // Historical naming seam: `orchestrator_agent_ready` is emitted here so
+    // `ember orchestrator status --verbose` can render live spawn progress,
+    // but this happens before `ember-scion start` executes. Treat it as a
+    // progress marker, not as a readiness proof. Failure is best-effort;
+    // observability writes must not block the spawn flow.
     if let Err(e) = emit_checkpoint(
         &persona_id,
         SpawnCheckpoint::OrchestratorAgentReady {
@@ -214,15 +227,16 @@ pub async fn cmd_orchestrator_spawn(
     //     *.anthropic.com, github.com (defaults from mint_per_agent_proxy_ca).
     //     The CA key is not written to disk — only the cert is needed by
     //     the container's trust-store install step. Single-tenant fixed
-    //     path for now; implementation-note-312
+    //     path for now; implementation-note-441
     //     tracks the per-container_id scoping work.
-    let certs_dir = PathBuf::from("/tmp/ember-agent-certs/current");
+    // per_agent_ca_path_scoped_by_container_id
+    let certs_dir = PathBuf::from(format!("/tmp/ember-agent-certs/{container_id}"));
     if let Err(e) = std::fs::create_dir_all(&certs_dir) {
         eprintln!("ember orchestrator spawn: create certs dir {certs_dir:?}: {e}");
         return Err(1);
     }
-    let (ca_cert_pem, _ca_key_pem) = mint_per_agent_proxy_ca(&container_id, None, None)
-        .map_err(|e| {
+    let (ca_cert_pem, _ca_key_pem) =
+        mint_per_agent_proxy_ca(&container_id, None, None).map_err(|e| {
             eprintln!("ember orchestrator spawn: mint per-agent CA: {e}");
             1i32
         })?;
@@ -244,37 +258,80 @@ pub async fn cmd_orchestrator_spawn(
     }
     debug!(path = %ca_path.display(), "per-agent CA cert written");
 
-    // 5. Invoke `scion start` directly with the upstream-native argv shape.
-    //
-    // The ember-scion Construct shim is the eventual architectural seam
-    // (broker-mediated translation of emberlink-specific flags into
-    // upstream scion-native ones, per design §4). Tonight the shim is
-    // unwired (it runs in passthrough-exec mode when EMBER_SESSION_ID is
-    // unset, with no broker mediation), so calling it just adds a hop
-    // that mis-routes the argv. Until the shim gets real argv-translation
-    // logic — tracked as implementation-note-12 — we
-    // invoke the upstream binary directly here. Persona/max-depth/
-    // container-id flow as env vars for ember-scion's eventual use.
+    // 4f-mtls. Materialize per-agent mTLS client cert files so the container
+    //     can authenticate to the bridge as a first-class principal (not just
+    //     via the shared proxy CA). Content is placeholder until
+    //     implementation-note-31 publishes the real mint helper.
+    // orchestrator_spawn_mints_bridge_client_cert: per-agent mTLS materialization (implementation-note-442)
+    let cert_dir = PathBuf::from("/tmp/ember-agent-certs"); // per-container subdirs created inside
+    let _materialized =
+        materialize_bridge_client_cert_for_container(&container_id, &persona_id, &cert_dir)
+            .map_err(|e| {
+                eprintln!("ember orchestrator spawn: materialize bridge client cert: {e}");
+                1i32
+            })?;
+    // TODO: replace placeholder cert content with real
+    // mint_per_agent_mtls_client_cert(persona_id, container_id, ...) output once the SPIFFE-shape
+    // helper is published from core-crypto.
+
+    // TODO(design): set EMBER_DAEMON_ENDPOINT=https://host.docker.internal:<port> in inline
+    // config env (replaces EMBER_DAEMON_SOCKET path for the bridge path).
+
+    // 5. Invoke `ember-scion start` via the Construct shim with emberlink-
+    //    shaped argv. The shim's argv-translation layer (scion.rs::translate_
+    //    scion_argv) strips --persona / --max-depth / --brief and renames
+    //    --template → --type before exec'ing the upstream scion binary, so
+    //    scion sees only its own native vocabulary. Per design §4 the shim
+    //    is also the broker.resolve gate for spawn-subagent authority
+    //    (capability check, scope attenuation, template-allowlist, depth cap).
+    //    Anchor: implementation-note-443.
     // 4f. Write a per-spawn SCION inline config carrying EMBER_PERSONA_ID
     //     and EMBER_DAEMON_SOCKET into the container's env. The base image
     //     (ember-claude-code:v1) requires EMBER_PERSONA_ID at startup for
     //     MCP-config substitution; without it the entrypoint refuses to
     //     start. The inline config merges with the named template via
     //     scion's --config path (see scion/cmd/common.go::RunAgent).
-    let socket_path_str = socket_path
-        .to_str()
-        .ok_or_else(|| {
-            eprintln!("ember orchestrator spawn: non-utf8 socket path: {socket_path:?}");
-            1i32
-        })?;
+    let socket_path_str = socket_path.to_str().ok_or_else(|| {
+        eprintln!("ember orchestrator spawn: non-utf8 socket path: {socket_path:?}");
+        1i32
+    })?;
     // In-container daemon socket path. SCION template bind-mounts the host
     // socket (socket_path_str) → this path inside the container.
-    // implementation-note-313 tracks the uid bridge work
+    // implementation-note-369 tracks the uid bridge work
     // (Docker Desktop on macOS does not pass through Linux UDS peer-cred
     // identically; first connect will likely surface the bridge gap).
     let in_container_socket = "/run/ember/daemon.sock";
+
+    // Probe EMBER_DAEMON_ENDPOINT once per spawn. When set, this is the
+    // HTTP endpoint that the in-container agent uses to reach emberd's HTTP
+    // listener (as opposed to the UDS socket). Injected into the container
+    // env so the agent can reach the daemon across the bridge.
+    // Anchor: scion_extra_hosts_declarative.
+    let daemon_endpoint: Option<String> = std::env::var("EMBER_DAEMON_ENDPOINT").ok();
+
+    // Build the env block for the inline SCION config.
+    let mut env_block = format!(
+        "  EMBER_PERSONA_ID: {persona_id}\n  EMBER_DAEMON_SOCKET: {in_container_socket}\n  EMBER_ORCHESTRATOR_CONTAINER_ID: {container_id}\n  EMBER_ORCHESTRATOR_PARENT_GRANT_ID: {root_grant_id}\n"
+    );
+    if let Some(ref endpoint) = daemon_endpoint {
+        env_block.push_str(&format!("  EMBER_DAEMON_ENDPOINT: {endpoint}\n"));
+        debug!(endpoint = %endpoint, "EMBER_DAEMON_ENDPOINT probed and wired into inline scion config");
+    }
+
+    // Build the extra_hosts block for the inline SCION config.
+    // Each entry in extra_hosts is passed as-is (Docker compose hostname:ip syntax).
+    let extra_hosts_block = if extra_hosts.is_empty() {
+        String::new()
+    } else {
+        let mut block = "extra_hosts:\n".to_string();
+        for entry in &extra_hosts {
+            block.push_str(&format!("  - \"{entry}\"\n"));
+        }
+        block
+    };
+
     let inline_cfg_yaml = format!(
-        "schema_version: \"1\"\nenv:\n  EMBER_PERSONA_ID: {persona_id}\n  EMBER_DAEMON_SOCKET: {in_container_socket}\n  EMBER_ORCHESTRATOR_CONTAINER_ID: {container_id}\n  EMBER_ORCHESTRATOR_PARENT_GRANT_ID: {root_grant_id}\nvolumes:\n  - source: {socket_path_str}\n    target: {in_container_socket}\n    read_only: false\n"
+        "schema_version: \"1\"\nenv:\n{env_block}volumes:\n  - source: {socket_path_str}\n    target: {in_container_socket}\n    read_only: false\n{extra_hosts_block}"
     );
     let inline_cfg_path = std::env::temp_dir().join(format!("ember-spawn-{container_id}.yaml"));
     if let Err(e) = std::fs::write(&inline_cfg_path, inline_cfg_yaml.as_bytes()) {
@@ -283,22 +340,28 @@ pub async fn cmd_orchestrator_spawn(
     }
     debug!(path = %inline_cfg_path.display(), "wrote per-spawn scion config");
 
-    let scion_bin = env_or_path("scion");
-    let mut cmd = std::process::Command::new(&scion_bin);
+    // Invoke ember-scion with emberlink-shaped argv. The Construct shim
+    // translates these to scion-native argv before exec'ing the upstream
+    // scion binary (design §4 step 3). The --persona / --max-depth / --brief
+    // flags are stripped by translate_scion_argv; --template is renamed to
+    // --type; --non-interactive is injected automatically for "start".
+    let ember_scion_bin = env_or_path_scion();
+    let mut cmd = std::process::Command::new(&ember_scion_bin);
     cmd.arg("start");
     cmd.arg(&container_id);
-    cmd.arg("--type").arg(&template);
+    cmd.arg("--persona").arg(&persona_id);
+    cmd.arg("--max-depth").arg(max_depth.to_string());
+    cmd.arg("--template").arg(&template);
     cmd.arg("--config").arg(&inline_cfg_path);
-    cmd.arg("--non-interactive");
     if let Some(ref b) = brief {
-        cmd.arg(b);
+        cmd.arg("--brief").arg(b);
     }
     cmd.env("EMBER_ORCHESTRATOR_PERSONA", &persona_id)
         .env("EMBER_ORCHESTRATOR_CONTAINER_ID", &container_id)
         .env("EMBER_ORCHESTRATOR_PARENT_GRANT_ID", &root_grant_id)
         .env("EMBER_SCION_MAX_DEPTH", max_depth.to_string());
 
-    debug!(binary = %scion_bin, persona = %persona_id, "launching ember-scion start");
+    debug!(binary = %ember_scion_bin, persona = %persona_id, "launching ember-scion start via Construct shim");
 
     // Emit DockerRunRequested before invoking scion — the next checkpoint
     // (ContainerCreated) fires only on success of the scion start.
@@ -326,7 +389,7 @@ pub async fn cmd_orchestrator_spawn(
             {
                 debug!(error = %e, "emit ContainerCreated checkpoint failed");
             }
-            Ok(())
+            Ok(spawn)
         }
         Ok(status) => {
             let code = status.code().unwrap_or(1);
@@ -344,7 +407,7 @@ pub async fn cmd_orchestrator_spawn(
             Err(1)
         }
         Err(e) => {
-            eprintln!("ember orchestrator spawn: failed to launch {scion_bin}: {e}");
+            eprintln!("ember orchestrator spawn: failed to launch {ember_scion_bin}: {e}");
             Err(1)
         }
     }
@@ -369,8 +432,7 @@ pub async fn cmd_orchestrator_status(
     // event log so the operator can pipe `spawn` → `status --follow` in
     // two panes per the SCION Beat 3 flow.
     let mut persona_id = if running {
-        daemon_query_orchestrator_persona(&socket_path)
-            .unwrap_or_else(|_| "<unknown>".to_string())
+        daemon_query_orchestrator_persona(&socket_path).unwrap_or_else(|_| "<unknown>".to_string())
     } else {
         String::new()
     };
@@ -379,11 +441,12 @@ pub async fn cmd_orchestrator_status(
         for v in events.iter().rev() {
             let kind = v.get("kind").and_then(Value::as_str).unwrap_or("");
             let event = v.get("event").and_then(Value::as_str).unwrap_or("");
-            if event == "spawn_checkpoint" && kind == "orchestrator_agent_ready" {
-                if let Some(pid) = v.get("agent_id").and_then(Value::as_str) {
-                    persona_id = pid.to_string();
-                    break;
-                }
+            if event == "spawn_checkpoint"
+                && kind == "orchestrator_agent_ready"
+                && let Some(pid) = v.get("agent_id").and_then(Value::as_str)
+            {
+                persona_id = pid.to_string();
+                break;
             }
         }
     }
@@ -391,7 +454,7 @@ pub async fn cmd_orchestrator_status(
     if verbose || follow {
         let started_at = if running {
             lock_mtime(&lock_path)
-                .map(|t| format_system_time(t))
+                .map(format_system_time)
                 .unwrap_or_else(|| "<unknown>".to_string())
         } else {
             String::new()
@@ -434,8 +497,8 @@ pub async fn cmd_orchestrator_stop(cfg: &DaemonConfig) -> Result<(), i32> {
 
     let socket_path = cfg.socket_dir.join("daemon.sock");
     // Revoke persona — best-effort; log on error but continue to remove lock.
-    let persona_id = daemon_query_orchestrator_persona(&socket_path)
-        .unwrap_or_else(|_| "<unknown>".to_string());
+    let persona_id =
+        daemon_query_orchestrator_persona(&socket_path).unwrap_or_else(|_| "<unknown>".to_string());
 
     if let Err(e) = daemon_revoke_persona(&socket_path, &persona_id) {
         eprintln!("ember orchestrator stop: revoke RPC warning: {e}");
@@ -454,19 +517,160 @@ pub async fn cmd_orchestrator_stop(cfg: &DaemonConfig) -> Result<(), i32> {
 // Private helpers
 // ---------------------------------------------------------------------------
 
-/// Resolve the canonical orchestrator lock path: `~/.ember/orchestrator.lock`.
-fn orchestrator_lock_path() -> Result<PathBuf, i32> {
-    let home = dirs_next::home_dir().ok_or_else(|| {
-        eprintln!("ember orchestrator: could not determine home directory");
-        1i32
+// ---------------------------------------------------------------------------
+// Bridge client cert materialization (implementation-note-442)
+// ---------------------------------------------------------------------------
+
+/// Paths to the materialized per-agent mTLS client cert files.
+///
+/// Returned by [`materialize_bridge_client_cert_for_container`]. Content is
+/// placeholder until `implementation-note-31` publishes the real
+/// `mint_per_agent_mtls_client_cert` helper from `core-crypto`.
+/// Anchor: orchestrator_spawn_mints_bridge_client_cert
+#[derive(Debug)]
+pub struct MaterializedCert {
+    /// Path to the DER/PEM client certificate (`client.crt`, mode 0644).
+    pub cert_path: PathBuf,
+    /// Path to the private key (`client.key`, mode 0600).
+    pub key_path: PathBuf,
+    /// Path to the CA certificate that signed the client cert (`client-ca.crt`, mode 0644).
+    pub ca_path: PathBuf,
+}
+
+/// Errors from [`materialize_bridge_client_cert_for_container`].
+#[derive(Debug, thiserror::Error)]
+pub enum BridgeCertError {
+    #[error("failed to create per-container cert directory {path}: {source}")]
+    CreateDirFailed {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("failed to write client cert to {path}: {source}")]
+    WriteCertFailed {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("failed to write client key to {path}: {source}")]
+    WriteKeyFailed {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("failed to write CA cert to {path}: {source}")]
+    WriteCaFailed {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+
+/// Create `<output_dir>/<container_id>/` (mode 0700) and write three stub
+/// certificate files into it, returning their paths as a [`MaterializedCert`].
+///
+/// File layout:
+/// - `client.crt`    (mode 0644) — stub client certificate
+/// - `client.key`    (mode 0600) — stub private key
+/// - `client-ca.crt` (mode 0644) — stub CA certificate
+///
+/// All three files contain placeholder content (`b"# placeholder"`) until
+/// `implementation-note-31` ships the real SPIFFE-shape mint.
+/// The directory is scoped per container so concurrent spawns don't collide.
+fn materialize_bridge_client_cert_for_container(
+    container_id: &str,
+    _persona_id: &str,
+    output_dir: &Path,
+) -> Result<MaterializedCert, BridgeCertError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let container_dir = output_dir.join(container_id);
+    std::fs::create_dir_all(&container_dir).map_err(|e| BridgeCertError::CreateDirFailed {
+        path: container_dir.clone(),
+        source: e,
     })?;
-    Ok(home.join(".ember").join("orchestrator.lock"))
+    // Set directory permissions to 0700 so only the owning uid can traverse it.
+    #[cfg(unix)]
+    {
+        if let Err(e) =
+            std::fs::set_permissions(&container_dir, std::fs::Permissions::from_mode(0o700))
+        {
+            // Non-fatal: cert files' own permissions are the real security boundary.
+            debug!(dir = %container_dir.display(), error = %e, "chmod 0700 cert dir failed (non-fatal)");
+        }
+    }
+
+    let cert_path = container_dir.join("client.crt");
+    let key_path = container_dir.join("client.key");
+    let ca_path = container_dir.join("client-ca.crt");
+
+    // Write stub client.crt (mode 0644).
+    std::fs::write(&cert_path, b"# placeholder").map_err(|e| BridgeCertError::WriteCertFailed {
+        path: cert_path.clone(),
+        source: e,
+    })?;
+    #[cfg(unix)]
+    {
+        let _ = std::fs::set_permissions(&cert_path, std::fs::Permissions::from_mode(0o644));
+    }
+
+    // Write stub client.key (mode 0600 — private key).
+    std::fs::write(&key_path, b"# placeholder").map_err(|e| BridgeCertError::WriteKeyFailed {
+        path: key_path.clone(),
+        source: e,
+    })?;
+    #[cfg(unix)]
+    {
+        let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    // Write stub client-ca.crt (mode 0644).
+    std::fs::write(&ca_path, b"# placeholder").map_err(|e| BridgeCertError::WriteCaFailed {
+        path: ca_path.clone(),
+        source: e,
+    })?;
+    #[cfg(unix)]
+    {
+        let _ = std::fs::set_permissions(&ca_path, std::fs::Permissions::from_mode(0o644));
+    }
+
+    debug!(
+        container_id = %container_id,
+        cert = %cert_path.display(),
+        key = %key_path.display(),
+        ca = %ca_path.display(),
+        "materialized bridge client cert stubs"
+    );
+
+    Ok(MaterializedCert {
+        cert_path,
+        key_path,
+        ca_path,
+    })
+}
+
+/// Resolve the canonical orchestrator lock path.
+///
+/// Under design (separate-uid daemon), `~/.ember/` is chowned to
+/// `ember:ember-clients` during install. The orchestrator lock is created
+/// by the CLI running as the operator uid, not by the daemon. Placing it
+/// inside `~/.ember/` would cause EACCES on the `O_CREAT|O_WRONLY` open
+/// after install completes.
+///
+/// Instead the lock lives in `/tmp` keyed to the invoking uid so:
+///   - the operator uid can always create and hold it;
+///   - two operators on the same machine (multi-user host) get independent
+///     lock files (each uid has its own slot);
+///   - the path is stable across reboots within a session (uid does not
+///     change) but is cleaned on OS restart (tmp-sweep).
+///
+/// Lock filename: `/tmp/ember-orchestrator-<uid>.lock`
+fn orchestrator_lock_path() -> Result<PathBuf, i32> {
+    // SAFETY: getuid(2) is always safe and never fails.
+    let uid = unsafe { libc::getuid() };
+    Ok(PathBuf::from(format!("/tmp/ember-orchestrator-{uid}.lock")))
 }
 
 /// Return `$EMBER_SCION_BIN` if set, otherwise `"ember-scion"` (resolved via
 /// `$PATH`). Never touches the shell — uses `std::env::var` only.
-fn env_or_path(binary: &str) -> String {
-    std::env::var("EMBER_SCION_BIN").unwrap_or_else(|_| binary.to_string())
+fn env_or_path_scion() -> String {
+    std::env::var("EMBER_SCION_BIN").unwrap_or_else(|_| "ember-scion".to_string())
 }
 
 /// Check whether the orchestrator lock file is held by another process.
@@ -544,10 +748,9 @@ impl FlockGuard {
     /// Open (or create) `path` and acquire an exclusive non-blocking flock.
     /// Returns `Err(FlockError::Contended)` if another process holds the lock.
     fn acquire_nb(path: &Path) -> Result<Self, FlockError> {
-        let c_path = CString::new(
-            path.to_str()
-                .ok_or_else(|| FlockError::Io(std::io::Error::from(std::io::ErrorKind::InvalidInput)))?,
-        )
+        let c_path = CString::new(path.to_str().ok_or_else(|| {
+            FlockError::Io(std::io::Error::from(std::io::ErrorKind::InvalidInput))
+        })?)
         .map_err(|_| FlockError::Io(std::io::Error::from(std::io::ErrorKind::InvalidInput)))?;
 
         // SAFETY: open(2) is a standard POSIX syscall. O_CREAT | O_WRONLY
@@ -596,10 +799,26 @@ impl Drop for FlockGuard {
 /// Errors from daemon socket calls in this module.
 #[derive(Debug)]
 enum OrchestratorRpcError {
-    DaemonUnavailable { socket: PathBuf, source: std::io::Error },
+    DaemonUnavailable {
+        socket: PathBuf,
+        source: std::io::Error,
+    },
     Io(String),
     Protocol(String),
-    DaemonRpc { code: i32, message: String },
+    DaemonRpc {
+        code: i32,
+        message: String,
+    },
+    /// Operator denied the approval request on the dashboard.
+    ApprovalDenied {
+        approval_id: String,
+        reason: String,
+    },
+    /// Approval request was not resolved before the polling deadline.
+    ApprovalTimedOut {
+        approval_id: String,
+        timeout_secs: u64,
+    },
 }
 
 impl std::fmt::Display for OrchestratorRpcError {
@@ -616,6 +835,20 @@ impl std::fmt::Display for OrchestratorRpcError {
             Self::Io(s) => write!(f, "socket I/O: {s}"),
             Self::Protocol(s) => write!(f, "protocol: {s}"),
             Self::DaemonRpc { code, message } => write!(f, "daemon error ({code}): {message}"),
+            Self::ApprovalDenied {
+                approval_id,
+                reason,
+            } => write!(
+                f,
+                "approval {approval_id} denied: {reason} — review at http://localhost:3141/approvals"
+            ),
+            Self::ApprovalTimedOut {
+                approval_id,
+                timeout_secs,
+            } => write!(
+                f,
+                "approval {approval_id} timed out after {timeout_secs}s — resolve at http://localhost:3141/approvals"
+            ),
         }
     }
 }
@@ -627,49 +860,23 @@ fn call_daemon(
     method: &str,
     params: &Value,
 ) -> Result<Value, OrchestratorRpcError> {
-    let stream = std::os::unix::net::UnixStream::connect(socket_path).map_err(|e| {
-        OrchestratorRpcError::DaemonUnavailable {
-            socket: socket_path.to_path_buf(),
-            source: e,
+    match crate::call_daemon_rpc(socket_path, method, params) {
+        Ok(result) => Ok(result),
+        Err(crate::DaemonRpcError::Unavailable(source)) => {
+            Err(OrchestratorRpcError::DaemonUnavailable {
+                socket: socket_path.to_path_buf(),
+                source,
+            })
         }
-    })?;
-
-    let mut writer = stream
-        .try_clone()
-        .map_err(|e| OrchestratorRpcError::Io(format!("clone socket: {e}")))?;
-    let mut reader = BufReader::new(stream);
-
-    let request = json!({
-        "id": "1",
-        "method": method,
-        "params": params,
-    });
-    let mut line = serde_json::to_string(&request).expect("serialize request");
-    line.push('\n');
-
-    writer
-        .write_all(line.as_bytes())
-        .map_err(|e| OrchestratorRpcError::Io(format!("write request: {e}")))?;
-
-    let mut response_line = String::new();
-    reader
-        .read_line(&mut response_line)
-        .map_err(|e| OrchestratorRpcError::Io(format!("read response: {e}")))?;
-
-    let response: Value = serde_json::from_str(response_line.trim())
-        .map_err(|e| OrchestratorRpcError::Protocol(format!("invalid JSON-RPC response: {e}")))?;
-
-    if let Some(err) = response.get("error").filter(|v| !v.is_null()) {
-        let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(-32000) as i32;
-        let message = err
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("unknown error")
-            .to_string();
-        return Err(OrchestratorRpcError::DaemonRpc { code, message });
+        Err(crate::DaemonRpcError::Io(e)) => Err(OrchestratorRpcError::Io(format!("{e}"))),
+        Err(crate::DaemonRpcError::Protocol(e)) => Err(OrchestratorRpcError::Protocol(e)),
+        Err(crate::DaemonRpcError::Rpc { code, message }) => {
+            if code == -32001 && message.contains("authority_class_not_met") {
+                eprintln!("ember: presence proof expired; visit the dashboard to re-authenticate");
+            }
+            Err(OrchestratorRpcError::DaemonRpc { code, message })
+        }
     }
-
-    Ok(response.get("result").cloned().unwrap_or(Value::Null))
 }
 
 /// Resolve the operator's persona — the trust anchor whose enrolled passkey
@@ -712,10 +919,10 @@ fn daemon_find_operator_persona(socket_path: &Path) -> Result<String, Orchestrat
 
     for candidate in &candidates {
         for p in arr {
-            if p.get("name").and_then(|v| v.as_str()) == Some(candidate.as_str()) {
-                if let Some(id) = p.get("id").and_then(|v| v.as_str()) {
-                    return Ok(id.to_string());
-                }
+            if p.get("name").and_then(|v| v.as_str()) == Some(candidate.as_str())
+                && let Some(id) = p.get("id").and_then(|v| v.as_str())
+            {
+                return Ok(id.to_string());
             }
         }
     }
@@ -725,10 +932,10 @@ fn daemon_find_operator_persona(socket_path: &Path) -> Result<String, Orchestrat
     // if the picked persona is wrong.
     for p in arr {
         let status = p.get("status").and_then(|v| v.as_str()).unwrap_or("");
-        if status == "active" {
-            if let Some(id) = p.get("id").and_then(|v| v.as_str()) {
-                return Ok(id.to_string());
-            }
+        if status == "active"
+            && let Some(id) = p.get("id").and_then(|v| v.as_str())
+        {
+            return Ok(id.to_string());
         }
     }
 
@@ -745,8 +952,13 @@ fn daemon_find_operator_persona(socket_path: &Path) -> Result<String, Orchestrat
 ///
 /// The grant uses a synthetic `credential_name` (`_orchestrator_root`)
 /// because `create_grant` is credential-shaped today; the destination work
-/// (implementation-note-220) replaces this with a proper
+/// (implementation-note-444) replaces this with a proper
 /// delegation primitive that doesn't piggyback on credential_name.
+///
+/// When `create_grant` returns `{status:"pending_approval", approval_id}`,
+/// this function blocks on the daemon's `await_approval` RPC (up to
+/// `APPROVAL_TIMEOUT_SECS`) and, on success, calls `list_grants` to
+/// resolve the newly-minted grant ID.
 fn daemon_find_or_mint_root_grant(
     socket_path: &Path,
     persona_id: &str,
@@ -756,16 +968,20 @@ fn daemon_find_or_mint_root_grant(
         "list_grants",
         &json!({ "persona_id": persona_id }),
     )?;
-    let arr = listed.as_array().ok_or_else(|| {
-        OrchestratorRpcError::Protocol("list_grants: expected array".to_string())
-    })?;
+    let arr = listed
+        .as_array()
+        .ok_or_else(|| OrchestratorRpcError::Protocol("list_grants: expected array".to_string()))?;
     for g in arr {
-        let credential = g.get("credential_name").and_then(|v| v.as_str()).unwrap_or("");
+        let credential = g
+            .get("credential_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let status = g.get("status").and_then(|v| v.as_str()).unwrap_or("");
-        if credential == "_orchestrator_root" && status == "active" {
-            if let Some(id) = g.get("id").and_then(|v| v.as_str()) {
-                return Ok(id.to_string());
-            }
+        if credential == "_orchestrator_root"
+            && status == "active"
+            && let Some(id) = g.get("id").and_then(|v| v.as_str())
+        {
+            return Ok(id.to_string());
         }
     }
     eprintln!(
@@ -787,6 +1003,29 @@ fn daemon_find_or_mint_root_grant(
             "max_delegation_depth": 8,
         }),
     )?;
+
+    // Handle pending_approval: daemon requires operator sign-off before the
+    // grant is minted. Block on `await_approval` then re-query list_grants
+    // to obtain the result_grant_id once the approval resolves.
+    if created.get("status").and_then(|v| v.as_str()) == Some("pending_approval") {
+        let approval_id = created
+            .get("approval_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                OrchestratorRpcError::Protocol(
+                    "pending_approval response missing approval_id field".to_string(),
+                )
+            })?
+            .to_string();
+        eprintln!(
+            "ember orchestrator spawn: waiting on dashboard approval (approval_id={approval_id}) — visit http://localhost:3141/approvals"
+        );
+        daemon_await_grant_approval(socket_path, persona_id, &approval_id)?;
+        // Approval succeeded; the daemon has now minted the grant.
+        // Re-query list_grants to retrieve the result_grant_id.
+        return daemon_find_active_root_grant(socket_path, persona_id, &approval_id);
+    }
+
     created
         .get("grant_id")
         .or_else(|| created.get("id"))
@@ -797,6 +1036,143 @@ fn daemon_find_or_mint_root_grant(
                 "create_grant response missing grant_id/id field".to_string(),
             )
         })
+}
+
+/// Block on the daemon's `await_approval` RPC until the operator resolves
+/// the approval request identified by `approval_id`. Returns `Ok(())` on
+/// approval, or a descriptive `Err` on denial or timeout.
+///
+/// The read deadline on the socket is set to `APPROVAL_TIMEOUT_SECS + 5s`
+/// so we always outlast the daemon's own polling deadline.
+fn daemon_await_grant_approval(
+    socket_path: &Path,
+    _persona_id: &str,
+    approval_id: &str,
+) -> Result<(), OrchestratorRpcError> {
+    // Five minutes — matches the proxy hook's default (implementation-note-42).
+    const APPROVAL_TIMEOUT_SECS: u64 = 300;
+
+    // Open a new socket connection with an extended read deadline so the
+    // blocking `await_approval` poll can run to completion.
+    let stream = std::os::unix::net::UnixStream::connect(socket_path).map_err(|e| {
+        OrchestratorRpcError::DaemonUnavailable {
+            socket: socket_path.to_path_buf(),
+            source: e,
+        }
+    })?;
+    // Read budget = daemon's poll deadline + 5 s slack so our socket does not
+    // time out before the daemon's own `TimedOut` response can land.
+    let read_deadline = std::time::Duration::from_secs(APPROVAL_TIMEOUT_SECS.saturating_add(5));
+    stream
+        .set_read_timeout(Some(read_deadline))
+        .map_err(|e| OrchestratorRpcError::Io(format!("set read timeout: {e}")))?;
+    stream
+        .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+        .map_err(|e| OrchestratorRpcError::Io(format!("set write timeout: {e}")))?;
+
+    let mut writer = stream
+        .try_clone()
+        .map_err(|e| OrchestratorRpcError::Io(format!("clone socket: {e}")))?;
+    let mut reader = std::io::BufReader::new(stream);
+
+    let request = json!({
+        "id": "orchestrator-await-approval",
+        "method": "await_approval",
+        "params": {
+            "request_id": approval_id,
+            "timeout_secs": APPROVAL_TIMEOUT_SECS,
+        },
+    });
+    let mut line = serde_json::to_string(&request).expect("serialize request");
+    line.push('\n');
+    writer
+        .write_all(line.as_bytes())
+        .map_err(|e| OrchestratorRpcError::Io(format!("write await_approval request: {e}")))?;
+
+    let mut response_line = String::new();
+    reader
+        .read_line(&mut response_line)
+        .map_err(|e| OrchestratorRpcError::Io(format!("read await_approval response: {e}")))?;
+
+    let response: Value = serde_json::from_str(response_line.trim()).map_err(|e| {
+        OrchestratorRpcError::Protocol(format!(
+            "invalid JSON-RPC response from await_approval: {e}"
+        ))
+    })?;
+
+    if let Some(err) = response.get("error").filter(|v| !v.is_null()) {
+        let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(-32000) as i32;
+        let message = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown error")
+            .to_string();
+        return Err(OrchestratorRpcError::DaemonRpc { code, message });
+    }
+
+    let result = response.get("result").cloned().unwrap_or(Value::Null);
+    let kind = result
+        .get("decision")
+        .and_then(|d| d.get("kind"))
+        .and_then(|k| k.as_str())
+        .unwrap_or("unknown");
+
+    match kind {
+        "approved" => Ok(()),
+        "denied" => {
+            let reason = result
+                .get("decision")
+                .and_then(|d| d.get("reason"))
+                .and_then(|r| r.as_str())
+                .unwrap_or("no reason provided")
+                .to_string();
+            Err(OrchestratorRpcError::ApprovalDenied {
+                approval_id: approval_id.to_string(),
+                reason,
+            })
+        }
+        "timed_out" => Err(OrchestratorRpcError::ApprovalTimedOut {
+            approval_id: approval_id.to_string(),
+            timeout_secs: APPROVAL_TIMEOUT_SECS,
+        }),
+        other => Err(OrchestratorRpcError::Protocol(format!(
+            "await_approval returned unexpected decision kind: {other}"
+        ))),
+    }
+}
+
+/// Re-query `list_grants` to find the active `_orchestrator_root` grant
+/// that the daemon created after the approval resolved. Called after
+/// `daemon_await_grant_approval` returns `Ok(())`.
+fn daemon_find_active_root_grant(
+    socket_path: &Path,
+    persona_id: &str,
+    approval_id: &str,
+) -> Result<String, OrchestratorRpcError> {
+    let listed = call_daemon(
+        socket_path,
+        "list_grants",
+        &json!({ "persona_id": persona_id }),
+    )?;
+    let arr = listed.as_array().ok_or_else(|| {
+        OrchestratorRpcError::Protocol("list_grants (post-approval): expected array".to_string())
+    })?;
+    for g in arr {
+        let credential = g
+            .get("credential_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let status = g.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        if credential == "_orchestrator_root" && status == "active" {
+            if let Some(id) = g.get("id").and_then(|v| v.as_str()) {
+                return Ok(id.to_string());
+            }
+        }
+    }
+    Err(OrchestratorRpcError::Protocol(format!(
+        "no active _orchestrator_root grant found after approval {approval_id} resolved; \
+         the daemon may not have minted the grant yet — retry spawn or check the dashboard"
+    )))
 }
 
 /// Mint the orchestrator-class Persona via `create_agent_persona` daemon RPC.
@@ -811,7 +1187,7 @@ fn daemon_create_agent_persona(
     max_depth: u8,
     template: &str,
     budget_cents: Option<u64>,
-) -> Result<String, OrchestratorRpcError> {
+) -> Result<OrchestratorSpawnResult, OrchestratorRpcError> {
     // Use a per-spawn persona name so re-spawns under the same operator do
     // not collide. The short prefix of container_id keeps the name readable
     // in dashboards + audit logs.
@@ -843,14 +1219,34 @@ fn daemon_create_agent_persona(
             )
         })?
         .to_string();
-    Ok(persona_id)
+    let grant_id = result
+        .get("attenuated_grant_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            OrchestratorRpcError::Protocol(
+                "create_agent_persona response missing attenuated_grant_id".to_string(),
+            )
+        })?
+        .to_string();
+    let container_id = result
+        .get("container_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            OrchestratorRpcError::Protocol(
+                "create_agent_persona response missing container_id".to_string(),
+            )
+        })?
+        .to_string();
+    Ok(OrchestratorSpawnResult {
+        persona_id,
+        grant_id,
+        container_id,
+    })
 }
 
 /// Query the daemon for the currently active orchestrator persona ID.
 /// Falls back gracefully so callers can display `<unknown>`.
-fn daemon_query_orchestrator_persona(
-    socket_path: &Path,
-) -> Result<String, OrchestratorRpcError> {
+fn daemon_query_orchestrator_persona(socket_path: &Path) -> Result<String, OrchestratorRpcError> {
     let params = json!({ "name_prefix": "orchestrator" });
     let result = call_daemon(socket_path, "list_personas", &params)?;
     // Expect an array; take the first matching entry.
@@ -865,10 +1261,7 @@ fn daemon_query_orchestrator_persona(
 }
 
 /// Revoke a Persona by ID via the daemon's `revoke_persona` RPC (best-effort).
-fn daemon_revoke_persona(
-    socket_path: &Path,
-    persona_id: &str,
-) -> Result<(), OrchestratorRpcError> {
+fn daemon_revoke_persona(socket_path: &Path, persona_id: &str) -> Result<(), OrchestratorRpcError> {
     let params = json!({ "persona_id": persona_id });
     call_daemon(socket_path, "revoke_persona", &params)?;
     Ok(())
@@ -968,10 +1361,7 @@ fn format_proxy_call_line(v: &Value) -> Option<String> {
     let tokens_in = v.get("tokens_in").and_then(Value::as_u64).unwrap_or(0);
     let tokens_out = v.get("tokens_out").and_then(Value::as_u64).unwrap_or(0);
     let tokens_total = tokens_in.saturating_add(tokens_out);
-    let receipt_id = v
-        .get("receipt_id")
-        .and_then(Value::as_str)
-        .unwrap_or("r-?");
+    let receipt_id = v.get("receipt_id").and_then(Value::as_str).unwrap_or("r-?");
     let persona_id = v.get("agent_id").and_then(Value::as_str).unwrap_or("?");
     // Short tag: persona prefix up to first `-`, or the full string if
     // no `-` separator. Keeps demo lines readable when persona IDs are
@@ -1025,11 +1415,8 @@ fn print_spawn_checkpoints(agent_id: &str) {
 
 /// Streaming form of `print_spawn_checkpoints` — used by Beat 3 of the
 /// SCION demo. Polls the event log every 500ms; prints new spawn-checkpoint
-/// events as they appear, deduped against a seen-set. Returns when either:
-/// - `timeout_secs` wall-clock elapses, or
-/// - A terminal checkpoint fires (ContainerCreated, OrchestratorAgentReady)
-///   with an Err outcome, or
-/// - The user sends SIGINT (Ctrl-C terminates the process).
+/// events as they appear, deduped against a seen-set. Returns when
+/// `timeout_secs` elapses; otherwise the operator stops it manually.
 ///
 /// Also matches `event=="proxy_call"` so per-request proxy log lines emitted
 /// by ember-proxy (Beat 4) flow into the same stream — useful when the
@@ -1047,8 +1434,7 @@ async fn stream_spawn_checkpoints(agent_id: &str, timeout_secs: u64) {
         let events = tail_engine_events_silent(1000);
         for v in events.iter() {
             let event_kind = v.get("event").and_then(Value::as_str).unwrap_or("");
-            let matches_agent =
-                v.get("agent_id").and_then(Value::as_str) == Some(agent_id);
+            let matches_agent = v.get("agent_id").and_then(Value::as_str) == Some(agent_id);
             if !matches_agent {
                 continue;
             }
@@ -1104,8 +1490,7 @@ fn cmd_orchestrator_status_inner(events: &[Value], agent_id: &str) -> Vec<String
         .iter()
         .filter(|v| {
             let kind = v.get("event").and_then(Value::as_str);
-            let matches_agent =
-                v.get("agent_id").and_then(Value::as_str) == Some(agent_id);
+            let matches_agent = v.get("agent_id").and_then(Value::as_str) == Some(agent_id);
             matches_agent && matches!(kind, Some("spawn_checkpoint") | Some("proxy_call"))
         })
         .filter_map(|v| match v.get("event").and_then(Value::as_str) {
@@ -1134,8 +1519,7 @@ mod tests {
         let lock_path = dir.path().join("orchestrator.lock");
 
         // First acquire — must succeed.
-        let guard = FlockGuard::acquire_nb(&lock_path)
-            .expect("first acquire should succeed");
+        let guard = FlockGuard::acquire_nb(&lock_path).expect("first acquire should succeed");
 
         // Second acquire — must be contended.
         let result = FlockGuard::acquire_nb(&lock_path);
@@ -1148,8 +1532,8 @@ mod tests {
         drop(guard);
 
         // After release, a third acquire should succeed again.
-        let _guard2 = FlockGuard::acquire_nb(&lock_path)
-            .expect("post-release acquire should succeed");
+        let _guard2 =
+            FlockGuard::acquire_nb(&lock_path).expect("post-release acquire should succeed");
     }
 
     /// T1 — max_depth validates the [1, 8] range.
@@ -1223,18 +1607,131 @@ mod tests {
 
         assert!(
             lines[0].contains("docker_run_requested") && lines[0].contains('✓'),
-            "line 0: {}", lines[0]
+            "line 0: {}",
+            lines[0]
         );
         assert!(
             lines[1].contains("container_created") && lines[1].contains("id=abc123"),
-            "line 1: {}", lines[1]
+            "line 1: {}",
+            lines[1]
         );
         assert!(
             lines[2].contains("ember_exec_ready")
                 && lines[2].contains('✗')
                 && lines[2].contains("mount failed: no such file"),
-            "line 2: {}", lines[2]
+            "line 2: {}",
+            lines[2]
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Approval flow tests (three-branch: approved / denied / timed_out)
+    // ---------------------------------------------------------------------------
+
+    /// Helper: spawn a Unix domain socket server that accepts one connection,
+    /// writes `response_json` as a newline-terminated JSON string, then exits.
+    /// Returns the socket path inside a temp dir so the caller can connect.
+    fn one_shot_daemon_server(
+        dir: &tempfile::TempDir,
+        response_json: serde_json::Value,
+    ) -> std::path::PathBuf {
+        use std::io::Write as _;
+        let socket_path = dir.path().join("daemon.sock");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("bind test socket");
+
+        let resp = serde_json::to_string(&response_json).expect("serialize response");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                // Drain the request line so the client's write_all completes.
+                use std::io::BufRead as _;
+                let mut r = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut _line = String::new();
+                let _ = r.read_line(&mut _line);
+                // Send the canned response.
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.write_all(b"\n");
+            }
+        });
+
+        socket_path
+    }
+
+    /// T-APPROVAL-APPROVED — `daemon_await_grant_approval` returns `Ok(())`
+    /// when the daemon resolves the approval as `approved`.
+    #[test]
+    fn daemon_await_grant_approval_approved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = one_shot_daemon_server(
+            &dir,
+            serde_json::json!({
+                "id": "orchestrator-await-approval",
+                "result": {
+                    "decision": { "kind": "approved" }
+                }
+            }),
+        );
+
+        let result = daemon_await_grant_approval(&socket_path, "persona-test", "approval-ok");
+        assert!(result.is_ok(), "expected Ok(()), got: {result:?}");
+    }
+
+    /// T-APPROVAL-DENIED — `daemon_await_grant_approval` returns
+    /// `Err(ApprovalDenied)` when the daemon resolves as `denied`.
+    #[test]
+    fn daemon_await_grant_approval_denied() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = one_shot_daemon_server(
+            &dir,
+            serde_json::json!({
+                "id": "orchestrator-await-approval",
+                "result": {
+                    "decision": {
+                        "kind": "denied",
+                        "reason": "operator declined"
+                    }
+                }
+            }),
+        );
+
+        let result = daemon_await_grant_approval(&socket_path, "persona-test", "approval-deny");
+        match result {
+            Err(OrchestratorRpcError::ApprovalDenied {
+                approval_id,
+                reason,
+            }) => {
+                assert_eq!(approval_id, "approval-deny");
+                assert!(
+                    reason.contains("operator declined"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("expected ApprovalDenied, got: {other:?}"),
+        }
+    }
+
+    /// T-APPROVAL-TIMED-OUT — `daemon_await_grant_approval` returns
+    /// `Err(ApprovalTimedOut)` when the daemon resolves as `timed_out`.
+    #[test]
+    fn daemon_await_grant_approval_timed_out() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket_path = one_shot_daemon_server(
+            &dir,
+            serde_json::json!({
+                "id": "orchestrator-await-approval",
+                "result": {
+                    "decision": { "kind": "timed_out" }
+                }
+            }),
+        );
+
+        let result = daemon_await_grant_approval(&socket_path, "persona-test", "approval-timeout");
+        match result {
+            Err(OrchestratorRpcError::ApprovalTimedOut { approval_id, .. }) => {
+                assert_eq!(approval_id, "approval-timeout");
+            }
+            other => panic!("expected ApprovalTimedOut, got: {other:?}"),
+        }
     }
 
     /// Beat 4 — proxy_call events render as the demo's display line.
@@ -1299,6 +1796,81 @@ mod tests {
                 && lines[1].contains("Receipt r-7a3f0c"),
             "proxy_call line: {}",
             lines[1]
+        );
+    }
+
+    /// T-MATERIALIZE-CERT — materialize_bridge_client_cert_for_container creates
+    /// a per-container subdirectory and writes the three expected stub files with
+    /// the correct names and placeholder content.
+    #[test]
+    fn materialize_bridge_client_cert_creates_stub_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let result = materialize_bridge_client_cert_for_container(
+            "test-container-id",
+            "test-persona-id",
+            dir.path(),
+        );
+        let cert = result.expect("materialize should succeed");
+
+        // All three paths must exist under <output_dir>/<container_id>/.
+        assert!(
+            cert.cert_path.exists(),
+            "client.crt must exist: {:?}",
+            cert.cert_path
+        );
+        assert!(
+            cert.key_path.exists(),
+            "client.key must exist: {:?}",
+            cert.key_path
+        );
+        assert!(
+            cert.ca_path.exists(),
+            "client-ca.crt must exist: {:?}",
+            cert.ca_path
+        );
+
+        // File names must be as specified.
+        assert_eq!(cert.cert_path.file_name().unwrap(), "client.crt");
+        assert_eq!(cert.key_path.file_name().unwrap(), "client.key");
+        assert_eq!(cert.ca_path.file_name().unwrap(), "client-ca.crt");
+
+        // Content must be the placeholder stub.
+        let crt_content = std::fs::read(&cert.cert_path).unwrap();
+        assert_eq!(crt_content, b"# placeholder");
+        let key_content = std::fs::read(&cert.key_path).unwrap();
+        assert_eq!(key_content, b"# placeholder");
+        let ca_content = std::fs::read(&cert.ca_path).unwrap();
+        assert_eq!(ca_content, b"# placeholder");
+    }
+
+    /// T-LOCK-PATH — orchestrator_lock_path returns a /tmp path keyed to the
+    /// invoking uid, not a path inside ~/.ember/.
+    ///
+    /// Under design the daemon owns ~/.ember/ (chowned to ember:ember-clients).
+    /// The operator uid must be able to create the lock file without elevated
+    /// privileges, so the path must not be inside ~/.ember/.
+    #[test]
+    fn orchestrator_lock_path_is_in_tmp_not_ember_dir() {
+        let path = orchestrator_lock_path().expect("lock path must resolve");
+        let path_str = path.to_string_lossy();
+
+        // Must be in /tmp, not ~/.ember/.
+        assert!(
+            path_str.starts_with("/tmp/"),
+            "lock path must start with /tmp/, got: {path_str}"
+        );
+
+        // Must contain the invoking uid so multi-user hosts don't collide.
+        let uid = unsafe { libc::getuid() };
+        assert!(
+            path_str.contains(&uid.to_string()),
+            "lock path must contain uid {uid}, got: {path_str}"
+        );
+
+        // Must not contain .ember in any component.
+        assert!(
+            !path_str.contains(".ember"),
+            "lock path must not contain .ember (daemon-owned dir), got: {path_str}"
         );
     }
 }

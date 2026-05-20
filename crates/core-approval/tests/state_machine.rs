@@ -44,12 +44,18 @@ fn arb_outcome() -> impl Strategy<Value = ApprovalOutcome> {
     prop_oneof![
         Just(ApprovalOutcome::Approved),
         Just(ApprovalOutcome::Denied),
-        (any::<String>(), proptest::option::of(any::<String>()), proptest::collection::vec(any::<String>(), 0..3))
-            .prop_map(|(cap, res, cons)| ApprovalOutcome::Narrowed(RequestedScope {
-                capability: cap,
-                resource_id: res,
-                constraints: cons,
-            })),
+        (
+            any::<String>(),
+            proptest::option::of(any::<String>()),
+            proptest::collection::vec(any::<String>(), 0..3)
+        )
+            .prop_map(
+                |(cap, res, cons)| ApprovalOutcome::Narrowed(RequestedScope {
+                    capability: cap,
+                    resource_id: res,
+                    constraints: cons,
+                })
+            ),
         any::<u64>().prop_map(|ttl| ApprovalOutcome::Always { ttl_seconds: ttl }),
     ]
 }
@@ -137,9 +143,24 @@ fn prop_apply_standing_idempotent_stub() {
 /// Verify ttl_elapsed: Pending → Expired; terminal states reject.
 #[test]
 fn ttl_elapsed_pending_to_expired() {
-    assert_eq!(ttl_elapsed(ApprovalStatus::Pending), Ok(ApprovalStatus::Expired));
-    assert_eq!(ttl_elapsed(ApprovalStatus::Approved), Err(TransitionError::AlreadyDecided));
-    assert_eq!(ttl_elapsed(ApprovalStatus::Denied), Err(TransitionError::AlreadyDecided));
-    assert_eq!(ttl_elapsed(ApprovalStatus::NarrowedAndApproved), Err(TransitionError::AlreadyDecided));
-    assert_eq!(ttl_elapsed(ApprovalStatus::Expired), Err(TransitionError::AlreadyDecided));
+    assert_eq!(
+        ttl_elapsed(ApprovalStatus::Pending),
+        Ok(ApprovalStatus::Expired)
+    );
+    assert_eq!(
+        ttl_elapsed(ApprovalStatus::Approved),
+        Err(TransitionError::AlreadyDecided)
+    );
+    assert_eq!(
+        ttl_elapsed(ApprovalStatus::Denied),
+        Err(TransitionError::AlreadyDecided)
+    );
+    assert_eq!(
+        ttl_elapsed(ApprovalStatus::NarrowedAndApproved),
+        Err(TransitionError::AlreadyDecided)
+    );
+    assert_eq!(
+        ttl_elapsed(ApprovalStatus::Expired),
+        Err(TransitionError::AlreadyDecided)
+    );
 }

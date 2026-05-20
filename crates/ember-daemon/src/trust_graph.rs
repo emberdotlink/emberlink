@@ -22,8 +22,8 @@ pub const EMBER_SYSTEMS_VALID_UNTIL: Option<i64> = None;
 #[derive(Debug, Clone)]
 pub struct PublisherKey {
     pub pubkey: VerifyingKey,
-    pub valid_from: i64,           // unix epoch seconds; 0 = since-genesis
-    pub valid_until: Option<i64>,  // unix epoch seconds; None = no upper bound
+    pub valid_from: i64,          // unix epoch seconds; 0 = since-genesis
+    pub valid_until: Option<i64>, // unix epoch seconds; None = no upper bound
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -41,10 +41,7 @@ pub enum TrustGraphError {
 /// a baked-in constant. All other DIDs return `PublisherNotTrusted` for v1
 /// (WoT walk is a stub — follow-up task wires it to the actual delegation
 /// graph). Per design (action namespace governance).
-pub fn resolve_publisher_pubkey(
-    did: &str,
-    build_ts: i64,
-) -> Result<PublisherKey, TrustGraphError> {
+pub fn resolve_publisher_pubkey(did: &str, build_ts: i64) -> Result<PublisherKey, TrustGraphError> {
     match did {
         "did:emberlink" => {
             // Validity window check.
@@ -54,13 +51,13 @@ pub fn resolve_publisher_pubkey(
                     build_ts,
                 });
             }
-            if let Some(until) = EMBER_SYSTEMS_VALID_UNTIL {
-                if build_ts > until {
-                    return Err(TrustGraphError::NoKeyInValidityWindow {
-                        did: did.to_string(),
-                        build_ts,
-                    });
-                }
+            if let Some(until) = EMBER_SYSTEMS_VALID_UNTIL
+                && build_ts > until
+            {
+                return Err(TrustGraphError::NoKeyInValidityWindow {
+                    did: did.to_string(),
+                    build_ts,
+                });
             }
             let pubkey = VerifyingKey::from_bytes(&EMBER_SYSTEMS_PUBKEY_BYTES)
                 .map_err(|e| TrustGraphError::InvalidPubkey(e.to_string()))?;

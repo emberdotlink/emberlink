@@ -2,12 +2,12 @@ use std::fmt::Write as _;
 
 use crate::activity_support::disclosure_payload_preview;
 use crate::commands::truncate_id;
+use core_event_types::EventType;
 use core_identity::disclosure_view;
+use core_principals::{RelayAdmission, RelayMode, TrustThreshold};
 use core_sync::{check_relay_admission, wrap_for_relay};
 use core_trust::queries;
 use core_trust::{derive_score, derive_score_for_recipient, explain};
-use core_event_types::{EventType};
-use core_principals::{RelayAdmission, RelayMode, TrustThreshold};
 
 use super::*;
 
@@ -706,12 +706,7 @@ impl DemoApp {
             .iter()
             .filter(|a| a.recipient_bound.is_none())
             .collect();
-        writeln!(
-            &mut out,
-            "Attestations loaded: {}",
-            visible.len()
-        )
-        .unwrap();
+        writeln!(&mut out, "Attestations loaded: {}", visible.len()).unwrap();
         if visible.is_empty() {
             writeln!(&mut out, "Attestations: none").unwrap();
         } else {
@@ -861,11 +856,8 @@ impl DemoApp {
         // -- Trust Network --
         // design: use trust_network() which excludes recipient-bound attestations.
         writeln!(&mut out, "── Trust Network ──").unwrap();
-        let graph = queries::trust_network(
-            &self.trust_attestations,
-            persona_id,
-            max_depth as usize,
-        );
+        let graph =
+            queries::trust_network(&self.trust_attestations, persona_id, max_depth as usize);
         writeln!(
             &mut out,
             "  {} nodes, {} edges (depth up to {})",
@@ -890,7 +882,8 @@ impl DemoApp {
         .unwrap();
         if let Some(session) = &self.recovery_session {
             let request_record = self
-                .app_runtime.store
+                .app_runtime
+                .store
                 .materialized()
                 .recovery_requests_current
                 .get(&session.request_id);
@@ -1195,7 +1188,11 @@ impl DemoApp {
             }
         }
 
-        let received = match self.app_runtime.store.local_received_presentation_artifacts() {
+        let received = match self
+            .app_runtime
+            .store
+            .local_received_presentation_artifacts()
+        {
             Ok(records) => records,
             Err(err) => {
                 writeln!(&mut out, "Received artifacts error: {}", err.message).unwrap();
@@ -1220,7 +1217,11 @@ impl DemoApp {
         writeln!(&mut out, "Received Artifacts").unwrap();
         writeln!(&mut out, "------------------").unwrap();
 
-        let records = match self.app_runtime.store.local_received_presentation_artifacts() {
+        let records = match self
+            .app_runtime
+            .store
+            .local_received_presentation_artifacts()
+        {
             Ok(records) => records,
             Err(err) => {
                 writeln!(&mut out, "Load error: {}", err.message).unwrap();
@@ -1239,7 +1240,10 @@ impl DemoApp {
             &records
         };
         for record in display_records {
-            let verification = self.app_runtime.store.verify_disclosure_issuer(&record.envelope);
+            let verification = self
+                .app_runtime
+                .store
+                .verify_disclosure_issuer(&record.envelope);
             writeln!(
                 &mut out,
                 "  - {}\tstatus {}\tverification {}\tissuer {}\t{}\t{}\tschema {}\treceipts {}\tlast-source {}\t{}",
@@ -1335,7 +1339,8 @@ impl DemoApp {
         writeln!(&mut out, "Relay mode: trust-gated").unwrap();
         writeln!(&mut out, "Threshold: 0.75").unwrap();
         if let Some(endpoint) = self
-            .app_runtime.store
+            .app_runtime
+            .store
             .materialized()
             .endpoint(&self.current_peer_id())
         {
@@ -1372,11 +1377,23 @@ impl DemoApp {
                 writeln!(&mut out, "Tracked peers: unavailable ({})", err.message).unwrap();
             }
         }
-        if self.app_runtime.store.materialized().endpoints_current.is_empty() {
+        if self
+            .app_runtime
+            .store
+            .materialized()
+            .endpoints_current
+            .is_empty()
+        {
             writeln!(&mut out, "Known endpoints: none").unwrap();
         } else {
             writeln!(&mut out, "Known endpoints:").unwrap();
-            for endpoint in self.app_runtime.store.materialized().endpoints_current.values() {
+            for endpoint in self
+                .app_runtime
+                .store
+                .materialized()
+                .endpoints_current
+                .values()
+            {
                 writeln!(
                     &mut out,
                     "  - {}\t{}\tvia {}",
@@ -1592,7 +1609,8 @@ impl DemoApp {
         writeln!(
             &mut out,
             "Message events: {}",
-            self.app_runtime.store
+            self.app_runtime
+                .store
                 .events()
                 .iter()
                 .filter(|event| event.event_type == EventType::MessageSent)
@@ -1602,7 +1620,8 @@ impl DemoApp {
         writeln!(
             &mut out,
             "Content events: {}",
-            self.app_runtime.store
+            self.app_runtime
+                .store
                 .events()
                 .iter()
                 .filter(|event| event.event_type == EventType::ContentPublished)
@@ -1612,7 +1631,11 @@ impl DemoApp {
         writeln!(
             &mut out,
             "Known endpoints: {}",
-            self.app_runtime.store.materialized().endpoints_current.len()
+            self.app_runtime
+                .store
+                .materialized()
+                .endpoints_current
+                .len()
         )
         .unwrap();
         writeln!(&mut out, "Roots in memory: {}", self.roots.len()).unwrap();
@@ -1635,7 +1658,8 @@ impl DemoApp {
         }
 
         if let Some(event) = self
-            .app_runtime.store
+            .app_runtime
+            .store
             .events()
             .iter()
             .find(|event| event.event_type == EventType::RootCreated)
@@ -1649,7 +1673,8 @@ impl DemoApp {
         }
 
         if let Some(event) = self
-            .app_runtime.store
+            .app_runtime
+            .store
             .events()
             .iter()
             .find(|event| event.event_type == EventType::PersonaCreated)

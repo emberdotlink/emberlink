@@ -59,9 +59,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use core_broker::{
-    Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential,
-};
+use core_broker::{Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
@@ -160,11 +158,7 @@ pub struct AzureScope {
 pub trait AzureHttpClient: Send + Sync {
     /// POST a `application/x-www-form-urlencoded` body to `url`. Used
     /// for the OAuth token endpoint.
-    async fn post_form(
-        &self,
-        url: &str,
-        body: String,
-    ) -> Result<(u16, String), String>;
+    async fn post_form(&self, url: &str, body: String) -> Result<(u16, String), String>;
 }
 
 /// Production [`AzureHttpClient`] backed by `reqwest`.
@@ -190,11 +184,7 @@ impl Default for ReqwestAzureClient {
 
 #[async_trait::async_trait]
 impl AzureHttpClient for ReqwestAzureClient {
-    async fn post_form(
-        &self,
-        url: &str,
-        body: String,
-    ) -> Result<(u16, String), String> {
+    async fn post_form(&self, url: &str, body: String) -> Result<(u16, String), String> {
         let resp = self
             .inner
             .post(url)
@@ -239,10 +229,7 @@ impl AzureCliBroker {
 
     /// Test constructor — accepts an arbitrary [`AzureHttpClient`] so
     /// unit tests can inject [`MockAzureClient`].
-    pub fn with_client(
-        sp: AzureServicePrincipal,
-        client: Arc<dyn AzureHttpClient>,
-    ) -> Self {
+    pub fn with_client(sp: AzureServicePrincipal, client: Arc<dyn AzureHttpClient>) -> Self {
         Self {
             sp,
             client,
@@ -439,8 +426,8 @@ fn map_azure_error(status: u16, body: &str) -> BrokerError {
         // / audience does not match any federated-credential trust
         // record on the SP app registration — a policy decision by AAD.
         let desc_upper = desc.to_ascii_uppercase();
-        let is_wif_assertion_failure = desc_upper.contains("AADSTS50012")
-            || desc_upper.contains("AADSTS70021");
+        let is_wif_assertion_failure =
+            desc_upper.contains("AADSTS50012") || desc_upper.contains("AADSTS70021");
         if is_wif_assertion_failure {
             return BrokerError::PolicyRejected(format!(
                 "Azure AD WIF assertion rejected ({code}): {desc} (status={status})"
@@ -467,9 +454,7 @@ fn map_azure_error(status: u16, body: &str) -> BrokerError {
             ));
         }
     }
-    BrokerError::Upstream(format!(
-        "Azure AD error (status={status}): {body}"
-    ))
+    BrokerError::Upstream(format!("Azure AD error (status={status}): {body}"))
 }
 
 impl Broker for AzureCliBroker {
@@ -644,11 +629,7 @@ impl Default for MockAzureClient {
 
 #[async_trait::async_trait]
 impl AzureHttpClient for MockAzureClient {
-    async fn post_form(
-        &self,
-        url: &str,
-        body: String,
-    ) -> Result<(u16, String), String> {
+    async fn post_form(&self, url: &str, body: String) -> Result<(u16, String), String> {
         self.calls
             .lock()
             .expect("mock azure mutex")
@@ -659,7 +640,9 @@ impl AzureHttpClient for MockAzureClient {
         } else if let Some(last) = q.last() {
             Ok(last.clone())
         } else {
-            Err(format!("MockAzureClient: no response queued for {url}; body={body}"))
+            Err(format!(
+                "MockAzureClient: no response queued for {url}; body={body}"
+            ))
         }
     }
 }
@@ -741,19 +724,13 @@ mod tests {
 
     #[test]
     fn provider_returns_azure_cli() {
-        let broker = AzureCliBroker::with_client(
-            fixture_sp(),
-            Arc::new(MockAzureClient::new()),
-        );
+        let broker = AzureCliBroker::with_client(fixture_sp(), Arc::new(MockAzureClient::new()));
         assert_eq!(broker.provider(), BrokerProvider::AzureCli);
     }
 
     #[test]
     fn token_url_embeds_tenant_id() {
-        let broker = AzureCliBroker::with_client(
-            fixture_sp(),
-            Arc::new(MockAzureClient::new()),
-        );
+        let broker = AzureCliBroker::with_client(fixture_sp(), Arc::new(MockAzureClient::new()));
         assert_eq!(
             broker.token_url(),
             "https://login.microsoftonline.com/11111111-2222-3333-4444-555555555555/oauth2/v2.0/token"
@@ -834,9 +811,7 @@ mod tests {
 
     #[tokio::test]
     async fn issue_success_returns_bearer_token() {
-        let mock = Arc::new(
-            MockAzureClient::new().with_response(200, token_ok_body()),
-        );
+        let mock = Arc::new(MockAzureClient::new().with_response(200, token_ok_body()));
         let broker = AzureCliBroker::with_client(fixture_sp(), mock.clone());
         let req = azure_request(
             serde_json::json!({
@@ -846,22 +821,25 @@ mod tests {
             }),
             3600,
         );
-        let cred = Broker::issue(&broker, req).await.expect("issue must succeed");
+        let cred = Broker::issue(&broker, req)
+            .await
+            .expect("issue must succeed");
         assert_eq!(
             cred.token.expose_secret(),
             "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.fake-azure-token"
         );
         assert!(
-            cred.materialization_id.starts_with("azure-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee-"),
+            cred.materialization_id
+                .starts_with("azure-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee-"),
             "materialization_id includes client_id: {}",
             cred.materialization_id
         );
         assert_eq!(broker.active_count(), 1);
         assert_eq!(mock.call_count(), 1);
         assert!(
-            mock.last_url()
-                .unwrap()
-                .contains("login.microsoftonline.com/11111111-2222-3333-4444-555555555555/oauth2/v2.0/token"),
+            mock.last_url().unwrap().contains(
+                "login.microsoftonline.com/11111111-2222-3333-4444-555555555555/oauth2/v2.0/token"
+            ),
             "request URL must include tenant id: {}",
             mock.last_url().unwrap()
         );
@@ -869,9 +847,7 @@ mod tests {
 
     #[tokio::test]
     async fn issue_with_empty_resource_uses_default() {
-        let mock = Arc::new(
-            MockAzureClient::new().with_response(200, token_ok_body()),
-        );
+        let mock = Arc::new(MockAzureClient::new().with_response(200, token_ok_body()));
         let broker = AzureCliBroker::with_client(fixture_sp(), mock.clone());
         let req = azure_request(
             serde_json::json!({
@@ -881,7 +857,9 @@ mod tests {
             }),
             3600,
         );
-        Broker::issue(&broker, req).await.expect("issue must succeed");
+        Broker::issue(&broker, req)
+            .await
+            .expect("issue must succeed");
         let body = mock.last_body().expect("call recorded");
         assert!(
             body.contains("scope=https%3A%2F%2Fmanagement.azure.com%2F.default"),
@@ -891,9 +869,7 @@ mod tests {
 
     #[tokio::test]
     async fn issue_invalid_client_returns_policy_rejected() {
-        let mock = Arc::new(
-            MockAzureClient::new().with_response(401, invalid_client_body()),
-        );
+        let mock = Arc::new(MockAzureClient::new().with_response(401, invalid_client_body()));
         let broker = AzureCliBroker::with_client(fixture_sp(), mock);
         let req = azure_request(
             serde_json::json!({
@@ -912,9 +888,7 @@ mod tests {
 
     #[tokio::test]
     async fn issue_invalid_scope_returns_upstream() {
-        let mock = Arc::new(
-            MockAzureClient::new().with_response(400, invalid_scope_body()),
-        );
+        let mock = Arc::new(MockAzureClient::new().with_response(400, invalid_scope_body()));
         let broker = AzureCliBroker::with_client(fixture_sp(), mock);
         let req = azure_request(
             serde_json::json!({
@@ -938,9 +912,7 @@ mod tests {
 
     #[tokio::test]
     async fn issue_invalid_grant_on_expired_secret_returns_upstream() {
-        let mock = Arc::new(
-            MockAzureClient::new().with_response(400, invalid_grant_body()),
-        );
+        let mock = Arc::new(MockAzureClient::new().with_response(400, invalid_grant_body()));
         let broker = AzureCliBroker::with_client(fixture_sp(), mock);
         let req = azure_request(
             serde_json::json!({
@@ -965,10 +937,7 @@ mod tests {
 
     #[tokio::test]
     async fn issue_with_zero_ttl_returns_invalid_scope_error() {
-        let broker = AzureCliBroker::with_client(
-            fixture_sp(),
-            Arc::new(MockAzureClient::new()),
-        );
+        let broker = AzureCliBroker::with_client(fixture_sp(), Arc::new(MockAzureClient::new()));
         let req = azure_request(
             serde_json::json!({
                 "resource": "https://management.azure.com/",
@@ -983,10 +952,7 @@ mod tests {
 
     #[tokio::test]
     async fn issue_with_wrong_provider_in_request_is_rejected() {
-        let broker = AzureCliBroker::with_client(
-            fixture_sp(),
-            Arc::new(MockAzureClient::new()),
-        );
+        let broker = AzureCliBroker::with_client(fixture_sp(), Arc::new(MockAzureClient::new()));
         let mut req = azure_request(
             serde_json::json!({
                 "resource": "https://management.azure.com/",
@@ -1002,9 +968,7 @@ mod tests {
 
     #[tokio::test]
     async fn revoke_drops_state_returns_ok_with_warn() {
-        let mock = Arc::new(
-            MockAzureClient::new().with_response(200, token_ok_body()),
-        );
+        let mock = Arc::new(MockAzureClient::new().with_response(200, token_ok_body()));
         let broker = AzureCliBroker::with_client(fixture_sp(), mock.clone());
         let cred = Broker::issue(
             &broker,
@@ -1033,10 +997,7 @@ mod tests {
 
     #[tokio::test]
     async fn revoke_unknown_id_returns_unknown_materialization() {
-        let broker = AzureCliBroker::with_client(
-            fixture_sp(),
-            Arc::new(MockAzureClient::new()),
-        );
+        let broker = AzureCliBroker::with_client(fixture_sp(), Arc::new(MockAzureClient::new()));
         let err = Broker::revoke(&broker, "does-not-exist").await.unwrap_err();
         assert!(matches!(err, BrokerError::UnknownMaterialization(_)));
     }
@@ -1126,8 +1087,7 @@ mod tests {
             scope: vec![],
             ttl_seconds: 3600,
         };
-        let body =
-            azure_workload_identity_exchange(&sp, &token_path, &scope).expect("build body");
+        let body = azure_workload_identity_exchange(&sp, &token_path, &scope).expect("build body");
         assert!(body.contains("grant_type=client_credentials"));
         assert!(body.contains("client_id=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
         // client_assertion_type is the jwt-bearer URN, percent-encoded.
@@ -1158,8 +1118,7 @@ mod tests {
         let token_path = write_oidc_token(tmp.path(), &raw);
         let sp = fixture_sp_wif(token_path.clone());
         let scope = AzureScope::default();
-        let body =
-            azure_workload_identity_exchange(&sp, &token_path, &scope).expect("build body");
+        let body = azure_workload_identity_exchange(&sp, &token_path, &scope).expect("build body");
         assert!(
             body.contains(&format!("client_assertion={}", fake_oidc_jwt())),
             "trailing newline must be trimmed before submission: {body}"
@@ -1192,8 +1151,7 @@ mod tests {
         let token_path = write_oidc_token(tmp.path(), "   \n  \t");
         let sp = fixture_sp_wif(token_path.clone());
         let scope = AzureScope::default();
-        let err =
-            azure_workload_identity_exchange(&sp, &token_path, &scope).unwrap_err();
+        let err = azure_workload_identity_exchange(&sp, &token_path, &scope).unwrap_err();
         assert!(
             matches!(err, BrokerError::Upstream(_)),
             "whitespace-only token must surface as Upstream, got {err:?}"
@@ -1204,11 +1162,8 @@ mod tests {
     async fn issue_with_federated_identity_succeeds_and_submits_client_assertion() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let token_path = write_oidc_token(tmp.path(), fake_oidc_jwt());
-        let mock = Arc::new(
-            MockAzureClient::new().with_response(200, token_ok_body()),
-        );
-        let broker =
-            AzureCliBroker::with_client(fixture_sp_wif(token_path), mock.clone());
+        let mock = Arc::new(MockAzureClient::new().with_response(200, token_ok_body()));
+        let broker = AzureCliBroker::with_client(fixture_sp_wif(token_path), mock.clone());
         let req = azure_request(
             serde_json::json!({
                 "resource": "https://management.azure.com/",
@@ -1217,8 +1172,9 @@ mod tests {
             }),
             3600,
         );
-        let cred =
-            Broker::issue(&broker, req).await.expect("WIF issue must succeed");
+        let cred = Broker::issue(&broker, req)
+            .await
+            .expect("WIF issue must succeed");
         assert_eq!(
             cred.token.expose_secret(),
             "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.fake-azure-token"
@@ -1247,10 +1203,7 @@ mod tests {
                 .with_response(200, token_ok_body())
                 .with_response(200, token_ok_body()),
         );
-        let broker = AzureCliBroker::with_client(
-            fixture_sp_wif(token_path.clone()),
-            mock.clone(),
-        );
+        let broker = AzureCliBroker::with_client(fixture_sp_wif(token_path.clone()), mock.clone());
 
         // First call uses "first-token-value".
         Broker::issue(
@@ -1269,8 +1222,7 @@ mod tests {
 
         // Rotate the on-disk token (kubelet projected-token refresh,
         // GH Actions step boundary, etc.).
-        std::fs::write(&token_path, "second-token-value")
-            .expect("rotate OIDC token");
+        std::fs::write(&token_path, "second-token-value").expect("rotate OIDC token");
 
         Broker::issue(
             &broker,
@@ -1290,7 +1242,12 @@ mod tests {
         // rotated token, proving the broker re-reads the file fresh
         // rather than caching from the first issue.
         let calls = mock.calls.lock().expect("mock azure mutex");
-        assert_eq!(calls.len(), 2, "two HTTP calls expected, got {}", calls.len());
+        assert_eq!(
+            calls.len(),
+            2,
+            "two HTTP calls expected, got {}",
+            calls.len()
+        );
         assert!(
             calls[0].1.contains("client_assertion=first-token-value"),
             "first call must carry first-token: {}",
@@ -1339,9 +1296,7 @@ mod tests {
     async fn issue_with_federated_identity_aadsts50012_returns_policy_rejected() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let token_path = write_oidc_token(tmp.path(), fake_oidc_jwt());
-        let mock = Arc::new(
-            MockAzureClient::new().with_response(401, aadsts50012_body()),
-        );
+        let mock = Arc::new(MockAzureClient::new().with_response(401, aadsts50012_body()));
         let broker = AzureCliBroker::with_client(fixture_sp_wif(token_path), mock);
         let req = azure_request(
             serde_json::json!({

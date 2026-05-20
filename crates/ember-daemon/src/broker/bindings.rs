@@ -1,8 +1,8 @@
 //! Daemon-controlled credential-target allowlist — CRUD over the
 //! `credential_bindings` table.
 //!
-//! implementation-note-87 — foundation subtask of
-//! implementation-note-88. A binding ties a principal
+//! implementation-note-110 — foundation subtask of
+//! implementation-note-111. A binding ties a principal
 //! (persona UUID) + working-tree (canonical absolute path of a repo
 //! root) + remote-name (e.g. `"origin"`) to the remote URL the broker
 //! is authorized to inject credentials for. The broker consults this
@@ -18,7 +18,7 @@
 //! All five CRUD helpers are free functions over a `&DaemonStore`
 //! handle — same shape as `infra/audit.rs::append_audit_event_with_chain`.
 
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 
 use crate::infra::store::{DaemonStore, StoreError};
 

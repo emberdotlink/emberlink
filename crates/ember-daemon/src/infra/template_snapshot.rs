@@ -18,7 +18,7 @@
 //!
 //! No Vault coupling, no Receipt-body wiring, no handler.rs dispatch.
 //!
-//! **Phase 2** (follow-up `implementation-note-223`) wires
+//! **Phase 2** (follow-up `implementation-note-312`) wires
 //! `store(scope, canonical_bytes)` and `fetch(scope, hash)` through the
 //! `VaultScope`-aware vault, extends the `headless_enrollment` Receipt body
 //! with `template_snapshot_hash`, and lands the Receipt-kind catalog entry.
@@ -118,10 +118,7 @@ mod tests {
     fn canonicalize_sorts_keys_recursively() {
         let outer_reversed = br#"{"z":{"y":2,"x":1},"a":1}"#;
         let outer_ordered = br#"{"a":1,"z":{"x":1,"y":2}}"#;
-        assert_eq!(
-            canonicalize(outer_reversed),
-            canonicalize(outer_ordered)
-        );
+        assert_eq!(canonicalize(outer_reversed), canonicalize(outer_ordered));
     }
 
     #[test]

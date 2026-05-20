@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_DELEGATION_DEPTH: u32 = 8;
 
-/// Grant schema version pinned by this daemon build (implementation-note-38).
+/// Grant schema version pinned by this daemon build (implementation-note-51).
 ///
 /// Every `Grant` consumed at a broker entry point must carry a
 /// `schema_version` equal to this constant. A mismatch is refused with
@@ -147,7 +147,7 @@ pub struct Grant {
     pub delegation_depth: u32,
     pub usage: Usage,
     /// Schema version this grant was minted under
-    /// (implementation-note-38).
+    /// (implementation-note-51).
     ///
     /// Defaults to [`GRANT_SCHEMA_VERSION_PIN`] when missing on
     /// deserialization (pre-field on-disk records). The broker boundary
@@ -249,7 +249,10 @@ pub fn delegate(grant: &Grant, narrowed_scope: Scope) -> Result<Grant, GrantErro
 /// **Post:** returned grant has `usage` incremented by `amount`; usage is monotonic.
 /// **Rejects:** `state != Active` → `GrantError::InvalidState`.
 /// **Rejects:** budget exhausted → `GrantError::BudgetExhausted`.
-pub fn use_grant(mut grant: Grant, amount: UsageDelta) -> Result<(Grant, UsageReceipt), GrantError> {
+pub fn use_grant(
+    mut grant: Grant,
+    amount: UsageDelta,
+) -> Result<(Grant, UsageReceipt), GrantError> {
     if grant.state != GrantState::Active {
         return Err(GrantError::InvalidState);
     }

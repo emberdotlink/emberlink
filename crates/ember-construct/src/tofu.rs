@@ -59,9 +59,7 @@ pub(crate) fn strip_global_flags(argv: &[String]) -> Vec<String> {
         // shouldn't have `=value` but accept it tolerantly).
         if let Some(eq) = tok.find('=') {
             let name = &tok[..eq];
-            if VALUE_BEARING_GLOBAL_FLAGS.contains(&name)
-                || BOOLEAN_GLOBAL_FLAGS.contains(&name)
-            {
+            if VALUE_BEARING_GLOBAL_FLAGS.contains(&name) || BOOLEAN_GLOBAL_FLAGS.contains(&name) {
                 i += 1;
                 continue;
             }
@@ -142,9 +140,7 @@ pub fn classify_tofu_argv(argv: &[String]) -> Option<ActionKey> {
                 "list" | "show" | "pull" => None,
                 "rm" => Some(ActionKey("tofu.state.rm".to_string())),
                 "mv" => Some(ActionKey("tofu.state.mv".to_string())),
-                "replace-provider" => {
-                    Some(ActionKey("tofu.state.replace-provider".to_string()))
-                }
+                "replace-provider" => Some(ActionKey("tofu.state.replace-provider".to_string())),
                 "push" => Some(ActionKey("tofu.state.push".to_string())),
                 _ => None,
             }
@@ -204,8 +200,7 @@ mod tests {
 
     #[test]
     fn import_classified() {
-        let r =
-            classify_tofu_argv(&args(&["import", "aws_s3_bucket.b", "my-bucket"])).unwrap();
+        let r = classify_tofu_argv(&args(&["import", "aws_s3_bucket.b", "my-bucket"])).unwrap();
         assert_eq!(r.0, "tofu.import");
     }
 
@@ -229,8 +224,7 @@ mod tests {
 
     #[test]
     fn force_unlock_classified() {
-        let r =
-            classify_tofu_argv(&args(&["force-unlock", "lock-id"])).unwrap();
+        let r = classify_tofu_argv(&args(&["force-unlock", "lock-id"])).unwrap();
         assert_eq!(r.0, "tofu.force-unlock");
     }
 
@@ -244,13 +238,8 @@ mod tests {
 
     #[test]
     fn state_mv_classified() {
-        let r = classify_tofu_argv(&args(&[
-            "state",
-            "mv",
-            "aws_instance.a",
-            "aws_instance.b",
-        ]))
-        .unwrap();
+        let r = classify_tofu_argv(&args(&["state", "mv", "aws_instance.a", "aws_instance.b"]))
+            .unwrap();
         assert_eq!(r.0, "tofu.state.mv");
     }
 
@@ -279,9 +268,7 @@ mod tests {
 
     #[test]
     fn state_show_passthrough() {
-        assert!(
-            classify_tofu_argv(&args(&["state", "show", "aws_instance.foo"])).is_none()
-        );
+        assert!(classify_tofu_argv(&args(&["state", "show", "aws_instance.foo"])).is_none());
     }
 
     #[test]
@@ -390,8 +377,7 @@ mod tests {
     fn chdir_value_form_stripped() {
         // `-chdir <dir>` (space-separated) — also stripped (both flag
         // and value).
-        let r =
-            classify_tofu_argv(&args(&["-chdir", "infra/prod", "apply"])).unwrap();
+        let r = classify_tofu_argv(&args(&["-chdir", "infra/prod", "apply"])).unwrap();
         assert_eq!(r.0, "tofu.apply");
     }
 

@@ -35,7 +35,7 @@ impl TokenPricing {
     /// by floor-dividing micro-cents to whole cents — kept for callers and
     /// tests that only need the human-readable cent value. Use
     /// `cents_micro_for` when the value will be summed across calls or
-    /// compared to a budget cap (implementation-note-32: per-side
+    /// compared to a budget cap (implementation-note-45: per-side
     /// truncation zeroed every sub-cent call, making the cap unreachable).
     pub fn cents_for(&self, input_tokens: u64, output_tokens: u64) -> u64 {
         self.cents_micro_for(input_tokens, output_tokens) / 1_000_000
@@ -59,7 +59,7 @@ impl TokenPricing {
 /// price as `claude-haiku-4-5`. Without this, the pricing match falls
 /// through to `UNKNOWN { 0, 0 }` every time Anthropic rolls a new
 /// date-pinned alias and budget enforcement silently breaks at the wire
-/// (implementation-note-32: shipped on `claude-haiku-4-5-20251001`).
+/// (implementation-note-45: shipped on `claude-haiku-4-5-20251001`).
 ///
 /// Only matches Anthropic's `-YYYYMMDD` shape (8 digits, no separators).
 /// OpenAI's `-YYYY-MM-DD` form has internal hyphens and falls through
@@ -85,8 +85,13 @@ fn strip_anthropic_date_suffix(model: &str) -> Option<&str> {
 /// dependency for the metering hot path.
 pub fn pricing_for(provider: &str, model: &str) -> TokenPricing {
     let exact = pricing_for_exact(provider, model);
-    if !matches!(exact, TokenPricing { input_cents_per_million: 0, output_cents_per_million: 0 })
-    {
+    if !matches!(
+        exact,
+        TokenPricing {
+            input_cents_per_million: 0,
+            output_cents_per_million: 0
+        }
+    ) {
         return exact;
     }
     // Fallback: strip a `-YYYYMMDD` Anthropic date suffix and retry once
@@ -95,8 +100,13 @@ pub fn pricing_for(provider: &str, model: &str) -> TokenPricing {
     // (no bare-name parent) still resolve correctly.
     if let Some(stripped) = strip_anthropic_date_suffix(model) {
         let retry = pricing_for_exact(provider, stripped);
-        if !matches!(retry, TokenPricing { input_cents_per_million: 0, output_cents_per_million: 0 })
-        {
+        if !matches!(
+            retry,
+            TokenPricing {
+                input_cents_per_million: 0,
+                output_cents_per_million: 0
+            }
+        ) {
             return retry;
         }
     }
@@ -114,11 +124,12 @@ fn pricing_for_exact(provider: &str, model: &str) -> TokenPricing {
     match (provider, model) {
         // --- Anthropic ---
         // Opus (4.5): $15/MTok input, $75/MTok output = 1500 / 7500 cents.
-        ("anthropic", "claude-opus-4-5")
-        | ("anthropic", "claude-opus-4-5-20250514") => TokenPricing {
-            input_cents_per_million: 1_500,
-            output_cents_per_million: 7_500,
-        },
+        ("anthropic", "claude-opus-4-5") | ("anthropic", "claude-opus-4-5-20250514") => {
+            TokenPricing {
+                input_cents_per_million: 1_500,
+                output_cents_per_million: 7_500,
+            }
+        }
         // Opus 4.6 / 4.7 — successive generations retain the 4.5 price point
         // until Anthropic publishes revised rates. When they do, swap the
         // constants here; callers don't need to change.
@@ -139,11 +150,12 @@ fn pricing_for_exact(provider: &str, model: &str) -> TokenPricing {
             output_cents_per_million: 1_500,
         },
         // Haiku 4.5: $1/MTok input, $5/MTok output = 100 / 500 cents.
-        ("anthropic", "claude-haiku-4-5")
-        | ("anthropic", "claude-haiku-4-5-20250514") => TokenPricing {
-            input_cents_per_million: 100,
-            output_cents_per_million: 500,
-        },
+        ("anthropic", "claude-haiku-4-5") | ("anthropic", "claude-haiku-4-5-20250514") => {
+            TokenPricing {
+                input_cents_per_million: 100,
+                output_cents_per_million: 500,
+            }
+        }
         // Haiku 3 (legacy): $0.25/MTok input, $1.25/MTok output = 25 / 125 cents.
         // Used by the May 3 YC composite-grant demo runner — without an entry
         // here the pricing lookup falls through to UNKNOWN { 0, 0 } and the
@@ -195,12 +207,7 @@ pub fn cents_for(model: &str, provider: &str, input_tokens: u64, output_tokens: 
 /// Sister to [`cents_for`]; use this when the value will be summed across
 /// calls or compared against a budget cap. See `Usage::cents_micro` for
 /// the load-bearing rationale.
-pub fn cents_micro_for(
-    model: &str,
-    provider: &str,
-    input_tokens: u64,
-    output_tokens: u64,
-) -> u64 {
+pub fn cents_micro_for(model: &str, provider: &str, input_tokens: u64, output_tokens: u64) -> u64 {
     pricing_for(provider, model).cents_micro_for(input_tokens, output_tokens)
 }
 
@@ -288,7 +295,9 @@ fn parse_anthropic_usage(usage: &serde_json::Value) -> Option<ParsedUsage> {
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
     Some(ParsedUsage {
-        input_tokens: input.saturating_add(cache_create).saturating_add(cache_read),
+        input_tokens: input
+            .saturating_add(cache_create)
+            .saturating_add(cache_read),
         output_tokens: output,
     })
 }
@@ -807,9 +816,10 @@ pub fn extract_model(provider: &str, body: &[u8]) -> Option<String> {
     if looks_like_json(body) {
         let value: serde_json::Value = serde_json::from_slice(body).ok()?;
         return match provider {
-            PROVIDER_ANTHROPIC | PROVIDER_OPENAI => {
-                value.get("model").and_then(|v| v.as_str()).map(String::from)
-            }
+            PROVIDER_ANTHROPIC | PROVIDER_OPENAI => value
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(String::from),
             _ => None,
         };
     }
@@ -899,7 +909,7 @@ mod tests {
         // Haiku 3 (legacy, used by May-3 demo runner): 25/125 per MTok.
         // 1M+1M = 150 cents. Regression guard against the bug where this
         // model fell through to UNKNOWN { 0, 0 } and the cents budget
-        // never incremented. (implementation-note-240)
+        // never incremented. (implementation-note-336)
         assert_eq!(
             cents_for("claude-3-haiku-20240307", "anthropic", 1_000_000, 1_000_000),
             150
@@ -921,7 +931,7 @@ mod tests {
         assert_eq!(cents_for("gpt-4.1", "openai", 1_000_000, 1_000_000), 1_500);
     }
 
-    /// implementation-note-32 regression: a date-pinned Anthropic
+    /// implementation-note-45 regression: a date-pinned Anthropic
     /// model alias must bill at the same rate as its bare-name parent.
     /// Before the fix the pricing match fell through to UNKNOWN { 0, 0 }
     /// and budget enforcement silently broke at the wire — every Anthropic
@@ -933,17 +943,32 @@ mod tests {
     fn pricing_date_pinned_anthropic_aliases_match_family_rate() {
         // Haiku 4.5 — May 3 demo runner ships against this date alias.
         assert_eq!(
-            cents_for("claude-haiku-4-5-20251001", "anthropic", 1_000_000, 1_000_000),
+            cents_for(
+                "claude-haiku-4-5-20251001",
+                "anthropic",
+                1_000_000,
+                1_000_000
+            ),
             600,
         );
         // Hypothetical future date pin must also match without a table edit.
         assert_eq!(
-            cents_for("claude-haiku-4-5-20260315", "anthropic", 1_000_000, 1_000_000),
+            cents_for(
+                "claude-haiku-4-5-20260315",
+                "anthropic",
+                1_000_000,
+                1_000_000
+            ),
             600,
         );
         // Sonnet 4.6 with a future date pin.
         assert_eq!(
-            cents_for("claude-sonnet-4-6-20260101", "anthropic", 1_000_000, 1_000_000),
+            cents_for(
+                "claude-sonnet-4-6-20260101",
+                "anthropic",
+                1_000_000,
+                1_000_000
+            ),
             1_800,
         );
         // Strip helper itself.
@@ -1077,7 +1102,8 @@ mod tests {
 
     #[test]
     fn extract_model_works_for_known_providers() {
-        let anth = br#"{"model": "claude-opus-4-5", "usage": {"input_tokens": 1, "output_tokens": 2}}"#;
+        let anth =
+            br#"{"model": "claude-opus-4-5", "usage": {"input_tokens": 1, "output_tokens": 2}}"#;
         assert_eq!(
             extract_model(PROVIDER_ANTHROPIC, anth).as_deref(),
             Some("claude-opus-4-5")

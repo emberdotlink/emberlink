@@ -64,10 +64,16 @@ impl CloudflareBroker {
     /// Trailing slash is normalized off so the URL builder can append
     /// `/user/tokens` paths uniformly.
     pub fn with_base_url(admin_token: SecretString, base_url: String) -> Self {
-        let http = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(10))
-            .timeout_read(Duration::from_secs(30))
-            .build();
+        // ureq v3: disable http_status_as_error so 4xx/5xx come back as
+        // Ok(Response) with a non-success status, matching the v2
+        // body-on-error behavior the upstream-error reporting here
+        // depends on (see anthropic.rs for full rationale).
+        let http: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_connect(Some(Duration::from_secs(10)))
+            .timeout_recv_response(Some(Duration::from_secs(30)))
+            .http_status_as_error(false)
+            .build()
+            .into();
         Self {
             admin_token,
             http,
@@ -139,27 +145,30 @@ impl Broker for CloudflareBroker {
         let resp = self
             .http
             .post(&url)
-            .set("Authorization", &self.auth_header())
-            .set("Content-Type", "application/json")
+            .header("Authorization", &self.auth_header())
+            .header("Content-Type", "application/json")
             .send_json(body);
 
         let body_text = match resp {
-            Ok(r) => r
-                .into_string()
-                .map_err(|e| BrokerError::Upstream(format!("read body: {e}")))?,
-            Err(ureq::Error::Status(code, r)) => {
-                let body = r.into_string().unwrap_or_default();
-                return Err(BrokerError::Upstream(format!(
-                    "cloudflare POST /user/tokens returned {code}: {body}"
-                )));
+            Ok(mut r) => {
+                let status = r.status();
+                let body = r
+                    .body_mut()
+                    .read_to_string()
+                    .map_err(|e| BrokerError::Upstream(format!("read body: {e}")))?;
+                if !status.is_success() {
+                    return Err(BrokerError::Upstream(format!(
+                        "cloudflare POST /user/tokens returned {}: {body}",
+                        status.as_u16()
+                    )));
+                }
+                body
             }
             Err(e) => return Err(BrokerError::Upstream(format!("transport: {e}"))),
         };
 
         let parsed: TokenResponse = serde_json::from_str(&body_text).map_err(|e| {
-            BrokerError::Upstream(format!(
-                "decode token response: {e}; body={body_text}"
-            ))
+            BrokerError::Upstream(format!("decode token response: {e}; body={body_text}"))
         })?;
 
         if !parsed.success {
@@ -197,30 +206,26 @@ impl Broker for CloudflareBroker {
         let resp = self
             .http
             .delete(&url)
-            .set("Authorization", &self.auth_header())
-            .set("Content-Type", "application/json")
+            .header("Authorization", &self.auth_header())
+            .header("Content-Type", "application/json")
             .call();
 
         match resp {
-            Ok(r) => {
-                let code = r.status();
+            Ok(mut r) => {
+                let code = r.status().as_u16();
                 if code == 200 || code == 204 {
                     Ok(())
+                } else if code == 404 {
+                    Err(BrokerError::UnknownMaterialization(
+                        materialization_id.to_string(),
+                    ))
                 } else {
+                    let body = r.body_mut().read_to_string().unwrap_or_default();
                     Err(BrokerError::Upstream(format!(
-                        "unexpected status {code} from DELETE /user/tokens"
+                        "cloudflare DELETE /user/tokens/{materialization_id} \
+                         returned {code}: {body}"
                     )))
                 }
-            }
-            Err(ureq::Error::Status(404, _)) => Err(BrokerError::UnknownMaterialization(
-                materialization_id.to_string(),
-            )),
-            Err(ureq::Error::Status(code, r)) => {
-                let body = r.into_string().unwrap_or_default();
-                Err(BrokerError::Upstream(format!(
-                    "cloudflare DELETE /user/tokens/{materialization_id} \
-                     returned {code}: {body}"
-                )))
             }
             Err(e) => Err(BrokerError::Upstream(format!("transport: {e}"))),
         }
@@ -402,7 +407,11 @@ mod tests {
         let cred = block_on(broker.issue(cf_request("demo-token"))).expect("issue ok");
 
         handle.join().expect("server thread");
-        let req = captured.lock().expect("captured").clone().expect("captured req");
+        let req = captured
+            .lock()
+            .expect("captured")
+            .clone()
+            .expect("captured req");
 
         assert_eq!(req.method, "POST");
         assert_eq!(req.path, "/user/tokens");
@@ -428,8 +437,7 @@ mod tests {
         let captured: Arc<Mutex<Option<CapturedRequest>>> = Arc::new(Mutex::new(None));
         let (base, handle) = spawn_one_shot(canned, captured);
 
-        let broker =
-            CloudflareBroker::with_base_url(SecretString::from("tok".to_string()), base);
+        let broker = CloudflareBroker::with_base_url(SecretString::from("tok".to_string()), base);
         let err = block_on(broker.issue(cf_request("bad"))).expect_err("must fail");
         handle.join().expect("server thread");
         match err {
@@ -454,8 +462,7 @@ mod tests {
         let captured: Arc<Mutex<Option<CapturedRequest>>> = Arc::new(Mutex::new(None));
         let (base, handle) = spawn_one_shot(canned, captured);
 
-        let broker =
-            CloudflareBroker::with_base_url(SecretString::from("tok".to_string()), base);
+        let broker = CloudflareBroker::with_base_url(SecretString::from("tok".to_string()), base);
         let err = block_on(broker.issue(cf_request("bad"))).expect_err("must fail");
         handle.join().expect("server thread");
         match err {
@@ -475,12 +482,15 @@ mod tests {
         let captured: Arc<Mutex<Option<CapturedRequest>>> = Arc::new(Mutex::new(None));
         let (base, handle) = spawn_one_shot(canned, captured.clone());
 
-        let broker =
-            CloudflareBroker::with_base_url(SecretString::from("tok".to_string()), base);
+        let broker = CloudflareBroker::with_base_url(SecretString::from("tok".to_string()), base);
         block_on(broker.revoke("cf-token-id-ZZZ")).expect("revoke ok");
 
         handle.join().expect("server thread");
-        let req = captured.lock().expect("captured").clone().expect("captured req");
+        let req = captured
+            .lock()
+            .expect("captured")
+            .clone()
+            .expect("captured req");
         assert_eq!(req.method, "DELETE");
         assert_eq!(req.path, "/user/tokens/cf-token-id-ZZZ");
         assert_eq!(req.auth.as_deref(), Some("Bearer tok"));
@@ -496,8 +506,7 @@ mod tests {
         let captured: Arc<Mutex<Option<CapturedRequest>>> = Arc::new(Mutex::new(None));
         let (base, handle) = spawn_one_shot(canned, captured);
 
-        let broker =
-            CloudflareBroker::with_base_url(SecretString::from("tok".to_string()), base);
+        let broker = CloudflareBroker::with_base_url(SecretString::from("tok".to_string()), base);
         let err = block_on(broker.revoke("does-not-exist")).expect_err("must fail");
         handle.join().expect("server thread");
         match err {

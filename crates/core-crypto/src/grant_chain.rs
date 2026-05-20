@@ -5,9 +5,7 @@
 use crate::DOMAIN_GRANT_CHAIN;
 use core_grant_types::{Block, SignedBlock};
 use core_types::CanonicalEncode;
-use ed25519_dalek::{
-    Signature as DalekSignature, Signer as DalekSigner, SigningKey, VerifyingKey,
-};
+use ed25519_dalek::{Signature as DalekSignature, Signer as DalekSigner, SigningKey, VerifyingKey};
 use getrandom::fill as os_fill;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -57,7 +55,10 @@ impl std::fmt::Display for ChainError {
                 write!(f, "signature verification failed at block {block_index}")
             }
             Self::RootKeyMismatch => {
-                write!(f, "block 0 signature does not verify against the declared root public key")
+                write!(
+                    f,
+                    "block 0 signature does not verify against the declared root public key"
+                )
             }
             Self::EmptyChain => write!(f, "grant chain must contain at least one block"),
             Self::ChainUnsigned { block_index } => write!(
@@ -82,8 +83,7 @@ pub const UNSIGNED_PHASE1_PLACEHOLDER: &str = "unsigned-phase1";
 /// returning `SignatureMismatch` (which would be a lie — nothing was
 /// signed at all).
 fn is_unsigned_phase1(sb: &SignedBlock) -> bool {
-    sb.signature == UNSIGNED_PHASE1_PLACEHOLDER
-        || sb.pubkey_next == UNSIGNED_PHASE1_PLACEHOLDER
+    sb.signature == UNSIGNED_PHASE1_PLACEHOLDER || sb.pubkey_next == UNSIGNED_PHASE1_PLACEHOLDER
 }
 
 const PUBKEY_HEX_LEN: usize = 64; // 32 bytes * 2 hex chars
@@ -115,7 +115,10 @@ impl PubkeyNextKeyPair {
         let public_hex = hex::encode(verifying_key.to_bytes());
         let secret_hex = hex::encode(seed);
         seed.zeroize();
-        Self { public_hex, secret_hex }
+        Self {
+            public_hex,
+            secret_hex,
+        }
     }
 
     /// Rebuild from hex strings. Rejects malformed encodings eagerly.
@@ -127,7 +130,10 @@ impl PubkeyNextKeyPair {
         let secret_hex = secret_hex.into();
         let _ = decode_secret(&secret_hex)?;
         let _ = decode_pubkey(&public_hex)?;
-        Ok(Self { public_hex, secret_hex })
+        Ok(Self {
+            public_hex,
+            secret_hex,
+        })
     }
 
     fn signing_key(&self) -> Result<SigningKey, ChainError> {
@@ -177,7 +183,10 @@ impl RootKeyPair {
         let secret_hex = secret_hex.into();
         let _ = decode_secret(&secret_hex)?;
         let _ = decode_pubkey(&public_hex)?;
-        Ok(Self { public_hex, secret_hex })
+        Ok(Self {
+            public_hex,
+            secret_hex,
+        })
     }
 
     /// The public half of the root key, in raw hex (no `ed25519:` prefix).
@@ -306,10 +315,7 @@ pub fn verify_chain(blocks: &[SignedBlock], root_pubkey: &[u8]) -> Result<(), Ch
         let prev_pubkey_hex = &blocks[i - 1].pubkey_next;
         let prev_pubkey_bytes = decode_pubkey(prev_pubkey_hex)?;
         let prev_verifying = VerifyingKey::from_bytes(&prev_pubkey_bytes).map_err(|err| {
-            ChainError::InvalidEncoding(format!(
-                "invalid pubkey_next at block {}: {err}",
-                i - 1
-            ))
+            ChainError::InvalidEncoding(format!("invalid pubkey_next at block {}: {err}", i - 1))
         })?;
         verify_one(&blocks[i], &prev_verifying, i)?;
     }
@@ -429,7 +435,9 @@ mod tests {
                 sid: sid.into(),
                 resource_type: ResourceType::Credential,
                 actions: vec!["credential:read".into()],
-                resource: ResourceSelector::Exact { value: "obj-github-token".into() },
+                resource: ResourceSelector::Exact {
+                    value: "obj-github-token".into(),
+                },
                 budget: None,
                 usage: Usage::default(),
                 conditions: Vec::new(),
@@ -479,7 +487,11 @@ mod tests {
         let b2 = sample_block("Stmt2", 30);
         let out2 = sign_appended_block(&out1.pubkey_next_secret, &b2).unwrap();
 
-        let chain = vec![out0.signed.clone(), out1.signed.clone(), out2.signed.clone()];
+        let chain = vec![
+            out0.signed.clone(),
+            out1.signed.clone(),
+            out2.signed.clone(),
+        ];
         verify_chain(&chain, &root_pubkey_bytes).unwrap();
     }
 
@@ -689,10 +701,9 @@ mod tests {
         // Replace the signature R component with a known Ed25519 torsion point.
         // Source: ed25519-dalek EIGHT_TORSION[1] — order-8 point, RFC 8032 §5.1.
         let torsion_r_bytes: [u8; 32] = [
-            0xc7, 0x17, 0x6a, 0x70, 0x3d, 0x4d, 0xd8, 0x4f,
-            0xba, 0x3c, 0x0b, 0x76, 0x0d, 0x10, 0x67, 0x0f,
-            0x2a, 0x20, 0x53, 0xfa, 0x2c, 0x39, 0xcc, 0xc6,
-            0x4e, 0xc7, 0xfd, 0x77, 0x92, 0xac, 0x03, 0x7a,
+            0xc7, 0x17, 0x6a, 0x70, 0x3d, 0x4d, 0xd8, 0x4f, 0xba, 0x3c, 0x0b, 0x76, 0x0d, 0x10,
+            0x67, 0x0f, 0x2a, 0x20, 0x53, 0xfa, 0x2c, 0x39, 0xcc, 0xc6, 0x4e, 0xc7, 0xfd, 0x77,
+            0x92, 0xac, 0x03, 0x7a,
         ];
         let mut sig_bytes = hex::decode(&out.signed.signature).unwrap();
         sig_bytes[..32].copy_from_slice(&torsion_r_bytes);

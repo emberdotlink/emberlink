@@ -1,6 +1,6 @@
 //! `ember bind {register, list, remove, move}` — admin verb for managing
-//! daemon-controlled credential bindings (implementation-note-88
-//! Phase 3 / implementation-note-111).
+//! daemon-controlled credential bindings (implementation-note-111
+//! Phase 3 / implementation-note-149).
 //!
 //! A binding ties `(persona, working_tree, remote_name)` to a remote URL the
 //! broker is authorized to inject credentials for. This verb is the EXPLICIT
@@ -17,13 +17,13 @@
 //!   * `broker.bindings.remove`
 //!   * `broker.bindings.move`
 //!
-//! Marker for `target_state_anchor` (implementation-note-112): `fn cmd_bind` lives in
+//! Marker for `target_state_anchor` (implementation-note-150): `fn cmd_bind` lives in
 //! this file as the top-level dispatch entry.
 
 use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::broker::BrokerCliError;
 
@@ -132,7 +132,7 @@ pub struct GlobalOpts {
 /// `Commands::Bind { action }`.
 ///
 /// The literal `fn cmd_bind` is the load-bearing marker for the
-/// implementation-note-112 `target_state_anchor` gate.
+/// implementation-note-150 `target_state_anchor` gate.
 pub fn cmd_bind(cmd: BindCmd, opts: GlobalOpts) -> Result<(), BrokerCliError> {
     match cmd {
         BindCmd::Register {
@@ -141,7 +141,14 @@ pub fn cmd_bind(cmd: BindCmd, opts: GlobalOpts) -> Result<(), BrokerCliError> {
             url,
             persona,
             json,
-        } => cmd_bind_register(&opts, &working_tree, &remote, &url, persona.as_deref(), json),
+        } => cmd_bind_register(
+            &opts,
+            &working_tree,
+            &remote,
+            &url,
+            persona.as_deref(),
+            json,
+        ),
         BindCmd::List {
             working_tree,
             persona,
@@ -231,18 +238,19 @@ fn cmd_bind_list(
         return Ok(());
     }
 
-    println!(
-        "{:<60}  {:<10}  REMOTE_URL",
-        "WORKING_TREE", "REMOTE",
-    );
+    println!("{:<60}  {:<10}  REMOTE_URL", "WORKING_TREE", "REMOTE",);
     for row in &rows {
         println!(
             "{:<60}  {:<10}  {}",
             row.get("working_tree_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("?"),
-            row.get("remote_name").and_then(|v| v.as_str()).unwrap_or("?"),
-            row.get("remote_url").and_then(|v| v.as_str()).unwrap_or("?"),
+            row.get("remote_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?"),
+            row.get("remote_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?"),
         );
     }
     Ok(())
@@ -273,9 +281,7 @@ fn cmd_bind_remove(
     } else if removed {
         println!("Removed binding {working_tree_id} :: {remote}");
     } else {
-        println!(
-            "No-op: no binding for ({caller}, {working_tree_id}, {remote})"
-        );
+        println!("No-op: no binding for ({caller}, {working_tree_id}, {remote})");
     }
     Ok(())
 }
@@ -329,8 +335,7 @@ fn resolve_persona(explicit: Option<&str>) -> Result<String, BrokerCliError> {
     match std::env::var("EMBER_PERSONA") {
         Ok(p) if !p.is_empty() => Ok(p),
         _ => Err(BrokerCliError::InvalidArgs(
-            "no persona supplied: pass --persona <uuid> or set $EMBER_PERSONA"
-                .to_string(),
+            "no persona supplied: pass --persona <uuid> or set $EMBER_PERSONA".to_string(),
         )),
     }
 }
@@ -339,20 +344,15 @@ fn resolve_persona(explicit: Option<&str>) -> Result<String, BrokerCliError> {
 /// return the `result` value. Mirrors `broker.rs::call_daemon` shape — we
 /// keep a copy here rather than re-exporting so the admin surface stays
 /// independent of the broker module's internal refactors.
-fn call_daemon(
-    socket_path: &Path,
-    method: &str,
-    params: &Value,
-) -> Result<Value, BrokerCliError> {
+fn call_daemon(socket_path: &Path, method: &str, params: &Value) -> Result<Value, BrokerCliError> {
     use std::io::{BufRead, BufReader, Write};
 
-    let stream =
-        std::os::unix::net::UnixStream::connect(socket_path).map_err(|e| {
-            BrokerCliError::DaemonUnavailable {
-                socket: socket_path.to_path_buf(),
-                source: e,
-            }
-        })?;
+    let stream = std::os::unix::net::UnixStream::connect(socket_path).map_err(|e| {
+        BrokerCliError::DaemonUnavailable {
+            socket: socket_path.to_path_buf(),
+            source: e,
+        }
+    })?;
     let mut writer = stream
         .try_clone()
         .map_err(|e| BrokerCliError::Io(format!("clone socket: {e}")))?;
@@ -418,10 +418,17 @@ mod tests {
 
     #[test]
     fn resolve_persona_rejects_when_no_source_present() {
+        // Serialize against other EMBER_PERSONA-touching tests in this
+        // crate (notably `launcher::claude_code::tests::persona_uses_env_var_when_set`).
+        // The cargo parallel runner used to race set/remove and produce
+        // test-order-dependent failures.
+        let _g = crate::EMBER_PERSONA_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Save + clear EMBER_PERSONA for the duration of the test.
         let prior = std::env::var("EMBER_PERSONA").ok();
-        // SAFETY: tests run single-threaded for this module's scope; we
-        // restore the prior value before returning.
+        // SAFETY: holds EMBER_PERSONA_TEST_LOCK for the duration of the
+        // env mutation; restored before return.
         unsafe {
             std::env::remove_var("EMBER_PERSONA");
         }

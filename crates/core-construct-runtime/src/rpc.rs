@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
 // Daemon socket resolution
@@ -70,9 +70,8 @@ pub fn call_daemon_rpc(
     method: &str,
     params: &Value,
 ) -> Result<Value, RpcError> {
-    let stream = UnixStream::connect(socket_path).map_err(|e| {
-        RpcError::DaemonUnavailable(format!("{}: {e}", socket_path.display()))
-    })?;
+    let stream = UnixStream::connect(socket_path)
+        .map_err(|e| RpcError::DaemonUnavailable(format!("{}: {e}", socket_path.display())))?;
 
     let mut writer = stream
         .try_clone()
@@ -100,10 +99,7 @@ pub fn call_daemon_rpc(
         .map_err(|e| RpcError::Protocol(format!("invalid JSON-RPC response: {e}")))?;
 
     if let Some(err) = response.get("error").filter(|v| !v.is_null()) {
-        let code = err
-            .get("code")
-            .and_then(|c| c.as_i64())
-            .unwrap_or(-32000) as i32;
+        let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(-32000) as i32;
         let message = err
             .get("message")
             .and_then(|m| m.as_str())

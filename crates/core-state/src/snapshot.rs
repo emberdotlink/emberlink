@@ -69,35 +69,98 @@ mod tests {
         // constructing a minimal stub that satisfies EventLog purely for the
         // events() and event_count() calls — the only two methods used by
         // events_since / current_event_watermark.
-        use std::collections::HashMap;
+        use core_event_types::EventType;
         use core_eventlog::{Authorizer, MaterializedState, SyncBatchRecord};
         use core_events::EventEnvelope;
-        use core_event_types::{EventType};
-        use core_principals::{PeerCursor};
-        use core_types::{ValidationError};
+        use core_principals::PeerCursor;
+        use core_types::ValidationError;
+        use std::collections::HashMap;
 
         struct CountLog(usize);
 
         impl EventLog for CountLog {
-            fn append(&mut self, _: EventEnvelope, _: &dyn core_crypto::Verifier) -> Result<(), ValidationError> { Ok(()) }
-            fn append_with_authorizer(&mut self, _: EventEnvelope, _: &dyn core_crypto::Verifier, _: &dyn Authorizer, _: u64) -> Result<(), ValidationError> { Ok(()) }
-            fn rebuild(&mut self) -> Result<(), ValidationError> { Ok(()) }
-            fn materialized(&self) -> &MaterializedState { panic!("not needed") }
-            fn events(&self) -> &[EventEnvelope] { &[] }
-            fn event_count(&self) -> usize { self.0 }
-            fn has_event(&self, _: &str) -> bool { false }
-            fn current_event_type_for(&self, _: &str) -> Option<EventType> { None }
-            fn event_ids(&self) -> Vec<String> { vec![] }
-            fn event_id_set(&self) -> &HashMap<String, usize> { panic!("not needed") }
-            fn events_by_ids(&self, _: &[String]) -> Vec<EventEnvelope> { vec![] }
-            fn events_of_type(&self, _: EventType) -> Vec<EventEnvelope> { vec![] }
-            fn events_of_type_rev(&self, _: EventType) -> Vec<EventEnvelope> { vec![] }
-            fn export_events(&self) -> String { String::new() }
-            fn import_events(&mut self, _: &str, _: &dyn core_crypto::Verifier, _: &dyn Authorizer, _: u64) -> Result<usize, ValidationError> { Ok(0) }
-            fn peer_cursor(&self, _: &str) -> Result<PeerCursor, ValidationError> { panic!("not needed") }
-            fn peer_cursors(&self) -> Result<Vec<PeerCursor>, ValidationError> { panic!("not needed") }
-            fn sync_batches(&self) -> Result<Vec<SyncBatchRecord>, ValidationError> { panic!("not needed") }
-            fn import_sync_batch(&mut self, _: &str, _: &str, _: &[EventEnvelope], _: Option<&str>, _: &dyn core_crypto::Verifier, _: &dyn Authorizer, _: u64) -> Result<usize, ValidationError> { Ok(0) }
+            fn append(
+                &mut self,
+                _: EventEnvelope,
+                _: &dyn core_crypto::Verifier,
+            ) -> Result<(), ValidationError> {
+                Ok(())
+            }
+            fn append_with_authorizer(
+                &mut self,
+                _: EventEnvelope,
+                _: &dyn core_crypto::Verifier,
+                _: &dyn Authorizer,
+                _: u64,
+            ) -> Result<(), ValidationError> {
+                Ok(())
+            }
+            fn rebuild(&mut self) -> Result<(), ValidationError> {
+                Ok(())
+            }
+            fn materialized(&self) -> &MaterializedState {
+                panic!("not needed")
+            }
+            fn events(&self) -> &[EventEnvelope] {
+                &[]
+            }
+            fn event_count(&self) -> usize {
+                self.0
+            }
+            fn has_event(&self, _: &str) -> bool {
+                false
+            }
+            fn current_event_type_for(&self, _: &str) -> Option<EventType> {
+                None
+            }
+            fn event_ids(&self) -> Vec<String> {
+                vec![]
+            }
+            fn event_id_set(&self) -> &HashMap<String, usize> {
+                panic!("not needed")
+            }
+            fn events_by_ids(&self, _: &[String]) -> Vec<EventEnvelope> {
+                vec![]
+            }
+            fn events_of_type(&self, _: EventType) -> Vec<EventEnvelope> {
+                vec![]
+            }
+            fn events_of_type_rev(&self, _: EventType) -> Vec<EventEnvelope> {
+                vec![]
+            }
+            fn export_events(&self) -> String {
+                String::new()
+            }
+            fn import_events(
+                &mut self,
+                _: &str,
+                _: &dyn core_crypto::Verifier,
+                _: &dyn Authorizer,
+                _: u64,
+            ) -> Result<usize, ValidationError> {
+                Ok(0)
+            }
+            fn peer_cursor(&self, _: &str) -> Result<PeerCursor, ValidationError> {
+                panic!("not needed")
+            }
+            fn peer_cursors(&self) -> Result<Vec<PeerCursor>, ValidationError> {
+                panic!("not needed")
+            }
+            fn sync_batches(&self) -> Result<Vec<SyncBatchRecord>, ValidationError> {
+                panic!("not needed")
+            }
+            fn import_sync_batch(
+                &mut self,
+                _: &str,
+                _: &str,
+                _: &[EventEnvelope],
+                _: Option<&str>,
+                _: &dyn core_crypto::Verifier,
+                _: &dyn Authorizer,
+                _: u64,
+            ) -> Result<usize, ValidationError> {
+                Ok(0)
+            }
         }
 
         let log = CountLog(7);
@@ -106,6 +169,9 @@ mod tests {
         // events() returns &[] so events_since always returns empty on CountLog,
         // but that is fine — we are testing current_event_watermark here.
         let delta = events_since(&log, 3, 100);
-        assert!(delta.is_empty(), "empty events() → empty delta regardless of watermark");
+        assert!(
+            delta.is_empty(),
+            "empty events() → empty delta regardless of watermark"
+        );
     }
 }

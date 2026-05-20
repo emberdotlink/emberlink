@@ -1,3 +1,4 @@
+# CLASSIFICATION: PUBLIC
 # Construct manifest for ember-npm per design §2.
 # Action schema: each [[actions]] declares an allowed action_key, optional
 # budget caps, biometric requirement, and a permit/deny default. The daemon's
@@ -110,3 +111,8 @@ mode = "deny"
 [[actions]]
 key = "npm.pack"
 default = "permit"
+
+# --- silence-override catalog (design §C8 Knob 10) ---
+
+[actions.npm-publish]
+silence_timeout_secs = 600    # registry roundtrip can be slow

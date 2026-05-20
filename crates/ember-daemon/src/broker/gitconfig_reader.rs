@@ -1,7 +1,7 @@
 //! Bounded INI parser for `.git/config` — resolves a remote's URL by name.
 //!
-//! implementation-note-92 — Phase 2 subtask of
-//! implementation-note-88. Used by DCC-6 (HTTPS dispatch) at
+//! implementation-note-115 — Phase 2 subtask of
+//! implementation-note-111. Used by DCC-6 (HTTPS dispatch) at
 //! credential-injection time to verify the binding's stored URL matches what
 //! the user's `.git/config` actually says for the target remote.
 
@@ -103,12 +103,11 @@ pub fn read_remote_url_from_gitconfig(
         }
 
         // Key-value pair inside the target section.
-        if in_target {
-            if let Some((key, value)) = trimmed.split_once('=') {
-                if key.trim().eq_ignore_ascii_case("url") {
-                    return Ok(value.trim().to_string());
-                }
-            }
+        if in_target
+            && let Some((key, value)) = trimmed.split_once('=')
+            && key.trim().eq_ignore_ascii_case("url")
+        {
+            return Ok(value.trim().to_string());
         }
     }
 
@@ -182,7 +181,8 @@ mod tests {
         let git_dir = tmp.path().join(".git");
         std::fs::create_dir(&git_dir).unwrap();
         // Embed non-ASCII bytes (UTF-8 for Cyrillic "гит") directly as a byte slice.
-        let content: &[u8] = b"[remote \"origin\"]\n    url = git@\xd0\xb3\xd0\xb8\xd1\x82hub.com:foo/bar.git\n";
+        let content: &[u8] =
+            b"[remote \"origin\"]\n    url = git@\xd0\xb3\xd0\xb8\xd1\x82hub.com:foo/bar.git\n";
         std::fs::write(git_dir.join("config"), content).unwrap();
 
         let err = read_remote_url_from_gitconfig(tmp.path(), "origin").unwrap_err();

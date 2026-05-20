@@ -147,7 +147,14 @@ pub fn deserialize(data: &str) -> Result<LocalState, String> {
         let parts: Vec<&str> = line.split('\t').collect();
         match parts.first() {
             Some(&"local_key") => match parts.as_slice() {
-                ["local_key", owner_kind, owner_id, key_id, public_key, private_key] => {
+                [
+                    "local_key",
+                    owner_kind,
+                    owner_id,
+                    key_id,
+                    public_key,
+                    private_key,
+                ] => {
                     let algorithm = key_algorithm_from_public_key(public_key)?;
                     keys.insert(
                         owner_id.to_string(),

@@ -1,4 +1,4 @@
-//! Public GitHub App manifest helpers (implementation-note-308).
+//! Public GitHub App manifest helpers (implementation-note-437).
 //!
 //! The canonical manifest doc lives at `docs/emberlink-github-app-manifest.md`
 //! and is embedded into the binary at compile time so the CLI surface and the
@@ -21,8 +21,8 @@
 //!
 //! The App's installation token is the credential ceiling for two consumer
 //! paths in the daemon: (a) agent operations via the broker (shipped, ARCH-
-//! implementation-note-309), and (b) headless-runtime PR-ship announcer (future,
-//! implementation-note-310). Both use `mint_installation_token` to obtain
+//! implementation-note-438), and (b) headless-runtime PR-ship announcer (future,
+//! implementation-note-439). Both use `mint_installation_token` to obtain
 //! narrowly-scoped tokens; the App's permissions are the upstream ceiling.
 //!
 //! Workflows, secrets, and administration are explicitly **denied** on the
@@ -130,7 +130,7 @@ mod tests {
     fn manifest_documents_floor_permissions() {
         // Any silent expansion or contraction of these permissions should
         // fail this test until the doc is updated explicitly. The set
-        // matches the implementation-note-308 brief and is the credential
+        // matches the implementation-note-437 brief and is the credential
         // ceiling the broker mints sub-scoped tokens against (design).
         for checkpoint in ["contents", "pull_requests", "issues", "actions", "metadata"] {
             assert!(

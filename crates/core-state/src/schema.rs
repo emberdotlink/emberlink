@@ -479,8 +479,7 @@ mod tests {
     #[test]
     fn fresh_init_ddl_includes_all_runtime_columns() {
         let conn = Connection::open_in_memory().expect("open in-memory db");
-        conn.execute_batch(SQLITE_INIT_DDL)
-            .expect("run init ddl");
+        conn.execute_batch(SQLITE_INIT_DDL).expect("run init ddl");
 
         for (table, expected) in required_runtime_columns() {
             let columns = table_columns(&conn, table);
@@ -514,8 +513,7 @@ mod tests {
     #[test]
     fn fresh_init_ddl_accepts_basic_inserts() {
         let conn = Connection::open_in_memory().expect("open in-memory db");
-        conn.execute_batch(SQLITE_INIT_DDL)
-            .expect("run init ddl");
+        conn.execute_batch(SQLITE_INIT_DDL).expect("run init ddl");
         conn.execute(
             "INSERT INTO credential_access_log (grant_id, agent_id, accessed_at, scope, outcome)
              VALUES (?1, ?2, ?3, ?4, ?5)",

@@ -89,13 +89,9 @@ async fn pty_bridge_window_resize() {
     let server = tokio::spawn(async move {
         // Use `sleep 0.05` then echo to give the client time to connect and
         // send the resize frame before the child exits.
-        serve_inner(
-            &server_socket,
-            "bash",
-            &["-c", "sleep 0.05; printf done"],
-        )
-        .await
-        .expect("serve_inner failed")
+        serve_inner(&server_socket, "bash", &["-c", "sleep 0.05; printf done"])
+            .await
+            .expect("serve_inner failed")
     });
 
     tokio::time::sleep(Duration::from_millis(30)).await;
@@ -113,7 +109,10 @@ async fn pty_bridge_window_resize() {
     );
 
     let exit = server.await.expect("server task panicked");
-    assert!(exit.success(), "expected successful exit after resize, got: {exit:?}");
+    assert!(
+        exit.success(),
+        "expected successful exit after resize, got: {exit:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -136,8 +135,9 @@ async fn pty_bridge_exit_code_propagation() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Client just connects and reads (no stdin needed).
-    let (_output, _status) =
-        connect_and_collect(&socket, None, None).await.expect("connect_and_collect failed");
+    let (_output, _status) = connect_and_collect(&socket, None, None)
+        .await
+        .expect("connect_and_collect failed");
 
     let exit = server.await.expect("server task panicked");
     assert!(
@@ -161,7 +161,7 @@ async fn pty_bridge_exit_code_propagation() {
 
 #[test]
 fn encode_data_frame_roundtrip() {
-    use ember_exec::pty::{encode_data_frame, TAG_DATA};
+    use ember_exec::pty::{TAG_DATA, encode_data_frame};
     let payload = b"spike data";
     let frame = encode_data_frame(payload);
     assert_eq!(frame[0], TAG_DATA);
@@ -172,7 +172,7 @@ fn encode_data_frame_roundtrip() {
 
 #[test]
 fn encode_winsize_frame_roundtrip() {
-    use ember_exec::pty::{encode_winsize_frame, TAG_WINSIZE};
+    use ember_exec::pty::{TAG_WINSIZE, encode_winsize_frame};
     let frame = encode_winsize_frame(40, 120, 0, 0);
     assert_eq!(frame[0], TAG_WINSIZE);
     let rows = u16::from_be_bytes([frame[1], frame[2]]);

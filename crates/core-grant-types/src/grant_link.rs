@@ -164,18 +164,15 @@ impl GrantLink {
             }
         }
 
-        let ephemeral_public_key_hex = ek.ok_or_else(|| {
-            ValidationError::invalid_format("grant link missing ek parameter")
-        })?;
-        let expires_str = exp.ok_or_else(|| {
-            ValidationError::invalid_format("grant link missing exp parameter")
-        })?;
+        let ephemeral_public_key_hex =
+            ek.ok_or_else(|| ValidationError::invalid_format("grant link missing ek parameter"))?;
+        let expires_str =
+            exp.ok_or_else(|| ValidationError::invalid_format("grant link missing exp parameter"))?;
         let expires_at = expires_str.parse::<u64>().map_err(|_| {
             ValidationError::invalid_format("exp must be a valid u64 epoch timestamp")
         })?;
-        let issuer_signature = sig.ok_or_else(|| {
-            ValidationError::invalid_format("grant link missing sig parameter")
-        })?;
+        let issuer_signature =
+            sig.ok_or_else(|| ValidationError::invalid_format("grant link missing sig parameter"))?;
         let issuer_persona_id = issuer.ok_or_else(|| {
             ValidationError::invalid_format("grant link missing issuer parameter")
         })?;
@@ -213,8 +210,10 @@ impl GrantLink {
         recipient_pubkey_hex: &str,
     ) -> Vec<u8> {
         let relay = relay_hint.unwrap_or("");
-        format!("{offer_id}|{ek_hex}|{expires_at}|{relay}|{issuer_persona_id}|{recipient_pubkey_hex}")
-            .into_bytes()
+        format!(
+            "{offer_id}|{ek_hex}|{expires_at}|{relay}|{issuer_persona_id}|{recipient_pubkey_hex}"
+        )
+        .into_bytes()
     }
 }
 
@@ -261,12 +260,18 @@ mod tests {
         let native = link.to_url();
         assert!(native.contains("&relay=wss://relay.example.com"));
         let parsed = GrantLink::parse(&native).unwrap();
-        assert_eq!(parsed.relay_hint, Some("wss://relay.example.com".to_string()));
+        assert_eq!(
+            parsed.relay_hint,
+            Some("wss://relay.example.com".to_string())
+        );
 
         let web = link.to_web_url();
         assert!(web.contains("?relay=wss://relay.example.com"));
         let parsed_web = GrantLink::parse(&web).unwrap();
-        assert_eq!(parsed_web.relay_hint, Some("wss://relay.example.com".to_string()));
+        assert_eq!(
+            parsed_web.relay_hint,
+            Some("wss://relay.example.com".to_string())
+        );
     }
 
     #[test]
@@ -314,7 +319,10 @@ mod tests {
         let mut link = sample_link();
         link.relay_hint = Some("wss://relay.example.com".to_string());
         let url = link.to_deep_link_url();
-        assert_eq!(url, "emberlink://claim/offer-abc123?relay=wss://relay.example.com");
+        assert_eq!(
+            url,
+            "emberlink://claim/offer-abc123?relay=wss://relay.example.com"
+        );
         assert!(!url.contains("ek="));
     }
 
@@ -469,7 +477,10 @@ mod tests {
         );
         assert_ne!(url, tampered, "tamper substitution must apply");
         let parsed_tampered = GrantLink::parse(&tampered).unwrap();
-        assert_eq!(parsed_tampered.ephemeral_public_key_hex, "attackerpubkey0011");
+        assert_eq!(
+            parsed_tampered.ephemeral_public_key_hex,
+            "attackerpubkey0011"
+        );
 
         let attacker_payload = GrantLink::signing_payload(
             &parsed_tampered.offer_id,

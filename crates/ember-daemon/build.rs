@@ -2,7 +2,7 @@
 //! consumption in `runtime.rs`.
 //!
 //! CLI-VERSION-FLAG: the daemon startup log line records both so a stale
-//! binary running against a newer codebase (the implementation-note-79
+//! binary running against a newer codebase (the implementation-note-101
 //! root cause) is identifiable in seconds.
 //!
 //! See `crates/emberlink-cli/build.rs` for the same algorithm — duplicated
@@ -48,7 +48,10 @@ fn main() {
         .unwrap_or_else(|| "(no-git)".to_string());
 
     println!("cargo:rustc-env=EMBERLINK_GIT_SHA={sha}");
-    println!("cargo:rustc-env=EMBERLINK_BUILD_TIMESTAMP={}", iso8601_now());
+    println!(
+        "cargo:rustc-env=EMBERLINK_BUILD_TIMESTAMP={}",
+        iso8601_now()
+    );
 
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs/heads");

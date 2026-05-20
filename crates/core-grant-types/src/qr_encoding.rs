@@ -138,8 +138,8 @@ pub fn decode_sealed_offer(qr_string: &str) -> Result<SealedOffer, QrError> {
         .ok_or_else(|| QrError::new(format!("missing prefix '{QR_PREFIX}'")))?;
 
     // 3. Decode Base45.
-    let cbor_bytes = base45::decode(b45)
-        .map_err(|e| QrError::new(format!("base45 decode error: {e}")))?;
+    let cbor_bytes =
+        base45::decode(b45).map_err(|e| QrError::new(format!("base45 decode error: {e}")))?;
 
     // 4. Bounded CBOR size check.
     if cbor_bytes.len() > CBOR_MAX_DECODED_BYTES {
@@ -183,8 +183,7 @@ fn to_cbor(offer: &SealedOffer) -> Result<Vec<u8>, QrError> {
 }
 
 fn from_cbor(bytes: &[u8]) -> Result<SealedOffer, QrError> {
-    ciborium::from_reader(bytes)
-        .map_err(|e| QrError::new(format!("CBOR decode error: {e}")))
+    ciborium::from_reader(bytes).map_err(|e| QrError::new(format!("CBOR decode error: {e}")))
 }
 
 #[cfg(test)]
@@ -222,9 +221,7 @@ mod tests {
         // Our prefix adds ':' which is also valid.
         let invalid: Vec<char> = qr
             .chars()
-            .filter(|c| {
-                !c.is_ascii_alphanumeric() && !" $%*+-./:".contains(*c)
-            })
+            .filter(|c| !c.is_ascii_alphanumeric() && !" $%*+-./:".contains(*c))
             .collect();
         assert!(
             invalid.is_empty(),

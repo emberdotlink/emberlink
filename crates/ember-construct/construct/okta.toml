@@ -23,6 +23,7 @@ name = "ember-okta"
 version = "0.1.0"
 publisher = "did:emberlink"
 description = "Okta admin CLI Construct. Mediates `okta` mutations through ember's broker: account-removal verbs (users delete/deactivate/suspend, users reset-password — account-takeover risk), group/app/policy/factor/idps destruction (groups delete, apps delete/deactivate, policies delete/deactivate, factors reset/deactivate, idps delete/deactivate), and session.end (force user logout) all require biometric approval. system-log.export gates without biometric (auditable read but not destructive). All other classified mutating verbs (creates, updates, assignments) gate without biometric. OKTA_API_TOKEN injects via env; daemon zeroizes on child exit."
+authority_refs = ["okta"]
 
 # Default policy for unlisted action keys.
 default = "deny"

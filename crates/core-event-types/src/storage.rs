@@ -1,6 +1,5 @@
 use core_types::encoding::*;
 use core_types::{CanonicalEncode, Validate, ValidationError};
-use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageRelationship {

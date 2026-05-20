@@ -3,10 +3,12 @@ pub mod queries;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use core_crypto::Signer;
+use core_event_types::{
+    EventBody, EventRefRelation, SignerBinding, TrustAttestedEvent, TrustRevokedEvent,
+};
 use core_events::EventEnvelope;
-use core_event_types::{EventBody, EventRefRelation, SignerBinding, TrustAttestedEvent, TrustRevokedEvent};
-use core_principals::{TrustAttestation, TrustThreshold};
 use core_principals::{DerivedTrustStatement, TrustExplanation};
+use core_principals::{TrustAttestation, TrustThreshold};
 
 // ---------------------------------------------------------------------------
 // Badge authority weighting (design)
@@ -75,7 +77,9 @@ pub fn compute_badge_weight(input: &BadgeWeightInput<'_>) -> BadgeWeight {
     // Build adjacency list: attester -> set of subjects they trust
     let mut adj: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
     for edge in trust_edges {
-        adj.entry(edge.attester.as_str()).or_default().push(edge.subject.as_str());
+        adj.entry(edge.attester.as_str())
+            .or_default()
+            .push(edge.subject.as_str());
     }
 
     let graph_distance: Option<u32> = if issuer_id == viewer_id {
@@ -142,8 +146,8 @@ pub fn compute_badge_weight(input: &BadgeWeightInput<'_>) -> BadgeWeight {
     let issuer_score: f32 = compute_issuer_score(issuer_inbound_trust_count, badges_issued);
 
     // --- Weighted total: distance 40%, convergence 40%, issuer 20% ---
-    let total = (0.40 * distance_score + 0.40 * convergence_score + 0.20 * issuer_score)
-        .clamp(0.0, 1.0);
+    let total =
+        (0.40 * distance_score + 0.40 * convergence_score + 0.20 * issuer_score).clamp(0.0, 1.0);
 
     BadgeWeight {
         convergence_score,
@@ -285,11 +289,11 @@ pub fn compute_dispute_penalty(
         };
 
         match distance {
-            Some(0) => total_weight += 1.0,      // viewer themselves disputes
-            Some(1) => total_weight += 0.8,      // direct peer disputes
-            Some(2) => total_weight += 0.4,      // two hops away
+            Some(0) => total_weight += 1.0, // viewer themselves disputes
+            Some(1) => total_weight += 0.8, // direct peer disputes
+            Some(2) => total_weight += 0.4, // two hops away
             Some(d) => total_weight += 1.0 / (d as f32), // diminishing
-            None => {}                           // unreachable = no weight
+            None => {}                      // unreachable = no weight
         }
     }
 
@@ -447,8 +451,7 @@ fn evaluate_single_condition(
             // returning `Met` via vacuous truth.
             if sub_conditions.is_empty() {
                 return ConditionResult::Unmet(
-                    "empty All combinator: no sub-conditions specified (fail-closed)"
-                        .to_string(),
+                    "empty All combinator: no sub-conditions specified (fail-closed)".to_string(),
                 );
             }
             for sub in sub_conditions {
@@ -466,8 +469,7 @@ fn evaluate_single_condition(
             // closed instead of short-circuiting to `Met`.
             if sub_conditions.is_empty() {
                 return ConditionResult::Unmet(
-                    "empty Any combinator: no alternatives provided (fail-closed)"
-                        .to_string(),
+                    "empty Any combinator: no alternatives provided (fail-closed)".to_string(),
                 );
             }
             let mut last_reason = String::new();
@@ -1019,7 +1021,9 @@ mod tests {
     #[test]
     fn dispute_penalty_direct_peer_dispute() {
         let edges = vec![make_edge("viewer", "disputer")];
-        let disputes = vec![DisputeInput { disputer_id: "disputer" }];
+        let disputes = vec![DisputeInput {
+            disputer_id: "disputer",
+        }];
         let penalty = compute_dispute_penalty("viewer", &disputes, &edges, DEFAULT_MAX_DEPTH);
         // Direct peer: 0.8
         assert!((penalty - 0.8).abs() < 0.01);
@@ -1028,7 +1032,9 @@ mod tests {
     #[test]
     fn dispute_penalty_viewer_self_disputes() {
         let edges: Vec<TrustAttestation> = vec![];
-        let disputes = vec![DisputeInput { disputer_id: "viewer" }];
+        let disputes = vec![DisputeInput {
+            disputer_id: "viewer",
+        }];
         let penalty = compute_dispute_penalty("viewer", &disputes, &edges, DEFAULT_MAX_DEPTH);
         // Viewer themselves: 1.0
         assert!((penalty - 1.0).abs() < f32::EPSILON);
@@ -1037,20 +1043,23 @@ mod tests {
     #[test]
     fn dispute_penalty_unreachable_disputer() {
         let edges = vec![make_edge("viewer", "peer")];
-        let disputes = vec![DisputeInput { disputer_id: "stranger" }];
+        let disputes = vec![DisputeInput {
+            disputer_id: "stranger",
+        }];
         let penalty = compute_dispute_penalty("viewer", &disputes, &edges, DEFAULT_MAX_DEPTH);
         assert!((penalty - 0.0).abs() < f32::EPSILON);
     }
 
     #[test]
     fn dispute_penalty_multiple_disputes_accumulate() {
-        let edges = vec![
-            make_edge("viewer", "peer_a"),
-            make_edge("viewer", "peer_b"),
-        ];
+        let edges = vec![make_edge("viewer", "peer_a"), make_edge("viewer", "peer_b")];
         let disputes = vec![
-            DisputeInput { disputer_id: "peer_a" },
-            DisputeInput { disputer_id: "peer_b" },
+            DisputeInput {
+                disputer_id: "peer_a",
+            },
+            DisputeInput {
+                disputer_id: "peer_b",
+            },
         ];
         let penalty = compute_dispute_penalty("viewer", &disputes, &edges, DEFAULT_MAX_DEPTH);
         // Two direct peers: 0.8 + 0.8 = 1.6, capped at 1.0
@@ -1101,12 +1110,17 @@ mod tests {
 
     #[test]
     fn badge_gate_simple_badge_held() {
-        let badges = [ClaimantBadge { badge_type: "verified-dev", issuer_persona_id: "badge-issuer" }];
+        let badges = [ClaimantBadge {
+            badge_type: "verified-dev",
+            issuer_persona_id: "badge-issuer",
+        }];
         let edges = vec![make_edge("issuer", "badge-issuer")];
         let mut counts = std::collections::BTreeMap::new();
         counts.insert("badge-issuer".into(), 5);
 
-        let conditions = vec![core_grant_types::grant_conditions::GrantCondition::badge("verified-dev")];
+        let conditions = vec![core_grant_types::grant_conditions::GrantCondition::badge(
+            "verified-dev",
+        )];
         let input = badge_gate_input("issuer", "claimant", &badges, &edges, &counts);
         let result = evaluate_grant_conditions(&conditions, &input);
         assert!(result.is_met());
@@ -1114,7 +1128,9 @@ mod tests {
 
     #[test]
     fn badge_gate_badge_not_held() {
-        let conditions = vec![core_grant_types::grant_conditions::GrantCondition::badge("verified-dev")];
+        let conditions = vec![core_grant_types::grant_conditions::GrantCondition::badge(
+            "verified-dev",
+        )];
         let empty_counts = std::collections::BTreeMap::new();
         let input = badge_gate_input("issuer", "claimant", &[], &[], &empty_counts);
         let result = evaluate_grant_conditions(&conditions, &input);
@@ -1126,7 +1142,10 @@ mod tests {
 
     #[test]
     fn badge_gate_with_distance_threshold() {
-        let badges = [ClaimantBadge { badge_type: "subway-rider", issuer_persona_id: "far-issuer" }];
+        let badges = [ClaimantBadge {
+            badge_type: "subway-rider",
+            issuer_persona_id: "far-issuer",
+        }];
         // far-issuer is 3 hops from issuer
         let edges = vec![
             make_edge("issuer", "a"),
@@ -1137,17 +1156,27 @@ mod tests {
         counts.insert("far-issuer".into(), 1);
 
         // max_distance=2 should fail (issuer is 3 hops away)
-        let conditions = vec![core_grant_types::grant_conditions::GrantCondition::badge_with_thresholds(
-            "subway-rider", None, Some(2), None,
-        )];
+        let conditions = vec![
+            core_grant_types::grant_conditions::GrantCondition::badge_with_thresholds(
+                "subway-rider",
+                None,
+                Some(2),
+                None,
+            ),
+        ];
         let input = badge_gate_input("issuer", "claimant", &badges, &edges, &counts);
         let result = evaluate_grant_conditions(&conditions, &input);
         assert!(!result.is_met());
 
         // max_distance=3 should pass
-        let conditions = vec![core_grant_types::grant_conditions::GrantCondition::badge_with_thresholds(
-            "subway-rider", None, Some(3), None,
-        )];
+        let conditions = vec![
+            core_grant_types::grant_conditions::GrantCondition::badge_with_thresholds(
+                "subway-rider",
+                None,
+                Some(3),
+                None,
+            ),
+        ];
         let result = evaluate_grant_conditions(&conditions, &input);
         assert!(result.is_met());
     }
@@ -1155,17 +1184,25 @@ mod tests {
     #[test]
     fn badge_gate_all_combinator() {
         let badges = [
-            ClaimantBadge { badge_type: "verified-dev", issuer_persona_id: "badge-issuer" },
-            ClaimantBadge { badge_type: "subway-rider", issuer_persona_id: "badge-issuer" },
+            ClaimantBadge {
+                badge_type: "verified-dev",
+                issuer_persona_id: "badge-issuer",
+            },
+            ClaimantBadge {
+                badge_type: "subway-rider",
+                issuer_persona_id: "badge-issuer",
+            },
         ];
         let edges = vec![make_edge("issuer", "badge-issuer")];
         let mut counts = std::collections::BTreeMap::new();
         counts.insert("badge-issuer".into(), 2);
 
-        let conditions = vec![core_grant_types::grant_conditions::GrantCondition::All(vec![
-            core_grant_types::grant_conditions::GrantCondition::badge("verified-dev"),
-            core_grant_types::grant_conditions::GrantCondition::badge("subway-rider"),
-        ])];
+        let conditions = vec![core_grant_types::grant_conditions::GrantCondition::All(
+            vec![
+                core_grant_types::grant_conditions::GrantCondition::badge("verified-dev"),
+                core_grant_types::grant_conditions::GrantCondition::badge("subway-rider"),
+            ],
+        )];
         let input = badge_gate_input("issuer", "claimant", &badges, &edges, &counts);
         let result = evaluate_grant_conditions(&conditions, &input);
         assert!(result.is_met());
@@ -1173,15 +1210,20 @@ mod tests {
 
     #[test]
     fn badge_gate_any_combinator() {
-        let badges = [ClaimantBadge { badge_type: "subway-rider", issuer_persona_id: "badge-issuer" }];
+        let badges = [ClaimantBadge {
+            badge_type: "subway-rider",
+            issuer_persona_id: "badge-issuer",
+        }];
         let edges = vec![make_edge("issuer", "badge-issuer")];
         let mut counts = std::collections::BTreeMap::new();
         counts.insert("badge-issuer".into(), 1);
 
-        let conditions = vec![core_grant_types::grant_conditions::GrantCondition::Any(vec![
-            core_grant_types::grant_conditions::GrantCondition::badge("verified-dev"),
-            core_grant_types::grant_conditions::GrantCondition::badge("subway-rider"),
-        ])];
+        let conditions = vec![core_grant_types::grant_conditions::GrantCondition::Any(
+            vec![
+                core_grant_types::grant_conditions::GrantCondition::badge("verified-dev"),
+                core_grant_types::grant_conditions::GrantCondition::badge("subway-rider"),
+            ],
+        )];
         let input = badge_gate_input("issuer", "claimant", &badges, &edges, &counts);
         let result = evaluate_grant_conditions(&conditions, &input);
         assert!(result.is_met());
@@ -1197,7 +1239,9 @@ mod tests {
     fn empty_all_combinator_evaluates_unmet() {
         let empty_counts = std::collections::BTreeMap::new();
         let input = badge_gate_input("issuer", "claimant", &[], &[], &empty_counts);
-        let conditions = vec![core_grant_types::grant_conditions::GrantCondition::All(vec![])];
+        let conditions = vec![core_grant_types::grant_conditions::GrantCondition::All(
+            vec![],
+        )];
         let result = evaluate_grant_conditions(&conditions, &input);
         assert!(!result.is_met(), "empty All must be Unmet (fail-closed)");
         if let ConditionResult::Unmet(reason) = result {
@@ -1212,7 +1256,9 @@ mod tests {
     fn empty_any_combinator_evaluates_unmet() {
         let empty_counts = std::collections::BTreeMap::new();
         let input = badge_gate_input("issuer", "claimant", &[], &[], &empty_counts);
-        let conditions = vec![core_grant_types::grant_conditions::GrantCondition::Any(vec![])];
+        let conditions = vec![core_grant_types::grant_conditions::GrantCondition::Any(
+            vec![],
+        )];
         let result = evaluate_grant_conditions(&conditions, &input);
         assert!(!result.is_met(), "empty Any must be Unmet (fail-closed)");
         if let ConditionResult::Unmet(reason) = result {

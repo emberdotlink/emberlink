@@ -1,4 +1,4 @@
-//! implementation-note-151 regression coverage.
+//! implementation-note-200 regression coverage.
 //!
 //! Pre-fix the simple-grant CLI path called `store.create_grant(...)` (which
 //! built the canonical block-zero statement with `budget = None`) and then
@@ -216,8 +216,7 @@ async fn api_grants_includes_budget_when_set() {
     // Body is everything after the "\r\n\r\n" separator.
     let body_start = response_str.find("\r\n\r\n").expect("CRLF body separator") + 4;
     let body = &response_str[body_start..];
-    let json: serde_json::Value =
-        serde_json::from_str(body).expect("api response is valid JSON");
+    let json: serde_json::Value = serde_json::from_str(body).expect("api response is valid JSON");
     let arr = json.as_array().expect("api response is JSON array");
 
     let with = arr
@@ -231,7 +230,10 @@ async fn api_grants_includes_budget_when_set() {
 
     // 4. With-budget assertions: every axis surfaced with the supplied value.
     let budget = &with["budget"];
-    assert!(budget.is_object(), "budget must be a JSON object, got: {budget}");
+    assert!(
+        budget.is_object(),
+        "budget must be a JSON object, got: {budget}"
+    );
     assert_eq!(budget["tokens"], serde_json::json!(50_000));
     assert_eq!(budget["cents"], serde_json::json!(50));
     assert_eq!(budget["requests"], serde_json::json!(100));
@@ -239,7 +241,10 @@ async fn api_grants_includes_budget_when_set() {
 
     // Usage must be present and zeroed for a freshly minted grant.
     let usage = &with["usage"];
-    assert!(usage.is_object(), "usage must be a JSON object, got: {usage}");
+    assert!(
+        usage.is_object(),
+        "usage must be a JSON object, got: {usage}"
+    );
     assert_eq!(usage["tokens"], serde_json::json!(0));
     assert_eq!(usage["cents"], serde_json::json!(0));
     assert_eq!(usage["requests"], serde_json::json!(0));

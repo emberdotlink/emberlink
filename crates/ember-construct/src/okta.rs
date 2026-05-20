@@ -33,12 +33,7 @@ use core_construct_runtime::ActionKey;
 
 /// Okta CLI global flags that take a value as the *next* argv token.
 /// When stripping, both the flag and its value are removed.
-const VALUE_BEARING_GLOBAL_FLAGS: &[&str] = &[
-    "--profile",
-    "--config",
-    "--output",
-    "--token",
-];
+const VALUE_BEARING_GLOBAL_FLAGS: &[&str] = &["--profile", "--config", "--output", "--token"];
 
 /// Okta CLI global flags that are valueless (boolean toggles).
 const BOOLEAN_GLOBAL_FLAGS: &[&str] = &["--verbose", "--quiet"];
@@ -60,9 +55,7 @@ pub(crate) fn strip_global_flags(argv: &[String]) -> Vec<String> {
         // shouldn't have `=value` but accept it tolerantly).
         if let Some(eq) = tok.find('=') {
             let name = &tok[..eq];
-            if VALUE_BEARING_GLOBAL_FLAGS.contains(&name)
-                || BOOLEAN_GLOBAL_FLAGS.contains(&name)
-            {
+            if VALUE_BEARING_GLOBAL_FLAGS.contains(&name) || BOOLEAN_GLOBAL_FLAGS.contains(&name) {
                 i += 1;
                 continue;
             }
@@ -132,14 +125,8 @@ pub fn classify_okta_argv(argv: &[String]) -> Option<ActionKey> {
 
         // apps <verb>
         "apps" => match verb {
-            "create"
-            | "delete"
-            | "deactivate"
-            | "update"
-            | "assign-user"
-            | "unassign-user"
-            | "assign-group"
-            | "unassign-group" => Some(ActionKey(format!("okta.apps.{verb}"))),
+            "create" | "delete" | "deactivate" | "update" | "assign-user" | "unassign-user"
+            | "assign-group" | "unassign-group" => Some(ActionKey(format!("okta.apps.{verb}"))),
             _ => None,
         },
 
@@ -153,9 +140,7 @@ pub fn classify_okta_argv(argv: &[String]) -> Option<ActionKey> {
 
         // factors <verb>
         "factors" => match verb {
-            "enroll" | "reset" | "deactivate" => {
-                Some(ActionKey(format!("okta.factors.{verb}")))
-            }
+            "enroll" | "reset" | "deactivate" => Some(ActionKey(format!("okta.factors.{verb}"))),
             _ => None,
         },
 
@@ -169,9 +154,7 @@ pub fn classify_okta_argv(argv: &[String]) -> Option<ActionKey> {
 
         // zones <verb>
         "zones" => match verb {
-            "create" | "delete" | "update" => {
-                Some(ActionKey(format!("okta.zones.{verb}")))
-            }
+            "create" | "delete" | "update" => Some(ActionKey(format!("okta.zones.{verb}"))),
             _ => None,
         },
 
@@ -494,14 +477,8 @@ mod tests {
 
     #[test]
     fn profile_flag_before_resource_stripped() {
-        let r = classify_okta_argv(&args(&[
-            "--profile",
-            "prod",
-            "users",
-            "delete",
-            "uid",
-        ]))
-        .unwrap();
+        let r =
+            classify_okta_argv(&args(&["--profile", "prod", "users", "delete", "uid"])).unwrap();
         assert_eq!(r.0, "okta.users.delete");
     }
 
@@ -520,77 +497,46 @@ mod tests {
 
     #[test]
     fn token_flag_after_verb_stripped() {
-        let r = classify_okta_argv(&args(&[
-            "apps",
-            "delete",
-            "--token",
-            "00aBcDeF",
-            "aid",
-        ]))
-        .unwrap();
+        let r =
+            classify_okta_argv(&args(&["apps", "delete", "--token", "00aBcDeF", "aid"])).unwrap();
         assert_eq!(r.0, "okta.apps.delete");
     }
 
     #[test]
     fn output_flag_stripped() {
-        let r = classify_okta_argv(&args(&[
-            "--output",
-            "json",
-            "groups",
-            "delete",
-            "gid",
-        ]))
-        .unwrap();
+        let r =
+            classify_okta_argv(&args(&["--output", "json", "groups", "delete", "gid"])).unwrap();
         assert_eq!(r.0, "okta.groups.delete");
     }
 
     #[test]
     fn verbose_boolean_flag_stripped() {
-        let r =
-            classify_okta_argv(&args(&["--verbose", "users", "suspend", "uid"])).unwrap();
+        let r = classify_okta_argv(&args(&["--verbose", "users", "suspend", "uid"])).unwrap();
         assert_eq!(r.0, "okta.users.suspend");
     }
 
     #[test]
     fn quiet_boolean_flag_stripped() {
-        let r =
-            classify_okta_argv(&args(&["--quiet", "policies", "delete", "pid"])).unwrap();
+        let r = classify_okta_argv(&args(&["--quiet", "policies", "delete", "pid"])).unwrap();
         assert_eq!(r.0, "okta.policies.delete");
     }
 
     #[test]
     fn equals_form_profile_flag_stripped() {
-        let r = classify_okta_argv(&args(&[
-            "--profile=prod",
-            "users",
-            "delete",
-            "uid",
-        ]))
-        .unwrap();
+        let r = classify_okta_argv(&args(&["--profile=prod", "users", "delete", "uid"])).unwrap();
         assert_eq!(r.0, "okta.users.delete");
     }
 
     #[test]
     fn equals_form_token_flag_stripped() {
-        let r = classify_okta_argv(&args(&[
-            "--token=00secret",
-            "session",
-            "end",
-            "sid",
-        ]))
-        .unwrap();
+        let r = classify_okta_argv(&args(&["--token=00secret", "session", "end", "sid"])).unwrap();
         assert_eq!(r.0, "okta.session.end");
     }
 
     #[test]
     fn equals_form_config_flag_stripped() {
-        let r = classify_okta_argv(&args(&[
-            "factors",
-            "--config=/x.toml",
-            "reset",
-            "uid",
-        ]))
-        .unwrap();
+        let r =
+            classify_okta_argv(&args(&["factors", "--config=/x.toml", "reset", "uid"])).unwrap();
         assert_eq!(r.0, "okta.factors.reset");
     }
 
@@ -614,18 +560,12 @@ mod tests {
 
     #[test]
     fn flags_reordered_classification_stable() {
-        let a = classify_okta_argv(&args(&[
-            "users", "delete", "uid", "--profile", "prod",
-        ]))
-        .unwrap();
-        let b = classify_okta_argv(&args(&[
-            "--profile", "prod", "users", "delete", "uid",
-        ]))
-        .unwrap();
-        let c = classify_okta_argv(&args(&[
-            "users", "--profile", "prod", "delete", "uid",
-        ]))
-        .unwrap();
+        let a =
+            classify_okta_argv(&args(&["users", "delete", "uid", "--profile", "prod"])).unwrap();
+        let b =
+            classify_okta_argv(&args(&["--profile", "prod", "users", "delete", "uid"])).unwrap();
+        let c =
+            classify_okta_argv(&args(&["users", "--profile", "prod", "delete", "uid"])).unwrap();
         assert_eq!(a.0, b.0);
         assert_eq!(b.0, c.0);
     }
@@ -639,9 +579,7 @@ mod tests {
 
     #[test]
     fn only_global_flags_passthrough() {
-        assert!(
-            classify_okta_argv(&args(&["--profile", "prod", "--verbose"])).is_none()
-        );
+        assert!(classify_okta_argv(&args(&["--profile", "prod", "--verbose"])).is_none());
     }
 
     #[test]
@@ -730,7 +668,7 @@ mod tests {
     // contract slice this Construct depends on: the broker registry can
     // hold a `MockBroker::new(BrokerProvider::Okta)`, and a request that
     // declares `provider = Okta` round-trips through issue → revoke
-    // without panicking. Real Okta broker impl is implementation-note-71
+    // without panicking. Real Okta broker impl is implementation-note-87
     // (separate task).
 
     use core_broker::{Broker, BrokerError, BrokerProvider, BrokerRequest, MockBroker};

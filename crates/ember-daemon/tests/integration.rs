@@ -2,15 +2,15 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
-use ember_daemon::trust::approval::ApprovalOutcome;
 use ember_daemon::infra::dashboard::run_dashboard;
-use ember_daemon::trust::policy::{
-    ApprovalRequirement, PolicyConfig, PolicyEngine, PolicyRule, RiskLevel,
-};
 use ember_daemon::infra::rate_limit::RateLimiter;
 use ember_daemon::infra::socket::SocketListener;
 use ember_daemon::infra::store::{DaemonStore, StoreError};
 use ember_daemon::infra::vault::Vault;
+use ember_daemon::trust::approval::ApprovalOutcome;
+use ember_daemon::trust::policy::{
+    ApprovalRequirement, PolicyConfig, PolicyEngine, PolicyRule, RiskLevel,
+};
 use tempfile::TempDir;
 use tokio::sync::watch;
 
@@ -92,14 +92,8 @@ fn spawn_listener_thread(tmp: &TempDir) -> (std::path::PathBuf, watch::Sender<bo
             store.set_vault(Rc::clone(&vault));
             let policy = Rc::new(permissive_test_policy());
             let rate_limiter = Rc::new(RefCell::new(RateLimiter::default()));
-            let listener = SocketListener::new(
-                path_for_thread,
-                shutdown_rx,
-                store,
-                vault,
-                policy,
-                rate_limiter,
-            );
+            let listener =
+                SocketListener::new(path_for_thread, shutdown_rx, store, policy, rate_limiter);
             listener.run().await.unwrap();
         });
     });
@@ -127,10 +121,7 @@ async fn full_grant_lifecycle_via_socket() {
 
         // 2. Create persona
         let p = t
-            .send(
-                "create_persona",
-                serde_json::json!({"name": "e2e-agent"}),
-            )
+            .send("create_persona", serde_json::json!({"name": "e2e-agent"}))
             .unwrap();
         let pid = p["id"].as_str().unwrap().to_string();
         assert!(pid.starts_with("persona-"), "persona id: {pid}");
@@ -245,7 +236,10 @@ async fn full_demo_flow() {
             .send("create_persona", json!({"name": "demo-agent"}))
             .unwrap();
         let persona_id = p["id"].as_str().unwrap().to_string();
-        assert!(persona_id.starts_with("persona-"), "persona id: {persona_id}");
+        assert!(
+            persona_id.starts_with("persona-"),
+            "persona id: {persona_id}"
+        );
         assert_eq!(p["name"], json!("demo-agent"));
 
         // 3. Add credential to vault
@@ -306,7 +300,9 @@ async fn full_demo_flow() {
         );
 
         // 8. List grants — verify the grant is listed (persona_id now required)
-        let grants = t.send("list_grants", json!({"persona_id": persona_id})).unwrap();
+        let grants = t
+            .send("list_grants", json!({"persona_id": persona_id}))
+            .unwrap();
         let grant_list = grants.as_array().unwrap();
         assert!(
             !grant_list.is_empty(),
@@ -611,7 +607,10 @@ async fn dashboard_tcp_listener_serves_html() {
             .build()
             .unwrap();
         let local = tokio::task::LocalSet::new();
-        local.block_on(&rt, run_dashboard(addr, db, "0.0.0-test".to_string(), None, shutdown_rx, None));
+        local.block_on(
+            &rt,
+            run_dashboard(addr, db, "0.0.0-test".to_string(), None, shutdown_rx, None),
+        );
     });
 
     // Give the listener time to bind.
@@ -667,7 +666,10 @@ async fn dashboard_csrf_protects_post_endpoints() {
             .build()
             .unwrap();
         let local = tokio::task::LocalSet::new();
-        local.block_on(&rt, run_dashboard(addr, db, "0.0.0-test".to_string(), None, shutdown_rx, None));
+        local.block_on(
+            &rt,
+            run_dashboard(addr, db, "0.0.0-test".to_string(), None, shutdown_rx, None),
+        );
     });
 
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -681,8 +683,14 @@ async fn dashboard_csrf_protects_post_endpoints() {
     let mut body = Vec::new();
     stream.read_to_end(&mut body).await.unwrap();
     let body_str = std::str::from_utf8(&body).unwrap();
-    assert!(body_str.contains("const CSRF_TOKEN ="), "HTML must define CSRF_TOKEN");
-    assert!(!body_str.contains("{{CSRF_TOKEN}}"), "template placeholder must be replaced");
+    assert!(
+        body_str.contains("const CSRF_TOKEN ="),
+        "HTML must define CSRF_TOKEN"
+    );
+    assert!(
+        !body_str.contains("{{CSRF_TOKEN}}"),
+        "template placeholder must be replaced"
+    );
 
     // Extract the token from the HTML (parsed from `const CSRF_TOKEN = "...";`).
     let marker = "const CSRF_TOKEN = \"";
@@ -725,7 +733,7 @@ async fn dashboard_csrf_protects_post_endpoints() {
     );
 
     // 4. POST with correct CSRF header AND matching Origin -> passes both checks,
-    //    fails downstream. implementation-note-74: with the WebAuthn gate active
+    //    fails downstream. implementation-note-91: with the WebAuthn gate active
     //    (no `EMBER_DISABLE_BIO=1`), an empty body reaches the gate and gets
     //    401 "missing webauthn challenge_id". Without the gate, the legacy
     //    path reaches the store and gets 400 "approval not found". Either
@@ -817,14 +825,8 @@ async fn socket_still_works_when_dashboard_port_occupied() {
             ));
 
             // Run the socket listener until shutdown.
-            let listener = SocketListener::new(
-                sock_path,
-                shutdown_rx_sock,
-                store,
-                vault,
-                policy,
-                rate_limiter,
-            );
+            let listener =
+                SocketListener::new(sock_path, shutdown_rx_sock, store, policy, rate_limiter);
             let _ = listener.run().await;
         });
     });
@@ -869,8 +871,8 @@ async fn socket_still_works_when_dashboard_port_occupied() {
 /// asserts that the bind result is `Err`.
 #[tokio::test]
 async fn dashboard_bind_failure_surfaced_via_channel() {
-    use tokio::sync::oneshot;
     use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
 
     let tmp = TempDir::new().unwrap();
     let db_path = tmp.path().join("daemon.db");
@@ -894,7 +896,14 @@ async fn dashboard_bind_failure_surfaced_via_channel() {
         let local = tokio::task::LocalSet::new();
         local.block_on(
             &rt,
-            run_dashboard(blocked_addr, db, "0.0.0-test".to_string(), None, shutdown_rx, Some(bind_tx)),
+            run_dashboard(
+                blocked_addr,
+                db,
+                "0.0.0-test".to_string(),
+                None,
+                shutdown_rx,
+                Some(bind_tx),
+            ),
         );
     });
 
@@ -917,7 +926,7 @@ async fn dashboard_bind_failure_surfaced_via_channel() {
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-214 — auto-unseal vault from keyring on daemon startup.
+// implementation-note-296 — auto-unseal vault from keyring on daemon startup.
 //
 // The bug: `qember.sh demo up` finished, then `grant create` failed with
 // "persona '<id>' secret is vault-sealed but no vault is attached" because
@@ -933,7 +942,7 @@ async fn dashboard_bind_failure_surfaced_via_channel() {
 // flipping them simultaneously would interfere.
 // ---------------------------------------------------------------------------
 
-/// Serialize all implementation-note-214 tests that mutate process-global env vars
+/// Serialize all implementation-note-296 tests that mutate process-global env vars
 /// (`EMBER_VAULT_PASSPHRASE`, `EMBER_VAULT_TEST_KEYRING_PRESENT`). Without
 /// this, the parallel cargo test runner can interleave env writes between
 /// tests and cause spurious `Unsealed` / `NoKeyringEntry` flips.
@@ -948,7 +957,7 @@ fn demo_ux_8_env_lock() -> std::sync::MutexGuard<'static, ()> {
 #[test]
 fn auto_unseal_returns_no_keyring_entry_when_none_configured() {
     use ember_daemon::infra::config::DaemonConfig;
-    use ember_daemon::infra::vault::{try_auto_unseal_from_keyring, AutoUnsealOutcome};
+    use ember_daemon::infra::vault::{AutoUnsealOutcome, try_auto_unseal_from_keyring};
 
     let _guard = demo_ux_8_env_lock();
 
@@ -982,7 +991,7 @@ fn auto_unseal_returns_no_keyring_entry_when_none_configured() {
 fn auto_unseal_returns_unsealed_when_keyring_entry_present() {
     use ember_daemon::infra::config::DaemonConfig;
     use ember_daemon::infra::store::DaemonStore;
-    use ember_daemon::infra::vault::{try_auto_unseal_from_keyring, AutoUnsealOutcome};
+    use ember_daemon::infra::vault::{AutoUnsealOutcome, try_auto_unseal_from_keyring};
     use std::rc::Rc;
 
     let _guard = demo_ux_8_env_lock();
@@ -1013,14 +1022,16 @@ fn auto_unseal_returns_unsealed_when_keyring_entry_present() {
     let vault = match outcome {
         AutoUnsealOutcome::Unsealed(v) => v,
         AutoUnsealOutcome::NoKeyringEntry => {
-            panic!("expected Unsealed; got NoKeyringEntry — test gate not honoring EMBER_VAULT_TEST_KEYRING_PRESENT")
+            panic!(
+                "expected Unsealed; got NoKeyringEntry — test gate not honoring EMBER_VAULT_TEST_KEYRING_PRESENT"
+            )
         }
         AutoUnsealOutcome::Error(e) => panic!("expected Unsealed; got Error: {e}"),
     };
 
     // Round-trip: attach to store, create a persona, retrieve its keypair.
     // This is the precise call sequence that `grant create` triggers and the
-    // path that was failing in implementation-note-214. If this works end-to-end, the
+    // path that was failing in implementation-note-296. If this works end-to-end, the
     // demo-blocking bug is fixed.
     let store = DaemonStore::open_in_memory().unwrap();
     store.set_vault(Rc::new(vault));
@@ -1039,10 +1050,11 @@ fn daemon_run_logs_vault_auto_unseal_audit_event() {
 
     let _guard = demo_ux_8_env_lock();
 
-    // Drive `DaemonRuntime::run()` long enough for it to attach the vault and
-    // emit the `vault.auto_unseal_from_keyring` audit event, then drop the
-    // runtime task to shut it down. We don't go through the full socket loop
-    // here — the audit row is written before the listener accepts.
+    // Drive `DaemonRuntime::run()` long enough for the explicit bridge
+    // bootstrap path to attach the vault and emit the
+    // `vault.auto_unseal_from_keyring` audit event, then drop the runtime
+    // task to shut it down. We don't go through the full socket loop here —
+    // the audit row is written before the listener accepts.
     //
     // Test gate: signal "keyring entry exists" so the helper returns Unsealed
     // and the audit event is labeled `auto_unseal_from_keyring`.
@@ -1062,6 +1074,8 @@ fn daemon_run_logs_vault_auto_unseal_audit_event() {
         socket_dir,
         // Disable dashboard so the runtime startup is purely about vault attach.
         dashboard_addr: None,
+        // Explicit bridge opt-in keeps this test on the bootstrap-open path.
+        bridge_bind: Some("127.0.0.1:8443".parse().unwrap()),
         ..DaemonConfig::for_test(tmp.path())
     };
 
@@ -1138,7 +1152,13 @@ fn ten_concurrent_approve_calls_mint_exactly_one_grant() {
         let store = DaemonStore::open(&db_path).unwrap();
         store.set_vault(Rc::new(Vault::new(VAULT_KEY)));
         store.create_persona("sec19-agent").unwrap();
-        let pid = store.list_personas().unwrap().into_iter().next().unwrap().id;
+        let pid = store
+            .list_personas()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .id;
         let req = store
             .submit_approval(&pid, "sec19-key", "read", None, "credential.access", "high")
             .unwrap();

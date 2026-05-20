@@ -1,4 +1,4 @@
-//! implementation-note-318 regression guard — MCP read path must see grants owned by
+//! implementation-note-453 regression guard — MCP read path must see grants owned by
 //! the caller's persona (and only those grants).
 //!
 //! The narrative being guarded is "agent asks -> human approves -> agent
@@ -34,13 +34,13 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
-use ember_daemon::trust::policy::{
-    ApprovalRequirement, PolicyConfig, PolicyEngine, PolicyRule, RiskLevel,
-};
 use ember_daemon::infra::rate_limit::RateLimiter;
 use ember_daemon::infra::socket::SocketListener;
 use ember_daemon::infra::store::DaemonStore;
 use ember_daemon::infra::vault::Vault;
+use ember_daemon::trust::policy::{
+    ApprovalRequirement, PolicyConfig, PolicyEngine, PolicyRule, RiskLevel,
+};
 use emberlink_agent::runtime::{AgentConfig, AgentRuntime, DaemonClient, DaemonClientError};
 use emberlink_mcp::daemon_transport::DaemonTransport;
 use emberlink_mcp::{JsonRpcRequest, JsonRpcResponse, McpServer};
@@ -86,14 +86,9 @@ fn spawn_listener_thread(tmp: &TempDir) -> (std::path::PathBuf, watch::Sender<bo
             store.set_vault(Rc::clone(&vault));
             let policy = Rc::new(auto_approve_policy());
             let rate_limiter = Rc::new(RefCell::new(RateLimiter::default()));
-            let listener = SocketListener::new(
-                path_for_thread,
-                shutdown_rx,
-                store,
-                vault,
-                policy,
-                rate_limiter,
-            );
+            let _vault = vault; // hold until end of scope: set_vault is the wire now
+            let listener =
+                SocketListener::new(path_for_thread, shutdown_rx, store, policy, rate_limiter);
             listener.run().await.unwrap();
         });
     });
@@ -118,7 +113,9 @@ impl TestDaemonClient {
 
         let stream = std::os::unix::net::UnixStream::connect(self.0.socket_path())
             .map_err(|_| DaemonClientError::Unavailable)?;
-        let mut writer = stream.try_clone().map_err(|_| DaemonClientError::Unavailable)?;
+        let mut writer = stream
+            .try_clone()
+            .map_err(|_| DaemonClientError::Unavailable)?;
         let mut reader = BufReader::new(stream);
 
         let request = serde_json::json!({
@@ -136,13 +133,9 @@ impl TestDaemonClient {
         reader
             .read_line(&mut response_line)
             .map_err(|_| DaemonClientError::Unavailable)?;
-        let response: serde_json::Value = serde_json::from_str(response_line.trim())
-            .map_err(|_| DaemonClientError::Daemon)?;
-        if response
-            .get("error")
-            .filter(|e| !e.is_null())
-            .is_some()
-        {
+        let response: serde_json::Value =
+            serde_json::from_str(response_line.trim()).map_err(|_| DaemonClientError::Daemon)?;
+        if response.get("error").filter(|e| !e.is_null()).is_some() {
             return Err(DaemonClientError::Daemon);
         }
         Ok(response
@@ -157,16 +150,18 @@ impl DaemonClient for TestDaemonClient {
         &mut self,
         params: &serde_json::Value,
     ) -> Result<serde_json::Value, DaemonClientError> {
-        self.0.call_tool("request_access", params).map_err(|e| match e {
-            emberlink_mcp::daemon_transport::DaemonTransportError::Io(_) => {
-                DaemonClientError::Unavailable
-            }
-            emberlink_mcp::daemon_transport::DaemonTransportError::Protocol(_)
-            | emberlink_mcp::daemon_transport::DaemonTransportError::DaemonError(_)
-            | emberlink_mcp::daemon_transport::DaemonTransportError::UnknownTool(_) => {
-                DaemonClientError::Daemon
-            }
-        })
+        self.0
+            .call_tool("request_access", params)
+            .map_err(|e| match e {
+                emberlink_mcp::daemon_transport::DaemonTransportError::Io(_) => {
+                    DaemonClientError::Unavailable
+                }
+                emberlink_mcp::daemon_transport::DaemonTransportError::Protocol(_)
+                | emberlink_mcp::daemon_transport::DaemonTransportError::DaemonError(_)
+                | emberlink_mcp::daemon_transport::DaemonTransportError::UnknownTool(_) => {
+                    DaemonClientError::Daemon
+                }
+            })
     }
 
     fn list_grants(
@@ -195,10 +190,7 @@ impl DaemonClient for TestDaemonClient {
 /// socket, configured for the given persona id. The server uses a
 /// disposable in-process EventStore — grants are stored in the daemon,
 /// never in this local store.
-fn mcp_server_for_persona(
-    socket_path: &std::path::Path,
-    persona_id: &str,
-) -> McpServer {
+fn mcp_server_for_persona(socket_path: &std::path::Path, persona_id: &str) -> McpServer {
     let store = Rc::new(core_state::EventStore::default());
     let config = AgentConfig {
         persona_id: persona_id.to_string(),
@@ -235,9 +227,16 @@ fn mcp_call(server: &McpServer, id: u32, tool: &str, args: serde_json::Value) ->
 /// and encode errors via `isError: true`. Panics if the call is marked
 /// as an error.
 fn expect_ok_text(resp: &JsonRpcResponse) -> String {
-    assert!(resp.error.is_none(), "unexpected JSON-RPC error: {:?}", resp.error);
+    assert!(
+        resp.error.is_none(),
+        "unexpected JSON-RPC error: {:?}",
+        resp.error
+    );
     let result = resp.result.as_ref().expect("missing result");
-    let is_err = result.get("isError").and_then(|v| v.as_bool()).unwrap_or(false);
+    let is_err = result
+        .get("isError")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     assert!(
         !is_err,
         "tool returned isError=true: {}",
@@ -252,9 +251,16 @@ fn expect_ok_text(resp: &JsonRpcResponse) -> String {
 /// Assert an MCP tool call came back as `isError=true`. Returns the
 /// error text for further substring assertions.
 fn expect_err_text(resp: &JsonRpcResponse) -> String {
-    assert!(resp.error.is_none(), "unexpected JSON-RPC error: {:?}", resp.error);
+    assert!(
+        resp.error.is_none(),
+        "unexpected JSON-RPC error: {:?}",
+        resp.error
+    );
     let result = resp.result.as_ref().expect("missing result");
-    let is_err = result.get("isError").and_then(|v| v.as_bool()).unwrap_or(false);
+    let is_err = result
+        .get("isError")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     assert!(is_err, "expected isError=true, got {}", result);
     result["content"][0]["text"]
         .as_str()
@@ -290,7 +296,10 @@ fn daemon_call(
     if let Some(err) = resp.get("error").filter(|e| !e.is_null()) {
         return Err(format!("{err}"));
     }
-    Ok(resp.get("result").cloned().unwrap_or(serde_json::Value::Null))
+    Ok(resp
+        .get("result")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null))
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -370,7 +379,11 @@ async fn mcp_persona_filter_round_trip_operator_grant() {
             !ids.contains(&grant_b.as_str()),
             "persona A must NOT see persona B's grant {grant_b}; got {ids:?}"
         );
-        assert_eq!(arr.len(), 1, "persona A owns exactly one grant; got {arr:?}");
+        assert_eq!(
+            arr.len(),
+            1,
+            "persona A owns exactly one grant; got {arr:?}"
+        );
 
         // grant_status for persona A's own grant -> active.
         let resp = mcp_call(
@@ -412,7 +425,10 @@ async fn mcp_persona_filter_round_trip_operator_grant() {
         let payload: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(payload["status"], "ok");
         assert_eq!(payload["credential"]["value"], "s3cret-value");
-        assert_eq!(payload["credential"]["grant_id"], serde_json::json!(grant_a));
+        assert_eq!(
+            payload["credential"]["grant_id"],
+            serde_json::json!(grant_a)
+        );
 
         // use_credential for persona B's grant MUST fail for persona A.
         let resp = mcp_call(
@@ -433,7 +449,10 @@ async fn mcp_persona_filter_round_trip_operator_grant() {
         let text = expect_ok_text(&resp);
         let grants_b: serde_json::Value = serde_json::from_str(&text).unwrap();
         let arr_b = grants_b.as_array().unwrap();
-        let ids_b: Vec<&str> = arr_b.iter().filter_map(|g| g["grant_id"].as_str()).collect();
+        let ids_b: Vec<&str> = arr_b
+            .iter()
+            .filter_map(|g| g["grant_id"].as_str())
+            .collect();
         assert_eq!(
             ids_b,
             vec![grant_b.as_str()],

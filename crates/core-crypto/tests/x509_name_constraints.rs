@@ -9,8 +9,7 @@ use x509_parser::prelude::*;
 
 /// Decode a PEM block and return the contained DER bytes.
 fn pem_to_der(pem_str: &str) -> Vec<u8> {
-    let (_, pem) =
-        parse_x509_pem(pem_str.as_bytes()).expect("PEM parse must succeed");
+    let (_, pem) = parse_x509_pem(pem_str.as_bytes()).expect("PEM parse must succeed");
     pem.contents
 }
 
@@ -143,12 +142,8 @@ proptest! {
 
 #[test]
 fn mint_rejects_invalid_validity_hours_zero() {
-    let err = mint_per_agent_ca_with_name_constraints(
-        "agent-test",
-        &["api.anthropic.com"],
-        0,
-    )
-    .expect_err("validity_hours=0 must fail");
+    let err = mint_per_agent_ca_with_name_constraints("agent-test", &["api.anthropic.com"], 0)
+        .expect_err("validity_hours=0 must fail");
     assert!(
         matches!(err, X509Error::InvalidValidity(0)),
         "expected InvalidValidity(0), got {err:?}"
@@ -157,12 +152,8 @@ fn mint_rejects_invalid_validity_hours_zero() {
 
 #[test]
 fn mint_rejects_invalid_validity_hours_over_limit() {
-    let err = mint_per_agent_ca_with_name_constraints(
-        "agent-test",
-        &["api.anthropic.com"],
-        169,
-    )
-    .expect_err("validity_hours=169 must fail");
+    let err = mint_per_agent_ca_with_name_constraints("agent-test", &["api.anthropic.com"], 169)
+        .expect_err("validity_hours=169 must fail");
     assert!(
         matches!(err, X509Error::InvalidValidity(169)),
         "expected InvalidValidity(169), got {err:?}"

@@ -20,7 +20,7 @@ pub const RECEIPT_KIND_SNAPSHOT_EMITTED: &str = "snapshot.emitted";
 pub const RECEIPT_KIND_IDENTITY_ROTATED: &str = "identity.rotated";
 pub const RECEIPT_KIND_LOCAL_STATE_KEY_RESOLVE: &str = "local_state.key_resolve";
 pub const RECEIPT_KIND_LOCAL_STATE_KEY_ROTATION: &str = "local_state.key_rotation";
-/// implementation-note-26 — emberd emits this kind on every
+/// implementation-note-33 — emberd emits this kind on every
 /// `ExecFrame::Exit` arriving from the in-container `ember-exec`
 /// sidecar. The body shape ([`ExecCompletionBody`]) carries the seven
 /// fields design §"Body shape per kind" pins for the in-container
@@ -119,8 +119,8 @@ pub struct LocalStateKeyRotationBody {
 /// Body for `exec.completion` — emberd-side Receipt v2 emission on every
 /// `ExecFrame::Exit` arriving from the in-container `ember-exec` sidecar.
 ///
-/// Per implementation-note-26 and the parent
-/// implementation-note-27 acceptance — emberd (not ember-exec) is
+/// Per implementation-note-33 and the parent
+/// implementation-note-34 acceptance — emberd (not ember-exec) is
 /// the receipt signer; the in-container sidecar reports the child's
 /// exit code over the UDS frame protocol, and emberd composes the
 /// signed v2 envelope.
@@ -174,8 +174,14 @@ mod tests {
         assert_eq!(RECEIPT_KIND_SEAL_UNSEALED, "seal.unsealed");
         assert_eq!(RECEIPT_KIND_SNAPSHOT_EMITTED, "snapshot.emitted");
         assert_eq!(RECEIPT_KIND_IDENTITY_ROTATED, "identity.rotated");
-        assert_eq!(RECEIPT_KIND_LOCAL_STATE_KEY_RESOLVE, "local_state.key_resolve");
-        assert_eq!(RECEIPT_KIND_LOCAL_STATE_KEY_ROTATION, "local_state.key_rotation");
+        assert_eq!(
+            RECEIPT_KIND_LOCAL_STATE_KEY_RESOLVE,
+            "local_state.key_resolve"
+        );
+        assert_eq!(
+            RECEIPT_KIND_LOCAL_STATE_KEY_ROTATION,
+            "local_state.key_rotation"
+        );
         assert_eq!(RECEIPT_KIND_EXEC_COMPLETION, "exec.completion");
     }
 
@@ -185,8 +191,8 @@ mod tests {
             persona_id: "11111111-1111-1111-1111-111111111111".into(),
             grant_id: "22222222-2222-2222-2222-222222222222".into(),
             binary_path: "/usr/local/bin/scion-test-binary".into(),
-            binary_blake3:
-                "deadbeefcafef00ddeadbeefcafef00ddeadbeefcafef00ddeadbeefcafef00d".into(),
+            binary_blake3: "deadbeefcafef00ddeadbeefcafef00ddeadbeefcafef00ddeadbeefcafef00d"
+                .into(),
             target_uid: 1234,
             exit_code: 0,
             materialized_at: "2026-05-12T18:00:00Z".into(),
@@ -326,6 +332,11 @@ mod tests {
             presence_kind: None,
             body: serde_json::to_value(&body).unwrap(),
             signature: None,
+            calling_principal: None,
+            presence_reason: None,
+            handle_id: None,
+            challenge_hash: None,
+            verifier_aaguid: None,
         };
         sign_receipt_v2(&mut env, &signer).unwrap();
         verify_receipt_v2(&env, &pk, &core_crypto::FixtureVerifier).unwrap();

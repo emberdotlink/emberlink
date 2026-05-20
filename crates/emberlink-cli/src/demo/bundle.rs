@@ -1,5 +1,5 @@
 //! `ember demo bundle` — mint the locked May-3 4-statement composite-grant
-//! bundle (implementation-note-274).
+//! bundle (implementation-note-391).
 //!
 //! Submits ONE composite-approval entry with the four locked statements:
 //!   - [0] credential:read   on `anthropic-key`
@@ -7,7 +7,7 @@
 //!   - [2] time:wall_clock   on *             (90s)
 //!   - [3] credential:read   on `github-token`
 //!
-//! implementation-note-240: tokens cap is sized as defense-in-depth (1M
+//! implementation-note-336: tokens cap is sized as defense-in-depth (1M
 //! is well above any 90-second realistic session). The cents cap (5¢) is the
 //! load-bearing enforcement axis — the voiceover names it. Pre-flight token
 //! estimation in `pricing::estimate_call_tokens` was previously tripping on
@@ -74,7 +74,10 @@ pub fn cmd_demo_bundle(config: &DaemonConfig) -> Result<(), Box<dyn std::error::
     println!("    s3  credential:read  github-token");
     println!();
     println!("Approve at http://localhost:3141 with Touch ID,");
-    println!("or run 'ember approval approve {}' from this terminal.", req.id);
+    println!(
+        "or run 'ember approval approve {}' from this terminal.",
+        req.id
+    );
 
     Ok(())
 }

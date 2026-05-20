@@ -110,8 +110,7 @@ fn csr_signature_round_trip() {
     let verifying_key = signing_key.verifying_key();
 
     let spiffe_uri = "spiffe://emberd/persona/bob/peer/server-1";
-    let csr_pem = generate_csr_pem(&signing_key, spiffe_uri)
-        .expect("CSR generation must succeed");
+    let csr_pem = generate_csr_pem(&signing_key, spiffe_uri).expect("CSR generation must succeed");
 
     // (a) Correct public key → success.
     let csr = parse_csr_signed_by(&csr_pem, &verifying_key)
@@ -171,8 +170,8 @@ fn parse_spiffe_uri_strict() {
         "spiffe://emberd/persona/abc-def/peer/xyz-123",
     ];
     for uri in &ok_cases {
-        let id = parse_spiffe_uri(uri)
-            .unwrap_or_else(|e| panic!("must accept {:?}, got {:?}", uri, e));
+        let id =
+            parse_spiffe_uri(uri).unwrap_or_else(|e| panic!("must accept {:?}, got {:?}", uri, e));
         // Verify round-trippable structure.
         assert!(
             !id.persona.is_empty(),

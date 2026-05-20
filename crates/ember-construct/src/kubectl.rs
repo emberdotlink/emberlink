@@ -54,17 +54,8 @@ pub fn classify_kubectl_argv(argv: &[String]) -> Option<ActionKey> {
 
     match verb {
         // Read-only verbs — always passthrough.
-        "get"
-        | "describe"
-        | "logs"
-        | "top"
-        | "cluster-info"
-        | "version"
-        | "api-resources"
-        | "api-versions"
-        | "explain"
-        | "wait"
-        | "events" => None,
+        "get" | "describe" | "logs" | "top" | "cluster-info" | "version" | "api-resources"
+        | "api-versions" | "explain" | "wait" | "events" => None,
 
         // auth subcommand — `auth can-i` is read-only; all auth subcommands are passthrough.
         "auth" => None,
@@ -140,8 +131,7 @@ fn find_verb_index(argv: &[String]) -> Option<usize> {
 fn needs_value_arg(flag: &str) -> bool {
     matches!(
         flag,
-        "-n"
-            | "--namespace"
+        "-n" | "--namespace"
             | "--context"
             | "--cluster"
             | "--user"
@@ -298,12 +288,18 @@ mod tests {
 
     #[test]
     fn apply_file_is_gated() {
-        assert_eq!(key(&["apply", "-f", "foo.yaml"]), Some("kubectl.apply".to_string()));
+        assert_eq!(
+            key(&["apply", "-f", "foo.yaml"]),
+            Some("kubectl.apply".to_string())
+        );
     }
 
     #[test]
     fn apply_kustomize_is_gated() {
-        assert_eq!(key(&["apply", "-k", "./overlays/prod"]), Some("kubectl.apply".to_string()));
+        assert_eq!(
+            key(&["apply", "-k", "./overlays/prod"]),
+            Some("kubectl.apply".to_string())
+        );
     }
 
     #[test]
@@ -318,7 +314,10 @@ mod tests {
 
     #[test]
     fn delete_pod_is_gated() {
-        assert_eq!(key(&["delete", "pod", "foo"]), Some("kubectl.delete".to_string()));
+        assert_eq!(
+            key(&["delete", "pod", "foo"]),
+            Some("kubectl.delete".to_string())
+        );
     }
 
     #[test]
@@ -351,14 +350,20 @@ mod tests {
 
     #[test]
     fn edit_is_gated() {
-        assert_eq!(key(&["edit", "deploy", "api"]), Some("kubectl.edit".to_string()));
+        assert_eq!(
+            key(&["edit", "deploy", "api"]),
+            Some("kubectl.edit".to_string())
+        );
     }
 
     // --- replace ---
 
     #[test]
     fn replace_is_gated() {
-        assert_eq!(key(&["replace", "-f", "file.yaml"]), Some("kubectl.replace".to_string()));
+        assert_eq!(
+            key(&["replace", "-f", "file.yaml"]),
+            Some("kubectl.replace".to_string())
+        );
     }
 
     // --- exec — two forms ---
@@ -393,7 +398,10 @@ mod tests {
 
     #[test]
     fn cp_is_gated() {
-        assert_eq!(key(&["cp", "foo.txt", "mypod:/tmp/"]), Some("kubectl.cp".to_string()));
+        assert_eq!(
+            key(&["cp", "foo.txt", "mypod:/tmp/"]),
+            Some("kubectl.cp".to_string())
+        );
     }
 
     // --- port-forward ---
@@ -417,7 +425,10 @@ mod tests {
 
     #[test]
     fn cordon_is_gated() {
-        assert_eq!(key(&["cordon", "node01"]), Some("kubectl.node.cordon".to_string()));
+        assert_eq!(
+            key(&["cordon", "node01"]),
+            Some("kubectl.node.cordon".to_string())
+        );
     }
 
     #[test]
@@ -430,7 +441,10 @@ mod tests {
 
     #[test]
     fn uncordon_is_gated() {
-        assert_eq!(key(&["uncordon", "node01"]), Some("kubectl.node.uncordon".to_string()));
+        assert_eq!(
+            key(&["uncordon", "node01"]),
+            Some("kubectl.node.uncordon".to_string())
+        );
     }
 
     #[test]
@@ -562,7 +576,13 @@ mod tests {
     #[test]
     fn create_secret_is_gated() {
         assert_eq!(
-            key(&["create", "secret", "generic", "mysecret", "--from-literal=key=val"]),
+            key(&[
+                "create",
+                "secret",
+                "generic",
+                "mysecret",
+                "--from-literal=key=val"
+            ]),
             Some("kubectl.create".to_string())
         );
     }

@@ -24,7 +24,7 @@ fn main() {
         .json()
         .init();
 
-    // implementation-note-82: resolve a real on-disk config.
+    // implementation-note-105: resolve a real on-disk config.
     // EMBER_CONFIG env override → `~/.ember/config.toml` → loud-fail. No silent
     // `DaemonConfig::default()` fallback — that path was the May-12 25-hour
     // leaked-daemon root cause (silent inheritance of user-home socket binding

@@ -62,7 +62,7 @@ const KEY_DEFAULT_ROLE_ARN: &str = "AWS_DEFAULT_ROLE_ARN";
 /// don't have a federated identity.
 ///
 /// Precedence rule (when daemon-side wireup lands; see
-/// implementation-note-86 follow-up):
+/// implementation-note-109 follow-up):
 ///
 /// 1. `AWS_OIDC_TOKEN_PATH` set + readable file → WebIdentity mode
 /// 2. `AWS_LONG_LIVED_KEY_ID` + secret + region present → AssumeRole
@@ -72,7 +72,7 @@ const KEY_DEFAULT_ROLE_ARN: &str = "AWS_DEFAULT_ROLE_ARN";
 ///
 /// The receiving field is reserved here; load_from_dir() does not
 /// yet read it (the broker accepts an already-loaded
-/// `SecretString` per the implementation-note-46 brief).
+/// `SecretString` per the implementation-note-64 brief).
 #[allow(dead_code)]
 const KEY_OIDC_TOKEN_PATH: &str = "AWS_OIDC_TOKEN_PATH";
 
@@ -147,9 +147,11 @@ pub async fn aws_sts_config_from_store(
         key: &str,
     ) -> Result<Option<String>, StoreError> {
         match store.get(key).await {
-            Ok(bytes) => Ok(Some(String::from_utf8(bytes).map_err(|e| {
-                StoreError::Other(format!("non-utf8 in {}: {e}", key))
-            })?)),
+            Ok(bytes) => {
+                Ok(Some(String::from_utf8(bytes).map_err(|e| {
+                    StoreError::Other(format!("non-utf8 in {}: {e}", key))
+                })?))
+            }
             Err(StoreError::NotFound(_)) => Ok(None),
             Err(other) => Err(other),
         }
@@ -309,8 +311,8 @@ mod tests {
 
     #[tokio::test]
     async fn aws_sts_config_from_store_happy_path() {
-        use crate::infra::credential_store::test_helpers::MockCredentialStore;
         use crate::infra::credential_store::CredentialStore;
+        use crate::infra::credential_store::test_helpers::MockCredentialStore;
 
         let mock = MockCredentialStore::new();
         mock.put(STORE_KEY_ACCESS_KEY_ID, b"AKIATESTKEY")

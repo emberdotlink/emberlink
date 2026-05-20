@@ -11,7 +11,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Errors returned by the CLI verify path. Distinct from the daemon-side
 /// `VerifyOutcome::Break`, which is *part of a successful RPC* (the chain
@@ -64,7 +64,7 @@ pub enum VerifyVerdict {
     },
 }
 
-/// implementation-note-164 (B): `ember audit verify` CLI entry
+/// implementation-note-230 (B): `ember audit verify` CLI entry
 /// point. Walks the daemon's audit chain via the `audit_verify` socket
 /// method. `tail = None` requests a full-chain walk; `Some(n)` requests
 /// the last N rows.
@@ -167,10 +167,7 @@ fn call_audit_verify(socket_path: &Path, tail: Option<usize>) -> Result<Value, V
         .map_err(|e| VerifyError::Protocol(format!("invalid JSON-RPC response: {e}")))?;
 
     if let Some(err) = response.get("error").filter(|v| !v.is_null()) {
-        let code = err
-            .get("code")
-            .and_then(|c| c.as_i64())
-            .unwrap_or(-32000) as i32;
+        let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(-32000) as i32;
         let message = err
             .get("message")
             .and_then(|m| m.as_str())

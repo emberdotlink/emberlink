@@ -2,9 +2,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use core_event_types::{StorageLedgerEntry, StorageRelationship};
 
-use core_principals::{EndpointDescriptor, PublicKeyMaterial, RecoveryScope, SurvivalMode, TrustAttestation};
+use core_principals::{
+    EndpointDescriptor, PublicKeyMaterial, RecoveryScope, SurvivalMode, TrustAttestation,
+};
 
-use core_principals::{DerivedTrustStatement};
+use core_principals::DerivedTrustStatement;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RootStatus {

@@ -22,6 +22,7 @@ name = "ember-gcloud"
 version = "0.1.0"
 publisher = "did:emberlink"
 description = "Google Cloud CLI Construct. Mediates `gcloud` invocations through ember's credential broker: IAM privilege removal (service-accounts.delete, roles.delete, policies.remove-iam-policy-binding), KMS key destruction (keys.destroy) and decrypt (keys.decrypt), storage data destruction (storage.rm), VM destruction (compute.instances.delete), function/service deletion (functions.delete, run.services.delete), cluster deletion (container.clusters.delete), and secrets reveal (secrets.versions.access) all require biometric approval. Project deletion (projects.delete) is denied by default and requires an explicit grant override. OAuth tokens inject via CLOUDSDK_AUTH_ACCESS_TOKEN; SA-key fallback path uses GOOGLE_APPLICATION_CREDENTIALS."
+authority_refs = ["gcp"]
 
 # Default policy for unlisted action keys.
 default = "deny"

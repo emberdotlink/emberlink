@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>sh.emberlink.daemon.dev</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{EMBER_DEV_BIN}}</string>
+        <string>--foreground</string>
+    </array>
+    <key>UserName</key>
+    <string>_ember_dev</string>
+    <key>GroupName</key>
+    <string>_ember_dev</string>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardErrorPath</key>
+    <string>/var/log/emberd.dev.err</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>EMBER_TRUST_ROOTS</key>
+        <string>{{TRUST_ROOTS}}</string>
+        <key>EMBER_DAEMON_SOCKET</key>
+        <string>{{HOME}}/.ember-dev/run/daemon.dev.sock</string>
+        <key>EMBER_DAEMON_FLAVOR</key>
+        <string>dev</string>
+        <key>EMBER_VAULT_DIR</key>
+        <string>{{HOME}}/.ember-dev/vault</string>
+        <key>EMBER_MANIFEST_PATH</key>
+        <string>{{HOME}}/.ember-dev/binaries/manifest.toml</string>
+    </dict>
+</dict>
+</plist>

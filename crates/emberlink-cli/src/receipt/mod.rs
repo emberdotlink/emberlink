@@ -15,10 +15,10 @@ pub mod tree;
 pub mod verify_dispatch;
 
 pub use render::render_receipt_markdown;
-pub use rollup::{rollup_command, verify_chain, RollupError, RollupFilters, RollupRow};
+pub use rollup::{RollupError, RollupFilters, RollupRow, rollup_command, verify_chain};
 pub use tree::{
-    build_tree, cmd_receipt_tree, format_verify_outcome, read_tree_export, render_tree_ascii,
-    verify_tree_offline, TreeError, TreeExport, TreeGrant, TreeReceipt, TreeSpawnWitness,
-    VerifyTreeOutcome,
+    TreeError, TreeExport, TreeGrant, TreeReceipt, TreeSpawnWitness, VerifyTreeOutcome, build_tree,
+    cmd_receipt_tree, format_verify_outcome, read_tree_export, render_tree_ascii,
+    verify_tree_offline,
 };
-pub use verify_dispatch::{dispatch_verify, format_outcome, DispatchOutcome};
+pub use verify_dispatch::{DispatchOutcome, dispatch_verify, format_outcome};

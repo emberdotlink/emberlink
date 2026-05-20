@@ -1,4 +1,4 @@
-//! Linux memfd-sealed credential surface for broker exec (implementation-note-89-
+//! Linux memfd-sealed credential surface for broker exec (implementation-note-112-
 //! EXEC-ENV-LEAK-VIA-PROC Phase 1).
 //!
 //! ## Problem
@@ -148,6 +148,20 @@ impl SealedEnv {
     pub fn is_empty(&self) -> bool {
         self.name_to_fd.is_empty()
     }
+
+    /// Return owned (KEY, RawFd) pairs paralleling `env_entries`'s
+    /// `<KEY>_FD=<n>` output. Used by the host-direct pre-exec stub
+    /// (Slice B) to read the sealed fd contents and rewrite the
+    /// child env as `<KEY>=<plaintext>` immediately before execve.
+    ///
+    /// On non-Linux platforms this returns an empty Vec — same as
+    /// `env_entries()`.
+    pub fn key_fd_map(&self) -> Vec<(String, std::os::fd::RawFd)> {
+        self.name_to_fd
+            .iter()
+            .map(|(name, fd)| (name.clone(), *fd as std::os::fd::RawFd))
+            .collect()
+    }
 }
 
 /// Validate that a credential name is safe to substitute into the
@@ -218,11 +232,43 @@ pub fn seal_credentials_for_exec(creds: &[(&str, &str)]) -> Result<SealedEnv, Se
     }
 }
 
+/// Read the plaintext from a Phase-1-sealed memfd and return it as a
+/// `String`. The caller is responsible for closing the fd afterward —
+/// `read_sealed_fd` does NOT take ownership.
+///
+/// Used by the Slice B pre-exec closure in `handler.rs` to recover the
+/// plaintext for env rewrite immediately before execve.
+///
+/// `lseek` to start is required because Phase 1's
+/// [`seal_credentials_for_exec`] left the position at EOF after the
+/// write. Without seeking, `read` returns 0 bytes.
+///
+/// Returns `InvalidData` if the buffer isn't valid UTF-8.
+#[cfg(target_os = "linux")]
+pub fn read_sealed_fd(fd: std::os::fd::RawFd) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::fd::FromRawFd;
+
+    // SAFETY: we borrow the fd temporarily. ManuallyDrop prevents the
+    // `File` from closing it when this fn returns — the caller (Slice
+    // B's pre-exec closure) owns the close discipline via `libc::close`.
+    let mut file = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
+    file.seek(SeekFrom::Start(0))?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
+    String::from_utf8(buf).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("sealed fd contents not valid UTF-8: {e}"),
+        )
+    })
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
-    use super::{is_valid_env_name, SealError, SealedEnv};
-    use nix::fcntl::{fcntl, FcntlArg, SealFlag};
-    use nix::sys::memfd::{memfd_create, MemFdCreateFlag};
+    use super::{SealError, SealedEnv, is_valid_env_name};
+    use nix::fcntl::{FcntlArg, SealFlag, fcntl};
+    use nix::sys::memfd::{MemFdCreateFlag, memfd_create};
     use std::collections::HashMap;
     use std::ffi::CString;
     use std::fs::File;
@@ -298,10 +344,7 @@ mod linux {
             fds.push(owned_fd);
         }
 
-        Ok(SealedEnv {
-            name_to_fd,
-            fds,
-        })
+        Ok(SealedEnv { name_to_fd, fds })
     }
 }
 
@@ -420,6 +463,33 @@ mod tests {
         let mut s = String::new();
         f.read_to_string(&mut s).expect("read memfd");
         assert_eq!(s, SECRET, "memfd content lost in seal path");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn key_fd_map_and_read_sealed_fd_roundtrip() {
+        let sealed =
+            seal_credentials_for_exec(&[("FOO", "alpha"), ("BAR", "beta")]).expect("seal succeeds");
+
+        let map = sealed.key_fd_map();
+        assert_eq!(map.len(), 2);
+
+        // Build a HashMap for order-independent assertion (HashMap ordering
+        // is unspecified, so the two entries can come out either way).
+        let map_by_name: std::collections::HashMap<String, std::os::fd::RawFd> =
+            map.into_iter().collect();
+
+        let foo_fd = map_by_name.get("FOO").expect("FOO present");
+        let bar_fd = map_by_name.get("BAR").expect("BAR present");
+
+        let foo_plaintext = read_sealed_fd(*foo_fd).expect("read FOO");
+        let bar_plaintext = read_sealed_fd(*bar_fd).expect("read BAR");
+
+        assert_eq!(foo_plaintext, "alpha");
+        assert_eq!(bar_plaintext, "beta");
+
+        // Don't close the fds — sealed.drop() owns them. Closing here
+        // would double-free in Drop.
     }
 
     /// Sealed memfd refuses further writes — proves the F_SEAL_WRITE

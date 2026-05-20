@@ -22,6 +22,7 @@ name = "ember-az"
 version = "0.1.0"
 publisher = "did:emberlink"
 description = "Azure CLI Construct. Mediates `az` invocations through ember's credential broker: privilege removal (role.assignment.delete, role.definition.delete), Key Vault destruction (keyvault.delete, keyvault.key.delete, keyvault.secret.delete) and reveal (keyvault.key.decrypt, keyvault.secret.show), VM destruction (vm.delete, vm.deallocate), AKS/SQL deletion (aks.delete, sql.server.delete, sql.db.delete), storage data destruction (storage.account.delete, storage.blob.delete, storage.container.delete), and webapp/functionapp deletion (functionapp.delete, webapp.delete) all require biometric approval. Resource group deletion (group.delete) is denied by default and requires an explicit grant override. OAuth tokens inject via AZURE_ACCESS_TOKEN; SP-file fallback path uses AZURE_AUTH_LOCATION."
+authority_refs = ["azure_cli"]
 
 # Default policy for unlisted action keys.
 default = "deny"

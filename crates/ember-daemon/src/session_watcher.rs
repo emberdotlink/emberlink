@@ -7,7 +7,7 @@ use tracing::{info, warn};
 
 use crate::infra::receipt::{
     current_identity,
-    issue::{issue_cohort_a_receipt, TerminationMeta},
+    issue::{TerminationMeta, issue_cohort_a_receipt},
 };
 use crate::infra::store::DaemonStore;
 use crate::session::lifecycle::DaemonPersonaSigner;
@@ -48,10 +48,7 @@ fn pid_alive(pid: u32) -> bool {
 /// fall back to `data_dir/../sessions` which is the same path on a standard
 /// install.
 pub fn sessions_dir_from_data(data_dir: &std::path::Path) -> PathBuf {
-    data_dir
-        .parent()
-        .unwrap_or(data_dir)
-        .join("sessions")
+    data_dir.parent().unwrap_or(data_dir).join("sessions")
 }
 
 /// Background task: heartbeat + TTL session watcher.
@@ -116,23 +113,21 @@ pub async fn run(store: Rc<DaemonStore>, sessions_dir: PathBuf) {
 
             // --- TTL backstop ---
             let grant_expired = match store.get_grant(&session.grant_id) {
-                Ok(grant_info) => {
-                    match grant_info.created_at.parse::<DateTime<Utc>>() {
-                        Ok(created_at) => {
-                            let expiry = created_at + GRANT_TTL;
-                            now > expiry
-                        }
-                        Err(e) => {
-                            warn!(
-                                session_id = %session_id,
-                                grant_id = %session.grant_id,
-                                error = %e,
-                                "session watcher: could not parse grant created_at — skipping TTL check"
-                            );
-                            false
-                        }
+                Ok(grant_info) => match grant_info.created_at.parse::<DateTime<Utc>>() {
+                    Ok(created_at) => {
+                        let expiry = created_at + GRANT_TTL;
+                        now > expiry
                     }
-                }
+                    Err(e) => {
+                        warn!(
+                            session_id = %session_id,
+                            grant_id = %session.grant_id,
+                            error = %e,
+                            "session watcher: could not parse grant created_at — skipping TTL check"
+                        );
+                        false
+                    }
+                },
                 Err(crate::infra::store::StoreError::NotFound) => {
                     // Grant is gone — treat as TTL expired.
                     true
@@ -200,7 +195,7 @@ pub fn close_session_ttl_expiry(
 /// with `TerminationReason::CleanExit` so test code does not need access to
 /// the private `close_session` signature.
 ///
-/// implementation-note-242: clean_exit MUST NOT revoke
+/// implementation-note-338: clean_exit MUST NOT revoke
 /// the grant — multiple sessions per 24h grant is the contract.
 pub fn close_session_clean_exit(
     session_store: &SessionStore,
@@ -230,7 +225,7 @@ pub fn close_session_clean_exit(
 ///
 /// # Grant revocation policy
 ///
-/// implementation-note-242: clean_exit MUST NOT revoke
+/// implementation-note-338: clean_exit MUST NOT revoke
 /// the grant — multiple sessions per 24h grant is the contract.
 ///
 /// Grant revocation is performed ONLY for:
@@ -259,7 +254,7 @@ fn close_session(
 ) {
     // Evaluate revocation policy before moving termination_reason into the Receipt.
     //
-    // implementation-note-242: clean_exit MUST NOT revoke
+    // implementation-note-338: clean_exit MUST NOT revoke
     // the grant — multiple sessions per 24h grant is the contract.
     let should_revoke = !matches!(termination_reason, TerminationReason::CleanExit);
 
@@ -327,29 +322,28 @@ fn close_session(
         );
         return;
     }
+    let _ = crate::infra::interactive_unlock::release_session_pin(session_id);
 
     // 3. Revoke the broker grant — cascades to children.
     //
     // Revoke only on terminal/dirty termination reasons (see policy at top of
     // function). CleanExit leaves the grant Active.
-    if should_revoke {
-        if let Err(e) = daemon_store.revoke_grant(grant_id) {
-            match e {
-                crate::infra::store::StoreError::NotFound => {
-                    warn!(
-                        session_id = %session_id,
-                        grant_id = %grant_id,
-                        "session watcher: grant absent at close — likely already terminal"
-                    );
-                }
-                other => {
-                    warn!(
-                        session_id = %session_id,
-                        grant_id = %grant_id,
-                        error = %other,
-                        "session watcher: failed to revoke grant"
-                    );
-                }
+    if should_revoke && let Err(e) = daemon_store.revoke_grant(grant_id) {
+        match e {
+            crate::infra::store::StoreError::NotFound => {
+                warn!(
+                    session_id = %session_id,
+                    grant_id = %grant_id,
+                    "session watcher: grant absent at close — likely already terminal"
+                );
+            }
+            other => {
+                warn!(
+                    session_id = %session_id,
+                    grant_id = %grant_id,
+                    error = %other,
+                    "session watcher: failed to revoke grant"
+                );
             }
         }
     }
@@ -367,6 +361,64 @@ fn close_session(
             reason = %reason,
             error = %e,
             "session watcher: failed to log session.closed audit event"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use core_state::sessions::SessionMeta;
+    use tempfile::TempDir;
+
+    #[test]
+    fn close_session_clean_exit_releases_interactive_unlock_pin() {
+        let _guard = crate::PROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::infra::interactive_unlock::reset_for_tests();
+
+        let sessions_root = TempDir::new().expect("temp sessions root");
+        let sessions_dir = sessions_root.path().to_path_buf();
+        let session_store = SessionStore::new(sessions_dir.clone());
+        let daemon_store = DaemonStore::open_in_memory().expect("in-memory daemon store");
+
+        let meta = SessionMeta {
+            session_id: "sess_watch_test".to_string(),
+            persona: "persona_test".to_string(),
+            grant_id: "grant_test".to_string(),
+            started_at: Utc::now(),
+            launcher_pid: std::process::id(),
+            workflow_id: None,
+            workflow_template: None,
+        };
+        session_store.create(&meta).expect("create session meta");
+        assert!(
+            crate::infra::interactive_unlock::acquire_session_pin(&meta.session_id),
+            "session-open pin should register before clean-exit close"
+        );
+        assert_eq!(crate::infra::interactive_unlock::pin_count(), 1);
+
+        close_session_clean_exit(
+            &session_store,
+            &daemon_store,
+            &meta.session_id,
+            &meta.grant_id,
+            &sessions_dir,
+        );
+
+        assert_eq!(
+            crate::infra::interactive_unlock::pin_count(),
+            0,
+            "clean-exit watcher close must release the interactive pin"
+        );
+        assert!(
+            sessions_dir
+                .join(&meta.session_id)
+                .join("meta.json.closed")
+                .exists(),
+            "session meta must be renamed closed"
         );
     }
 }

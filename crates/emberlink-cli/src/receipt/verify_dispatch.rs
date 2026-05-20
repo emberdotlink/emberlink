@@ -1,4 +1,4 @@
-//! Receipt verify dispatch (implementation-note-44).
+//! Receipt verify dispatch (implementation-note-59).
 //!
 //! `ember receipt verify --file <path>` reads a receipt off disk and routes
 //! to the right verifier based on its `version` field:
@@ -8,12 +8,12 @@
 //!   [`core_receipts::tool_registry::ToolRegistry`].
 //! - any other value → clear error.
 //!
-//! implementation-note-44 anchor: this is the dispatch site — keep the version
+//! implementation-note-59 anchor: this is the dispatch site — keep the version
 //! match arm exhaustive and the error message naming the unknown version
 //! literally so users can grep for it in logs.
 
 use core_receipts::tool_registry::ToolRegistry;
-use core_receipts::{verify_v2, ReceiptV2, VerifyResult};
+use core_receipts::{ReceiptV2, VerifyResult, verify_v2};
 
 /// Outcome of [`dispatch_verify`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,7 +33,7 @@ pub enum DispatchOutcome {
 ///
 /// `bytes` is the raw file contents. The function does NOT do I/O.
 pub fn dispatch_verify(bytes: &[u8]) -> DispatchOutcome {
-    // implementation-note-44: parse-once, branch-on-version. Keep this branching
+    // implementation-note-59: parse-once, branch-on-version. Keep this branching
     // exhaustive so a future v3 receipt can't silently fall through to v1.
     let raw: serde_json::Value = match serde_json::from_slice(bytes) {
         Ok(v) => v,
@@ -82,7 +82,9 @@ pub fn format_outcome(outcome: &DispatchOutcome) -> String {
             format!("v2 verify FAILED: unknown tool_id {tool_id}")
         }
         DispatchOutcome::UnknownVersion(v) => {
-            format!("error: unknown receipt version: {v} (implementation-note-44: only v1 and v2 are supported)")
+            format!(
+                "error: unknown receipt version: {v} (implementation-note-59: only v1 and v2 are supported)"
+            )
         }
         DispatchOutcome::InvalidJson(e) => format!("error: not valid receipt JSON: {e}"),
     }
@@ -138,10 +140,10 @@ mod tests {
             DispatchOutcome::UnknownVersion(_) => {}
             other => panic!("expected UnknownVersion, got {other:?}"),
         }
-        // The user-facing message must name implementation-note-44 so operators
+        // The user-facing message must name implementation-note-59 so operators
         // can correlate to this dispatch site.
         let msg = format_outcome(&dispatch_verify(&bytes));
-        assert!(msg.contains("implementation-note-44"), "msg={msg}");
+        assert!(msg.contains("implementation-note-59"), "msg={msg}");
         assert!(msg.contains("99"), "msg={msg}");
     }
 

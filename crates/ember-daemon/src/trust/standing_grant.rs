@@ -1,8 +1,10 @@
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use core_proxy_forward::r#match::host_matches_domain;
 
 use crate::infra::store::{DaemonStore, StoreError};
+use crate::trust::grant::MAX_GRANT_TTL_SECS;
 
 /// Per-Statement standing grant match (design). Returned when an active
 /// grant for the persona carries a Statement whose selector covers the
@@ -39,7 +41,11 @@ fn resource_matches_allowed_targets(allowed_targets: Option<&str>, resource: &st
     let Some(targets) = allowed_targets else {
         return true; // no restriction
     };
-    let entries: Vec<&str> = targets.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    let entries: Vec<&str> = targets
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
     if entries.is_empty() {
         return false; // empty list is deny-all
     }
@@ -70,6 +76,34 @@ impl DaemonStore {
         scope: &str,
         expires_at: Option<&str>,
     ) -> Result<(), StoreError> {
+        // standing_grant_expires_at_capped — Per adversarial-review
+        // 2026-05-19 HIGH-7. The `Always` approval outcome funnels through
+        // here with a caller-supplied `expires_at` string. Without a cap, an
+        // approver (or coerced/buggy dashboard) could mint a year-2099
+        // standing grant, defeating design's "bounded" invariant. Parse
+        // the RFC-3339 string, compute seconds-from-now, refuse when the
+        // window exceeds [`MAX_GRANT_TTL_SECS`]. `None` (indefinite) is
+        // left to caller discretion — daemon-internal flows occasionally
+        // mint genuinely persistent standing grants and the cap there is
+        // architectural intent rather than a per-row check.
+        if let Some(s) = expires_at {
+            let parsed = DateTime::parse_from_rfc3339(s)
+                .map_err(|e| {
+                    StoreError::InvalidInput(format!(
+                        "standing-grant expires_at {s:?} is not RFC-3339: {e}"
+                    ))
+                })?
+                .with_timezone(&Utc);
+            let now = Utc::now();
+            let secs_from_now = (parsed - now).num_seconds();
+            if secs_from_now > MAX_GRANT_TTL_SECS as i64 {
+                return Err(StoreError::InvalidInput(format!(
+                    "standing-grant expires_at {s:?} is {secs_from_now}s from now, \
+                     exceeding MAX_GRANT_TTL_SECS ({MAX_GRANT_TTL_SECS}s); grants are \
+                     bounded per design"
+                )));
+            }
+        }
         self.conn()
             .execute(
                 "INSERT OR REPLACE INTO standing_grants \
@@ -121,7 +155,8 @@ impl DaemonStore {
                 })
             })
             .map_err(StoreError::Sqlite)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::Sqlite)
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::Sqlite)
     }
 
     /// Walk every active grant for the persona and return the first that
@@ -187,7 +222,13 @@ mod tests {
     }
 
     fn persona_id(store: &DaemonStore) -> String {
-        store.list_personas().unwrap().into_iter().next().unwrap().id
+        store
+            .list_personas()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .id
     }
 
     #[test]
@@ -213,8 +254,16 @@ mod tests {
         store
             .create_standing_grant(&pid, "credential.access", "*", None)
             .unwrap();
-        assert!(store.check_standing_grant(&pid, "credential.access").unwrap());
-        assert!(!store.check_standing_grant(&pid, "credential.write").unwrap());
+        assert!(
+            store
+                .check_standing_grant(&pid, "credential.access")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .check_standing_grant(&pid, "credential.write")
+                .unwrap()
+        );
     }
 
     #[test]
@@ -224,8 +273,16 @@ mod tests {
         store
             .create_standing_grant(&pid, "credential.*", "*", None)
             .unwrap();
-        assert!(store.check_standing_grant(&pid, "credential.access").unwrap());
-        assert!(store.check_standing_grant(&pid, "credential.write").unwrap());
+        assert!(
+            store
+                .check_standing_grant(&pid, "credential.access")
+                .unwrap()
+        );
+        assert!(
+            store
+                .check_standing_grant(&pid, "credential.write")
+                .unwrap()
+        );
         assert!(!store.check_standing_grant(&pid, "sandbox.run").unwrap());
     }
 
@@ -273,29 +330,88 @@ mod tests {
         store
             .create_standing_grant(&pid, "credential.access", "*", None)
             .unwrap();
-        assert!(!store.check_standing_grant("other-persona", "credential.access").unwrap());
+        assert!(
+            !store
+                .check_standing_grant("other-persona", "credential.access")
+                .unwrap()
+        );
     }
 
     #[test]
     fn expired_standing_grant_not_matched() {
         let store = setup();
         let pid = persona_id(&store);
-        // Insert a grant that expired in the past.
+        // standing_grant_expires_at_capped: parser is now strict RFC-3339;
+        // emit the past timestamp via `.to_rfc3339()` rather than the legacy
+        // naive-ISO shape. Past dates do not trip the MAX_GRANT_TTL_SECS
+        // cap (secs_from_now is negative).
+        let past = (Utc::now() - chrono::Duration::days(7300)).to_rfc3339();
         store
-            .create_standing_grant(&pid, "credential.access", "*", Some("2000-01-01T00:00:00"))
+            .create_standing_grant(&pid, "credential.access", "*", Some(&past))
             .unwrap();
         // Must not match even though the action and persona are correct.
-        assert!(!store.check_standing_grant(&pid, "credential.access").unwrap());
+        assert!(
+            !store
+                .check_standing_grant(&pid, "credential.access")
+                .unwrap()
+        );
     }
 
     #[test]
     fn future_expiry_standing_grant_matches() {
         let store = setup();
         let pid = persona_id(&store);
+        // standing_grant_expires_at_capped: needs strict RFC-3339 AND a
+        // future date within MAX_GRANT_TTL_SECS. 1 day satisfies both.
+        let future = (Utc::now() + chrono::Duration::days(1)).to_rfc3339();
         store
-            .create_standing_grant(&pid, "credential.access", "*", Some("2099-01-01T00:00:00"))
+            .create_standing_grant(&pid, "credential.access", "*", Some(&future))
             .unwrap();
-        assert!(store.check_standing_grant(&pid, "credential.access").unwrap());
+        assert!(
+            store
+                .check_standing_grant(&pid, "credential.access")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn create_standing_grant_refuses_expires_at_past_cap() {
+        // Direct test of the MAX_GRANT_TTL_SECS enforcement at the
+        // standing-grant write path. Tracks adversarial-review 2026-05-19
+        // HIGH-7 closure.
+        let store = setup();
+        let pid = persona_id(&store);
+        let past_cap = (Utc::now() + chrono::Duration::days(60)).to_rfc3339();
+        let err = store
+            .create_standing_grant(&pid, "credential.access", "*", Some(&past_cap))
+            .expect_err("expected MAX_GRANT_TTL_SECS refusal");
+        match err {
+            StoreError::InvalidInput(msg) => {
+                assert!(
+                    msg.contains("MAX_GRANT_TTL_SECS"),
+                    "error message must reference the cap: {msg}"
+                );
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_standing_grant_refuses_non_rfc3339_expires_at() {
+        // Direct test: the parser is strict RFC-3339 (TZ required). Tracks
+        // adversarial-review 2026-05-19 HIGH-7 — the legacy naive-ISO
+        // format is no longer accepted, closing the audit-shape ambiguity.
+        let store = setup();
+        let pid = persona_id(&store);
+        let err = store
+            .create_standing_grant(&pid, "credential.access", "*", Some("2099-01-01T00:00:00"))
+            .expect_err("expected RFC-3339 refusal");
+        match err {
+            StoreError::InvalidInput(msg) => {
+                assert!(msg.contains("RFC-3339"), "got: {msg}");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
     }
 
     #[test]
@@ -332,30 +448,60 @@ mod tests {
     #[test]
     fn resource_matches_allowed_targets_none_is_unrestricted() {
         // None = no restriction; any resource is allowed.
-        assert!(resource_matches_allowed_targets(None, "any.host.example.com"));
+        assert!(resource_matches_allowed_targets(
+            None,
+            "any.host.example.com"
+        ));
         assert!(resource_matches_allowed_targets(None, ""));
     }
 
     #[test]
     fn resource_matches_allowed_targets_empty_is_deny_all() {
         // Empty string → deny-all, not wildcard.
-        assert!(!resource_matches_allowed_targets(Some(""), "api.github.com"));
-        assert!(!resource_matches_allowed_targets(Some("  "), "api.github.com"));
-        assert!(!resource_matches_allowed_targets(Some(" , , "), "api.github.com"));
+        assert!(!resource_matches_allowed_targets(
+            Some(""),
+            "api.github.com"
+        ));
+        assert!(!resource_matches_allowed_targets(
+            Some("  "),
+            "api.github.com"
+        ));
+        assert!(!resource_matches_allowed_targets(
+            Some(" , , "),
+            "api.github.com"
+        ));
     }
 
     #[test]
     fn resource_matches_allowed_targets_exact_match() {
-        assert!(resource_matches_allowed_targets(Some("api.github.com"), "api.github.com"));
-        assert!(!resource_matches_allowed_targets(Some("api.github.com"), "evil.example.com"));
+        assert!(resource_matches_allowed_targets(
+            Some("api.github.com"),
+            "api.github.com"
+        ));
+        assert!(!resource_matches_allowed_targets(
+            Some("api.github.com"),
+            "evil.example.com"
+        ));
     }
 
     #[test]
     fn resource_matches_allowed_targets_wildcard_subdomain() {
-        assert!(resource_matches_allowed_targets(Some("*.github.com"), "api.github.com"));
-        assert!(resource_matches_allowed_targets(Some("*.github.com"), "uploads.api.github.com"));
-        assert!(resource_matches_allowed_targets(Some("*.github.com"), "github.com"));
-        assert!(!resource_matches_allowed_targets(Some("*.github.com"), "evil.example.com"));
+        assert!(resource_matches_allowed_targets(
+            Some("*.github.com"),
+            "api.github.com"
+        ));
+        assert!(resource_matches_allowed_targets(
+            Some("*.github.com"),
+            "uploads.api.github.com"
+        ));
+        assert!(resource_matches_allowed_targets(
+            Some("*.github.com"),
+            "github.com"
+        ));
+        assert!(!resource_matches_allowed_targets(
+            Some("*.github.com"),
+            "evil.example.com"
+        ));
     }
 
     #[test]
@@ -374,9 +520,18 @@ mod tests {
     #[test]
     fn resource_matches_allowed_targets_multi_entry() {
         let targets = "api.github.com,anthropic.com";
-        assert!(resource_matches_allowed_targets(Some(targets), "api.github.com"));
-        assert!(resource_matches_allowed_targets(Some(targets), "anthropic.com"));
-        assert!(!resource_matches_allowed_targets(Some(targets), "evil.example.com"));
+        assert!(resource_matches_allowed_targets(
+            Some(targets),
+            "api.github.com"
+        ));
+        assert!(resource_matches_allowed_targets(
+            Some(targets),
+            "anthropic.com"
+        ));
+        assert!(!resource_matches_allowed_targets(
+            Some(targets),
+            "evil.example.com"
+        ));
     }
 
     #[test]

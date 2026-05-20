@@ -17,6 +17,8 @@
 
 pub mod events;
 pub mod storage;
+pub mod workflow_receipt;
 
 pub use events::*;
 pub use storage::*;
+pub use workflow_receipt::PregrantPath;

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EmberConfig {
-    /// implementation-note-11: when true, hook unreachable/panic paths permit. When false, all deny.
+    /// implementation-note-13: when true, hook unreachable/panic paths permit. When false, all deny.
     /// Default: true (fail-open during cohort A friendly-dev rollout).
     pub explicit_fail_open: bool,
 }
@@ -37,7 +37,9 @@ impl EmberConfig {
     /// Returns Err on parse failure.
     pub fn load() -> Result<Self, ConfigError> {
         let home = std::env::var("HOME").map_err(|_| ConfigError::NoHome)?;
-        let path = std::path::Path::new(&home).join(".ember").join("config.toml");
+        let path = std::path::Path::new(&home)
+            .join(".ember")
+            .join("config.toml");
         if !path.exists() {
             return Ok(Self::default());
         }

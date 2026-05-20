@@ -1,10 +1,11 @@
-// implementation-note-6
+// implementation-note-8
 use chrono::Utc;
-use core_approval::{ApprovalLifecycle, LifecycleError, RequestId, SubmitMetadata};
 use core_approval::ApprovalOutcome as CoreApprovalOutcome;
+use core_approval::{ApprovalLifecycle, LifecycleError, RequestId, SubmitMetadata};
 use core_grant_types::approval::RequestedScope;
-use core_grant_types::{GrantProposal, Statement, Usage};
+use core_grant_types::{Budget, GrantProposal, Statement, Usage};
 use rusqlite::OptionalExtension;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::rc::Rc;
 use uuid::Uuid;
@@ -84,9 +85,24 @@ impl ApprovalLifecycle for DaemonApprovalStore {
             metadata.risk_level.as_str()
         };
 
+        // implementation-note-7 — pass
+        // the five grant-shaping fields through to the inner writer so they
+        // survive the approval queue and the resolver can re-stamp them on
+        // the minted grant.
+        let grant_shape = GrantShapeFields {
+            max_delegation_depth: metadata.max_delegation_depth,
+            max_uses_per_hour: metadata.max_uses_per_hour,
+            allowed_hours_start: metadata.allowed_hours_start,
+            allowed_hours_end: metadata.allowed_hours_end,
+            allowed_targets: metadata.allowed_targets.clone(),
+            budget: metadata.budget.clone(),
+            max_children_per_day: metadata.max_children_per_day,
+            auto_delegate_scope_template: metadata.auto_delegate_scope_template.clone(),
+        };
+
         let info = self
             .store
-            .submit_approval_inner(
+            .submit_approval_inner_with_fields(
                 persona,
                 credential,
                 &scope_str,
@@ -99,6 +115,7 @@ impl ApprovalLifecycle for DaemonApprovalStore {
                 metadata.target_url,
                 metadata.agent_framework,
                 None,
+                grant_shape,
             )
             .map_err(LifecycleError::from)?;
 
@@ -116,7 +133,8 @@ impl ApprovalLifecycle for DaemonApprovalStore {
             .get_approval(&request_id.0)
             .map_err(LifecycleError::from)?;
 
-        let current_status: core_grant_types::approval::ApprovalStatus = match info.status.as_str() {
+        let current_status: core_grant_types::approval::ApprovalStatus = match info.status.as_str()
+        {
             "pending" => core_grant_types::approval::ApprovalStatus::Pending,
             "approved" => core_grant_types::approval::ApprovalStatus::Approved,
             "denied" => core_grant_types::approval::ApprovalStatus::Denied,
@@ -189,7 +207,9 @@ impl ApprovalLifecycle for DaemonApprovalStore {
         // Phase B stub — Phase C wires the full standing-grant path.
         // TODO: coordinate with C-3A — standing-grant
         // path will be implemented once handler.rs migration is complete.
-        Err(LifecycleError::Storage("apply_standing: not yet implemented in Phase B".into()))
+        Err(LifecycleError::Storage(
+            "apply_standing: not yet implemented in Phase B".into(),
+        ))
     }
 }
 
@@ -237,6 +257,9 @@ impl<'a> ApprovalLifecycle for DaemonApprovalStoreRef<'a> {
         // in that impl for the metadata/action/risk fallback rationale.
         // approval_notify_fields_persisted: thread the four NOTIF-1 fields
         // through to submit_approval_inner so get_approval returns them.
+        // implementation-note-7 — also
+        // thread the five grant-shaping fields through so the resolver can
+        // re-stamp them on the minted grant.
         let scope_str = scope.capability.clone();
         let action = if metadata.action.is_empty() {
             "credential.access"
@@ -249,9 +272,20 @@ impl<'a> ApprovalLifecycle for DaemonApprovalStoreRef<'a> {
             metadata.risk_level.as_str()
         };
 
+        let grant_shape = GrantShapeFields {
+            max_delegation_depth: metadata.max_delegation_depth,
+            max_uses_per_hour: metadata.max_uses_per_hour,
+            allowed_hours_start: metadata.allowed_hours_start,
+            allowed_hours_end: metadata.allowed_hours_end,
+            allowed_targets: metadata.allowed_targets.clone(),
+            budget: metadata.budget.clone(),
+            max_children_per_day: metadata.max_children_per_day,
+            auto_delegate_scope_template: metadata.auto_delegate_scope_template.clone(),
+        };
+
         let info = self
             .store
-            .submit_approval_inner(
+            .submit_approval_inner_with_fields(
                 persona,
                 credential,
                 &scope_str,
@@ -264,6 +298,7 @@ impl<'a> ApprovalLifecycle for DaemonApprovalStoreRef<'a> {
                 metadata.target_url,
                 metadata.agent_framework,
                 None,
+                grant_shape,
             )
             .map_err(LifecycleError::from)?;
 
@@ -281,7 +316,8 @@ impl<'a> ApprovalLifecycle for DaemonApprovalStoreRef<'a> {
             .get_approval(&request_id.0)
             .map_err(LifecycleError::from)?;
 
-        let current_status: core_grant_types::approval::ApprovalStatus = match info.status.as_str() {
+        let current_status: core_grant_types::approval::ApprovalStatus = match info.status.as_str()
+        {
             "pending" => core_grant_types::approval::ApprovalStatus::Pending,
             "approved" => core_grant_types::approval::ApprovalStatus::Approved,
             "denied" => core_grant_types::approval::ApprovalStatus::Denied,
@@ -349,7 +385,9 @@ impl<'a> ApprovalLifecycle for DaemonApprovalStoreRef<'a> {
     ) -> Result<core_grants::Grant, LifecycleError> {
         // TODO: coordinate with C-3A — standing-grant
         // path will be implemented once handler.rs migration is complete.
-        Err(LifecycleError::Storage("apply_standing: not yet implemented in Phase B".into()))
+        Err(LifecycleError::Storage(
+            "apply_standing: not yet implemented in Phase B".into(),
+        ))
     }
 }
 
@@ -385,9 +423,9 @@ fn access_grant_to_core_grants(ag: &core_grant_types::AccessGrant) -> core_grant
         .unwrap_or_default();
 
     // Derive expires_at from the earliest block expiry (epoch seconds → DateTime).
-    let expires_at = ag.effective_expires_at().and_then(|epoch| {
-        chrono::DateTime::<chrono::Utc>::from_timestamp(epoch as i64, 0)
-    });
+    let expires_at = ag
+        .effective_expires_at()
+        .and_then(|epoch| chrono::DateTime::<chrono::Utc>::from_timestamp(epoch as i64, 0));
 
     // Strip "grant-" prefix before parsing as UUID.
     let raw_id = ag.id.strip_prefix("grant-").unwrap_or(&ag.id);
@@ -425,6 +463,7 @@ fn sha256_hex(json: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRequestInfo {
     pub id: String,
     pub persona_id: String,
@@ -442,7 +481,7 @@ pub struct ApprovalRequestInfo {
     pub target_summary: Option<String>,
     pub target_url: Option<String>,
     pub agent_framework: Option<String>,
-    /// implementation-note-152 — composite envelope statements (3-statement
+    /// implementation-note-201 — composite envelope statements (3-statement
     /// credential+session+time bundle minted by `ember sandbox run`)
     /// serialized as JSON when set. Surfaces as a single approval entry
     /// (NOT three) so the dashboard can render all three statements as
@@ -456,12 +495,61 @@ pub struct ApprovalRequestInfo {
     /// the `GrantProposal.skill_ref` field; emberd does not enforce on it.
     /// Per design. `None` for approvals submitted without a skill_ref.
     pub skill_ref: Option<String>,
+    /// Current create-grant shaping fields. Persisted on the approval row so
+    /// the resolver can mint the same budget / condition / standing-parent
+    /// shape after Approve that the auto-approve path would have produced
+    /// inline.
+    pub max_delegation_depth: Option<u32>,
+    pub max_uses_per_hour: Option<u64>,
+    pub allowed_hours_start: Option<u32>,
+    pub allowed_hours_end: Option<u32>,
+    pub allowed_targets: Option<String>,
+    pub budget: Option<Budget>,
+    pub max_children_per_day: Option<u64>,
+    pub auto_delegate_scope_template: Option<String>,
+}
+
+/// Caller-supplied create-grant shaping fields that flow through the approval
+/// queue. Bundled into one struct so `submit_approval_inner` does not grow a
+/// long positional tail. After Approve, the resolver re-applies each field to
+/// the freshly-minted grant so the auto-approve and approval-required paths
+/// produce grants of identical shape.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GrantShapeFields {
+    pub max_delegation_depth: Option<u32>,
+    pub max_uses_per_hour: Option<u64>,
+    pub allowed_hours_start: Option<u32>,
+    pub allowed_hours_end: Option<u32>,
+    pub allowed_targets: Option<String>,
+    pub budget: Option<Budget>,
+    pub max_children_per_day: Option<u64>,
+    pub auto_delegate_scope_template: Option<String>,
+}
+
+impl GrantShapeFields {
+    /// True iff every field is `None`. Used to skip the post-mint UPDATE so
+    /// rows that didn't request any grant-shaping conditions don't pay the
+    /// write cost.
+    pub fn is_empty(&self) -> bool {
+        self.max_delegation_depth.is_none()
+            && self.max_uses_per_hour.is_none()
+            && self.allowed_hours_start.is_none()
+            && self.allowed_hours_end.is_none()
+            && self.allowed_targets.is_none()
+            && self.budget.is_none()
+            && self.max_children_per_day.is_none()
+            && self.auto_delegate_scope_template.is_none()
+    }
 }
 
 pub enum ApprovalOutcome {
     Approved,
-    Denied { reason: String },
-    Narrowed { new_scope: String },
+    Denied {
+        reason: String,
+    },
+    Narrowed {
+        new_scope: String,
+    },
     /// Approve this request AND create a standing grant so future matching
     /// requests auto-approve without prompting.
     ///
@@ -500,7 +588,7 @@ impl DaemonStore {
         )
     }
 
-    /// implementation-note-152 — submit ONE approval entry that bundles a 3-statement
+    /// implementation-note-201 — submit ONE approval entry that bundles a 3-statement
     /// composite envelope (credential + session + time). On `Approved` the
     /// resolver mints a single composite grant whose `blocks_json` is
     /// overwritten with the supplied statement list (matching the shape
@@ -565,7 +653,7 @@ impl DaemonStore {
             .enumerate()
             .map(|(i, sp)| Statement {
                 sid: format!("s{i}"),
-                resource_type: sp.resource_type.clone(),
+                resource_type: sp.resource_type,
                 actions: sp.actions.clone(),
                 resource: sp.resource.clone(),
                 budget: sp.budget.clone(),
@@ -651,6 +739,48 @@ impl DaemonStore {
         agent_framework: Option<String>,
         skill_ref: Option<String>,
     ) -> Result<ApprovalRequestInfo, StoreError> {
+        // Legacy entry: zero-shaped delegation fields. Production paths that
+        // need to preserve grant-shaping fields call
+        // `submit_approval_inner_with_fields` directly.
+        self.submit_approval_inner_with_fields(
+            persona_id,
+            credential_name,
+            scope,
+            ttl_secs,
+            action,
+            risk_level,
+            composite_statements,
+            tool_name,
+            target_host,
+            target_url,
+            agent_framework,
+            skill_ref,
+            GrantShapeFields::default(),
+        )
+    }
+
+    /// implementation-note-7 — inner
+    /// approval-row writer that persists the five grant-shaping fields the
+    /// `create_grant` socket call previously dropped on the floor when policy
+    /// required approval. The resolver re-applies them to the freshly-minted
+    /// grant row after Approve.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn submit_approval_inner_with_fields(
+        &self,
+        persona_id: &str,
+        credential_name: &str,
+        scope: &str,
+        ttl_secs: Option<u64>,
+        action: &str,
+        risk_level: &str,
+        composite_statements: Option<Vec<Statement>>,
+        tool_name: Option<String>,
+        target_host: Option<String>,
+        target_url: Option<String>,
+        agent_framework: Option<String>,
+        skill_ref: Option<String>,
+        grant_shape: GrantShapeFields,
+    ) -> Result<ApprovalRequestInfo, StoreError> {
         let id = format!("approval-{}", Uuid::new_v4());
         let created_at = Utc::now().to_rfc3339();
 
@@ -668,12 +798,19 @@ impl DaemonStore {
 
         // approval_notify_fields_persisted — INSERT includes the four NOTIF-1
         // fields so get_approval reads them back instead of returning None.
+        // INSERT also carries the operator-requested create-grant shaping
+        // fields so the resolver can re-stamp them on the minted grant after
+        // Approve.
         self.conn().execute(
             "INSERT INTO approval_requests \
              (id, persona_id, credential_name, scope, ttl_secs, action, risk_level, status, created_at, \
               composite_statements_json, composite_statements_hash, \
-              tool_name, target_host, target_url, agent_framework, skill_ref) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+              tool_name, target_host, target_url, agent_framework, skill_ref, \
+              max_delegation_depth, max_uses_per_hour, allowed_hours_start, \
+              allowed_hours_end, allowed_targets, budget_json, \
+              max_children_per_day, auto_delegate_scope_template) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
+                     ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
             rusqlite::params![
                 id,
                 persona_id,
@@ -690,6 +827,23 @@ impl DaemonStore {
                 target_url,
                 agent_framework,
                 skill_ref,
+                grant_shape.max_delegation_depth.map(|v| v as i64),
+                grant_shape.max_uses_per_hour.map(|v| v as i64),
+                grant_shape.allowed_hours_start.map(|v| v as i64),
+                grant_shape.allowed_hours_end.map(|v| v as i64),
+                grant_shape.allowed_targets.clone(),
+                grant_shape
+                    .budget
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|e| {
+                        StoreError::InvalidInput(format!(
+                            "grant shape budget serialize: {e}"
+                        ))
+                    })?,
+                grant_shape.max_children_per_day.map(|v| v as i64),
+                grant_shape.auto_delegate_scope_template.clone(),
             ],
         )?;
 
@@ -712,6 +866,14 @@ impl DaemonStore {
             composite_statements,
             result_grant_id: None,
             skill_ref,
+            max_delegation_depth: grant_shape.max_delegation_depth,
+            max_uses_per_hour: grant_shape.max_uses_per_hour,
+            allowed_hours_start: grant_shape.allowed_hours_start,
+            allowed_hours_end: grant_shape.allowed_hours_end,
+            allowed_targets: grant_shape.allowed_targets,
+            budget: grant_shape.budget,
+            max_children_per_day: grant_shape.max_children_per_day,
+            auto_delegate_scope_template: grant_shape.auto_delegate_scope_template,
         })
     }
 
@@ -719,7 +881,10 @@ impl DaemonStore {
         let mut stmt = self.conn().prepare(
             "SELECT id, persona_id, credential_name, scope, ttl_secs, action, risk_level, \
              status, reason, created_at, composite_statements_json, result_grant_id, \
-             tool_name, target_host, target_url, agent_framework, skill_ref \
+             tool_name, target_host, target_url, agent_framework, skill_ref, \
+             max_delegation_depth, max_uses_per_hour, allowed_hours_start, \
+             allowed_hours_end, allowed_targets, budget_json, \
+             max_children_per_day, auto_delegate_scope_template \
              FROM approval_requests WHERE status = 'pending' ORDER BY created_at",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -728,6 +893,11 @@ impl DaemonStore {
             let composite_statements = composite_json
                 .as_deref()
                 .and_then(|s| serde_json::from_str::<Vec<Statement>>(s).ok());
+            let mdd: Option<i64> = row.get(17)?;
+            let muph: Option<i64> = row.get(18)?;
+            let ahs: Option<i64> = row.get(19)?;
+            let ahe: Option<i64> = row.get(20)?;
+            let budget_json: Option<String> = row.get(22)?;
             Ok(ApprovalRequestInfo {
                 id: row.get(0)?,
                 persona_id: row.get(1)?,
@@ -747,6 +917,16 @@ impl DaemonStore {
                 composite_statements,
                 result_grant_id: row.get(11)?,
                 skill_ref: row.get(16)?,
+                max_delegation_depth: mdd.map(|v| v as u32),
+                max_uses_per_hour: muph.map(|v| v as u64),
+                allowed_hours_start: ahs.map(|v| v as u32),
+                allowed_hours_end: ahe.map(|v| v as u32),
+                allowed_targets: row.get(21)?,
+                budget: budget_json
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str::<Budget>(json).ok()),
+                max_children_per_day: row.get::<_, Option<i64>>(23)?.map(|v| v as u64),
+                auto_delegate_scope_template: row.get(24)?,
             })
         })?;
         let mut requests = Vec::new();
@@ -757,7 +937,7 @@ impl DaemonStore {
     }
 
     /// Resolve an approval request with optional biometric attestation
-    /// metadata (implementation-note-156).
+    /// metadata (implementation-note-205).
     ///
     /// `biometric` records whether the approval was gated by a hardware
     /// biometric on the operator's device (Touch ID via LocalAuthentication
@@ -815,12 +995,31 @@ impl DaemonStore {
             committed: false,
         };
 
-        // implementation-note-152 — composite approvals stash their 3-statement envelope
+        // implementation-note-201 — composite approvals stash their 3-statement envelope
         // alongside the legacy single-statement fields, so the SELECT row
-        // shape grew by one column. Aliased to keep clippy happy.
-        // REVIEW2-F2 — also fetch composite_statements_hash for integrity check.
-        // Index 0..6 = data; index 7 = status.
-        type ApprovalRow = (String, String, String, Option<i64>, String, Option<String>, Option<String>, String);
+        // shape grew. Aliased to keep clippy happy.
+        // REVIEW2-F2 — also fetch composite_statements_hash for integrity
+        // check. Current create-grant shaping fields travel with the approval
+        // row so the resolver can mint the same post-approve grant shape the
+        // auto-approve path would have produced inline.
+        type ApprovalRow = (
+            String,
+            String,
+            String,
+            Option<i64>,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            Option<i64>,    // max_delegation_depth
+            Option<i64>,    // max_uses_per_hour
+            Option<i64>,    // allowed_hours_start
+            Option<i64>,    // allowed_hours_end
+            Option<String>, // allowed_targets
+            Option<String>, // budget_json
+            Option<i64>,    // max_children_per_day
+            Option<String>, // auto_delegate_scope_template
+        );
 
         // Fetch all columns we need (including status) in a single query.
         // Inside the IMMEDIATE transaction this read is stable — no concurrent
@@ -829,7 +1028,10 @@ impl DaemonStore {
             .conn()
             .query_row(
                 "SELECT persona_id, credential_name, scope, ttl_secs, action, \
-                 composite_statements_json, composite_statements_hash, status \
+                 composite_statements_json, composite_statements_hash, status, \
+                 max_delegation_depth, max_uses_per_hour, allowed_hours_start, \
+                 allowed_hours_end, allowed_targets, budget_json, \
+                 max_children_per_day, auto_delegate_scope_template \
                  FROM approval_requests WHERE id = ?1",
                 rusqlite::params![id],
                 |row| {
@@ -842,13 +1044,52 @@ impl DaemonStore {
                         row.get(5)?,
                         row.get(6)?,
                         row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                        row.get(11)?,
+                        row.get(12)?,
+                        row.get(13)?,
+                        row.get(14)?,
+                        row.get(15)?,
                     ))
                 },
             )
             .optional()?;
 
-        let (persona_id, credential_name, scope, ttl_secs_raw, action, composite_json, composite_hash, current_status) =
-            row.ok_or(StoreError::NotFound)?;
+        let (
+            persona_id,
+            credential_name,
+            scope,
+            ttl_secs_raw,
+            action,
+            composite_json,
+            composite_hash,
+            current_status,
+            max_delegation_depth_raw,
+            max_uses_per_hour_raw,
+            allowed_hours_start_raw,
+            allowed_hours_end_raw,
+            allowed_targets_raw,
+            budget_json_raw,
+            max_children_per_day_raw,
+            auto_delegate_scope_template_raw,
+        ) = row.ok_or(StoreError::NotFound)?;
+
+        let grant_shape = GrantShapeFields {
+            max_delegation_depth: max_delegation_depth_raw.map(|v| v as u32),
+            max_uses_per_hour: max_uses_per_hour_raw.map(|v| v as u64),
+            allowed_hours_start: allowed_hours_start_raw.map(|v| v as u32),
+            allowed_hours_end: allowed_hours_end_raw.map(|v| v as u32),
+            allowed_targets: allowed_targets_raw,
+            budget: budget_json_raw
+                .as_deref()
+                .map(serde_json::from_str::<Budget>)
+                .transpose()
+                .map_err(|e| StoreError::InvalidInput(format!("grant shape budget parse: {e}")))?,
+            max_children_per_day: max_children_per_day_raw.map(|v| v as u64),
+            auto_delegate_scope_template: auto_delegate_scope_template_raw,
+        };
 
         // If a concurrent caller already committed the status transition,
         // reject this one — exactly one caller wins the write lock, mints
@@ -862,7 +1103,9 @@ impl DaemonStore {
         // REVIEW2-F2 — integrity check: if a hash was stored at submit time,
         // recompute SHA-256 of the current JSON and reject on mismatch.
         // NULL hash = legacy row without protection; allow through for backward compat.
-        if let (Some(json), Some(stored_hash)) = (composite_json.as_deref(), composite_hash.as_deref()) {
+        if let (Some(json), Some(stored_hash)) =
+            (composite_json.as_deref(), composite_hash.as_deref())
+        {
             let current_hash = sha256_hex(json);
             if current_hash != stored_hash {
                 let _ = self.log_event(
@@ -894,7 +1137,7 @@ impl DaemonStore {
 
         match outcome {
             ApprovalOutcome::Approved => {
-                // implementation-note-152 — for composite approvals the row is created
+                // implementation-note-201 — for composite approvals the row is created
                 // with scope "*" because the typed child statements
                 // (Credential / Session / Time) overwrite `blocks_json`
                 // immediately below; the flat `scope` column is a
@@ -918,18 +1161,38 @@ impl DaemonStore {
                 // emits the canonical grant.minted after the multi-statement shape is
                 // finalised so the audit log shows the accurate statement_count.
                 let grant = if composite_statements.is_some() {
-                    self.create_grant_suppress_minted_event(&persona_id, &credential_name, parent_scope, ttl_secs)?
+                    self.create_grant_with_budget_suppress_minted_event(
+                        &persona_id,
+                        &credential_name,
+                        parent_scope,
+                        ttl_secs,
+                        grant_shape.budget.clone(),
+                    )?
                 } else {
-                    self.create_grant(&persona_id, &credential_name, parent_scope, ttl_secs)?
+                    self.create_grant_with_budget(
+                        &persona_id,
+                        &credential_name,
+                        parent_scope,
+                        ttl_secs,
+                        grant_shape.budget.clone(),
+                    )?
                 };
 
-                // implementation-note-152 — when the approval bundles a composite envelope,
+                self.apply_grant_shape_to_grant(&grant.id, &grant_shape)?;
+
+                // implementation-note-201 — when the approval bundles a composite envelope,
                 // overwrite the freshly-minted single-statement grant's
                 // blocks_json with the canonical 3-statement composite chain.
                 // Mirrors the path the CLI sandbox-run handler used to take
                 // before the policy gate moved minting into approval flow.
                 if let Some(stmts) = composite_statements.as_ref() {
-                    self.mint_composite_chain_for_grant(&grant.id, &persona_id, &credential_name, stmts.clone(), ttl_secs)?;
+                    self.mint_composite_chain_for_grant(
+                        &grant.id,
+                        &persona_id,
+                        &credential_name,
+                        stmts.clone(),
+                        ttl_secs,
+                    )?;
                 }
 
                 let _ = self.log_event(
@@ -944,7 +1207,7 @@ impl DaemonStore {
                             "ttl_secs": ttl_secs,
                             "source": "approval",
                             "composite": composite_statements.is_some(),
-                            // implementation-note-156 — `biometric=true` indicates the
+                            // implementation-note-205 — `biometric=true` indicates the
                             // approval was attested by a hardware biometric on
                             // the operator's device (Touch ID via
                             // LocalAuthentication on the macOS CLI, or
@@ -958,7 +1221,7 @@ impl DaemonStore {
                         .to_string(),
                     ),
                 );
-                // implementation-note-156 — also emit a dedicated `approval.approved`
+                // implementation-note-205 — also emit a dedicated `approval.approved`
                 // event so downstream auditors can filter on the approval
                 // beat without parsing `grant.issued` semantics.
                 let _ = self.log_event(
@@ -988,7 +1251,7 @@ impl DaemonStore {
                      reason = ?2 WHERE id = ?3",
                     rusqlite::params![resolved_at, reason, id],
                 )?;
-                // implementation-note-156 — record the biometric posture on denial too
+                // implementation-note-205 — record the biometric posture on denial too
                 // so an auditor can distinguish "human rejected with TouchID"
                 // from "untouched timeout".
                 let _ = self.log_event(
@@ -1008,8 +1271,32 @@ impl DaemonStore {
                 );
             }
             ApprovalOutcome::Narrowed { new_scope } => {
-                let grant =
-                    self.create_grant(&persona_id, &credential_name, new_scope, ttl_secs)?;
+                // approval_outcome_scope_subset_check — Per adversarial-
+                // review 2026-05-19 CRIT-5. The variant is named
+                // "Narrowed"; the contract is narrowing only. Without this
+                // check, an approver (or compromised dashboard, or coerced
+                // operator) could supply a new_scope that is wider than
+                // the original request, silently broadening authority at
+                // resolve time. Use the existing offline-attenuation
+                // subset check (`core_grants::scope::enforce_subset`)
+                // which already covers wildcard, glob, and synonym cases
+                // for the (provider, action, target, subtarget) tuple.
+                if let Err(violation) = core_grants::scope::enforce_subset(new_scope, &scope) {
+                    return Err(StoreError::InvalidInput(format!(
+                        "Narrowed outcome scope {new_scope:?} is not a subset of \
+                         original request scope {scope:?}: {violation}"
+                    )));
+                }
+                let grant = self.create_grant_with_budget(
+                    &persona_id,
+                    &credential_name,
+                    new_scope,
+                    ttl_secs,
+                    grant_shape.budget.clone(),
+                )?;
+                // Narrowing the scope must not silently drop the operator's
+                // original grant-shaping fields on the other axes.
+                self.apply_grant_shape_to_grant(&grant.id, &grant_shape)?;
                 let _ = self.log_event(
                     Some(&persona_id),
                     "grant.issued",
@@ -1033,11 +1320,37 @@ impl DaemonStore {
                     rusqlite::params![resolved_at, new_scope, id],
                 )?;
             }
-            ApprovalOutcome::Always { scope: narrow_scope, expires_at } => {
+            ApprovalOutcome::Always {
+                scope: narrow_scope,
+                expires_at,
+            } => {
                 // Resolve the effective scope: narrowed if provided, original otherwise.
                 let effective_scope = narrow_scope.as_deref().unwrap_or(&scope);
-                let grant =
-                    self.create_grant(&persona_id, &credential_name, effective_scope, ttl_secs)?;
+                // approval_outcome_scope_subset_check — Per adversarial-
+                // review 2026-05-19 CRIT-5. The `Always` outcome mints
+                // BOTH a credential grant AND a standing-grant row, so a
+                // broadening "narrow_scope" here is doubly bad — it
+                // persists across future requests via the standing-grant
+                // fast path. The subset check fires only when the
+                // resolver supplied an explicit narrow_scope; when
+                // narrow_scope is None we reuse the original (already
+                // operator-approved) request scope verbatim.
+                if let Some(ns) = narrow_scope {
+                    if let Err(violation) = core_grants::scope::enforce_subset(ns, &scope) {
+                        return Err(StoreError::InvalidInput(format!(
+                            "Always outcome scope {ns:?} is not a subset of original \
+                             request scope {scope:?}: {violation}"
+                        )));
+                    }
+                }
+                let grant = self.create_grant_with_budget(
+                    &persona_id,
+                    &credential_name,
+                    effective_scope,
+                    ttl_secs,
+                    grant_shape.budget.clone(),
+                )?;
+                self.apply_grant_shape_to_grant(&grant.id, &grant_shape)?;
                 // Create the standing grant so future matching requests auto-approve.
                 self.create_standing_grant(
                     &persona_id,
@@ -1076,12 +1389,57 @@ impl DaemonStore {
         Ok(())
     }
 
+    /// Apply the stored create-grant shaping fields to a freshly-minted grant.
+    ///
+    /// Budget is already carried in block-zero at mint time, so this method
+    /// only re-stamps the row-level condition columns and marks the grant as a
+    /// standing parent when requested. A no-op when every field is None.
+    pub(crate) fn apply_grant_shape_to_grant(
+        &self,
+        grant_id: &str,
+        fields: &GrantShapeFields,
+    ) -> Result<(), StoreError> {
+        if fields.is_empty() {
+            return Ok(());
+        }
+        if fields.max_uses_per_hour.is_some()
+            || fields.allowed_hours_start.is_some()
+            || fields.allowed_targets.is_some()
+            || fields.max_delegation_depth.is_some()
+        {
+            self.conn().execute(
+                "UPDATE grants SET max_uses_per_hour = ?1, allowed_hours_start = ?2, \
+                 allowed_hours_end = ?3, allowed_targets = ?4, max_delegation_depth = ?5 \
+                 WHERE id = ?6",
+                rusqlite::params![
+                    fields.max_uses_per_hour.map(|v| v as i64),
+                    fields.allowed_hours_start.map(|v| v as i64),
+                    fields.allowed_hours_end.map(|v| v as i64),
+                    fields.allowed_targets.clone(),
+                    fields.max_delegation_depth.map(|v| v as i64),
+                    grant_id,
+                ],
+            )?;
+        }
+        if let Some(limit) = fields.max_children_per_day {
+            self.mark_grant_standing(
+                grant_id,
+                limit,
+                fields.auto_delegate_scope_template.as_deref(),
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn get_approval(&self, id: &str) -> Result<ApprovalRequestInfo, StoreError> {
         self.conn()
             .query_row(
                 "SELECT id, persona_id, credential_name, scope, ttl_secs, action, risk_level, \
                  status, reason, created_at, composite_statements_json, result_grant_id, \
-                 tool_name, target_host, target_url, agent_framework, skill_ref \
+                 tool_name, target_host, target_url, agent_framework, skill_ref, \
+                 max_delegation_depth, max_uses_per_hour, allowed_hours_start, \
+                 allowed_hours_end, allowed_targets, budget_json, \
+                 max_children_per_day, auto_delegate_scope_template \
                  FROM approval_requests WHERE id = ?1",
                 rusqlite::params![id],
                 |row| {
@@ -1090,6 +1448,11 @@ impl DaemonStore {
                     let composite_statements = composite_json
                         .as_deref()
                         .and_then(|s| serde_json::from_str::<Vec<Statement>>(s).ok());
+                    let mdd: Option<i64> = row.get(17)?;
+                    let muph: Option<i64> = row.get(18)?;
+                    let ahs: Option<i64> = row.get(19)?;
+                    let ahe: Option<i64> = row.get(20)?;
+                    let budget_json: Option<String> = row.get(22)?;
                     Ok(ApprovalRequestInfo {
                         id: row.get(0)?,
                         persona_id: row.get(1)?,
@@ -1109,6 +1472,16 @@ impl DaemonStore {
                         composite_statements,
                         result_grant_id: row.get(11)?,
                         skill_ref: row.get(16)?,
+                        max_delegation_depth: mdd.map(|v| v as u32),
+                        max_uses_per_hour: muph.map(|v| v as u64),
+                        allowed_hours_start: ahs.map(|v| v as u32),
+                        allowed_hours_end: ahe.map(|v| v as u32),
+                        allowed_targets: row.get(21)?,
+                        budget: budget_json
+                            .as_deref()
+                            .and_then(|json| serde_json::from_str::<Budget>(json).ok()),
+                        max_children_per_day: row.get::<_, Option<i64>>(23)?.map(|v| v as u64),
+                        auto_delegate_scope_template: row.get(24)?,
                     })
                 },
             )
@@ -1116,7 +1489,7 @@ impl DaemonStore {
             .ok_or(StoreError::NotFound)
     }
 
-    /// implementation-note-152 — overwrite a freshly-minted single-statement grant's
+    /// implementation-note-201 — overwrite a freshly-minted single-statement grant's
     /// `blocks_json` with the canonical 3-statement composite chain.
     ///
     /// Mirrors the path `ember sandbox run` previously took inline (signing
@@ -1270,13 +1643,16 @@ impl DaemonStore {
                 "grant.request.stale_expired",
                 None,
                 "expired",
-                Some(&serde_json::json!({"count": count, "threshold_secs": threshold_secs}).to_string()),
+                Some(
+                    &serde_json::json!({"count": count, "threshold_secs": threshold_secs})
+                        .to_string(),
+                ),
             );
         }
         Ok(count)
     }
 
-    /// implementation-note-147 — operator-initiated dismiss of a pending
+    /// implementation-note-196 — operator-initiated dismiss of a pending
     /// approval card. Sets status to `dismissed`, records an `approval.dismissed`
     /// audit event, and returns. Does NOT fire a desktop notification (the operator
     /// is already looking at the dashboard). Only `pending` rows can be dismissed;
@@ -1358,7 +1734,9 @@ mod tests {
             .submit_approval(&pid, "api-key", "read", None, "credential.access", "high")
             .unwrap();
 
-        store.resolve_approval(&req.id, &ApprovalOutcome::Approved).unwrap();
+        store
+            .resolve_approval(&req.id, &ApprovalOutcome::Approved)
+            .unwrap();
 
         let resolved = store.get_approval(&req.id).unwrap();
         assert_eq!(resolved.status, "approved");
@@ -1397,10 +1775,16 @@ mod tests {
 
     #[test]
     fn narrow_creates_grant_with_narrowed_scope() {
+        // approval_outcome_scope_subset_check: the legacy fixture used
+        // "read:write:admin" as the original scope, which the structured
+        // scope parser reads as provider=read/action=write/target=admin
+        // (not a "read OR write OR admin" union). Narrow to "read" then
+        // fails the subset check. Update both ends to parser-compatible
+        // scopes that preserve the test's narrowing intent.
         let store = setup();
         let pid = persona_id(&store);
         let req = store
-            .submit_approval(&pid, "api-key", "read:write:admin", None, "credential.access", "high")
+            .submit_approval(&pid, "api-key", "*", None, "credential.access", "high")
             .unwrap();
 
         store
@@ -1422,6 +1806,90 @@ mod tests {
     }
 
     #[test]
+    fn narrow_refuses_broadening_scope() {
+        // approval_outcome_scope_subset_check — adversarial-review CRIT-5
+        // regression guard. An approver MUST NOT be able to "narrow" to a
+        // scope wider than the original request.
+        let store = setup();
+        let pid = persona_id(&store);
+        let req = store
+            .submit_approval(
+                &pid,
+                "api-key",
+                "github:read:emberdotlink/widgets",
+                None,
+                "credential.access",
+                "high",
+            )
+            .unwrap();
+
+        let err = store
+            .resolve_approval(
+                &req.id,
+                &ApprovalOutcome::Narrowed {
+                    // Attempt to broaden target from a single repo to a
+                    // glob — must be refused.
+                    new_scope: "github:read:*".to_string(),
+                },
+            )
+            .expect_err("broadening narrow must be refused");
+        match err {
+            StoreError::InvalidInput(msg) => {
+                assert!(
+                    msg.contains("not a subset"),
+                    "error must name subset violation: {msg}"
+                );
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+
+        // No grant should have been minted; approval row is still pending.
+        let row = store.get_approval(&req.id).unwrap();
+        assert_eq!(row.status, "pending");
+        assert!(store.list_grants().unwrap().is_empty());
+    }
+
+    #[test]
+    fn always_refuses_broadening_scope() {
+        // approval_outcome_scope_subset_check — adversarial-review CRIT-5
+        // regression guard. Same subset rule applies on the `Always` path,
+        // which is doubly impactful because it also mints a standing-grant
+        // row (future requests auto-approve via the fast path).
+        let store = setup();
+        let pid = persona_id(&store);
+        let req = store
+            .submit_approval(
+                &pid,
+                "api-key",
+                "github:read:emberdotlink/widgets",
+                None,
+                "credential.access.github-token",
+                "high",
+            )
+            .unwrap();
+
+        let err = store
+            .resolve_approval(
+                &req.id,
+                &ApprovalOutcome::Always {
+                    scope: Some("github:read:*".to_string()),
+                    expires_at: None,
+                },
+            )
+            .expect_err("broadening Always.scope must be refused");
+        match err {
+            StoreError::InvalidInput(msg) => {
+                assert!(msg.contains("not a subset"), "got: {msg}");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+        let row = store.get_approval(&req.id).unwrap();
+        assert_eq!(row.status, "pending");
+        assert!(store.list_grants().unwrap().is_empty());
+        assert!(store.list_standing_grants().unwrap().is_empty());
+    }
+
+    #[test]
     fn resolve_nonexistent_returns_not_found() {
         let store = DaemonStore::open_in_memory().unwrap();
         let result = store.resolve_approval("approval-does-not-exist", &ApprovalOutcome::Approved);
@@ -1440,7 +1908,9 @@ mod tests {
             .submit_approval(&pid, "key2", "write", None, "credential.access", "high")
             .unwrap();
 
-        store.resolve_approval(&req1.id, &ApprovalOutcome::Approved).unwrap();
+        store
+            .resolve_approval(&req1.id, &ApprovalOutcome::Approved)
+            .unwrap();
 
         let pending = store.list_pending_approvals().unwrap();
         assert_eq!(pending.len(), 1);
@@ -1456,7 +1926,9 @@ mod tests {
             .submit_approval(&pid, "api-key", "read", None, "credential.access", "high")
             .unwrap();
 
-        store.resolve_approval(&req.id, &ApprovalOutcome::Approved).unwrap();
+        store
+            .resolve_approval(&req.id, &ApprovalOutcome::Approved)
+            .unwrap();
 
         let entries = store
             .query_audit(&AuditFilter {
@@ -1478,17 +1950,13 @@ mod tests {
     #[test]
     fn resolve_approval_narrowed_logs_grant_issued() {
         use crate::infra::audit::AuditFilter;
+        // approval_outcome_scope_subset_check: parser-incompatible legacy
+        // "read:write:admin" fixture updated to "*" for the same reason
+        // as `narrow_creates_grant_with_narrowed_scope` above.
         let store = setup();
         let pid = persona_id(&store);
         let req = store
-            .submit_approval(
-                &pid,
-                "api-key",
-                "read:write:admin",
-                None,
-                "credential.access",
-                "high",
-            )
+            .submit_approval(&pid, "api-key", "*", None, "credential.access", "high")
             .unwrap();
 
         store
@@ -1522,15 +1990,28 @@ mod tests {
         let store = setup();
         let pid = persona_id(&store);
         let req = store
-            .submit_approval(&pid, "api-key", "read", None, "credential.access.github-token", "low")
+            .submit_approval(
+                &pid,
+                "api-key",
+                "read",
+                None,
+                "credential.access.github-token",
+                "low",
+            )
             .unwrap();
 
+        // standing_grant_expires_at_capped: pick a near-future expiry
+        // within MAX_GRANT_TTL_SECS so the cap doesn't trip the test;
+        // the previous fixture used "2099-01-01T00:00:00" which is both
+        // non-strict-RFC-3339 (no timezone) and past the cap. Use a 1-day
+        // forward shift in strict RFC-3339 form.
+        let expires_at = (Utc::now() + chrono::Duration::days(1)).to_rfc3339();
         store
             .resolve_approval(
                 &req.id,
                 &ApprovalOutcome::Always {
                     scope: None,
-                    expires_at: Some("2099-01-01T00:00:00".to_string()),
+                    expires_at: Some(expires_at.clone()),
                 },
             )
             .unwrap();
@@ -1540,7 +2021,7 @@ mod tests {
         assert_eq!(standing[0].persona_id, pid);
         assert_eq!(standing[0].action_pattern, "credential.access.github-token");
         assert_eq!(standing[0].scope, "read");
-        assert_eq!(standing[0].expires_at.as_deref(), Some("2099-01-01T00:00:00"));
+        assert_eq!(standing[0].expires_at.as_deref(), Some(expires_at.as_str()));
     }
 
     #[test]
@@ -1549,7 +2030,14 @@ mod tests {
         let store = setup();
         let pid = persona_id(&store);
         let req = store
-            .submit_approval(&pid, "api-key", "read", None, "credential.access.github-token", "low")
+            .submit_approval(
+                &pid,
+                "api-key",
+                "read",
+                None,
+                "credential.access.github-token",
+                "low",
+            )
             .unwrap();
 
         store
@@ -1587,10 +2075,20 @@ mod tests {
 
     #[test]
     fn resolve_approval_always_with_narrow_scope_creates_narrowed_standing_grant() {
+        // approval_outcome_scope_subset_check: parser-incompatible legacy
+        // "read:write:admin" fixture updated to "*" for the same reason
+        // as `narrow_creates_grant_with_narrowed_scope` above.
         let store = setup();
         let pid = persona_id(&store);
         let req = store
-            .submit_approval(&pid, "api-key", "read:write:admin", None, "credential.access.github-token", "low")
+            .submit_approval(
+                &pid,
+                "api-key",
+                "*",
+                None,
+                "credential.access.github-token",
+                "low",
+            )
             .unwrap();
 
         store
@@ -1618,7 +2116,14 @@ mod tests {
         let store = setup();
         let pid = persona_id(&store);
         let req = store
-            .submit_approval(&pid, "api-key", "read", None, "credential.access.github-token", "low")
+            .submit_approval(
+                &pid,
+                "api-key",
+                "read",
+                None,
+                "credential.access.github-token",
+                "low",
+            )
             .unwrap();
 
         store
@@ -1642,7 +2147,9 @@ mod tests {
 
         // Different action must not match
         assert!(
-            !store.check_standing_grant(&pid, "credential.access.other-token").unwrap(),
+            !store
+                .check_standing_grant(&pid, "credential.access.other-token")
+                .unwrap(),
             "exact-match pattern must not match unrelated actions"
         );
     }
@@ -1672,11 +2179,17 @@ mod tests {
         assert_eq!(count, 1, "expected 1 row expired");
 
         let resolved = store.get_approval(&id).unwrap();
-        assert_eq!(resolved.status, "timed_out", "row should be timed_out after sweep");
+        assert_eq!(
+            resolved.status, "timed_out",
+            "row should be timed_out after sweep"
+        );
 
         // Verify no rows remain in pending.
         let pending = store.list_pending_approvals().unwrap();
-        assert!(pending.is_empty(), "no rows should remain pending after sweep");
+        assert!(
+            pending.is_empty(),
+            "no rows should remain pending after sweep"
+        );
     }
 
     #[test]
@@ -1720,7 +2233,7 @@ mod tests {
         assert_eq!(still_pending.status, "pending");
     }
 
-    // --- implementation-note-152 — composite-grant approval flow ---
+    // --- implementation-note-201 — composite-grant approval flow ---
 
     fn demo_three_statements(credential: &str) -> Vec<Statement> {
         use core_grant_types::{Budget, ResourceSelector, ResourceType, Usage};
@@ -1730,7 +2243,9 @@ mod tests {
                 sid: "s0-credential".to_string(),
                 resource_type: ResourceType::Credential,
                 actions: vec!["credential:read".to_string()],
-                resource: ResourceSelector::Exact { value: credential.to_string() },
+                resource: ResourceSelector::Exact {
+                    value: credential.to_string(),
+                },
                 budget: None,
                 usage: Usage::default(),
                 conditions: vec![],
@@ -1873,7 +2388,9 @@ mod tests {
             )
             .unwrap();
 
-        store.auto_resolve(&req.id).expect("auto_resolve must succeed");
+        store
+            .auto_resolve(&req.id)
+            .expect("auto_resolve must succeed");
 
         // The approval row resolved as 'approved' and recorded the grant id —
         // same shape the human-approval path produces.
@@ -1930,7 +2447,9 @@ mod tests {
             .submit_approval(&pid, "api-key", "read", None, "credential.access", "high")
             .unwrap();
 
-        store.auto_resolve(&req.id).expect("first auto_resolve must succeed");
+        store
+            .auto_resolve(&req.id)
+            .expect("first auto_resolve must succeed");
         let second = store.auto_resolve(&req.id);
         assert!(
             matches!(second, Err(StoreError::AlreadyResolved)),
@@ -2052,10 +2571,8 @@ mod tests {
             "audit log must contain exactly one grant.minted event for a composite grant"
         );
 
-        let details: serde_json::Value = serde_json::from_str(
-            minted_entries[0].details.as_deref().unwrap_or("{}"),
-        )
-        .unwrap();
+        let details: serde_json::Value =
+            serde_json::from_str(minted_entries[0].details.as_deref().unwrap_or("{}")).unwrap();
         assert_eq!(
             details["grant_id"], grant_id,
             "grant.minted must reference the minted grant_id"
@@ -2088,7 +2605,9 @@ mod tests {
         store
             .resolve_approval(
                 &req.id,
-                &ApprovalOutcome::Denied { reason: "demo deny".to_string() },
+                &ApprovalOutcome::Denied {
+                    reason: "demo deny".to_string(),
+                },
             )
             .unwrap();
 
@@ -2233,10 +2752,13 @@ mod tests {
         // Directly mutate composite_statements_json in the DB to simulate a
         // SQLite-level tamper (e.g. attacker with write access to the DB file).
         let tampered_json = r#"[{"sid":"evil","resource_type":"Credential","actions":["credential:admin"],"resource":{"type":"Any"},"budget":null,"usage":{"tokens":0,"wall_clock_secs":0,"calls":0,"cost_usd_millicents":0},"conditions":[]}]"#;
-        store.conn().execute(
-            "UPDATE approval_requests SET composite_statements_json = ?1 WHERE id = ?2",
-            rusqlite::params![tampered_json, req.id],
-        ).unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE approval_requests SET composite_statements_json = ?1 WHERE id = ?2",
+                rusqlite::params![tampered_json, req.id],
+            )
+            .unwrap();
 
         // Approve must be blocked.
         let result = store.resolve_approval(&req.id, &ApprovalOutcome::Approved);
@@ -2299,10 +2821,13 @@ mod tests {
             .unwrap();
 
         // Simulate a legacy row by nulling the hash column after insert.
-        store.conn().execute(
-            "UPDATE approval_requests SET composite_statements_hash = NULL WHERE id = ?1",
-            rusqlite::params![req.id],
-        ).unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE approval_requests SET composite_statements_hash = NULL WHERE id = ?1",
+                rusqlite::params![req.id],
+            )
+            .unwrap();
 
         // Approve must succeed — legacy rows have no binding and are allowed through.
         let result = store.resolve_approval(&req.id, &ApprovalOutcome::Approved);
@@ -2313,7 +2838,10 @@ mod tests {
 
         let resolved = store.get_approval(&req.id).unwrap();
         assert_eq!(resolved.status, "approved");
-        assert!(resolved.result_grant_id.is_some(), "legacy row must mint grant on approve");
+        assert!(
+            resolved.result_grant_id.is_some(),
+            "legacy row must mint grant on approve"
+        );
     }
 
     // --- REVIEW2-F3: double-approve race prevention ---
@@ -2340,7 +2868,13 @@ mod tests {
             let store = DaemonStore::open(&db_path).unwrap();
             store.set_vault(Rc::new(Vault::new(VAULT_KEY)));
             store.create_persona("race-agent").unwrap();
-            let pid = store.list_personas().unwrap().into_iter().next().unwrap().id;
+            let pid = store
+                .list_personas()
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
+                .id;
             let req = store
                 .submit_approval(&pid, "api-key", "read", None, "credential.access", "high")
                 .unwrap();
@@ -2379,13 +2913,14 @@ mod tests {
         let r2 = t2.join().expect("thread 2 panicked");
 
         // Exactly one must succeed; the other must return AlreadyResolved.
-        let (ok_count, err_count) = [&r1, &r2].iter().fold((0usize, 0usize), |(ok, err), r| {
-            match r {
-                Ok(()) => (ok + 1, err),
-                Err(StoreError::AlreadyResolved) => (ok, err + 1),
-                Err(e) => panic!("unexpected error: {e}"),
-            }
-        });
+        let (ok_count, err_count) =
+            [&r1, &r2]
+                .iter()
+                .fold((0usize, 0usize), |(ok, err), r| match r {
+                    Ok(()) => (ok + 1, err),
+                    Err(StoreError::AlreadyResolved) => (ok, err + 1),
+                    Err(e) => panic!("unexpected error: {e}"),
+                });
         assert_eq!(ok_count, 1, "exactly one approve call must succeed");
         assert_eq!(err_count, 1, "the other must return AlreadyResolved");
 
@@ -2394,7 +2929,12 @@ mod tests {
         let verify_store = DaemonStore::open(&db_path).unwrap();
         verify_store.set_vault(Rc::new(Vault::new(VAULT_KEY)));
         let grants = verify_store.list_grants().unwrap();
-        assert_eq!(grants.len(), 1, "exactly one grant must be minted, got {}", grants.len());
+        assert_eq!(
+            grants.len(),
+            1,
+            "exactly one grant must be minted, got {}",
+            grants.len()
+        );
         assert_eq!(grants[0].credential_name, "api-key");
 
         // The approval row must record the winner's grant ID.
@@ -2412,7 +2952,9 @@ mod tests {
             .unwrap();
 
         // First approval succeeds.
-        store.resolve_approval(&req.id, &ApprovalOutcome::Approved).unwrap();
+        store
+            .resolve_approval(&req.id, &ApprovalOutcome::Approved)
+            .unwrap();
 
         // Second approval on the same request must fail with AlreadyResolved.
         let result = store.resolve_approval(&req.id, &ApprovalOutcome::Approved);
@@ -2423,7 +2965,11 @@ mod tests {
 
         // Still exactly one grant.
         let grants = store.list_grants().unwrap();
-        assert_eq!(grants.len(), 1, "must not mint a second grant on double-approve");
+        assert_eq!(
+            grants.len(),
+            1,
+            "must not mint a second grant on double-approve"
+        );
     }
 
     // --- REVIEW2-F4: union-bound parent for composite mint ----------------
@@ -2443,7 +2989,9 @@ mod tests {
                 sid: "s0-push".into(),
                 resource_type: ResourceType::Credential,
                 actions: vec!["github:push".into()],
-                resource: ResourceSelector::Exact { value: "acme/widgets".into() },
+                resource: ResourceSelector::Exact {
+                    value: "acme/widgets".into(),
+                },
                 budget: None,
                 usage: Usage::default(),
                 conditions: vec![],
@@ -2452,7 +3000,9 @@ mod tests {
                 sid: "s1-read".into(),
                 resource_type: ResourceType::Credential,
                 actions: vec!["github:read".into()],
-                resource: ResourceSelector::Glob { pattern: "acme/*".into() },
+                resource: ResourceSelector::Glob {
+                    pattern: "acme/*".into(),
+                },
                 budget: None,
                 usage: Usage::default(),
                 conditions: vec![],
@@ -2511,8 +3061,7 @@ mod tests {
 
         // And the bound dominates each one (sanity-check via the same
         // function `overwrite_grant_blocks` runs internally).
-        let bound_stmts =
-            crate::trust::attenuation::compute_statements_union_bound(&stmts);
+        let bound_stmts = crate::trust::attenuation::compute_statements_union_bound(&stmts);
         let bound_block = core_grant_types::Block {
             statements: bound_stmts,
             nbf: None,
@@ -2523,8 +3072,7 @@ mod tests {
             note: None,
         };
         let root = store.persona_root_keypair(&pid).unwrap();
-        let signed_bound =
-            crate::trust::grant::sign_block_zero_with(&root, &bound_block).unwrap();
+        let signed_bound = crate::trust::grant::sign_block_zero_with(&root, &bound_block).unwrap();
         let bound_grant = core_grant_types::AccessGrant {
             id: grant_id.to_string(),
             version: 1,
@@ -2562,7 +3110,9 @@ mod tests {
                 sid: "s0".into(),
                 resource_type: ResourceType::Credential,
                 actions: vec!["github:push".into()],
-                resource: ResourceSelector::Exact { value: "acme/widgets".into() },
+                resource: ResourceSelector::Exact {
+                    value: "acme/widgets".into(),
+                },
                 budget: None,
                 usage: Usage::default(),
                 conditions: vec![],
@@ -2571,7 +3121,9 @@ mod tests {
                 sid: "s1".into(),
                 resource_type: ResourceType::Credential,
                 actions: vec!["github:read".into()],
-                resource: ResourceSelector::Exact { value: "acme/widgets".into() },
+                resource: ResourceSelector::Exact {
+                    value: "acme/widgets".into(),
+                },
                 budget: None,
                 usage: Usage::default(),
                 conditions: vec![],
@@ -2579,8 +3131,7 @@ mod tests {
         ];
 
         // Build the bound and a hypothetical "admin" child grant.
-        let bound_stmts =
-            crate::trust::attenuation::compute_statements_union_bound(&approved);
+        let bound_stmts = crate::trust::attenuation::compute_statements_union_bound(&approved);
         let bound_block = core_grant_types::Block {
             statements: bound_stmts,
             nbf: None,
@@ -2591,8 +3142,7 @@ mod tests {
             note: None,
         };
         let root = store.persona_root_keypair(&pid).unwrap();
-        let signed_bound =
-            crate::trust::grant::sign_block_zero_with(&root, &bound_block).unwrap();
+        let signed_bound = crate::trust::grant::sign_block_zero_with(&root, &bound_block).unwrap();
         let bound_grant = core_grant_types::AccessGrant {
             id: "grant-bound".into(),
             version: 1,
@@ -2616,7 +3166,9 @@ mod tests {
             sid: "s-admin".into(),
             resource_type: ResourceType::Credential,
             actions: vec!["github:admin".into()],
-            resource: ResourceSelector::Exact { value: "acme/widgets".into() },
+            resource: ResourceSelector::Exact {
+                value: "acme/widgets".into(),
+            },
             budget: None,
             usage: Usage::default(),
             conditions: vec![],
@@ -2630,8 +3182,7 @@ mod tests {
             approval: None,
             note: None,
         };
-        let signed_child =
-            crate::trust::grant::sign_block_zero_with(&root, &child_block).unwrap();
+        let signed_child = crate::trust::grant::sign_block_zero_with(&root, &child_block).unwrap();
         let child_grant = core_grant_types::AccessGrant {
             id: "grant-bound".into(),
             version: 1,
@@ -2653,13 +3204,12 @@ mod tests {
 
         // The union bound must REJECT a child whose action is outside the
         // approved set.
-        let err = crate::trust::attenuation::check_statement_attenuation(
-            &bound_grant,
-            &child_grant,
-        )
-        .expect_err("union bound must not subsume `github:admin`");
+        let err =
+            crate::trust::attenuation::check_statement_attenuation(&bound_grant, &child_grant)
+                .expect_err("union bound must not subsume `github:admin`");
         assert!(
-            err.reason.contains("no parent with matching selector/actions"),
+            err.reason
+                .contains("no parent with matching selector/actions"),
             "expected matching-parent violation, got: {}",
             err.reason
         );
@@ -2690,11 +3240,8 @@ mod tests {
             blocks: vec![signed_wild],
             ..bound_grant.clone()
         };
-        crate::trust::attenuation::check_statement_attenuation(
-            &wildcard_grant,
-            &child_grant,
-        )
-        .expect("wildcard parent (pre-fix) trivially accepts admin child");
+        crate::trust::attenuation::check_statement_attenuation(&wildcard_grant, &child_grant)
+            .expect("wildcard parent (pre-fix) trivially accepts admin child");
     }
 
     /// Single-statement composite: the union bound's lone parent statement
@@ -2707,7 +3254,9 @@ mod tests {
             sid: "s0".into(),
             resource_type: ResourceType::Credential,
             actions: vec!["github:read".into()],
-            resource: ResourceSelector::Exact { value: "acme/widgets".into() },
+            resource: ResourceSelector::Exact {
+                value: "acme/widgets".into(),
+            },
             budget: Some(core_grant_types::Budget {
                 tokens: Some(100),
                 ..Default::default()
@@ -2736,7 +3285,7 @@ mod tests {
         );
     }
 
-    // --- implementation-note-147: dismiss_approval ---
+    // --- implementation-note-196: dismiss_approval ---
 
     #[test]
     fn dismiss_pending_approval_sets_status_dismissed() {
@@ -2768,9 +3317,16 @@ mod tests {
 
         use crate::infra::audit::AuditFilter;
         let entries = store
-            .query_audit(&AuditFilter { action: Some("approval.dismissed".to_string()), ..Default::default() })
+            .query_audit(&AuditFilter {
+                action: Some("approval.dismissed".to_string()),
+                ..Default::default()
+            })
             .unwrap();
-        assert_eq!(entries.len(), 1, "expected one approval.dismissed audit entry");
+        assert_eq!(
+            entries.len(),
+            1,
+            "expected one approval.dismissed audit entry"
+        );
         assert_eq!(entries[0].action, "approval.dismissed");
     }
 
@@ -2781,11 +3337,16 @@ mod tests {
         let req = store
             .submit_approval(&pid, "api-key", "read", None, "credential.access", "low")
             .unwrap();
-        store.resolve_approval(&req.id, &ApprovalOutcome::Approved).unwrap();
+        store
+            .resolve_approval(&req.id, &ApprovalOutcome::Approved)
+            .unwrap();
 
         let result = store.dismiss_approval(&req.id);
         assert!(
-            matches!(result, Err(crate::infra::store::StoreError::AlreadyResolved)),
+            matches!(
+                result,
+                Err(crate::infra::store::StoreError::AlreadyResolved)
+            ),
             "dismissing an already-approved request should return AlreadyResolved"
         );
     }
@@ -2809,7 +3370,9 @@ mod tests {
         use std::rc::Rc;
 
         let store = DaemonStore::open_in_memory().expect("in-memory store");
-        store.create_persona("roundtrip-test").expect("create persona");
+        store
+            .create_persona("roundtrip-test")
+            .expect("create persona");
         let pid = store
             .list_personas()
             .unwrap()
@@ -2842,7 +3405,10 @@ mod tests {
             .store
             .get_approval(&request_id.0)
             .expect("approval row must exist");
-        assert_eq!(info.status, "pending", "newly submitted request must be pending");
+        assert_eq!(
+            info.status, "pending",
+            "newly submitted request must be pending"
+        );
 
         // Step 2: decide(id, Approved) → core_grants::Grant returned
         let grant_opt = adapter
@@ -2851,26 +3417,35 @@ mod tests {
             .expect("decide must succeed");
 
         let grant = grant_opt.expect("Approved outcome must produce a Grant");
-        assert!(grant.id != uuid::Uuid::nil(), "Grant must have a non-nil UUID id");
+        assert!(
+            grant.id != uuid::Uuid::nil(),
+            "Grant must have a non-nil UUID id"
+        );
 
         // Verify the approval row has transitioned to approved.
         let resolved = adapter
             .store
             .get_approval(&request_id.0)
             .expect("approval row must still be readable");
-        assert_eq!(resolved.status, "approved", "request must be approved after decide");
+        assert_eq!(
+            resolved.status, "approved",
+            "request must be approved after decide"
+        );
 
         // Step 3: decide again on same id → AlreadyDecided error
         let second_result = adapter
             .decide(&request_id, CoreApprovalOutcome::Denied)
             .await;
         assert!(
-            matches!(second_result, Err(core_approval::LifecycleError::AlreadyDecided)),
+            matches!(
+                second_result,
+                Err(core_approval::LifecycleError::AlreadyDecided)
+            ),
             "deciding an already-decided request must return AlreadyDecided"
         );
     }
 
-    // --- implementation-note-248: T1 unit tests ---
+    // --- implementation-note-351: T1 unit tests ---
 
     /// T1: submit_approval_inner persists tool_name, target_host, target_url,
     /// and agent_framework; get_approval reads them back (not None).
@@ -2900,15 +3475,34 @@ mod tests {
         // Returned struct has the fields set immediately.
         assert_eq!(req.tool_name.as_deref(), Some("Bash"));
         assert_eq!(req.target_host.as_deref(), Some("api.example.com"));
-        assert_eq!(req.target_url.as_deref(), Some("https://api.example.com/v1/data"));
+        assert_eq!(
+            req.target_url.as_deref(),
+            Some("https://api.example.com/v1/data")
+        );
         assert_eq!(req.agent_framework.as_deref(), Some("claude-code"));
 
         // get_approval must read them back from the DB.
         let fetched = store.get_approval(&req.id).unwrap();
-        assert_eq!(fetched.tool_name.as_deref(), Some("Bash"), "tool_name must survive DB round-trip");
-        assert_eq!(fetched.target_host.as_deref(), Some("api.example.com"), "target_host must survive DB round-trip");
-        assert_eq!(fetched.target_url.as_deref(), Some("https://api.example.com/v1/data"), "target_url must survive DB round-trip");
-        assert_eq!(fetched.agent_framework.as_deref(), Some("claude-code"), "agent_framework must survive DB round-trip");
+        assert_eq!(
+            fetched.tool_name.as_deref(),
+            Some("Bash"),
+            "tool_name must survive DB round-trip"
+        );
+        assert_eq!(
+            fetched.target_host.as_deref(),
+            Some("api.example.com"),
+            "target_host must survive DB round-trip"
+        );
+        assert_eq!(
+            fetched.target_url.as_deref(),
+            Some("https://api.example.com/v1/data"),
+            "target_url must survive DB round-trip"
+        );
+        assert_eq!(
+            fetched.agent_framework.as_deref(),
+            Some("claude-code"),
+            "agent_framework must survive DB round-trip"
+        );
     }
 
     /// T1: list_pending_approvals returns notify fields from DB.
@@ -2939,7 +3533,10 @@ mod tests {
         let p = &pending[0];
         assert_eq!(p.tool_name.as_deref(), Some("Read"));
         assert_eq!(p.target_host.as_deref(), Some("storage.example.com"));
-        assert_eq!(p.target_url.as_deref(), Some("https://storage.example.com/bucket"));
+        assert_eq!(
+            p.target_url.as_deref(),
+            Some("https://storage.example.com/bucket")
+        );
         assert_eq!(p.agent_framework.as_deref(), Some("aider"));
     }
 
@@ -2954,13 +3551,25 @@ mod tests {
             .unwrap();
 
         let fetched = store.get_approval(&req.id).unwrap();
-        assert!(fetched.tool_name.is_none(), "tool_name must be None when not provided");
-        assert!(fetched.target_host.is_none(), "target_host must be None when not provided");
-        assert!(fetched.target_url.is_none(), "target_url must be None when not provided");
-        assert!(fetched.agent_framework.is_none(), "agent_framework must be None when not provided");
+        assert!(
+            fetched.tool_name.is_none(),
+            "tool_name must be None when not provided"
+        );
+        assert!(
+            fetched.target_host.is_none(),
+            "target_host must be None when not provided"
+        );
+        assert!(
+            fetched.target_url.is_none(),
+            "target_url must be None when not provided"
+        );
+        assert!(
+            fetched.agent_framework.is_none(),
+            "agent_framework must be None when not provided"
+        );
     }
 
-    // --- implementation-note-248: T2 round-trip via ApprovalLifecycle ---
+    // --- implementation-note-351: T2 round-trip via ApprovalLifecycle ---
 
     /// T2: SubmitMetadata carries notify fields → DaemonApprovalStoreRef persists them →
     /// get_approval returns them. This is the seam that was broken before this task.
@@ -2971,7 +3580,13 @@ mod tests {
 
         let store = DaemonStore::open_in_memory().expect("in-memory store");
         store.create_persona("notify-test").expect("create persona");
-        let pid = store.list_personas().unwrap().into_iter().next().unwrap().id;
+        let pid = store
+            .list_personas()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .id;
 
         let adapter = DaemonApprovalStoreRef::new(&store);
 
@@ -2983,6 +3598,7 @@ mod tests {
             target_host: Some("docs.anthropic.com".to_string()),
             target_url: Some("https://docs.anthropic.com/api".to_string()),
             agent_framework: Some("claude-code".to_string()),
+            ..Default::default()
         };
         let scope = RequestedScope {
             capability: "read".to_string(),
@@ -2996,12 +3612,30 @@ mod tests {
             .expect("submit_request must succeed");
 
         // get_approval must return the persisted notify fields.
-        let info = store.get_approval(&request_id.0).expect("approval row must exist");
+        let info = store
+            .get_approval(&request_id.0)
+            .expect("approval row must exist");
         assert_eq!(info.status, "pending");
-        assert_eq!(info.tool_name.as_deref(), Some("WebFetch"), "tool_name must round-trip via DaemonApprovalStoreRef");
-        assert_eq!(info.target_host.as_deref(), Some("docs.anthropic.com"), "target_host must round-trip");
-        assert_eq!(info.target_url.as_deref(), Some("https://docs.anthropic.com/api"), "target_url must round-trip");
-        assert_eq!(info.agent_framework.as_deref(), Some("claude-code"), "agent_framework must round-trip");
+        assert_eq!(
+            info.tool_name.as_deref(),
+            Some("WebFetch"),
+            "tool_name must round-trip via DaemonApprovalStoreRef"
+        );
+        assert_eq!(
+            info.target_host.as_deref(),
+            Some("docs.anthropic.com"),
+            "target_host must round-trip"
+        );
+        assert_eq!(
+            info.target_url.as_deref(),
+            Some("https://docs.anthropic.com/api"),
+            "target_url must round-trip"
+        );
+        assert_eq!(
+            info.agent_framework.as_deref(),
+            Some("claude-code"),
+            "agent_framework must round-trip"
+        );
     }
 
     /// T2: SubmitMetadata carries notify fields → DaemonApprovalStore persists them →
@@ -3012,8 +3646,16 @@ mod tests {
         use std::rc::Rc;
 
         let store = DaemonStore::open_in_memory().expect("in-memory store");
-        store.create_persona("notify-rc-test").expect("create persona");
-        let pid = store.list_personas().unwrap().into_iter().next().unwrap().id;
+        store
+            .create_persona("notify-rc-test")
+            .expect("create persona");
+        let pid = store
+            .list_personas()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .id;
         let store_rc = Rc::new(store);
 
         let adapter = DaemonApprovalStore::new(Rc::clone(&store_rc));
@@ -3026,6 +3668,7 @@ mod tests {
             target_host: Some("github.com".to_string()),
             target_url: Some("https://github.com/org/repo".to_string()),
             agent_framework: Some("cursor".to_string()),
+            ..Default::default()
         };
         let scope = RequestedScope {
             capability: "write".to_string(),
@@ -3038,10 +3681,293 @@ mod tests {
             .await
             .expect("submit_request must succeed");
 
-        let info = store_rc.get_approval(&request_id.0).expect("approval row must exist");
+        let info = store_rc
+            .get_approval(&request_id.0)
+            .expect("approval row must exist");
         assert_eq!(info.tool_name.as_deref(), Some("ListFiles"));
         assert_eq!(info.target_host.as_deref(), Some("github.com"));
-        assert_eq!(info.target_url.as_deref(), Some("https://github.com/org/repo"));
+        assert_eq!(
+            info.target_url.as_deref(),
+            Some("https://github.com/org/repo")
+        );
         assert_eq!(info.agent_framework.as_deref(), Some("cursor"));
+    }
+
+    // --- create-grant shape round-trip via the approval queue. Asserts that the
+    // current create-grant shaping fields the auto-approve path writes onto the
+    // freshly-minted grant are also written when the approval-required branch
+    // resolves Approved.
+
+    /// T2: SubmitMetadata carries the full current create-grant shape →
+    /// DaemonApprovalStoreRef persists it on the approval row →
+    /// `get_approval` reads it back unchanged → `decide(Approved)` mints a
+    /// grant whose row + block-zero budget + standing-parent flags carry the
+    /// same shape via `apply_grant_shape_to_grant`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn grant_shape_survives_approval_round_trip() {
+        use core_approval::{ApprovalLifecycle, ApprovalOutcome as CoreApprovalOutcome};
+        use core_grant_types::approval::RequestedScope;
+
+        let store = DaemonStore::open_in_memory().expect("in-memory store");
+        store
+            .create_persona("delegation-roundtrip")
+            .expect("create persona");
+        let pid = store
+            .list_personas()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .id;
+
+        let adapter = DaemonApprovalStoreRef::new(&store);
+
+        // Non-default values for every shaping axis so the assertion catches
+        // any None-defaulting drop bug. `max_delegation_depth = 3` is the
+        // load-bearing value the acceptance criterion calls out.
+        let metadata = SubmitMetadata {
+            action: "create_grant".to_string(),
+            ttl_secs: Some(1800),
+            risk_level: "high".to_string(),
+            tool_name: None,
+            target_host: None,
+            target_url: None,
+            agent_framework: None,
+            max_delegation_depth: Some(3),
+            max_uses_per_hour: Some(50),
+            allowed_hours_start: Some(9),
+            allowed_hours_end: Some(17),
+            allowed_targets: Some("[\"api.example.com\"]".to_string()),
+            budget: Some(Budget {
+                tokens: Some(42),
+                cents: Some(25),
+                requests: None,
+                workload_hours: None,
+                wall_clock_secs: Some(900),
+            }),
+            max_children_per_day: Some(7),
+            auto_delegate_scope_template: Some("github:push:acme/*".to_string()),
+        };
+        let scope = RequestedScope {
+            capability: "read".to_string(),
+            resource_id: None,
+            constraints: vec![],
+        };
+
+        // Step 1: submit_request persists every shaping field on the
+        // approval row.
+        let request_id = adapter
+            .submit_request(&pid, "api-key", scope, metadata)
+            .await
+            .expect("submit_request must succeed");
+
+        let pending = store.get_approval(&request_id.0).expect("approval row");
+        assert_eq!(pending.status, "pending");
+        assert_eq!(
+            pending.max_delegation_depth,
+            Some(3),
+            "max_delegation_depth must round-trip via the approval row (the load-bearing implementation-note-224 regression)"
+        );
+        assert_eq!(pending.max_uses_per_hour, Some(50));
+        assert_eq!(pending.allowed_hours_start, Some(9));
+        assert_eq!(pending.allowed_hours_end, Some(17));
+        assert_eq!(
+            pending.allowed_targets.as_deref(),
+            Some("[\"api.example.com\"]")
+        );
+        assert_eq!(pending.budget.as_ref().and_then(|b| b.tokens), Some(42));
+        assert_eq!(pending.max_children_per_day, Some(7));
+        assert_eq!(
+            pending.auto_delegate_scope_template.as_deref(),
+            Some("github:push:acme/*")
+        );
+
+        // Step 2: Approve → resolver re-stamps the shaping fields on the
+        // freshly-minted grant row.
+        let _ = adapter
+            .decide(
+                &core_approval::RequestId(request_id.0.clone()),
+                CoreApprovalOutcome::Approved,
+            )
+            .await
+            .expect("decide(Approved) must succeed");
+
+        let resolved = store
+            .get_approval(&request_id.0)
+            .expect("approval row must still exist after decide");
+        let grant_id = resolved
+            .result_grant_id
+            .as_deref()
+            .expect("Approved must populate result_grant_id");
+
+        // Read the grant row directly and assert every shaping field
+        // survived the queue.
+        let (mdd, muph, ahs, ahe, at, is_standing, max_children_per_day, auto_scope): (
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            i64,
+            Option<i64>,
+            Option<String>,
+        ) = store
+            .conn()
+            .query_row(
+                "SELECT max_delegation_depth, max_uses_per_hour, \
+                 allowed_hours_start, allowed_hours_end, allowed_targets, \
+                 is_standing, max_children_per_day, auto_delegate_scope_template \
+                 FROM grants WHERE id = ?1",
+                rusqlite::params![grant_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .expect("grant row must exist");
+
+        assert_eq!(
+            mdd,
+            Some(3),
+            "max_delegation_depth must survive the approval round-trip onto the minted grant"
+        );
+        assert_eq!(muph, Some(50), "max_uses_per_hour must survive");
+        assert_eq!(ahs, Some(9), "allowed_hours_start must survive");
+        assert_eq!(ahe, Some(17), "allowed_hours_end must survive");
+        assert_eq!(
+            at.as_deref(),
+            Some("[\"api.example.com\"]"),
+            "allowed_targets must survive"
+        );
+        assert_eq!(is_standing, 1, "standing flag must survive");
+        assert_eq!(
+            max_children_per_day,
+            Some(7),
+            "standing daily ceiling must survive"
+        );
+        assert_eq!(
+            auto_scope.as_deref(),
+            Some("github:push:acme/*"),
+            "standing auto-scope must survive"
+        );
+
+        let grant = store.get_grant(grant_id).expect("minted grant row");
+        assert_eq!(
+            grant.budget.as_ref().and_then(|b| b.tokens),
+            Some(42),
+            "budget must survive on the minted grant projection"
+        );
+    }
+
+    /// T2: an approval submitted WITHOUT any shaping fields produces a
+    /// grant whose shaping columns remain NULL (the legacy no-shape path).
+    /// Companion to `grant_shape_survives_approval_round_trip` — guards
+    /// against `apply_grant_shape_to_grant` accidentally
+    /// stamping zeros (or other defaults) on rows where the operator
+    /// supplied nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn approval_without_grant_shape_leaves_grant_unshaped() {
+        use core_approval::{ApprovalLifecycle, ApprovalOutcome as CoreApprovalOutcome};
+        use core_grant_types::approval::RequestedScope;
+
+        let store = DaemonStore::open_in_memory().expect("in-memory store");
+        store
+            .create_persona("plain-approval")
+            .expect("create persona");
+        let pid = store
+            .list_personas()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .id;
+
+        let adapter = DaemonApprovalStoreRef::new(&store);
+
+        let metadata = SubmitMetadata {
+            action: "credential.access".to_string(),
+            ttl_secs: Some(60),
+            risk_level: "low".to_string(),
+            ..Default::default()
+        };
+        let scope = RequestedScope {
+            capability: "read".to_string(),
+            resource_id: None,
+            constraints: vec![],
+        };
+
+        let request_id = adapter
+            .submit_request(&pid, "api-key", scope, metadata)
+            .await
+            .expect("submit_request must succeed");
+
+        let _ = adapter
+            .decide(
+                &core_approval::RequestId(request_id.0.clone()),
+                CoreApprovalOutcome::Approved,
+            )
+            .await
+            .expect("decide must succeed");
+
+        let resolved = store
+            .get_approval(&request_id.0)
+            .expect("approval row must exist");
+        let grant_id = resolved
+            .result_grant_id
+            .expect("Approved must populate result_grant_id");
+
+        let (mdd, muph, ahs, ahe, at): (
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+        ) = store
+            .conn()
+            .query_row(
+                "SELECT max_delegation_depth, max_uses_per_hour, \
+                 allowed_hours_start, allowed_hours_end, allowed_targets \
+                 FROM grants WHERE id = ?1",
+                rusqlite::params![grant_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("grant row must exist");
+
+        assert!(
+            mdd.is_none(),
+            "no-shape approval must leave max_delegation_depth NULL"
+        );
+        assert!(
+            muph.is_none(),
+            "no-shape approval must leave max_uses_per_hour NULL"
+        );
+        assert!(
+            ahs.is_none(),
+            "no-shape approval must leave allowed_hours_start NULL"
+        );
+        assert!(
+            ahe.is_none(),
+            "no-shape approval must leave allowed_hours_end NULL"
+        );
+        assert!(
+            at.is_none(),
+            "no-shape approval must leave allowed_targets NULL"
+        );
     }
 }

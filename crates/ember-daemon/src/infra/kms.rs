@@ -27,9 +27,7 @@ pub enum KmsError {
 pub enum KmsCallerSource {
     /// Existing loopback path — caller presented a bearer token that identified
     /// a persona via the in-process token registry.
-    Loopback {
-        token_persona: String,
-    },
+    Loopback { token_persona: String },
     /// New mTLS edge path — caller presented a client certificate whose SPIFFE
     /// URI was verified against the edge CA and parsed into a `SpiffeIdentity`.
     Edge {
@@ -69,9 +67,7 @@ pub async fn resolve_persona_grants(
 
     // Load active grants for the persona via the grant store adapter.
     let grant_store = store.grant_store();
-    let grants = grant_store
-        .list_active(persona)
-        .map_err(KmsError::Store)?;
+    let grants = grant_store.list_active(persona).map_err(KmsError::Store)?;
 
     if grants.is_empty() {
         return Err(KmsError::NoActiveGrants(persona.to_owned()));

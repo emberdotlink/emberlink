@@ -1,18 +1,20 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use core_crypto::{
-    Ed25519Verifier, Verifier, generate_ephemeral_keypair, generate_local_encryption_key_pair,
-    generate_local_key_pair, generate_random_identifier, grant_chain, seal_grant_payload,
-    LocalKeyPair, LocalKeySigner, PublicKey, Signature, Signer,
+    Ed25519Verifier, LocalKeyPair, LocalKeySigner, PublicKey, Signature, Signer, Verifier,
+    generate_ephemeral_keypair, generate_local_encryption_key_pair, generate_local_key_pair,
+    generate_random_identifier, grant_chain, seal_grant_payload,
 };
+use core_event_types::SignerBinding;
 use core_events::EventEnvelope;
+use core_grant_types::{
+    GrantLink, decode_sealed_offer, encode_sealed_offer, qr_encoding::SealedOffer,
+};
 use core_identity::{create_root, device_revoked_event, root_created_event, root_revoked_event};
 use core_personas::{create_persona, persona_created_event, persona_revoked_event};
-use core_state::IdentityAuthorizer;
-use core_grant_types::{GrantLink, decode_sealed_offer, encode_sealed_offer, qr_encoding::SealedOffer};
-use core_event_types::{SignerBinding};
 use core_principals::{PublicKeyMaterial, SurvivalMode};
-use core_types::{ValidationError};
+use core_state::IdentityAuthorizer;
+use core_types::ValidationError;
 
 use crate::backend::AppBackend;
 use crate::commands::UiAction;
@@ -52,10 +54,7 @@ impl<S: AppBackend> AppRuntime<S> {
     ///
     /// `mutated` tells the caller whether it should persist state after this
     /// call. Read-only actions return `mutated = false`.
-    pub fn handle_action(
-        &mut self,
-        action: UiAction,
-    ) -> Result<(serde_json::Value, bool), String> {
+    pub fn handle_action(&mut self, action: UiAction) -> Result<(serde_json::Value, bool), String> {
         let mutates = !matches!(
             action,
             UiAction::GetState
@@ -75,24 +74,30 @@ impl<S: AppBackend> AppRuntime<S> {
             }
             UiAction::GetGrantDetail { grant_id } => self.do_get_grant_detail(&grant_id)?,
 
-            UiAction::Init { name, device_label, persona_label } => {
-                self.do_init(&name, &device_label, &persona_label)?
-            }
+            UiAction::Init {
+                name,
+                device_label,
+                persona_label,
+            } => self.do_init(&name, &device_label, &persona_label)?,
             UiAction::CreateRoot { name } => self.do_create_root(&name)?,
-            UiAction::CreatePersona { root, label, template } => {
-                self.do_create_persona(&root, &label, &template)?
-            }
+            UiAction::CreatePersona {
+                root,
+                label,
+                template,
+            } => self.do_create_persona(&root, &label, &template)?,
             UiAction::AddDevice { root, label } => self.do_add_device(&root, &label)?,
 
-            UiAction::RevokeRoot { root_id, reason } => {
-                self.do_revoke_root(&root_id, &reason)?
-            }
-            UiAction::RevokePersona { root_id, persona_id, reason } => {
-                self.do_revoke_persona(&root_id, &persona_id, &reason)?
-            }
-            UiAction::RevokeDevice { root_id, device_id, reason } => {
-                self.do_revoke_device(&root_id, &device_id, &reason)?
-            }
+            UiAction::RevokeRoot { root_id, reason } => self.do_revoke_root(&root_id, &reason)?,
+            UiAction::RevokePersona {
+                root_id,
+                persona_id,
+                reason,
+            } => self.do_revoke_persona(&root_id, &persona_id, &reason)?,
+            UiAction::RevokeDevice {
+                root_id,
+                device_id,
+                reason,
+            } => self.do_revoke_device(&root_id, &device_id, &reason)?,
 
             UiAction::RevokeGrant { grant_id, reason } => {
                 self.do_revoke_grant(&grant_id, &reason)?
@@ -134,13 +139,17 @@ impl<S: AppBackend> AppRuntime<S> {
                 note.as_deref(),
             )?,
 
-            UiAction::CreateCredential { persona_id, device_id, claim_type, payload_json } => {
-                self.do_create_credential(&persona_id, &device_id, &claim_type, &payload_json)?
-            }
+            UiAction::CreateCredential {
+                persona_id,
+                device_id,
+                claim_type,
+                payload_json,
+            } => self.do_create_credential(&persona_id, &device_id, &claim_type, &payload_json)?,
             UiAction::ListCredentials { persona_id } => self.do_list_credentials(&persona_id)?,
-            UiAction::GetCredential { object_id, persona_id } => {
-                self.do_get_credential(&object_id, &persona_id)?
-            }
+            UiAction::GetCredential {
+                object_id,
+                persona_id,
+            } => self.do_get_credential(&object_id, &persona_id)?,
             UiAction::ListServiceBindings { persona_id } => {
                 self.do_list_service_bindings(&persona_id)?
             }
@@ -162,9 +171,15 @@ impl<S: AppBackend> AppRuntime<S> {
                 &conditions,
             )?,
 
-            UiAction::ClaimGrantOffer { link_url, claiming_persona_id, new_user_name } => {
-                self.do_claim_grant_offer(&link_url, claiming_persona_id.as_deref(), new_user_name.as_deref())?
-            }
+            UiAction::ClaimGrantOffer {
+                link_url,
+                claiming_persona_id,
+                new_user_name,
+            } => self.do_claim_grant_offer(
+                &link_url,
+                claiming_persona_id.as_deref(),
+                new_user_name.as_deref(),
+            )?,
 
             UiAction::IssueBadge {
                 issuer_persona_id,
@@ -184,29 +199,50 @@ impl<S: AppBackend> AppRuntime<S> {
                 expires_in_secs,
             )?,
 
-            UiAction::RevokeBadge { badge_id, revoker_persona_id, reason } => {
-                self.do_revoke_badge(&badge_id, &revoker_persona_id, &reason)?
-            }
+            UiAction::RevokeBadge {
+                badge_id,
+                revoker_persona_id,
+                reason,
+            } => self.do_revoke_badge(&badge_id, &revoker_persona_id, &reason)?,
 
-            UiAction::ListBadges { persona_id, role, badge_type } => {
-                self.do_list_badges(persona_id.as_deref(), role.as_deref(), badge_type.as_deref())?
-            }
+            UiAction::ListBadges {
+                persona_id,
+                role,
+                badge_type,
+            } => self.do_list_badges(
+                persona_id.as_deref(),
+                role.as_deref(),
+                badge_type.as_deref(),
+            )?,
 
-            UiAction::SetBadgeVisibility { badge_id, persona_id, visible } => {
-                self.do_set_badge_visibility(&badge_id, &persona_id, visible)?
-            }
+            UiAction::SetBadgeVisibility {
+                badge_id,
+                persona_id,
+                visible,
+            } => self.do_set_badge_visibility(&badge_id, &persona_id, visible)?,
 
-            UiAction::GetBadgeGallery { persona_id, visible_only } => {
-                self.do_get_badge_gallery(&persona_id, visible_only)?
-            }
+            UiAction::GetBadgeGallery {
+                persona_id,
+                visible_only,
+            } => self.do_get_badge_gallery(&persona_id, visible_only)?,
 
-            UiAction::BadgeWeight { badge_id, viewer_persona_id, max_depth } => {
-                self.do_badge_weight(&badge_id, viewer_persona_id.as_deref(), max_depth)?
-            }
+            UiAction::BadgeWeight {
+                badge_id,
+                viewer_persona_id,
+                max_depth,
+            } => self.do_badge_weight(&badge_id, viewer_persona_id.as_deref(), max_depth)?,
 
-            UiAction::DisputeBadge { target_badge_id, disputer_persona_id, reason, evidence } => {
-                self.do_dispute_badge(&target_badge_id, &disputer_persona_id, &reason, evidence.as_deref())?
-            }
+            UiAction::DisputeBadge {
+                target_badge_id,
+                disputer_persona_id,
+                reason,
+                evidence,
+            } => self.do_dispute_badge(
+                &target_badge_id,
+                &disputer_persona_id,
+                &reason,
+                evidence.as_deref(),
+            )?,
         };
 
         Ok((result, mutates))
@@ -234,7 +270,10 @@ impl<S: AppBackend> AppRuntime<S> {
 
         self.local_state.keys.insert(
             root_id.clone(),
-            LocalKeyEntry { owner_kind: "root".into(), key_pair },
+            LocalKeyEntry {
+                owner_kind: "root".into(),
+                key_pair,
+            },
         );
 
         Ok(serde_json::json!({ "status": "ok", "root_id": root_id }))
@@ -246,7 +285,12 @@ impl<S: AppBackend> AppRuntime<S> {
         label: &str,
         template: &str,
     ) -> Result<serde_json::Value, String> {
-        if !self.store.materialized().roots_current.contains_key(root_id) {
+        if !self
+            .store
+            .materialized()
+            .roots_current
+            .contains_key(root_id)
+        {
             return Err(format!("root '{root_id}' not found"));
         }
 
@@ -262,8 +306,11 @@ impl<S: AppBackend> AppRuntime<S> {
         let persona_id = allocate_subject_id(&self.store, "persona");
         let key_pair = generate_local_key_pair("persona", &persona_id);
         let pk = public_key_material(&key_pair);
-        let disclosure_profile =
-            if template.is_empty() { None } else { Some(template.to_string()) };
+        let disclosure_profile = if template.is_empty() {
+            None
+        } else {
+            Some(template.to_string())
+        };
 
         let persona = create_persona(
             &persona_id,
@@ -296,8 +343,7 @@ impl<S: AppBackend> AppRuntime<S> {
             .devices_current
             .values()
             .filter(|d| {
-                d.root_id == root_id
-                    && !matches!(d.status, core_eventlog::DeviceStatus::Revoked)
+                d.root_id == root_id && !matches!(d.status, core_eventlog::DeviceStatus::Revoked)
             })
             .map(|d| d.device_id.clone())
             .collect();
@@ -310,18 +356,22 @@ impl<S: AppBackend> AppRuntime<S> {
 
         self.local_state.keys.insert(
             persona_id.clone(),
-            LocalKeyEntry { owner_kind: "persona".into(), key_pair },
+            LocalKeyEntry {
+                owner_kind: "persona".into(),
+                key_pair,
+            },
         );
 
         Ok(serde_json::json!({ "status": "ok", "persona_id": persona_id }))
     }
 
-    fn do_add_device(
-        &mut self,
-        root_id: &str,
-        label: &str,
-    ) -> Result<serde_json::Value, String> {
-        if !self.store.materialized().roots_current.contains_key(root_id) {
+    fn do_add_device(&mut self, root_id: &str, label: &str) -> Result<serde_json::Value, String> {
+        if !self
+            .store
+            .materialized()
+            .roots_current
+            .contains_key(root_id)
+        {
             return Err(format!("root '{root_id}' not found"));
         }
 
@@ -355,7 +405,10 @@ impl<S: AppBackend> AppRuntime<S> {
 
         self.local_state.keys.insert(
             device_id.clone(),
-            LocalKeyEntry { owner_kind: "device".into(), key_pair },
+            LocalKeyEntry {
+                owner_kind: "device".into(),
+                key_pair,
+            },
         );
 
         Ok(serde_json::json!({ "status": "ok", "device_id": device_id }))
@@ -368,15 +421,22 @@ impl<S: AppBackend> AppRuntime<S> {
         persona_label: &str,
     ) -> Result<serde_json::Value, String> {
         let root_result = self.do_create_root(name)?;
-        let root_id = root_result["root_id"].as_str().ok_or("missing root_id")?.to_string();
+        let root_id = root_result["root_id"]
+            .as_str()
+            .ok_or("missing root_id")?
+            .to_string();
 
         let device_result = self.do_add_device(&root_id, device_label)?;
-        let device_id =
-            device_result["device_id"].as_str().ok_or("missing device_id")?.to_string();
+        let device_id = device_result["device_id"]
+            .as_str()
+            .ok_or("missing device_id")?
+            .to_string();
 
         let persona_result = self.do_create_persona(&root_id, persona_label, "")?;
-        let persona_id =
-            persona_result["persona_id"].as_str().ok_or("missing persona_id")?.to_string();
+        let persona_id = persona_result["persona_id"]
+            .as_str()
+            .ok_or("missing persona_id")?
+            .to_string();
 
         Ok(serde_json::json!({
             "status": "ok",
@@ -390,12 +450,13 @@ impl<S: AppBackend> AppRuntime<S> {
     // Revocation
     // -----------------------------------------------------------------------
 
-    fn do_revoke_root(
-        &mut self,
-        root_id: &str,
-        reason: &str,
-    ) -> Result<serde_json::Value, String> {
-        if !self.store.materialized().roots_current.contains_key(root_id) {
+    fn do_revoke_root(&mut self, root_id: &str, reason: &str) -> Result<serde_json::Value, String> {
+        if !self
+            .store
+            .materialized()
+            .roots_current
+            .contains_key(root_id)
+        {
             return Err(format!("root '{root_id}' not found"));
         }
         let root_entry = self
@@ -425,7 +486,12 @@ impl<S: AppBackend> AppRuntime<S> {
         persona_id: &str,
         reason: &str,
     ) -> Result<serde_json::Value, String> {
-        if !self.store.materialized().personas_current.contains_key(persona_id) {
+        if !self
+            .store
+            .materialized()
+            .personas_current
+            .contains_key(persona_id)
+        {
             return Err(format!("persona '{persona_id}' not found"));
         }
         let root_entry = self
@@ -455,7 +521,12 @@ impl<S: AppBackend> AppRuntime<S> {
         device_id: &str,
         reason: &str,
     ) -> Result<serde_json::Value, String> {
-        if !self.store.materialized().devices_current.contains_key(device_id) {
+        if !self
+            .store
+            .materialized()
+            .devices_current
+            .contains_key(device_id)
+        {
             return Err(format!("device '{device_id}' not found"));
         }
         let root_entry = self
@@ -497,7 +568,11 @@ impl<S: AppBackend> AppRuntime<S> {
         grant_id: &str,
         reason: &str,
     ) -> Result<serde_json::Value, String> {
-        let reason_opt = if reason.is_empty() { None } else { Some(reason) };
+        let reason_opt = if reason.is_empty() {
+            None
+        } else {
+            Some(reason)
+        };
         self.store
             .revoke_access_grant(grant_id, reason_opt)
             .map_err(|e| e.to_string())?;
@@ -517,15 +592,16 @@ impl<S: AppBackend> AppRuntime<S> {
         not_before: Option<u64>,
         expires_at: Option<u64>,
     ) -> Result<serde_json::Value, String> {
-        use core_grant_types::{AccessGrant, AttestationBinding, Block, GrantMode, GrantStatus, RecipientProfile};
-        use core_event_types::{PresentationAudienceKind};
+        use core_event_types::PresentationAudienceKind;
+        use core_grant_types::{
+            AccessGrant, AttestationBinding, Block, GrantMode, GrantStatus, RecipientProfile,
+        };
 
         let recipient_kind = PresentationAudienceKind::parse(recipient_kind)
             .ok_or_else(|| format!("invalid recipient_kind: {recipient_kind}"))?;
         let recipient_profile = RecipientProfile::parse(recipient_profile)
             .ok_or_else(|| format!("invalid recipient_profile: {recipient_profile}"))?;
-        let mode = GrantMode::parse(mode)
-            .ok_or_else(|| format!("invalid mode: {mode}"))?;
+        let mode = GrantMode::parse(mode).ok_or_else(|| format!("invalid mode: {mode}"))?;
         let parsed_statements = statement_specs
             .iter()
             .enumerate()
@@ -595,7 +671,9 @@ impl<S: AppBackend> AppRuntime<S> {
             label,
         };
 
-        self.store.create_access_grant(&grant).map_err(|e| e.to_string())?;
+        self.store
+            .create_access_grant(&grant)
+            .map_err(|e| e.to_string())?;
         Ok(serde_json::json!({ "status": "ok", "grant_id": grant_id }))
     }
 
@@ -656,9 +734,9 @@ impl<S: AppBackend> AppRuntime<S> {
         relay_hint: Option<String>,
         conditions: &[core_grant_types::grant_conditions::GrantCondition],
     ) -> Result<serde_json::Value, String> {
+        use core_event_types::GrantOfferCreatedEvent;
         use core_grant_types::GrantLink;
-        use core_grant_types::{GrantMode};
-        use core_event_types::{GrantOfferCreatedEvent};
+        use core_grant_types::GrantMode;
 
         // Validate persona exists
         if !self
@@ -671,8 +749,7 @@ impl<S: AppBackend> AppRuntime<S> {
         }
 
         // Validate mode
-        let grant_mode = GrantMode::parse(mode)
-            .ok_or_else(|| format!("invalid mode: {mode}"))?;
+        let grant_mode = GrantMode::parse(mode).ok_or_else(|| format!("invalid mode: {mode}"))?;
 
         // Validate every spec parses into a Statement before minting the offer.
         let _parsed_stmts: Vec<core_grant_types::Statement> = statement_specs
@@ -701,8 +778,8 @@ impl<S: AppBackend> AppRuntime<S> {
                     persona.root_id
                 )
             })?;
-        let signer =
-            LocalKeySigner::from_local_key_pair(&persona_entry.key_pair).map_err(|e| e.to_string())?;
+        let signer = LocalKeySigner::from_local_key_pair(&persona_entry.key_pair)
+            .map_err(|e| e.to_string())?;
         let signer_key_id = persona_entry.key_pair.key_id.clone();
 
         // Generate IDs and timing
@@ -741,27 +818,25 @@ impl<S: AppBackend> AppRuntime<S> {
         let signature = signer.sign(&link_signing_payload);
 
         // Create the event
-        let event_body =
-            core_event_types::EventBody::GrantOfferCreated(GrantOfferCreatedEvent {
-                offer_id: offer_id.clone(),
-                issuer_persona_id: issuing_persona_id.to_string(),
-                ephemeral_public_key_hex: eph.public_key_hex.clone(),
-                sealed_payload_hex: sealed_hex.clone(),
-                relay_hint: relay_hint.clone(),
-                expires_at,
-                conditions_json: if conditions.is_empty() {
-                    String::new()
-                } else {
-                    // GC-H2 sibling: fail-closed on serialize errors. An
-                    // unwrap_or_default() here would write an empty string,
-                    // which the claim path treats as "no conditions" — a
-                    // silent fail-open that permanently strips gating from
-                    // the event log.
-                    serde_json::to_string(conditions).map_err(|e| {
-                        format!("failed to serialize grant conditions: {e}")
-                    })?
-                },
-            });
+        let event_body = core_event_types::EventBody::GrantOfferCreated(GrantOfferCreatedEvent {
+            offer_id: offer_id.clone(),
+            issuer_persona_id: issuing_persona_id.to_string(),
+            ephemeral_public_key_hex: eph.public_key_hex.clone(),
+            sealed_payload_hex: sealed_hex.clone(),
+            relay_hint: relay_hint.clone(),
+            expires_at,
+            conditions_json: if conditions.is_empty() {
+                String::new()
+            } else {
+                // GC-H2 sibling: fail-closed on serialize errors. An
+                // unwrap_or_default() here would write an empty string,
+                // which the claim path treats as "no conditions" — a
+                // silent fail-open that permanently strips gating from
+                // the event log.
+                serde_json::to_string(conditions)
+                    .map_err(|e| format!("failed to serialize grant conditions: {e}"))?
+            },
+        });
 
         // Determine signer binding — use root key if we're signing with root
         let signer_binding = if persona_entry.owner_kind == "root" {
@@ -862,24 +937,24 @@ impl<S: AppBackend> AppRuntime<S> {
                     sealed.issuer_signature,
                 )
             } else {
-            // URL path: parse the grant link to get offer_id and ek.
-            // The sealed payload must come from the relay (fetch handled by CLI).
-            // For URL-based claims we expect the caller to have embedded the sealed
-            // payload in the link_url after a relay FETCH_OFFER, serialized as a
-            // synthetic QR string. If it is not a QR string but a plain URL, we
-            // return a clear error directing the caller to use the relay-fetch path.
-            let link = GrantLink::parse(link_url).map_err(|e| e.to_string())?;
-            // URL-only: we do not have the sealed payload yet.
-            // The CLI layer must call `relay fetch` first and then pass the
-            // EL1:... result to ClaimGrantOffer. Return a descriptive error.
-            return Err(format!(
-                "URL-based offer '{}' requires a relay fetch first. \
+                // URL path: parse the grant link to get offer_id and ek.
+                // The sealed payload must come from the relay (fetch handled by CLI).
+                // For URL-based claims we expect the caller to have embedded the sealed
+                // payload in the link_url after a relay FETCH_OFFER, serialized as a
+                // synthetic QR string. If it is not a QR string but a plain URL, we
+                // return a clear error directing the caller to use the relay-fetch path.
+                let link = GrantLink::parse(link_url).map_err(|e| e.to_string())?;
+                // URL-only: we do not have the sealed payload yet.
+                // The CLI layer must call `relay fetch` first and then pass the
+                // EL1:... result to ClaimGrantOffer. Return a descriptive error.
+                return Err(format!(
+                    "URL-based offer '{}' requires a relay fetch first. \
                  Run `grant offer fetch {}{}` to retrieve the sealed payload, \
                  then claim the returned EL1:... string.",
-                link.offer_id,
-                link.relay_hint.as_deref().unwrap_or("<relay-addr>"),
-                link.offer_id,
-            ));
+                    link.offer_id,
+                    link.relay_hint.as_deref().unwrap_or("<relay-addr>"),
+                    link.offer_id,
+                ));
             };
 
         // --- Step 2: check offer expiry ---
@@ -941,7 +1016,12 @@ impl<S: AppBackend> AppRuntime<S> {
         if let Some(ref offer_view) = offer_event {
             // Look up the issuer persona's public key from the event log.
             let issuer_pid = &offer_view.issuer_persona_id;
-            let issuer_persona = self.store.materialized().personas_current.get(issuer_pid).cloned();
+            let issuer_persona = self
+                .store
+                .materialized()
+                .personas_current
+                .get(issuer_pid)
+                .cloned();
             if let Some(persona) = issuer_persona {
                 // Try persona key first, then root key.
                 let pub_key_hex = self
@@ -1102,12 +1182,9 @@ impl<S: AppBackend> AppRuntime<S> {
                     max_depth: core_trust::DEFAULT_MAX_DEPTH,
                 };
 
-                let result =
-                    core_trust::evaluate_grant_conditions(&parsed_conditions, &gate_input);
+                let result = core_trust::evaluate_grant_conditions(&parsed_conditions, &gate_input);
                 if let core_trust::ConditionResult::Unmet(reason) = result {
-                    return Err(format!(
-                        "grant condition not met: {reason}"
-                    ));
+                    return Err(format!("grant condition not met: {reason}"));
                 }
             }
         }
@@ -1134,8 +1211,8 @@ impl<S: AppBackend> AppRuntime<S> {
                     persona.root_id
                 )
             })?;
-        let signer =
-            LocalKeySigner::from_local_key_pair(&persona_entry.key_pair).map_err(|e| e.to_string())?;
+        let signer = LocalKeySigner::from_local_key_pair(&persona_entry.key_pair)
+            .map_err(|e| e.to_string())?;
         let signer_key_id = persona_entry.key_pair.key_id.clone();
         let claim_signature = signer.sign(claim_payload.as_bytes());
 
@@ -1171,7 +1248,10 @@ impl<S: AppBackend> AppRuntime<S> {
             .as_str()
             .unwrap_or("unknown")
             .to_string();
-        let grant_mode = grant_params["mode"].as_str().unwrap_or("unknown").to_string();
+        let grant_mode = grant_params["mode"]
+            .as_str()
+            .unwrap_or("unknown")
+            .to_string();
 
         Ok(serde_json::json!({
             "status": "ok",
@@ -1223,7 +1303,9 @@ impl<S: AppBackend> AppRuntime<S> {
         let view = views
             .into_iter()
             .find(|v| v.object_id == object_id)
-            .ok_or_else(|| format!("credential '{object_id}' not found for persona '{persona_id}'"))?;
+            .ok_or_else(|| {
+                format!("credential '{object_id}' not found for persona '{persona_id}'")
+            })?;
         serde_json::to_value(view).map_err(|e| e.to_string())
     }
 
@@ -1287,7 +1369,9 @@ impl<S: AppBackend> AppRuntime<S> {
             .personas_current
             .contains_key(recipient_persona_id)
         {
-            return Err(format!("recipient persona '{recipient_persona_id}' not found"));
+            return Err(format!(
+                "recipient persona '{recipient_persona_id}' not found"
+            ));
         }
 
         // Resolve signing key — prefer persona key, fall back to root key
@@ -1302,8 +1386,8 @@ impl<S: AppBackend> AppRuntime<S> {
                     issuer_persona.root_id
                 )
             })?;
-        let signer =
-            LocalKeySigner::from_local_key_pair(&persona_entry.key_pair).map_err(|e| e.to_string())?;
+        let signer = LocalKeySigner::from_local_key_pair(&persona_entry.key_pair)
+            .map_err(|e| e.to_string())?;
         let signer_key_id = persona_entry.key_pair.key_id.clone();
 
         let now = now_epoch_secs();
@@ -1401,8 +1485,8 @@ impl<S: AppBackend> AppRuntime<S> {
                     revoker_persona.root_id
                 )
             })?;
-        let signer =
-            LocalKeySigner::from_local_key_pair(&persona_entry.key_pair).map_err(|e| e.to_string())?;
+        let signer = LocalKeySigner::from_local_key_pair(&persona_entry.key_pair)
+            .map_err(|e| e.to_string())?;
         let signer_key_id = persona_entry.key_pair.key_id.clone();
 
         let event_body = EventBody::BadgeRevoked(BadgeRevokedEvent {
@@ -1473,8 +1557,8 @@ impl<S: AppBackend> AppRuntime<S> {
                     disputer_persona.root_id
                 )
             })?;
-        let signer =
-            LocalKeySigner::from_local_key_pair(&persona_entry.key_pair).map_err(|e| e.to_string())?;
+        let signer = LocalKeySigner::from_local_key_pair(&persona_entry.key_pair)
+            .map_err(|e| e.to_string())?;
         let signer_key_id = persona_entry.key_pair.key_id.clone();
 
         let dispute_id = generate_random_identifier("dispute");
@@ -1528,9 +1612,7 @@ impl<S: AppBackend> AppRuntime<S> {
                 match (persona_id, role) {
                     (Some(pid), Some("issuer")) => b.issuer_persona_id == pid,
                     (Some(pid), Some("recipient")) => b.recipient_persona_id == pid,
-                    (Some(pid), _) => {
-                        b.issuer_persona_id == pid || b.recipient_persona_id == pid
-                    }
+                    (Some(pid), _) => b.issuer_persona_id == pid || b.recipient_persona_id == pid,
                     (None, _) => true,
                 }
             })
@@ -1558,11 +1640,21 @@ impl<S: AppBackend> AppRuntime<S> {
         visible: bool,
     ) -> Result<serde_json::Value, String> {
         // Validate that the persona exists.
-        if !self.store.materialized().personas_current.contains_key(persona_id) {
+        if !self
+            .store
+            .materialized()
+            .personas_current
+            .contains_key(persona_id)
+        {
             return Err(format!("persona '{persona_id}' not found"));
         }
         // Validate that the badge exists.
-        if !self.store.materialized().badges_current.contains_key(badge_id) {
+        if !self
+            .store
+            .materialized()
+            .badges_current
+            .contains_key(badge_id)
+        {
             return Err(format!("badge '{badge_id}' not found"));
         }
 
@@ -1910,7 +2002,9 @@ mod tests {
 
         // Must appear in list
         let (list, _) = rt
-            .handle_action(UiAction::ListCredentials { persona_id: persona_id.clone() })
+            .handle_action(UiAction::ListCredentials {
+                persona_id: persona_id.clone(),
+            })
             .unwrap();
         let creds = list.as_array().unwrap();
         assert_eq!(creds.len(), 1);
@@ -2046,7 +2140,10 @@ mod tests {
             })
             .unwrap();
         let badges = list.as_array().unwrap();
-        let revoked = badges.iter().find(|b| b["badge_id"].as_str().unwrap() == badge_id).unwrap();
+        let revoked = badges
+            .iter()
+            .find(|b| b["badge_id"].as_str().unwrap() == badge_id)
+            .unwrap();
         assert!(revoked["revoked"].as_bool().unwrap());
     }
 
@@ -2109,7 +2206,10 @@ mod tests {
         assert_eq!(dispute_result["status"], "ok");
         let dispute_id = dispute_result["dispute_id"].as_str().unwrap().to_string();
         assert!(!dispute_id.is_empty());
-        assert_eq!(dispute_result["target_badge_id"].as_str().unwrap(), badge_id);
+        assert_eq!(
+            dispute_result["target_badge_id"].as_str().unwrap(),
+            badge_id
+        );
     }
 
     #[test]
@@ -2514,7 +2614,10 @@ mod tests {
         let snap = claimant.snapshot();
         assert_eq!(snap.roots.len(), 1, "should have auto-created root");
         assert_eq!(snap.personas.len(), 1, "should have auto-created persona");
-        assert!(snap.event_count >= 4, "root + device + persona + claim events");
+        assert!(
+            snap.event_count >= 4,
+            "root + device + persona + claim events"
+        );
 
         // === REPLAY PREVENTION: same QR can't be claimed again ===
         let mut replay_claimant = memory_runtime();
@@ -2553,7 +2656,10 @@ mod tests {
             revoker_persona_id: issuer_persona.clone(),
             reason: "test revocation".into(),
         });
-        assert!(revoke_result.is_ok(), "issuer should be able to revoke own badge");
+        assert!(
+            revoke_result.is_ok(),
+            "issuer should be able to revoke own badge"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2615,9 +2721,9 @@ mod tests {
                 statement_specs: vec!["read_credential:obj-gc-h2".into()],
                 expires_in_secs: Some(86400),
                 relay_hint: None,
-                conditions: vec![
-                    core_grant_types::grant_conditions::GrantCondition::badge("required-badge"),
-                ],
+                conditions: vec![core_grant_types::grant_conditions::GrantCondition::badge(
+                    "required-badge",
+                )],
             })
             .unwrap();
         assert_eq!(offer_result["status"], "ok");
@@ -2703,15 +2809,17 @@ mod tests {
         let ek_hex = "aa".repeat(32); // 64-char hex — valid X25519 length
         let event = EventEnvelope::from_body(
             "evt-gc-h2-test",
-            core_event_types::EventBody::GrantOfferCreated(core_event_types::GrantOfferCreatedEvent {
-                offer_id: offer_id.into(),
-                issuer_persona_id: "fake-issuer".into(),
-                ephemeral_public_key_hex: ek_hex.clone(),
-                sealed_payload_hex: "deadbeef".into(),
-                relay_hint: None,
-                expires_at: 9_999_999_999,
-                conditions_json: r#"[{"type":"future_variant","value":{}}]"#.into(),
-            }),
+            core_event_types::EventBody::GrantOfferCreated(
+                core_event_types::GrantOfferCreatedEvent {
+                    offer_id: offer_id.into(),
+                    issuer_persona_id: "fake-issuer".into(),
+                    ephemeral_public_key_hex: ek_hex.clone(),
+                    sealed_payload_hex: "deadbeef".into(),
+                    relay_hint: None,
+                    expires_at: 9_999_999_999,
+                    conditions_json: r#"[{"type":"future_variant","value":{}}]"#.into(),
+                },
+            ),
             vec![],
             SignerBinding::persona("fake-issuer", "fake-key"),
             &FixtureSigner::new("fake-key"),
@@ -2806,9 +2914,9 @@ mod tests {
                 statement_specs: vec!["read_credential:obj-cond-pin".into()],
                 expires_in_secs: Some(86400),
                 relay_hint: None,
-                conditions: vec![
-                    core_grant_types::grant_conditions::GrantCondition::badge("verified-dev"),
-                ],
+                conditions: vec![core_grant_types::grant_conditions::GrantCondition::badge(
+                    "verified-dev",
+                )],
             })
             .unwrap();
         assert_eq!(offer["status"], "ok");

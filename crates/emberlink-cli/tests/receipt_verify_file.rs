@@ -26,8 +26,13 @@ fn run(args: &[&str]) -> (String, String, i32) {
 
 #[test]
 fn verify_with_id_and_file_is_a_clap_conflict() {
-    let (_stdout, stderr, code) =
-        run(&["receipt", "verify", "abc123", "--file", "/tmp/whatever.json"]);
+    let (_stdout, stderr, code) = run(&[
+        "receipt",
+        "verify",
+        "abc123",
+        "--file",
+        "/tmp/whatever.json",
+    ]);
     assert_ne!(code, 0, "id + --file together must fail");
     let combined = stderr.to_lowercase();
     assert!(
@@ -63,7 +68,9 @@ fn verify_file_with_garbage_json_errors() {
             .expect("spawn ember");
         {
             let stdin = child.stdin.as_mut().expect("stdin");
-            stdin.write_all(b"this is not a receipt").expect("write stdin");
+            stdin
+                .write_all(b"this is not a receipt")
+                .expect("write stdin");
         }
         let out = child.wait_with_output().expect("wait ember");
         (
@@ -80,7 +87,7 @@ fn verify_file_with_garbage_json_errors() {
 }
 
 // ---------------------------------------------------------------------------
-// v2 dispatch tests (implementation-note-317)
+// v2 dispatch tests (implementation-note-450)
 // ---------------------------------------------------------------------------
 
 /// Build a signed v2 ReceiptEnvelope using the deterministic FixtureSigner,
@@ -109,6 +116,11 @@ fn make_signed_v2_receipt() -> (String, String) {
             "permits_merkle_root": ""
         }),
         signature: None,
+        calling_principal: None,
+        presence_reason: None,
+        handle_id: None,
+        challenge_hash: None,
+        verifier_aaguid: None,
     };
     sign_receipt_v2(&mut env, &signer).expect("sign");
     let json = serde_json::to_string_pretty(&env).expect("serialize");
@@ -170,9 +182,11 @@ fn verify_v2_sidecar_tamper_fails() {
 
 #[test]
 fn verify_v1_receipt_still_succeeds() {
-    use core_grant_types::grant_receipt::{Evidence, GrantReceipt, Lifecycle, ReceiptSummary, TerminalReason};
     use core_grant_types::AttestationBinding;
-    use ember_daemon::infra::receipt::{DaemonPersona, canonical_hash, CANONICAL_VERSION};
+    use core_grant_types::grant_receipt::{
+        Evidence, GrantReceipt, Lifecycle, ReceiptSummary, TerminalReason,
+    };
+    use ember_daemon::infra::receipt::{CANONICAL_VERSION, DaemonPersona, canonical_hash};
 
     // Create a DaemonPersona in a temp dir for signing.
     let dir = tempfile::tempdir().expect("tempdir");
@@ -201,6 +215,7 @@ fn verify_v1_receipt_still_succeeds() {
             terminal_reason: TerminalReason::Expired,
         },
         attestation: AttestationBinding::default(),
+        dev_mode_active: false,
         evidence: Evidence::default(),
     };
 
@@ -209,7 +224,7 @@ fn verify_v1_receipt_still_succeeds() {
     let sig_bytes = identity.sign(hash_hex.as_bytes());
     receipt.evidence = Evidence {
         hash: hash_hex,
-        sig: hex::encode(&*sig_bytes),
+        sig: hex::encode(*sig_bytes),
         signer_pubkey: pubkey_hex.clone(),
         canonical_version: CANONICAL_VERSION,
     };

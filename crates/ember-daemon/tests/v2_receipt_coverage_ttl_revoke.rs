@@ -1,4 +1,4 @@
-//! implementation-note-241 — T2 integration tests.
+//! implementation-note-337 — T2 integration tests.
 //!
 //! Asserts that the two gap termination paths (TTL-expiry and explicit-revoke)
 //! each emit signed v2 cohort-A Receipts with the correct `termination_reason`
@@ -17,7 +17,7 @@
 //!   T2c — Regression guard: dirty-exit path still produces a receipt with
 //!          termination_reason = HeartbeatLost (non-regression).
 //!
-//! implementation-note-242 — T3 regression tests.
+//! implementation-note-338 — T3 regression tests.
 //!
 //! Guards the invariant that a CleanExit MUST NOT revoke the grant. A 24h
 //! grant must support many sessions; revoking on CleanExit broke touch #2 of
@@ -34,9 +34,10 @@ use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
 
-use core_events::receipt::{ClaudeCodeBody, ReceiptEnvelope, TerminationReason};
 use core_events::receipt::sign::verify_receipt_v2;
-use ember_daemon::infra::handler::{dispatch_method_with_context, RequestContext};
+use core_events::receipt::{ClaudeCodeBody, ReceiptEnvelope, TerminationReason};
+use core_state::sessions::{SessionMeta, SessionStore};
+use ember_daemon::infra::handler::{RequestContext, dispatch_method_with_context};
 use ember_daemon::infra::rate_limit::RateLimiter;
 use ember_daemon::infra::receipt::{current_identity, init_identity};
 use ember_daemon::infra::store::DaemonStore;
@@ -44,7 +45,6 @@ use ember_daemon::infra::vault::Vault;
 use ember_daemon::session::lifecycle::transition_to_terminated_dirty_at;
 use ember_daemon::session_watcher::{close_session_clean_exit, close_session_ttl_expiry};
 use ember_daemon::trust::policy::PolicyEngine;
-use core_state::sessions::{SessionMeta, SessionStore};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -83,9 +83,7 @@ fn create_session(
     persona_name: &str,
 ) -> SessionMeta {
     // Mint persona + grant
-    let persona = store
-        .create_persona(persona_name)
-        .expect("create_persona");
+    let persona = store.create_persona(persona_name).expect("create_persona");
     let grant = store
         .create_grant(&persona.id, "test-token", "read", Some(3600))
         .expect("create_grant");
@@ -96,8 +94,12 @@ fn create_session(
         grant_id: grant.id.clone(),
         launcher_pid: std::process::id(),
         started_at: chrono::Utc::now(),
+        workflow_id: None,
+        workflow_template: None,
     };
-    session_store.create(&meta).expect("create session in store");
+    session_store
+        .create(&meta)
+        .expect("create session in store");
     meta
 }
 
@@ -106,10 +108,10 @@ fn create_session(
 fn load_receipt(receipt_path: &Path) -> (ReceiptEnvelope, ClaudeCodeBody) {
     let bytes = std::fs::read(receipt_path)
         .unwrap_or_else(|e| panic!("read receipt at {}: {e}", receipt_path.display()));
-    let envelope: ReceiptEnvelope = serde_json::from_slice(&bytes)
-        .expect("deserialize ReceiptEnvelope");
-    let body: ClaudeCodeBody = serde_json::from_value(envelope.body.clone())
-        .expect("deserialize ClaudeCodeBody");
+    let envelope: ReceiptEnvelope =
+        serde_json::from_slice(&bytes).expect("deserialize ReceiptEnvelope");
+    let body: ClaudeCodeBody =
+        serde_json::from_value(envelope.body.clone()).expect("deserialize ClaudeCodeBody");
     (envelope, body)
 }
 
@@ -135,9 +137,15 @@ fn ttl_expiry_session_close_emits_v2_receipt_with_ttl_expired() {
 
     // Pre-condition: receipt.json placeholder is empty (created by SessionStore::create).
     let receipt_path = sessions_dir.join(session_id).join("receipt.json");
-    assert!(receipt_path.exists(), "receipt.json placeholder must exist after session creation");
+    assert!(
+        receipt_path.exists(),
+        "receipt.json placeholder must exist after session creation"
+    );
     let pre_content = std::fs::read(&receipt_path).expect("read pre-receipt");
-    assert!(pre_content.is_empty(), "receipt.json must be empty before close");
+    assert!(
+        pre_content.is_empty(),
+        "receipt.json must be empty before close"
+    );
 
     // Invoke the TTL-expiry close path via the public helper that wraps
     // the internal close_session with TerminationReason::TtlExpired.
@@ -209,7 +217,9 @@ async fn explicit_revoke_emits_v2_receipt_with_explicit_revoke() {
     let vault = test_vault();
 
     // Mint a persona + grant so revoke_grant has something to act on.
-    let persona = store.create_persona("persona-revoke-v2").expect("create_persona");
+    let persona = store
+        .create_persona("persona-revoke-v2")
+        .expect("create_persona");
     let grant = store
         .create_grant(&persona.id, "test-cred", "read", Some(3600))
         .expect("create_grant");
@@ -234,11 +244,17 @@ async fn explicit_revoke_emits_v2_receipt_with_explicit_revoke() {
     .await
     .expect("revoke_grant must succeed");
 
-    assert_eq!(result["revoked"], json!(true), "revoke_grant must return revoked=true");
+    assert_eq!(
+        result["revoked"],
+        json!(true),
+        "revoke_grant must return revoked=true"
+    );
 
     // The receipt sidecar must exist at <sessions_dir>/grant:<grant_id>/receipt.json.
     let synthetic_session_id = format!("grant:{grant_id}");
-    let receipt_path = sessions_dir.join(&synthetic_session_id).join("receipt.json");
+    let receipt_path = sessions_dir
+        .join(&synthetic_session_id)
+        .join("receipt.json");
     assert!(
         receipt_path.exists(),
         "receipt.json sidecar must be written at {}: grant: {}",
@@ -308,8 +324,8 @@ fn dirty_exit_still_emits_heartbeat_lost_receipt() {
     assert_eq!(envelope.version.0, "2");
     assert!(envelope.signature.is_some());
 
-    let body: ClaudeCodeBody = serde_json::from_value(envelope.body.clone())
-        .expect("deserialize ClaudeCodeBody");
+    let body: ClaudeCodeBody =
+        serde_json::from_value(envelope.body.clone()).expect("deserialize ClaudeCodeBody");
     assert_eq!(
         body.termination_reason,
         Some(TerminationReason::HeartbeatLost),
@@ -325,13 +341,13 @@ fn dirty_exit_still_emits_heartbeat_lost_receipt() {
 
 // ---------------------------------------------------------------------------
 // T3a — CleanExit MUST NOT revoke the grant
-// (implementation-note-242)
+// (implementation-note-338)
 // ---------------------------------------------------------------------------
 
 /// T3a: After a CleanExit session close, the grant must remain Active.
 ///
 /// This guards the multi-session-per-24h-grant invariant from the v0.3 test
-/// plan. Regression introduced by implementation-note-241
+/// plan. Regression introduced by implementation-note-337
 /// M3 which unconditionally called revoke_grant inside close_session.
 #[test]
 fn clean_exit_does_not_revoke_grant() {
@@ -354,26 +370,20 @@ fn clean_exit_does_not_revoke_grant() {
     );
 
     // Close with CleanExit.
-    close_session_clean_exit(
-        &session_store,
-        &store,
-        session_id,
-        &grant_id,
-        &sessions_dir,
-    );
+    close_session_clean_exit(&session_store, &store, session_id, &grant_id, &sessions_dir);
 
     // Post-condition: grant must still be Active — CleanExit MUST NOT revoke.
     let post_grant = store.get_grant(&grant_id).expect("get_grant post-close");
     assert_eq!(
         post_grant.status, "active",
         "CleanExit MUST NOT revoke the grant — multi-session per 24h grant is the contract \
-         (implementation-note-242)"
+         (implementation-note-338)"
     );
 }
 
 // ---------------------------------------------------------------------------
 // T3d — handler close_session RPC arm MUST NOT revoke the grant on CleanExit
-// (implementation-note-187)
+// (implementation-note-259)
 // ---------------------------------------------------------------------------
 
 /// T3d: After calling the handler's close_session RPC arm, the grant must
@@ -386,7 +396,7 @@ fn clean_exit_does_not_revoke_grant() {
 ///
 /// Invariant: a 24h grant supports many sessions. CleanExit closes the
 /// session but MUST leave the grant Active for the next session.
-/// (implementation-note-187)
+/// (implementation-note-259)
 #[tokio::test]
 async fn handler_close_session_does_not_revoke_grant_on_clean_exit() {
     let _id_dir = init_test_identity();
@@ -401,16 +411,26 @@ async fn handler_close_session_does_not_revoke_grant_on_clean_exit() {
 
     // Mint a persona + grant via the RPC arms (mirrors the launcher flow).
     let persona_resp = dispatch_method_with_context(
-        &store, &vault, &policy, &rl,
-        None, RequestContext::internal("handler-clean-exit-test"),
+        &store,
+        &vault,
+        &policy,
+        &rl,
+        None,
+        RequestContext::internal("handler-clean-exit-test"),
         "create_persona",
         &json!({"name": "handler-clean-exit-persona"}),
-    ).await.expect("create_persona must succeed");
+    )
+    .await
+    .expect("create_persona must succeed");
     let persona_id = persona_resp["id"].as_str().expect("persona id");
 
     let grant_resp = dispatch_method_with_context(
-        &store, &vault, &policy, &rl,
-        None, RequestContext::internal("handler-clean-exit-test"),
+        &store,
+        &vault,
+        &policy,
+        &rl,
+        None,
+        RequestContext::internal("handler-clean-exit-test"),
         "create_grant",
         &json!({
             "persona_id": persona_id,
@@ -418,44 +438,65 @@ async fn handler_close_session_does_not_revoke_grant_on_clean_exit() {
             "scope": "claude-code",
             "force": true,
         }),
-    ).await.expect("create_grant must succeed");
+    )
+    .await
+    .expect("create_grant must succeed");
     let grant_id = grant_resp["id"].as_str().expect("grant id").to_string();
 
     // Pre-condition: grant Active.
     let pre_grant = store.get_grant(&grant_id).expect("get_grant pre-close");
-    assert_eq!(pre_grant.status, "active", "grant must be Active before close");
+    assert_eq!(
+        pre_grant.status, "active",
+        "grant must be Active before close"
+    );
 
     // Register a session via the RPC arm.
     let mut ctx = RequestContext::internal("handler-clean-exit-test");
     ctx.sessions_dir = Some(sessions_dir.clone());
 
     let reg = dispatch_method_with_context(
-        &store, &vault, &policy, &rl,
-        None, ctx.clone(),
+        &store,
+        &vault,
+        &policy,
+        &rl,
+        None,
+        ctx.clone(),
         "register_session",
         &json!({
             "persona": "handler-clean-exit-persona",
             "launcher_pid": std::process::id(),
         }),
-    ).await.expect("register_session must succeed");
+    )
+    .await
+    .expect("register_session must succeed");
     let session_id = reg["session_id"].as_str().expect("session_id").to_string();
 
     // Close the session via the handler's close_session RPC arm.
     let close = dispatch_method_with_context(
-        &store, &vault, &policy, &rl,
-        None, ctx,
+        &store,
+        &vault,
+        &policy,
+        &rl,
+        None,
+        ctx,
         "close_session",
         &json!({ "session_id": session_id }),
-    ).await.expect("close_session must succeed");
-    assert_eq!(close["closed"], json!(true), "close_session must return closed:true");
+    )
+    .await
+    .expect("close_session must succeed");
+    assert_eq!(
+        close["closed"],
+        json!(true),
+        "close_session must return closed:true"
+    );
 
     // Post-condition: grant must remain Active — MUST NOT be revoked.
-    // implementation-note-187
+    // implementation-note-259
     let post_grant = store.get_grant(&grant_id).expect("get_grant post-close");
     assert_eq!(
         post_grant.status, "active",
         "handler close_session CleanExit MUST NOT revoke the grant \
-         (implementation-note-187)"
+         (implementation-note-259)"
     );
 }
 
@@ -485,13 +526,7 @@ fn ttl_expired_revokes_grant() {
     assert_eq!(pre_grant.status, "active");
 
     // Close via TTL-expiry path.
-    close_session_ttl_expiry(
-        &session_store,
-        &store,
-        session_id,
-        &grant_id,
-        &sessions_dir,
-    );
+    close_session_ttl_expiry(&session_store, &store, session_id, &grant_id, &sessions_dir);
 
     // Post-condition: grant must be Revoked.
     let post_grant = store.get_grant(&grant_id).expect("get_grant post-close");
@@ -528,7 +563,9 @@ fn explicit_revoke_revokes_grant() {
     assert_eq!(pre_grant.status, "active");
 
     // Explicit revocation via DaemonStore.
-    store.revoke_grant(&grant_id).expect("revoke_grant must succeed");
+    store
+        .revoke_grant(&grant_id)
+        .expect("revoke_grant must succeed");
 
     // Post-condition: grant must be Revoked.
     let post_grant = store.get_grant(&grant_id).expect("get_grant post-revoke");

@@ -1,5 +1,5 @@
 //! Integration tests for `ember broker {issue, revoke, list}`
-//! (implementation-note-296).
+//! (implementation-note-416).
 //!
 //! Each test spawns a real `ember-daemon` socket listener on a temp
 //! `UnixStream` path with a `MockBroker`-backed registry installed (the
@@ -37,17 +37,15 @@ use std::rc::Rc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use ember_daemon::broker::handler::{install_registry, BrokerRegistry};
-use ember_daemon::trust::policy::{
-    ApprovalRequirement, PolicyConfig, PolicyEngine, PolicyRule, RiskLevel,
-};
+use ember_daemon::broker::handler::{BrokerRegistry, install_registry};
 use ember_daemon::infra::rate_limit::RateLimiter;
 use ember_daemon::infra::socket::SocketListener;
 use ember_daemon::infra::store::DaemonStore;
 use ember_daemon::infra::vault::Vault;
-use emberlink_cli::broker::{
-    broker_command, BrokerCliError, BrokerCmd, GlobalOpts,
+use ember_daemon::trust::policy::{
+    ApprovalRequirement, PolicyConfig, PolicyEngine, PolicyRule, RiskLevel,
 };
+use emberlink_cli::broker::{BrokerCliError, BrokerCmd, GlobalOpts, broker_command};
 use tempfile::TempDir;
 use tokio::sync::watch;
 
@@ -92,8 +90,14 @@ fn permissive_policy() -> PolicyEngine {
 /// The listener owns its own thread + tokio runtime so the calling test
 /// can drive the synchronous CLI helper without blocking the daemon's
 /// accept loop.
+///
+/// Also flips the process-global presence manager to Unlocked. The
+/// dispatch gate added in prior change (hard-lock after session grace window)
+/// refuses non-exempt RPC methods when the session is `Locked`; tests
+/// that bypass `register_session` must satisfy the gate explicitly.
 fn spawn_listener(tmp: &TempDir, name: &str) -> (PathBuf, watch::Sender<bool>) {
     ensure_registry_installed();
+    ember_daemon::trust::presence::mark_unlocked();
 
     let socket_path = tmp.path().join(format!("{name}.sock"));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -112,14 +116,10 @@ fn spawn_listener(tmp: &TempDir, name: &str) -> (PathBuf, watch::Sender<bool>) {
             store.set_vault(Rc::clone(&vault));
             let policy = Rc::new(permissive_policy());
             let rate_limiter = Rc::new(RefCell::new(RateLimiter::default()));
-            let listener = SocketListener::new(
-                path_for_thread,
-                shutdown_rx,
-                store,
-                vault,
-                policy,
-                rate_limiter,
-            );
+            let _vault = vault; // hold until end of scope: set_vault is the wire now
+            let listener =
+                SocketListener::new(path_for_thread, shutdown_rx, store, policy, rate_limiter)
+                    .with_test_mode_synthetic_presence_token(true);
             let _ = listener.run().await;
         });
     });
@@ -165,7 +165,7 @@ fn broker_issue_valid_scope_returns_brokered_credential() {
         provider: "cloudflare".to_string(),
         scope_json: r#"{"zone":"emberlink.dev","permissions":["dns:edit"]}"#.to_string(),
         ttl: "15m".to_string(),
-        reason: "implementation-note-315issue-test".to_string(),
+        reason: "implementation-note-446issue-test".to_string(),
         json: true,
     };
     let res = broker_command(cmd, opts(&socket));

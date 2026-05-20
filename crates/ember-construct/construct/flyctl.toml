@@ -24,6 +24,7 @@ name = "ember-flyctl"
 version = "0.1.0"
 publisher = "did:emberlink"
 description = "Fly.io CLI Construct. Mediates `flyctl`/`fly` invocations through ember's credential broker: irreversible destruction (apps/machine/volumes/postgres/redis destroy) requires biometric; secrets unset (silent secret loss) requires biometric; tokens/orgs revoke (privilege removal) requires biometric; machine exec and ssh console (arbitrary code execution / interactive shell) require biometric. All other classified mutating verbs gate without biometric. FLY_API_TOKEN is the credential injection env var."
+authority_refs = ["fly_io"]
 
 # Default policy for unlisted action keys.
 default = "deny"

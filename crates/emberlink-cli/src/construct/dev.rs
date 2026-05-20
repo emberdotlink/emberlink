@@ -163,10 +163,7 @@ pub fn unregister_authoring_path(
 ///
 /// Path comparison is prefix-based on canonicalized inputs so symlink
 /// trickery cannot escape the registered scope.
-pub fn script_is_in_authoring_path(
-    registry: &AuthoringPaths,
-    script_path: &Path,
-) -> bool {
+pub fn script_is_in_authoring_path(registry: &AuthoringPaths, script_path: &Path) -> bool {
     let canonical = match std::fs::canonicalize(script_path) {
         Ok(p) => p,
         Err(_) => script_path.to_path_buf(),
@@ -185,9 +182,8 @@ pub fn script_is_in_authoring_path(
 /// Returns a boxed error if `$HOME` is not resolvable, the registry file
 /// cannot be parsed, or a path operation fails.
 pub fn dev_construct(args: &DevConstructArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let registry_file = registry_path().ok_or_else(|| {
-        "could not resolve $HOME to find authoring-paths.toml".to_string()
-    })?;
+    let registry_file = registry_path()
+        .ok_or_else(|| "could not resolve $HOME to find authoring-paths.toml".to_string())?;
     let mut registry = load_registry(&registry_file)?;
 
     if args.list {
@@ -227,7 +223,10 @@ pub fn dev_construct(args: &DevConstructArgs) -> Result<(), Box<dyn std::error::
             "[construct dev] receipts emitted from this path will be tagged authoring = true"
         );
     } else {
-        eprintln!("[construct dev] {} already registered (no-op)", path.display());
+        eprintln!(
+            "[construct dev] {} already registered (no-op)",
+            path.display()
+        );
     }
     Ok(())
 }
@@ -254,10 +253,7 @@ mod tests {
 
         let reloaded = load_registry(&registry_file).unwrap();
         assert_eq!(reloaded.paths.len(), 1);
-        assert_eq!(
-            reloaded.paths[0],
-            std::fs::canonicalize(&worktree).unwrap()
-        );
+        assert_eq!(reloaded.paths[0], std::fs::canonicalize(&worktree).unwrap());
     }
 
     #[test]
@@ -291,8 +287,7 @@ mod tests {
         let tmp = fresh_registry_dir();
         let mut reg = AuthoringPaths::default();
         let changed =
-            unregister_authoring_path(&mut reg, &tmp.path().join("never-registered"))
-                .unwrap();
+            unregister_authoring_path(&mut reg, &tmp.path().join("never-registered")).unwrap();
         assert!(!changed);
     }
 
@@ -347,7 +342,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&registry_file).unwrap().permissions().mode();
+            let mode = std::fs::metadata(&registry_file)
+                .unwrap()
+                .permissions()
+                .mode();
             assert_eq!(
                 mode & 0o777,
                 0o600,

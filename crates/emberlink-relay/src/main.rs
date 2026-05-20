@@ -1,4 +1,4 @@
-use emberlink_relay::{RelayConfig, run, print_usage};
+use emberlink_relay::{RelayConfig, print_usage, run};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();

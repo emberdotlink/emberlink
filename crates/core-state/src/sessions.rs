@@ -12,6 +12,19 @@ pub struct SessionMeta {
     pub grant_id: String,
     pub started_at: DateTime<Utc>,
     pub launcher_pid: u32,
+    /// design §Component 3 — ULID of the workflow grant active for this
+    /// session, if the launcher attached one at session-open. None for
+    /// pre-workflow-grant sessions and for sessions that opened without
+    /// selecting a workflow template. The sidecar `workflow-grant.json`
+    /// in the session directory carries the full `core_grants::WorkflowGrant`
+    /// when this field is `Some`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<String>,
+    /// design §Component 3 — Human-readable workflow template name
+    /// (e.g. "emberd-development"). Paired with `workflow_id`; both should
+    /// be `Some` together or `None` together.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_template: Option<String>,
 }
 
 /// Filesystem-backed session store.
@@ -21,10 +34,10 @@ pub struct SessionMeta {
 /// <base_dir>/
 ///   <session_id>/
 ///     meta.json          # written by `create`, removed by `close`
-///     audit-gaps.jsonl   # placeholder — implementation-note-11 writes this
-///     permits-archive.jsonl  # placeholder — implementation-note-28 sidecar
-///     hook-errors.jsonl  # placeholder — implementation-note-11 panic catch
-///     receipt.json       # placeholder — implementation-note-28 termination receipt
+///     audit-gaps.jsonl   # placeholder — implementation-note-13 writes this
+///     permits-archive.jsonl  # placeholder — implementation-note-35 sidecar
+///     hook-errors.jsonl  # placeholder — implementation-note-13 panic catch
+///     receipt.json       # placeholder — implementation-note-35 termination receipt
 /// ```
 ///
 /// `close` moves `meta.json` to `meta.json.closed` so the session directory
@@ -56,8 +69,8 @@ impl SessionStore {
         fs::write(&tmp_path, &json)?;
         fs::rename(&tmp_path, session_dir.join("meta.json"))?;
 
-        // Touch placeholder sidecar files so downstream tasks (implementation-note-28,
-        // implementation-note-11) can append without creating their own directories.
+        // Touch placeholder sidecar files so downstream tasks (implementation-note-35,
+        // implementation-note-13) can append without creating their own directories.
         for name in &[
             "audit-gaps.jsonl",
             "permits-archive.jsonl",
@@ -93,8 +106,8 @@ impl SessionStore {
 
     /// Close a session by renaming `meta.json` → `meta.json.closed`.
     ///
-    /// The session directory stays on disk so sidecar writers (implementation-note-28,
-    /// implementation-note-11) can still append to their files after termination.
+    /// The session directory stays on disk so sidecar writers (implementation-note-35,
+    /// implementation-note-13) can still append to their files after termination.
     /// A no-op (returns `Ok(())`) when the session is already closed or does
     /// not exist.
     pub fn close(&self, id: &str) -> io::Result<()> {
@@ -165,6 +178,8 @@ mod tests {
             grant_id: "grant-abc123".to_string(),
             started_at: Utc::now(),
             launcher_pid: std::process::id(),
+            workflow_id: None,
+            workflow_template: None,
         }
     }
 

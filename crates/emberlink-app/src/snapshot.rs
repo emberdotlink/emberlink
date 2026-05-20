@@ -305,7 +305,7 @@ impl AppSnapshot {
             devices,
             trust_attestations,
             grants,
-            credentials: vec![],   // populated on demand via ListCredentials
+            credentials: vec![], // populated on demand via ListCredentials
             recovery,
             event_count: store.event_count(),
         }

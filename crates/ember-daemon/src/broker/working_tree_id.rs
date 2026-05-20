@@ -1,4 +1,4 @@
-//! Stable working-tree identifier derived from a cwd path (implementation-note-116).
+//! Stable working-tree identifier derived from a cwd path (implementation-note-164).
 //!
 //! Walks up from a canonicalized `cwd` until finding an ancestor directory
 //! that contains a `.git/` subdirectory. Returns that ancestor's absolute
@@ -26,7 +26,7 @@ pub fn working_tree_id(cwd: &Path) -> Result<String, WorkingTreeIdError> {
         .ancestors()
         .find(|p| p.join(".git").is_dir())
         .map(|p| p.to_string_lossy().into_owned())
-        .ok_or_else(|| WorkingTreeIdError::NoGitDirAncestor(canonical))
+        .ok_or(WorkingTreeIdError::NoGitDirAncestor(canonical))
 }
 
 #[cfg(test)]
@@ -41,7 +41,12 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
 
         let resolved = working_tree_id(&sub).unwrap();
-        let expected = tmp.path().canonicalize().unwrap().to_string_lossy().into_owned();
+        let expected = tmp
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(resolved, expected);
     }
 
@@ -49,6 +54,9 @@ mod tests {
     fn refuses_when_no_git_ancestor() {
         let tmp = tempfile::tempdir().unwrap();
         let result = working_tree_id(tmp.path());
-        assert!(matches!(result, Err(WorkingTreeIdError::NoGitDirAncestor(_))));
+        assert!(matches!(
+            result,
+            Err(WorkingTreeIdError::NoGitDirAncestor(_))
+        ));
     }
 }

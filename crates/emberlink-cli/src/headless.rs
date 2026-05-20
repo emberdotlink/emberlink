@@ -1,6 +1,6 @@
-//! implementation-note-14 — Phase 1 substrate.
+//! implementation-note-16 — Phase 1 substrate.
 //!
-//! implementation-note-15
+//! implementation-note-17
 //!
 //! Per design §"Pre-flight scope check at enrollment" Layer 2
 //! (Historical): at enrollment time, the CLI surfaces recent
@@ -11,8 +11,8 @@
 //! ships the substrate — daemon socket call, CTA renderer, and
 //! [`PreflightDecision`] enum — without wiring it into an actual
 //! `ember headless enroll` command (that command does not yet exist;
-//! see the blocked-by dependency on implementation-note-16 in
-//! `release-checklist`). Phase 2 (implementation-note-299) will:
+//! see the blocked-by dependency on implementation-note-18 in
+//! `release-checklist`). Phase 2 (implementation-note-420) will:
 //!   - wire this helper into the enrollment flow,
 //!   - apply per-enrollment template amendments that revert at expiry,
 //!   - amend the enrollment Receipt with the widen-template evidence
@@ -22,19 +22,19 @@
 //! `crates/emberlink-cli/src/commands/headless.rs` because `commands.rs`
 //! is a single 300K-line file rather than a directory; converting it
 //! to a `commands/` directory is out of scope for Phase 1. The
-//! checkpoint `// implementation-note-15` lives in this file +
+//! checkpoint `// implementation-note-17` lives in this file +
 //! `crates/headless-runtime/src/permission_gaps.rs` +
 //! `crates/ember-daemon/src/infra/handler.rs` so the `target_state_anchor`
 //! signal in `release-checklist` resolves cleanly.
 
-// implementation-note-15
+// implementation-note-17
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// One aggregated permission-gap entry as returned by the daemon's
 /// `headless_preflight_gaps` socket method. Mirrors
@@ -166,7 +166,7 @@ pub fn preflight_gaps_cta(
     let gaps = fetch_gaps(socket_path, persona, lookback)?;
     let cta = format_cta(persona, &gaps, lookback);
     // Phase 1 stub: return `Skip` unconditionally. Phase 2 (post
-    // implementation-note-16) wires the interactive prompt and
+    // implementation-note-18) wires the interactive prompt and
     // the per-enrollment template amendment path.
     Ok((PreflightDecision::Skip, cta))
 }
@@ -190,11 +190,7 @@ pub fn fetch_gaps(
 /// Send a synchronous JSON-RPC request over the daemon's Unix-domain
 /// socket. Mirrors the call pattern used by `broker.rs::call_daemon`
 /// so the wire-level handshake stays identical across CLI surfaces.
-fn call_daemon(
-    socket_path: &Path,
-    method: &str,
-    params: &Value,
-) -> Result<Value, PreflightError> {
+fn call_daemon(socket_path: &Path, method: &str, params: &Value) -> Result<Value, PreflightError> {
     let stream = std::os::unix::net::UnixStream::connect(socket_path).map_err(|e| {
         PreflightError::DaemonUnavailable {
             socket: socket_path.to_path_buf(),
@@ -240,17 +236,17 @@ fn call_daemon(
     Ok(response.get("result").cloned().unwrap_or(Value::Null))
 }
 
-// ─── implementation-note-275 — enroll / revoke / status commands ──
+// ─── implementation-note-392 — enroll / revoke / status commands ──
 //
 // CLI surface for the daemon-side `headless_enroll` / `headless_revoke` /
 // `headless_status` socket methods that shipped in prior change
-// (implementation-note-188 Phase 1). Per design §"Headless:
+// (implementation-note-260 Phase 1). Per design §"Headless:
 // attested device, variable enrollment". The daemon-side handlers
-// return Phase 1 stubs for enroll + revoke today; status returns the
-// steady-state shape (`active_enrollment: null`). This slice wires
-// the CLI dispatch + interactive prompt + CTA copy so the operator
-// surface lands before the Phase 2 MEK-sourcing + Receipt-emission
-// work.
+// now ship a first real local enroll/revoke/status workflow. `headless_enroll`
+// installs a fresh headless MEK plus the currently configured local
+// broker-authority subset; `headless_revoke` and `headless_status` operate on
+// that persisted enrollment substrate. Template-bounded shaping and Receipt
+// emission are still follow-up work.
 //
 // The brief's nominal path was `crates/emberlink-cli/src/commands/headless.rs`;
 // the actual home is this top-level file because `commands.rs` is a
@@ -268,15 +264,13 @@ fn call_daemon(
 //
 //   1. `qember.sh demo up` — clean daemon + vault.
 //   2. `ember headless enroll --duration 1m --persona main --yes`
-//      → currently returns the Phase 1 stub error; the CLI surfaces
-//      it as a non-zero exit. Phase 2 makes this succeed and emits a
-//      `headless_enrollment` Receipt.
-//   3. `ember headless status` → currently shows
-//      `{"active_enrollment": null}` regardless (Phase 1 stub on the
-//      daemon side); Phase 2 will return the active enrollment.
-//   4. Wait 1 minute. (Phase 2: status flips to expired; subsequent
+//      → installs the current local broker-authority subset into the
+//      headless scope. A future slice adds the `headless_enrollment`
+//      Receipt.
+//   3. `ember headless status` → shows the active enrollment.
+//   4. Wait 1 minute. (Future slice: status flips to expired; subsequent
 //      headless-credential requests fail with `headless_enrollment_expired`.)
-//   5. `ember headless revoke` — Phase 2 cleans up the enrollment.
+//   5. `ember headless revoke` — cleans up the enrollment.
 //
 // The clap-level smoke tests live in
 // `crates/emberlink-cli/tests/headless_cli_smoke.rs`.
@@ -409,7 +403,9 @@ pub fn render_enroll_cta(duration_display: &str) -> String {
     buf.push_str("  already authorized.\n\n");
     buf.push_str("  Revoke any time: `ember headless revoke` from any device.\n\n");
     buf.push_str(&format!("  Duration [{duration_display}]:\n"));
-    buf.push_str(&format!("  Confirm enrollment for {duration_display}? [Y/n]:\n"));
+    buf.push_str(&format!(
+        "  Confirm enrollment for {duration_display}? [Y/n]:\n"
+    ));
     buf
 }
 
@@ -420,16 +416,16 @@ fn format_duration_display(secs: u64) -> String {
     if secs == 0 {
         return "0s".to_string();
     }
-    if secs % (7 * 86400) == 0 {
+    if secs.is_multiple_of(7 * 86400) {
         return format!("{}w", secs / (7 * 86400));
     }
-    if secs % 86400 == 0 {
+    if secs.is_multiple_of(86400) {
         return format!("{}d", secs / 86400);
     }
-    if secs % 3600 == 0 {
+    if secs.is_multiple_of(3600) {
         return format!("{}h", secs / 3600);
     }
-    if secs % 60 == 0 {
+    if secs.is_multiple_of(60) {
         return format!("{}m", secs / 60);
     }
     format!("{secs}s")
@@ -443,7 +439,7 @@ fn format_duration_display(secs: u64) -> String {
 ///      daemon re-checks).
 ///   3. Print the CTA copy (Y/n confirm). `--yes` skips this.
 ///   4. Call `headless_enroll` socket method on the daemon.
-///   5. Print the daemon's response (or the Phase 1 stub error).
+///   5. Print the daemon's response.
 pub fn cmd_enroll(socket_path: &Path, args: EnrollArgs) -> Result<(), HeadlessCommandError> {
     let duration = match &args.duration {
         Some(spec) => parse_duration_spec(spec)?,
@@ -480,7 +476,10 @@ pub fn cmd_enroll(socket_path: &Path, args: EnrollArgs) -> Result<(), HeadlessCo
         "duration_seconds": secs,
     });
     let result = call_daemon(socket_path, "headless_enroll", &params)?;
-    println!("enrollment: {}", serde_json::to_string_pretty(&result).unwrap_or_default());
+    println!(
+        "enrollment: {}",
+        serde_json::to_string_pretty(&result).unwrap_or_default()
+    );
     Ok(())
 }
 
@@ -491,7 +490,10 @@ pub fn cmd_revoke(socket_path: &Path, args: RevokeArgs) -> Result<(), HeadlessCo
         None => json!({}),
     };
     let result = call_daemon(socket_path, "headless_revoke", &params)?;
-    println!("revoked: {}", serde_json::to_string_pretty(&result).unwrap_or_default());
+    println!(
+        "revoked: {}",
+        serde_json::to_string_pretty(&result).unwrap_or_default()
+    );
     Ok(())
 }
 
@@ -499,7 +501,10 @@ pub fn cmd_revoke(socket_path: &Path, args: RevokeArgs) -> Result<(), HeadlessCo
 /// payload (or `none` when Phase 1 stub returns null).
 pub fn cmd_status(socket_path: &Path) -> Result<(), HeadlessCommandError> {
     let result = call_daemon(socket_path, "headless_status", &json!({}))?;
-    let active = result.get("active_enrollment").cloned().unwrap_or(Value::Null);
+    let active = result
+        .get("active_enrollment")
+        .cloned()
+        .unwrap_or(Value::Null);
     if active.is_null() {
         println!("active enrollment: none");
     } else {
@@ -511,9 +516,9 @@ pub fn cmd_status(socket_path: &Path) -> Result<(), HeadlessCommandError> {
     Ok(())
 }
 
-// ─── implementation-note-190 — CLI surface ─────────
+// ─── implementation-note-261 — CLI surface ─────────
 //
-// implementation-note-191
+// implementation-note-262
 //
 // `ember headless preflight` shells the daemon's
 // `headless_preflight_layer1` RPC, then renders the gap list as a
@@ -570,8 +575,7 @@ pub struct PreflightArgs {
 /// caller can snapshot the rendered output for tests.
 pub fn format_preflight_gap_table(gaps: &[PreflightLayer1Gap]) -> String {
     if gaps.is_empty() {
-        return "no gaps — headless can run the queue under the enrolled template\n"
-            .to_string();
+        return "no gaps — headless can run the queue under the enrolled template\n".to_string();
     }
     // Column widths: max content width within each column, with a
     // minimum-of-header floor so the header always fits.
@@ -606,7 +610,10 @@ pub fn format_preflight_gap_table(gaps: &[PreflightLayer1Gap]) -> String {
             perm_w = perm_w
         ));
     }
-    buf.push_str(&format!("\n{} gap(s) — widen the template or shrink the queue\n", gaps.len()));
+    buf.push_str(&format!(
+        "\n{} gap(s) — widen the template or shrink the queue\n",
+        gaps.len()
+    ));
     buf
 }
 
@@ -738,7 +745,7 @@ mod tests {
         requires_copy(PreflightDecision::Skip);
     }
 
-    // ─── implementation-note-275 helper tests ───────────────────
+    // ─── implementation-note-392 helper tests ───────────────────
 
     #[test]
     fn parse_duration_spec_recognizes_canonical_units() {
@@ -774,7 +781,7 @@ mod tests {
     #[test]
     fn render_enroll_cta_includes_locked_copy() {
         let cta = render_enroll_cta("4h");
-        // Spot-check the load-bearing lines from the implementation-note-300 lock.
+        // Spot-check the load-bearing lines from the implementation-note-421 lock.
         assert!(cta.contains("Enable headless — for how long?"));
         assert!(cta.contains("Default: 4 hours."));
         assert!(cta.contains("anything up to 7 days"));
@@ -815,7 +822,7 @@ mod tests {
         assert_eq!(format_duration_display(0), "0s");
     }
 
-    // ─── implementation-note-190 — CLI table tests ─
+    // ─── implementation-note-261 — CLI table tests ─
 
     #[test]
     fn preflight_table_renders_no_gaps_message_for_empty_input() {
@@ -842,7 +849,10 @@ mod tests {
         ];
         let out = format_preflight_gap_table(&gaps);
         assert!(out.contains("TASK"), "header includes TASK column");
-        assert!(out.contains("PERMISSION"), "header includes PERMISSION column");
+        assert!(
+            out.contains("PERMISSION"),
+            "header includes PERMISSION column"
+        );
         assert!(out.contains("SCOPE"), "header includes SCOPE column");
         assert!(out.contains("TASK-AP-PR-MERGE"));
         assert!(out.contains("ember-gh.pr_merge"));
@@ -862,7 +872,10 @@ mod tests {
             scope: None,
         }];
         let out = format_preflight_gap_table(&gaps);
-        assert!(out.contains(" -"), "missing scope renders as '-'; got:\n{out}");
+        assert!(
+            out.contains(" -"),
+            "missing scope renders as '-'; got:\n{out}"
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! awaits a button click on the resulting block-kit message.
 //!
 //! Stub: logs at info and returns `TimedOut`. Real wire ships in
-//! `implementation-note-49` (Slack webhook POST + interactivity
+//! `implementation-note-67` (Slack webhook POST + interactivity
 //! callback).
 
 use anyhow::Result;

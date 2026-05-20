@@ -152,7 +152,7 @@ pub struct ApprovalResponse {
     pub granted_duration_secs: Option<u64>,
 }
 
-/// implementation-note-31 — block-and-poll RPC request shape.
+/// implementation-note-42 — block-and-poll RPC request shape.
 ///
 /// Sent by the proxy hook (`ember-proxy/src/claude_code_hook.rs`) when the
 /// daemon's `evaluate_tool_call` returns a `RequireApproval` outcome with a
@@ -171,7 +171,7 @@ pub struct AwaitApprovalRequest {
     pub timeout_secs: u64,
 }
 
-/// implementation-note-31 — block-and-poll RPC response.
+/// implementation-note-42 — block-and-poll RPC response.
 ///
 /// Wraps the resolved [`ApprovalDecision`] for the awaited request. A
 /// dedicated wrapper rather than returning `ApprovalDecision` directly
@@ -398,7 +398,7 @@ mod tests {
         assert!(back.denial_reason.is_some());
     }
 
-    // ---- implementation-note-31: await_approval RPC types -----------------------
+    // ---- implementation-note-42: await_approval RPC types -----------------------
 
     #[test]
     fn await_approval_request_roundtrip() {

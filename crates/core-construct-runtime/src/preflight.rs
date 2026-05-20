@@ -11,7 +11,7 @@
 //! ## Phase 2 slice B (this slice) — manifest-backed resolver
 //!
 //! [`resolve_queued_task_permissions`] now consumes each task's
-//! `constructs` field (implementation-note-17) and a
+//! `constructs` field (implementation-note-19) and a
 //! registry of parsed `construct.toml` manifests
 //! ([`crate::manifest::ConstructManifest`]). For every
 //! `"<construct>.<action>"` declaration the task carries, the resolver
@@ -30,12 +30,12 @@
 //! matches `kubectl.toml`'s `key = "kubectl.apply"` when the construct
 //! is `ember-kubectl`).
 //!
-//! implementation-note-18 — checkpoint for stale_check; do not remove.
+//! implementation-note-20 — checkpoint for stale_check; do not remove.
 //!
 
 use std::collections::HashMap;
 
-use crate::manifest::{lookup, ConstructManifest};
+use crate::manifest::{ConstructManifest, lookup};
 
 /// A permission a Construct requires to perform an action.
 ///
@@ -72,12 +72,24 @@ pub struct Template {
 /// schema's mixed-case task-id grammar (`^[A-Z][A-Za-z0-9_.-]+$`).
 pub type TaskId = String;
 
+/// Authority-ref resolution for a queued task set.
+///
+/// `refs_by_task` is the union of manifest-declared authority families for
+/// each task. `fully_declared = false` means at least one declaration was
+/// malformed, unknown, or lacked an authority declaration, so callers must
+/// not treat the returned refs as a complete minimal authority set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorityRefResolution {
+    pub refs_by_task: HashMap<TaskId, Vec<String>>,
+    pub fully_declared: bool,
+}
+
 /// Resolve, for each task, the union of permissions implied by the
 /// Constructs that task declares it invokes.
 ///
 /// **Pre:** every entry in `tasks` is a `(task_id, task.constructs)` pair
 /// where each construct declaration is the
-/// implementation-note-17 shape
+/// implementation-note-19 shape
 /// `"<construct>.<action>"` (e.g. `"ember-gh.pr_merge"`,
 /// `"ember-kubectl.apply"`). `registry` maps a manifest's `[meta] name`
 /// (e.g. `"ember-gh"`) to its parsed [`ConstructManifest`].
@@ -125,17 +137,79 @@ pub fn resolve_queued_task_permissions(
     out
 }
 
+/// Resolve, for each task, the manifest-declared authority families its
+/// declared Constructs consume.
+///
+/// Unlike [`resolve_queued_task_permissions`], this resolver is strict about
+/// declaration completeness: malformed entries, unknown Constructs, unknown
+/// actions, or matched actions with no declared authority refs all flip
+/// `fully_declared` to `false`. The returned refs remain useful as a partial
+/// narrowing hint, but callers must preserve a broader fail-safe posture when
+/// completeness is false.
+pub fn resolve_queued_task_authority_refs(
+    tasks: &[(TaskId, Vec<String>)],
+    registry: &HashMap<String, ConstructManifest>,
+) -> AuthorityRefResolution {
+    let mut out = HashMap::with_capacity(tasks.len());
+    let mut fully_declared = true;
+    for (task_id, declarations) in tasks {
+        let mut refs = std::collections::BTreeSet::new();
+        for decl in declarations {
+            let Some((construct_name, action_suffix)) = decl.split_once('.') else {
+                fully_declared = false;
+                continue;
+            };
+            let Some(manifest) = lookup(registry, construct_name) else {
+                fully_declared = false;
+                continue;
+            };
+            let Some(action_refs) = action_authority_refs(manifest, action_suffix) else {
+                fully_declared = false;
+                continue;
+            };
+            if action_refs.is_empty() {
+                fully_declared = false;
+                continue;
+            }
+            refs.extend(action_refs);
+        }
+        out.insert(task_id.clone(), refs.into_iter().collect());
+    }
+    AuthorityRefResolution {
+        refs_by_task: out,
+        fully_declared,
+    }
+}
+
 /// True when `action_suffix` resolves to a declared action key in
 /// `manifest`, trying the suffix verbatim and the short-name-prepended
 /// variant. See [`resolve_queued_task_permissions`] for the convention
 /// rationale.
 fn action_key_present(manifest: &ConstructManifest, action_suffix: &str) -> bool {
-    if manifest.action_keys.iter().any(|k| k == action_suffix) {
-        return true;
+    action_entry(manifest, action_suffix).is_some()
+}
+
+fn action_entry<'a>(
+    manifest: &'a ConstructManifest,
+    action_suffix: &str,
+) -> Option<&'a crate::manifest::ConstructAction> {
+    if let Some(action) = manifest.actions.iter().find(|a| a.key == action_suffix) {
+        return Some(action);
     }
-    let short = manifest.name.strip_prefix("ember-").unwrap_or(&manifest.name);
+    let short = manifest
+        .name
+        .strip_prefix("ember-")
+        .unwrap_or(&manifest.name);
     let prefixed = format!("{short}.{action_suffix}");
-    manifest.action_keys.contains(&prefixed)
+    manifest.actions.iter().find(|a| a.key == prefixed)
+}
+
+fn action_authority_refs(manifest: &ConstructManifest, action_suffix: &str) -> Option<Vec<String>> {
+    let action = action_entry(manifest, action_suffix)?;
+    if !action.authority_refs.is_empty() {
+        return Some(action.authority_refs.clone());
+    }
+    Some(manifest.authority_refs.clone())
 }
 
 /// Diff a set of needed permissions against an enrolled persona template,
@@ -170,6 +244,8 @@ mod tests {
     const GH_MANIFEST: &str = r#"
 [meta]
 name = "ember-gh"
+
+authority_refs = ["github"]
 
 default = "deny"
 
@@ -226,10 +302,7 @@ key = "kubectl.delete"
     #[test]
     fn resolver_round_trip_bare_action_key() {
         let registry = registry_with(&[GH_MANIFEST]);
-        let tasks = vec![(
-            "TASK-A".to_string(),
-            vec!["ember-gh.pr_merge".to_string()],
-        )];
+        let tasks = vec![("TASK-A".to_string(), vec!["ember-gh.pr_merge".to_string()])];
         let result = resolve_queued_task_permissions(&tasks, &registry);
         let perms = result.get("TASK-A").expect("task entry present");
         assert_eq!(perms.len(), 1);
@@ -253,6 +326,46 @@ key = "kubectl.delete"
         let perms = result.get("TASK-B").expect("task entry present");
         assert_eq!(perms.len(), 1);
         assert_eq!(perms[0].identifier, "ember-kubectl.apply");
+    }
+
+    #[test]
+    fn authority_refs_round_trip_manifest_default() {
+        let registry = registry_with(&[GH_MANIFEST]);
+        let tasks = vec![("TASK-H".to_string(), vec!["ember-gh.pr_merge".to_string()])];
+        let resolved = resolve_queued_task_authority_refs(&tasks, &registry);
+        assert!(resolved.fully_declared);
+        assert_eq!(
+            resolved
+                .refs_by_task
+                .get("TASK-H")
+                .cloned()
+                .unwrap_or_default(),
+            vec!["github".to_string()]
+        );
+    }
+
+    #[test]
+    fn missing_authority_ref_marks_resolution_incomplete() {
+        let registry = registry_with(&[KUBECTL_MANIFEST]);
+        let tasks = vec![(
+            "TASK-I".to_string(),
+            vec!["ember-kubectl.apply".to_string()],
+        )];
+        let resolved = resolve_queued_task_authority_refs(&tasks, &registry);
+        assert!(!resolved.fully_declared);
+        assert!(resolved.refs_by_task.get("TASK-I").unwrap().is_empty());
+    }
+
+    #[test]
+    fn unknown_construct_marks_authority_resolution_incomplete() {
+        let registry = registry_with(&[GH_MANIFEST]);
+        let tasks = vec![(
+            "TASK-J".to_string(),
+            vec!["ember-unknown.do_thing".to_string()],
+        )];
+        let resolved = resolve_queued_task_authority_refs(&tasks, &registry);
+        assert!(!resolved.fully_declared);
+        assert!(resolved.refs_by_task.get("TASK-J").unwrap().is_empty());
     }
 
     #[test]
@@ -296,10 +409,7 @@ key = "kubectl.delete"
                     "ember-kubectl.apply".to_string(),
                 ],
             ),
-            (
-                "TASK-G".to_string(),
-                vec!["ember-gh.pr_merge".to_string()],
-            ),
+            ("TASK-G".to_string(), vec!["ember-gh.pr_merge".to_string()]),
         ];
         let result = resolve_queued_task_permissions(&tasks, &registry);
         assert_eq!(result.len(), 2);

@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
 use core_crypto::Verifier;
+use core_event_types::EventType;
 use core_events::EventEnvelope;
-use core_event_types::{EventType};
-use core_principals::{PeerCursor};
-use core_types::{ValidationError};
+use core_principals::PeerCursor;
+use core_types::ValidationError;
 
 use crate::{Authorizer, MaterializedState, SyncBatchRecord};
 

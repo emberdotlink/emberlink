@@ -1,13 +1,13 @@
 //! `ember claude-code` launcher.
 //!
-//! Per design §2 / implementation-note-272 + design §3 (PATH-shadow wiring, sub-B).
+//! Per design §2 / implementation-note-389 + design §3 (PATH-shadow wiring, sub-B).
 //! Real daemon RPC shipped in #2318 (LAUNCHER-SESSION-RPC); see design §2
 //! for the full protocol contract.
 //!
 //! 1. Resolve persona: `$EMBER_PERSONA` env var if set; otherwise
 //!    `claude-code-{hostname}` (matching what `init --for claude-code`
 //!    creates). Install PATH-shadow symlinks via `install_path_shadow`
-//!    (idempotent; creates `~/.ember/shadow/` on first launch, verifies
+//!    (idempotent; creates `~/.ember/shadow/bin/` on first launch, verifies
 //!    symlinks on subsequent launches).
 //! 2. Register a new session with the daemon (`register_session_rpc`) — live
 //!    Unix-socket RPC per design §2. Returns `{session_id, grant_id,
@@ -15,7 +15,7 @@
 //! 3. Set `EMBER_GRANT_ID` / `EMBER_PROXY_URL` / `EMBER_SESSION_ID` in
 //!    the child env. `HTTPS_PROXY` is intentionally NOT set — the
 //!    daemon's LLM proxy isn't CONNECT-compatible (see
-//!    implementation-note-303). Claude Code talks
+//!    implementation-note-429). Claude Code talks
 //!    to api.anthropic.com directly with the friendly's own auth.
 //! 4. Prepend `shadow_dir` to the child's `PATH` via `Command::env` so that
 //!    tool invocations like `gh pr create` resolve to the ember Construct
@@ -27,6 +27,8 @@
 //!    termination), close the session via `close_session_rpc` which emits
 //!    a signed Receipt with `termination_reason = clean_exit`.
 //! 7. Exit with the child's status code.
+//!
+//! implementation-note-430
 //!
 //! The launcher uses `std::process::Command::status` (parent-and-child
 //! model) rather than `execve`. Terminal SIGINT/SIGTERM go to the
@@ -41,12 +43,15 @@
 //! shell's environment is unchanged after the launcher returns.
 
 use std::io;
+use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::launcher::path_shadow::{install_path_shadow, ConstructSpec};
+use crate::launcher::path_shadow::{ConstructSpec, install_path_shadow, shadow_bin_dir};
+use crate::launcher::presence;
+use crate::launcher::session_prefs;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Outcome of the daemon `register_session` RPC.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,13 +59,13 @@ pub struct SessionRegistration {
     pub session_id: String,
     pub grant_id: String,
     pub proxy_url: String,
-    /// Git credential-injection proxy URL (implementation-note-195).
+    /// Git credential-injection proxy URL (implementation-note-267).
     /// When `Some`, the child process receives `EMBER_GIT_PROXY_URL=<url>`.
     /// `None` when the daemon did not allocate a git proxy (git proxy disabled
     /// or pre-fix daemon).
     pub git_proxy_url: Option<String>,
     /// Path to the daemon-managed ssh-agent socket for this session
-    /// (implementation-note-56). When `Some`, the child process
+    /// (implementation-note-72). When `Some`, the child process
     /// receives `SSH_AUTH_SOCK=<path>` so git/ssh in the child tree find
     /// the daemon socket. `None` when the daemon did not allocate an
     /// ssh-agent for this session (e.g. pre-design daemon).
@@ -80,6 +85,24 @@ pub fn register_session_rpc(persona: &str, socket_path: &Path) -> io::Result<Ses
         "launcher_pid": launcher_pid,
     });
     let result = call_daemon(socket_path, "register_session", &params)?;
+    parse_register_session_result(&result, socket_path)
+}
+
+fn parse_register_session_result(
+    result: &Value,
+    socket_path: &Path,
+) -> io::Result<SessionRegistration> {
+    if let (Some(tab_url), Some(prompt_id)) = (
+        result["presence_required"]["tab_url"].as_str(),
+        result["presence_required"]["prompt_id"].as_str(),
+    ) {
+        return Err(presence::session_open_presence_unavailable(
+            socket_path,
+            prompt_id,
+            tab_url,
+        ));
+    }
+
     let session_id = result["session_id"]
         .as_str()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "daemon: missing session_id"))?
@@ -88,7 +111,7 @@ pub fn register_session_rpc(persona: &str, socket_path: &Path) -> io::Result<Ses
         .as_str()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "daemon: missing grant_id"))?
         .to_string();
-    // implementation-note-195: the daemon should always include
+    // implementation-note-267: the daemon should always include
     // proxy_url in the register_session response (it reads EMBER_PROXY_URL
     // from runtime state). If the fallback to 8484 fires it means the daemon
     // is pre-fix or the LLM proxy failed to bind — Claude Code will hit
@@ -100,7 +123,7 @@ pub fn register_session_rpc(persona: &str, socket_path: &Path) -> io::Result<Ses
                 "ember claude-code: WARNING — daemon did not return proxy_url in \
                  register_session response; falling back to http://127.0.0.1:8484 which \
                  is likely not bound. Claude Code may fail with ECONNREFUSED. \
-                 (implementation-note-195)"
+                 (implementation-note-267)"
             );
             "http://127.0.0.1:8484".to_string()
         }
@@ -128,8 +151,12 @@ pub fn close_session_rpc(session_id: &str, socket_path: &Path) {
     }
 }
 
-/// Resolve the shadow directory path: `~/.ember/shadow/`, overridable via
+/// Resolve the shadow root directory: `~/.ember/shadow/`, overridable via
 /// `$EMBER_SHADOW_DIR` for test harnesses.
+///
+/// The shadow root holds credential / config / state files. Shim binaries
+/// live under `<shadow_dir>/bin/` — use [`shadow_bin_dir`] to obtain the
+/// PATH-prepend target.
 pub fn resolve_shadow_dir() -> PathBuf {
     if let Ok(override_dir) = std::env::var("EMBER_SHADOW_DIR") {
         return PathBuf::from(override_dir);
@@ -238,7 +265,7 @@ pub fn run_with_registration(
     cmd.args(extra_args)
         .env("EMBER_GRANT_ID", &registration.grant_id)
         .env("EMBER_PROXY_URL", &registration.proxy_url)
-        // implementation-note-303: do NOT inject
+        // implementation-note-429: do NOT inject
         // HTTPS_PROXY for Claude Code. The daemon's LLM proxy
         // (`infra::proxy::run_proxy`) is a custom POST endpoint for the
         // Anthropic SDK base_url use case — NOT a CONNECT-supporting
@@ -255,24 +282,22 @@ pub fn run_with_registration(
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    // Inject the git proxy URL when the daemon provided one (implementation-note-195).
+    // Inject the git proxy URL when the daemon provided one (implementation-note-267).
     if let Some(ref gpu) = registration.git_proxy_url {
         cmd.env("EMBER_GIT_PROXY_URL", gpu);
     }
     // Inject daemon-managed ssh-agent socket when the broker provided one
-    // (implementation-note-56). git/ssh in the child tree pick this up
+    // (implementation-note-72). git/ssh in the child tree pick this up
     // automatically without any additional configuration.
     if let Some(ref sock) = registration.ssh_auth_sock {
         cmd.env("SSH_AUTH_SOCK", sock);
     }
-    let status = cmd
-        .status()
-        .map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!("ember claude-code: failed to spawn {bin}: {e}"),
-            )
-        })?;
+    let status = cmd.status().map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("ember claude-code: failed to spawn {bin}: {e}"),
+        )
+    })?;
 
     // Exit trap: close session unconditionally on child exit, including
     // signal-forwarded SIGINT/SIGTERM. close_session_rpc logs but does not
@@ -286,19 +311,71 @@ pub fn run_with_registration(
 ///
 /// Priority:
 /// 1. `$EMBER_PERSONA` env var — explicit override, highest precedence.
-/// 2. `claude-code-{hostname}` — the name `init --for claude-code` creates
-///    (matches `onboarding::claude_code::claude_code_persona_name`).
+/// 2. The locked 2-slot Persona schema (CONTEXT.md "Identity surface"
+///    §Persona ID schema): `claude-code-<context>` where `<context>` is
+///    the worktree directory name when launched with `-w` (future flag)
+///    or `default`. Routes through the shared helper
+///    [`super::default_persona_id_for_runtime`] so the launcher and
+///    `onboarding::claude_code::claude_code_persona_name` agree on the
+///    same identifier shape.
 ///
 /// Returns the persona name string. The caller is responsible for surfacing a
 /// clear error if the daemon rejects the persona (e.g. user never ran
 /// `ember init --for claude-code`).
 pub fn resolve_persona_name() -> String {
-    if let Ok(v) = std::env::var("EMBER_PERSONA") {
-        if !v.is_empty() {
-            return v;
-        }
+    if let Ok(v) = std::env::var("EMBER_PERSONA")
+        && !v.is_empty()
+    {
+        return v;
     }
     crate::onboarding::claude_code::claude_code_persona_name()
+}
+
+/// Print the host-mode mediation disclaimer (design §Component 5a) and
+/// wait for the user to acknowledge or suppress it.
+///
+/// Behaviour:
+/// - If stderr is not a tty (piped / CI): returns immediately without printing.
+/// - If `host_mode_disclaimer_suppressed` is true in session-prefs: returns
+///   immediately without printing.
+/// - Otherwise: prints the locked copy to stderr, reads one line from stdin,
+///   and (if the user typed `s` or `S`) persists suppression to session-prefs.
+///   Any other input (including bare Enter) continues silently.
+pub fn maybe_print_host_mode_disclaimer() -> io::Result<()> {
+    // Skip when stderr is not a tty — no human reader, suppression irrelevant.
+    if !std::io::stderr().is_terminal() {
+        return Ok(());
+    }
+
+    // Skip when the user has already suppressed the disclaimer.
+    let prefs = session_prefs::load();
+    if prefs.host_mode_disclaimer_suppressed {
+        return Ok(());
+    }
+
+    // LOCKED COPY — do not edit. Source: design §Component 5a.
+    eprintln!(
+        "\nember brokers 15 tools (git, gh, kubectl, …); other commands run with your shell's authority.\n\
+         Need stricter? `ember up` runs in a container.\n\
+         \n\
+         [Enter] continue   [S] don't show again"
+    );
+
+    // Read one line from stdin. Non-tty stdin in CI is guarded above, so
+    // this read will always have a human on the other end. Errors are
+    // ignored — a read failure (e.g. stdin closed) is treated as Enter.
+    let mut input = String::new();
+    let _ = std::io::stdin().read_line(&mut input);
+
+    let trimmed = input.trim();
+    if trimmed.eq_ignore_ascii_case("s") {
+        // Persist suppression. Log but do not block launch on failure.
+        if let Err(e) = session_prefs::suppress_host_mode_disclaimer() {
+            eprintln!("ember: could not persist disclaimer suppression: {e}");
+        }
+    }
+
+    Ok(())
 }
 
 /// `ember claude-code [extra_args...]` entry point.
@@ -324,84 +401,58 @@ pub fn launch_claude_code(extra_args: &[String], socket_path: &Path) -> io::Resu
         let msg = e.to_string();
         // When the daemon rejects a "no such persona" error for the cohort-A
         // default name, surface a friendly hint so users know to run init.
-        if msg.contains("not found") || msg.contains("no such persona") || msg.contains("unknown persona") {
+        if msg.contains("not found")
+            || msg.contains("no such persona")
+            || msg.contains("unknown persona")
+        {
             io::Error::new(
                 e.kind(),
-                format!(
-                    "no cohort-A persona found.\n  \
-                     Run `ember init --for claude-code` first, or set \
-                     $EMBER_PERSONA to an existing persona name."
-                ),
+                "no cohort-A persona found.\n  \
+                 Run `ember init --for claude-code` first, or set \
+                 $EMBER_PERSONA to an existing persona name."
+                    .to_string(),
             )
         } else {
             e
         }
     })?;
 
-    // Step 3: Spawn child with shadow PATH prepended and all ember env vars set.
-    run_with_registration(&bin, extra_args, &registration, socket_path, &shadow_dir)
+    // Step 3: Print the host-mode mediation disclaimer (design §Component 5a)
+    // immediately before invoking the Claude Code child binary. Skipped when
+    // stderr is not a tty or the user has persisted suppression.
+    maybe_print_host_mode_disclaimer()?;
+
+    // Step 4: Spawn child with shadow/bin PATH prepended and all ember env vars set.
+    // The bin/ subdirectory holds the shim binaries; the root holds creds/config.
+    let bin_dir = shadow_bin_dir(&shadow_dir);
+    run_with_registration(&bin, extra_args, &registration, socket_path, &bin_dir)
 }
 
 /// Send a synchronous JSON-RPC request over the daemon's Unix socket and
 /// return the `result` value. Mirrors the `call_daemon` shape in
 /// `crates/emberlink-cli/src/broker.rs` so wire behaviour is identical.
 fn call_daemon(socket_path: &Path, method: &str, params: &Value) -> io::Result<Value> {
-    use std::io::{BufRead, BufReader, Write};
-
-    let stream = std::os::unix::net::UnixStream::connect(socket_path).map_err(|e| {
-        io::Error::new(
+    match crate::call_daemon_rpc(socket_path, method, params) {
+        Ok(result) => Ok(result),
+        Err(crate::DaemonRpcError::Unavailable(e)) => Err(io::Error::new(
             e.kind(),
             format!(
                 "ember claude-code: daemon not running (socket: {}): {e}; \
                  start with 'ember daemon start'",
                 socket_path.display()
             ),
-        )
-    })?;
-
-    let mut writer = stream
-        .try_clone()
-        .map_err(|e| io::Error::new(e.kind(), format!("clone socket: {e}")))?;
-    let mut reader = BufReader::new(stream);
-
-    let request = json!({
-        "id": "1",
-        "method": method,
-        "params": params,
-    });
-    let mut line = serde_json::to_string(&request)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("serialize request: {e}")))?;
-    line.push('\n');
-
-    writer
-        .write_all(line.as_bytes())
-        .map_err(|e| io::Error::new(e.kind(), format!("write request: {e}")))?;
-
-    let mut response_line = String::new();
-    reader
-        .read_line(&mut response_line)
-        .map_err(|e| io::Error::new(e.kind(), format!("read response: {e}")))?;
-
-    let response: Value = serde_json::from_str(response_line.trim()).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("invalid JSON-RPC response: {e}"),
-        )
-    })?;
-
-    if let Some(err) = response.get("error").filter(|v| !v.is_null()) {
-        let message = err
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("unknown daemon error")
-            .to_string();
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("daemon error: {message}"),
-        ));
+        )),
+        Err(crate::DaemonRpcError::Io(e)) => Err(io::Error::new(
+            e.kind(),
+            format!("daemon socket error: {e}"),
+        )),
+        Err(crate::DaemonRpcError::Protocol(e)) => {
+            Err(io::Error::new(io::ErrorKind::InvalidData, e))
+        }
+        Err(crate::DaemonRpcError::Rpc { message, .. }) => {
+            Err(io::Error::other(format!("daemon error: {message}")))
+        }
     }
-
-    Ok(response.get("result").cloned().unwrap_or(Value::Null))
 }
 
 #[cfg(test)]
@@ -519,15 +570,72 @@ mod tests {
         close_session_rpc("sess_nonexistent", Path::new("/nonexistent.sock"));
     }
 
-    // ── persona resolution tests (implementation-note-304) ──
+    #[test]
+    fn parse_register_session_result_parses_direct_success() {
+        let raw = json!({
+            "session_id": "sess_fixture",
+            "grant_id": "grt_fixture",
+            "proxy_url": "http://127.0.0.1:7001",
+            "git_proxy_url": "http://127.0.0.1:7002",
+        });
+        let parsed = parse_register_session_result(&raw, Path::new("/tmp/daemon.sock"))
+            .expect("direct result must parse");
+        assert_eq!(parsed.session_id, "sess_fixture");
+        assert_eq!(parsed.grant_id, "grt_fixture");
+        assert_eq!(parsed.proxy_url, "http://127.0.0.1:7001");
+        assert_eq!(
+            parsed.git_proxy_url.as_deref(),
+            Some("http://127.0.0.1:7002")
+        );
+    }
+
+    #[test]
+    fn parse_register_session_result_rejects_reserved_presence_branch() {
+        let raw = json!({
+            "presence_required": {
+                "tab_url": "http://localhost:5173/prompt/pmt_xyz",
+                "prompt_id": "pmt_xyz",
+            }
+        });
+        let err = parse_register_session_result(&raw, Path::new("/tmp/daemon.sock"))
+            .expect_err("reserved browser branch must refuse cleanly");
+        let msg = err.to_string();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        assert!(
+            msg.contains("browser/session-open presence flow is not shipped yet"),
+            "error must explain current state: {msg}"
+        );
+        assert!(
+            msg.contains("prompt_id=pmt_xyz"),
+            "error must carry prompt_id context: {msg}"
+        );
+    }
+
+    // ── persona resolution tests (implementation-note-431) ──
 
     #[test]
     fn persona_defaults_to_cohort_a_when_env_unset() {
-        // SAFETY: single-threaded env mutation; value is removed before return.
+        // Serialize against other EMBER_PERSONA-mutating tests in this
+        // crate (`bind.rs::resolve_persona_rejects_…` removes,
+        // `persona_uses_env_var_when_set` sets+restores). Without the
+        // lock, the cargo parallel runner can race our `remove_var`
+        // against another test's `set_var("EMBER_PERSONA", "foo")` and
+        // `resolved` comes back as "foo" instead of the cohort-A
+        // default. Same pattern as #3237.
+        let _g = crate::EMBER_PERSONA_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prior = std::env::var("EMBER_PERSONA").ok();
+        // SAFETY: holds EMBER_PERSONA_TEST_LOCK for the duration of the
+        // env mutation; restored before return.
         unsafe { std::env::remove_var("EMBER_PERSONA") };
         // Mirror the onboarding helper to build the expected name.
         let hostname = crate::onboarding::claude_code::claude_code_persona_name();
         let resolved = resolve_persona_name();
+        // Restore prior before any assertion so a panic leaves a clean env.
+        if let Some(v) = prior {
+            unsafe { std::env::set_var("EMBER_PERSONA", v) };
+        }
         assert_eq!(
             resolved, hostname,
             "resolve_persona_name should match claude_code_persona_name when EMBER_PERSONA is unset"
@@ -540,10 +648,29 @@ mod tests {
 
     #[test]
     fn persona_uses_env_var_when_set() {
-        // SAFETY: single-threaded env mutation; value is restored before return.
+        // Serialize against other tests in this crate that touch
+        // EMBER_PERSONA (notably `bind.rs::resolve_persona_rejects_…`).
+        // Without this lock the cargo parallel runner can interleave a
+        // set_var/remove_var with our read, producing the
+        // `resolved != "foo"` failure.
+        let _g = crate::EMBER_PERSONA_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Save prior so we don't clobber developer env or other test
+        // setup that leaked across module boundaries.
+        let prior = std::env::var("EMBER_PERSONA").ok();
+        // SAFETY: holds EMBER_PERSONA_TEST_LOCK for the duration of the
+        // env mutation; restored before return.
         unsafe { std::env::set_var("EMBER_PERSONA", "foo") };
         let resolved = resolve_persona_name();
-        unsafe { std::env::remove_var("EMBER_PERSONA") };
+        // Restore prior value (or clear) before assertion so a panic
+        // leaves a clean env for the next acquirer.
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("EMBER_PERSONA", v),
+                None => std::env::remove_var("EMBER_PERSONA"),
+            }
+        }
         assert_eq!(resolved, "foo");
     }
 
@@ -555,9 +682,15 @@ mod tests {
         // We drive this by testing the error-remapping closure logic directly:
         // create an io::Error with the "not found" substring and assert the
         // remapped message contains the init hint.
-        let raw_err = io::Error::new(io::ErrorKind::Other, "daemon error: persona 'claude-code-myhost' not found");
+        let raw_err = io::Error::new(
+            io::ErrorKind::Other,
+            "daemon error: persona 'claude-code-myhost' not found",
+        );
         let msg = raw_err.to_string();
-        let remapped = if msg.contains("not found") || msg.contains("no such persona") || msg.contains("unknown persona") {
+        let remapped = if msg.contains("not found")
+            || msg.contains("no such persona")
+            || msg.contains("unknown persona")
+        {
             io::Error::new(
                 raw_err.kind(),
                 format!(
@@ -576,11 +709,11 @@ mod tests {
         );
     }
 
-    // ── implementation-note-195: launcher env injection tests ──
+    // ── implementation-note-267: launcher env injection tests ──
 
     #[test]
     fn registration_with_real_proxy_url_is_not_8484() {
-        // implementation-note-195: verify that a registration
+        // implementation-note-267: verify that a registration
         // carrying a daemon-provided URL (non-8484) is accepted without
         // falling back. This is the T1 launcher acceptance condition.
         let reg = SessionRegistration {
@@ -607,7 +740,7 @@ mod tests {
 
     #[test]
     fn run_with_registration_injects_daemon_proxy_url_not_8484() {
-        // implementation-note-195: T2 launcher — assert that the
+        // implementation-note-267: T2 launcher — assert that the
         // child env receives the daemon-returned proxy URL. We verify this
         // indirectly by confirming run_with_registration succeeds (returns 0)
         // with a registration carrying an ephemeral port. The real child-env
@@ -633,6 +766,66 @@ mod tests {
             Path::new("/tmp"),
         )
         .expect("spawn /usr/bin/true with real proxy URL");
-        assert_eq!(code, 0, "child must exit 0 when launched with real proxy URL");
+        assert_eq!(
+            code, 0,
+            "child must exit 0 when launched with real proxy URL"
+        );
+    }
+
+    // ── host-mode mediation disclaimer tests (implementation-note-432) ──
+
+    #[test]
+    fn disclaimer_skipped_when_stderr_not_tty() {
+        // In a test process stderr is not a tty, so maybe_print_host_mode_disclaimer
+        // must return Ok(()) immediately without reading stdin or printing anything.
+        // This covers the CI/piped path from the acceptance criteria.
+        let result = maybe_print_host_mode_disclaimer();
+        assert!(
+            result.is_ok(),
+            "disclaimer must not error when stderr is not a tty"
+        );
+    }
+
+    #[test]
+    fn disclaimer_skipped_when_suppressed_in_prefs() {
+        let _g = session_prefs::EMBER_HOME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        unsafe { std::env::set_var("EMBER_HOME", dir.path()) };
+        // Write suppression=true into session-prefs.
+        session_prefs::suppress_host_mode_disclaimer().expect("suppress");
+        // maybe_print_host_mode_disclaimer must return without printing when
+        // suppressed=true. In a test process stderr is not a tty so it would
+        // skip anyway; we validate the prefs-read path by asserting prefs.
+        let prefs = session_prefs::load();
+        unsafe { std::env::remove_var("EMBER_HOME") };
+        assert!(
+            prefs.host_mode_disclaimer_suppressed,
+            "suppression must be persisted and readable back"
+        );
+    }
+
+    #[test]
+    fn disclaimer_suppression_write_path() {
+        let _g = session_prefs::EMBER_HOME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Verify the suppress_host_mode_disclaimer helper writes and the
+        // subsequent load reflects the persisted value (round-trip).
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        unsafe { std::env::set_var("EMBER_HOME", dir.path()) };
+        // Before: not suppressed.
+        let before = session_prefs::load();
+        assert!(!before.host_mode_disclaimer_suppressed);
+        // Suppress.
+        session_prefs::suppress_host_mode_disclaimer().expect("suppress");
+        // After: suppressed.
+        let after = session_prefs::load();
+        unsafe { std::env::remove_var("EMBER_HOME") };
+        assert!(
+            after.host_mode_disclaimer_suppressed,
+            "suppression must persist"
+        );
     }
 }

@@ -1,3 +1,4 @@
+# CLASSIFICATION: PUBLIC
 # Construct manifest for ember-gh per design §2.
 # Action schema: each [[actions]] declares an allowed (verb, subverb)
 # pair, optional budget caps, biometric requirement, and a permit/deny
@@ -9,6 +10,7 @@ name = "ember-gh"
 version = "0.1.0"
 publisher = "did:emberlink"
 description = "GitHub CLI (`gh`) Construct. Mediates `gh` invocations through ember's credential broker: each call mints a scoped, time-bound GitHub App installation token with permissions narrowed to the requested action (pr_create, pr_merge, pr_list, workflow_run, etc.), injects it at exec time, revokes the token on exit, and emits a signed Receipt of the invocation. The agent never holds a long-lived GitHub PAT; every credentialed call is grant-gated, audited, and revocable."
+authority_refs = ["github"]
 
 # Default policy for unlisted (verb, subverb) pairs.
 default = "deny"
@@ -61,3 +63,13 @@ default = "prompt"          # creates content visible to repo collaborators; eas
 [[actions]]
 key = "pr_edit"
 default = "prompt"          # modifies PR title/body/labels visible to reviewers; gated so operator can confirm scope of change
+
+# --- silence-override catalog (design §C8 Knob 10) ---
+
+[actions.gh-api-paginate]
+classify_argv = "api --paginate *"
+silence_timeout_secs = 300
+
+[actions.gh-workflow-watch]
+classify_argv = "workflow watch *"
+silence_timeout_secs = 600

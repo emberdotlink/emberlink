@@ -26,10 +26,16 @@ pub struct BinaryInstallArgs {
 }
 
 fn manifest_path(home_dir: &std::path::Path) -> PathBuf {
-    home_dir.join(".ember").join("binaries").join("manifest.toml")
+    home_dir
+        .join(".ember")
+        .join("binaries")
+        .join("manifest.toml")
 }
 
-pub fn binary_install(args: &BinaryInstallArgs, home_dir: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+pub fn binary_install(
+    args: &BinaryInstallArgs,
+    home_dir: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (tool_name, version) = args
         .tool_at_version
         .split_once('@')
@@ -41,7 +47,10 @@ pub fn binary_install(args: &BinaryInstallArgs, home_dir: &std::path::Path) -> R
     let hash = blake3::hash(&binary_bytes);
     let content_hash = format!("blake3:{}", hex::encode(hash.as_bytes()));
 
-    let absolute_path = args.from_path.canonicalize().unwrap_or_else(|_| args.from_path.clone());
+    let absolute_path = args
+        .from_path
+        .canonicalize()
+        .unwrap_or_else(|_| args.from_path.clone());
 
     let installed_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -105,7 +114,11 @@ mod tests {
 
         binary_install(&args, home_dir.path()).expect("install should succeed");
 
-        let manifest_path = home_dir.path().join(".ember").join("binaries").join("manifest.toml");
+        let manifest_path = home_dir
+            .path()
+            .join(".ember")
+            .join("binaries")
+            .join("manifest.toml");
         assert!(manifest_path.exists(), "manifest.toml must be created");
 
         let manifest = load_manifest(&manifest_path).expect("manifest must parse");
@@ -113,10 +126,16 @@ mod tests {
         let entry = &manifest.entries[0];
         assert_eq!(entry.tool_name, "ember-gh");
         assert_eq!(entry.version, "1.0.0");
-        assert!(entry.content_hash.starts_with("blake3:"), "content_hash must have blake3: prefix");
+        assert!(
+            entry.content_hash.starts_with("blake3:"),
+            "content_hash must have blake3: prefix"
+        );
 
         // Verify the hash matches blake3 of the binary.
-        let expected = format!("blake3:{}", hex::encode(blake3::hash(b"fake-binary").as_bytes()));
+        let expected = format!(
+            "blake3:{}",
+            hex::encode(blake3::hash(b"fake-binary").as_bytes())
+        );
         assert_eq!(entry.content_hash, expected);
     }
 }

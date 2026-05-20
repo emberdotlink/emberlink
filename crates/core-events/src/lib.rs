@@ -1,6 +1,9 @@
-use core_crypto::{PublicKey, Signature, Signer, DOMAIN_EVENT};
+use core_crypto::{DOMAIN_EVENT, PublicKey, Signature, Signer};
 use core_event_types::{EventBody, EventRefRelation, EventSubject, EventType, SignerBinding};
-use core_types::{CanonicalEncode, SchemaVersion, Validate, ValidationError, size_limits::validate_envelope_payload_size};
+use core_types::{
+    CanonicalEncode, SchemaVersion, Validate, ValidationError,
+    size_limits::validate_envelope_payload_size,
+};
 
 pub mod construct_toml;
 pub mod receipt;
@@ -312,7 +315,10 @@ mod tests {
                 survival_mode: SurvivalMode::Strict,
                 initial_key: test_key("key-persona-1"),
             }),
-            vec![EventRef::previous("evt-0", 1), EventRef::previous("evt-0", 1)],
+            vec![
+                EventRef::previous("evt-0", 1),
+                EventRef::previous("evt-0", 1),
+            ],
             SignerBinding::root("root-1", "key-root-1"),
             &signer,
         )

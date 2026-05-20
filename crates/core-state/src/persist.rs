@@ -1,10 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use core_crypto::{EncryptedContent, LocalKeyPair, PublicKey, Signature, decrypt_content, encrypt_content};
+use core_crypto::{
+    EncryptedContent, LocalKeyPair, PublicKey, Signature, decrypt_content, encrypt_content,
+};
+use core_event_types::{
+    ChunkReference, EventRefRelation, EventSubject, EventType, FileManifest, KeyRole,
+    ManifestDeviceAccess, PresentationArtifact, PresentationTemplate, SignerBinding, SubjectKind,
+    VaultNamespace, VaultOwnerKind,
+};
 use core_events::{EventEnvelope, EventRef};
 use core_storage::{EncryptedBlock, PresentationArtifactEnvelope};
-use core_event_types::{ChunkReference, EventRefRelation, EventSubject, EventType, FileManifest, KeyRole, ManifestDeviceAccess, PresentationArtifact, PresentationTemplate, SignerBinding, SubjectKind, VaultNamespace, VaultOwnerKind};
-use core_types::{CanonicalEncode, SchemaVersion, Validate, ValidationError, bytes_to_hex, hex_to_bytes};
+use core_types::{
+    CanonicalEncode, SchemaVersion, Validate, ValidationError, bytes_to_hex, hex_to_bytes,
+};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 const COLUMN_ENC_TAG: &str = "ENC1:";
@@ -41,8 +49,9 @@ pub(crate) fn decrypt_column(
     let (nonce_hex, ciphertext_hex) = rest.split_once(':').ok_or_else(|| {
         ValidationError::new("malformed encrypted column value: missing ':' separator".to_string())
     })?;
-    let ciphertext = hex_to_bytes(ciphertext_hex)
-        .map_err(|e| ValidationError::new(format!("encrypted column ciphertext hex decode: {e}")))?;
+    let ciphertext = hex_to_bytes(ciphertext_hex).map_err(|e| {
+        ValidationError::new(format!("encrypted column ciphertext hex decode: {e}"))
+    })?;
     let plaintext_bytes = decrypt_content(
         master_key,
         &EncryptedContent {
@@ -723,19 +732,20 @@ pub(crate) fn load_local_vault_catalog_head(
     namespace: &VaultNamespace,
     master_key: Option<&str>,
 ) -> Result<Option<(FileManifest, String)>, ValidationError> {
-    let row = conn.query_row(
-        "SELECT manifest_payload, content_key
+    let row = conn
+        .query_row(
+            "SELECT manifest_payload, content_key
          FROM local_vault_catalogs
          WHERE owner_kind = ?1 AND owner_id = ?2",
-        params![namespace.owner_kind.as_str(), &namespace.owner_id],
-        |row| {
-            let manifest_payload = row.get::<_, Vec<u8>>(0)?;
-            let content_key = row.get::<_, String>(1)?;
-            Ok((manifest_payload, content_key))
-        },
-    )
-    .optional()
-    .map_err(|err| ValidationError::new(format!("load local vault catalog head: {err}")))?;
+            params![namespace.owner_kind.as_str(), &namespace.owner_id],
+            |row| {
+                let manifest_payload = row.get::<_, Vec<u8>>(0)?;
+                let content_key = row.get::<_, String>(1)?;
+                Ok((manifest_payload, content_key))
+            },
+        )
+        .optional()
+        .map_err(|err| ValidationError::new(format!("load local vault catalog head: {err}")))?;
 
     let Some((manifest_payload, stored_key)) = row else {
         return Ok(None);
@@ -916,7 +926,11 @@ pub(crate) fn write_local_manifest_key(
     master_key: Option<&str>,
 ) -> Result<(), ValidationError> {
     let stored_key = if let Some(mk) = master_key {
-        encrypt_column(mk, content_key, format!("manifest-key:{manifest_id}").as_bytes())?
+        encrypt_column(
+            mk,
+            content_key,
+            format!("manifest-key:{manifest_id}").as_bytes(),
+        )?
     } else {
         content_key.to_string()
     };
@@ -938,7 +952,11 @@ pub(crate) fn write_local_device_encryption_key(
     master_key: Option<&str>,
 ) -> Result<(), ValidationError> {
     let stored_private_key = if let Some(mk) = master_key {
-        encrypt_column(mk, &key_pair.private_key, format!("device-enc-key:{device_id}").as_bytes())?
+        encrypt_column(
+            mk,
+            &key_pair.private_key,
+            format!("device-enc-key:{device_id}").as_bytes(),
+        )?
     } else {
         key_pair.private_key.clone()
     };
@@ -973,33 +991,35 @@ pub(crate) fn load_local_device_encryption_key(
     device_id: &str,
     master_key: Option<&str>,
 ) -> Result<Option<LocalKeyPair>, ValidationError> {
-    let row = conn.query_row(
-        "SELECT key_id, algorithm, public_key, private_key
+    let row = conn
+        .query_row(
+            "SELECT key_id, algorithm, public_key, private_key
          FROM local_device_encryption_keys
          WHERE device_id = ?1",
-        params![device_id],
-        |row| {
-            let algorithm = row.get::<_, String>(1)?;
-            let algorithm = core_principals::KeyAlgorithm::parse(&algorithm).ok_or_else(|| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    1,
-                    rusqlite::types::Type::Text,
-                    Box::new(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("unknown key algorithm: {algorithm}"),
-                    )),
-                )
-            })?;
-            Ok(LocalKeyPair {
-                key_id: row.get(0)?,
-                algorithm,
-                public_key: row.get(2)?,
-                private_key: row.get(3)?,
-            })
-        },
-    )
-    .optional()
-    .map_err(|err| ValidationError::new(format!("load local device encryption key: {err}")))?;
+            params![device_id],
+            |row| {
+                let algorithm = row.get::<_, String>(1)?;
+                let algorithm =
+                    core_principals::KeyAlgorithm::parse(&algorithm).ok_or_else(|| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("unknown key algorithm: {algorithm}"),
+                            )),
+                        )
+                    })?;
+                Ok(LocalKeyPair {
+                    key_id: row.get(0)?,
+                    algorithm,
+                    public_key: row.get(2)?,
+                    private_key: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|err| ValidationError::new(format!("load local device encryption key: {err}")))?;
 
     match (row, master_key) {
         (Some(mut kp), Some(mk)) => {
@@ -1031,15 +1051,16 @@ pub(crate) fn load_local_manifest_key(
     manifest_id: &str,
     master_key: Option<&str>,
 ) -> Result<Option<String>, ValidationError> {
-    let stored = conn.query_row(
-        "SELECT content_key
+    let stored = conn
+        .query_row(
+            "SELECT content_key
          FROM local_manifest_keys
          WHERE manifest_id = ?1",
-        params![manifest_id],
-        |row| row.get::<_, String>(0),
-    )
-    .optional()
-    .map_err(|err| ValidationError::new(format!("load local manifest key: {err}")))?;
+            params![manifest_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|err| ValidationError::new(format!("load local manifest key: {err}")))?;
 
     match (stored, master_key) {
         (Some(s), Some(mk)) => Ok(Some(decrypt_column(
@@ -1187,12 +1208,10 @@ pub(crate) fn load_artifact_ids_by_grant(
              WHERE grant_id = ?1
              ORDER BY artifact_id ASC",
         )
-        .map_err(|err| {
-            ValidationError::new(format!("prepare artifact-by-grant query: {err}"))
-        })?;
-    let mut rows = stmt.query(params![grant_id]).map_err(|err| {
-        ValidationError::new(format!("query artifacts by grant: {err}"))
-    })?;
+        .map_err(|err| ValidationError::new(format!("prepare artifact-by-grant query: {err}")))?;
+    let mut rows = stmt
+        .query(params![grant_id])
+        .map_err(|err| ValidationError::new(format!("query artifacts by grant: {err}")))?;
     let mut ids = Vec::new();
     while let Some(row) = rows
         .next()
@@ -2346,14 +2365,16 @@ fn row_to_access_grant(
         .unwrap_or(core_event_types::PresentationAudienceKind::Service);
     let recipient_profile = core_grant_types::RecipientProfile::parse(&recipient_profile_str)
         .unwrap_or(core_grant_types::RecipientProfile::Human);
-    let mode = core_grant_types::GrantMode::parse(&mode_str).unwrap_or(core_grant_types::GrantMode::OneShot);
+    let mode = core_grant_types::GrantMode::parse(&mode_str)
+        .unwrap_or(core_grant_types::GrantMode::OneShot);
     let blocks = blocks_from_json(&blocks_json).unwrap_or_default();
     let exp = expires_at.map(|v| v as u64);
     // Derive nbf from blocks for the status computation.
     let nb = blocks.iter().filter_map(|sb| sb.block.nbf).max();
     let status = core_grant_types::GrantStatus::derive(&stored_status, nb, exp, now);
-    let attestation = serde_json::from_str::<core_grant_types::AttestationBinding>(&attestation_json)
-        .unwrap_or_default();
+    let attestation =
+        serde_json::from_str::<core_grant_types::AttestationBinding>(&attestation_json)
+            .unwrap_or_default();
 
     Ok(core_grant_types::AccessGrant {
         id: grant_id,
@@ -2387,9 +2408,7 @@ pub(crate) fn load_access_grant(
     grant_id: &str,
     now: u64,
 ) -> Result<Option<core_grant_types::AccessGrant>, ValidationError> {
-    let sql = format!(
-        "SELECT {ACCESS_GRANT_COLUMNS} FROM access_grants WHERE grant_id = ?1"
-    );
+    let sql = format!("SELECT {ACCESS_GRANT_COLUMNS} FROM access_grants WHERE grant_id = ?1");
     conn.query_row(&sql, params![grant_id], |row| row_to_access_grant(row, now))
         .optional()
         .map_err(|err| ValidationError::new(format!("load access grant: {err}")))
@@ -2440,8 +2459,9 @@ pub(crate) fn load_access_grants_by_persona(
 
     let mut grants = Vec::new();
     for row in rows {
-        grants
-            .push(row.map_err(|err| ValidationError::new(format!("read access grant row: {err}")))?);
+        grants.push(
+            row.map_err(|err| ValidationError::new(format!("read access grant row: {err}")))?,
+        );
     }
     Ok(grants)
 }
@@ -2463,16 +2483,14 @@ pub(crate) fn load_access_grants_for_recipient(
         .map_err(|err| ValidationError::new(format!("prepare recipient grants query: {err}")))?;
 
     let rows = stmt
-        .query_map(
-            params![recipient_kind.as_str(), recipient_id],
-            |row| row_to_access_grant(row, now),
-        )
+        .query_map(params![recipient_kind.as_str(), recipient_id], |row| {
+            row_to_access_grant(row, now)
+        })
         .map_err(|err| ValidationError::new(format!("query recipient grants: {err}")))?;
 
     let mut grants = Vec::new();
     for row in rows {
-        grants
-            .push(row.map_err(|err| ValidationError::new(format!("read grant row: {err}")))?);
+        grants.push(row.map_err(|err| ValidationError::new(format!("read grant row: {err}")))?);
     }
     Ok(grants)
 }
@@ -2592,9 +2610,7 @@ pub(crate) fn load_grant_history_timeline(
     let mut entries = Vec::new();
     for row in rows {
         entries.push(
-            row.map_err(|err| {
-                ValidationError::new(format!("read grant timeline row: {err}"))
-            })?,
+            row.map_err(|err| ValidationError::new(format!("read grant timeline row: {err}")))?,
         );
     }
     Ok(entries)
@@ -2701,14 +2717,26 @@ pub(crate) fn load_grant_offers_by_persona(
                 row.get::<_, Option<String>>(7)?,
                 row.get::<_, Option<String>>(8)?,
                 row.get::<_, Option<i64>>(9)?.map(|v| v as u64),
-                row.get::<_, String>(10).unwrap_or_else(|_| "[]".to_string()),
+                row.get::<_, String>(10)
+                    .unwrap_or_else(|_| "[]".to_string()),
             ))
         })
         .map_err(|err| ValidationError::new(format!("query grant offers: {err}")))?;
     let mut result = Vec::new();
     for row in rows {
-        let (offer_id, issuer_persona_id, ek_hex, payload_hex, relay_hint, expires_at, status_str, recipient, claim_response, claimed_at, cond_json) =
-            row.map_err(|err| ValidationError::new(format!("read grant offer row: {err}")))?;
+        let (
+            offer_id,
+            issuer_persona_id,
+            ek_hex,
+            payload_hex,
+            relay_hint,
+            expires_at,
+            status_str,
+            recipient,
+            claim_response,
+            claimed_at,
+            cond_json,
+        ) = row.map_err(|err| ValidationError::new(format!("read grant offer row: {err}")))?;
         let status = match status_str.as_str() {
             "claimed" => core_eventlog::GrantOfferStatus::Claimed,
             "revoked" => core_eventlog::GrantOfferStatus::Revoked,
@@ -2803,8 +2831,19 @@ pub(crate) fn load_badges(
         .map_err(|err| ValidationError::new(format!("query badges: {err}")))?;
     let mut result = Vec::new();
     for row in rows {
-        let (badge_id, issuer, recipient, btype, dname, ev_type, ev_payload, issued_at, expires_at, status_str, revoked_reason) =
-            row.map_err(|err| ValidationError::new(format!("read badge row: {err}")))?;
+        let (
+            badge_id,
+            issuer,
+            recipient,
+            btype,
+            dname,
+            ev_type,
+            ev_payload,
+            issued_at,
+            expires_at,
+            status_str,
+            revoked_reason,
+        ) = row.map_err(|err| ValidationError::new(format!("read badge row: {err}")))?;
         let evidence = match (ev_type, ev_payload) {
             (Some(et), Some(ph)) if !et.is_empty() => Some(core_event_types::BadgeEvidence {
                 evidence_type: et,
@@ -2893,8 +2932,20 @@ pub(crate) fn load_badge_gallery(
         .map_err(|err| ValidationError::new(format!("query gallery: {err}")))?;
     let mut result = Vec::new();
     for row in rows {
-        let (badge_id, issuer, recipient, btype, dname, ev_type, ev_payload, issued_at, expires_at, status_str, revoked_reason, visible_int) =
-            row.map_err(|err| ValidationError::new(format!("read gallery row: {err}")))?;
+        let (
+            badge_id,
+            issuer,
+            recipient,
+            btype,
+            dname,
+            ev_type,
+            ev_payload,
+            issued_at,
+            expires_at,
+            status_str,
+            revoked_reason,
+            visible_int,
+        ) = row.map_err(|err| ValidationError::new(format!("read gallery row: {err}")))?;
         let evidence = match (ev_type, ev_payload) {
             (Some(et), Some(ph)) if !et.is_empty() => Some(core_event_types::BadgeEvidence {
                 evidence_type: et,
@@ -2997,7 +3048,11 @@ pub(crate) fn count_badge_disputes_from_set(
         return Ok(0);
     }
     // For small sets, use IN clause. For large sets, a temp table would be better.
-    let placeholders: Vec<String> = persona_ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 2)).collect();
+    let placeholders: Vec<String> = persona_ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 2))
+        .collect();
     let sql = format!(
         "SELECT COUNT(*) FROM badge_disputes WHERE target_badge_id = ?1 AND disputer_persona_id IN ({})",
         placeholders.join(", ")
@@ -3011,7 +3066,8 @@ pub(crate) fn count_badge_disputes_from_set(
     for &pid in persona_ids {
         params_vec.push(Box::new(pid.to_string()));
     }
-    let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+    let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+        params_vec.iter().map(|p| p.as_ref()).collect();
 
     let count: u32 = stmt
         .query_row(params_refs.as_slice(), |row| row.get(0))

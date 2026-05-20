@@ -1,25 +1,27 @@
 use chrono::{DateTime, Duration, Timelike, Utc};
 use core_crypto::grant_chain::{
-    self, verify_chain, RootKeyPair, root_pubkey_bytes_from_ed25519_hex,
+    self, RootKeyPair, root_pubkey_bytes_from_ed25519_hex, verify_chain,
 };
-use core_grant_types::{AccessGrant, AttestationBinding, Block, Budget, GrantMode, GrantStatus, RecipientProfile, ResourceSelector, ResourceType, SignedBlock, Statement, Usage};
-use core_event_types::{PresentationAudienceKind};
+use core_event_types::PresentationAudienceKind;
+use core_grant_types::{
+    AccessGrant, AttestationBinding, Block, Budget, GrantMode, GrantStatus, RecipientProfile,
+    ResourceSelector, ResourceType, SignedBlock, Statement, Usage,
+};
 use rusqlite::OptionalExtension;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::infra::store::{DaemonStore, StoreError};
 use core_grants::chain::{
     access_grant_envelope, build_single_statement_block, scope_to_actions_and_selector,
 };
 use core_grants::scope::{
-    check_budget_attenuation, check_expiry_attenuation, check_statement_attenuation,
-    enforce_subset,
+    check_budget_attenuation, check_expiry_attenuation, check_statement_attenuation, enforce_subset,
 };
-use crate::infra::store::{DaemonStore, StoreError};
 
-// implementation-note-249 — final phase cleanup pass completed (design phase C-FINAL)
-// implementation-note-250 — internal grant.rs sites walk AccessGrant.blocks[] (design phase C-2)
-// implementation-note-251 — legacy entry points delegate through DaemonGrantStore (design phase C-1)
+// implementation-note-352 — final phase cleanup pass completed (design phase C-FINAL)
+// implementation-note-353 — internal grant.rs sites walk AccessGrant.blocks[] (design phase C-2)
+// implementation-note-354 — legacy entry points delegate through DaemonGrantStore (design phase C-1)
 // --- Phase B: DaemonGrantStore adapter (design §2.3) ---
 // TODO: GrantInfo struct is retained as a daemon-internal DB projection
 // because receipt.rs, dashboard.rs, tailnet.rs, and handler.rs all depend on fields not present
@@ -33,17 +35,13 @@ impl From<core_grants::GrantError> for StoreError {
             core_grants::GrantError::InvalidState => {
                 StoreError::InvalidInput("grant state machine: invalid state for operation".into())
             }
-            core_grants::GrantError::ScopeViolation => {
-                StoreError::DelegationViolation {
-                    reason: "narrowed scope is not a subset of the grant scope".into(),
-                }
-            }
+            core_grants::GrantError::ScopeViolation => StoreError::DelegationViolation {
+                reason: "narrowed scope is not a subset of the grant scope".into(),
+            },
             core_grants::GrantError::BudgetExhausted => {
                 StoreError::InvalidInput("grant budget exhausted".into())
             }
-            core_grants::GrantError::NotAuthorized => {
-                StoreError::Unauthorized
-            }
+            core_grants::GrantError::NotAuthorized => StoreError::Unauthorized,
         }
     }
 }
@@ -67,9 +65,10 @@ pub(crate) fn grant_info_to_core(g: &GrantInfo) -> core_grants::Grant {
             .ok()
             .map(|dt| dt.with_timezone(&chrono::Utc))
     });
-    let parent_id = g.parent_grant_id.as_deref().and_then(|s| {
-        uuid::Uuid::parse_str(s).ok()
-    });
+    let parent_id = g
+        .parent_grant_id
+        .as_deref()
+        .and_then(|s| uuid::Uuid::parse_str(s).ok());
     // Grant IDs are stored as "grant-{uuid}" — strip the prefix before parsing.
     let raw_id = g.id.strip_prefix("grant-").unwrap_or(&g.id);
     let id = uuid::Uuid::parse_str(raw_id).unwrap_or_else(|_| uuid::Uuid::nil());
@@ -128,7 +127,7 @@ impl<'a> DaemonGrantStore<'a> {
     /// Load a `core_grants::Grant` by its daemon-format string ID ("grant-{uuid}").
     ///
     /// Thin convenience bridge for handler.rs sites migrated in
-    /// implementation-note-169. Returns the state-machine type so callers can
+    /// implementation-note-241. Returns the state-machine type so callers can
     /// use `grant.state` / `grant.issuer` / `grant.expires_at` directly
     /// without going through the `GrantInfo` projection.
     pub fn load_grant(&self, id: &str) -> Result<core_grants::Grant, StoreError> {
@@ -201,7 +200,8 @@ impl<'a> DaemonGrantStore<'a> {
         // Validate that the state machine allows extension (Active only).
         let ttl = chrono::Duration::seconds(ttl_extension_secs.unwrap_or(0) as i64);
         let _ = core_grants::extend(grant, ttl)?;
-        self.inner.extend_grant_sql(id, tokens_delta, cents_delta, ttl_extension_secs)
+        self.inner
+            .extend_grant_sql(id, tokens_delta, cents_delta, ttl_extension_secs)
     }
 
     /// Delegate a grant (narrow scope only, no child budget).
@@ -212,7 +212,13 @@ impl<'a> DaemonGrantStore<'a> {
         narrowed_scope: &str,
         ttl_secs: Option<u64>,
     ) -> Result<GrantInfo, StoreError> {
-        self.delegate_grant_full(parent_grant_id, child_persona_id, narrowed_scope, ttl_secs, None)
+        self.delegate_grant_full(
+            parent_grant_id,
+            child_persona_id,
+            narrowed_scope,
+            ttl_secs,
+            None,
+        )
     }
 
     /// Delegate a grant with optional child budget.
@@ -236,11 +242,15 @@ impl<'a> DaemonGrantStore<'a> {
         let grant = GrantStore::load(self, uuid)?;
         // Validate that the parent is Active — delegates to the state machine.
         if grant.state != core_grants::GrantState::Active {
-            return Err(StoreError::InvalidInput(
-                "parent grant not active".into(),
-            ));
+            return Err(StoreError::InvalidInput("parent grant not active".into()));
         }
-        self.inner.delegate_grant_full_sql(parent_grant_id, child_persona_id, narrowed_scope, ttl_secs, child_budget)
+        self.inner.delegate_grant_full_sql(
+            parent_grant_id,
+            child_persona_id,
+            narrowed_scope,
+            ttl_secs,
+            child_budget,
+        )
     }
 
     /// Per-Statement revocation list passthrough — no state-machine check
@@ -310,7 +320,7 @@ impl GrantStore for DaemonGrantStore<'_> {
 /// on `GrantInfo` (scope, budget, usage, etc.) are **projections** over the
 /// first-statement in the chain. Full deletion requires migrating all callers
 /// above to walk `access_grant.blocks[].statements[]` natively.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrantInfo {
     pub id: String,
     pub persona_id: String,
@@ -408,6 +418,23 @@ pub const MAX_STATEMENTS_PER_BLOCK: usize = 16;
 /// bug upstream.
 pub const MAX_BLOCKS_JSON_BYTES: usize = 64 * 1024;
 
+/// Maximum lifetime (in seconds) for a grant's TTL. Per adversarial-review
+/// 2026-05-19 HIGH-7: without a cap, an approver could mint an effectively-
+/// permanent grant (e.g. `ttl_secs: 31_536_000` for one year, or the
+/// `Always.expires_at` path with a year-2099 date). That violates design's
+/// "bounded" invariant for the Grant Warden category.
+///
+/// 30 days matches the longest reasonable dogfooding / standing-grant
+/// window the operator would mint by hand. Standing grants (the `Always`
+/// outcome) are subject to the same cap — the implicit assumption that
+/// `Always` means "permanent" is itself the bug. Mirrors the pattern in
+/// `crates/ember-daemon/src/infra/tailnet.rs::MAX_LEASE_TTL_SECS`.
+///
+/// Internal callers (test harness, recovery flow) still observe this cap;
+/// adjust the constant if a legitimate use case emerges, but do not gate
+/// it behind a flag — the cap is the architectural intent.
+pub const MAX_GRANT_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+
 /// Validate an [`AccessGrant`]'s block chain + its serialized JSON
 /// length against the size caps. Called on every production path that
 /// writes `blocks_json` so a cap violation is caught before the SQL
@@ -466,9 +493,7 @@ pub(crate) fn validate_blocks_json_caps(
 /// minimum acceptable shape. The validator does NOT enforce a known
 /// method list (that's the resolver's job at runtime, not the parser's
 /// job at submit time).
-pub fn validate_action_keys_did_prefixed(
-    statements: &[Statement],
-) -> Result<(), StoreError> {
+pub fn validate_action_keys_did_prefixed(statements: &[Statement]) -> Result<(), StoreError> {
     for s in statements {
         for action in &s.actions {
             if !is_did_prefixed_action_key(action) {
@@ -526,7 +551,7 @@ pub fn build_fq_action_key(publisher_did: &str, tool: &str, action: &str) -> Str
 /// maps [`core_grants::chain::ChainBuildError`] onto `StoreError::InvalidInput`
 /// so daemon callers don't have to juggle two error enums.
 ///
-/// Logic lives in `core_grants::chain::sign_block_zero_with` (implementation-note-37).
+/// Logic lives in `core_grants::chain::sign_block_zero_with` (implementation-note-50).
 pub(crate) fn sign_block_zero_with(
     root: &RootKeyPair,
     block: &Block,
@@ -546,13 +571,13 @@ fn parse_epoch(s: Option<&str>) -> Option<u64> {
 /// per call), so the stored value is always 0. This derivation computes the
 /// actual time the grant has been in force at the moment of the query.
 ///
-/// Rules (per implementation-note-159):
+/// Rules (per implementation-note-208):
 /// - If the grant has already expired (`expires_at` set and `now > expires_at`),
 ///   return `min(expires_at, now) - created_at` clamped to `[0, budget_cap]`.
 /// - Otherwise return `now - created_at` clamped to `[0, budget_cap]`.
 /// - `budget_cap = None` means no wall-clock budget; elapsed time is still
 ///   derived (for audit accuracy) but is not clamped.
-// implementation-note-159: shipped
+// implementation-note-208: shipped
 pub(crate) fn derive_wall_clock_secs(
     now_secs: u64,
     created_at_secs: u64,
@@ -598,8 +623,9 @@ fn row_to_grant(row: &rusqlite::Row<'_>) -> rusqlite::Result<GrantInfo> {
     // If blocks_json parses to a non-empty chain, use its first-statement
     // budget + usage for the `budget`/`usage` scalar projection. Otherwise,
     // fall back to the flat `budget_json`/`usage_json` columns (legacy).
-    let flat_budget: Option<Budget> =
-        budget_json.as_deref().and_then(|s| serde_json::from_str(s).ok());
+    let flat_budget: Option<Budget> = budget_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok());
     let flat_usage: Usage = usage_json
         .as_deref()
         .and_then(|s| serde_json::from_str(s).ok())
@@ -620,7 +646,7 @@ fn row_to_grant(row: &rusqlite::Row<'_>) -> rusqlite::Result<GrantInfo> {
         None => (flat_budget, flat_usage),
     };
 
-    // implementation-note-159: derive wall_clock_secs at read time.
+    // implementation-note-208: derive wall_clock_secs at read time.
     // The proxy never increments this field; compute elapsed seconds from
     // created_at/expires_at so signed receipts record actual time used.
     let now_secs = std::time::SystemTime::now()
@@ -630,17 +656,25 @@ fn row_to_grant(row: &rusqlite::Row<'_>) -> rusqlite::Result<GrantInfo> {
     let created_at_epoch = parse_epoch(Some(&created_at)).unwrap_or(0);
     let expires_at_epoch = parse_epoch(expires_at.as_deref());
     let budget_wall_cap = projected_budget.as_ref().and_then(|b| b.wall_clock_secs);
-    projected_usage.wall_clock_secs =
-        derive_wall_clock_secs(now_secs, created_at_epoch, expires_at_epoch, budget_wall_cap);
+    projected_usage.wall_clock_secs = derive_wall_clock_secs(
+        now_secs,
+        created_at_epoch,
+        expires_at_epoch,
+        budget_wall_cap,
+    );
 
     // Compute effective status at read time so callers see time-accurate state.
     // Terminal states persisted in the column (revoked, expired, exhausted_by_budget,
     // expired_by_budget, parent_cascade_revoked) are kept as-is.  For non-terminal
     // stored states (active, paused) we additionally derive time-based expiry from
-    // `expires_at`, reusing `GrantStatus::derive` (see prior change / implementation-note-252).
+    // `expires_at`, reusing `GrantStatus::derive` (see prior change / implementation-note-355).
     let effective_status = if matches!(
         status.as_str(),
-        "revoked" | "expired" | "exhausted_by_budget" | "expired_by_budget" | "parent_cascade_revoked"
+        "revoked"
+            | "expired"
+            | "exhausted_by_budget"
+            | "expired_by_budget"
+            | "parent_cascade_revoked"
     ) {
         status.clone()
     } else {
@@ -689,7 +723,7 @@ pub(crate) fn access_grant_blocks_to_json(g: &AccessGrant) -> Result<String, Sto
 ///
 /// Daemon-layer wrapper that maps [`core_grants::chain::ChainBuildError`] onto
 /// `StoreError::InvalidInput`. Logic lives in
-/// `core_grants::chain::access_grant_from_statements` (implementation-note-37).
+/// `core_grants::chain::access_grant_from_statements` (implementation-note-50).
 pub fn access_grant_from_statements(
     id: &str,
     persona_id: &str,
@@ -700,7 +734,13 @@ pub fn access_grant_from_statements(
     root: &RootKeyPair,
 ) -> Result<AccessGrant, StoreError> {
     core_grants::chain::access_grant_from_statements(
-        id, persona_id, recipient_id, statements, created_at, expires_at, root,
+        id,
+        persona_id,
+        recipient_id,
+        statements,
+        created_at,
+        expires_at,
+        root,
     )
     .map_err(|e| StoreError::InvalidInput(e.to_string()))
 }
@@ -712,7 +752,7 @@ pub fn access_grant_from_statements(
 /// derived from the store rather than threaded in from the outside.
 /// Existing callers of [`access_grant_from_statements`] continue to
 /// compile unchanged; migrate them to this form incrementally
-/// (TODO P69K-C28-implementation-note-253 caller migration).
+/// (TODO P69K-C28-implementation-note-356 caller migration).
 ///
 /// Returns the same value as calling `access_grant_from_statements` with
 /// the result of `store.persona_root_keypair(persona_id)`.
@@ -789,21 +829,36 @@ impl DaemonStore {
         ttl_secs: Option<u64>,
         budget: Option<Budget>,
     ) -> Result<GrantInfo, StoreError> {
-        self.create_grant_with_budget_inner(persona_id, credential_name, scope, ttl_secs, budget, true)
+        self.create_grant_with_budget_inner(
+            persona_id,
+            credential_name,
+            scope,
+            ttl_secs,
+            budget,
+            true,
+        )
     }
 
     /// Like [`create_grant_with_budget`] but suppresses the `grant.minted`
     /// audit event.  Used by the composite-approval path so that
     /// `mint_composite_chain_for_grant` can emit a single `grant.minted`
     /// event AFTER the composite shape is finalised (REVIEW2-F8).
-    pub(crate) fn create_grant_suppress_minted_event(
+    pub(crate) fn create_grant_with_budget_suppress_minted_event(
         &self,
         persona_id: &str,
         credential_name: &str,
         scope: &str,
         ttl_secs: Option<u64>,
+        budget: Option<Budget>,
     ) -> Result<GrantInfo, StoreError> {
-        self.create_grant_with_budget_inner(persona_id, credential_name, scope, ttl_secs, None, false)
+        self.create_grant_with_budget_inner(
+            persona_id,
+            credential_name,
+            scope,
+            ttl_secs,
+            budget,
+            false,
+        )
     }
 
     fn create_grant_with_budget_inner(
@@ -815,6 +870,21 @@ impl DaemonStore {
         budget: Option<Budget>,
         emit_minted_event: bool,
     ) -> Result<GrantInfo, StoreError> {
+        // grant_ttl_capped_at_max — Per adversarial-review 2026-05-19 HIGH-7.
+        // Refuse a TTL that exceeds [`MAX_GRANT_TTL_SECS`] before any
+        // persona/key work or event emission. Maintains design's "bounded"
+        // invariant: even a malicious approver (or compromised dashboard)
+        // cannot mint an effectively-permanent grant.
+        if let Some(secs) = ttl_secs
+            && secs > MAX_GRANT_TTL_SECS
+        {
+            return Err(StoreError::InvalidInput(format!(
+                "ttl_secs ({secs}) exceeds MAX_GRANT_TTL_SECS ({MAX_GRANT_TTL_SECS}); \
+                 grants are bounded per design — mint a shorter-lived grant or \
+                 schedule re-issuance"
+            )));
+        }
+
         // Verify persona exists and is active.
         let persona_status: Option<String> = self
             .conn()
@@ -831,7 +901,7 @@ impl DaemonStore {
             Some(other) => {
                 return Err(StoreError::InvalidInput(format!(
                     "persona is not active: {other}"
-                )))
+                )));
             }
         }
 
@@ -994,7 +1064,7 @@ impl DaemonStore {
     }
 
     pub fn list_active_grants(&self) -> Result<Vec<GrantInfo>, StoreError> {
-        // implementation-note-141 — `paused` is a reversible state; the operator
+        // implementation-note-190 — `paused` is a reversible state; the operator
         // who pauses a grant must still be able to find and resume it
         // without flipping the "show terminated" toggle (which is for
         // *terminal* states: revoked / expired / exhausted_by_budget).
@@ -1108,8 +1178,7 @@ impl DaemonStore {
                 // rejected — they had a persona at mint time and the
                 // missing row is suspicious.
                 let is_phase1 = grant.blocks.len() == 1
-                    && grant.blocks[0].signature
-                        == grant_chain::UNSIGNED_PHASE1_PLACEHOLDER;
+                    && grant.blocks[0].signature == grant_chain::UNSIGNED_PHASE1_PLACEHOLDER;
                 if is_phase1 {
                     tracing::warn!(
                         grant_id = %grant.id,
@@ -1128,9 +1197,9 @@ impl DaemonStore {
             }
             Some(root_pubkey) => verify_chain(&grant.blocks, &root_pubkey)
                 .map(|()| grant)
-                .map_err(|e| StoreError::InvalidInput(format!(
-                    "grant chain verification failed: {e}"
-                ))),
+                .map_err(|e| {
+                    StoreError::InvalidInput(format!("grant chain verification failed: {e}"))
+                }),
         }
     }
 
@@ -1161,10 +1230,7 @@ impl DaemonStore {
     /// design revision — the projection produces a chain that callers
     /// (proxy, dashboard, standing-grant sweep) can feed straight into
     /// `verify_chain` without tripping on placeholders.
-    pub fn project_access_grant(
-        &self,
-        info: &GrantInfo,
-    ) -> Result<AccessGrant, StoreError> {
+    pub fn project_access_grant(&self, info: &GrantInfo) -> Result<AccessGrant, StoreError> {
         let created_at_epoch = parse_epoch(Some(&info.created_at)).unwrap_or(0);
         let expires_at_epoch = info
             .expires_at
@@ -1196,11 +1262,7 @@ impl DaemonStore {
     /// chain. Used by multi-statement minting flows (e.g. `ember sandbox
     /// run`'s 3-statement envelope) to replace the single-statement shim
     /// `create_grant` wrote with the canonical multi-Statement shape.
-    pub fn overwrite_grant_blocks(
-        &self,
-        id: &str,
-        grant: &AccessGrant,
-    ) -> Result<(), StoreError> {
+    pub fn overwrite_grant_blocks(&self, id: &str, grant: &AccessGrant) -> Result<(), StoreError> {
         self.overwrite_grant_blocks_inner(id, grant, None)
     }
 
@@ -1338,9 +1400,7 @@ impl DaemonStore {
             }
             Some(root_pubkey) => {
                 verify_chain(&grant.blocks, &root_pubkey).map_err(|e| {
-                    StoreError::InvalidInput(format!(
-                        "grant chain verification failed: {e}"
-                    ))
+                    StoreError::InvalidInput(format!("grant chain verification failed: {e}"))
                 })?;
             }
         }
@@ -1432,7 +1492,11 @@ impl DaemonStore {
         );
         let grant = self
             .conn()
-            .query_row(&sql, rusqlite::params![persona_id, credential_name, now], row_to_grant)
+            .query_row(
+                &sql,
+                rusqlite::params![persona_id, credential_name, now],
+                row_to_grant,
+            )
             .optional()?
             .ok_or(StoreError::NotFound)?;
 
@@ -1497,27 +1561,11 @@ impl DaemonStore {
         narrowed_scope: &str,
         ttl_secs: Option<u64>,
     ) -> Result<GrantInfo, StoreError> {
-        self.grant_store().delegate_grant(parent_grant_id, child_persona_id, narrowed_scope, ttl_secs)
-    }
-
-    /// Thin wrapper over `delegate_grant_full_sql` that passes `None` for the
-    /// child budget. If the parent carries a budget this call will fail
-    /// attenuation (child must also bound every parent-bounded axis). Kept
-    /// as-is so existing socket + CLI callers keep working for grants
-    /// without budgets.
-    pub(crate) fn delegate_grant_sql(
-        &self,
-        parent_grant_id: &str,
-        child_persona_id: &str,
-        narrowed_scope: &str,
-        ttl_secs: Option<u64>,
-    ) -> Result<GrantInfo, StoreError> {
-        self.delegate_grant_full_sql(
+        self.grant_store().delegate_grant(
             parent_grant_id,
             child_persona_id,
             narrowed_scope,
             ttl_secs,
-            None,
         )
     }
 
@@ -1529,7 +1577,13 @@ impl DaemonStore {
         ttl_secs: Option<u64>,
         child_budget: Option<Budget>,
     ) -> Result<GrantInfo, StoreError> {
-        self.grant_store().delegate_grant_full(parent_grant_id, child_persona_id, narrowed_scope, ttl_secs, child_budget)
+        self.grant_store().delegate_grant_full(
+            parent_grant_id,
+            child_persona_id,
+            narrowed_scope,
+            ttl_secs,
+            child_budget,
+        )
     }
 
     /// Create a delegated grant with narrowed scope + optional child budget.
@@ -1614,7 +1668,8 @@ impl DaemonStore {
         if flat_actions != parent_stmt.actions || flat_selector != parent_stmt.resource {
             return Err(StoreError::InvalidInput(
                 "parent grant scope diverges from signed chain — \
-                 rejecting delegation of tampered parent".into(),
+                 rejecting delegation of tampered parent"
+                    .into(),
             ));
         }
 
@@ -1622,12 +1677,10 @@ impl DaemonStore {
 
         // Compute child expiry epoch seconds (if provided) and parent's from chain.
         let now: DateTime<Utc> = Utc::now();
-        let child_expiry_epoch: Option<u64> = ttl_secs
-            .map(|s| (now.timestamp() as i128 + s as i128).max(0) as u64);
-        let parent_expiry_epoch: Option<u64> = parent_chain
-            .blocks
-            .first()
-            .and_then(|b| b.block.expires_at);
+        let child_expiry_epoch: Option<u64> =
+            ttl_secs.map(|s| (now.timestamp() as i128 + s as i128).max(0) as u64);
+        let parent_expiry_epoch: Option<u64> =
+            parent_chain.blocks.first().and_then(|b| b.block.expires_at);
 
         check_expiry_attenuation(parent_expiry_epoch, child_expiry_epoch)?;
         check_budget_attenuation(&parent_stmt.budget, &parent_stmt.usage, &child_budget)?;
@@ -1708,6 +1761,105 @@ impl DaemonStore {
                 .to_string(),
             ),
         );
+
+        // implementation-note-94 — emit + persist a
+        // `spawn.witness` Receipt v2 envelope for this parent→child grant
+        // edge. The witness binds the spawned (child) persona to the
+        // parent's authorization via two independent signatures (CRIT-7
+        // mitigation per design / core-receipts):
+        //
+        //   1. The parent persona signs JCS(body \ parent_signature). The
+        //      parent's signing key is decrypted out of the vault via
+        //      `persona_signer`; without this signature an emberd
+        //      impersonator could forge `spawned_persona_id` without the
+        //      parent's corroborating authorization.
+        //   2. The daemon persona signs the outer envelope (receipt_id +
+        //      body), matching `broker.materialization` / `exec.completion`.
+        //
+        // Best-effort: any failure here (parent persona key not loadable,
+        // daemon identity uninitialised in tests, signing or persistence
+        // I/O error) logs a warning and continues — the child grant has
+        // already minted and a receipt-emission failure must not break
+        // delegation. Demo-seam fallback in `tree.rs` was removed in the
+        // same patch; downstream verifiers that find no witness for an
+        // edge will treat it as an audit gap, not silently fabricate one.
+        if let Some(identity) = crate::infra::receipt::current_identity() {
+            match self.persona_signer(&parent.persona_id) {
+                Ok(parent_signer) => {
+                    let daemon_signer =
+                        crate::session::lifecycle::DaemonPersonaSigner::new(identity);
+                    // container_id is the SCION container slot when the
+                    // parent persona is bound to one (workload personas
+                    // minted via `create_agent_persona_enrolling`).
+                    // Legacy parents created via `create_persona` have no
+                    // container binding; pass an empty string so the body
+                    // shape stays stable and verifiers can distinguish
+                    // SCION-bound from legacy edges via the field.
+                    let container_id = self
+                        .get_persona(&parent.persona_id)
+                        .ok()
+                        .and_then(|p| p.container_id)
+                        .unwrap_or_default();
+                    // implementation-note-60:
+                    // read the Bridge CA fingerprint cached on `DaemonStore`
+                    // (wired in by `runtime.rs` after `load_or_mint_bridge_ca`
+                    // succeeds at startup). In-memory test stores that never
+                    // wired a Bridge CA return `None`; we pass `[0u8; 32]` in
+                    // that case — Slice D treats the zero checkpoint as
+                    // "fingerprint not asserted" and falls back to legacy
+                    // verification (bridge_ca_fingerprint_in_spawn_receipt).
+                    let ca_fingerprint = self.bridge_ca_fingerprint().unwrap_or([0u8; 32]);
+                    match crate::spawn::scion::emit_spawn_witness_receipt(
+                        child_persona_id,
+                        &parent.persona_id,
+                        &container_id,
+                        parent_grant_id,
+                        ca_fingerprint,
+                        &parent_signer,
+                        &daemon_signer,
+                    ) {
+                        Ok(envelope) => {
+                            if let Err(e) = self.store_spawn_witness_receipt(&envelope) {
+                                tracing::warn!(
+                                    error = %e,
+                                    parent_grant_id = %parent_grant_id,
+                                    child_grant_id = %id,
+                                    receipt_id = %envelope.receipt_id,
+                                    "spawn.witness: failed to persist envelope; \
+                                     parent→child edge will lack an audit witness"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                parent_grant_id = %parent_grant_id,
+                                child_grant_id = %id,
+                                "spawn.witness: sign failed; receipt not persisted"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        parent_grant_id = %parent_grant_id,
+                        parent_persona_id = %parent.persona_id,
+                        child_grant_id = %id,
+                        "spawn.witness: parent persona signer unavailable; \
+                         receipt not emitted (edge will lack audit witness)"
+                    );
+                }
+            }
+        } else {
+            tracing::debug!(
+                parent_grant_id = %parent_grant_id,
+                child_grant_id = %id,
+                "spawn.witness: daemon identity not initialised — \
+                 skipping receipt emission (test harness / pre-startup path)"
+            );
+        }
+
         Ok(GrantInfo {
             id,
             persona_id: child_persona_id.to_string(),
@@ -1733,13 +1885,21 @@ impl DaemonStore {
         })
     }
 
-    /// implementation-note-170 — read the per-Statement
+    /// implementation-note-242 — read the per-Statement
     /// revocation list for a grant. Returns the deserialized vector of
     /// revoked sids ("S0", "S1", ...). Missing or NULL column is treated
     /// as empty (legacy rows that predate the migration). Malformed JSON
     /// is logged and treated as empty so a corrupt row doesn't take down
     /// the whole grant.
-    pub fn get_revoked_sids(&self, grant_id: &str) -> Result<Vec<String>, StoreError> {
+    ///
+    /// Reads the per-grant column only — no ancestry walk. Most callers
+    /// want [`Self::get_revoked_sids`] which unions this row's sids with
+    /// every ancestor persona's grant revocations so revoking an
+    /// orchestrator persona cascades to its spawned workers.
+    pub(crate) fn get_revoked_sids_for_grant(
+        &self,
+        grant_id: &str,
+    ) -> Result<Vec<String>, StoreError> {
         let raw: Option<String> = self
             .conn()
             .query_row(
@@ -1765,11 +1925,84 @@ impl DaemonStore {
         }
     }
 
+    // fn get_revoked_sids walks parent_persona_id ancestry (implementation-note-269)
+    /// implementation-note-269 — return the per-Statement
+    /// revocation set for a grant **unioned with every ancestor persona's
+    /// grant revocations**. Revoking an orchestrator persona's grant now
+    /// cascades to all child / grandchild personas spawned under that
+    /// orchestrator: their statement sids appear revoked from the proxy's
+    /// perspective even though the per-grant `revoked_sids_json` on the
+    /// child row is unchanged.
+    ///
+    /// Walk shape:
+    ///   1. Read the grant row to find its owning `persona_id`.
+    ///   2. Walk `personas.parent_grant_id → grants.persona_id` up to
+    ///      [`crate::infra::persona::MAX_PARENT_PERSONA_CHAIN_HOPS`]
+    ///      ancestors (bounded; cycle-safe via seen-set).
+    ///   3. For each ancestor persona, union the revoked sids from EVERY
+    ///      grant that persona owns.
+    ///   4. Union in the original grant's own revoked sids.
+    ///
+    /// Signature is preserved (single `grant_id`) — this is an additive
+    /// enhancement, not a breaking change. All existing call sites pick
+    /// up cascade semantics transparently.
+    pub fn get_revoked_sids(&self, grant_id: &str) -> Result<Vec<String>, StoreError> {
+        // Always include the grant's own revocations.
+        let own = self.get_revoked_sids_for_grant(grant_id)?;
+        let mut acc: std::collections::BTreeSet<String> = own.into_iter().collect();
+
+        // Resolve the grant's owning persona. If the grant row is missing
+        // the own-read above returns Vec::new() and the persona lookup
+        // here also misses — treat as "no ancestors to union" and return
+        // the empty set.
+        let persona_id: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT persona_id FROM grants WHERE id = ?1",
+                rusqlite::params![grant_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(persona_id) = persona_id else {
+            return Ok(acc.into_iter().collect());
+        };
+
+        // Walk the ancestry. `parent_persona_chain` returns [self, parent,
+        // grandparent, ...] — we union over the WHOLE chain (including
+        // self) so revocations on sibling grants owned by the same
+        // persona also propagate to this grant's view.
+        let chain = self
+            .parent_persona_chain(&persona_id)
+            .unwrap_or_else(|_| vec![persona_id.clone()]);
+
+        for ancestor in &chain {
+            // For each ancestor persona, find every grant they own and
+            // union that grant's revoked sids into the accumulator.
+            let mut stmt = self
+                .conn()
+                .prepare("SELECT id FROM grants WHERE persona_id = ?1")?;
+            let grant_ids: Vec<String> = stmt
+                .query_map(rusqlite::params![ancestor], |row| row.get::<_, String>(0))?
+                .filter_map(Result::ok)
+                .collect();
+            drop(stmt);
+
+            for gid in grant_ids {
+                let sids = self.get_revoked_sids_for_grant(&gid)?;
+                for sid in sids {
+                    acc.insert(sid);
+                }
+            }
+        }
+
+        Ok(acc.into_iter().collect())
+    }
+
     pub fn revoke_grant_statement(&self, grant_id: &str, sid: &str) -> Result<(), StoreError> {
         self.grant_store().revoke_grant_statement(grant_id, sid)
     }
 
-    /// implementation-note-170 — append `sid` to the per-Statement
+    /// implementation-note-242 — append `sid` to the per-Statement
     /// revocation list for a grant. Idempotent: appending an already-revoked
     /// sid is a no-op. Emits a `grant.statement_revoked` audit event with
     /// the grant_id and statement sid.
@@ -1800,9 +2033,8 @@ impl DaemonStore {
             return Ok(());
         }
         sids.push(sid.to_string());
-        let json = serde_json::to_string(&sids).map_err(|e| {
-            StoreError::InvalidInput(format!("revoked_sids serialize: {e}"))
-        })?;
+        let json = serde_json::to_string(&sids)
+            .map_err(|e| StoreError::InvalidInput(format!("revoked_sids serialize: {e}")))?;
         let n = self.conn().execute(
             "UPDATE grants SET revoked_sids_json = ?1 WHERE id = ?2",
             rusqlite::params![json, grant_id],
@@ -1831,7 +2063,7 @@ impl DaemonStore {
     }
 
     pub(crate) fn revoke_grant_sql(&self, id: &str) -> Result<(), StoreError> {
-        // implementation-note-120 (F-S5-008 + F-S5-005): wrap the revoke +
+        // implementation-note-168 (F-S5-008 + F-S5-005): wrap the revoke +
         // audit chain emission + grant-receipt emission in a single
         // BEGIN IMMEDIATE transaction so partial failure can't leave a
         // revoked grant without its audit / receipt trail (or vice versa).
@@ -1909,9 +2141,9 @@ impl DaemonStore {
         parent_id: &str,
         root_revoked_id: &str,
     ) -> Result<(), StoreError> {
-        let mut stmt = self.conn().prepare(
-            "SELECT id FROM grants WHERE parent_grant_id = ?1 AND status = 'active'",
-        )?;
+        let mut stmt = self
+            .conn()
+            .prepare("SELECT id FROM grants WHERE parent_grant_id = ?1 AND status = 'active'")?;
         let children: Vec<String> = stmt
             .query_map(rusqlite::params![parent_id], |row| row.get(0))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1927,9 +2159,11 @@ impl DaemonStore {
             if crate::infra::receipt::trigger_receipt_if_terminal_current(
                 self,
                 &child_id,
-                Some(core_grant_types::grant_receipt::TerminalReason::ParentCascadeRevoked {
-                    parent_grant_id: root_revoked_id.to_string(),
-                }),
+                Some(
+                    core_grant_types::grant_receipt::TerminalReason::ParentCascadeRevoked {
+                        parent_grant_id: root_revoked_id.to_string(),
+                    },
+                ),
             )
             .is_none()
             {
@@ -2025,7 +2259,9 @@ impl DaemonStore {
                     });
                 }
             }
-            let Some(limit) = min_wall_clock else { continue };
+            let Some(limit) = min_wall_clock else {
+                continue;
+            };
 
             if elapsed >= limit {
                 self.conn().execute(
@@ -2037,18 +2273,18 @@ impl DaemonStore {
                     "grant.exhausted",
                     Some(&ag.recipient_id),
                     "exhausted_by_budget",
-                    Some(&format!(
-                        "wall_clock elapsed={elapsed} limit={limit}"
-                    )),
+                    Some(&format!("wall_clock elapsed={elapsed} limit={limit}")),
                 );
                 // Emit a signed Grant Receipt for the terminal state.
                 if crate::infra::receipt::trigger_receipt_if_terminal_current(
                     self,
                     &ag.id,
-                    Some(core_grant_types::grant_receipt::TerminalReason::ExhaustedByBudget {
-                        statement_sid: "S0".into(),
-                        axis: core_grant_types::grant_receipt::BudgetAxis::WallClockSecs,
-                    }),
+                    Some(
+                        core_grant_types::grant_receipt::TerminalReason::ExhaustedByBudget {
+                            statement_sid: "S0".into(),
+                            axis: core_grant_types::grant_receipt::BudgetAxis::WallClockSecs,
+                        },
+                    ),
                 )
                 .is_none()
                 {
@@ -2082,7 +2318,7 @@ impl DaemonStore {
         Ok((exhausted, warned))
     }
 
-    /// implementation-note-174: per-grant version of the
+    /// implementation-note-246: per-grant version of the
     /// background sweeps (`expire_stale_grants` + `expire_grants_by_wall_clock`)
     /// run synchronously on observation. `get_grant` already projects an
     /// `effective_status` from `expires_at` vs `now`, so callers can
@@ -2098,10 +2334,7 @@ impl DaemonStore {
     /// resolve the not-found path via the subsequent `get_grant`).
     /// Receipt-emit failures are logged via `tracing::warn` but do not
     /// fail the call — observability beats blocking the read.
-    pub fn expire_grant_if_terminal_now(
-        &self,
-        grant_id: &str,
-    ) -> Result<bool, StoreError> {
+    pub fn expire_grant_if_terminal_now(&self, grant_id: &str) -> Result<bool, StoreError> {
         // Cheap row-level fetch to decide whether anything's worth doing.
         let row: Option<(String, Option<String>)> = self
             .conn()
@@ -2180,10 +2413,12 @@ impl DaemonStore {
             if crate::infra::receipt::trigger_receipt_if_terminal_current(
                 self,
                 grant_id,
-                Some(core_grant_types::grant_receipt::TerminalReason::ExhaustedByBudget {
-                    statement_sid: "S0".into(),
-                    axis: core_grant_types::grant_receipt::BudgetAxis::WallClockSecs,
-                }),
+                Some(
+                    core_grant_types::grant_receipt::TerminalReason::ExhaustedByBudget {
+                        statement_sid: "S0".into(),
+                        axis: core_grant_types::grant_receipt::BudgetAxis::WallClockSecs,
+                    },
+                ),
             )
             .is_none()
             {
@@ -2300,7 +2535,8 @@ impl DaemonStore {
         cents_delta: Option<u64>,
         ttl_extension_secs: Option<u64>,
     ) -> Result<GrantInfo, StoreError> {
-        self.grant_store().extend_grant(id, tokens_delta, cents_delta, ttl_extension_secs)
+        self.grant_store()
+            .extend_grant(id, tokens_delta, cents_delta, ttl_extension_secs)
     }
 
     /// - `tokens_delta`: additional tokens to add to `budget_tokens` (and reset `tokens_used` floor
@@ -2378,7 +2614,11 @@ impl DaemonStore {
             },
             ..existing_budget
         };
-        let new_budget_opt: Option<Budget> = if new_budget.is_none_set() { None } else { Some(new_budget) };
+        let new_budget_opt: Option<Budget> = if new_budget.is_none_set() {
+            None
+        } else {
+            Some(new_budget)
+        };
         let new_budget_json: Option<String> = new_budget_opt
             .as_ref()
             .map(|b| serde_json::to_string(b).expect("Budget serializes"));
@@ -2410,7 +2650,8 @@ impl DaemonStore {
             return Err(StoreError::InvalidInput(
                 "extend_grant not supported on multi-block chains yet — \
                  mutating block 0 would orphan subsequent blocks' signatures. \
-                 Append-block path (P69K-C3) required.".into(),
+                 Append-block path (P69K-C3) required."
+                    .into(),
             ));
         }
 
@@ -2586,7 +2827,7 @@ impl DaemonStore {
                 if stmt.sid == statement_sid {
                     let before = stmt.usage.clone();
                     stmt.usage.tokens = stmt.usage.tokens.saturating_add(delta.tokens);
-                    // implementation-note-32: accumulate micro-cents
+                    // implementation-note-45: accumulate micro-cents
                     // (sub-cent precision) and DERIVE the integer `cents`
                     // display value from it. Adding `delta.cents` directly
                     // would lose every sub-cent call to integer truncation,
@@ -2607,24 +2848,21 @@ impl DaemonStore {
                     //      assertion `s.usage.cents == N` after increment
                     //      still holds.
                     if stmt.usage.cents_micro == 0 && stmt.usage.cents > 0 {
-                        stmt.usage.cents_micro = stmt
-                            .usage
-                            .cents
-                            .saturating_mul(1_000_000);
+                        stmt.usage.cents_micro = stmt.usage.cents.saturating_mul(1_000_000);
                     }
                     let delta_cents_micro = if delta.cents_micro > 0 {
                         delta.cents_micro
                     } else {
                         delta.cents.saturating_mul(1_000_000)
                     };
-                    stmt.usage.cents_micro = stmt
-                        .usage
-                        .cents_micro
-                        .saturating_add(delta_cents_micro);
+                    stmt.usage.cents_micro =
+                        stmt.usage.cents_micro.saturating_add(delta_cents_micro);
                     stmt.usage.cents = stmt.usage.cents_micro / 1_000_000;
                     stmt.usage.requests = stmt.usage.requests.saturating_add(delta.requests);
-                    stmt.usage.workload_hours =
-                        stmt.usage.workload_hours.saturating_add(delta.workload_hours);
+                    stmt.usage.workload_hours = stmt
+                        .usage
+                        .workload_hours
+                        .saturating_add(delta.workload_hours);
                     stmt.usage.wall_clock_secs = stmt
                         .usage
                         .wall_clock_secs
@@ -2653,7 +2891,8 @@ impl DaemonStore {
             return Err(StoreError::InvalidInput(
                 "increment_statement_usage not supported on multi-block chains yet — \
                  re-signing block 0 would orphan subsequent blocks. \
-                 Live-usage-outside-chain (P69K-G) required.".into(),
+                 Live-usage-outside-chain (P69K-G) required."
+                    .into(),
             ));
         }
 
@@ -2745,7 +2984,11 @@ impl DaemonStore {
     }
 
     /// Record a spending event. Returns error if daily limit exceeded.
-    pub fn record_grant_spending(&self, grant_id: &str, amount_cents: u64) -> Result<(), StoreError> {
+    pub fn record_grant_spending(
+        &self,
+        grant_id: &str,
+        amount_cents: u64,
+    ) -> Result<(), StoreError> {
         let limit: Option<i64> = self
             .conn()
             .query_row(
@@ -2786,7 +3029,7 @@ impl DaemonStore {
         Ok(())
     }
 
-    /// implementation-note-60: evaluate a Claude Code PreToolUse request against the
+    /// implementation-note-76: evaluate a Claude Code PreToolUse request against the
     /// active grant for the supplied persona, emit a `tool_call_attempt`
     /// audit event, and return a `ToolCallDecision`.
     ///
@@ -2797,7 +3040,7 @@ impl DaemonStore {
     ///     and find its first active grant.
     ///
     /// On hit: returns `ToolCallDecision { permit: true, reason: None, .. }`
-    /// (Permit-stub — the real evaluator is implementation-note-61 future work).
+    /// (Permit-stub — the real evaluator is implementation-note-77 future work).
     /// On miss: returns `ToolCallDecision { permit: false, reason: Some(..), .. }`.
     ///
     /// Either way, an audit row is written to the `audit_log` table keyed
@@ -2855,7 +3098,7 @@ impl DaemonStore {
                 ToolCallDecision {
                     permit: false,
                     reason: Some(format!(
-                        "no active grant for persona '{persona}' (implementation-note-60 stub evaluator)"
+                        "no active grant for persona '{persona}' (implementation-note-76 stub evaluator)"
                     )),
                     grant_id: None,
                     emitted_event_id: String::new(),
@@ -2887,13 +3130,13 @@ impl DaemonStore {
     }
 }
 
-/// implementation-note-60: decision returned by [`DaemonStore::evaluate_tool_call`].
+/// implementation-note-76: decision returned by [`DaemonStore::evaluate_tool_call`].
 ///
 /// Wire-compatible with the proxy hook's `HookResponse` shape: `permit`
 /// maps to `allow`, `reason` to `reason` (a `None` reason on the permit
-/// path becomes the canned "permit (implementation-note-60 stub)" string in the
+/// path becomes the canned "permit (implementation-note-76 stub)" string in the
 /// proxy). `grant_id` and `emitted_event_id` are surfaced so future
-/// receipt-termination work (implementation-note-28) can correlate the hook
+/// receipt-termination work (implementation-note-35) can correlate the hook
 /// invocation back to the grant + audit row without a second RPC.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct ToolCallDecision {
@@ -2965,6 +3208,53 @@ mod tests {
     }
 
     #[test]
+    fn create_grant_with_ttl_at_cap_succeeds() {
+        // grant_ttl_capped_at_max — boundary case: exactly the cap value
+        // is accepted (the check is strict `>`). Tracks adversarial-review
+        // 2026-05-19 HIGH-7 closure.
+        let store = setup();
+        let persona = store.create_persona("agent-cap-edge").unwrap();
+        store
+            .create_grant_with_budget(
+                &persona.id,
+                "api-key",
+                "read",
+                Some(MAX_GRANT_TTL_SECS),
+                None,
+            )
+            .expect("exact-cap TTL must be accepted");
+    }
+
+    #[test]
+    fn create_grant_with_ttl_past_cap_refused() {
+        // grant_ttl_capped_at_max — adversarial-review 2026-05-19 HIGH-7
+        // regression guard. A 1-year TTL must be refused even when policy
+        // would otherwise allow it. The cap is enforced inside
+        // `create_grant_with_budget_inner`, which sits below every public
+        // create_grant entry point, so callers (including Internal admin
+        // paths) cannot bypass.
+        let store = setup();
+        let persona = store.create_persona("agent-too-long").unwrap();
+        let too_long = MAX_GRANT_TTL_SECS + 1;
+        let err = store
+            .create_grant_with_budget(&persona.id, "api-key", "read", Some(too_long), None)
+            .expect_err("over-cap TTL must be refused");
+        match err {
+            StoreError::InvalidInput(msg) => {
+                assert!(
+                    msg.contains("MAX_GRANT_TTL_SECS"),
+                    "error must name the cap: {msg}"
+                );
+                assert!(
+                    msg.contains(&too_long.to_string()),
+                    "error must echo the rejected value: {msg}"
+                );
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn evaluate_grant_returns_active_grant() {
         let store = setup();
         let persona = store.create_persona("agent-gamma").unwrap();
@@ -3022,7 +3312,7 @@ mod tests {
         assert!(matches!(result, Err(StoreError::NotFound)));
     }
 
-    // implementation-note-170 — per-statement revoke unit tests.
+    // implementation-note-242 — per-statement revoke unit tests.
 
     #[test]
     fn revoke_grant_statement_appends_sid() {
@@ -3074,6 +3364,94 @@ mod tests {
         let store = setup();
         let result = store.revoke_grant_statement("grant-does-not-exist", "S0");
         assert!(matches!(result, Err(StoreError::NotFound)));
+    }
+
+    // implementation-note-269 — cascade test. Revoking a
+    // statement on an ancestor persona's grant must surface as a revoked
+    // sid when reading the descendant grant's revoked set, so the proxy's
+    // per-call check (`get_revoked_sids(&grant.id).contains(&resolved_sid)`)
+    // denies workers spawned under a revoked orchestrator without any
+    // change to the per-grant `revoked_sids_json` on the descendant row.
+    #[test]
+    fn revocation_cascades_through_parent_chain() {
+        let store = setup();
+
+        // Build three-generation chain: A (root) → B → C.
+        let root = store.create_persona("root-orch").unwrap();
+        let g_a = store.create_grant(&root.id, "cred-a", "*", None).unwrap();
+
+        let child = store
+            .create_agent_persona_enrolling("child-worker", "ctr-child", &g_a.id)
+            .unwrap();
+        store.activate_persona(&child.id).unwrap();
+        let g_b = store.create_grant(&child.id, "cred-b", "*", None).unwrap();
+
+        let grand = store
+            .create_agent_persona_enrolling("grand-worker", "ctr-grand", &g_b.id)
+            .unwrap();
+        store.activate_persona(&grand.id).unwrap();
+        let g1 = store.create_grant(&grand.id, "cred-1", "*", None).unwrap();
+
+        // Pre-cascade: every grant's revoked set is empty.
+        assert!(store.get_revoked_sids(&g1.id).unwrap().is_empty());
+
+        // Revoke a statement on the ROOT's grant (the orchestrator).
+        store.revoke_grant_statement(&g_a.id, "S0").unwrap();
+
+        // The grandchild's grant must now report S0 as revoked even
+        // though g1.revoked_sids_json is still empty.
+        let cascaded = store.get_revoked_sids(&g1.id).unwrap();
+        assert!(
+            cascaded.contains(&"S0".to_string()),
+            "ancestor revocation did not cascade: {cascaded:?}"
+        );
+
+        // Per-grant read (no ancestry walk) confirms the column itself
+        // is untouched — cascade lives in the union, not on the row.
+        let own = store.get_revoked_sids_for_grant(&g1.id).unwrap();
+        assert!(
+            own.is_empty(),
+            "per-grant row should be untouched, got {own:?}"
+        );
+    }
+
+    // implementation-note-269 — middle-of-chain revocation
+    // also cascades to descendants but NOT to ancestors. Sibling grants
+    // owned by the same intermediate persona share the revocation
+    // (BTreeSet union over all grants owned by every ancestor).
+    #[test]
+    fn revocation_cascade_propagates_down_not_up() {
+        let store = setup();
+
+        let root = store.create_persona("root-orch-2").unwrap();
+        let g_a = store.create_grant(&root.id, "cred-a", "*", None).unwrap();
+
+        let child = store
+            .create_agent_persona_enrolling("child-worker-2", "ctr-child-2", &g_a.id)
+            .unwrap();
+        store.activate_persona(&child.id).unwrap();
+        let g_b = store.create_grant(&child.id, "cred-b", "*", None).unwrap();
+
+        let grand = store
+            .create_agent_persona_enrolling("grand-worker-2", "ctr-grand-2", &g_b.id)
+            .unwrap();
+        store.activate_persona(&grand.id).unwrap();
+        let g1 = store.create_grant(&grand.id, "cred-1", "*", None).unwrap();
+
+        // Revoke on the MIDDLE persona's grant.
+        store.revoke_grant_statement(&g_b.id, "S7").unwrap();
+
+        // Descendant sees the revocation.
+        let descendant = store.get_revoked_sids(&g1.id).unwrap();
+        assert!(descendant.contains(&"S7".to_string()));
+
+        // Ancestor (root's grant) does NOT — revocations don't propagate
+        // up the chain.
+        let ancestor = store.get_revoked_sids(&g_a.id).unwrap();
+        assert!(
+            !ancestor.contains(&"S7".to_string()),
+            "revocation leaked upward: {ancestor:?}"
+        );
     }
 
     #[test]
@@ -3342,7 +3720,10 @@ mod tests {
                 }),
             )
             .expect("grandchild delegate approved");
-        assert_eq!(grandchild.parent_grant_id.as_deref(), Some(child.id.as_str()));
+        assert_eq!(
+            grandchild.parent_grant_id.as_deref(),
+            Some(child.id.as_str())
+        );
         assert_eq!(grandchild.budget.and_then(|b| b.tokens), Some(1_000));
     }
 
@@ -3546,7 +3927,9 @@ mod tests {
                 sid: "S0".into(),
                 resource_type: ResourceType::Credential,
                 actions: vec!["credential:read".into()],
-                resource: ResourceSelector::Exact { value: "api-key".into() },
+                resource: ResourceSelector::Exact {
+                    value: "api-key".into(),
+                },
                 budget: None,
                 usage: Usage::default(),
                 conditions: Vec::new(),
@@ -3555,7 +3938,9 @@ mod tests {
                 sid: "S1".into(),
                 resource_type: ResourceType::Session,
                 actions: vec!["llm:generate".into()],
-                resource: ResourceSelector::Glob { pattern: "anthropic/*".into() },
+                resource: ResourceSelector::Glob {
+                    pattern: "anthropic/*".into(),
+                },
                 budget: Some(Budget {
                     tokens: Some(5_000),
                     ..Default::default()
@@ -3585,7 +3970,7 @@ mod tests {
     }
 
     /// `access_grant_from_statements_for_persona` returns the same `AccessGrant`
-    /// as the explicit-root form when both use the same persona (P69K-C28-implementation-note-253).
+    /// as the explicit-root form when both use the same persona (P69K-C28-implementation-note-356).
     #[test]
     fn access_grant_from_statements_for_persona_matches_explicit_root() {
         let store = setup();
@@ -3595,7 +3980,9 @@ mod tests {
                 sid: "S0".into(),
                 resource_type: ResourceType::Credential,
                 actions: vec!["credential:read".into()],
-                resource: ResourceSelector::Exact { value: "api-key".into() },
+                resource: ResourceSelector::Exact {
+                    value: "api-key".into(),
+                },
                 budget: None,
                 usage: Usage::default(),
                 conditions: Vec::new(),
@@ -3660,7 +4047,9 @@ mod tests {
     fn seed_persona_with_key(store: &DaemonStore, public_key: &str, private_key: &str) -> String {
         let id = format!("persona-{}", Uuid::new_v4());
         let now = Utc::now().to_rfc3339();
-        let vault = store.vault().expect("test store must have a vault attached");
+        let vault = store
+            .vault()
+            .expect("test store must have a vault attached");
         let (nonce, ciphertext) = vault
             .seal(private_key.as_bytes())
             .expect("seal secret under test vault");
@@ -3730,7 +4119,9 @@ mod tests {
         let grant_id = seed_grant_with_blocks(&store, &persona_id, &blocks_json);
 
         // Should succeed — valid chain.
-        let grant = store.get_access_grant(&grant_id).expect("valid chain must succeed");
+        let grant = store
+            .get_access_grant(&grant_id)
+            .expect("valid chain must succeed");
         assert_eq!(grant.id, grant_id);
         assert_eq!(grant.issuing_persona_id, persona_id);
     }
@@ -3787,7 +4178,11 @@ mod tests {
 
         // Tamper: flip the last two hex chars of the signature.
         let sig = out.signed.signature.clone();
-        let tampered = format!("{}{}", &sig[..sig.len() - 2], if sig.ends_with("00") { "ff" } else { "00" });
+        let tampered = format!(
+            "{}{}",
+            &sig[..sig.len() - 2],
+            if sig.ends_with("00") { "ff" } else { "00" }
+        );
         out.signed.signature = tampered;
 
         let blocks_json = serde_json::to_string(&[out.signed]).unwrap();
@@ -3831,9 +4226,15 @@ mod tests {
     /// Seed a grant row whose persona_id has no matching personas row.
     /// Disables FK enforcement for the insert, then re-enables it.
     fn seed_orphan_grant(store: &DaemonStore, persona_id: &str, blocks_json: &str) -> String {
-        store.conn().execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        store
+            .conn()
+            .execute_batch("PRAGMA foreign_keys = OFF")
+            .unwrap();
         let grant_id = seed_grant_with_blocks(store, persona_id, blocks_json);
-        store.conn().execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        store
+            .conn()
+            .execute_batch("PRAGMA foreign_keys = ON")
+            .unwrap();
         grant_id
     }
 
@@ -3960,7 +4361,9 @@ mod tests {
         assert_eq!(child.parent_grant_id, Some(parent_id.clone()));
         assert_eq!(
             child.max_delegation_depth,
-            parent_before.max_delegation_depth.map(|d| d.saturating_sub(1)),
+            parent_before
+                .max_delegation_depth
+                .map(|d| d.saturating_sub(1)),
             "child depth = parent depth − 1",
         );
         assert_eq!(
@@ -4062,7 +4465,10 @@ mod tests {
         let grant_id = seed_grant_with_blocks(&store, &persona_id, &blocks_json);
 
         // Delete persona to create the orphan scenario.
-        store.conn().execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+        store
+            .conn()
+            .execute_batch("PRAGMA foreign_keys = OFF")
+            .unwrap();
         store
             .conn()
             .execute(
@@ -4070,7 +4476,10 @@ mod tests {
                 rusqlite::params![persona_id],
             )
             .unwrap();
-        store.conn().execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        store
+            .conn()
+            .execute_batch("PRAGMA foreign_keys = ON")
+            .unwrap();
 
         // F-07: signed-chain orphan is rejected, not silently passed through.
         let err = store
@@ -4282,7 +4691,9 @@ mod tests {
     fn pause_active_grant_blocks_proxy() {
         let store = setup();
         let persona = store.create_persona("pause-proxy-agent").unwrap();
-        let grant = store.create_grant(&persona.id, "api-key", "read", None).unwrap();
+        let grant = store
+            .create_grant(&persona.id, "api-key", "read", None)
+            .unwrap();
 
         // Grant is active; evaluate_grant should succeed.
         assert!(store.evaluate_grant(&persona.id, "api-key").is_ok());
@@ -4305,7 +4716,9 @@ mod tests {
     fn resume_paused_grant_allows_proxy() {
         let store = setup();
         let persona = store.create_persona("resume-proxy-agent").unwrap();
-        let grant = store.create_grant(&persona.id, "api-key", "read", None).unwrap();
+        let grant = store
+            .create_grant(&persona.id, "api-key", "read", None)
+            .unwrap();
 
         store.pause_grant(&grant.id).unwrap();
         // Confirm blocked.
@@ -4338,7 +4751,9 @@ mod tests {
     fn cannot_pause_revoked_grant() {
         let store = setup();
         let persona = store.create_persona("no-pause-revoked").unwrap();
-        let grant = store.create_grant(&persona.id, "api-key", "read", None).unwrap();
+        let grant = store
+            .create_grant(&persona.id, "api-key", "read", None)
+            .unwrap();
         store.revoke_grant(&grant.id).unwrap();
 
         let result = store.pause_grant(&grant.id);
@@ -4354,7 +4769,9 @@ mod tests {
     fn pause_grant_is_idempotent() {
         let store = setup();
         let persona = store.create_persona("idem-pause").unwrap();
-        let grant = store.create_grant(&persona.id, "api-key", "read", None).unwrap();
+        let grant = store
+            .create_grant(&persona.id, "api-key", "read", None)
+            .unwrap();
 
         store.pause_grant(&grant.id).unwrap();
         // Second pause should not error — idempotent.
@@ -4366,7 +4783,9 @@ mod tests {
     fn resume_grant_is_idempotent() {
         let store = setup();
         let persona = store.create_persona("idem-resume").unwrap();
-        let grant = store.create_grant(&persona.id, "api-key", "read", None).unwrap();
+        let grant = store
+            .create_grant(&persona.id, "api-key", "read", None)
+            .unwrap();
 
         // Resume on an already-active grant should not error.
         store.resume_grant(&grant.id).unwrap();
@@ -4375,15 +4794,19 @@ mod tests {
 
     #[test]
     fn list_active_grants_includes_paused() {
-        // implementation-note-141 — paused grants are reversible; the operator
+        // implementation-note-190 — paused grants are reversible; the operator
         // who pauses a grant must still see it on the Active list to be
         // able to resume it. Terminal states (revoked / expired /
         // exhausted_by_budget) belong behind the "show terminated"
         // toggle, but paused is not terminal.
         let store = setup();
         let persona = store.create_persona("excl-paused").unwrap();
-        let g1 = store.create_grant(&persona.id, "key-a", "read", None).unwrap();
-        let g2 = store.create_grant(&persona.id, "key-b", "read", None).unwrap();
+        let g1 = store
+            .create_grant(&persona.id, "key-a", "read", None)
+            .unwrap();
+        let g2 = store
+            .create_grant(&persona.id, "key-b", "read", None)
+            .unwrap();
 
         store.pause_grant(&g1.id).unwrap();
 
@@ -4484,9 +4907,7 @@ mod tests {
         // Both the legacy `create_grant` (no budget param) and the new
         // `create_grant_with_budget(..., None)` must produce a statement
         // with `budget = None`.
-        let g1 = store
-            .create_grant(&persona.id, "k1", "read", None)
-            .unwrap();
+        let g1 = store.create_grant(&persona.id, "k1", "read", None).unwrap();
         let g2 = store
             .create_grant_with_budget(&persona.id, "k2", "read", None, None)
             .unwrap();
@@ -4509,13 +4930,7 @@ mod tests {
         let store = setup();
         let persona = store.create_persona("agent-budget-empty").unwrap();
         let grant = store
-            .create_grant_with_budget(
-                &persona.id,
-                "k",
-                "read",
-                None,
-                Some(Budget::default()),
-            )
+            .create_grant_with_budget(&persona.id, "k", "read", None, Some(Budget::default()))
             .unwrap();
         assert!(grant.budget.is_none());
         let ag = store.get_access_grant(&grant.id).unwrap();
@@ -4585,18 +5000,29 @@ mod tests {
         let store = setup();
         let persona = store.create_persona("agent-cap-blocks").unwrap();
         // Seed a grant so `overwrite_grant_blocks` finds the row.
-        let seeded = store.create_grant(&persona.id, "cred", "read", None).unwrap();
+        let seeded = store
+            .create_grant(&persona.id, "cred", "read", None)
+            .unwrap();
 
         // Build a 33-block chain — one over the cap.
-        let blocks: Vec<SignedBlock> =
-            (0..MAX_BLOCKS + 1).map(|_| dummy_signed_block(&persona.id, 1)).collect();
+        let blocks: Vec<SignedBlock> = (0..MAX_BLOCKS + 1)
+            .map(|_| dummy_signed_block(&persona.id, 1))
+            .collect();
         let grant = make_grant_with_blocks(&seeded.id, &persona.id, blocks);
 
-        let err = store.overwrite_grant_blocks(&seeded.id, &grant).unwrap_err();
+        let err = store
+            .overwrite_grant_blocks(&seeded.id, &grant)
+            .unwrap_err();
         match err {
             StoreError::InvalidInput(s) => {
-                assert!(s.contains("blocks"), "message must name the violated cap, got: {s}");
-                assert!(s.contains(&format!("{}", MAX_BLOCKS)), "message should cite the cap: {s}");
+                assert!(
+                    s.contains("blocks"),
+                    "message must name the violated cap, got: {s}"
+                );
+                assert!(
+                    s.contains(&format!("{}", MAX_BLOCKS)),
+                    "message should cite the cap: {s}"
+                );
             }
             other => panic!("expected InvalidInput, got {other:?}"),
         }
@@ -4606,16 +5032,26 @@ mod tests {
     fn blocks_json_write_rejects_too_many_statements_per_block() {
         let store = setup();
         let persona = store.create_persona("agent-cap-stmts").unwrap();
-        let seeded = store.create_grant(&persona.id, "cred", "read", None).unwrap();
+        let seeded = store
+            .create_grant(&persona.id, "cred", "read", None)
+            .unwrap();
 
         // Single block, 17 statements — one over the per-block cap.
-        let blocks = vec![dummy_signed_block(&persona.id, MAX_STATEMENTS_PER_BLOCK + 1)];
+        let blocks = vec![dummy_signed_block(
+            &persona.id,
+            MAX_STATEMENTS_PER_BLOCK + 1,
+        )];
         let grant = make_grant_with_blocks(&seeded.id, &persona.id, blocks);
 
-        let err = store.overwrite_grant_blocks(&seeded.id, &grant).unwrap_err();
+        let err = store
+            .overwrite_grant_blocks(&seeded.id, &grant)
+            .unwrap_err();
         match err {
             StoreError::InvalidInput(s) => {
-                assert!(s.contains("statements"), "message must name the violated cap, got: {s}");
+                assert!(
+                    s.contains("statements"),
+                    "message must name the violated cap, got: {s}"
+                );
             }
             other => panic!("expected InvalidInput, got {other:?}"),
         }
@@ -4625,7 +5061,9 @@ mod tests {
     fn blocks_json_write_rejects_oversized_payload() {
         let store = setup();
         let persona = store.create_persona("agent-cap-size").unwrap();
-        let seeded = store.create_grant(&persona.id, "cred", "read", None).unwrap();
+        let seeded = store
+            .create_grant(&persona.id, "cred", "read", None)
+            .unwrap();
 
         // Single block, single statement — but the statement's resource
         // selector is a giant glob pattern that pushes the serialized
@@ -4635,7 +5073,9 @@ mod tests {
         sb.block.statements[0].resource = ResourceSelector::Glob { pattern: giant };
         let grant = make_grant_with_blocks(&seeded.id, &persona.id, vec![sb]);
 
-        let err = store.overwrite_grant_blocks(&seeded.id, &grant).unwrap_err();
+        let err = store
+            .overwrite_grant_blocks(&seeded.id, &grant)
+            .unwrap_err();
         match err {
             StoreError::InvalidInput(s) => {
                 assert!(
@@ -4657,7 +5097,9 @@ mod tests {
         // itself must NOT fire.
         let store = setup();
         let persona = store.create_persona("agent-cap-ok").unwrap();
-        let seeded = store.create_grant(&persona.id, "cred", "read", None).unwrap();
+        let seeded = store
+            .create_grant(&persona.id, "cred", "read", None)
+            .unwrap();
 
         let blocks: Vec<SignedBlock> = (0..5).map(|_| dummy_signed_block(&persona.id, 3)).collect();
         let grant = make_grant_with_blocks(&seeded.id, &persona.id, blocks);
@@ -4679,8 +5121,9 @@ mod tests {
         // off-by-one that would silently reject a maxed-out legitimate
         // chain.
         let persona_id = "agent-boundary-blocks";
-        let blocks: Vec<SignedBlock> =
-            (0..MAX_BLOCKS).map(|_| dummy_signed_block(persona_id, 1)).collect();
+        let blocks: Vec<SignedBlock> = (0..MAX_BLOCKS)
+            .map(|_| dummy_signed_block(persona_id, 1))
+            .collect();
         let grant = make_grant_with_blocks("grant-boundary-b", persona_id, blocks);
         let json = access_grant_blocks_to_json(&grant).unwrap();
         assert!(
@@ -4699,8 +5142,7 @@ mod tests {
         let blocks = vec![dummy_signed_block(persona_id, MAX_STATEMENTS_PER_BLOCK)];
         let grant = make_grant_with_blocks("grant-boundary-s", persona_id, blocks);
         let json = access_grant_blocks_to_json(&grant).unwrap();
-        validate_blocks_json_caps(&grant, &json)
-            .expect("exact MAX_STATEMENTS_PER_BLOCK must pass");
+        validate_blocks_json_caps(&grant, &json).expect("exact MAX_STATEMENTS_PER_BLOCK must pass");
     }
 
     // --- design §4: composite-grant action-key validator ---------------
@@ -4710,7 +5152,9 @@ mod tests {
             sid: "s0".into(),
             resource_type: ResourceType::Credential,
             actions: actions.into_iter().map(String::from).collect(),
-            resource: ResourceSelector::Exact { value: "cred".into() },
+            resource: ResourceSelector::Exact {
+                value: "cred".into(),
+            },
             budget: None,
             usage: Usage::default(),
             conditions: vec![],
@@ -4768,8 +5212,9 @@ mod tests {
         // a `did:web:hashicorp.com:terraform.apply` statement parses
         // cleanly today; community-publisher resolution is the v0.4+
         // runtime-gate flip.
-        let stmts =
-            vec![stmt_with_actions(vec!["did:web:hashicorp.com:terraform.apply"])];
+        let stmts = vec![stmt_with_actions(vec![
+            "did:web:hashicorp.com:terraform.apply",
+        ])];
         validate_action_keys_did_prefixed(&stmts)
             .expect("did:web: prefixed action key must pass parse-time validation");
     }
@@ -4884,7 +5329,9 @@ mod tests {
                 sid: sid.into(),
                 resource_type: ResourceType::Credential,
                 actions: vec!["read".into()],
-                resource: ResourceSelector::Exact { value: "cred".into() },
+                resource: ResourceSelector::Exact {
+                    value: "cred".into(),
+                },
                 budget: None,
                 usage: Usage::default(),
                 conditions: vec![],
@@ -4906,7 +5353,9 @@ mod tests {
         // RootKeyMismatch (block-0) and overwrite must refuse to persist.
         let store = setup();
         let persona = store.create_persona("agent-overwrite-tamper").unwrap();
-        let seeded = store.create_grant(&persona.id, "cred", "read", None).unwrap();
+        let seeded = store
+            .create_grant(&persona.id, "cred", "read", None)
+            .unwrap();
 
         let root = store.persona_root_keypair(&persona.id).unwrap();
         let mut out = signed_block_for(&persona.id, "S0", &root);
@@ -4923,7 +5372,9 @@ mod tests {
 
         let grant = make_grant_with_blocks(&seeded.id, &persona.id, vec![out.signed]);
 
-        let err = store.overwrite_grant_blocks(&seeded.id, &grant).unwrap_err();
+        let err = store
+            .overwrite_grant_blocks(&seeded.id, &grant)
+            .unwrap_err();
         match err {
             StoreError::InvalidInput(s) => assert!(
                 s.contains("chain verification failed"),
@@ -4947,7 +5398,9 @@ mod tests {
         // block-0's pubkey_next) is a SignatureMismatch.
         let store = setup();
         let persona = store.create_persona("agent-overwrite-reorder").unwrap();
-        let seeded = store.create_grant(&persona.id, "cred", "read", None).unwrap();
+        let seeded = store
+            .create_grant(&persona.id, "cred", "read", None)
+            .unwrap();
 
         let root = store.persona_root_keypair(&persona.id).unwrap();
         let out0 = signed_block_for(&persona.id, "S0", &root);
@@ -4957,7 +5410,9 @@ mod tests {
                 sid: "S1".into(),
                 resource_type: ResourceType::Credential,
                 actions: vec!["read".into()],
-                resource: ResourceSelector::Exact { value: "cred".into() },
+                resource: ResourceSelector::Exact {
+                    value: "cred".into(),
+                },
                 budget: None,
                 usage: Usage::default(),
                 conditions: vec![],
@@ -4976,7 +5431,9 @@ mod tests {
                 sid: "S2".into(),
                 resource_type: ResourceType::Credential,
                 actions: vec!["read".into()],
-                resource: ResourceSelector::Exact { value: "cred".into() },
+                resource: ResourceSelector::Exact {
+                    value: "cred".into(),
+                },
                 budget: None,
                 usage: Usage::default(),
                 conditions: vec![],
@@ -4997,7 +5454,9 @@ mod tests {
         let reordered = vec![out0.signed, out2.signed, out1.signed];
         let grant = make_grant_with_blocks(&seeded.id, &persona.id, reordered);
 
-        let err = store.overwrite_grant_blocks(&seeded.id, &grant).unwrap_err();
+        let err = store
+            .overwrite_grant_blocks(&seeded.id, &grant)
+            .unwrap_err();
         match err {
             StoreError::InvalidInput(s) => assert!(
                 s.contains("chain verification failed"),
@@ -5017,7 +5476,9 @@ mod tests {
         let store = setup();
         let victim = store.create_persona("agent-overwrite-victim").unwrap();
         let attacker = store.create_persona("agent-overwrite-attacker").unwrap();
-        let seeded = store.create_grant(&victim.id, "cred", "read", None).unwrap();
+        let seeded = store
+            .create_grant(&victim.id, "cred", "read", None)
+            .unwrap();
 
         // Sign a block under the attacker's root, but label issued_by
         // as the victim so it slips past the envelope check that fires
@@ -5026,7 +5487,9 @@ mod tests {
         let out = signed_block_for(&victim.id, "S0", &attacker_root);
         let grant = make_grant_with_blocks(&seeded.id, &victim.id, vec![out.signed]);
 
-        let err = store.overwrite_grant_blocks(&seeded.id, &grant).unwrap_err();
+        let err = store
+            .overwrite_grant_blocks(&seeded.id, &grant)
+            .unwrap_err();
         match err {
             StoreError::InvalidInput(s) => assert!(
                 s.contains("chain verification failed"),
@@ -5044,7 +5507,9 @@ mod tests {
         // one and launder authority through the placeholder.
         let store = setup();
         let persona = store.create_persona("agent-overwrite-unsigned").unwrap();
-        let seeded = store.create_grant(&persona.id, "cred", "read", None).unwrap();
+        let seeded = store
+            .create_grant(&persona.id, "cred", "read", None)
+            .unwrap();
 
         let root = store.persona_root_keypair(&persona.id).unwrap();
         let mut out = signed_block_for(&persona.id, "S0", &root);
@@ -5052,7 +5517,9 @@ mod tests {
 
         let grant = make_grant_with_blocks(&seeded.id, &persona.id, vec![out.signed]);
 
-        let err = store.overwrite_grant_blocks(&seeded.id, &grant).unwrap_err();
+        let err = store
+            .overwrite_grant_blocks(&seeded.id, &grant)
+            .unwrap_err();
         match err {
             StoreError::InvalidInput(s) => assert!(
                 s.contains("chain verification failed"),
@@ -5109,7 +5576,9 @@ mod tests {
             sid: "S0".into(),
             resource_type: ResourceType::Credential,
             actions: vec!["write".into()],
-            resource: ResourceSelector::Exact { value: "cred".into() },
+            resource: ResourceSelector::Exact {
+                value: "cred".into(),
+            },
             budget: None,
             usage: Usage::default(),
             conditions: vec![],
@@ -5149,7 +5618,9 @@ mod tests {
             sid: "S0".into(),
             resource_type: ResourceType::Credential,
             actions: vec!["github:push".into()],
-            resource: ResourceSelector::Exact { value: "other/repo".into() },
+            resource: ResourceSelector::Exact {
+                value: "other/repo".into(),
+            },
             budget: None,
             usage: Usage::default(),
             conditions: vec![],
@@ -5189,8 +5660,7 @@ mod tests {
             usage: Usage::default(),
             conditions: vec![],
         };
-        let parent =
-            overwrite_attempt_grant(&store, &seeded.id, &persona.id, parent_stmt);
+        let parent = overwrite_attempt_grant(&store, &seeded.id, &persona.id, parent_stmt);
         store
             .overwrite_grant_blocks(&seeded.id, &parent)
             .expect("parent narrow from '*' must succeed");
@@ -5205,8 +5675,7 @@ mod tests {
             usage: Usage::default(),
             conditions: vec![],
         };
-        let attempt =
-            overwrite_attempt_grant(&store, &seeded.id, &persona.id, child_stmt);
+        let attempt = overwrite_attempt_grant(&store, &seeded.id, &persona.id, child_stmt);
 
         store
             .overwrite_grant_blocks(&seeded.id, &attempt)
@@ -5243,8 +5712,7 @@ mod tests {
             usage: Usage::default(),
             conditions: vec![],
         };
-        let parent =
-            overwrite_attempt_grant(&store, &seeded.id, &persona.id, parent_stmt);
+        let parent = overwrite_attempt_grant(&store, &seeded.id, &persona.id, parent_stmt);
         store
             .overwrite_grant_blocks(&seeded.id, &parent)
             .expect("parent narrow from '*' with tokens=100 must succeed");
@@ -5262,8 +5730,7 @@ mod tests {
             usage: Usage::default(),
             conditions: vec![],
         };
-        let attempt =
-            overwrite_attempt_grant(&store, &seeded.id, &persona.id, child_stmt);
+        let attempt = overwrite_attempt_grant(&store, &seeded.id, &persona.id, child_stmt);
 
         let err = store
             .overwrite_grant_blocks(&seeded.id, &attempt)
@@ -5619,10 +6086,7 @@ mod tests {
 
     // --- — standing parent grant with auto-delegation ---
 
-    fn setup_standing_parent(
-        store: &DaemonStore,
-        max_children_per_day: u64,
-    ) -> (String, String) {
+    fn setup_standing_parent(store: &DaemonStore, max_children_per_day: u64) -> (String, String) {
         let parent_persona = store.create_persona("agent-standing-parent").unwrap();
         let child_persona = store.create_persona("agent-standing-child").unwrap();
         let parent_grant = store
@@ -5672,9 +6136,7 @@ mod tests {
         let parent = store
             .create_grant(&persona.id, "k", "read", Some(3600))
             .unwrap();
-        let err = store
-            .mark_grant_standing(&parent.id, 0, None)
-            .unwrap_err();
+        let err = store.mark_grant_standing(&parent.id, 0, None).unwrap_err();
         match err {
             StoreError::InvalidInput(msg) => assert!(msg.contains("> 0"), "got: {msg}"),
             other => panic!("expected InvalidInput, got {other:?}"),
@@ -5902,6 +6364,148 @@ mod tests {
         assert_eq!(details["parent_grant_id"], parent.id);
     }
 
+    /// implementation-note-94 — end-to-end:
+    ///   1. Initialise the daemon identity (required by the emit path).
+    ///   2. Create parent + child personas; mint a parent grant with
+    ///      delegation depth.
+    ///   3. Delegate to the child via `delegate_grant_full` — this is the
+    ///      production code path the spawn-witness emitter is wired into.
+    ///   4. Read back the persisted witness via
+    ///      `list_spawn_witnesses_for_grants` and verify BOTH signatures
+    ///      under their real trust anchors:
+    ///        a. Envelope signature verifies under the daemon's pubkey
+    ///           (proves emberd composed the receipt).
+    ///        b. body.parent_signature verifies under the **parent
+    ///           persona's real pubkey** loaded out of the personas
+    ///           table — the acceptance criterion "integration test
+    ///           verifies witness under real parent persona pubkey".
+    #[test]
+    fn delegate_grant_emits_spawn_witness_under_real_parent_persona_pubkey() {
+        use core_crypto::{Ed25519Verifier, PublicKey};
+        use core_events::receipt::sign::{
+            verify_receipt_v2, verify_spawn_witness_parent_signature,
+        };
+
+        // Daemon identity is required for the emit path — the spawn
+        // witness emission no-ops when current_identity() is None.
+        // Inline the same per-process tempdir pattern used by
+        // `infra::receipt::tests::ensure_identity` so we share the
+        // process-singleton identity rather than racing it.
+        use once_cell::sync::OnceCell as SyncOnceCell;
+        static INIT_DIR: SyncOnceCell<tempfile::TempDir> = SyncOnceCell::new();
+        let dir = INIT_DIR.get_or_init(|| tempfile::tempdir().expect("tempdir"));
+        let _ = crate::infra::receipt::init_identity(dir.path());
+        let identity = crate::infra::receipt::current_identity()
+            .expect("identity initialised by the line above");
+        let daemon_pubkey_hex = identity.pubkey_hex();
+
+        let store = setup();
+        let parent_persona = store.create_persona("agent-spawn-witness-parent").unwrap();
+        let child_persona = store.create_persona("agent-spawn-witness-child").unwrap();
+
+        let parent = store
+            .create_grant(
+                &parent_persona.id,
+                "api-key",
+                "github:push:acme/*",
+                Some(3600),
+            )
+            .unwrap();
+        store
+            .conn()
+            .execute(
+                "UPDATE grants SET max_delegation_depth = 1 WHERE id = ?1",
+                rusqlite::params![parent.id],
+            )
+            .unwrap();
+
+        let child = store
+            .delegate_grant_full(
+                &parent.id,
+                &child_persona.id,
+                "github:push:acme/widgets",
+                Some(1800),
+                None,
+            )
+            .expect("delegation succeeds");
+
+        // Read the persisted witnesses for the parent grant edge.
+        let witnesses = store
+            .list_spawn_witnesses_for_grants(&[parent.id.clone()])
+            .expect("list_spawn_witnesses_for_grants succeeds");
+        assert_eq!(
+            witnesses.len(),
+            1,
+            "exactly one spawn.witness must be persisted for the parent→child edge"
+        );
+        let (envelope, parent_persona_id_in_row) = &witnesses[0];
+
+        assert_eq!(envelope.kind, "spawn.witness");
+        assert_eq!(parent_persona_id_in_row, &parent_persona.id);
+
+        // Body shape: the four fields must reflect the delegation, with
+        // a populated `parent_signature` in canonical wire form.
+        let body = envelope.body.as_object().expect("body is object");
+        assert_eq!(body["spawned_persona_id"], child_persona.id);
+        assert_eq!(body["parent_persona_id"], parent_persona.id);
+        assert_eq!(body["spawn_grant_id"], parent.id);
+        assert!(
+            body["parent_signature"]
+                .as_str()
+                .map(|s| s.starts_with("ed25519sig:"))
+                .unwrap_or(false),
+            "parent_signature must be in ed25519sig:<hex> form",
+        );
+
+        // (a) Envelope signature verifies under the daemon's pubkey.
+        let daemon_pk = PublicKey(format!("ed25519:{daemon_pubkey_hex}"));
+        verify_receipt_v2(envelope, &daemon_pk, &Ed25519Verifier)
+            .expect("envelope signature verifies under daemon pubkey");
+
+        // (b) body.parent_signature verifies under the REAL parent persona's
+        //     pubkey loaded out of the personas table. This is the
+        //     acceptance criterion — the witness must be cryptographically
+        //     bound to the parent persona's actual key material, not to a
+        //     daemon-stand-in.
+        let parent_pubkey = store
+            .get_persona(&parent_persona.id)
+            .expect("parent persona row")
+            .public_key;
+        assert!(
+            parent_pubkey.starts_with("ed25519:"),
+            "persona pubkey stored in canonical wire form",
+        );
+        // The parent's persona pubkey MUST be distinct from the daemon's —
+        // proves the dual-signature is meaningful, not two signatures from
+        // the same key.
+        assert_ne!(
+            parent_pubkey,
+            format!("ed25519:{daemon_pubkey_hex}"),
+            "parent persona pubkey must differ from daemon pubkey",
+        );
+        verify_spawn_witness_parent_signature(
+            &envelope.body,
+            &PublicKey(parent_pubkey.clone()),
+            &Ed25519Verifier,
+        )
+        .expect("body.parent_signature verifies under real parent persona pubkey");
+
+        // CRIT-7 regression guard: swapping the trust anchors must fail
+        // — otherwise the dual-signature design is collapsed.
+        assert!(
+            verify_spawn_witness_parent_signature(&envelope.body, &daemon_pk, &Ed25519Verifier)
+                .is_err(),
+            "parent_signature must NOT verify under the daemon pubkey",
+        );
+        assert!(
+            verify_receipt_v2(envelope, &PublicKey(parent_pubkey), &Ed25519Verifier).is_err(),
+            "envelope signature must NOT verify under the parent persona pubkey",
+        );
+
+        // The child grant row must still reference the parent.
+        assert_eq!(child.parent_grant_id.as_deref(), Some(parent.id.as_str()));
+    }
+
     // --- T2: DaemonGrantStore adapter tests (design §5 T2) ---
 
     fn parse_grant_uuid(id: &str) -> uuid::Uuid {
@@ -5949,8 +6553,12 @@ mod tests {
     fn test_daemon_grant_store_list_active() {
         let store = setup();
         let persona = store.create_persona("adapter-list").unwrap();
-        let g1 = store.create_grant(&persona.id, "key-a", "read", None).unwrap();
-        let g2 = store.create_grant(&persona.id, "key-b", "read", None).unwrap();
+        let g1 = store
+            .create_grant(&persona.id, "key-a", "read", None)
+            .unwrap();
+        let g2 = store
+            .create_grant(&persona.id, "key-b", "read", None)
+            .unwrap();
         // Revoke g2 so only g1 appears in list_active.
         store.revoke_grant(&g2.id).unwrap();
 
@@ -6001,7 +6609,12 @@ mod tests {
         let child_persona = store.create_persona("cascade-child").unwrap();
 
         let parent = store
-            .create_grant(&parent_persona.id, "api-key", "github:push:acme/*", Some(3600))
+            .create_grant(
+                &parent_persona.id,
+                "api-key",
+                "github:push:acme/*",
+                Some(3600),
+            )
             .unwrap();
         store
             .conn()
@@ -6029,7 +6642,7 @@ mod tests {
         assert_eq!(store.get_grant(&child.id).unwrap().status, "revoked");
     }
 
-    // ---- implementation-note-60: evaluate_tool_call -----------------------------
+    // ---- implementation-note-76: evaluate_tool_call -----------------------------
 
     #[test]
     fn evaluate_tool_call_persona_with_active_grant_permits() {
@@ -6100,9 +6713,7 @@ mod tests {
 
         let store = setup();
         let persona = store.create_persona("claude-code-host-d").unwrap();
-        let _grant = store
-            .create_grant(&persona.id, "k", "read", None)
-            .unwrap();
+        let _grant = store.create_grant(&persona.id, "k", "read", None).unwrap();
 
         // Permit path.
         let _ = store
@@ -6141,9 +6752,7 @@ mod tests {
     fn evaluate_tool_call_grant_id_short_circuits_persona_lookup() {
         let store = setup();
         let persona = store.create_persona("any-persona-name").unwrap();
-        let grant = store
-            .create_grant(&persona.id, "k", "read", None)
-            .unwrap();
+        let grant = store.create_grant(&persona.id, "k", "read", None).unwrap();
 
         // Send a `persona` that doesn't match anything in the store, but
         // a real `grant_id`. The grant_id branch must win.
@@ -6173,7 +6782,7 @@ mod tests {
         assert_eq!(back, d);
     }
 
-    // --- implementation-note-159: derive_wall_clock_secs unit tests ---
+    // --- implementation-note-208: derive_wall_clock_secs unit tests ---
 
     #[test]
     fn wall_clock_derive_mid_grant() {
@@ -6231,7 +6840,12 @@ mod tests {
             for &elapsed in &[0u64, 1, 30, 75, 80, 200] {
                 let now = created.saturating_add(elapsed);
                 for &cap in &[None, Some(0u64), Some(1), Some(75), Some(200)] {
-                    for &expires_at in &[None, Some(created + 50), Some(created + 75), Some(created + 200)] {
+                    for &expires_at in &[
+                        None,
+                        Some(created + 50),
+                        Some(created + 75),
+                        Some(created + 200),
+                    ] {
                         let result = derive_wall_clock_secs(now, created, expires_at, cap);
                         if let Some(c) = cap {
                             assert!(

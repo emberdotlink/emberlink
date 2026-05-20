@@ -92,9 +92,11 @@ pub async fn fly_config_from_store(
         key: &str,
     ) -> Result<Option<String>, StoreError> {
         match store.get(key).await {
-            Ok(bytes) => Ok(Some(String::from_utf8(bytes).map_err(|e| {
-                StoreError::Other(format!("non-utf8 in {}: {e}", key))
-            })?)),
+            Ok(bytes) => {
+                Ok(Some(String::from_utf8(bytes).map_err(|e| {
+                    StoreError::Other(format!("non-utf8 in {}: {e}", key))
+                })?))
+            }
             Err(StoreError::NotFound(_)) => Ok(None),
             Err(other) => Err(other),
         }
@@ -174,10 +176,7 @@ mod tests {
     #[test]
     fn load_from_dir_with_only_api_token_returns_credentials_no_default_org() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        write(
-            &tmp.path().join(ENV_FILENAME),
-            "FLY_API_TOKEN=fo1_solo\n",
-        );
+        write(&tmp.path().join(ENV_FILENAME), "FLY_API_TOKEN=fo1_solo\n");
         let creds = load_from_dir(tmp.path()).expect("must load");
         assert_eq!(creds.token.expose_secret(), "fo1_solo");
         assert!(
@@ -201,8 +200,7 @@ mod tests {
 
     #[test]
     fn parse_env_var_strips_quotes_and_whitespace() {
-        let env =
-            "FLY_API_TOKEN=\"fo1_quoted\"\nFLY_DEFAULT_ORG_SLUG='acme'\n";
+        let env = "FLY_API_TOKEN=\"fo1_quoted\"\nFLY_DEFAULT_ORG_SLUG='acme'\n";
         assert_eq!(
             parse_env_var(env, "FLY_API_TOKEN"),
             Some("fo1_quoted".to_string())
@@ -221,8 +219,8 @@ mod tests {
 
     #[tokio::test]
     async fn fly_config_from_store_happy_path() {
-        use crate::infra::credential_store::test_helpers::MockCredentialStore;
         use crate::infra::credential_store::CredentialStore;
+        use crate::infra::credential_store::test_helpers::MockCredentialStore;
 
         let mock = MockCredentialStore::new();
         mock.put(STORE_KEY_API_TOKEN, b"fo1_test_parent_token")

@@ -56,27 +56,9 @@ pub fn classify_git_argv(argv: &[String]) -> Option<ActionKey> {
 
     match verb {
         // Read-only verbs — always passthrough.
-        "status"
-        | "log"
-        | "diff"
-        | "show"
-        | "remote"
-        | "config"
-        | "rev-parse"
-        | "ls-files"
-        | "ls-tree"
-        | "blame"
-        | "bisect"
-        | "stash"
-        | "worktree"
-        | "reflog"
-        | "shortlog"
-        | "describe"
-        | "grep"
-        | "archive"
-        | "format-patch"
-        | "count-objects"
-        | "fsck" => None,
+        "status" | "log" | "diff" | "show" | "remote" | "config" | "rev-parse" | "ls-files"
+        | "ls-tree" | "blame" | "bisect" | "stash" | "worktree" | "reflog" | "shortlog"
+        | "describe" | "grep" | "archive" | "format-patch" | "count-objects" | "fsck" => None,
 
         // Verbs that have both passthrough and gated forms depending on flags.
         "commit" => classify_commit(rest),
@@ -89,28 +71,9 @@ pub fn classify_git_argv(argv: &[String]) -> Option<ActionKey> {
         "gc" => classify_gc(rest),
 
         // Safe write verbs that have no gated variant in cohort-A scope.
-        "add"
-        | "rm"
-        | "mv"
-        | "checkout"
-        | "switch"
-        | "restore"
-        | "merge"
-        | "pull"
-        | "fetch"
-        | "clone"
-        | "init"
-        | "cherry-pick"
-        | "revert"
-        | "apply"
-        | "am"
-        | "notes"
-        | "submodule"
-        | "subtree"
-        | "bundle"
-        | "request-pull"
-        | "send-email"
-        | "instaweb" => None,
+        "add" | "rm" | "mv" | "checkout" | "switch" | "restore" | "merge" | "pull" | "fetch"
+        | "clone" | "init" | "cherry-pick" | "revert" | "apply" | "am" | "notes" | "submodule"
+        | "subtree" | "bundle" | "request-pull" | "send-email" | "instaweb" => None,
 
         // Catch-all: unknown verbs are passthrough (daemon will re-classify).
         _ => None,
@@ -214,8 +177,7 @@ fn classify_clean(rest: &[String]) -> Option<ActionKey> {
 
 /// `git gc` — `--aggressive` / `--prune=now` are gated; plain `gc` is passthrough.
 fn classify_gc(rest: &[String]) -> Option<ActionKey> {
-    let destructive = has_flag(rest, &["--aggressive"])
-        || rest.iter().any(|a| a == "--prune=now");
+    let destructive = has_flag(rest, &["--aggressive"]) || rest.iter().any(|a| a == "--prune=now");
 
     if destructive {
         Some(ActionKey("git.gc.destructive".to_string()))
@@ -288,9 +250,7 @@ pub fn extract_git_remote_name(verb: &str, rest: &[String]) -> Option<String> {
         _ => return None,
     }
     // Skip leading flags (tokens starting with '-') to find first positional.
-    rest.iter()
-        .find(|a| !a.starts_with('-'))
-        .cloned()
+    rest.iter().find(|a| !a.starts_with('-')).cloned()
 }
 
 #[cfg(test)]
@@ -314,12 +274,18 @@ mod tests {
 
     #[test]
     fn push_with_remote_is_git_push() {
-        assert_eq!(key(&["push", "origin", "main"]), Some("git.push".to_string()));
+        assert_eq!(
+            key(&["push", "origin", "main"]),
+            Some("git.push".to_string())
+        );
     }
 
     #[test]
     fn push_force_long_flag() {
-        assert_eq!(key(&["push", "--force"]), Some("git.push.force".to_string()));
+        assert_eq!(
+            key(&["push", "--force"]),
+            Some("git.push.force".to_string())
+        );
     }
 
     #[test]
@@ -462,10 +428,7 @@ mod tests {
 
     #[test]
     fn clean_force_short() {
-        assert_eq!(
-            key(&["clean", "-f"]),
-            Some("git.clean.force".to_string())
-        );
+        assert_eq!(key(&["clean", "-f"]), Some("git.clean.force".to_string()));
     }
 
     #[test]
@@ -479,19 +442,13 @@ mod tests {
     #[test]
     fn clean_fd_combined() {
         // `-fd` is a combined short flag — force + directories.
-        assert_eq!(
-            key(&["clean", "-fd"]),
-            Some("git.clean.force".to_string())
-        );
+        assert_eq!(key(&["clean", "-fd"]), Some("git.clean.force".to_string()));
     }
 
     #[test]
     fn clean_dfx_combined() {
         // `-dfx` contains 'f' → gated.
-        assert_eq!(
-            key(&["clean", "-dfx"]),
-            Some("git.clean.force".to_string())
-        );
+        assert_eq!(key(&["clean", "-dfx"]), Some("git.clean.force".to_string()));
     }
 
     // --- branch ---
@@ -578,8 +535,16 @@ mod tests {
     #[test]
     fn read_only_verbs_are_passthrough() {
         for verb in &[
-            "status", "log", "diff", "show", "remote", "config",
-            "rev-parse", "ls-files", "blame", "reflog",
+            "status",
+            "log",
+            "diff",
+            "show",
+            "remote",
+            "config",
+            "rev-parse",
+            "ls-files",
+            "blame",
+            "reflog",
         ] {
             assert!(
                 classify_git_argv(&args(&[verb])).is_none(),
@@ -591,8 +556,18 @@ mod tests {
     #[test]
     fn safe_write_verbs_are_passthrough() {
         for verb in &[
-            "add", "rm", "mv", "checkout", "switch", "merge", "pull",
-            "fetch", "clone", "init", "cherry-pick", "revert",
+            "add",
+            "rm",
+            "mv",
+            "checkout",
+            "switch",
+            "merge",
+            "pull",
+            "fetch",
+            "clone",
+            "init",
+            "cherry-pick",
+            "revert",
         ] {
             assert!(
                 classify_git_argv(&args(&[verb])).is_none(),
@@ -611,7 +586,10 @@ mod tests {
     #[test]
     fn extract_remote_name_push_with_origin() {
         let argv: Vec<String> = vec!["push".into(), "origin".into(), "main".into()];
-        assert_eq!(extract_git_remote_name("push", &argv[1..]), Some("origin".into()));
+        assert_eq!(
+            extract_git_remote_name("push", &argv[1..]),
+            Some("origin".into())
+        );
     }
 
     #[test]
@@ -623,24 +601,41 @@ mod tests {
     #[test]
     fn extract_remote_name_push_with_upstream_flag() {
         // git push -u origin feature/foo
-        let argv: Vec<String> = vec!["push".into(), "-u".into(), "origin".into(), "feature/foo".into()];
-        assert_eq!(extract_git_remote_name("push", &argv[1..]), Some("origin".into()));
+        let argv: Vec<String> = vec![
+            "push".into(),
+            "-u".into(),
+            "origin".into(),
+            "feature/foo".into(),
+        ];
+        assert_eq!(
+            extract_git_remote_name("push", &argv[1..]),
+            Some("origin".into())
+        );
     }
 
     #[test]
     fn extract_remote_name_push_with_force_flag() {
         let argv: Vec<String> = vec!["push".into(), "--force".into(), "upstream".into()];
-        assert_eq!(extract_git_remote_name("push", &argv[1..]), Some("upstream".into()));
+        assert_eq!(
+            extract_git_remote_name("push", &argv[1..]),
+            Some("upstream".into())
+        );
     }
 
     #[test]
     fn extract_remote_name_fetch_with_remote() {
         let argv: Vec<String> = vec!["fetch".into(), "upstream".into()];
-        assert_eq!(extract_git_remote_name("fetch", &argv[1..]), Some("upstream".into()));
+        assert_eq!(
+            extract_git_remote_name("fetch", &argv[1..]),
+            Some("upstream".into())
+        );
     }
 
     #[test]
     fn extract_remote_name_unrelated_verb_returns_none() {
-        assert_eq!(extract_git_remote_name("commit", &["-m".into(), "msg".into()]), None);
+        assert_eq!(
+            extract_git_remote_name("commit", &["-m".into(), "msg".into()]),
+            None
+        );
     }
 }

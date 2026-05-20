@@ -1,4 +1,4 @@
-//! implementation-note-256 — T3 cutover end-to-end test.
+//! implementation-note-361 — T3 cutover end-to-end test.
 //!
 //! Pins the vault-first credential-discovery contract added by PR4A
 //! (`github_config_from_store` design reader) + PR4B (the
@@ -25,10 +25,11 @@
 //! lives entirely inside `runtime.rs`'s broker registration block and
 //! reduces to a single call: `github_config_from_store(&store)` against
 //! a populated `LocalEncryptedStore`. This test drives that exact call
-//! shape — same `LocalEncryptedStore::new(Rc<Vault>, Rc<DaemonStore>)`
-//! construction `runtime.rs` performs at startup — so the regression
-//! surface is identical to a full-daemon-boot variant without the
-//! ten-minute startup tax.
+//! shape — same `LocalEncryptedStore::new(Rc<DaemonStore>)`
+//! construction `runtime.rs` performs at startup, with the live vault
+//! attached through the store slot — so the regression surface is
+//! identical to a full-daemon-boot variant without the ten-minute
+//! startup tax.
 //!
 //! Sibling reference: `credential_store_wiring.rs` uses the same
 //! construction pattern for its empty-store fallback contract.
@@ -54,9 +55,9 @@ use ember_daemon::infra::vault::Vault;
 use tempfile::TempDir;
 use tracing::Subscriber;
 use tracing::subscriber::set_default;
+use tracing_subscriber::Layer;
 use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
-use tracing_subscriber::Layer;
 
 /// Deterministic vault key for this test. Same shape as
 /// `budget_persistence.rs::TEST_VAULT_KEY`.
@@ -124,8 +125,7 @@ impl tracing::field::Visit for FieldVisitor {
         if !self.0.is_empty() {
             self.0.push(' ');
         }
-        self.0
-            .push_str(&format!("{}=\"{}\"", field.name(), value));
+        self.0.push_str(&format!("{}=\"{}\"", field.name(), value));
     }
 
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
@@ -155,9 +155,8 @@ async fn cutover_e2e_vault_first_path() {
     //       the same LocalEncryptedStore the runtime constructs at
     //       startup (sibling: credential_store_wiring.rs).
     let store = Rc::new(DaemonStore::open_in_memory().expect("open in-memory store"));
-    let vault = Rc::new(Vault::new(TEST_VAULT_KEY));
-    let cs: Arc<dyn CredentialStore> =
-        Arc::new(LocalEncryptedStore::new(Rc::clone(&vault), Rc::clone(&store)));
+    store.set_vault(Rc::new(Vault::new(TEST_VAULT_KEY)));
+    let cs: Arc<dyn CredentialStore> = Arc::new(LocalEncryptedStore::new(Rc::clone(&store)));
 
     // ── 2. Pre-seed the vault with a complete design-grammar GitHub
     //       App credential triple. This is the moral equivalent of the
@@ -264,7 +263,10 @@ async fn cutover_e2e_vault_first_path() {
         !vault_sourced.is_empty(),
         "expected ≥1 bot-identity-source event with source=\"vault\"; \
          captured bot-identity-source events: {:?}",
-        bot_id_events.iter().map(|e| &e.rendered).collect::<Vec<_>>()
+        bot_id_events
+            .iter()
+            .map(|e| &e.rendered)
+            .collect::<Vec<_>>()
     );
     // No file-sourced event must have fired — that would mean the
     // legacy `load_gh_app_credentials` branch was taken.
@@ -288,23 +290,21 @@ async fn cutover_e2e_vault_first_path() {
     //       available signal rather than a hard gate — the
     //       bot-identity-source assertion above is the load-bearing
     //       part of acceptance criterion (2).
-    if let (Some(before), Some(after)) =
-        (atime_before_pem, file_atime(&pem_sentinel))
-    {
+    if let (Some(before), Some(after)) = (atime_before_pem, file_atime(&pem_sentinel)) {
         assert!(
-            after <= before
-                .checked_add(std::time::Duration::from_secs(1))
-                .unwrap_or(before),
+            after
+                <= before
+                    .checked_add(std::time::Duration::from_secs(1))
+                    .unwrap_or(before),
             "PEM file atime advanced — file was opened despite vault-first hit"
         );
     }
-    if let (Some(before), Some(after)) =
-        (atime_before_env, file_atime(&env_sentinel))
-    {
+    if let (Some(before), Some(after)) = (atime_before_env, file_atime(&env_sentinel)) {
         assert!(
-            after <= before
-                .checked_add(std::time::Duration::from_secs(1))
-                .unwrap_or(before),
+            after
+                <= before
+                    .checked_add(std::time::Duration::from_secs(1))
+                    .unwrap_or(before),
             "env file atime advanced — file was opened despite vault-first hit"
         );
     }

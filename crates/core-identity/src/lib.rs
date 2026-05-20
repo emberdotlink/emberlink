@@ -1,5 +1,12 @@
-use core_event_types::{DeviceAddedEvent, DeviceEncryptionKeyRotatedEvent, DeviceFrozenEvent, DeviceKeyRotatedEvent, DeviceReplacedEvent, DeviceRevokedEvent, EventBody, RootCreatedEvent, RootKeyRotatedEvent, RootRevokedEvent};
-use core_principals::{DisclosedLinkage, DisclosedPersona, DisclosureView, IdentityRoot, LinkageAssertion, Persona, PublicKeyMaterial};
+use core_event_types::{
+    DeviceAddedEvent, DeviceEncryptionKeyRotatedEvent, DeviceFrozenEvent, DeviceKeyRotatedEvent,
+    DeviceReplacedEvent, DeviceRevokedEvent, EventBody, RootCreatedEvent, RootKeyRotatedEvent,
+    RootRevokedEvent,
+};
+use core_principals::{
+    DisclosedLinkage, DisclosedPersona, DisclosureView, IdentityRoot, LinkageAssertion, Persona,
+    PublicKeyMaterial,
+};
 
 pub fn create_root(
     id: impl Into<String>,
@@ -167,7 +174,7 @@ pub fn disclosure_view(
 
 #[cfg(test)]
 mod tests {
-    use core_event_types::{EventType};
+    use core_event_types::EventType;
     use core_principals::{KeyAlgorithm, SurvivalMode};
 
     use super::*;

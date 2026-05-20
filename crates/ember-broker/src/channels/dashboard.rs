@@ -30,7 +30,10 @@ impl ApprovalChannel for DashboardChannel {
     }
 
     async fn request(&self, req: GrantRequest) -> Result<ApprovalDecision> {
-        tracing::info!(?req, "dashboard channel: stub — would surface in /approvals");
+        tracing::info!(
+            ?req,
+            "dashboard channel: stub — would surface in /approvals"
+        );
         Ok(ApprovalDecision::TimedOut)
     }
 }

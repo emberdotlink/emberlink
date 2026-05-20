@@ -18,9 +18,9 @@
 //! methods just call through to the underlying sync `Vault` API
 //! directly rather than dispatching through `spawn_blocking`.
 //!
-//! # Receipt emission (implementation-note-93)
+//! # Receipt emission (implementation-note-116)
 //!
-//! Per implementation-note-136 security-review Findings 5 and 17 (audit-completeness
+//! Per implementation-note-185 security-review Findings 5 and 17 (audit-completeness
 //! gap for vault reads), every successful `get` emits a v2
 //! [`ReceiptEnvelope`] with `kind = "vault.read"`. Emission is
 //! best-effort — failures to sign or persist log a warning but do not
@@ -28,36 +28,44 @@
 //! initialised the process identity (`current_identity()` returns
 //! `None`) silently skip emission.
 
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use core_events::receipt::envelope::{ReceiptEnvelope, ReceiptVersion, TerminationAuthority};
 use core_events::receipt::sign::sign_receipt_v2;
+use zeroize::Zeroize;
 
 use crate::infra::store::DaemonStore;
-use crate::infra::vault::{Vault, VaultError, VaultScope};
+use crate::infra::vault::{VaultError, VaultScope, logical_name_from_storage};
 
 use super::{CredentialStore, StoreError};
 
 /// v2 kind discriminator for `LocalEncryptedStore::get` success-path
-/// audit. Per implementation-note-93 (Findings 5, 17 — daemon
+/// audit. Per implementation-note-116 (Findings 5, 17 — daemon
 /// vault reads must leave a signed receipt so post-hoc audit can
 /// reconstruct which credentials were read by whom and when).
 pub(crate) const RECEIPT_KIND_VAULT_READ: &str = "vault.read";
 
+enum VaultSource {
+    SharedInteractive,
+    BootstrapInteractive(Rc<crate::infra::vault::Vault>),
+    HeadlessAttestedEnrollment { data_dir: PathBuf },
+    InteractiveOrHeadless { data_dir: PathBuf },
+}
+
 /// `CredentialStore` impl backed by the local sealed-credential vault.
 ///
-/// implementation-note-137: holds an `Rc<Vault>` (was `Arc<Vault>`
-/// — switched to `Rc` so the daemon's LocalSet has a single
-/// reference-count substrate, the MEK byte-array is shared with the
-/// proxy / dashboard / store Rc<Vault>s, and the Send/Sync invariant is
-/// carried by the unsafe impl below rather than by the inner Arc).
-/// `Rc<DaemonStore>` (the SQLite connection — `!Send + !Sync`) is
-/// confined to the daemon's `LocalSet` thread.
+/// implementation-note-186: the live vault is resolved from the shared
+/// store slot at point of use instead of being owned directly here. That lets
+/// explicit lock cut off credential-store reads without needing to tear down
+/// the helper itself.
+///
+/// `Rc<DaemonStore>` (the SQLite connection — `!Send + !Sync`) is confined
+/// to the daemon's `LocalSet` thread.
 pub struct LocalEncryptedStore {
-    vault: Rc<Vault>,
     store: Rc<DaemonStore>,
+    vault_source: VaultSource,
 }
 
 // SAFETY: `DaemonStore` (rusqlite) is `!Send + !Sync` by marker, but the
@@ -71,13 +79,213 @@ unsafe impl Send for LocalEncryptedStore {}
 unsafe impl Sync for LocalEncryptedStore {}
 
 impl LocalEncryptedStore {
-    /// Construct a new `LocalEncryptedStore` from an open vault and an
-    /// open store. Both arguments are typically minted at daemon startup
-    /// (`runtime.rs` — wired in sub-piece D) and reused for the rest of
-    /// the process lifetime.
-    pub fn new(vault: Rc<Vault>, store: Rc<DaemonStore>) -> Self {
-        Self { vault, store }
+    /// Construct a new `LocalEncryptedStore` from an open store. The live
+    /// vault is read from the store's shared slot on each operation.
+    pub fn new(store: Rc<DaemonStore>) -> Self {
+        Self {
+            store,
+            vault_source: VaultSource::SharedInteractive,
+        }
     }
+
+    /// Construct a bootstrap-scoped `LocalEncryptedStore` that reads through a
+    /// temporary vault handle without requiring the daemon's shared live-vault
+    /// slot to be populated.
+    ///
+    /// Runtime startup uses this narrower seam for broker credential hydration
+    /// so the daemon can keep the shared interactive slot empty until an
+    /// operator-triggered `register_session` / `vault_unlock` repopulates it.
+    pub fn with_bootstrap_vault(
+        store: Rc<DaemonStore>,
+        vault: Rc<crate::infra::vault::Vault>,
+    ) -> Self {
+        Self {
+            store,
+            vault_source: VaultSource::BootstrapInteractive(vault),
+        }
+    }
+
+    /// Construct a headless-scoped `LocalEncryptedStore` that rehydrates a
+    /// temporary vault from the active attested enrollment on each operation.
+    ///
+    /// This keeps the headless MEK out of long-lived daemon memory and gives
+    /// design a real second adapter to build unattended broker authority on
+    /// without publishing anything into the shared interactive live-vault
+    /// slot.
+    pub fn with_headless_attested_enrollment(
+        store: Rc<DaemonStore>,
+        data_dir: impl AsRef<Path>,
+    ) -> Self {
+        Self {
+            store,
+            vault_source: VaultSource::HeadlessAttestedEnrollment {
+                data_dir: data_dir.as_ref().to_path_buf(),
+            },
+        }
+    }
+
+    /// Construct the local runtime authority seam for broker reloads.
+    ///
+    /// Read paths prefer the shared interactive live-vault slot and fall back
+    /// to the active headless enrollment only when the interactive lane is
+    /// unavailable. Mutation paths stay interactive-only so headless
+    /// enrollment cannot silently widen into a general local-vault write lane.
+    pub fn with_runtime_authority(store: Rc<DaemonStore>, data_dir: impl AsRef<Path>) -> Self {
+        Self {
+            store,
+            vault_source: VaultSource::InteractiveOrHeadless {
+                data_dir: data_dir.as_ref().to_path_buf(),
+            },
+        }
+    }
+
+    fn current_interactive_vault(
+        &self,
+        key: &str,
+    ) -> Result<Rc<crate::infra::vault::Vault>, StoreError> {
+        match &self.vault_source {
+            VaultSource::BootstrapInteractive(vault) => Ok(Rc::clone(vault)),
+            _ => crate::infra::interactive_unlock::current_live_vault(&self.store).map_err(|err| {
+                StoreError::Unavailable(err.with_context(&format!("vault key {key}")))
+            }),
+        }
+    }
+
+    fn read_access(
+        &self,
+        key: &str,
+    ) -> Result<(Rc<crate::infra::vault::Vault>, VaultScope), StoreError> {
+        match &self.vault_source {
+            VaultSource::SharedInteractive => Ok((
+                self.current_interactive_vault(key)?,
+                VaultScope::Interactive,
+            )),
+            VaultSource::BootstrapInteractive(vault) => {
+                Ok((Rc::clone(vault), VaultScope::Interactive))
+            }
+            VaultSource::HeadlessAttestedEnrollment { data_dir } => Ok((
+                current_headless_vault(&self.store, data_dir, key)?,
+                VaultScope::Headless,
+            )),
+            VaultSource::InteractiveOrHeadless { data_dir } => {
+                match self.current_interactive_vault(key) {
+                    Ok(vault) => Ok((vault, VaultScope::Interactive)),
+                    Err(interactive_err) => {
+                        match current_headless_vault(&self.store, data_dir, key) {
+                            Ok(vault) => Ok((vault, VaultScope::Headless)),
+                            Err(headless_err) => Err(StoreError::Unavailable(format!(
+                                "runtime authority unavailable for key {key}: interactive lane unavailable ({interactive_err}); headless lane unavailable ({headless_err})"
+                            ))),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn write_access(
+        &self,
+        key: &str,
+    ) -> Result<(Rc<crate::infra::vault::Vault>, VaultScope), StoreError> {
+        match &self.vault_source {
+            VaultSource::SharedInteractive => Ok((
+                self.current_interactive_vault(key)?,
+                VaultScope::Interactive,
+            )),
+            VaultSource::BootstrapInteractive(vault) => {
+                Ok((Rc::clone(vault), VaultScope::Interactive))
+            }
+            VaultSource::HeadlessAttestedEnrollment { data_dir } => Ok((
+                current_headless_vault(&self.store, data_dir, key)?,
+                VaultScope::Headless,
+            )),
+            VaultSource::InteractiveOrHeadless { .. } => self
+                .current_interactive_vault(key)
+                .map(|vault| (vault, VaultScope::Interactive))
+                .map_err(|err| {
+                    StoreError::Unavailable(format!(
+                        "interactive runtime authority required for key {key}: {err}"
+                    ))
+                }),
+        }
+    }
+
+    fn list_metadata_names(&self, prefix: Option<&str>) -> Result<Vec<String>, StoreError> {
+        let metadata_scope = match &self.vault_source {
+            VaultSource::HeadlessAttestedEnrollment { .. } => VaultScope::Headless,
+            VaultSource::SharedInteractive
+            | VaultSource::BootstrapInteractive(_)
+            | VaultSource::InteractiveOrHeadless { .. } => VaultScope::Interactive,
+        };
+        let prefix = prefix.unwrap_or("");
+        let mut stmt = self
+            .store
+            .conn()
+            .prepare("SELECT name FROM credentials ORDER BY created_at")
+            .map_err(|e| StoreError::Other(format!("sqlite: {e}")))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| StoreError::Other(format!("sqlite: {e}")))?;
+
+        let mut names = Vec::new();
+        for row in rows {
+            let stored_name = row.map_err(|e| StoreError::Other(format!("sqlite: {e}")))?;
+            let Some(logical_name) = logical_name_from_storage(metadata_scope, &stored_name) else {
+                continue;
+            };
+            if prefix.is_empty() || logical_name.starts_with(prefix) {
+                names.push(logical_name);
+            }
+        }
+        Ok(names)
+    }
+}
+
+fn current_headless_vault(
+    store: &DaemonStore,
+    data_dir: &Path,
+    key: &str,
+) -> Result<Rc<crate::infra::vault::Vault>, StoreError> {
+    match crate::infra::attested_device::AttestedDevice::active_status(data_dir) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            if let Err(err) = crate::infra::headless_scope::clear_headless_scope(store) {
+                tracing::warn!(
+                    error = %err,
+                    "headless scope cleanup failed while clearing stale ciphertext after enrollment disappearance"
+                );
+            }
+            return Err(StoreError::Unavailable(format!(
+                "headless enrollment unavailable for vault key {key}: no active enrollment"
+            )));
+        }
+        Err(err) => {
+            return Err(StoreError::Unavailable(format!(
+                "headless enrollment metadata unavailable for vault key {key}: {err}"
+            )));
+        }
+    }
+
+    let Some(device) = crate::infra::attested_device::AttestedDevice::load_active(data_dir)
+        .map_err(|err| {
+            StoreError::Unavailable(format!(
+                "headless enrollment metadata unavailable for vault key {key}: {err}"
+            ))
+        })?
+    else {
+        return Err(StoreError::Unavailable(format!(
+            "headless enrollment unavailable for vault key {key}: no active enrollment"
+        )));
+    };
+
+    let mut mek = device.unwrap_mek().map_err(|err| {
+        StoreError::Unavailable(format!(
+            "headless enrollment key unavailable for vault key {key}: {err}"
+        ))
+    })?;
+    let vault = Rc::new(crate::infra::vault::Vault::new(mek));
+    mek.zeroize();
+    Ok(vault)
 }
 
 /// Translate `VaultError` into the abstract `StoreError`.
@@ -109,16 +317,16 @@ fn map_vault_error(e: VaultError, key: &str) -> StoreError {
 #[async_trait::async_trait]
 impl CredentialStore for LocalEncryptedStore {
     async fn get(&self, key: &str) -> Result<Vec<u8>, StoreError> {
-        let plaintext = self
-            .vault
-            .get(VaultScope::Interactive, &self.store, key)
+        let (vault, scope) = self.read_access(key)?;
+        let plaintext = vault
+            .get(scope, &self.store, key)
             .map_err(|e| map_vault_error(e, key))?;
 
-        // implementation-note-93: emit a v2 `vault.read` Receipt
+        // implementation-note-116: emit a v2 `vault.read` Receipt
         // on the success path so the audit trail includes every
         // daemon-side credential read. Best-effort — emission failures
         // log a warning but do NOT fail the read.
-        emit_vault_read_receipt(&self.store, key);
+        emit_vault_read_receipt(&self.store, key, scope);
 
         Ok(plaintext)
     }
@@ -130,16 +338,17 @@ impl CredentialStore for LocalEncryptedStore {
         // currently fails — this matches the existing `vault_add`
         // semantics. Overwrite-in-place is a follow-up; for now callers
         // must `delete` first if they really mean overwrite.
-        self.vault
-            .add(VaultScope::Interactive, &self.store, key, value, None)
+        let (vault, scope) = self.write_access(key)?;
+        vault
+            .add(scope, &self.store, key, value, None)
             .map(|_info| ())
             .map_err(|e| map_vault_error(e, key))
     }
 
     async fn list(&self, prefix: Option<&str>) -> Result<Vec<String>, StoreError> {
-        let infos = self
-            .vault
-            .list(VaultScope::Interactive, &self.store)
+        let (vault, scope) = self.read_access(prefix.unwrap_or(""))?;
+        let infos = vault
+            .list(scope, &self.store)
             .map_err(|e| map_vault_error(e, ""))?;
         let prefix = prefix.unwrap_or("");
         let names = infos
@@ -150,15 +359,20 @@ impl CredentialStore for LocalEncryptedStore {
         Ok(names)
     }
 
+    async fn list_metadata(&self, prefix: Option<&str>) -> Result<Vec<String>, StoreError> {
+        self.list_metadata_names(prefix)
+    }
+
     async fn delete(&self, key: &str) -> Result<(), StoreError> {
-        self.vault
-            .remove(VaultScope::Interactive, &self.store, key)
+        let (vault, scope) = self.write_access(key)?;
+        vault
+            .remove(scope, &self.store, key)
             .map_err(|e| map_vault_error(e, key))
     }
 }
 
 // ---------------------------------------------------------------------------
-// Receipt emission (implementation-note-93)
+// Receipt emission (implementation-note-116)
 // ---------------------------------------------------------------------------
 
 /// Best-effort: build, sign, and persist a v2 `vault.read` Receipt for
@@ -177,7 +391,14 @@ impl CredentialStore for LocalEncryptedStore {
 /// sign/persist failure rather than propagating — the caller already
 /// has the plaintext; failing the read to make a side-effect green
 /// would be a regression, not a fix.
-fn emit_vault_read_receipt(store: &DaemonStore, key: &str) {
+fn vault_scope_label(scope: VaultScope) -> &'static str {
+    match scope {
+        VaultScope::Interactive => "interactive",
+        VaultScope::Headless => "headless",
+    }
+}
+
+fn emit_vault_read_receipt(store: &DaemonStore, key: &str, scope: VaultScope) {
     let Some(identity) = crate::infra::receipt::current_identity() else {
         // Tests and pre-startup paths — silently skip. The receipt is a
         // best-effort audit artifact; the read itself is the contract.
@@ -190,7 +411,7 @@ fn emit_vault_read_receipt(store: &DaemonStore, key: &str) {
         .unwrap_or(0);
     let body = serde_json::json!({
         "key": key,
-        "scope": "interactive",
+        "scope": vault_scope_label(scope),
         "read_at_epoch_secs": now_epoch,
     });
     let mut envelope = ReceiptEnvelope {
@@ -205,6 +426,11 @@ fn emit_vault_read_receipt(store: &DaemonStore, key: &str) {
         presence_kind: None,
         body,
         signature: None,
+        calling_principal: None,
+        presence_reason: None,
+        handle_id: None,
+        challenge_hash: None,
+        verifier_aaguid: None,
     };
 
     let signer = crate::session::lifecycle::DaemonPersonaSigner::new(identity);
@@ -260,9 +486,12 @@ mod tests {
     /// `infra::store::tests` (open_in_memory ships a vault-attached
     /// store under `cfg(test)`).
     fn fresh_store() -> LocalEncryptedStore {
-        let store = Rc::new(DaemonStore::open_in_memory().expect("open in-memory store"));
-        let vault = Rc::new(Vault::new([0xABu8; 32]));
-        LocalEncryptedStore::new(vault, store)
+        let store = Rc::new(
+            DaemonStore::open_in_memory_without_vault()
+                .expect("open in-memory store without vault"),
+        );
+        store.set_vault(Rc::new(Vault::new([0xABu8; 32])));
+        LocalEncryptedStore::new(store)
     }
 
     // The async trait surface is exercised on a current_thread runtime
@@ -298,6 +527,251 @@ mod tests {
     }
 
     #[test]
+    fn get_without_live_vault_surfaces_shared_unavailable_contract() {
+        let store = Rc::new(
+            DaemonStore::open_in_memory_without_vault()
+                .expect("open in-memory store without vault"),
+        );
+        let cs = LocalEncryptedStore::new(store);
+
+        rt().block_on(async {
+            let err = cs.get("svc/no-vault").await.unwrap_err();
+            match err {
+                StoreError::Unavailable(message) => {
+                    assert!(
+                        message.contains("vault unavailable"),
+                        "shared live-vault seam must keep the unavailable reason: {message}"
+                    );
+                    assert!(
+                        message.contains("ember vault unlock"),
+                        "shared live-vault seam must keep operator guidance: {message}"
+                    );
+                }
+                other => panic!("expected Unavailable, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn bootstrap_vault_override_reads_without_live_slot() {
+        let store = Rc::new(
+            DaemonStore::open_in_memory_without_vault()
+                .expect("open in-memory store without vault"),
+        );
+        let cs = LocalEncryptedStore::with_bootstrap_vault(
+            Rc::clone(&store),
+            Rc::new(Vault::new([0xBCu8; 32])),
+        );
+
+        rt().block_on(async {
+            cs.put("svc/bootstrap-token", b"bootstrap").await.unwrap();
+            let got = cs.get("svc/bootstrap-token").await.unwrap();
+            assert_eq!(got, b"bootstrap");
+            assert!(
+                store.vault().is_none(),
+                "bootstrap credential hydration must not populate the shared live-vault slot"
+            );
+        });
+    }
+
+    #[test]
+    fn headless_attested_enrollment_requires_active_enrollment() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let store = Rc::new(
+            DaemonStore::open_in_memory_without_vault()
+                .expect("open in-memory store without vault"),
+        );
+        let cs =
+            LocalEncryptedStore::with_headless_attested_enrollment(Rc::clone(&store), tmp.path());
+
+        rt().block_on(async {
+            let err = cs.get("svc/headless-token").await.unwrap_err();
+            match err {
+                StoreError::Unavailable(message) => {
+                    assert!(
+                        message.contains("headless enrollment unavailable"),
+                        "missing headless enrollment must surface the authority seam: {message}"
+                    );
+                    assert!(
+                        message.contains("no active enrollment"),
+                        "missing headless enrollment must explain the operator action: {message}"
+                    );
+                }
+                other => panic!("expected Unavailable, got {other:?}"),
+            }
+            assert!(
+                store.vault().is_none(),
+                "headless credential reads must not rely on the shared interactive live-vault slot"
+            );
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn missing_headless_enrollment_clears_stale_headless_scope() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let store = Rc::new(
+            DaemonStore::open_in_memory_without_vault()
+                .expect("open in-memory store without vault"),
+        );
+        let stray = Vault::new([0xD3u8; 32]);
+        stray
+            .add(
+                VaultScope::Headless,
+                &store,
+                "svc/stale-headless",
+                b"stale",
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            crate::infra::headless_scope::list_headless_keys(&store).unwrap(),
+            vec!["svc/stale-headless".to_string()]
+        );
+
+        let cs =
+            LocalEncryptedStore::with_headless_attested_enrollment(Rc::clone(&store), tmp.path());
+
+        rt().block_on(async {
+            let err = cs.get("svc/stale-headless").await.unwrap_err();
+            assert!(
+                matches!(err, StoreError::Unavailable(_)),
+                "missing enrollment must still fail closed"
+            );
+        });
+
+        assert!(
+            crate::infra::headless_scope::list_headless_keys(&store)
+                .unwrap()
+                .is_empty(),
+            "stale headless ciphertext must be pruned once the daemon observes no active enrollment"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn headless_attested_enrollment_round_trips_without_live_slot() {
+        use std::time::Duration;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let persona = "test-local-encrypted-store-headless";
+        let mek = [0xD4u8; 32];
+        let store = Rc::new(
+            DaemonStore::open_in_memory_without_vault()
+                .expect("open in-memory store without vault"),
+        );
+        let device = crate::infra::attested_device::AttestedDevice::enroll_active(
+            tmp.path(),
+            persona,
+            Duration::from_secs(3600),
+            &mek,
+        )
+        .expect("enroll active succeeds");
+        let cs =
+            LocalEncryptedStore::with_headless_attested_enrollment(Rc::clone(&store), tmp.path());
+
+        rt().block_on(async {
+            cs.put("svc/headless-token", b"headless").await.unwrap();
+            let got = cs.get("svc/headless-token").await.unwrap();
+            assert_eq!(got, b"headless");
+            assert!(
+                store.vault().is_none(),
+                "headless credential hydration must not populate the shared interactive live-vault slot"
+            );
+        });
+
+        crate::infra::attested_device::AttestedDevice::revoke_active(
+            tmp.path(),
+            Some(&device.enrollment_id),
+        )
+        .expect("revoke active succeeds");
+    }
+
+    #[test]
+    fn runtime_authority_falls_back_to_headless_when_interactive_unavailable() {
+        use std::time::Duration;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let persona = "test-runtime-headless-read-fallback";
+        let store = Rc::new(
+            DaemonStore::open_in_memory_without_vault()
+                .expect("open in-memory store without vault"),
+        );
+        let device = crate::infra::attested_device::AttestedDevice::enroll_active(
+            tmp.path(),
+            persona,
+            Duration::from_secs(3600),
+            &[0xD5u8; 32],
+        )
+        .expect("enroll active succeeds");
+        let headless =
+            LocalEncryptedStore::with_headless_attested_enrollment(Rc::clone(&store), tmp.path());
+        let runtime = LocalEncryptedStore::with_runtime_authority(Rc::clone(&store), tmp.path());
+
+        rt().block_on(async {
+            headless.put("svc/runtime-token", b"headless").await.unwrap();
+            let got = runtime.get("svc/runtime-token").await.unwrap();
+            assert_eq!(got, b"headless");
+            assert!(
+                store.vault().is_none(),
+                "runtime authority fallback must not repopulate the shared interactive live-vault slot"
+            );
+        });
+
+        crate::infra::attested_device::AttestedDevice::revoke_active(
+            tmp.path(),
+            Some(&device.enrollment_id),
+        )
+        .expect("revoke active succeeds");
+    }
+
+    #[test]
+    fn runtime_authority_writes_still_require_interactive_unlock() {
+        use std::time::Duration;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let persona = "test-runtime-headless-write-locked";
+        let store = Rc::new(
+            DaemonStore::open_in_memory_without_vault()
+                .expect("open in-memory store without vault"),
+        );
+        let device = crate::infra::attested_device::AttestedDevice::enroll_active(
+            tmp.path(),
+            persona,
+            Duration::from_secs(3600),
+            &[0xE1u8; 32],
+        )
+        .expect("enroll active succeeds");
+        let runtime = LocalEncryptedStore::with_runtime_authority(Rc::clone(&store), tmp.path());
+
+        rt().block_on(async {
+            let err = runtime
+                .put("svc/runtime-write", b"blocked")
+                .await
+                .unwrap_err();
+            match err {
+                StoreError::Unavailable(message) => {
+                    assert!(
+                        message.contains("interactive runtime authority required"),
+                        "runtime writes must stay interactive-only: {message}"
+                    );
+                }
+                other => panic!("expected Unavailable, got {other:?}"),
+            }
+            assert!(
+                store.vault().is_none(),
+                "interactive-only write failure must not repopulate the shared live-vault slot"
+            );
+        });
+
+        crate::infra::attested_device::AttestedDevice::revoke_active(
+            tmp.path(),
+            Some(&device.enrollment_id),
+        )
+        .expect("revoke active succeeds");
+    }
+
+    #[test]
     fn list_empty_prefix_returns_all() {
         let cs = fresh_store();
         rt().block_on(async {
@@ -307,7 +781,10 @@ mod tests {
 
             let mut all = cs.list(None).await.unwrap();
             all.sort();
-            assert_eq!(all, vec!["alpha".to_string(), "beta".into(), "gamma".into()]);
+            assert_eq!(
+                all,
+                vec!["alpha".to_string(), "beta".into(), "gamma".into()]
+            );
 
             let mut all2 = cs.list(Some("")).await.unwrap();
             all2.sort();
@@ -336,6 +813,84 @@ mod tests {
     }
 
     #[test]
+    fn list_metadata_without_live_vault_uses_store_names_only() {
+        let store = Rc::new(
+            DaemonStore::open_in_memory_without_vault()
+                .expect("open in-memory store without vault"),
+        );
+        let bootstrap = LocalEncryptedStore::with_bootstrap_vault(
+            Rc::clone(&store),
+            Rc::new(Vault::new([0xA7u8; 32])),
+        );
+        let shared = LocalEncryptedStore::new(Rc::clone(&store));
+
+        rt().block_on(async {
+            bootstrap.put("svc/a", b"1").await.unwrap();
+            bootstrap.put("svc/b", b"2").await.unwrap();
+            bootstrap.put("other/c", b"3").await.unwrap();
+
+            let mut svc = shared.list_metadata(Some("svc/")).await.unwrap();
+            svc.sort();
+            assert_eq!(svc, vec!["svc/a".to_string(), "svc/b".to_string()]);
+            assert!(
+                store.vault().is_none(),
+                "metadata-only listing must not populate the shared live-vault slot"
+            );
+
+            let err = shared.get("svc/a").await.unwrap_err();
+            assert!(
+                matches!(err, StoreError::Unavailable(_)),
+                "metadata-only enumeration must not imply plaintext access"
+            );
+        });
+    }
+
+    #[test]
+    fn list_metadata_respects_headless_namespace_boundaries() {
+        use std::time::Duration;
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let persona = "test-headless-metadata-scope";
+        let store = Rc::new(
+            DaemonStore::open_in_memory_without_vault()
+                .expect("open in-memory store without vault"),
+        );
+        let bootstrap = LocalEncryptedStore::with_bootstrap_vault(
+            Rc::clone(&store),
+            Rc::new(Vault::new([0xA7u8; 32])),
+        );
+        let device = crate::infra::attested_device::AttestedDevice::enroll_active(
+            tmp.path(),
+            persona,
+            Duration::from_secs(3600),
+            &[0xC4u8; 32],
+        )
+        .expect("enroll active succeeds");
+        let headless =
+            LocalEncryptedStore::with_headless_attested_enrollment(Rc::clone(&store), tmp.path());
+        let shared = LocalEncryptedStore::new(Rc::clone(&store));
+
+        rt().block_on(async {
+            bootstrap.put("svc/interactive", b"i").await.unwrap();
+            headless.put("svc/headless", b"h").await.unwrap();
+
+            let mut interactive = shared.list_metadata(Some("svc/")).await.unwrap();
+            interactive.sort();
+            assert_eq!(interactive, vec!["svc/interactive".to_string()]);
+
+            let mut headless_keys = headless.list_metadata(Some("svc/")).await.unwrap();
+            headless_keys.sort();
+            assert_eq!(headless_keys, vec!["svc/headless".to_string()]);
+        });
+
+        crate::infra::attested_device::AttestedDevice::revoke_active(
+            tmp.path(),
+            Some(&device.enrollment_id),
+        )
+        .expect("revoke active succeeds");
+    }
+
+    #[test]
     fn delete_removes_key() {
         let cs = fresh_store();
         rt().block_on(async {
@@ -355,7 +910,7 @@ mod tests {
         });
     }
 
-    /// implementation-note-93: with the daemon identity
+    /// implementation-note-116: with the daemon identity
     /// initialised, a successful `get` must leave a signed
     /// `vault.read` row in the audit log carrying the credential
     /// name + the signed envelope JSON.
@@ -369,8 +924,8 @@ mod tests {
         use crate::infra::audit::AuditFilter;
 
         let store = Rc::new(DaemonStore::open_in_memory().expect("open in-memory store"));
-        let vault = Rc::new(Vault::new([0xCDu8; 32]));
-        let cs = LocalEncryptedStore::new(vault, Rc::clone(&store));
+        store.set_vault(Rc::new(Vault::new([0xCDu8; 32])));
+        let cs = LocalEncryptedStore::new(Rc::clone(&store));
 
         // Ensure the process-singleton daemon identity is initialised
         // for this test run. `OnceCell` guarantees idempotency across
@@ -437,7 +992,7 @@ mod tests {
         });
     }
 
-    /// implementation-note-93: a cache-miss `get` (NotFound)
+    /// implementation-note-116: a cache-miss `get` (NotFound)
     /// must NOT emit a vault.read audit row — emission is success-path
     /// only so the audit log reflects credentials actually exposed.
     #[test]
@@ -445,8 +1000,8 @@ mod tests {
         use crate::infra::audit::AuditFilter;
 
         let store = Rc::new(DaemonStore::open_in_memory().expect("open in-memory store"));
-        let vault = Rc::new(Vault::new([0xEFu8; 32]));
-        let cs = LocalEncryptedStore::new(vault, Rc::clone(&store));
+        store.set_vault(Rc::new(Vault::new([0xEFu8; 32])));
+        let cs = LocalEncryptedStore::new(Rc::clone(&store));
 
         // Same identity-init posture as the success-path test.
         let tmp = tempfile::TempDir::new().expect("tempdir for identity");

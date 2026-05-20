@@ -37,9 +37,9 @@ use tokio::task::LocalSet;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::infra::events::GrantEvent;
-use crate::trust::policy::PolicyEngine;
+use crate::infra::events::{GrantEvent, GrantEventExt};
 use crate::infra::rate_limit::RateLimiter;
+use crate::trust::policy::PolicyEngine;
 
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024; // 1 MB
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -57,6 +57,8 @@ const EVENT_CHANNEL_CAPACITY: usize = 64;
 /// within a few seconds.
 const MIN_ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(10);
 const MAX_ACCEPT_RETRY_DELAY: Duration = Duration::from_secs(5);
+static FALLBACK_DISPATCH_VAULT: Lazy<crate::infra::vault::Vault> =
+    Lazy::new(|| crate::infra::vault::Vault::new([0u8; 32]));
 
 /// Compute the next accept-error backoff delay given the previous delay.
 ///
@@ -79,14 +81,14 @@ pub enum SocketError {
     Bind(std::io::Error),
     #[error("socket path already bound")]
     AlreadyBound,
-    /// implementation-note-104 (CRIT-C): an inode already exists at the
+    /// implementation-note-134 (CRIT-C): an inode already exists at the
     /// per-agent socket path. Returned when the O_EXCL precondition under
     /// the parent-dir `flock()` fails, including the symlink-swap attack
     /// where a privileged container process pre-creates a symlink at the
     /// predictable path before emberd's permission check.
     #[error("per-agent socket path already exists: {0}")]
     AlreadyExists(PathBuf),
-    /// implementation-note-104: the UUID was previously tombstoned and
+    /// implementation-note-134: the UUID was previously tombstoned and
     /// is permanently retired. Tombstoning prevents agent-id recycling so
     /// a freshly-spawned agent cannot inherit a previous agent's grants
     /// or audit trail by replaying its UUID.
@@ -117,10 +119,7 @@ pub(crate) fn annotate_bind_error(err: std::io::Error, target: &str) -> std::io:
     if kind == std::io::ErrorKind::AddrInUse {
         let how_to_find = if looks_tcp {
             // Pull the port out of the trailing `:NNNN` segment.
-            let port = target
-                .rsplit_once(':')
-                .map(|(_, p)| p)
-                .unwrap_or(target);
+            let port = target.rsplit_once(':').map(|(_, p)| p).unwrap_or(target);
             format!("    lsof -i :{port}")
         } else {
             format!("    lsof -U {target}")
@@ -193,17 +192,26 @@ pub struct SocketListener {
     path: PathBuf,
     shutdown: watch::Receiver<bool>,
     store: Rc<crate::infra::store::DaemonStore>,
-    vault: Rc<crate::infra::vault::Vault>,
     policy: Rc<PolicyEngine>,
     rate_limiter: Rc<RefCell<RateLimiter>>,
     events_tx: broadcast::Sender<GrantEvent>,
     sessions_dir: Option<PathBuf>,
-    /// implementation-note-165: bound LLM proxy
+    /// implementation-note-233: bound LLM proxy
     /// URL populated after the proxy listener binds in runtime.rs, then
     /// plumbed into every connection's RequestContext via handle_connection.
     llm_proxy_url: Option<String>,
-    /// implementation-note-165: bound git proxy URL.
+    /// implementation-note-233: bound git proxy URL.
     git_proxy_url: Option<String>,
+    /// implementation-note-235 — integration
+    /// tests in sibling crates (`emberlink-cli/tests/*.rs`) link against
+    /// `ember-daemon` as cfg(not(test)), so the `cfg(test)` synthesis on
+    /// `RequestContext::socket` does not fire. When this flag is set,
+    /// `handle_connection` builds the per-request context via
+    /// `RequestContext::socket_for_test` instead, which mints a synthetic
+    /// presence_token bound to the peer-cred uid via the same SHA-256 stub
+    /// signer the dispatch layer's `StubPresenceSigner` validates against.
+    /// Production callers never set this — the daemon binary leaves it false.
+    test_mode_synthetic_presence_token: bool,
 }
 
 impl SocketListener {
@@ -211,7 +219,6 @@ impl SocketListener {
         path: PathBuf,
         shutdown: watch::Receiver<bool>,
         store: Rc<crate::infra::store::DaemonStore>,
-        vault: Rc<crate::infra::vault::Vault>,
         policy: Rc<PolicyEngine>,
         rate_limiter: Rc<RefCell<RateLimiter>>,
     ) -> Self {
@@ -220,14 +227,26 @@ impl SocketListener {
             path,
             shutdown,
             store,
-            vault,
             policy,
             rate_limiter,
             events_tx,
             sessions_dir: None,
             llm_proxy_url: None,
             git_proxy_url: None,
+            test_mode_synthetic_presence_token: false,
         }
+    }
+
+    /// Enable integration-test mode. When `enabled = true`, every accepted
+    /// connection's `RequestContext` is built via
+    /// `RequestContext::socket_for_test` (mints a synthetic presence_token
+    /// bound to the peer-cred uid) instead of `RequestContext::socket` (no
+    /// presence_token under cfg(not(test))). Production code MUST NOT call
+    /// this — see the field docstring. implementation-note-304-
+    /// PRE-EXISTING-FAILURES.
+    pub fn with_test_mode_synthetic_presence_token(mut self, enabled: bool) -> Self {
+        self.test_mode_synthetic_presence_token = enabled;
+        self
     }
 
     pub fn with_sessions_dir(mut self, sessions_dir: PathBuf) -> Self {
@@ -297,23 +316,17 @@ impl SocketListener {
                             // starts again at MIN_ACCEPT_RETRY_DELAY.
                             accept_delay = Duration::ZERO;
 
-                            // development milestone: SO_PEERCRED / LOCAL_PEERCRED gate.
-                            // The daemon's Unix socket is the trust boundary —
-                            // any process that can connect can request grants.
-                            // Reject connections from any uid other than the
-                            // daemon's own euid so a permissions slip on the
-                            // socket file (or a shared tmpfs) cannot let a
-                            // second local user drive the daemon.
-                            //
-                            // verify_peer_uid uses SO_PEERCRED (linux) /
-                            // LOCAL_PEERCRED (macos). Other platforms fail-closed.
+                            // The Unix socket is the local trust boundary.
+                            // In install-shaped mode the listener accepts
+                            // `ember-clients` members; in development/CI it
+                            // falls back to same-euid. Reuse the runtime's
+                            // audited helper so the live listener matches the
+                            // install/runtime contract.
                             #[cfg(any(target_os = "linux", target_os = "macos"))]
-                            let peer = match verify_peer_uid(&stream) {
-                                Some(peer) => peer,
-                                None => {
-                                    // verify_peer_uid already logged the reason.
-                                    // Drop the stream — this closes the connection
-                                    // without a partial handshake.
+                            let peer_creds = match crate::infra::runtime::authenticate_peer_creds(&stream) {
+                                Ok(peer) => peer,
+                                Err(e) => {
+                                    warn!(error = %e, "rejecting socket connection");
                                     drop(stream);
                                     continue;
                                 }
@@ -326,6 +339,11 @@ impl SocketListener {
                                 drop(stream);
                                 continue;
                             }
+                            #[cfg(any(target_os = "linux", target_os = "macos"))]
+                            let peer = PeerIdentity {
+                                uid: peer_creds.uid,
+                                pid: peer_creds.pid,
+                            };
                             // development milestone: include peer_uid and
                             // peer_pid in the success log so "who connected
                             // at T+5s" is answerable from the journal. Both
@@ -334,14 +352,14 @@ impl SocketListener {
                             // (BSD may omit it); -1 checkpoint means unavailable.
                             #[cfg(any(target_os = "linux", target_os = "macos"))]
                             {
-                                let uid = peer.uid;
-                                let pid = peer.pid.unwrap_or(-1);
-                                info!(peer_uid = uid, peer_pid = pid, "client connected");
+                                let uid = peer_creds.uid;
+                                let gid = peer_creds.gid;
+                                let pid = peer_creds.pid.unwrap_or(-1);
+                                info!(peer_uid = uid, peer_gid = gid, peer_pid = pid, "client connected");
                             }
                             #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                             info!("client connected");
                             let store = Rc::clone(&self.store);
-                            let vault = Rc::clone(&self.vault);
                             let policy = Rc::clone(&self.policy);
                             let rate_limiter = Rc::clone(&self.rate_limiter);
                             let events_tx = self.events_tx.clone();
@@ -356,7 +374,7 @@ impl SocketListener {
                             let peer_for_task = Some(peer);
                             #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                             let peer_for_task: Option<PeerIdentity> = None;
-                            // implementation-note-103: extract
+                            // implementation-note-133: extract
                             // the (uid, pid, socket_path) triple once per
                             // connection so every dispatch on this stream
                             // gets the same kernel-attested principal.
@@ -376,10 +394,11 @@ impl SocketListener {
                             .ok();
                             #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                             let peer_cred_principal: Option<crate::infra::runtime::PeerCredPrincipal> = None;
+                            let test_mode_synthetic_presence_token =
+                                self.test_mode_synthetic_presence_token;
                             tokio::task::spawn_local(handle_connection(
                                 stream,
                                 store,
-                                vault,
                                 policy,
                                 rate_limiter,
                                 events_tx,
@@ -389,6 +408,7 @@ impl SocketListener {
                                 llm_proxy_url,
                                 git_proxy_url,
                                 peer_cred_principal,
+                                test_mode_synthetic_presence_token,
                             ));
                         }
                         Err(e) => {
@@ -436,7 +456,7 @@ impl SocketListener {
 
 /// Return the daemon's effective uid. Used as the "expected" peer uid for
 /// the SO_PEERCRED / LOCAL_PEERCRED gate.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 fn daemon_euid() -> u32 {
     // SAFETY: `geteuid` is a simple syscall wrapper with no preconditions
     // and cannot fail.
@@ -548,8 +568,7 @@ pub fn ensure_socket_perms(path: &Path) -> Result<(), SocketError> {
             // SAFETY: `lchown` is a standard POSIX syscall. We use lchown
             // (not chown) so we act on the socket itself, not a symlink
             // target, which would be a TOCTOU risk on chown after bind.
-            let chown_rc =
-                unsafe { libc::lchown(c_path.as_ptr(), uid, gid) };
+            let chown_rc = unsafe { libc::lchown(c_path.as_ptr(), uid, gid) };
             if chown_rc != 0 {
                 let e = std::io::Error::last_os_error();
                 warn!(
@@ -590,6 +609,51 @@ pub fn ensure_socket_perms(_path: &Path) -> Result<(), SocketError> {
     Ok(())
 }
 
+/// Read the kernel-supplied credentials for the peer process on the other
+/// end of `stream`, without applying any uid-match policy.
+///
+/// Returns `Some(PeerCreds)` when the kernel successfully delivers the
+/// peer's uid, gid, and pid. Returns `None` only when the kernel call
+/// itself fails (i.e. `SO_PEERCRED` / `LOCAL_PEERCRED` returns an error).
+///
+/// This is the fact-collection step: it does NOT enforce that the peer
+/// uid matches the daemon euid. That policy check is the caller's
+/// responsibility. `verify_peer_uid` is the existing wrapper that
+/// re-applies the strict uid-match on top of this function.
+///
+/// implementation-note-305: Phase A design destination.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn read_peer_creds(stream: &UnixStream) -> Option<PeerCreds> {
+    match stream.peer_cred() {
+        Ok(c) => Some(PeerCreds {
+            uid: c.uid(),
+            gid: c.gid(),
+            pid: c.pid(),
+        }),
+        Err(e) => {
+            warn!(error = %e, "read_peer_creds: kernel peer_cred() call failed");
+            None
+        }
+    }
+}
+
+fn take_presence_token(
+    params: &mut serde_json::Value,
+) -> Option<crate::auth::presence_token::PresenceToken> {
+    let token_value = match params {
+        serde_json::Value::Object(map) => map.remove("_presence_token"),
+        _ => None,
+    }?;
+
+    match serde_json::from_value(token_value) {
+        Ok(token) => Some(token),
+        Err(e) => {
+            warn!(error = %e, "ignoring malformed _presence_token");
+            None
+        }
+    }
+}
+
 /// Verify that the peer of `stream` is running as the daemon's own euid.
 ///
 /// On Linux this uses `SO_PEERCRED`; on macOS tokio's `peer_cred()`
@@ -609,191 +673,20 @@ pub fn ensure_socket_perms(_path: &Path) -> Result<(), SocketError> {
 /// daemon, `None` otherwise. On rejection, emits a `tracing::warn!` with
 /// the peer uid, the expected uid, and (when available) the peer pid.
 ///
-/// ### BRIDGE: ember-clients widening (cohort-A friendly-dev mode)
-///
-/// When the env var `EMBER_LOOSE_PEER_GID_FOR_EMBER_CLIENTS=1` is set,
-/// `verify_peer_uid` additionally accepts peers whose primary gid equals
-/// `ember-clients` (the group that already has filesystem permission on
-/// the socket via `0660 ember:ember-clients`). Each non-daemon-euid accept
-/// logs a structured WARN.
-///
-/// This is an explicit *interim* — the destination is per-method authority
-/// gating with operator-presence proof binding (per design). The bridge
-/// is tracked by implementation-note-220 (2026-05-14). It
-/// MUST NOT ship to team0+/ent0 deployments without the per-method gate
-/// landed first; that constraint lives in the env-var name and the WARN
-/// line so it is visible at every accept.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 fn verify_peer_uid(stream: &UnixStream) -> Option<PeerIdentity> {
-    let loose = std::env::var("EMBER_LOOSE_PEER_GID_FOR_EMBER_CLIENTS")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-
-    if loose {
-        verify_peer_creds_with_ember_clients_widening(
-            || {
-                stream.peer_cred().map(|c| PeerCreds {
-                    uid: c.uid(),
-                    gid: c.gid(),
-                    pid: c.pid(),
-                })
-            },
-            daemon_euid(),
-            resolve_ember_clients_gid(),
-            peer_uid_is_in_ember_clients_membership,
-        )
-    } else {
-        verify_peer_uid_with(
-            || {
-                stream
-                    .peer_cred()
-                    .map(|cred| PeerIdentity { uid: cred.uid(), pid: cred.pid() })
-            },
-            daemon_euid(),
-        )
-    }
-}
-
-/// Resolve the gid of the `ember-clients` group. Returns `None` when the
-/// group does not exist on this system (development mode, CI without the
-/// install scripts having run). Cached by the OS resolver across calls.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn resolve_ember_clients_gid() -> Option<u32> {
-    use std::ffi::CString;
-    let name = CString::new("ember-clients").ok()?;
-    // SAFETY: `getgrnam` is a standard POSIX call. We read `gr_gid`
-    // immediately and never retain the returned pointer.
-    let gr = unsafe { libc::getgrnam(name.as_ptr()) };
-    if gr.is_null() {
-        None
-    } else {
-        Some(unsafe { (*gr).gr_gid })
-    }
-}
-
-/// Test whether `peer_uid` is a member of the `ember-clients` group, including
-/// SUPPLEMENTARY group memberships (not just primary gid). On macOS and Linux
-/// each user has one primary gid plus zero-or-more supplementary groups; the
-/// kernel's peer-cred returns only the primary, so we must look up the user's
-/// supplementary list explicitly. Iterates the group's member list via
-/// `getgrnam("ember-clients").gr_mem` — finite, cached by Open Directory on
-/// macOS / nsswitch on Linux. Returns `false` on any resolver failure
-/// (fail-closed).
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn peer_uid_is_in_ember_clients_membership(peer_uid: u32) -> bool {
-    use std::ffi::{CStr, CString};
-    // 1. Resolve peer uid → username (so we can string-compare against gr_mem).
-    let pw = unsafe { libc::getpwuid(peer_uid as libc::uid_t) };
-    if pw.is_null() {
-        return false;
-    }
-    let pw_name_ptr = unsafe { (*pw).pw_name };
-    if pw_name_ptr.is_null() {
-        return false;
-    }
-    // SAFETY: `pw_name` is a NUL-terminated C string owned by the resolver's
-    // internal buffer; valid until the next libc call that mutates it.
-    let pw_name = unsafe { CStr::from_ptr(pw_name_ptr) };
-
-    // 2. Resolve `ember-clients` group → iterate its member list.
-    let grp_name = match CString::new("ember-clients") {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    let gr = unsafe { libc::getgrnam(grp_name.as_ptr()) };
-    if gr.is_null() {
-        return false;
-    }
-    let gr_mem = unsafe { (*gr).gr_mem };
-    if gr_mem.is_null() {
-        return false;
-    }
-    // gr_mem is a `char **` terminated by a NULL pointer. Walk it.
-    let mut i = 0isize;
-    loop {
-        // SAFETY: gr_mem is non-null; we stop at the first NULL entry.
-        let member_ptr = unsafe { *gr_mem.offset(i) };
-        if member_ptr.is_null() {
-            return false;
-        }
-        let member_name = unsafe { CStr::from_ptr(member_ptr) };
-        if member_name == pw_name {
-            return true;
-        }
-        i += 1;
-    }
-}
-
-/// BRIDGE seam for `EMBER_LOOSE_PEER_GID_FOR_EMBER_CLIENTS=1`: accept the
-/// peer when uid matches daemon euid (existing strict path) OR when peer
-/// gid equals the supplied `ember_clients_gid`. Mismatched-gid and
-/// peer-cred-error paths fail closed. Every non-daemon-euid accept emits
-/// a structured WARN naming the bridge ticket so audit greps can find
-/// every call site that exercised the loosened gate.
-///
-/// Factored as a fn-with-closure-seam so unit tests can drive the four
-/// branches (matching uid, matching gid, mismatched gid, peer-cred error)
-/// without a hostile cross-uid Unix-socket pair.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn verify_peer_creds_with_ember_clients_widening<F, G>(
-    get_peer: F,
-    expected_uid: u32,
-    ember_clients_gid: Option<u32>,
-    is_in_ember_clients_membership: G,
-) -> Option<PeerIdentity>
-where
-    F: FnOnce() -> io::Result<PeerCreds>,
-    G: Fn(u32) -> bool,
-{
-    match get_peer() {
-        Ok(peer) => {
-            if peer.uid == expected_uid {
-                Some(PeerIdentity { uid: peer.uid, pid: peer.pid })
-            } else if let Some(ec_gid) = ember_clients_gid {
-                // Two accept paths under the widening: (a) primary gid matches
-                // ember-clients (common for users whose login uses ember-clients
-                // as primary group), (b) the peer's uid is in ember-clients'
-                // supplementary member list (common on macOS where each user's
-                // primary gid is `staff`/20 and `ember-clients` is supplementary
-                // — what `dseditgroup -o edit -a ... -t user ember-clients`
-                // produces). Per design's bridge framing.
-                if peer.gid == ec_gid || is_in_ember_clients_membership(peer.uid) {
-                    warn!(
-                        peer_uid = peer.uid,
-                        peer_gid = peer.gid,
-                        expected_uid,
-                        pid = ?peer.pid,
-                        match_path = if peer.gid == ec_gid { "primary_gid" } else { "supplementary_membership" },
-                        "BRIDGE accept: non-daemon-uid via ember-clients group (implementation-note-220 — destination is per-method authority gate)"
-                    );
-                    Some(PeerIdentity { uid: peer.uid, pid: peer.pid })
-                } else {
-                    warn!(
-                        peer_uid = peer.uid,
-                        peer_gid = peer.gid,
-                        expected_uid,
-                        ember_clients_gid = ec_gid,
-                        pid = ?peer.pid,
-                        "rejecting socket connection: peer uid does not match daemon euid and uid is not in ember-clients group (primary or supplementary)"
-                    );
-                    None
-                }
-            } else {
-                warn!(
-                    peer_uid = peer.uid,
-                    peer_gid = peer.gid,
-                    expected_uid,
-                    pid = ?peer.pid,
-                    "rejecting socket connection: ember-clients gid did not resolve so widening unavailable"
-                );
-                None
-            }
-        }
-        Err(e) => {
-            warn!(error = %e, expected_uid, "rejecting socket connection: failed to read peer credentials");
-            None
-        }
-    }
+    // bridge_widening_removed (implementation-note-306):
+    // design bridge widening removed; per-method authority gate from
+    // Phase D (WebAuthn presence-token cache) is the replacement.
+    verify_peer_uid_with(
+        || {
+            stream.peer_cred().map(|cred| PeerIdentity {
+                uid: cred.uid(),
+                pid: cred.pid(),
+            })
+        },
+        daemon_euid(),
+    )
 }
 
 /// Pure peer-cred policy: accept iff the source returns a peer whose uid
@@ -801,7 +694,7 @@ where
 /// paths (mismatched uid, failed `peer_cred()` read) can be unit-tested
 /// without needing a hostile cross-uid Unix-socket pair in CI
 /// (development milestone).
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 fn verify_peer_uid_with<F>(get_peer: F, expected_uid: u32) -> Option<PeerIdentity>
 where
     F: FnOnce() -> io::Result<PeerIdentity>,
@@ -841,7 +734,6 @@ where
 async fn handle_connection(
     stream: UnixStream,
     store: Rc<crate::infra::store::DaemonStore>,
-    vault: Rc<crate::infra::vault::Vault>,
     policy: Rc<PolicyEngine>,
     rate_limiter: Rc<RefCell<RateLimiter>>,
     events_tx: broadcast::Sender<GrantEvent>,
@@ -851,6 +743,7 @@ async fn handle_connection(
     llm_proxy_url: Option<String>,
     git_proxy_url: Option<String>,
     peer_cred_principal: Option<crate::infra::runtime::PeerCredPrincipal>,
+    test_mode_synthetic_presence_token: bool,
 ) {
     let peer = stream.peer_addr().ok();
     debug!(?peer, ?peer_cred, "handling connection");
@@ -911,7 +804,14 @@ async fn handle_connection(
                     }
                 };
 
-                debug!(id = %req.id, method = %req.method, "dispatching request");
+                let Request {
+                    id,
+                    method,
+                    mut params,
+                } = req;
+                let presence_token = take_presence_token(&mut params);
+
+                debug!(id = %id, method = %method, "dispatching request");
 
                 #[cfg(any(target_os = "linux", target_os = "macos"))]
                 let peer_for_ctx: Option<crate::infra::handler::PeerCred> =
@@ -919,36 +819,102 @@ async fn handle_connection(
                 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                 let peer_for_ctx: Option<crate::infra::handler::PeerCred> = None;
 
-                let mut ctx = crate::infra::handler::RequestContext::socket(peer_for_ctx);
+                // implementation-note-235: when
+                // the listener was constructed with
+                // `with_test_mode_synthetic_presence_token(true)`, build via
+                // `socket_for_test` so external integration tests
+                // (`emberlink-cli/tests/*.rs` link as cfg(not(test))) get the
+                // synthetic presence_token that satisfies OperatorPresence-
+                // class methods. Production daemons leave the flag false.
+                let base_ctx = match (test_mode_synthetic_presence_token, peer_for_ctx.clone()) {
+                    (true, Some(p)) => crate::infra::handler::RequestContext::socket_for_test(p),
+                    _ => crate::infra::handler::RequestContext::socket(peer_for_ctx),
+                };
+                let mut ctx = base_ctx.with_presence_token(presence_token);
                 ctx.sessions_dir = sessions_dir.clone();
                 ctx.llm_proxy_url = llm_proxy_url.clone();
                 ctx.git_proxy_url = git_proxy_url.clone();
-                // implementation-note-103: stamp the
+                // implementation-note-133: stamp the
                 // kernel-attested principal captured at accept time so
                 // every dispatch on this connection inherits the same
                 // (uid, pid, socket_path) triple.
                 ctx.peer_cred_principal = peer_cred_principal.clone();
 
-                let response = match crate::infra::handler::dispatch_method_with_context(
+                // implementation-note-97 — dispatch_method_panic_recovered.
+                //
+                // prior change shipped `recover_rpc_panic` as a sync
+                // `std::panic::catch_unwind` wrapper, but `catch_unwind` doesn't
+                // work on async futures directly. The standard pattern is
+                // `AssertUnwindSafe(future).catch_unwind().await` from
+                // `futures_util::FutureExt`. Without this wrap a single panic
+                // in any dispatch arm crashes the entire daemon process, taking
+                // down every other in-flight connection with it.
+                //
+                // AssertUnwindSafe justification matches recover_rpc_panic's
+                // (broker/handler.rs): SQLite transactions auto-rollback on
+                // Drop; non-transactional state is borrowed read-only or
+                // Mutex-guarded (poisoning is observable). Safe to wrap.
+                use futures_util::FutureExt;
+                use std::panic::AssertUnwindSafe;
+                let dispatch_method_str = method.clone();
+                let dispatch_params_owned = params.clone();
+                let dispatch_future = crate::infra::handler::dispatch_method_with_context(
                     &store,
-                    &vault,
+                    &FALLBACK_DISPATCH_VAULT,
                     &policy,
                     &rate_limiter,
                     Some(&events_tx),
                     ctx,
-                    &req.method,
-                    &req.params,
-                ).await {
-                    Ok(result) => Response {
-                        id: req.id,
+                    &method,
+                    &params,
+                );
+                let dispatch_outcome = AssertUnwindSafe(dispatch_future).catch_unwind().await;
+                let response = match dispatch_outcome {
+                    Ok(Ok(result)) => Response {
+                        id,
                         result: Some(result),
                         error: None,
                     },
-                    Err((code, message)) => Response {
-                        id: req.id,
+                    Ok(Err((code, message))) => Response {
+                        id,
                         result: None,
                         error: Some(ErrorPayload { code, message }),
                     },
+                    Err(panic_payload) => {
+                        let panic_msg = panic_payload
+                            .downcast_ref::<&str>()
+                            .map(|s| (*s).to_string())
+                            .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "<panic payload not downcastable>".to_string());
+                        let frame_hash = {
+                            use sha2::{Digest, Sha256};
+                            let mut h = Sha256::new();
+                            h.update(dispatch_method_str.as_bytes());
+                            h.update(
+                                serde_json::to_vec(&dispatch_params_owned).unwrap_or_default(),
+                            );
+                            let digest = h.finalize();
+                            let mut s = String::with_capacity(16);
+                            for b in digest.iter().take(8) {
+                                s.push_str(&format!("{b:02x}"));
+                            }
+                            s
+                        };
+                        tracing::error!(
+                            method = %dispatch_method_str,
+                            frame_hash = %frame_hash,
+                            panic = %panic_msg,
+                            "async dispatch_method panicked — converted to RpcError::InternalPanic"
+                        );
+                        Response {
+                            id,
+                            result: None,
+                            error: Some(ErrorPayload {
+                                code: -32603,
+                                message: format!("internal_panic_recovered: {panic_msg}"),
+                            }),
+                        }
+                    }
                 };
 
                 debug!(id = %response.id, "sending response");
@@ -989,9 +955,8 @@ async fn write_response(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     resp: &Response,
 ) -> std::io::Result<()> {
-    let mut bytes = serde_json::to_vec(resp).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-    })?;
+    let mut bytes = serde_json::to_vec(resp)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     bytes.push(b'\n');
     writer.write_all(&bytes).await
 }
@@ -1005,14 +970,13 @@ async fn write_notification(
         method: event.method_name(),
         params: event.params(),
     };
-    let mut bytes = serde_json::to_vec(&notif).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-    })?;
+    let mut bytes = serde_json::to_vec(&notif)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     bytes.push(b'\n');
     writer.write_all(&bytes).await
 }
 
-// ---- implementation-note-104 ------------------------------------------
+// ---- implementation-note-134 ------------------------------------------
 //
 // CRIT-1: a single shared daemon socket cannot distinguish two agents living
 // in different pid namespaces — `SO_PEERCRED.pid` is pid-namespace-relative,
@@ -1044,8 +1008,7 @@ pub const PER_AGENT_SOCKET_PARENT: &str = "/run/emberd";
 /// process-namespace anyway. The tombstone defends against in-process
 /// recycling attacks where a long-running daemon might otherwise be
 /// coerced into re-creating a socket with a previously-released UUID.
-static TOMBSTONED_UUIDS: Lazy<Mutex<HashSet<Uuid>>> =
-    Lazy::new(|| Mutex::new(HashSet::new()));
+static TOMBSTONED_UUIDS: Lazy<Mutex<HashSet<Uuid>>> = Lazy::new(|| Mutex::new(HashSet::new()));
 
 /// RAII guard for an exclusive `flock()` on the parent directory. Drops
 /// release the lock by closing the fd. Used to serialize the
@@ -1108,10 +1071,7 @@ impl Drop for DirFlockGuard {
 /// `path` without following symlinks. Returns `true` iff `lstat()` succeeds.
 fn path_exists_nofollow(path: &Path) -> bool {
     use std::ffi::CString;
-    let Some(c_path) = path
-        .to_str()
-        .and_then(|s| CString::new(s).ok())
-    else {
+    let Some(c_path) = path.to_str().and_then(|s| CString::new(s).ok()) else {
         // If the path is not a valid C string the call would fail anyway
         // — fall through to bind() and let it produce the canonical error.
         return false;
@@ -1170,9 +1130,7 @@ pub fn create_per_agent_socket_with(
     // Tombstone check first — no point doing filesystem work if the UUID
     // is permanently retired.
     {
-        let table = TOMBSTONED_UUIDS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let table = TOMBSTONED_UUIDS.lock().unwrap_or_else(|e| e.into_inner());
         if table.contains(&uuid) {
             return Err(SocketError::TombstonedUuid(uuid));
         }
@@ -1271,9 +1229,7 @@ fn chown_per_agent_socket(path: &Path, uid: u32, gid: u32) -> Result<(), SocketE
 /// Callers should invoke this when an agent terminates. The UUID is
 /// permanently retired for the lifetime of the daemon process.
 pub fn tombstone_socket(uuid: Uuid) -> Result<(), SocketError> {
-    let mut table = TOMBSTONED_UUIDS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut table = TOMBSTONED_UUIDS.lock().unwrap_or_else(|e| e.into_inner());
     table.insert(uuid);
     info!(uuid = %uuid, "per-agent socket UUID tombstoned");
     Ok(())
@@ -1287,20 +1243,18 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
-    fn make_store_vault() -> (Rc<crate::infra::store::DaemonStore>, Rc<crate::infra::vault::Vault>) {
+    fn make_store() -> Rc<crate::infra::store::DaemonStore> {
         let store = crate::infra::store::DaemonStore::open_in_memory().unwrap();
-        let vault = crate::infra::vault::Vault::new([42u8; 32]);
-        (Rc::new(store), Rc::new(vault))
+        Rc::new(store)
     }
 
     async fn start_listener(tmp: &TempDir) -> (PathBuf, watch::Sender<bool>) {
         let path = tmp.path().join("ember.sock");
         let (tx, rx) = watch::channel(false);
-        let (store, vault) = make_store_vault();
+        let store = make_store();
         let policy = Rc::new(PolicyEngine::default());
         let rate_limiter = Rc::new(RefCell::new(RateLimiter::default()));
-        let listener =
-            SocketListener::new(path.clone(), rx, store, vault, policy, rate_limiter);
+        let listener = SocketListener::new(path.clone(), rx, store, policy, rate_limiter);
         tokio::task::spawn_local(async move {
             listener.run().await.unwrap();
         });
@@ -1309,7 +1263,12 @@ mod tests {
         (path, tx)
     }
 
-    async fn connect(path: &PathBuf) -> (tokio::net::unix::OwnedWriteHalf, tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>) {
+    async fn connect(
+        path: &PathBuf,
+    ) -> (
+        tokio::net::unix::OwnedWriteHalf,
+        tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
+    ) {
         let stream = UnixStream::connect(path).await.unwrap();
         let (r, w) = stream.into_split();
         (w, BufReader::new(r))
@@ -1329,121 +1288,191 @@ mod tests {
         serde_json::from_str(&resp_line).unwrap()
     }
 
+    fn test_presence_token(uid: u32) -> crate::auth::presence_token::PresenceToken {
+        use crate::auth::presence_token::{DaemonSigner, ScopeKey, mint};
+
+        struct TestStubSigner;
+
+        impl DaemonSigner for TestStubSigner {
+            fn sign(&self, msg: &[u8]) -> bytes::Bytes {
+                use sha2::{Digest, Sha256};
+                let hash = Sha256::digest(msg);
+                bytes::Bytes::copy_from_slice(&hash)
+            }
+
+            fn verify(&self, msg: &[u8], sig: &[u8]) -> bool {
+                use sha2::{Digest, Sha256};
+                let expected = Sha256::digest(msg);
+                sig == expected.as_slice()
+            }
+        }
+
+        mint(
+            uid,
+            ScopeKey::all(),
+            Duration::from_secs(60),
+            &TestStubSigner,
+        )
+    }
+
+    #[test]
+    fn take_presence_token_extracts_and_removes_field() {
+        let token = test_presence_token(501);
+        let token_value = serde_json::to_value(&token).expect("token value");
+        let mut params = serde_json::json!({
+            "name": "socket-token-test",
+            "_presence_token": token_value,
+        });
+
+        let parsed = take_presence_token(&mut params).expect("presence token");
+
+        assert_eq!(parsed.uid, 501);
+        assert_eq!(params, serde_json::json!({"name": "socket-token-test"}));
+    }
+
+    #[test]
+    fn take_presence_token_ignores_malformed_field() {
+        let mut params = serde_json::json!({
+            "name": "socket-token-test",
+            "_presence_token": {"uid": "not-a-number"},
+        });
+
+        let parsed = take_presence_token(&mut params);
+
+        assert!(parsed.is_none(), "malformed token must be ignored");
+        assert_eq!(params, serde_json::json!({"name": "socket-token-test"}));
+    }
+
     #[tokio::test]
     async fn test_ping() {
         let local = LocalSet::new();
-        local.run_until(async {
-            let tmp = TempDir::new().unwrap();
-            let (path, _tx) = start_listener(&tmp).await;
-            let (mut w, mut r) = connect(&path).await;
+        local
+            .run_until(async {
+                let tmp = TempDir::new().unwrap();
+                let (path, _tx) = start_listener(&tmp).await;
+                let (mut w, mut r) = connect(&path).await;
 
-            let req = r#"{"id":"1","method":"ping","params":null}"#;
-            let resp = send_recv(&mut w, &mut r, req).await;
+                let req = r#"{"id":"1","method":"ping","params":null}"#;
+                let resp = send_recv(&mut w, &mut r, req).await;
 
-            assert_eq!(resp.id, "1");
-            assert!(resp.error.is_none());
-            let result = resp.result.unwrap();
-            assert_eq!(result["pong"], serde_json::json!(true));
-        }).await;
+                assert_eq!(resp.id, "1");
+                assert!(resp.error.is_none());
+                let result = resp.result.unwrap();
+                assert_eq!(result["pong"], serde_json::json!(true));
+            })
+            .await;
     }
 
     #[tokio::test]
     async fn test_unknown_method() {
         let local = LocalSet::new();
-        local.run_until(async {
-            let tmp = TempDir::new().unwrap();
-            let (path, _tx) = start_listener(&tmp).await;
-            let (mut w, mut r) = connect(&path).await;
+        local
+            .run_until(async {
+                let tmp = TempDir::new().unwrap();
+                let (path, _tx) = start_listener(&tmp).await;
+                let (mut w, mut r) = connect(&path).await;
 
-            let req = r#"{"id":"2","method":"no_such_method"}"#;
-            let resp = send_recv(&mut w, &mut r, req).await;
+                let req = r#"{"id":"2","method":"no_such_method"}"#;
+                let resp = send_recv(&mut w, &mut r, req).await;
 
-            assert_eq!(resp.id, "2");
-            assert!(resp.result.is_none());
-            let err = resp.error.unwrap();
-            assert_eq!(err.code, -32601);
-        }).await;
+                assert_eq!(resp.id, "2");
+                assert!(resp.result.is_none());
+                let err = resp.error.unwrap();
+                assert_eq!(err.code, -32601);
+            })
+            .await;
     }
 
     #[tokio::test]
     async fn test_malformed_json() {
         let local = LocalSet::new();
-        local.run_until(async {
-            let tmp = TempDir::new().unwrap();
-            let (path, _tx) = start_listener(&tmp).await;
-            let (mut w, mut r) = connect(&path).await;
+        local
+            .run_until(async {
+                let tmp = TempDir::new().unwrap();
+                let (path, _tx) = start_listener(&tmp).await;
+                let (mut w, mut r) = connect(&path).await;
 
-            let req = "not json at all\n";
-            w.write_all(req.as_bytes()).await.unwrap();
+                let req = "not json at all\n";
+                w.write_all(req.as_bytes()).await.unwrap();
 
-            let mut resp_line = String::new();
-            r.read_line(&mut resp_line).await.unwrap();
-            let resp: Response = serde_json::from_str(&resp_line).unwrap();
+                let mut resp_line = String::new();
+                r.read_line(&mut resp_line).await.unwrap();
+                let resp: Response = serde_json::from_str(&resp_line).unwrap();
 
-            assert!(resp.result.is_none());
-            let err = resp.error.unwrap();
-            assert_eq!(err.code, -32700);
-        }).await;
+                assert!(resp.result.is_none());
+                let err = resp.error.unwrap();
+                assert_eq!(err.code, -32700);
+            })
+            .await;
     }
 
     #[tokio::test]
     async fn test_shutdown() {
         let local = LocalSet::new();
-        local.run_until(async {
-            let tmp = TempDir::new().unwrap();
-            let (path, tx) = start_listener(&tmp).await;
+        local
+            .run_until(async {
+                let tmp = TempDir::new().unwrap();
+                let (path, tx) = start_listener(&tmp).await;
 
-            // Signal shutdown.
-            tx.send(true).unwrap();
+                // Signal shutdown.
+                tx.send(true).unwrap();
 
-            // After shutdown the listener should stop accepting.
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            let result = UnixStream::connect(&path).await;
-            assert!(result.is_err(), "expected connection refused after shutdown");
-        }).await;
+                // After shutdown the listener should stop accepting.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let result = UnixStream::connect(&path).await;
+                assert!(
+                    result.is_err(),
+                    "expected connection refused after shutdown"
+                );
+            })
+            .await;
     }
 
     #[tokio::test]
     async fn test_concurrent_connections() {
         let local = LocalSet::new();
-        local.run_until(async {
-            let tmp = TempDir::new().unwrap();
-            let (path, _tx) = start_listener(&tmp).await;
+        local
+            .run_until(async {
+                let tmp = TempDir::new().unwrap();
+                let (path, _tx) = start_listener(&tmp).await;
 
-            let mut handles = vec![];
-            for i in 0..5u32 {
-                let p = path.clone();
-                handles.push(tokio::task::spawn_local(async move {
-                    let (mut w, mut r) = connect(&p).await;
-                    let req = format!(r#"{{"id":"{i}","method":"ping"}}"#);
-                    let resp = send_recv(&mut w, &mut r, &req).await;
-                    assert_eq!(resp.id, i.to_string());
-                    assert!(resp.error.is_none());
-                }));
-            }
-            for h in handles {
-                h.await.unwrap();
-            }
-        }).await;
+                let mut handles = vec![];
+                for i in 0..5u32 {
+                    let p = path.clone();
+                    handles.push(tokio::task::spawn_local(async move {
+                        let (mut w, mut r) = connect(&p).await;
+                        let req = format!(r#"{{"id":"{i}","method":"ping"}}"#);
+                        let resp = send_recv(&mut w, &mut r, &req).await;
+                        assert_eq!(resp.id, i.to_string());
+                        assert!(resp.error.is_none());
+                    }));
+                }
+                for h in handles {
+                    h.await.unwrap();
+                }
+            })
+            .await;
     }
 
     #[tokio::test]
     async fn test_create_persona_returns_id() {
         let local = LocalSet::new();
-        local.run_until(async {
-            let tmp = TempDir::new().unwrap();
-            let (path, _tx) = start_listener(&tmp).await;
-            let (mut w, mut r) = connect(&path).await;
+        local
+            .run_until(async {
+                let tmp = TempDir::new().unwrap();
+                let (path, _tx) = start_listener(&tmp).await;
+                let (mut w, mut r) = connect(&path).await;
 
-            let req = r#"{"id":"10","method":"create_persona","params":{"name":"test-agent"}}"#;
-            let resp = send_recv(&mut w, &mut r, req).await;
+                let req = r#"{"id":"10","method":"create_persona","params":{"name":"test-agent"}}"#;
+                let resp = send_recv(&mut w, &mut r, req).await;
 
-            assert_eq!(resp.id, "10");
-            assert!(resp.error.is_none());
-            let result = resp.result.unwrap();
-            assert!(result["id"].as_str().unwrap().starts_with("persona-"));
-            assert_eq!(result["name"], serde_json::json!("test-agent"));
-        }).await;
+                assert_eq!(resp.id, "10");
+                assert!(resp.error.is_none());
+                let result = resp.result.unwrap();
+                assert!(result["id"].as_str().unwrap().starts_with("persona-"));
+                assert_eq!(result["name"], serde_json::json!("test-agent"));
+            })
+            .await;
     }
 
     #[tokio::test]
@@ -1453,17 +1482,19 @@ mod tests {
         // connect and complete a ping round-trip. This exercises the
         // `verify_peer_uid` branch that returns `true`.
         let local = LocalSet::new();
-        local.run_until(async {
-            let tmp = TempDir::new().unwrap();
-            let (path, _tx) = start_listener(&tmp).await;
-            let (mut w, mut r) = connect(&path).await;
+        local
+            .run_until(async {
+                let tmp = TempDir::new().unwrap();
+                let (path, _tx) = start_listener(&tmp).await;
+                let (mut w, mut r) = connect(&path).await;
 
-            let req = r#"{"id":"peer-uid","method":"ping"}"#;
-            let resp = send_recv(&mut w, &mut r, req).await;
+                let req = r#"{"id":"peer-uid","method":"ping"}"#;
+                let resp = send_recv(&mut w, &mut r, req).await;
 
-            assert_eq!(resp.id, "peer-uid");
-            assert!(resp.error.is_none());
-        }).await;
+                assert_eq!(resp.id, "peer-uid");
+                assert!(resp.error.is_none());
+            })
+            .await;
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1479,6 +1510,100 @@ mod tests {
         assert_eq!(uid, expected);
     }
 
+    // ── read_peer_creds tests (implementation-note-305) ──────
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn read_peer_creds_returns_pid_uid_gid() {
+        // read_peer_creds must return the current process's own uid/gid/pid
+        // when called on a connected UnixStream pair from the same process.
+        // Uses a real socket pair — no injection needed because both ends
+        // are this process.
+        use tempfile::TempDir;
+        use tokio::net::UnixListener;
+        use tokio::task::LocalSet;
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let tmp = TempDir::new().unwrap();
+                let path = tmp.path().join("read_peer_creds_test.sock");
+                let listener = UnixListener::bind(&path).unwrap();
+
+                let connect_task = tokio::task::spawn_local({
+                    let path = path.clone();
+                    async move { tokio::net::UnixStream::connect(&path).await.unwrap() }
+                });
+
+                let (server_side, _) = listener.accept().await.unwrap();
+                let _client_side = connect_task.await.unwrap();
+
+                let expected_uid = unsafe { libc::geteuid() };
+                let expected_gid = unsafe { libc::getegid() };
+                let expected_pid = std::process::id() as i32;
+
+                let creds = read_peer_creds(&server_side)
+                    .expect("read_peer_creds must succeed on a same-process socket pair");
+
+                assert_eq!(
+                    creds.uid, expected_uid,
+                    "uid must match current process euid"
+                );
+                assert_eq!(
+                    creds.gid, expected_gid,
+                    "gid must match current process egid"
+                );
+                // pid may be None on BSD platforms that don't surface it in LOCAL_PEERCRED;
+                // when present it must match the current process.
+                if let Some(pid) = creds.pid {
+                    assert_eq!(
+                        pid, expected_pid,
+                        "pid must match current process id when present"
+                    );
+                }
+            })
+            .await;
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn read_peer_creds_returns_some_on_valid_pair() {
+        // Contract test: read_peer_creds must return Some(_) for a connected
+        // socket pair. The kernel-anomaly (None) path cannot be exercised
+        // in normal unit tests without a mock socket, so this test asserts
+        // the happy-path type contract: Some is returned and all three fields
+        // are present at the struct level.
+        use tempfile::TempDir;
+        use tokio::net::UnixListener;
+        use tokio::task::LocalSet;
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let tmp = TempDir::new().unwrap();
+                let path = tmp.path().join("read_peer_creds_contract.sock");
+                let listener = UnixListener::bind(&path).unwrap();
+
+                let connect_task = tokio::task::spawn_local({
+                    let path = path.clone();
+                    async move { tokio::net::UnixStream::connect(&path).await.unwrap() }
+                });
+
+                let (server_side, _) = listener.accept().await.unwrap();
+                let _client_side = connect_task.await.unwrap();
+
+                let result = read_peer_creds(&server_side);
+                assert!(
+                    result.is_some(),
+                    "read_peer_creds must return Some for a real connected socket"
+                );
+                let creds = result.unwrap();
+                // Verify the struct carries all three fields at the type level.
+                let _: u32 = creds.uid;
+                let _: u32 = creds.gid;
+                let _: Option<i32> = creds.pid;
+            })
+            .await;
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn test_verify_peer_uid_accepts_self_connection() {
@@ -1486,23 +1611,25 @@ mod tests {
         // socket pair from the same process. Both ends are this process,
         // so the peer uid must match the daemon euid.
         let local = LocalSet::new();
-        local.run_until(async {
-            let tmp = TempDir::new().unwrap();
-            let path = tmp.path().join("peer_cred.sock");
-            let listener = UnixListener::bind(&path).unwrap();
+        local
+            .run_until(async {
+                let tmp = TempDir::new().unwrap();
+                let path = tmp.path().join("peer_cred.sock");
+                let listener = UnixListener::bind(&path).unwrap();
 
-            let connect_task = tokio::task::spawn_local({
-                let path = path.clone();
-                async move { UnixStream::connect(&path).await.unwrap() }
-            });
+                let connect_task = tokio::task::spawn_local({
+                    let path = path.clone();
+                    async move { UnixStream::connect(&path).await.unwrap() }
+                });
 
-            let (server_side, _) = listener.accept().await.unwrap();
-            let _client_side = connect_task.await.unwrap();
+                let (server_side, _) = listener.accept().await.unwrap();
+                let _client_side = connect_task.await.unwrap();
 
-            let peer = verify_peer_uid(&server_side)
-                .expect("self-connection must pass the same-uid gate");
-            assert_eq!(peer.uid, daemon_euid());
-        }).await;
+                let peer = verify_peer_uid(&server_side)
+                    .expect("self-connection must pass the same-uid gate");
+                assert_eq!(peer.uid, daemon_euid());
+            })
+            .await;
     }
 
     // ---- development milestone ----------------------------
@@ -1525,7 +1652,12 @@ mod tests {
         let expected = daemon_euid();
         let intruder = expected.wrapping_add(1);
         let result = verify_peer_uid_with(
-            || Ok(PeerIdentity { uid: intruder, pid: Some(4242) }),
+            || {
+                Ok(PeerIdentity {
+                    uid: intruder,
+                    pid: Some(4242),
+                })
+            },
             expected,
         );
         assert!(
@@ -1561,7 +1693,12 @@ mod tests {
         // expected uid and surface the peer identity for logging.
         let expected = daemon_euid();
         let peer = verify_peer_uid_with(
-            || Ok(PeerIdentity { uid: expected, pid: Some(7) }),
+            || {
+                Ok(PeerIdentity {
+                    uid: expected,
+                    pid: Some(7),
+                })
+            },
             expected,
         )
         .expect("matching uid must be accepted");
@@ -1576,7 +1713,12 @@ mod tests {
         // does not by itself cause the accept path to reject.
         let expected = daemon_euid();
         let peer = verify_peer_uid_with(
-            || Ok(PeerIdentity { uid: expected, pid: None }),
+            || {
+                Ok(PeerIdentity {
+                    uid: expected,
+                    pid: None,
+                })
+            },
             expected,
         )
         .expect("matching uid with unknown pid must still be accepted");
@@ -1594,125 +1736,6 @@ mod tests {
     const _C43_PEERCRED_NEGATIVE_TESTS_GREP_ANCHOR: &str =
         "fn verify_peer_uid_rejects_mismatched_uid + fn verify_peer_uid_rejects_peer_cred_error";
 
-    // ── BRIDGE: ember-clients widening tests (implementation-note-220)
-    //
-    // These four tests pin the bridge behavior so the seam stays observable.
-    // Delete these only when the destination per-method authority gate lands
-    // AND `verify_peer_creds_with_ember_clients_widening` is removed from the
-    // codebase. Until then they document the surface the bridge widens.
-
-    /// Test helper — synthetic membership probe that says "no" for every uid.
-    /// Used by tests that exercise the primary-gid path or the reject paths.
-    fn membership_never(_uid: u32) -> bool { false }
-
-    /// Test helper — synthetic membership probe that returns true ONLY for
-    /// the named uid. Used by the supplementary-membership accept-path test.
-    fn membership_only(uid_match: u32) -> impl Fn(u32) -> bool {
-        move |u| u == uid_match
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn widening_accepts_matching_uid_ignoring_gid() {
-        // Even when the widening fn is the active path, an exact uid match
-        // is still the primary accept rule — no group lookup needed.
-        let expected = daemon_euid();
-        let peer = verify_peer_creds_with_ember_clients_widening(
-            || Ok(PeerCreds { uid: expected, gid: 9999, pid: Some(1) }),
-            expected,
-            Some(123),
-            membership_never,
-        )
-        .expect("matching uid must be accepted regardless of gid");
-        assert_eq!(peer.uid, expected);
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn widening_accepts_ember_clients_gid_on_uid_mismatch() {
-        // The bridge: non-matching uid is OK if the peer's PRIMARY gid
-        // equals the supplied ember-clients gid. Logs WARN at runtime
-        // with match_path="primary_gid".
-        let expected = daemon_euid();
-        let intruder = expected.wrapping_add(1);
-        let ec_gid: u32 = 502;
-        let peer = verify_peer_creds_with_ember_clients_widening(
-            || Ok(PeerCreds { uid: intruder, gid: ec_gid, pid: Some(2) }),
-            expected,
-            Some(ec_gid),
-            membership_never,
-        )
-        .expect("ember-clients primary gid must accept under the widening");
-        assert_eq!(peer.uid, intruder);
-        assert_eq!(peer.pid, Some(2));
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn widening_accepts_ember_clients_supplementary_membership_on_uid_and_gid_mismatch() {
-        // The bridge's macOS-common path: peer's PRIMARY gid is `staff`
-        // (20) but the user IS in ember-clients as a SUPPLEMENTARY group
-        // (per `dseditgroup -o edit -a ... -t user ember-clients`). The
-        // widening must accept via the supplementary-membership lookup,
-        // not just the primary-gid compare.
-        let expected = daemon_euid();
-        let intruder = expected.wrapping_add(1);
-        let ec_gid: u32 = 502;
-        let staff_gid: u32 = 20;
-        assert_ne!(staff_gid, ec_gid);
-        let peer = verify_peer_creds_with_ember_clients_widening(
-            || Ok(PeerCreds { uid: intruder, gid: staff_gid, pid: Some(5) }),
-            expected,
-            Some(ec_gid),
-            membership_only(intruder),
-        )
-        .expect("supplementary ember-clients membership must accept under the widening");
-        assert_eq!(peer.uid, intruder);
-        assert_eq!(peer.pid, Some(5));
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn widening_rejects_when_neither_gid_nor_supplementary_match() {
-        // Defense-in-depth: even under the widening, a peer whose primary
-        // gid is not ember-clients AND who is not in the supplementary
-        // ember-clients member list must be rejected.
-        let expected = daemon_euid();
-        let intruder = expected.wrapping_add(1);
-        let ec_gid: u32 = 502;
-        let other_gid: u32 = 9999;
-        assert_ne!(other_gid, ec_gid);
-        let result = verify_peer_creds_with_ember_clients_widening(
-            || Ok(PeerCreds { uid: intruder, gid: other_gid, pid: Some(3) }),
-            expected,
-            Some(ec_gid),
-            membership_never,
-        );
-        assert!(result.is_none(), "neither primary nor supplementary ember-clients membership → reject");
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn widening_rejects_when_ember_clients_gid_does_not_resolve() {
-        // If the ember-clients group doesn't exist on this host, the
-        // widening is unavailable and the gate falls back to the strict
-        // uid-match rule. A non-matching uid must therefore be rejected
-        // even if the membership probe would return true (defensive — if
-        // the gid didn't resolve we don't trust any other lookup either).
-        let expected = daemon_euid();
-        let intruder = expected.wrapping_add(1);
-        let result = verify_peer_creds_with_ember_clients_widening(
-            || Ok(PeerCreds { uid: intruder, gid: 502, pid: Some(4) }),
-            expected,
-            None,
-            membership_only(intruder),
-        );
-        assert!(
-            result.is_none(),
-            "no ember-clients gid resolved → widening unavailable → reject"
-        );
-    }
-
     #[test]
     fn test_compute_next_accept_delay_sequence() {
         // development milestone: verify the exponential backoff sequence so that a
@@ -1722,7 +1745,11 @@ mod tests {
         //   -> 2_560ms -> 5_000ms (capped) -> 5_000ms (stays capped)
         let d0 = Duration::ZERO;
         let d1 = compute_next_accept_delay(d0);
-        assert_eq!(d1, Duration::from_millis(10), "first retry should be 10ms, not 0");
+        assert_eq!(
+            d1,
+            Duration::from_millis(10),
+            "first retry should be 10ms, not 0"
+        );
 
         let d2 = compute_next_accept_delay(d1);
         assert_eq!(d2, Duration::from_millis(20));
@@ -1741,7 +1768,10 @@ mod tests {
             );
         }
         // After many iterations we must be pinned at the cap.
-        assert_eq!(d, MAX_ACCEPT_RETRY_DELAY, "backoff should saturate at the cap");
+        assert_eq!(
+            d, MAX_ACCEPT_RETRY_DELAY,
+            "backoff should saturate at the cap"
+        );
 
         // Re-entering with the cap must stay at the cap.
         let d_capped = compute_next_accept_delay(MAX_ACCEPT_RETRY_DELAY);
@@ -1757,20 +1787,22 @@ mod tests {
     #[tokio::test]
     async fn test_list_personas_empty() {
         let local = LocalSet::new();
-        local.run_until(async {
-            let tmp = TempDir::new().unwrap();
-            let (path, _tx) = start_listener(&tmp).await;
-            let (mut w, mut r) = connect(&path).await;
+        local
+            .run_until(async {
+                let tmp = TempDir::new().unwrap();
+                let (path, _tx) = start_listener(&tmp).await;
+                let (mut w, mut r) = connect(&path).await;
 
-            let req = r#"{"id":"11","method":"list_personas","params":null}"#;
-            let resp = send_recv(&mut w, &mut r, req).await;
+                let req = r#"{"id":"11","method":"list_personas","params":null}"#;
+                let resp = send_recv(&mut w, &mut r, req).await;
 
-            assert_eq!(resp.id, "11");
-            assert!(resp.error.is_none());
-            let result = resp.result.unwrap();
-            let arr = result.as_array().unwrap();
-            assert!(arr.is_empty());
-        }).await;
+                assert_eq!(resp.id, "11");
+                assert!(resp.error.is_none());
+                let result = resp.result.unwrap();
+                let arr = result.as_array().unwrap();
+                assert!(arr.is_empty());
+            })
+            .await;
     }
 
     // ---- P69E.8b: annotate_bind_error -------------------------------
@@ -1840,7 +1872,7 @@ mod tests {
         );
     }
 
-    // ---- implementation-note-104 ------------------------------------
+    // ---- implementation-note-134 ------------------------------------
     //
     // CRIT-C symlink-swap rejection + tombstone UUID-recycling rejection.
     // Both tests use the `_with` seam so we can drive the would-be-path
@@ -1873,11 +1905,12 @@ mod tests {
 
         match err {
             SocketError::AlreadyExists(p) => {
-                assert_eq!(p, socket_path, "AlreadyExists must surface the colliding path");
+                assert_eq!(
+                    p, socket_path,
+                    "AlreadyExists must surface the colliding path"
+                );
             }
-            other => panic!(
-                "expected SocketError::AlreadyExists on symlink-swap, got: {other:?}"
-            ),
+            other => panic!("expected SocketError::AlreadyExists on symlink-swap, got: {other:?}"),
         }
 
         // Symlink must still be present — we refused to touch it.
@@ -1893,7 +1926,16 @@ mod tests {
         // After tombstoning a UUID, attempts to create another socket
         // with the same UUID must reject with `TombstonedUuid` so a
         // recycled agent-id cannot inherit a previous agent's identity.
-        let tmp = TempDir::new().unwrap();
+        //
+        // tempdir_in("/tmp") matches the canonical SUN_LEN-safe pattern
+        // used elsewhere in the daemon (broker/spawn_helper_client.rs).
+        // macOS $TMPDIR resolves under /var/folders/<long>/T which
+        // overruns sockaddr_un's 104-byte path limit; binding then
+        // fails with `path must be shorter than SUN_LEN`.
+        let tmp = tempfile::Builder::new()
+            .prefix("ember-socket-test-")
+            .tempdir_in("/tmp")
+            .unwrap();
         let parent = tmp.path();
         let uuid = Uuid::new_v4();
         let uid = unsafe { libc::geteuid() };
@@ -1901,8 +1943,7 @@ mod tests {
 
         // First create succeeds: tombstone table is empty for this UUID.
         let (got_uuid, socket_path, listener) =
-            create_per_agent_socket_with(parent, uuid, uid, gid)
-                .expect("fresh UUID must bind");
+            create_per_agent_socket_with(parent, uuid, uid, gid).expect("fresh UUID must bind");
         assert_eq!(got_uuid, uuid);
         assert!(socket_path.exists(), "socket inode must exist after create");
         drop(listener);
@@ -1921,9 +1962,9 @@ mod tests {
             SocketError::TombstonedUuid(u) => {
                 assert_eq!(u, uuid, "TombstonedUuid must surface the recycled UUID");
             }
-            other => panic!(
-                "expected SocketError::TombstonedUuid on recycled UUID, got: {other:?}"
-            ),
+            other => {
+                panic!("expected SocketError::TombstonedUuid on recycled UUID, got: {other:?}")
+            }
         }
     }
 
@@ -1932,15 +1973,20 @@ mod tests {
         // Regression guard for the success path: a fresh UUID under a
         // fresh tempdir binds, the socket exists at the returned path,
         // and the listener accepts connections.
-        let tmp = TempDir::new().unwrap();
+        //
+        // tempdir_in("/tmp") — see SUN_LEN note on
+        // tombstone_prevents_uuid_recycling above.
+        let tmp = tempfile::Builder::new()
+            .prefix("ember-socket-test-")
+            .tempdir_in("/tmp")
+            .unwrap();
         let parent = tmp.path();
         let uuid = Uuid::new_v4();
         let uid = unsafe { libc::geteuid() };
         let gid = unsafe { libc::getegid() };
 
         let (got_uuid, socket_path, _listener) =
-            create_per_agent_socket_with(parent, uuid, uid, gid)
-                .expect("fresh path must bind");
+            create_per_agent_socket_with(parent, uuid, uid, gid).expect("fresh path must bind");
         assert_eq!(got_uuid, uuid);
         assert!(
             socket_path.starts_with(parent),
@@ -1960,5 +2006,94 @@ mod tests {
             meta.file_type().is_socket(),
             "created inode must be a Unix socket",
         );
+    }
+
+    // ─── implementation-note-97 ────────────────────
+    //
+    // The dispatch-site wrapper in this file uses
+    // `AssertUnwindSafe(future).catch_unwind().await` from
+    // futures_util::FutureExt to convert async panics into typed
+    // RpcError responses. These tests demonstrate the pattern
+    // converts panics into the expected `Err(panic_payload)` shape
+    // that the wrap-block then turns into a -32603 InternalPanic
+    // response (`internal_panic_recovered: <msg>`). Anchor:
+    // dispatch_method_panic_recovered.
+
+    #[tokio::test]
+    async fn catch_unwind_converts_async_panic_to_err() {
+        use futures_util::FutureExt;
+        use std::panic::AssertUnwindSafe;
+
+        // Suppress the default panic hook's stderr noise during this
+        // intentional-panic test so cargo test output stays readable.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        let fut = async {
+            // Await something first to prove the wrap catches a panic
+            // that fires after a real .await suspension — not just a
+            // straight-line panic at construction.
+            tokio::task::yield_now().await;
+            panic!("dispatch_method_panic_recovered fixture panic");
+        };
+
+        let outcome = AssertUnwindSafe(fut).catch_unwind().await;
+
+        std::panic::set_hook(prev);
+
+        let panic_payload = outcome.expect_err("panic must surface as Err");
+        let panic_msg = panic_payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+            .expect("panic payload must downcast to a string");
+        assert!(
+            panic_msg.contains("dispatch_method_panic_recovered fixture panic"),
+            "panic message preserved through catch_unwind, got: {panic_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn catch_unwind_passes_through_non_panicking_future() {
+        // A future that returns Ok(value) must not be perturbed by the
+        // wrap — outcome is Ok(Ok(value)).
+        use futures_util::FutureExt;
+        use std::panic::AssertUnwindSafe;
+
+        let fut: std::pin::Pin<Box<dyn std::future::Future<Output = Result<i32, (i32, String)>>>> =
+            Box::pin(async {
+                tokio::task::yield_now().await;
+                Ok::<i32, (i32, String)>(42)
+            });
+
+        let outcome = AssertUnwindSafe(fut).catch_unwind().await;
+        match outcome {
+            Ok(Ok(v)) => assert_eq!(v, 42),
+            other => panic!("expected Ok(Ok(42)), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn catch_unwind_passes_through_typed_err() {
+        // A future that returns Err((code, msg)) must surface as
+        // Ok(Err((code, msg))) — the wrap distinguishes "domain error"
+        // from "panic".
+        use futures_util::FutureExt;
+        use std::panic::AssertUnwindSafe;
+
+        let fut: std::pin::Pin<Box<dyn std::future::Future<Output = Result<i32, (i32, String)>>>> =
+            Box::pin(async {
+                tokio::task::yield_now().await;
+                Err::<i32, _>((-32601, "method not found".to_string()))
+            });
+
+        let outcome = AssertUnwindSafe(fut).catch_unwind().await;
+        match outcome {
+            Ok(Err((code, msg))) => {
+                assert_eq!(code, -32601);
+                assert_eq!(msg, "method not found");
+            }
+            other => panic!("expected Ok(Err(...)), got {other:?}"),
+        }
     }
 }

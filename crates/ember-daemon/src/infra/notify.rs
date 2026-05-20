@@ -206,9 +206,7 @@ fn log_sent(title: &str, subtitle: Option<&str>, message: &str) {
 /// Strip control characters (including newlines/tabs) that break AppleScript
 /// string literals. Keep spaces.
 fn sanitize(s: &str) -> String {
-    s.chars()
-        .filter(|c| !c.is_control() || *c == ' ')
-        .collect()
+    s.chars().filter(|c| !c.is_control() || *c == ' ').collect()
 }
 
 #[cfg(target_os = "macos")]

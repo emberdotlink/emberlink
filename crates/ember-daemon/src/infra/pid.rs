@@ -84,7 +84,7 @@ impl Drop for PidFile {
     }
 }
 
-/// `daemon_status_pid_liveness_check` — implementation-note-196.
+/// `daemon_status_pid_liveness_check` — implementation-note-270.
 ///
 /// Discriminate `kill(0)` errno states so cross-uid daemons aren't
 /// misclassified as gone under design separate-uid posture:
@@ -206,7 +206,10 @@ mod tests {
         // Simulate CLI-side read-only handle: construct, read, drop.
         {
             let reader = PidFile::new(path.clone());
-            let pid = reader.read().unwrap().expect("reader should see writer's PID");
+            let pid = reader
+                .read()
+                .unwrap()
+                .expect("reader should see writer's PID");
             assert_eq!(pid, std::process::id());
         }
 
@@ -214,7 +217,7 @@ mod tests {
         assert_eq!(writer.read().unwrap(), Some(std::process::id()));
     }
 
-    /// implementation-note-196 — regression test
+    /// implementation-note-270 — regression test
     /// for the cross-uid case under design separate-uid posture.
     ///
     /// PID 1 (init/launchd) always exists and is owned by root. When the

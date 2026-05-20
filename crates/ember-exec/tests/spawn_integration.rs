@@ -1,5 +1,5 @@
 //!
-//! implementation-note-267: integration coverage for two
+//! implementation-note-373: integration coverage for two
 //! parent-task acceptance criteria that subtasks B/C/D shipped behavior for
 //! but did not test end-to-end via `handle_spawn_directive`:
 //!
@@ -21,7 +21,7 @@
 #![cfg(unix)]
 
 use ember_exec::spawn::handle_spawn_directive;
-use ember_exec::uds::{read_frame, ExecFrame, SpawnDirective};
+use ember_exec::uds::{ExecFrame, SpawnDirective, read_frame};
 use std::path::PathBuf;
 use tokio::io::duplex;
 
@@ -42,7 +42,7 @@ fn blake3_of_file(path: &std::path::Path) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-/// implementation-note-267: dispatch a `SpawnDirective` for
+/// implementation-note-373: dispatch a `SpawnDirective` for
 /// `/usr/bin/id` and assert the child's output reports the expected uid.
 /// Because the test runs as the current user with `target_uid = current
 /// uid`, the privilege-drop codepath (when running as root) reduces to a
@@ -67,9 +67,7 @@ async fn test_setuid_drop_before_execve() {
     };
 
     let (mut peer, mut server) = duplex(64 * 1024);
-    let handle = tokio::spawn(async move {
-        handle_spawn_directive(directive, &mut server).await
-    });
+    let handle = tokio::spawn(async move { handle_spawn_directive(directive, &mut server).await });
 
     // Drain OutputBytes frames until Exit arrives; concatenate the child's
     // stdout so we can assert the expected `uid=<n>` substring.
@@ -85,7 +83,10 @@ async fn test_setuid_drop_before_execve() {
             _ => {}
         }
     }
-    handle.await.expect("task join").expect("handle_spawn_directive");
+    handle
+        .await
+        .expect("task join")
+        .expect("handle_spawn_directive");
     let text = String::from_utf8_lossy(&collected);
     assert!(saw_exit, "expected Exit frame");
     let needle = format!("uid={target_uid}");
@@ -95,7 +96,7 @@ async fn test_setuid_drop_before_execve() {
     );
 }
 
-/// implementation-note-267: dispatch a `SpawnDirective` with a
+/// implementation-note-373: dispatch a `SpawnDirective` with a
 /// wrong `content_hash_expected`. The hash gate must close the connection
 /// with a `HashMismatch` frame before any privilege drop or spawn. The
 /// stricter assertion is that NO `OutputBytes` and NO `Exit` precede
@@ -121,9 +122,7 @@ async fn test_hash_mismatch_refuses_exec() {
     };
 
     let (mut peer, mut server) = duplex(64 * 1024);
-    let handle = tokio::spawn(async move {
-        handle_spawn_directive(directive, &mut server).await
-    });
+    let handle = tokio::spawn(async move { handle_spawn_directive(directive, &mut server).await });
 
     // The first (and only) frame must be HashMismatch. Reaching an
     // OutputBytes or Exit frame before that would prove the child spawned,
@@ -136,7 +135,9 @@ async fn test_hash_mismatch_refuses_exec() {
                 break;
             }
             ExecFrame::OutputBytes { .. } => {
-                panic!("OutputBytes frame arrived before HashMismatch — child spawned despite bad hash");
+                panic!(
+                    "OutputBytes frame arrived before HashMismatch — child spawned despite bad hash"
+                );
             }
             ExecFrame::Exit { .. } => {
                 panic!("Exit frame arrived before HashMismatch — child spawned despite bad hash");
@@ -146,6 +147,9 @@ async fn test_hash_mismatch_refuses_exec() {
             }
         }
     }
-    handle.await.expect("task join").expect("handle_spawn_directive");
+    handle
+        .await
+        .expect("task join")
+        .expect("handle_spawn_directive");
     assert!(saw_mismatch, "expected HashMismatch frame");
 }

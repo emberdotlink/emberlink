@@ -87,8 +87,8 @@ pub fn fetch_grant_requests(
         if trimmed.is_empty() {
             continue;
         }
-        let req: RelayGrantRequest =
-            serde_json::from_str(trimmed).map_err(|e| format!("invalid grant request JSON: {e}"))?;
+        let req: RelayGrantRequest = serde_json::from_str(trimmed)
+            .map_err(|e| format!("invalid grant request JSON: {e}"))?;
         results.push(req);
     }
     Ok(results)

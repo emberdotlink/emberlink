@@ -17,7 +17,7 @@
 //! name only the violating axis (never the parent's full state) so that a
 //! compromised child cannot use rejections as an oracle for parent state.
 //!
-//! Lifted verbatim from `ember-daemon::attenuation` per implementation-note-39.
+//! Lifted verbatim from `ember-daemon::attenuation` per implementation-note-52.
 //! No I/O — wasm32-compatible.
 
 use core_grant_types::{AccessGrant, Budget, ResourceSelector, Statement, Usage};
@@ -146,7 +146,7 @@ fn parse_scope(scope: &str) -> Result<ScopeParts<'_>, String> {
 ///
 /// Returns `Ok(())` on subset; `Err(DelegationViolation)` otherwise.
 ///
-/// Renamed from `scope_subset` per implementation-note-39 (design §2.1).
+/// Renamed from `scope_subset` per implementation-note-52 (design §2.1).
 /// The behavior is identical — the rename clarifies that this is the
 /// enforcement entry point (returns `Result`), distinct from the bool-returning
 /// `Scope::is_subset_of` helper on the in-memory `core_grants::Grant` type.
@@ -160,12 +160,10 @@ fn parse_scope(scope: &str) -> Result<ScopeParts<'_>, String> {
 /// - **subtarget** — parent absent subsumes any child subtarget; else parent
 ///   subtarget must be present in child and glob-subsume it.
 pub fn enforce_subset(child: &str, parent: &str) -> Result<(), DelegationViolation> {
-    let p = parse_scope(parent).map_err(|e| {
-        DelegationViolation::new(format!("parent scope unparseable: {e}"))
-    })?;
-    let c = parse_scope(child).map_err(|e| {
-        DelegationViolation::new(format!("child scope unparseable: {e}"))
-    })?;
+    let p = parse_scope(parent)
+        .map_err(|e| DelegationViolation::new(format!("parent scope unparseable: {e}")))?;
+    let c = parse_scope(child)
+        .map_err(|e| DelegationViolation::new(format!("child scope unparseable: {e}")))?;
 
     // Provider.
     if p.provider != "*" && p.provider != c.provider {
@@ -177,10 +175,7 @@ pub fn enforce_subset(child: &str, parent: &str) -> Result<(), DelegationViolati
     // Action.
     if p.action != "*" && p.action != c.action {
         // Accept "write" as a synonym of "push" and vice versa.
-        let synonym = matches!(
-            (p.action, c.action),
-            ("push", "write") | ("write", "push")
-        );
+        let synonym = matches!((p.action, c.action), ("push", "write") | ("write", "push"));
         if !synonym {
             return Err(DelegationViolation::new(
                 "scope.action not subset of parent",
@@ -316,9 +311,7 @@ pub fn check_expiry_attenuation(
         ));
     };
     if child_ts > parent_ts {
-        return Err(DelegationViolation::new(
-            "expiry exceeds parent remaining",
-        ));
+        return Err(DelegationViolation::new("expiry exceeds parent remaining"));
     }
     Ok(())
 }
@@ -334,9 +327,7 @@ pub fn check_expiry_attenuation(
 fn selector_subset(child: &ResourceSelector, parent: &ResourceSelector) -> bool {
     match (parent, child) {
         (ResourceSelector::Any, _) => true,
-        (ResourceSelector::Exact { value: p }, ResourceSelector::Exact { value: c }) => {
-            p == c
-        }
+        (ResourceSelector::Exact { value: p }, ResourceSelector::Exact { value: c }) => p == c,
         (ResourceSelector::Glob { pattern: p }, ResourceSelector::Exact { value: c }) => {
             wildcard_match(p, c)
         }
@@ -366,7 +357,9 @@ fn selector_subset(child: &ResourceSelector, parent: &ResourceSelector) -> bool 
         ) => (pp == "*" || pp == cp) && (ps == "*" || ps == cs),
         (
             ResourceSelector::Glob { pattern: p },
-            ResourceSelector::GlobWithSubtarget { primary_glob: cp, .. },
+            ResourceSelector::GlobWithSubtarget {
+                primary_glob: cp, ..
+            },
         ) => p == "*" || p == cp,
         _ => false,
     }
@@ -429,13 +422,9 @@ pub fn check_statement_attenuation(
         // (Session / Time / Payment).
 
         // Budget: child must fit inside parent's remaining allowance.
-        check_budget_attenuation(&pstmt.budget, &pstmt.usage, &cstmt.budget)
-            .map_err(|e| {
-                DelegationViolation::new(format!(
-                    "statement[{}] {}",
-                    cstmt.sid, e.reason
-                ))
-            })?;
+        check_budget_attenuation(&pstmt.budget, &pstmt.usage, &cstmt.budget).map_err(|e| {
+            DelegationViolation::new(format!("statement[{}] {}", cstmt.sid, e.reason))
+        })?;
     }
     Ok(())
 }
@@ -517,11 +506,13 @@ mod tests {
 
     #[test]
     fn scope_strict_match_ok() {
-        assert!(enforce_subset(
-            "github:read:acme/widgets:main",
-            "github:read:acme/widgets:main"
-        )
-        .is_ok());
+        assert!(
+            enforce_subset(
+                "github:read:acme/widgets:main",
+                "github:read:acme/widgets:main"
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -538,60 +529,52 @@ mod tests {
 
     #[test]
     fn scope_different_action_rejected() {
-        assert!(
-            enforce_subset("github:push:acme/widgets", "github:read:acme/widgets").is_err()
-        );
+        assert!(enforce_subset("github:push:acme/widgets", "github:read:acme/widgets").is_err());
     }
 
     #[test]
     fn scope_parent_target_glob_subsumes_child() {
         assert!(enforce_subset("github:read:acme/widgets", "github:read:acme/*").is_ok());
-        assert!(
-            enforce_subset("github:read:other/widgets", "github:read:acme/*").is_err()
-        );
+        assert!(enforce_subset("github:read:other/widgets", "github:read:acme/*").is_err());
     }
 
     #[test]
     fn scope_subtarget_parent_absent_child_any() {
         // Parent has no subtarget → child may add one.
-        assert!(enforce_subset(
-            "github:read:acme/widgets:main",
-            "github:read:acme/widgets"
-        )
-        .is_ok());
+        assert!(
+            enforce_subset("github:read:acme/widgets:main", "github:read:acme/widgets").is_ok()
+        );
     }
 
     #[test]
     fn scope_subtarget_parent_present_child_absent_rejected() {
-        assert!(enforce_subset(
-            "github:read:acme/widgets",
-            "github:read:acme/widgets:main"
-        )
-        .is_err());
+        assert!(
+            enforce_subset("github:read:acme/widgets", "github:read:acme/widgets:main").is_err()
+        );
     }
 
     #[test]
     fn scope_subtarget_glob_subsumes_child() {
-        assert!(enforce_subset(
-            "github:push:acme/widgets:feat/foo",
-            "github:push:acme/widgets:feat/*"
-        )
-        .is_ok());
-        assert!(enforce_subset(
-            "github:push:acme/widgets:main",
-            "github:push:acme/widgets:feat/*"
-        )
-        .is_err());
+        assert!(
+            enforce_subset(
+                "github:push:acme/widgets:feat/foo",
+                "github:push:acme/widgets:feat/*"
+            )
+            .is_ok()
+        );
+        assert!(
+            enforce_subset(
+                "github:push:acme/widgets:main",
+                "github:push:acme/widgets:feat/*"
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn scope_push_write_synonyms() {
-        assert!(
-            enforce_subset("github:write:acme/widgets", "github:push:acme/widgets").is_ok()
-        );
-        assert!(
-            enforce_subset("github:push:acme/widgets", "github:write:acme/widgets").is_ok()
-        );
+        assert!(enforce_subset("github:write:acme/widgets", "github:push:acme/widgets").is_ok());
+        assert!(enforce_subset("github:push:acme/widgets", "github:write:acme/widgets").is_ok());
     }
 
     #[test]
@@ -607,12 +590,14 @@ mod tests {
     #[test]
     fn budget_parent_none_child_any_ok() {
         assert!(check_budget_attenuation(&None, &usage(0, 0), &None).is_ok());
-        assert!(check_budget_attenuation(
-            &None,
-            &usage(0, 0),
-            &Some(budget(Some(999), None, None, None, None))
-        )
-        .is_ok());
+        assert!(
+            check_budget_attenuation(
+                &None,
+                &usage(0, 0),
+                &Some(budget(Some(999), None, None, None, None))
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -629,17 +614,14 @@ mod tests {
         assert!(check_budget_attenuation(&parent, &usage(2_000, 0), &child).is_ok());
         // Exactly remaining is ok.
         let child_exact = Some(budget(Some(8_000), None, None, None, None));
-        assert!(
-            check_budget_attenuation(&parent, &usage(2_000, 0), &child_exact).is_ok()
-        );
+        assert!(check_budget_attenuation(&parent, &usage(2_000, 0), &child_exact).is_ok());
     }
 
     #[test]
     fn budget_child_exceeds_remaining_rejected() {
         let parent = Some(budget(Some(10_000), None, None, None, None));
         let child = Some(budget(Some(15_000), None, None, None, None));
-        let err =
-            check_budget_attenuation(&parent, &usage(0, 0), &child).unwrap_err();
+        let err = check_budget_attenuation(&parent, &usage(0, 0), &child).unwrap_err();
         assert!(err.reason.contains("tokens"));
     }
 
@@ -648,8 +630,7 @@ mod tests {
         let parent = Some(budget(Some(10_000), None, None, None, None));
         // Remaining = 10_000 - 6_000 = 4_000. Child asks 5_000.
         let child = Some(budget(Some(5_000), None, None, None, None));
-        let err =
-            check_budget_attenuation(&parent, &usage(6_000, 0), &child).unwrap_err();
+        let err = check_budget_attenuation(&parent, &usage(6_000, 0), &child).unwrap_err();
         assert!(err.reason.contains("tokens"));
     }
 
@@ -658,8 +639,7 @@ mod tests {
         // Parent bounds cents; child only bounds tokens.
         let parent = Some(budget(None, Some(500), None, None, None));
         let child = Some(budget(Some(100), None, None, None, None));
-        let err =
-            check_budget_attenuation(&parent, &usage(0, 0), &child).unwrap_err();
+        let err = check_budget_attenuation(&parent, &usage(0, 0), &child).unwrap_err();
         assert!(err.reason.contains("cents"));
     }
 
@@ -676,8 +656,7 @@ mod tests {
         let parent = Some(budget(Some(10_000), Some(5000), Some(100), None, None));
         // Tokens OK, cents OK, requests too high.
         let child = Some(budget(Some(1000), Some(500), Some(999), None, None));
-        let err =
-            check_budget_attenuation(&parent, &usage(0, 0), &child).unwrap_err();
+        let err = check_budget_attenuation(&parent, &usage(0, 0), &child).unwrap_err();
         assert!(err.reason.contains("requests"));
     }
 
@@ -697,32 +676,27 @@ mod tests {
 
     #[test]
     fn expiry_child_earlier_ok() {
-        assert!(
-            check_expiry_attenuation(Some(1_700_000_000), Some(1_699_999_000)).is_ok()
-        );
+        assert!(check_expiry_attenuation(Some(1_700_000_000), Some(1_699_999_000)).is_ok());
     }
 
     #[test]
     fn expiry_child_equal_ok() {
-        assert!(
-            check_expiry_attenuation(Some(1_700_000_000), Some(1_700_000_000)).is_ok()
-        );
+        assert!(check_expiry_attenuation(Some(1_700_000_000), Some(1_700_000_000)).is_ok());
     }
 
     #[test]
     fn expiry_child_later_rejected() {
-        let err = check_expiry_attenuation(Some(1_700_000_000), Some(1_700_001_000))
-            .unwrap_err();
+        let err = check_expiry_attenuation(Some(1_700_000_000), Some(1_700_001_000)).unwrap_err();
         assert!(err.reason.contains("expiry"));
     }
 
     // --- per-Statement attenuation tests ---
 
     fn make_grant(statements: Vec<core_grant_types::Statement>) -> AccessGrant {
+        use core_event_types::PresentationAudienceKind;
         use core_grant_types::{
             AttestationBinding, Block, GrantMode, GrantStatus, RecipientProfile, SignedBlock,
         };
-        use core_event_types::PresentationAudienceKind;
         AccessGrant {
             id: "g".into(),
             version: 1,
@@ -859,14 +833,18 @@ mod tests {
         let parent = make_grant(vec![stmt(
             "P",
             vec!["llm:generate".into()],
-            ResourceSelector::Exact { value: "model:haiku".into() },
+            ResourceSelector::Exact {
+                value: "model:haiku".into(),
+            },
             None,
         )]);
         // Child asks for a different exact resource.
         let child = make_grant(vec![stmt(
             "C",
             vec!["llm:generate".into()],
-            ResourceSelector::Exact { value: "model:opus".into() },
+            ResourceSelector::Exact {
+                value: "model:opus".into(),
+            },
             None,
         )]);
         let err = check_statement_attenuation(&parent, &child).unwrap_err();

@@ -5,7 +5,7 @@
 //! create, settings.json patch, optional GH PAT capture). The
 //! `settings_patch` submodule holds the lower-level JSON-patch primitives
 //! that both `init --for claude-code` and `uninstall --for claude-code`
-//! call into. The `github_app` submodule (implementation-note-308)
+//! call into. The `github_app` submodule (implementation-note-437)
 //! exposes the public GitHub App manifest doc and install URL for adopters
 //! who want to install Emberlink against a real GitHub account or org.
 
@@ -15,7 +15,7 @@ pub mod github_app;
 pub mod settings_patch;
 
 pub use settings_patch::{
-    add_permissions_deny_outside_shadow, add_pretooluse_hook, has_pretooluse_hook,
-    patch_settings_json, remove_permissions_deny_outside_shadow, remove_pretooluse_hook,
-    PatchError, EMBER_PROXY_HOOK_COMMAND, RAW_TOOL_DENY_LIST,
+    EMBER_PROXY_HOOK_COMMAND, PatchError, RAW_TOOL_DENY_LIST, add_permissions_deny_outside_shadow,
+    add_pretooluse_hook, has_pretooluse_hook, patch_settings_json,
+    remove_permissions_deny_outside_shadow, remove_pretooluse_hook,
 };

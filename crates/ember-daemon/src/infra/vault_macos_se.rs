@@ -90,9 +90,7 @@ pub fn get_mek_passphrase(_data_dir: &Path) -> Result<Zeroizing<String>, VaultEr
         .map(|s| Zeroizing::new(s.to_owned()))
         .map_err(|e| {
             tracing::warn!(error = %e, "MEK passphrase was not valid UTF-8");
-            VaultError::Crypto(
-                "MEK passphrase was not valid UTF-8 (see daemon log)".to_string(),
-            )
+            VaultError::Crypto("MEK passphrase was not valid UTF-8 (see daemon log)".to_string())
         })
 }
 
@@ -125,8 +123,8 @@ mod tests {
     #[test]
     fn missing_keychain_item_returns_install_hint() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let err = get_mek_passphrase(tmp.path())
-            .expect_err("must fail when keychain item is absent");
+        let err =
+            get_mek_passphrase(tmp.path()).expect_err("must fail when keychain item is absent");
         match err {
             VaultError::Io(msg) => {
                 assert!(

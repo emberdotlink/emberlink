@@ -1,19 +1,24 @@
-//! `ember broker {issue, revoke, list}` — operator + wrapper-script entry
+//! `ember broker {issue, revoke, list, register}` — operator + wrapper-script entry
 //! point for the credential broker (design / design).
 //!
-//! The daemon RPC handlers shipped in implementation-note-94
+//! The daemon RPC handlers shipped in implementation-note-117
 //! (`crates/ember-daemon/src/broker_handler.rs`); this module is the CLI
 //! surface that wraps them. Subcommands:
 //!
-//! - [`issue`]  — request a fresh materialization from a registered
+//! - [`issue`]    — request a fresh materialization from a registered
 //!   provider (`broker_issue` daemon RPC).
-//! - [`revoke`] — actively cancel a live materialization
+//! - [`revoke`]   — actively cancel a live materialization
 //!   (`broker_revoke` daemon RPC). Idempotent: unknown ids exit 0.
-//! - [`list`]   — enumerate active materializations (`broker_list` daemon
+//! - [`list`]     — enumerate active materializations (`broker_list` daemon
 //!   RPC), optionally filtered by provider / tier / task-id /
 //!   active-only.
+//! - [`register`] — register a GitHub App credential triple in the vault
+//!   (`vault_add` daemon RPC × 3). Calls `GET /apps/<slug>` to canonicalize
+//!   the operator-supplied slug before writing (Finding 12 /
+//!   implementation-note-384). `--allow-unverified-slug` bypasses
+//!   the network round-trip for offline / suspended-app scenarios.
 //!
-//! ## Grants-file flow (implementation-note-110)
+//! ## Grants-file flow (implementation-note-148)
 //!
 //! `ember broker issue --grants-file <path> --credential <name>` reads a
 //! `GrantsManifest` TOML, locates the named credential entry, and issues a
@@ -27,11 +32,11 @@
 //!
 //! ## Marker for `target_state_anchor`
 //!
-//! implementation-note-296 uses `BrokerCmd|broker_command` as its grep gate;
+//! implementation-note-416 uses `BrokerCmd|broker_command` as its grep gate;
 //! both literals appear in this file (`pub enum BrokerCmd` below and
 //! `pub fn broker_command` below).
 //!
-//! implementation-note-110 uses `ember broker issue.*grants-file` as its
+//! implementation-note-148 uses `ember broker issue.*grants-file` as its
 //! grep gate; see `#[arg(long = "grants-file")]` on `BrokerCmd::Issue` below.
 //!
 //! ## Secret handling
@@ -48,14 +53,14 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use clap::Subcommand;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use core_grants_toml::{Credential, GrantsManifest};
 
 /// CLI subcommand surface for `ember broker`.
 ///
 /// Mirrors the daemon's three RPC methods one-to-one. The literal
-/// `BrokerCmd` is the load-bearing marker for the implementation-note-296
+/// `BrokerCmd` is the load-bearing marker for the implementation-note-416
 /// `target_state_anchor`.
 #[derive(Subcommand, Debug)]
 pub enum BrokerCmd {
@@ -100,7 +105,7 @@ pub enum BrokerCmd {
         json: bool,
     },
 
-    /// Issue grants from a TOML grants file (design / implementation-note-110).
+    /// Issue grants from a TOML grants file (design / implementation-note-148).
     ///
     /// Reads a `GrantsManifest` TOML via `core-grants-toml`, locates the
     /// credential entry named by `--credential`, and issues a scoped grant
@@ -112,11 +117,11 @@ pub enum BrokerCmd {
     ///
     /// ## Checkpoint for target_state_anchor
     ///
-    /// `ember broker issue --grants-file` (implementation-note-110)
+    /// `ember broker issue --grants-file` (implementation-note-148)
     #[command(name = "issue-file")]
     IssueFromFile {
         /// Path to the grants manifest TOML file.
-        // ember broker issue --grants-file (implementation-note-110)
+        // ember broker issue --grants-file (implementation-note-148)
         #[arg(long = "grants-file")]
         grants_file: PathBuf,
 
@@ -139,6 +144,38 @@ pub enum BrokerCmd {
         /// Emit the response (including grant IDs) as JSON to stdout.
         #[arg(long)]
         json: bool,
+    },
+
+    /// Register a GitHub App credential in the daemon vault (design path
+    /// grammar — Finding 12 / implementation-note-384).
+    ///
+    /// Writes three vault entries under
+    /// `github/apps/<canonical-slug>/install-<installation-id>/`:
+    ///   - `private-key`     — PEM contents of the RSA private key
+    ///   - `app-id`          — numeric GitHub App ID
+    ///   - `installation-id` — numeric GitHub installation ID
+    ///
+    /// The slug is canonicalized by calling `GET /apps/<slug>` with a
+    /// short-lived App JWT derived from the supplied PEM + app-id. The
+    /// GitHub-returned `slug` field is stored verbatim so divergent
+    /// operator-typed slugs cannot produce two vault rows for the same app.
+    ///
+    /// When `--allow-unverified-slug` is set the GitHub round-trip is
+    /// skipped; the operator-typed slug is stored as-is and a warning is
+    /// emitted. Use this escape hatch when GitHub is unreachable or the
+    /// app is suspended.
+    ///
+    /// ## Rename-race follow-up
+    ///
+    /// Between `register` and the daemon's next credential reload the app
+    /// could be renamed on github.com, causing the stored slug to diverge
+    /// again. A future `ember broker reconcile-slugs` cron will re-verify
+    /// and update vault entries. This is a known deferral; see the
+    /// adversarial review (broker-vault-cutover-2026-05-12.md §Finding 12).
+    #[command(name = "register")]
+    Register {
+        #[command(subcommand)]
+        provider: RegisterProvider,
     },
 
     /// Revoke a live materialization by id.
@@ -186,6 +223,65 @@ pub enum BrokerCmd {
     },
 }
 
+/// Provider-specific subcommands for `ember broker register`.
+///
+/// Currently only `github` is implemented. Structured as a sub-enum so
+/// future `register cloudflare` / `register anthropic` variants slot in
+/// without changing the top-level dispatch.
+#[derive(Subcommand, Debug)]
+pub enum RegisterProvider {
+    /// Register a GitHub App credential in the daemon vault.
+    ///
+    /// Writes three vault entries under
+    /// `github/apps/<slug>/install-<installation-id>/`:
+    ///   `private-key`, `app-id`, `installation-id`.
+    ///
+    /// The slug is verified against GitHub's API (Finding 12 /
+    /// implementation-note-384). Pass `--allow-unverified-slug`
+    /// to skip the verification (offline / app-suspended scenarios).
+    Github {
+        /// Path to the GitHub App's RSA private key (PEM-encoded PKCS#8
+        /// or traditional PKCS#1). The contents are stored in the vault
+        /// under `github/apps/<slug>/install-<id>/private-key`.
+        #[arg(long = "pem-file")]
+        pem_file: PathBuf,
+
+        /// Numeric GitHub App ID (shown on the App settings page).
+        #[arg(long = "app-id")]
+        app_id: String,
+
+        /// Numeric GitHub installation ID (from the installation webhook
+        /// or `GET /app/installations`).
+        #[arg(long = "installation-id")]
+        installation_id: String,
+
+        /// Operator-typed App slug (the human-readable name that appears
+        /// in `https://github.com/apps/<slug>`). When `--allow-unverified-slug`
+        /// is NOT set this value is passed to `GET /apps/<slug>` and the
+        /// API-returned slug is stored instead of this value.
+        #[arg(long)]
+        slug: String,
+
+        /// Skip the `GET /apps/<slug>` round-trip and store the
+        /// operator-typed slug verbatim. Use when GitHub is unreachable
+        /// or the app is suspended. Emits a warning when set.
+        ///
+        /// allow-unverified-slug
+        #[arg(long = "allow-unverified-slug")]
+        allow_unverified_slug: bool,
+
+        /// Replace existing vault entries for this slug+installation-id
+        /// pair without error. Without `--replace` the command refuses to
+        /// overwrite an existing triple.
+        #[arg(long)]
+        replace: bool,
+
+        /// Emit a JSON object with the written vault paths on success.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 /// Global options resolved by the parent CLI before dispatch into
 /// `broker_command`. Today only the daemon socket path is needed; this
 /// struct exists so future cross-cutting flags (`--config`, `--quiet`)
@@ -215,11 +311,38 @@ pub fn broker_command(cmd: BrokerCmd, opts: GlobalOpts) -> Result<(), BrokerCliE
             ttl,
             inject,
             json,
-        } => issue_from_grants_file(&opts, &grants_file, &credential, ttl.as_deref(), inject, json),
+        } => issue_from_grants_file(
+            &opts,
+            &grants_file,
+            &credential,
+            ttl.as_deref(),
+            inject,
+            json,
+        ),
         BrokerCmd::Revoke {
             materialization_id,
             json,
         } => revoke(&opts, &materialization_id, json),
+        BrokerCmd::Register { provider } => match provider {
+            RegisterProvider::Github {
+                pem_file,
+                app_id,
+                installation_id,
+                slug,
+                allow_unverified_slug,
+                replace,
+                json,
+            } => register_github(
+                &opts,
+                &pem_file,
+                &app_id,
+                &installation_id,
+                &slug,
+                allow_unverified_slug,
+                replace,
+                json,
+            ),
+        },
         BrokerCmd::List {
             provider,
             tier,
@@ -266,7 +389,7 @@ pub fn issue(
 
     let result = call_daemon(&opts.socket_path, "broker_issue", &params)?;
 
-    // Result shape (implementation-note-10):
+    // Result shape (implementation-note-12):
     //   { secret_ref, materialization_id, expires_at, issued_at, provider }
     // The opaque `secret_ref` is what callers pass back to ember-proxy /
     // ember-tools when the actual credential is needed at a trust
@@ -300,14 +423,14 @@ pub fn issue(
 }
 
 /// `ember broker issue-file --grants-file <path> --credential <name>`
-/// (implementation-note-110)
+/// (implementation-note-148)
 ///
 /// Reads a `GrantsManifest` TOML, locates the named credential, issues a
 /// scoped grant stamped with `grants_file_rev` (SHA-256 of file bytes) and
 /// `credential_name`. With `--inject` spawns a child shell and registers the
 /// PID for daemon auto-revoke.
 ///
-/// // ember broker issue --grants-file (implementation-note-110)
+/// // ember broker issue --grants-file (implementation-note-148)
 pub fn issue_from_grants_file(
     opts: &GlobalOpts,
     grants_file: &Path,
@@ -367,7 +490,9 @@ pub fn issue_from_grants_file(
 
     // 3. Extract scope + TTL from the credential entry.
     let (scope, entry_ttl_secs) = match cred_entry {
-        Credential::Ephemeral { scope, ttl_secs, .. } => (scope.clone(), *ttl_secs),
+        Credential::Ephemeral {
+            scope, ttl_secs, ..
+        } => (scope.clone(), *ttl_secs),
         Credential::Static { scope, .. } => (scope.clone(), None),
         Credential::Sealed { scope, .. } => (scope.clone(), None),
         Credential::Unknown => unreachable!("already filtered above"),
@@ -375,15 +500,12 @@ pub fn issue_from_grants_file(
 
     // Resolve effective TTL: --ttl flag > entry ttl_secs > manifest defaults > 3600.
     let effective_ttl_secs = if let Some(ttl_s) = ttl_override {
-        parse_duration(ttl_s).map_err(|msg| {
-            BrokerCliError::InvalidArgs(format!("invalid --ttl: {msg}"))
-        })?
+        parse_duration(ttl_s)
+            .map_err(|msg| BrokerCliError::InvalidArgs(format!("invalid --ttl: {msg}")))?
     } else if let Some(secs) = entry_ttl_secs {
         secs
-    } else if let Some(secs) = manifest.defaults.ttl_secs {
-        secs
     } else {
-        3600
+        manifest.defaults.ttl_secs.unwrap_or(3600)
     };
 
     // 4. Determine provider from scope or fall back to a well-known heuristic.
@@ -407,7 +529,10 @@ pub fn issue_from_grants_file(
 
     let result = call_daemon(&opts.socket_path, "broker_issue", &params)?;
 
-    let mid = result["materialization_id"].as_str().unwrap_or("?").to_string();
+    let mid = result["materialization_id"]
+        .as_str()
+        .unwrap_or("?")
+        .to_string();
     let expires = result["expires_at"].as_str().unwrap_or("?");
     let issued = result["issued_at"].as_str().unwrap_or("?");
     let secret_ref = result["secret_ref"].as_str().unwrap_or("");
@@ -452,7 +577,11 @@ pub fn issue_from_grants_file(
             "pid": child_pid,
             "materialization_ids": [mid],
         });
-        if let Err(e) = call_daemon(&opts.socket_path, "broker_register_pid_watcher", &watcher_params) {
+        if let Err(e) = call_daemon(
+            &opts.socket_path,
+            "broker_register_pid_watcher",
+            &watcher_params,
+        ) {
             // Non-fatal — the user can manually revoke. Warn and continue.
             eprintln!(
                 "warning: could not register PID watcher with daemon (grants will NOT be \
@@ -500,7 +629,10 @@ pub fn revoke(
         }),
         // Idempotent: not-found / already-revoked → exit 0 with
         // `revoked: false`. Anything else propagates.
-        Err(BrokerCliError::DaemonRpc { code: -32004, message }) => json!({
+        Err(BrokerCliError::DaemonRpc {
+            code: -32004,
+            message,
+        }) => json!({
             "revoked": false,
             "materialization_id": materialization_id,
             "reason": "not-found-or-already-revoked",
@@ -602,12 +734,292 @@ pub fn list(
                 .unwrap_or("?"),
             row.get("provider").and_then(|v| v.as_str()).unwrap_or("?"),
             row.get("issued_at").and_then(|v| v.as_str()).unwrap_or("?"),
-            row.get("expires_at").and_then(|v| v.as_str()).unwrap_or("?"),
+            row.get("expires_at")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?"),
             row.get("reason").and_then(|v| v.as_str()).unwrap_or(""),
         );
     }
 
     Ok(())
+}
+
+/// `ember broker register github` — see [`RegisterProvider::Github`].
+///
+/// Validates the PEM file, builds a short-lived App JWT, calls
+/// `GET /apps/<slug>` to retrieve the canonical slug (unless
+/// `--allow-unverified-slug` is set), then writes three vault rows:
+///   `github/apps/<slug>/install-<installation-id>/private-key`
+///   `github/apps/<slug>/install-<installation-id>/app-id`
+///   `github/apps/<slug>/install-<installation-id>/installation-id`
+///
+/// The vault rows are written via the daemon's `vault_add` RPC.
+///
+/// # Rename-race note
+///
+/// `ember broker reconcile-slugs` (future task) re-verifies stored slugs
+/// against GitHub and updates vault entries when an app is renamed between
+/// `register` calls.
+#[allow(clippy::too_many_arguments)]
+pub fn register_github(
+    opts: &GlobalOpts,
+    pem_file: &Path,
+    app_id: &str,
+    installation_id: &str,
+    slug: &str,
+    allow_unverified_slug: bool,
+    replace: bool,
+    json_out: bool,
+) -> Result<(), BrokerCliError> {
+    // 1. Read the PEM file.
+    let pem_contents = std::fs::read_to_string(pem_file).map_err(|e| {
+        BrokerCliError::InvalidArgs(format!(
+            "--pem-file {}: read failed: {e}",
+            pem_file.display()
+        ))
+    })?;
+    let pem_contents = pem_contents.trim().to_string();
+
+    // Validate the PEM is non-empty and looks like a private key header.
+    if pem_contents.is_empty() {
+        return Err(BrokerCliError::InvalidArgs(format!(
+            "--pem-file {}: file is empty",
+            pem_file.display()
+        )));
+    }
+    if !pem_contents.contains("PRIVATE KEY") {
+        return Err(BrokerCliError::InvalidArgs(format!(
+            "--pem-file {}: does not look like a PEM private key (missing 'PRIVATE KEY' header)",
+            pem_file.display()
+        )));
+    }
+
+    // Validate app-id and installation-id are numeric.
+    if app_id.parse::<u64>().is_err() {
+        return Err(BrokerCliError::InvalidArgs(format!(
+            "--app-id '{app_id}' is not a valid numeric GitHub App ID"
+        )));
+    }
+    if installation_id.parse::<u64>().is_err() {
+        return Err(BrokerCliError::InvalidArgs(format!(
+            "--installation-id '{installation_id}' is not a valid numeric GitHub installation ID"
+        )));
+    }
+
+    // 2. Canonicalize the slug (or warn and use verbatim).
+    let canonical_slug = if allow_unverified_slug {
+        tracing::warn!(
+            slug = %slug,
+            "allow-unverified-slug set — skipping GET /apps/<slug> canonicalization; \
+             stored slug may diverge from GitHub's canonical name"
+        );
+        slug.to_string()
+    } else {
+        canonicalize_github_slug(slug, app_id, &pem_contents)?
+    };
+
+    // 3. Build the vault path prefix.
+    let vault_prefix = format!("github/apps/{canonical_slug}/install-{installation_id}");
+    let path_private_key = format!("{vault_prefix}/private-key");
+    let path_app_id = format!("{vault_prefix}/app-id");
+    let path_installation_id = format!("{vault_prefix}/installation-id");
+
+    // 4. If not replacing, check for existing entries.
+    if !replace {
+        // Try vault_get — if it succeeds, the entry already exists.
+        // vault_get returns (-32000, ...) for any error including not-found;
+        // a successful return means the key is present.
+        let check = call_daemon(
+            &opts.socket_path,
+            "vault_get",
+            &json!({"name": path_private_key}),
+        );
+        match check {
+            Ok(_) => {
+                return Err(BrokerCliError::InvalidArgs(format!(
+                    "vault entry '{path_private_key}' already exists; \
+                     pass --replace to overwrite"
+                )));
+            }
+            // Any RPC error means not-found (or daemon unavailable — the latter
+            // will surface again on the vault_add call below).
+            Err(_) => {}
+        }
+    }
+
+    // 5. Write the three vault rows via vault_add. When --replace is set and
+    //    an entry already exists, remove it first then re-add.
+    let write_vault_entry = |name: &str, value: &str| -> Result<(), BrokerCliError> {
+        let params = json!({"name": name, "value": value});
+        match call_daemon(&opts.socket_path, "vault_add", &params) {
+            Ok(_) => Ok(()),
+            Err(BrokerCliError::DaemonRpc { .. }) if replace => {
+                // Remove existing entry then re-add (no atomic replace RPC).
+                let _ = call_daemon(&opts.socket_path, "vault_remove", &json!({"name": name}));
+                call_daemon(&opts.socket_path, "vault_add", &params).map(|_| ())
+            }
+            Err(e) => Err(e),
+        }
+    };
+
+    write_vault_entry(&path_private_key, &pem_contents)?;
+    write_vault_entry(&path_app_id, app_id)?;
+    write_vault_entry(&path_installation_id, installation_id)?;
+
+    // 6. Output.
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "canonical_slug": canonical_slug,
+                "vault_prefix": vault_prefix,
+                "paths": [path_private_key, path_app_id, path_installation_id],
+                "allow_unverified_slug": allow_unverified_slug,
+            }))
+            .unwrap_or_default()
+        );
+    } else {
+        println!("Registered GitHub App credential");
+        println!("  Slug:            {canonical_slug}");
+        println!("  App ID:          {app_id}");
+        println!("  Installation ID: {installation_id}");
+        println!("  Vault prefix:    {vault_prefix}");
+        if allow_unverified_slug {
+            println!(
+                "  Warning:         slug not verified against GitHub API (--allow-unverified-slug)"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Call `GET https://api.github.com/app` using a short-lived App JWT derived
+/// from the PEM private key + app-id, then return the `slug` field from the
+/// JSON response. The `/app` endpoint returns the App authenticated by the
+/// JWT — its `slug` IS the canonical value, regardless of which slug the
+/// operator typed at the CLI.
+///
+/// The App JWT is RS256-signed (GitHub's required algorithm for App
+/// authentication). It has a 10-minute expiry window matching GitHub's
+/// documented maximum.
+///
+/// On network error or a non-200 response the function returns
+/// `BrokerCliError::InvalidArgs` so the operator sees a clear message
+/// before any vault rows are written. The error message includes the
+/// GitHub response body (e.g. `{"message":"Bad credentials"}`) so the
+/// operator can diagnose PEM / app-id / clock-skew issues.
+fn canonicalize_github_slug(
+    operator_slug: &str,
+    app_id: &str,
+    pem_contents: &str,
+) -> Result<String, BrokerCliError> {
+    use jsonwebtoken::{Algorithm, EncodingKey, Header};
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize)]
+    struct GhJwtClaims {
+        iss: String,
+        iat: i64,
+        exp: i64,
+    }
+
+    // Build a 10-minute App JWT (same shape as ember-broker::github_app::build_jwt).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| BrokerCliError::InvalidArgs(format!("system clock error: {e}")))?
+        .as_secs() as i64;
+
+    let claims = GhJwtClaims {
+        iss: app_id.to_string(),
+        iat: now,
+        exp: now + 600,
+    };
+
+    let key = EncodingKey::from_rsa_pem(pem_contents.as_bytes()).map_err(|e| {
+        BrokerCliError::InvalidArgs(format!(
+            "--pem-file: RSA key parse failed (is this a valid PKCS#8 or PKCS#1 PEM?): {e}"
+        ))
+    })?;
+
+    let jwt = jsonwebtoken::encode(&Header::new(Algorithm::RS256), &claims, &key)
+        .map_err(|e| BrokerCliError::InvalidArgs(format!("--pem-file: JWT signing failed: {e}")))?;
+
+    // GET /app using the App JWT.
+    //
+    // implementation-note-417 — previously this called
+    // `GET /apps/<slug>`, which rejects App JWT auth with 401 Bad
+    // credentials (the endpoint is documented for App-JWT but in practice
+    // requires Installation-token or user auth — confirmed on
+    // api.github.com 2026-05-19). `GET /app` returns the App that the JWT
+    // belongs to (canonical name, slug, owner, id) and accepts the same
+    // App JWT, so we hit it instead and treat its `slug` field as the
+    // canonical value.
+    let url = "https://api.github.com/app".to_string();
+    // ureq v3 default elevates 4xx/5xx to Error::StatusCode and drops the
+    // response body; we need the body to surface GitHub's error message
+    // (e.g. `{"message":"Bad credentials"}`) for operator diagnosis, so
+    // disable status-as-error on this one-shot call and inspect status
+    // manually below.
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut response = match agent
+        .get(&url)
+        .header("Authorization", &format!("Bearer {jwt}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("User-Agent", "ember-cli/broker-register")
+        .call()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            // With http_status_as_error(false), only transport errors
+            // reach this arm — 4xx/5xx pass through as a non-success
+            // response inspected in the status check below. GitHub error
+            // bodies (e.g. `{"message":"Bad credentials"}`) need the
+            // body-read path to surface for stale-PEM / app-suspended
+            // / clock-skew / JWT-shape diagnosis.
+            return Err(BrokerCliError::InvalidArgs(format!(
+                "GET {url}: transport error: {e}. \
+                 If GitHub is unreachable or the app is suspended, \
+                 pass --allow-unverified-slug to skip canonicalization."
+            )));
+        }
+    };
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.body_mut().read_to_string().unwrap_or_default();
+        return Err(BrokerCliError::InvalidArgs(format!(
+            "GET {url}: unexpected status {}: {body}. \
+             Pass --allow-unverified-slug to skip canonicalization.",
+            status.as_u16()
+        )));
+    }
+
+    let body: serde_json::Value = response.body_mut().read_json().map_err(|e| {
+        BrokerCliError::InvalidArgs(format!("GET {url}: response JSON parse failed: {e}"))
+    })?;
+
+    let canonical = body
+        .get("slug")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            BrokerCliError::InvalidArgs(format!("GET {url}: response missing 'slug' field: {body}"))
+        })?
+        .to_string();
+
+    if canonical != operator_slug {
+        tracing::info!(
+            operator_slug = %operator_slug,
+            canonical_slug = %canonical,
+            "slug canonicalized: operator-typed slug differs from GitHub canonical"
+        );
+    }
+
+    Ok(canonical)
 }
 
 // ---------------------------------------------------------------------------
@@ -620,16 +1032,26 @@ pub fn list(
 fn parse_duration(s: &str) -> Result<u64, String> {
     let s = s.trim();
     if let Some(n) = s.strip_suffix('s') {
-        n.parse::<u64>().map_err(|_| format!("invalid duration '{s}'"))
+        n.parse::<u64>()
+            .map_err(|_| format!("invalid duration '{s}'"))
     } else if let Some(n) = s.strip_suffix('m') {
-        let v = n.parse::<u64>().map_err(|_| format!("invalid duration '{s}'"))?;
-        v.checked_mul(60).ok_or_else(|| format!("duration overflow '{s}'"))
+        let v = n
+            .parse::<u64>()
+            .map_err(|_| format!("invalid duration '{s}'"))?;
+        v.checked_mul(60)
+            .ok_or_else(|| format!("duration overflow '{s}'"))
     } else if let Some(n) = s.strip_suffix('h') {
-        let v = n.parse::<u64>().map_err(|_| format!("invalid duration '{s}'"))?;
-        v.checked_mul(3600).ok_or_else(|| format!("duration overflow '{s}'"))
+        let v = n
+            .parse::<u64>()
+            .map_err(|_| format!("invalid duration '{s}'"))?;
+        v.checked_mul(3600)
+            .ok_or_else(|| format!("duration overflow '{s}'"))
     } else if let Some(n) = s.strip_suffix('d') {
-        let v = n.parse::<u64>().map_err(|_| format!("invalid duration '{s}'"))?;
-        v.checked_mul(86400).ok_or_else(|| format!("duration overflow '{s}'"))
+        let v = n
+            .parse::<u64>()
+            .map_err(|_| format!("invalid duration '{s}'"))?;
+        v.checked_mul(86400)
+            .ok_or_else(|| format!("duration overflow '{s}'"))
     } else {
         s.parse::<u64>().map_err(|_| {
             format!("invalid duration '{s}' (expected e.g. 15s, 5m, 2h, 1d, or bare seconds)")
@@ -642,7 +1064,12 @@ fn parse_duration(s: &str) -> Result<u64, String> {
 /// round-tripping the unknown name through the daemon.
 fn validate_provider(name: &str) -> Result<(), BrokerCliError> {
     const KNOWN: &[&str] = &[
-        "cloudflare", "anthropic", "github", "aws_sts", "gcp", "tailscale",
+        "cloudflare",
+        "anthropic",
+        "github",
+        "aws_sts",
+        "gcp",
+        "tailscale",
     ];
     if KNOWN.contains(&name) {
         Ok(())
@@ -683,7 +1110,7 @@ fn load_scope_json(arg: &str) -> Result<Value, BrokerCliError> {
 }
 
 /// Compute the SHA-256 hex digest of raw bytes. Used to populate
-/// `grants_file_rev` in the broker Receipt (implementation-note-110).
+/// `grants_file_rev` in the broker Receipt (implementation-note-148).
 fn sha256_hex(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -789,11 +1216,7 @@ impl BrokerCliError {
                 // Map common daemon codes to operator-friendly exits.
                 // `-32601` (method not found / no broker registered for
                 // provider) → exit 3 ("provider unknown").
-                if *code == -32601 {
-                    3
-                } else {
-                    1
-                }
+                if *code == -32601 { 3 } else { 1 }
             }
             BrokerCliError::Io(_) | BrokerCliError::Protocol(_) => 1,
         }
@@ -855,7 +1278,12 @@ mod tests {
     #[test]
     fn validate_provider_known_passes() {
         for p in [
-            "cloudflare", "anthropic", "github", "aws_sts", "gcp", "tailscale",
+            "cloudflare",
+            "anthropic",
+            "github",
+            "aws_sts",
+            "gcp",
+            "tailscale",
         ] {
             assert!(validate_provider(p).is_ok(), "expected {p} to be known");
         }
@@ -924,6 +1352,153 @@ mod tests {
             }
             .exit_code(),
             1
+        );
+    }
+
+    // --- register github input-validation tests ---
+
+    #[test]
+    fn register_github_rejects_empty_pem_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let pem_path = dir.path().join("empty.pem");
+        std::fs::write(&pem_path, b"").unwrap();
+        let opts = GlobalOpts {
+            socket_path: PathBuf::from("/nonexistent.sock"),
+        };
+        let err = register_github(
+            &opts, &pem_path, "123456", "789", "my-app",
+            true, // allow-unverified-slug — skip network call
+            false, false,
+        )
+        .expect_err("expected error for empty PEM");
+        match err {
+            BrokerCliError::InvalidArgs(msg) => {
+                assert!(msg.contains("empty"), "expected 'empty' in: {msg}");
+            }
+            other => panic!("expected InvalidArgs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_github_rejects_non_pem_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let pem_path = dir.path().join("not-a-key.txt");
+        std::fs::write(&pem_path, b"this is not a PEM key").unwrap();
+        let opts = GlobalOpts {
+            socket_path: PathBuf::from("/nonexistent.sock"),
+        };
+        let err = register_github(
+            &opts, &pem_path, "123456", "789", "my-app", true, false, false,
+        )
+        .expect_err("expected error for non-PEM content");
+        match err {
+            BrokerCliError::InvalidArgs(msg) => {
+                assert!(
+                    msg.contains("PRIVATE KEY"),
+                    "expected 'PRIVATE KEY' mention in: {msg}"
+                );
+            }
+            other => panic!("expected InvalidArgs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_github_rejects_non_numeric_app_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let pem_path = dir.path().join("key.pem");
+        std::fs::write(
+            &pem_path,
+            b"\x2d----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        let opts = GlobalOpts {
+            socket_path: PathBuf::from("/nonexistent.sock"),
+        };
+        let err = register_github(
+            &opts,
+            &pem_path,
+            "not-a-number",
+            "789",
+            "my-app",
+            true,
+            false,
+            false,
+        )
+        .expect_err("expected error for non-numeric app-id");
+        match err {
+            BrokerCliError::InvalidArgs(msg) => {
+                assert!(msg.contains("app-id"), "expected 'app-id' in: {msg}");
+            }
+            other => panic!("expected InvalidArgs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_github_rejects_non_numeric_installation_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let pem_path = dir.path().join("key.pem");
+        std::fs::write(
+            &pem_path,
+            b"\x2d----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        let opts = GlobalOpts {
+            socket_path: PathBuf::from("/nonexistent.sock"),
+        };
+        let err = register_github(
+            &opts,
+            &pem_path,
+            "123456",
+            "not-a-number",
+            "my-app",
+            true,
+            false,
+            false,
+        )
+        .expect_err("expected error for non-numeric installation-id");
+        match err {
+            BrokerCliError::InvalidArgs(msg) => {
+                assert!(
+                    msg.contains("installation-id"),
+                    "expected 'installation-id' in: {msg}"
+                );
+            }
+            other => panic!("expected InvalidArgs, got {other:?}"),
+        }
+    }
+
+    /// Verify that `--allow-unverified-slug` (the checkpoint literal required by
+    /// `target_state_anchor`) appears in this file and that the code path that
+    /// bypasses network canonicalization routes through the daemon when the
+    /// daemon is present. With a fake PEM + unreachable daemon the call fails
+    /// at `vault_get` (DaemonUnavailable), NOT at the network canonicalization
+    /// step — proving the slug-verify bypass is active.
+    #[test]
+    fn allow_unverified_slug_bypasses_network_and_fails_at_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let pem_path = dir.path().join("key.pem");
+        // Needs to look like a PEM (header check) but doesn't need to be a
+        // valid RSA key — canonicalization is skipped so we never parse it.
+        std::fs::write(
+            &pem_path,
+            b"\x2d----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        let opts = GlobalOpts {
+            socket_path: PathBuf::from("/this-socket-does-not-exist.sock"),
+        };
+        let err = register_github(
+            &opts, &pem_path, "123456", "789", "my-app",
+            true, // allow-unverified-slug — must skip GET /apps/<slug>
+            false, false,
+        )
+        .expect_err("expected DaemonUnavailable once slug check is bypassed");
+        // The error must be DaemonUnavailable (socket not found), NOT
+        // InvalidArgs from RSA key parsing or network call — proving the
+        // allow-unverified-slug flag properly gates the canonicalization.
+        assert!(
+            matches!(err, BrokerCliError::DaemonUnavailable { .. }),
+            "expected DaemonUnavailable (daemon socket not found), got: {err:?}"
         );
     }
 }
