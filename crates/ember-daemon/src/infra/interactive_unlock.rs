@@ -79,6 +79,10 @@ pub fn register_config(config: DaemonConfig) {
     MANAGER.with(|manager| manager.borrow_mut().config = Some(config));
 }
 
+pub(crate) fn current_config() -> Option<DaemonConfig> {
+    MANAGER.with(|manager| manager.borrow().config.clone())
+}
+
 /// Configure the shared grace window for this daemon runtime.
 ///
 /// Startup-only today: the runtime applies the tier default before any
@@ -191,11 +195,13 @@ pub fn explicit_lock() {
 }
 
 #[doc(hidden)]
+#[cfg(test)]
 pub(crate) fn pin_count() -> usize {
     MANAGER.with(|manager| manager.borrow().pins.pin_count())
 }
 
 #[doc(hidden)]
+#[cfg(test)]
 pub(crate) fn set_test_grace_window(duration: Duration) {
     MANAGER.with(|manager| {
         manager.borrow_mut().pins = UnlockPinTracker::with_grace_window(duration);
@@ -203,6 +209,7 @@ pub(crate) fn set_test_grace_window(duration: Duration) {
 }
 
 #[doc(hidden)]
+#[cfg(test)]
 pub(crate) fn acquire_session_pin_at(session_id: &str, acquired_at: Instant) -> bool {
     MANAGER.with(|manager| {
         manager
@@ -213,6 +220,7 @@ pub(crate) fn acquire_session_pin_at(session_id: &str, acquired_at: Instant) -> 
 }
 
 #[doc(hidden)]
+#[cfg(test)]
 pub(crate) fn release_session_pin_at(session_id: &str, released_at: Instant) -> bool {
     MANAGER.with(|manager| {
         manager

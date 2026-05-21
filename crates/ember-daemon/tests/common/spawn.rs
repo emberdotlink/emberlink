@@ -1,6 +1,6 @@
 //!
 //! Shared test helper for spawning the ember daemon and guaranteeing the
-//! child process is reaped on test exit. Per implementation-note-360
+//! child process is reaped on test exit. Per implementation-note-403
 //! defense-in-depth: subtask A's type-system fix (`for_test` constructor)
 //! prevents tests from inheriting user-home paths, but a panicking test still
 //! leaks the spawned `Child` because `Drop` doesn't run on bare

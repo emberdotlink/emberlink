@@ -7,7 +7,7 @@
 //!
 //! ## Scaffold status
 //!
-//! This is the stub shipped with implementation-note-335.
+//! This is the stub shipped with implementation-note-377.
 //! The real Objective-C runtime bindings (objc2 / cocoa-foundation crate)
 //! land in a successor task; the type + signature exist now so call sites
 //! in `crate::infra::runtime` can wire the watcher into the daemon's
@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex};
 /// macOS presence-event watcher. Currently a no-op stub; logs intent
 /// and returns `Ok` so call sites can adopt the API surface now.
 ///
-/// TODO(implementation-note-335 successor): swap the
+/// TODO(implementation-note-377 successor): swap the
 /// `_cache: Arc<Mutex<()>>` placeholder for
 /// `Arc<Mutex<ember_memory::cache::PresenceCache>>` once `ember-memory`
 /// is added to `ember-daemon`'s Cargo.toml dep list and the daemon's

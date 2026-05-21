@@ -24,7 +24,7 @@ fn main() {
         .json()
         .init();
 
-    // implementation-note-105: resolve a real on-disk config.
+    // implementation-note-120: resolve a real on-disk config.
     // EMBER_CONFIG env override → `~/.ember/config.toml` → loud-fail. No silent
     // `DaemonConfig::default()` fallback — that path was the May-12 25-hour
     // leaked-daemon root cause (silent inheritance of user-home socket binding
@@ -55,6 +55,14 @@ fn main() {
 
     if let Err(e) = config.ensure_dirs() {
         eprintln!("emberd: ensure_dirs failed: {e}");
+        process::exit(1);
+    }
+
+    // emberd_sandbox_startup_probe (implementation-note-121).
+    // Verify the daemon is actually sandboxed before accepting connections.
+    // WARN-by-default; EMBER_REQUIRE_SANDBOX=1 turns this into a refuse-to-start.
+    if let Err(e) = ember_daemon::infra::runtime::check_sandbox_at_startup() {
+        eprintln!("emberd: sandbox-startup-probe refused (strict mode): {e}");
         process::exit(1);
     }
 

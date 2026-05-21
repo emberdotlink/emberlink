@@ -1,4 +1,4 @@
-//! implementation-note-134: container mount-table helpers.
+//! implementation-note-150: container mount-table helpers.
 //!
 //! Bind-mount strategy (one socket per agent, parent dir read-only):
 //!
@@ -40,7 +40,7 @@ use uuid::Uuid;
 
 /// Errors raised by the SCION agent-spawn path.
 ///
-/// The two variants relevant to implementation-note-175 are:
+/// The two variants relevant to implementation-note-198 are:
 ///
 /// - [`SpawnError::BinaryHashMismatch`] — the on-disk binary's SHA-256
 ///   does not match the operator-pinned hash from [`crate::infra::config::DaemonConfig::scion_binary_sha256`].
@@ -73,7 +73,7 @@ pub enum SpawnError {
     /// [`SpawnError`] for the rationale.
     #[error("scion binary io error: {0}")]
     BinaryIo(#[from] std::io::Error),
-    /// implementation-note-95 — the configured
+    /// implementation-note-109 — the configured
     /// in-container UDS path does not exist, is not a socket, or
     /// could not be `stat`-ed. Validated BEFORE `connect()` so a
     /// dangling path produces a clean error instead of a vague
@@ -88,21 +88,21 @@ pub enum SpawnError {
         /// Human-readable reason (`not found`, `not a socket`, etc.).
         reason: String,
     },
-    /// implementation-note-95 — `tokio::net::UnixStream::connect`
+    /// implementation-note-109 — `tokio::net::UnixStream::connect`
     /// failed against an already-validated path. Carries the underlying
     /// I/O error (`ECONNREFUSED` when the receiver crashed between
     /// validation and connect, `EACCES` when the agent uid doesn't
     /// hold 0660 on the socket, etc.).
     #[error("scion exec connect failed: {0}")]
     ExecConnect(std::io::Error),
-    /// implementation-note-95 — encoding or writing
+    /// implementation-note-109 — encoding or writing
     /// the SpawnDirective frame failed mid-handshake. The connection
     /// is owned by the caller at the point of return; this variant
     /// is reached only on the pre-return write path inside
     /// [`send_spawn_directive`] itself.
     #[error("scion exec directive write failed: {0}")]
     ExecDirectiveWrite(FrameError),
-    /// implementation-note-310 — failed to capture the
+    /// implementation-note-347 — failed to capture the
     /// (cgroup_v2_id, userns_inode, mnt_ns_inode) tuple for a freshly
     /// spawned container PID. Refuse-spawn: a missing binding tuple
     /// breaks the agent_socket_enrollments → container identity
@@ -193,7 +193,7 @@ pub struct MountSpec {
 /// [`MountKind::MlockedPersonaKey`] is a virtual entry — it describes
 /// the in-process mlocked memory region for the agent's persona key, not
 /// a filesystem mount. It is emitted only by
-/// [`scion_mount_table_with_persona_key`] (implementation-note-263)
+/// [`scion_mount_table_with_persona_key`] (implementation-note-290)
 /// so the lifecycle of the locked region is observable in the same
 /// table that the container runtime consumes for the socket bind-mounts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,7 +208,7 @@ pub enum MountKind {
     /// it can `connect()` and send/receive bytes, but the parent-dir
     /// RO mount prevents `unlink`/`rename` of the inode itself.
     ReadWriteSocket,
-    /// implementation-note-263 — virtual entry describing the
+    /// implementation-note-290 — virtual entry describing the
     /// in-process mlocked memory region holding the persona's Ed25519
     /// secret. The `source` path is a checkpoint (`/proc/self/mem`) and
     /// the `target` carries the persona id so reconcilers can correlate
@@ -269,7 +269,7 @@ pub fn scion_mount_table_for_socket(socket_path: &Path) -> Vec<MountSpec> {
     ]
 }
 
-/// implementation-note-263 — build the mount-table contribution
+/// implementation-note-290 — build the mount-table contribution
 /// for a per-agent UDS socket AND surface the persona's mlocked
 /// memory region as an additional informational entry.
 ///
@@ -304,7 +304,7 @@ pub fn scion_mount_table_with_persona_key(socket_path: &Path, persona_id: &str) 
     mounts
 }
 
-/// implementation-note-95 — emberd-side wire-protocol
+/// implementation-note-109 — emberd-side wire-protocol
 /// counterpart to `ember_exec::spawn::handle_spawn_directive` (subtask C).
 ///
 /// Opens a `tokio::net::UnixStream` to the in-container `ember-exec`
@@ -393,13 +393,13 @@ pub async fn send_spawn_directive(
     Ok(stream)
 }
 
-/// implementation-note-33 — build + sign a Receipt v2 envelope
+/// implementation-note-43 — build + sign a Receipt v2 envelope
 /// of kind `exec.completion` for the just-completed in-container exec.
 ///
 /// Called by [`crate::broker::handler::handle_broker_exec`]'s in-container
 /// branch on every `ExecFrame::Exit` arriving from the in-container
 /// `ember-exec` sidecar. The receipt is the audit-trail anchor for the
-/// parent implementation-note-34 acceptance — emberd (not ember-exec)
+/// parent implementation-note-44 acceptance — emberd (not ember-exec)
 /// is the receipt signer; ember-exec only reports the child's exit code,
 /// and emberd composes + signs the v2 envelope from the inputs the daemon
 /// already trusts (the directive's `binary_path` + the blake3 hash the
@@ -476,8 +476,8 @@ pub fn emit_exec_completion_receipt<S: Signer>(
         receipt_id: String::new(),
         daemon_root_id,
         traceparent: None,
-        // implementation-note-33 — emberd (daemon persona) is
-        // the receipt signer per the parent implementation-note-34
+        // implementation-note-43 — emberd (daemon persona) is
+        // the receipt signer per the parent implementation-note-44
         // acceptance, matching the `broker.materialization` envelope's
         // posture in `crate::infra::receipt::build_broker_materialization_envelope`.
         termination_authority: TerminationAuthority::DaemonPersona,
@@ -494,7 +494,7 @@ pub fn emit_exec_completion_receipt<S: Signer>(
     Ok(envelope)
 }
 
-/// implementation-note-94 — build + dual-sign a Receipt v2
+/// implementation-note-108 — build + dual-sign a Receipt v2
 /// envelope of kind `spawn.witness` for a parent→child grant edge.
 ///
 /// Called from the spawn path (`crate::trust::grant::delegate_grant_full_sql`)
@@ -541,7 +541,7 @@ pub fn emit_spawn_witness_receipt<P: Signer, D: Signer>(
     daemon_signer: &D,
 ) -> Result<ReceiptEnvelope, SignError> {
     // 1. Build the unsigned body and have the parent persona sign it.
-    //    implementation-note-60 — the
+    //    implementation-note-71 — the
     //    `ca_fingerprint` binds the spawn to the daemon's SE-sealed Bridge CA
     //    (Slice B's `runtime.bridge_ca.lock().unwrap().as_ref().map(|ca|
     //    ca.fingerprint())`). Callers without a fingerprint to bind (legacy
@@ -584,7 +584,7 @@ pub fn emit_spawn_witness_receipt<P: Signer, D: Signer>(
     Ok(envelope)
 }
 
-/// implementation-note-348 — mint a per-agent X.509 CA for the
+/// implementation-note-390 — mint a per-agent X.509 CA for the
 /// ember-proxy TLS interceptor.
 ///
 /// Each SCION worker runs its own ember-proxy instance (design §7). The
@@ -638,7 +638,7 @@ pub fn mint_per_agent_proxy_ca(
     core_crypto::mint_per_agent_ca_with_name_constraints(agent_id, names, hours)
 }
 
-/// implementation-note-349 — mint a per-agent mTLS client cert for the
+/// implementation-note-391 — mint a per-agent mTLS client cert for the
 /// ember-proxy SCION listener.
 ///
 /// The proxy at `https://localhost:8443` inside the worker container requires
@@ -687,7 +687,7 @@ pub fn mint_per_agent_mtls_client_cert(
     core_crypto::mint_per_agent_client_cert(agent_id, container_id, signer_key, signer_cert, hours)
 }
 
-/// implementation-note-310 — the three-tuple captured at
+/// implementation-note-347 — the three-tuple captured at
 /// spawn-completion that binds an `agent_socket_enrollments` row to a
 /// kernel-observable namespace identity.
 ///
@@ -961,7 +961,7 @@ mod tests {
 
     #[test]
     fn emit_spawn_witness_receipt_dual_signature_verifies() {
-        // implementation-note-94 — the emit function
+        // implementation-note-108 — the emit function
         // must produce an envelope where BOTH signatures verify under
         // the supplied trust anchors:
         //
@@ -980,8 +980,8 @@ mod tests {
             verify_receipt_v2, verify_spawn_witness_parent_signature,
         };
 
-        let parent_signer = FixtureSigner::new("implementation-note-350spawn-witness-parent-key");
-        let daemon_signer = FixtureSigner::new("implementation-note-350spawn-witness-daemon-key");
+        let parent_signer = FixtureSigner::new("implementation-note-392spawn-witness-parent-key");
+        let daemon_signer = FixtureSigner::new("implementation-note-392spawn-witness-daemon-key");
         let parent_pk = parent_signer.public_key();
         let daemon_pk = daemon_signer.public_key();
 
@@ -1065,7 +1065,7 @@ mod tests {
 
     #[test]
     fn mount_table_with_persona_key_appends_mlock_entry() {
-        // implementation-note-263 — the companion table extends
+        // implementation-note-290 — the companion table extends
         // the bare socket-only table with a third MlockedPersonaKey
         // entry. The first two entries match the bare table byte-for-
         // byte so callers can swap variants without losing the
@@ -1090,7 +1090,7 @@ mod tests {
         );
     }
 
-    /// implementation-note-310 T2 fixture — happy path.
+    /// implementation-note-347 T2 fixture — happy path.
     ///
     /// Build a fake `/proc/<pid>/` tree and a fake cgroup root in a
     /// tempdir, run the capture helper against them, assert the three
@@ -1132,7 +1132,7 @@ mod tests {
         assert_eq!(captured.mnt_ns_inode, expected_mntns);
     }
 
-    /// implementation-note-310 T2 fixture — failure path.
+    /// implementation-note-347 T2 fixture — failure path.
     ///
     /// Missing `/proc/<pid>/cgroup` must produce
     /// [`SpawnError::NamespaceInodeCaptureFailed`]. The spawn flow
@@ -1153,7 +1153,7 @@ mod tests {
         );
     }
 
-    /// implementation-note-310 T2 fixture — malformed cgroup
+    /// implementation-note-347 T2 fixture — malformed cgroup
     /// file (no `0::` line) refuses.
     #[test]
     #[cfg(target_os = "linux")]

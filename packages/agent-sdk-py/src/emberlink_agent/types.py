@@ -10,6 +10,7 @@ class AgentConfig:
     persona_id: str
     binary_path: str = "emberlink-agent"
     label: str | None = None
+    daemon_socket: str | None = None
 
 
 @dataclass
@@ -35,8 +36,9 @@ class RequestGrantResult:
 
 @dataclass
 class GrantStatusResult:
-    grant_id: str
     status: str
+    grant_id: str | None = None
+    request_id: str | None = None
     issuer_id: str | None = None
     capability: str | None = None
     expires_at: int | None = None

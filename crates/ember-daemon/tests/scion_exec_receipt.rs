@@ -1,4 +1,4 @@
-//! implementation-note-33 — T2 tests for the emberd-side
+//! implementation-note-43 — T2 tests for the emberd-side
 //! `exec.completion` Receipt v2 emission path.
 //!
 //! Two tests:
@@ -168,12 +168,17 @@ async fn test_handle_exit_frame_emits_receipt() {
     let store = store_with_vault();
 
     // Build a broker_exec request that routes through the
-    // in-container branch via `scion_exec_socket`. /bin/true is the
-    // binary we report as "what the daemon approved" — the receipt
-    // records its blake3 hash. The mock listener never actually
-    // execs anything; it just emits the Exit frame.
+    // in-container branch via `scion_exec_socket`. /usr/bin/true is
+    // the binary we report as "what the daemon approved" — the
+    // receipt records its blake3 hash. The mock listener never
+    // actually execs anything; it just emits the Exit frame.
+    //
+    // Use /usr/bin/true (not /bin/true): macOS ships /usr/bin/true
+    // but not /bin/true, so the blake3 read fails ENOENT on Darwin.
+    // Same fix-shape as prior change for broker_exec_* tests
+    // (memory project_broker_exec_tests_sandbox_blocked).
     let req = serde_json::json!({
-        "binary": "/bin/true",
+        "binary": "/usr/bin/true",
         "argv": [],
         "cwd": null,
         "env_passthrough": [],
@@ -256,7 +261,7 @@ async fn test_handle_exit_frame_emits_receipt() {
             // caller (no caller_persona in params).
             let body: ExecCompletionBody =
                 serde_json::from_value(envelope.body.clone()).expect("body deserialize");
-            assert_eq!(body.binary_path, "/bin/true");
+            assert_eq!(body.binary_path, "/usr/bin/true");
             assert_eq!(body.exit_code, 0);
             assert_eq!(body.target_uid, 4242);
             assert!(

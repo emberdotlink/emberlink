@@ -1,5 +1,5 @@
 //! `ember init --for claude-code` and `ember uninstall --for claude-code`
-//! orchestration (implementation-note-387).
+//! orchestration (implementation-note-451).
 //!
 //! Per design §2 / §3: a one-command first-run setup that wires Claude Code
 //! to the local ember daemon. This module is the orchestration layer — the
@@ -14,10 +14,10 @@
 //!      grant for the persona if one exists).
 //!   4. Patch `~/.claude/settings.json` to install the `ember-proxy hook`
 //!      PreToolUse hook (idempotent — see `settings_patch.rs`).
-//!   5. Optional GH PAT capture: prompt the user; if accepted, run
-//!      `gh auth token` in-process and pipe the value directly into the
-//!      vault as `github-pat`. The token never crosses a visible-shell
-//!      boundary.
+//!   5. GitHub fallback guidance: keep the HTTPS/App lane as canonical.
+//!      The degraded `github-pat` lane remains available later through
+//!      `ember vault add --name github-pat`, but init no longer captures
+//!      PATs interactively.
 //!   6. Print the next two commands per design §2:
 //!      `ember claude-code` and `ember receipt show`.
 //!
@@ -25,8 +25,9 @@
 //! other artifacts (persona, grant, vault entry) are intentionally left in
 //! place because they may be in use by other tools.
 
+use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::onboarding::settings_patch::{
@@ -38,6 +39,21 @@ pub const DEFAULT_GRANT_TTL_SECS: u64 = 24 * 60 * 60;
 
 /// Vault credential name used for the captured GitHub PAT.
 pub const GH_PAT_VAULT_NAME: &str = "github-pat";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitHubOnboardingPosture {
+    AppConfiguredReal,
+    PatConfigured,
+    AppConfiguredMock,
+    AppBroken(String),
+    AppNotConfigured,
+}
+
+/// Truthful operator-facing follow-up when the onboarding flow skips PAT
+/// capture or a vault write fails.
+pub fn gh_pat_later_command() -> String {
+    format!("ember vault add --name {GH_PAT_VAULT_NAME}")
+}
 
 /// Embedded grant scope template (design §3 / γ). Sourced from
 /// `core-policy/src/templates/claude_code_default_v1.toml` so the template
@@ -83,7 +99,7 @@ pub fn default_settings_json_path() -> Result<PathBuf, InitError> {
 /// users who relied on per-host persona separation must now set
 /// `EMBER_PERSONA` explicitly or pass `-w <name>` to the launcher.
 ///
-/// implementation-note-433 anchor: routes
+/// implementation-note-483 anchor: routes
 /// through `default_persona_id_for_runtime` so launcher + init agree on
 /// the same persona-id shape.
 pub fn claude_code_persona_name() -> String {
@@ -189,102 +205,142 @@ pub fn unpatch_claude_settings_file(path: &Path) -> Result<bool, InitError> {
     Ok(true)
 }
 
-/// Print the next two commands per design §2 to stdout. Single point of
-/// truth so the wording stays in sync between `init` success and any other
-/// output paths that want to nudge the user forward.
-pub fn print_next_commands() {
-    println!();
-    println!("Next steps:");
-    println!("  ember claude-code        # launch Claude Code with this grant");
-    println!("  ember receipt show       # see the audit trail of the grant");
+/// Print posture-aware next commands plus the launcher-vs-bare-claude
+/// gradient explanation. Single point of truth so the wording stays in sync
+/// between `init` success and any other output paths that want to nudge the
+/// user forward.
+///
+/// `init_claude_code_launcher_finish_slimmed` — for `v0.3.0`, the init finish
+/// screen should reinforce one canonical next step, not teach every advanced
+/// lane. Bare `claude` and headless automation remain real surfaces, but they
+/// are intentionally demoted out of the first-run success path so friendlies
+/// leave init with one supported launcher mental model.
+pub fn print_next_commands(posture: GitHubOnboardingPosture) {
+    print!("{}", next_commands_text(posture));
 }
 
-/// Interactive GH PAT prompt. If the user types a non-empty string, returns
-/// `Some(value)`. If the user hits enter on an empty line, returns `None`.
-/// Writes the prompt to stderr so stdout stays clean for callers that
-/// pipe `ember init` output.
-///
-/// **Security note:** the value never appears in any subprocess argv or
-/// environment. The intended caller writes it directly to the vault via
-/// the in-process `Vault::add` API.
-///
-/// Stub limitation per the brief: today the user pastes the value
-/// directly. A future revision can shell out to `gh auth token` in-process
-/// and pipe the bytes — but that requires a `Command::output()` call with
-/// careful buffer handling, which we defer to keep the implementation-note-410 surface
-/// minimal. The `ember vault add --stdin` path is the same shape.
-///
-/// implementation-note-435: reframed to position the broker's
-/// GH App installation token minting as the default path, with PAT as the
-/// emergency fallback. The default behavior on Enter is unchanged (skip; no
-/// PAT stored). `ember gh-app install` is referenced as the recommended next
-/// step even though the OAuth flow is not yet implemented — that is a
-/// separate task.
-pub fn prompt_for_gh_pat(stdin_is_terminal: bool) -> io::Result<Option<String>> {
-    if !stdin_is_terminal {
-        // Non-interactive context (CI, scripted) — skip the prompt. The
-        // user can re-run with a PAT in env or call `ember vault add
-        // github-pat` separately.
-        return Ok(None);
+fn next_commands_text(posture: GitHubOnboardingPosture) -> String {
+    let mut lines = vec!["", "Next steps:"];
+    match posture {
+        GitHubOnboardingPosture::AppConfiguredReal => {
+            lines.extend_from_slice(&[
+                "  ember claude-code        # launch Claude Code with this grant (recommended)",
+                "  ember receipt show       # see the audit trail of the grant",
+            ]);
+        }
+        GitHubOnboardingPosture::PatConfigured => {
+            lines.extend_from_slice(&[
+                "  ember claude-code        # launch now on the degraded PAT lane",
+                "  ember github setup       # upgrade to the real App lane when ready",
+                "  ember receipt show       # see the audit trail of the grant",
+            ]);
+        }
+        GitHubOnboardingPosture::AppBroken(_) => {
+            lines.extend_from_slice(&[
+                "  ember github setup       # repair or replace the local App credential triple",
+                "  ember github status      # confirm the App lane is healthy",
+                "  ember claude-code        # launch once GitHub is repaired",
+            ]);
+        }
+        GitHubOnboardingPosture::AppConfiguredMock | GitHubOnboardingPosture::AppNotConfigured => {
+            lines.extend_from_slice(&[
+                "  ember github setup       # register PEM + App ID + installation URL/ID + slug",
+                "  ember github status      # confirm the App lane is ready",
+                "  ember claude-code        # launch once GitHub is configured",
+            ]);
+        }
     }
-    eprintln!();
-    eprintln!("GitHub access:");
-    eprintln!("  The broker mints short-lived (1h) installation tokens from the");
-    eprintln!("  Ember Systems GitHub App. Recommended: skip this step and run");
-    eprintln!("  `ember gh-app install` later to OAuth-install the App on your");
-    eprintln!("  repos. Tokens are minted on demand; no PAT ever stored.");
-    eprintln!();
-    eprintln!("  Fallback: paste a personal access token if you can't install the");
-    eprintln!("  GH App right now (development repos, no admin rights, etc.).");
-    eprintln!("  PAT will be stored in the vault as `github-pat`.");
-    eprintln!();
-    eprint!("PAT (or Enter to skip — RECOMMENDED): ");
-    let _ = io::stderr().flush();
-    let mut buf = String::new();
-    io::stdin().read_line(&mut buf)?;
-    let trimmed = buf.trim();
-    if trimmed.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(trimmed.to_string()))
-    }
+    lines.extend_from_slice(&[
+        "",
+        "About the launcher",
+        "------------------",
+        "`ember claude-code` is the canonical v0.3.0 launcher. It opens a fresh session,",
+        "attaches a scoped grant, and keeps audit plus revocation on the supported path.",
+        "",
+        "Use that path first. Bare `claude` and headless automation remain advanced",
+        "surfaces, but they are intentionally outside the friendly default.",
+    ]);
+    lines.join("\n") + "\n"
 }
 
-/// Probe whether the daemon socket exists at the given path, indicating the
-/// daemon is running and ready.
+/// Render GitHub onboarding guidance for the current posture.
 ///
-/// Used by `cmd_init_for_claude_code` to decide whether to autostart the
-/// daemon before opening the vault (implementation-note-403).
-/// The socket file is created by the daemon on bind and removed on clean
-/// shutdown, so its presence is a reliable liveness indicator.
-pub fn daemon_socket_exists(socket_path: &std::path::Path) -> bool {
-    socket_path.exists()
+/// For `v0.3.0`, init keeps the App lane as the canonical onboarding path.
+/// The degraded `github-pat` lane remains available later via
+/// `ember vault add --name github-pat`, but we do not teach that fallback as
+/// part of the first-run path when the App lane is simply not configured yet.
+pub fn render_github_onboarding_guidance(posture: GitHubOnboardingPosture) -> String {
+    let mut out = String::new();
+    out.push('\n');
+    out.push_str("GitHub access:\n");
+
+    match posture {
+        GitHubOnboardingPosture::AppConfiguredReal => {
+            out.push_str("  Ready: GitHub App broker configured for the HTTPS/API lane.\n");
+            out.push_str("  `ember claude-code` will use short-lived installation tokens there.\n");
+        }
+        GitHubOnboardingPosture::PatConfigured => {
+            out.push_str("  Degraded PAT fallback is configured today.\n");
+            out.push_str("  Preferred fix: run `ember github setup` to move onto the App lane.\n");
+            out.push_str("  Until then, gh/git will attribute through your GitHub identity.\n");
+        }
+        GitHubOnboardingPosture::AppConfiguredMock => {
+            out.push_str("  Not ready: this daemon only has a mock GitHub broker right now.\n");
+            out.push_str(
+                "  Run `ember github setup` to register the real App credential triple.\n",
+            );
+            out.push_str("  Have these ready: private key PEM, App ID, installation URL or ID, and App slug.\n");
+            out.push_str("  The friendly v0.3.0 path is HTTPS/App first.\n");
+        }
+        GitHubOnboardingPosture::AppBroken(detail) => {
+            out.push_str("  Broken: this daemon has local GitHub authority configured, but it is not usable yet.\n");
+            let _ = writeln!(out, "  Detail: {detail}");
+            out.push_str("  Repair path: run `ember github setup` again to replace or complete the credential triple.\n");
+            out.push_str("  The friendly v0.3.0 path is HTTPS/App first.\n");
+        }
+        GitHubOnboardingPosture::AppNotConfigured => {
+            out.push_str(
+                "  Not ready: this daemon does not have a real GitHub App broker configured yet.\n",
+            );
+            out.push_str("  Run `ember github setup` to register the App credential triple.\n");
+            out.push_str("  Have these ready: private key PEM, App ID, installation URL or ID, and App slug.\n");
+            out.push_str("  The friendly v0.3.0 path is HTTPS/App first.\n");
+        }
+    }
+
+    out
+}
+
+/// Print GitHub onboarding guidance for the current posture.
+pub fn print_github_onboarding_guidance(posture: GitHubOnboardingPosture) -> io::Result<()> {
+    eprint!("{}", render_github_onboarding_guidance(posture));
+    Ok(())
 }
 
 /// Decide whether the autostart path should install a LaunchAgent / systemd
 /// user unit, or fall back to a raw `--background` daemon spawn.
 ///
-/// implementation-note-402: the LaunchAgent / systemd-user
+/// implementation-note-486: the LaunchAgent / systemd-user
 /// path is correct for the canonical "production user" install (single
 /// always-up daemon per login session) — but it baked an absolute `~/.ember/`
 /// path resolved against the operator's *real* HOME at install time, so an
 /// `init --for claude-code` invocation under an isolated `HOME=/tmp/...`
 /// would write a service file pointing at the production socket while the
-/// liveness probe waited at the isolated socket and timed out.
-///
-/// Returns `true` only when:
+/// Returns `true` only when the invocation is running in the canonical
+/// friendly-install topology:
 ///   - `home` looks like a default user home (not `/tmp/`, `/var/folders/`,
 ///     `/private/var/`), AND
 ///   - `config` is `None` (no `--config` / `EMBER_CONFIG` override).
 ///
-/// When this returns `false`, the caller should spawn `ember daemon start
-/// --background` directly so the child inherits the current process env
-/// (HOME, EMBER_KEYRING_SERVICE, EMBER_CONFIG, …) instead of the login user's.
-///
-/// This is a best-effort heuristic — perfect cross-platform detection of
-/// "non-default HOME" is out of scope. Any of the markers above is enough
-/// to route around the LaunchAgent path.
-pub fn should_use_launch_agent(home: &std::path::Path, config: Option<&std::path::Path>) -> bool {
+/// `ember init` and `ember init --for claude-code` may only offer to run the
+/// managed separate-uid installer in this topology. In isolated HOME / custom
+/// config environments, running `sudo ember daemon install` would provision
+/// the operator's real installed daemon instead of the isolated test target,
+/// so the correct behavior is to refuse and surface a clear manual path.
+pub fn supports_managed_daemon_install(
+    home: &std::path::Path,
+    config: Option<&std::path::Path>,
+) -> bool {
     // Any explicit --config / EMBER_CONFIG override means the caller is
     // running outside the default install topology — skip the LaunchAgent.
     if config.is_some() {
@@ -304,7 +360,7 @@ pub fn should_use_launch_agent(home: &std::path::Path, config: Option<&std::path
 
 /// Resolve the autostart liveness-wait timeout in seconds. Honors the
 /// `EMBER_DAEMON_AUTOSTART_TIMEOUT_SECS` env override; falls back to a
-/// 10s default (raised from 5s in implementation-note-402
+/// 10s default (raised from 5s in implementation-note-486
 /// because first-time provisioning — vault.salt + daemon.db schema — can
 /// exceed 5s on slow disks).
 pub fn autostart_liveness_timeout_secs() -> u64 {
@@ -339,7 +395,7 @@ mod tests {
 
     #[test]
     fn persona_name_uses_2_slot_default_shape() {
-        // implementation-note-433: the default
+        // implementation-note-483: the default
         // persona now follows the locked 2-slot Persona schema
         // (CONTEXT.md "Identity surface" §Persona ID schema) —
         // `claude-code-<context>` where `<context>` is `default` until
@@ -482,123 +538,155 @@ mod tests {
     }
 
     #[test]
-    fn prompt_returns_none_when_stdin_not_terminal() {
-        // No real prompt fired — non-interactive returns None.
-        let result = prompt_for_gh_pat(false).unwrap();
-        assert!(result.is_none());
+    fn guidance_for_app_not_configured_names_one_next_command() {
+        let rendered = render_github_onboarding_guidance(GitHubOnboardingPosture::AppNotConfigured);
+        assert!(rendered.contains("Run `ember github setup`"));
+        assert!(rendered.contains("HTTPS/App first"));
+        assert!(
+            !rendered.contains("github-pat"),
+            "friendly not-configured guidance should not teach degraded PAT fallback up front"
+        );
     }
 
-    /// implementation-note-435: the reframed prompt must
-    /// position skip as the RECOMMENDED default and reference the GH App
-    /// install path. This test validates the prompt text by capturing the
-    /// function source directly (the actual eprintln output goes to stderr
-    /// and is not easily captured in unit tests without process-level
-    /// redirection). We verify the string literals are present in the source
-    /// at compile time via a const assertion approach — the strings being
-    /// tested are the ones the function emits.
     #[test]
-    fn pat_prompt_text_recommends_skip() {
-        // The framing checkpoint and key strings are embedded in this source
-        // file. Compile-time check via include_str! ensures they survive
-        // future edits.
-        let src = include_str!("claude_code.rs");
-        assert!(
-            src.contains("implementation-note-435"),
-            "checkpoint must be present in source"
-        );
-        assert!(
-            src.contains("RECOMMENDED"),
-            "prompt must label skip as RECOMMENDED"
-        );
-        assert!(
-            src.contains("ember gh-app install"),
-            "prompt must reference `ember gh-app install` as the recommended path"
-        );
-        assert!(
-            src.contains("Tokens are minted on demand; no PAT ever stored"),
-            "prompt must state that no PAT is stored under the GH App path"
-        );
-        assert!(
-            src.contains("Enter to skip"),
-            "prompt must explicitly offer Enter-to-skip as the default action"
-        );
+    fn guidance_prints_for_real_app_lane() {
+        let rendered =
+            render_github_onboarding_guidance(GitHubOnboardingPosture::AppConfiguredReal);
+        assert!(rendered.contains("Ready: GitHub App broker configured"));
     }
 
-    // ── implementation-note-403 tests ───────────────────────
-
-    /// daemon_socket_exists returns true when the socket file is present.
-    /// This mirrors the liveness probe used by cmd_init_for_claude_code to
-    /// decide whether to autostart the daemon before opening the vault.
     #[test]
-    fn daemon_socket_exists_true_when_file_present() {
-        let tmp = tempdir().unwrap();
-        let socket = tmp.path().join("daemon.sock");
-        fs::write(&socket, "").unwrap();
-        assert!(daemon_socket_exists(&socket));
+    fn guidance_prints_for_broken_app_lane() {
+        let rendered = render_github_onboarding_guidance(GitHubOnboardingPosture::AppBroken(
+            "github/apps/ember/install-123: partial credential triple".to_string(),
+        ));
+        assert!(rendered.contains("Repair path: run `ember github setup` again"));
     }
 
-    /// daemon_socket_exists returns false when the socket file is absent —
-    /// the daemon is not running and autostart should be triggered.
     #[test]
-    fn daemon_socket_exists_false_when_file_absent() {
-        let tmp = tempdir().unwrap();
-        let socket = tmp.path().join("daemon.sock");
-        assert!(!daemon_socket_exists(&socket));
+    fn guidance_prints_for_pat_fallback() {
+        let rendered = render_github_onboarding_guidance(GitHubOnboardingPosture::PatConfigured);
+        assert!(rendered.contains("Degraded PAT fallback is configured today."));
+        assert!(rendered.contains("Preferred fix: run `ember github setup`"));
     }
+
+    #[test]
+    fn gh_pat_later_command_uses_real_vault_add_shape() {
+        assert_eq!(
+            gh_pat_later_command(),
+            "ember vault add --name github-pat",
+            "friendly fallback must use the real `vault add` CLI shape"
+        );
+    }
+
+    #[test]
+    fn next_commands_text_stays_truthful_about_launcher_presence() {
+        let text = next_commands_text(GitHubOnboardingPosture::AppConfiguredReal);
+        assert!(
+            text.contains(
+                "`ember claude-code` is the canonical v0.3.0 launcher. It opens a fresh session,"
+            ),
+            "launcher guidance should still recommend the session-scoped path"
+        );
+        assert!(
+            text.contains(
+                "attaches a scoped grant, and keeps audit plus revocation on the supported path."
+            ),
+            "launcher guidance should keep the actual scoping/revocation value proposition"
+        );
+        assert!(
+            !text.contains("Touch ID"),
+            "launcher guidance must not overclaim session-open Touch ID until the presence flow exists"
+        );
+        assert!(
+            !text.contains("You CAN launch bare `claude`"),
+            "friendly init should not teach the partial bare-claude lane as a first-run path"
+        );
+        assert!(
+            !text.contains("ember headless enroll --duration"),
+            "friendly init should not dump headless automation instructions into the first-run finish screen"
+        );
+    }
+
+    #[test]
+    fn next_commands_text_blocks_launch_until_app_lane_is_ready() {
+        let text = next_commands_text(GitHubOnboardingPosture::AppNotConfigured);
+        assert!(text.contains("ember github setup"));
+        assert!(text.contains("ember github status"));
+        assert!(text.contains("launch once GitHub is configured"));
+    }
+
+    #[test]
+    fn next_commands_text_names_pat_lane_as_degraded() {
+        let text = next_commands_text(GitHubOnboardingPosture::PatConfigured);
+        assert!(text.contains("launch now on the degraded PAT lane"));
+        assert!(text.contains("upgrade to the real App lane"));
+    }
+
+    #[test]
+    fn next_commands_text_names_broken_app_lane_as_repair_path() {
+        let text = next_commands_text(GitHubOnboardingPosture::AppBroken(
+            "github/apps/ember/install-123: partial credential triple".to_string(),
+        ));
+        assert!(text.contains("repair or replace the local App credential triple"));
+        assert!(text.contains("confirm the App lane is healthy"));
+        assert!(text.contains("launch once GitHub is repaired"));
+    }
+
+    // ── implementation-note-487 tests ───────────────────────
 
     /// Integration-level: init_for_claude_code_autostarts_daemon_when_not_running
     ///
     /// Full end-to-end process spawn is not attempted here because it would
-    /// require a real ember binary + keychain on the test host. Instead this
-    /// test validates the unit-level liveness check that feeds the autostart
-    /// decision, and is marked #[ignore] for the real process-spawn variant
-    /// (which the operator runs manually per T4 protocol).
+    /// require a real ember binary + keychain on the test host. It is marked
+    /// #[ignore] for the real process-spawn variant (which the operator runs
+    /// manually per T4 protocol).
     #[test]
     #[ignore = "T4 manual: requires real ember binary + keychain; run `ember daemon stop && ember init --for claude-code`"]
     fn init_for_claude_code_autostarts_daemon_when_not_running() {
         // Manual T4 invariant: with the daemon stopped, `ember init --for
         // claude-code` should:
-        //   1. Detect socket absence.
+        //   1. Detect live daemon absence.
         //   2. Call `install_agent` (or background spawn on unsupported platform).
-        //   3. Print "started daemon (background, install-agent)".
-        //   4. Wait for socket to appear (up to 5s).
+        //   3. Print "started managed daemon service".
+        //   4. Wait for the daemon's socket/RPC seam to become live (up to 5s).
         //   5. Proceed with persona + grant + settings.json patch.
         // Outcome: daemon is alive AND init completed successfully.
         unimplemented!("run manually: ember daemon stop && ember init --for claude-code")
     }
 
-    // ── implementation-note-402 tests ───────────────────────
+    // ── implementation-note-486 tests ───────────────────────
 
     /// LaunchAgent/systemd path is appropriate for a default user HOME with
     /// no --config override.
     #[test]
-    fn should_use_launch_agent_true_for_default_home() {
+    fn supports_managed_daemon_install_true_for_default_home() {
         let home = std::path::PathBuf::from("/home/alice");
-        assert!(should_use_launch_agent(&home, None));
+        assert!(supports_managed_daemon_install(&home, None));
     }
 
-    /// `--config` (or `EMBER_CONFIG`) being set always disables LaunchAgent
-    /// — the caller is running outside the canonical install topology.
+    /// `--config` (or `EMBER_CONFIG`) being set always disables the automatic
+    /// managed-daemon install offer — the caller is running outside the
+    /// canonical install topology.
     #[test]
-    fn should_use_launch_agent_false_when_config_overridden() {
+    fn supports_managed_daemon_install_false_when_config_overridden() {
         let home = std::path::PathBuf::from("/home/alice");
         let config = std::path::PathBuf::from("/home/alice/custom/config.toml");
-        assert!(!should_use_launch_agent(&home, Some(&config)));
+        assert!(!supports_managed_daemon_install(&home, Some(&config)));
     }
 
-    /// HOME under `/tmp/` (T3 isolation pattern) routes around LaunchAgent so
-    /// the spawned daemon inherits the isolated env instead of the login
-    /// user's.
+    /// HOME under `/tmp/` (T3 isolation pattern) must refuse the automatic
+    /// managed-daemon install offer.
     #[test]
-    fn should_use_launch_agent_false_for_tmp_home() {
+    fn supports_managed_daemon_install_false_for_tmp_home() {
         let home = std::path::PathBuf::from("/tmp/t3-1778351393");
-        assert!(!should_use_launch_agent(&home, None));
+        assert!(!supports_managed_daemon_install(&home, None));
     }
 
     /// macOS ephemeral HOMEs (`/var/folders/...`, `/private/var/...`,
-    /// `/private/tmp/...`) also route around LaunchAgent.
+    /// `/private/tmp/...`) also refuse the automatic managed-daemon offer.
     #[test]
-    fn should_use_launch_agent_false_for_macos_ephemeral_homes() {
+    fn supports_managed_daemon_install_false_for_macos_ephemeral_homes() {
         for path in [
             "/var/folders/zz/qa-iso/T/abc",
             "/private/var/folders/zz/qa-iso/T/abc",
@@ -606,7 +694,7 @@ mod tests {
         ] {
             let home = std::path::PathBuf::from(path);
             assert!(
-                !should_use_launch_agent(&home, None),
+                !supports_managed_daemon_install(&home, None),
                 "expected false for {path}"
             );
         }
@@ -652,22 +740,20 @@ mod tests {
         assert_eq!(secs, 30);
     }
 
-    /// Manual T3 walk: init under isolated HOME succeeds without manual
-    /// `ember daemon start --background` workaround. Marked #[ignore] so it
-    /// doesn't run in CI — invoked manually by the operator per T3 protocol.
+    /// Manual T3 walk: init under isolated HOME now refuses to auto-install a
+    /// managed daemon into the wrong topology. Marked #[ignore] so it doesn't
+    /// run in CI — invoked manually by the operator per T3 protocol.
     #[test]
     #[ignore = "T3 manual: HOME=/tmp/t3-... target/release/ember init --for claude-code"]
-    fn init_for_claude_code_autostart_honors_isolated_home() {
+    fn init_for_claude_code_refuses_managed_install_in_isolated_home() {
         // Manual T3 invariant: with an isolated HOME=/tmp/t3-..., `ember
         // init --for claude-code` should:
         //   1. Detect socket absence under $HOME/.ember/.
-        //   2. Skip LaunchAgent install (should_use_launch_agent → false).
-        //   3. Spawn `ember daemon start --background` inheriting current env.
-        //   4. Wait up to EMBER_DAEMON_AUTOSTART_TIMEOUT_SECS (default 10s)
-        //      for the isolated socket to appear.
-        //   5. Proceed with persona + grant + settings.json patch.
-        // Outcome: init completes without the "daemon started but socket did
-        // not appear within Ns" error and without manual daemon-start prep.
+        //   2. Refuse the automatic managed-daemon install
+        //      (supports_managed_daemon_install → false).
+        //   3. Exit with a loud explanation that friendly init only supports
+        //      the canonical default HOME/config topology.
+        // Outcome: no same-uid daemon is spawned under the isolated HOME.
         unimplemented!(
             "run manually: HOME=/tmp/t3-XXX EMBER_KEYRING_SERVICE=... \
              target/release/ember init --for claude-code"
@@ -685,7 +771,7 @@ mod tests {
         // claude-code` should:
         //   1. Detect socket presence.
         //   2. Print "daemon already running (socket ...)".
-        //   3. NOT attempt install_agent (no double-start).
+        //   3. NOT attempt daemon-service autostart (no double-start).
         //   4. Proceed with persona + grant + settings.json patch.
         // Outcome: daemon still alive (same PID) AND init completed successfully.
         unimplemented!("run manually with daemon pre-started: ember init --for claude-code")

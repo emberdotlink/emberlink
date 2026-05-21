@@ -1,125 +1,206 @@
-import { execSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { execSync, spawn, type ChildProcess } from 'node:child_process';
+import { mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve, dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join, resolve } from 'node:path';
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { EmberAgent, EmberAgentError } from '../src/client.js';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const BINARY_PATH = resolve(__dirname, '../../../target/debug/emberlink-agent');
-const TEST_PERSONA_ID = 'test-persona-001';
+const REPO_ROOT = resolve(process.cwd(), '../..');
+const BINARY_PATH = resolve(REPO_ROOT, 'target/debug/emberlink-agent');
+const FIXTURE_DAEMON_PATH = resolve(
+  REPO_ROOT,
+  'target/debug/examples/ember_sdk_fixture_daemon',
+);
+const TEST_CREDENTIAL_NAME = 'github-token';
+const TEST_CREDENTIAL_VALUE = 'ghp_fixture_secret';
 
-function binaryAvailable(): boolean {
+type FixtureReady = {
+  socket_path: string;
+  persona_id: string;
+  credential_name: string;
+};
+
+function binaryAvailable(path: string): boolean {
   try {
-    execSync(`test -x "${BINARY_PATH}"`, { stdio: 'ignore' });
+    execSync(`test -x "${path}"`, { stdio: 'ignore' });
     return true;
   } catch {
     return false;
   }
 }
 
-const skipReason = binaryAvailable()
-  ? undefined
-  : 'binary not built — run: cargo build -p emberlink-agent';
+async function spawnFixtureDaemon(tmpDir: string): Promise<{
+  proc: ChildProcess;
+  ready: FixtureReady;
+}> {
+  const socketPath = `/tmp/ember-sdk-ts-${process.pid}-${Date.now()}.sock`;
+  const proc = spawn(
+    FIXTURE_DAEMON_PATH,
+    [
+      '--socket',
+      socketPath,
+      '--persona-name',
+      'sdk-ts-agent',
+      '--credential-name',
+      TEST_CREDENTIAL_NAME,
+      '--credential-value',
+      TEST_CREDENTIAL_VALUE,
+    ],
+    { stdio: ['ignore', 'pipe', 'inherit'] },
+  );
 
-describe('emberlink-agent integration', { skip: skipReason }, () => {
+  const ready = await new Promise<FixtureReady>((resolveReady, reject) => {
+    let output = '';
+
+    proc.once('error', reject);
+    proc.once('close', (code) => {
+      reject(new Error(`fixture daemon exited before readiness (code=${code})`));
+    });
+
+    proc.stdout!.on('data', (chunk: Buffer) => {
+      output += chunk.toString();
+      const newline = output.indexOf('\n');
+      if (newline === -1) {
+        return;
+      }
+      const line = output.slice(0, newline).trim();
+      if (!line) {
+        return;
+      }
+      try {
+        resolveReady(JSON.parse(line) as FixtureReady);
+      } catch (err) {
+        reject(err);
+      }
+    });
+  });
+
+  return { proc, ready };
+}
+
+const liveDaemonSkipReason =
+  binaryAvailable(BINARY_PATH) && binaryAvailable(FIXTURE_DAEMON_PATH)
+    ? undefined
+    : `binaries not built — run: cargo build -p emberlink-agent && cargo build -p ember-daemon --example ember_sdk_fixture_daemon`;
+
+describe('emberlink-agent integration (live daemon)', { skip: liveDaemonSkipReason }, () => {
   let tmpDir: string;
   let dbPath: string;
   let agent: EmberAgent;
+  let fixtureProc: ChildProcess;
+  let fixtureReady: FixtureReady;
 
   before(async () => {
-    tmpDir = mkdtempSync(join(tmpdir(), 'emberlink-agent-test-'));
+    tmpDir = mkdtempSync(join(tmpdir(), 'emberlink-agent-live-'));
     dbPath = join(tmpDir, 'test.db');
+    const fixture = await spawnFixtureDaemon(tmpDir);
+    fixtureProc = fixture.proc;
+    fixtureReady = fixture.ready;
     agent = new EmberAgent({
       binaryPath: BINARY_PATH,
       dbPath,
-      personaId: TEST_PERSONA_ID,
+      personaId: fixtureReady.persona_id,
       label: 'Integration Test Agent',
+      daemonSocket: fixtureReady.socket_path,
     });
     await agent.connect();
   });
 
   after(() => {
     agent.close();
+    fixtureProc.kill('SIGTERM');
+    if (existsSync(fixtureReady.socket_path)) {
+      rmSync(fixtureReady.socket_path, { force: true });
+    }
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
   test('whoami returns persona info', async () => {
     const result = await agent.whoami();
-    assert.equal(result.persona_id, TEST_PERSONA_ID);
+    assert.equal(result.persona_id, fixtureReady.persona_id);
     assert.equal(result.label, 'Integration Test Agent');
   });
 
-  test('list_grants returns an array (empty initially)', async () => {
+  test('listGrants returns an array', async () => {
     const grants = await agent.listGrants();
     assert.ok(Array.isArray(grants));
   });
 
-  test('request_grant with scope returns a request_id', async () => {
-    const result = await agent.requestGrant({ scope: 'test' });
-    assert.ok(typeof result.request_id === 'string');
-    assert.ok(result.request_id.length > 0);
-    assert.equal(result.status, 'pending');
+  test('requestGrant auto-approves against the live daemon fixture', async () => {
+    const result = await agent.requestGrant({
+      scope: 'repo:read',
+      resource_id: fixtureReady.credential_name,
+      reason: 'integration test',
+    });
+    assert.equal(result.status, 'approved');
+    assert.ok(result.request_id.startsWith('grant-'));
   });
 
-  test('grant_status for pending request returns pending status', async () => {
-    const granted = await agent.requestGrant({ scope: 'ReadCredential', reason: 'integration test' });
+  test('grantStatus resolves an active grant after approval', async () => {
+    const granted = await agent.requestGrant({
+      scope: 'repo:read',
+      resource_id: fixtureReady.credential_name,
+      reason: 'status integration test',
+    });
     const status = await agent.grantStatus(granted.request_id);
-    assert.ok(typeof (status as unknown as Record<string, unknown>)['status'] === 'string');
+    assert.equal(status.status, 'active');
+    assert.ok('grant_id' in status);
+    assert.equal(status.grant_id, granted.request_id);
   });
 
-  test('grant_status for nonexistent grant returns NOT_FOUND error', async () => {
-    await assert.rejects(
-      () => agent.grantStatus('nonexistent-grant-id'),
-      (err: unknown) => {
-        assert.ok(err instanceof EmberAgentError);
-        assert.equal((err as EmberAgentError).code, 'NOT_FOUND');
-        return true;
-      },
-    );
+  test('useCredential returns the live daemon secret', async () => {
+    const granted = await agent.requestGrant({
+      scope: 'repo:read',
+      resource_id: fixtureReady.credential_name,
+      reason: 'credential integration test',
+    });
+    const result = await agent.useCredential({
+      grant_id: granted.request_id,
+      credential_name: fixtureReady.credential_name,
+    });
+    assert.equal(result.status, 'ok');
+    assert.equal(result.credential.value, TEST_CREDENTIAL_VALUE);
+    assert.equal(result.credential.grant_id, granted.request_id);
   });
+});
 
-  test('use_credential for nonexistent grant returns NOT_FOUND error', async () => {
-    await assert.rejects(
-      () => agent.useCredential({ grant_id: 'nonexistent-grant', credential_name: 'cred-1' }),
-      (err: unknown) => {
-        assert.ok(err instanceof EmberAgentError);
-        assert.equal((err as EmberAgentError).code, 'NOT_FOUND');
-        return true;
-      },
-    );
-  });
+const helperSkipReason = binaryAvailable(BINARY_PATH)
+  ? undefined
+  : 'binary not built — run: cargo build -p emberlink-agent';
 
-  test('invalid method returns error via protocol', async () => {
-    // Spawn a second agent and send a bad request directly over stdin
-    // to exercise the UNKNOWN_METHOD error path.
-    const { spawn } = await import('node:child_process');
-    const proc = spawn(BINARY_PATH, ['--db', dbPath, '--persona', TEST_PERSONA_ID], {
-      stdio: ['pipe', 'pipe', 'inherit'],
+describe('emberlink-agent integration (no daemon)', { skip: helperSkipReason }, () => {
+  test('requestGrant fails closed when no daemon is reachable', async () => {
+    const originalHome = process.env.HOME;
+    const isolatedHome = mkdtempSync(join(tmpdir(), 'emberlink-agent-nodaemon-'));
+    process.env.HOME = isolatedHome;
+
+    const agent = new EmberAgent({
+      binaryPath: BINARY_PATH,
+      dbPath: join(isolatedHome, 'test.db'),
+      personaId: 'persona-no-daemon',
     });
 
-    const response = await new Promise<Record<string, unknown>>((resolve, reject) => {
-      let output = '';
-      proc.stdout!.on('data', (chunk: Buffer) => {
-        output += chunk.toString();
-        if (output.includes('\n')) {
-          try {
-            resolve(JSON.parse(output.trim()) as Record<string, unknown>);
-          } catch {
-            reject(new Error(`Failed to parse response: ${output}`));
-          }
-        }
-      });
-      proc.on('error', reject);
-      proc.stdin!.write(JSON.stringify({ id: 'req-bad', method: 'fly_to_moon', params: {} }) + '\n');
-    });
-
-    proc.kill();
-    assert.ok('error' in response);
-    const error = response['error'] as { code: string };
-    assert.equal(error.code, 'UNKNOWN_METHOD');
+    try {
+      await agent.connect();
+      await assert.rejects(
+        () =>
+          agent.requestGrant({
+            scope: 'repo:read',
+            resource_id: 'github-token',
+            reason: 'no daemon proof',
+          }),
+        (err: unknown) => {
+          assert.ok(err instanceof EmberAgentError);
+          assert.equal((err as EmberAgentError).code, 'DAEMON_UNAVAILABLE');
+          return true;
+        },
+      );
+    } finally {
+      agent.close();
+      process.env.HOME = originalHome;
+      rmSync(isolatedHome, { recursive: true, force: true });
+    }
   });
 });

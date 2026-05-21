@@ -7,7 +7,19 @@ publish = false
 
 [dependencies]
 age = { version = "0.11", features = ["armor"] }
+# argon2: passphrase-based KDF for `backup_envelope::seal_backup` /
+# `open_backup` — the encrypted IR backup primitive
+# (implementation-note-30 / design §Component 4). Same crate pinned by
+# `ember-daemon` for vault MEK derivation; we pin matching `0.5` so a
+# future param-rotation campaign can share the OWASP-recommended cost
+# table across both surfaces.
+argon2 = "0.5"
 base64 = "0.22"
+# ciborium: deterministic CBOR encoder for the BackupEnvelope payload
+# embedded inside the sealed-backup blob. Same crate used by emberlink-cli
+# for the v030 survey artifact; CBOR keeps the wire form compact and
+# version-tolerant for the metadata fields.
+ciborium = "0.2"
 core-types = { path = "../core-types" }
 core-principals = { path = "../core-principals" }
 core-grant-types = { path = "../core-grant-types" }

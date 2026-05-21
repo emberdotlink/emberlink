@@ -7,11 +7,20 @@ description = "Consolidated crate producing all 15 bundled L2 Construct binaries
 publish = false
 
 [dependencies]
+# implementation-note-91 — Compose V2 manifest
+# translator emits `bollard::container::Config<String>` +
+# `bollard::models::HostConfig`. Pinned to the same 0.18.x line the
+# daemon already uses so callers don't pay a duplicate-compile tax.
+bollard = "0.18"
 core-broker = { path = "../core-broker" }
 core-construct-runtime = { path = "../core-construct-runtime" }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# implementation-note-91 — Compose V2 manifests
+# are YAML; serde_yaml parses them into `ComposeManifest`. Same 0.9.x
+# line used by ember-kernel + headless-runtime, so cargo dedups.
+serde_yaml = "0.9"
 thiserror = "2"
 toml.workspace = true
 tracing = "0.1"

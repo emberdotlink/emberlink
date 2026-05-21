@@ -192,7 +192,7 @@ pub struct TrustedPublisher {
 /// The corresponding Ed25519 secret key is held in the project's hardware
 /// security module — see `docs/install-supply-chain.md` §"Publisher key
 /// custody". The base64 string here is a placeholder that the release
-/// pipeline will overwrite once the production key is provisioned (implementation-note-422
+/// pipeline will overwrite once the production key is provisioned (implementation-note-471
 /// follow-up). Until then, `verify_install_bundle` will fail-closed with
 /// `BadPublisherKey` because the placeholder isn't a valid Ed25519 point.
 pub const EMBERLINK_RELEASE_PUBLISHER_DID: &str = "did:web:ember.link";
@@ -371,7 +371,7 @@ pub fn verify_bundle_in_toto_envelope(
 ///    no long-lived cosign signing key. This witness is passed as
 ///    `sigstore_sig` (the raw bytes that cosign would verify, i.e. the decoded
 ///    `.sig` sidecar). Currently modelled as an opaque byte slice; the full
-///    cosign-verify integration is left for a follow-up task (implementation-note-423).
+///    cosign-verify integration is left for a follow-up task (implementation-note-472).
 ///
 /// 2. **Ember-IdentityRoot Ed25519** — the release pipeline signs the manifest
 ///    blob with the project's hardware-bound Ed25519 key (see
@@ -407,10 +407,10 @@ pub fn verify_manifest_dual_witness(
     // Witness 1: sigstore keyless — parse `sigstore_sig` as a cosign
     // SimpleSigning envelope (JCS-encoded JSON) and verify its
     // `critical.image.docker_manifest_digest` matches `sha256(blob)`. This is
-    // implementation-note-424 (anchor:
+    // implementation-note-473 (anchor:
     // sigstore_witness_envelope_digest_verified). Fulcio cert chain
     // verification + Rekor inclusion-proof verification are deferred to
-    // implementation-note-383 and -C — a determined attacker who can
+    // implementation-note-429 and -C — a determined attacker who can
     // forge a SimpleSigning envelope locally can still pass this slice until
     // -B and -C land.
     if sigstore_sig.is_empty() {
@@ -760,7 +760,7 @@ mod tests {
         );
     }
 
-    /// implementation-note-424 T1: bytes that don't deserialize as
+    /// implementation-note-473 T1: bytes that don't deserialize as
     /// a cosign SimpleSigning envelope must be rejected before any digest
     /// comparison — the previous `if sigstore_sig.is_empty()` stub accepted
     /// arbitrary non-empty bytes; this test pins that the structural-parse
@@ -789,7 +789,7 @@ mod tests {
         }
     }
 
-    /// implementation-note-424 T1: a structurally-valid envelope
+    /// implementation-note-473 T1: a structurally-valid envelope
     /// whose `docker-manifest-digest` does not match `sha256(blob)` must be
     /// rejected — checkpoint `sigstore_witness_envelope_digest_verified`.
     #[test]

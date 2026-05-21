@@ -5,14 +5,18 @@
 # credential mint, an existing grant, or refuses.
 #
 # Per-registry keys (`docker.push.<host>`, `docker.login.<host>`) are
-# matched by family-prefix at broker resolve time when no exact key is
-# declared here — see design §3 (server-side reclassification).
+# matched by family-prefix at policy time when no exact key is declared here —
+# see design §3 (server-side reclassification). Current runtime still relies
+# on caller-supplied registry auth via env/file passthrough (`DOCKER_CONFIG`,
+# `DOCKER_CERT_PATH`, etc.); canonical broker materialization for registry creds
+# is follow-up work.
 
 [meta]
 name = "ember-docker"
 version = "0.1.0"
 publisher = "did:emberlink"
-description = "Docker CLI Construct. Mediates `docker` invocations through ember's credential broker: each push/login mints a scoped, time-bound registry token (Docker Hub, ECR, GCR, GHCR, custom registries), populates a temp DOCKER_CONFIG with the materialized auth, runs the command, then revokes/cleans up on exit. Read-only verbs (ps, images, inspect, logs, stats) are passthrough — no broker mediation. Privileged invocations (--privileged, --pid=host, --network=host, host-root volume mounts) are refused outright."
+description = "Docker CLI Construct. Gates `docker` invocations through ember's action policy: push/login/logout/run/build/exec/cp and cleanup verbs are classified and gated; read-only verbs (ps, images, inspect, logs, stats) are passthrough. Current runtime still relies on caller-supplied registry auth via DOCKER_CONFIG / related env/file passthrough rather than broker-minted registry credentials. Privileged invocations (--privileged, --pid=host, --network=host, host-root volume mounts) are refused outright."
+headless_requirements = ["env_passthrough_authority"]
 
 # Default policy for unlisted action keys.
 default = "deny"

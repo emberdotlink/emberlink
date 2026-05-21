@@ -15,7 +15,7 @@
 //! On revoke or expiry, the keychain entry is deleted and the in-memory
 //! MEK copy is zeroized.
 //!
-//! ## Scope (implementation-note-165)
+//! ## Scope (implementation-note-188)
 //!
 //! - Generate keychain-backed storage for one MEK per persona-enrollment.
 //! - Persist the single active-enrollment metadata slot under the daemon
@@ -127,7 +127,7 @@ fn keychain_set(account: &str, encoded: &str) -> Result<(), Error> {
         return Ok(());
     }
 
-    let entry = keyring::Entry::new(&service, &resolved_account)
+    let entry = keyring_core::Entry::new(&service, &resolved_account)
         .map_err(|e| Error::Keychain(format!("new: {e}")))?;
     entry
         .set_password(encoded)
@@ -146,11 +146,11 @@ fn keychain_get(account: &str) -> Result<String, Error> {
             .ok_or(Error::NotFound);
     }
 
-    let entry = keyring::Entry::new(&service, &resolved_account)
+    let entry = keyring_core::Entry::new(&service, &resolved_account)
         .map_err(|e| Error::Keychain(format!("new: {e}")))?;
     match entry.get_password() {
         Ok(password) => Ok(password),
-        Err(keyring::Error::NoEntry) => Err(Error::NotFound),
+        Err(keyring_core::Error::NoEntry) => Err(Error::NotFound),
         Err(e) => Err(Error::Keychain(format!("read: {e}"))),
     }
 }
@@ -165,11 +165,11 @@ fn keychain_delete(account: &str) -> Result<(), Error> {
         return Ok(());
     }
 
-    let entry = keyring::Entry::new(&service, &resolved_account)
+    let entry = keyring_core::Entry::new(&service, &resolved_account)
         .map_err(|e| Error::Keychain(format!("new: {e}")))?;
     match entry.delete_credential() {
         Ok(()) => Ok(()),
-        Err(keyring::Error::NoEntry) => Ok(()),
+        Err(keyring_core::Error::NoEntry) => Ok(()),
         Err(e) => Err(Error::Keychain(format!("delete: {e}"))),
     }
 }
@@ -310,13 +310,13 @@ impl AttestedDevice {
         let Some(device) = Self::load_active(data_dir)? else {
             return Ok(None);
         };
-        if let Some(requested) = enrollment_id {
-            if requested != device.enrollment_id {
-                return Err(Error::EnrollmentIdMismatch {
-                    requested: requested.to_string(),
-                    active: device.enrollment_id.clone(),
-                });
-            }
+        if let Some(requested) = enrollment_id
+            && requested != device.enrollment_id
+        {
+            return Err(Error::EnrollmentIdMismatch {
+                requested: requested.to_string(),
+                active: device.enrollment_id.clone(),
+            });
         }
         device.revoke()?;
         remove_active_metadata(data_dir)?;

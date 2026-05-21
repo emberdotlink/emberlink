@@ -158,3 +158,5 @@ $ ember daemon start
 Every credential encrypted. Every access scoped and time-bound. Every action logged. Every grant signed. Every termination receipted.
 
 Not "trust us." Trust yourself.
+
+Install path and the three-tier integration gradient: `project documentation`.

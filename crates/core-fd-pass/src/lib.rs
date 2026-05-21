@@ -1,8 +1,8 @@
 //!
 //! `core-fd-pass` — SCM_RIGHTS + sealed-memfd cross-process fd-passing
 //! primitive. Helper crate for the `ember-rpc` plaintext lane
-//! (implementation-note-39; depends on
-//! META-design-AMEND-EXTEND-TO-implementation-note-40 Phase D).
+//! (implementation-note-50; depends on
+//! META-design-AMEND-EXTEND-TO-implementation-note-51 Phase D).
 //!
 //! ## checkpoint
 //!
@@ -13,7 +13,7 @@
 //!
 //! The existing `ember-daemon::broker::exec_env` covers the
 //! `fork(2) + execve(2)` fd-inheritance case (Phase 1 of
-//! implementation-note-41). That path can NOT hand an fd to
+//! implementation-note-52). That path can NOT hand an fd to
 //! a cross-process peer over a Unix domain socket because the receiver
 //! never shared a parent fd-table with the sender.
 //!

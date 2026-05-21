@@ -123,7 +123,7 @@ pub trait PolicyBackend: Send + Sync + 'static {
     /// Distinct from `post_flight` so the daemon-side implementation can
     /// route the two through different metering paths — Slice B will land
     /// the in-process implementation, Slice C the remote one.
-    /// (implementation-note-55.)
+    /// (implementation-note-66.)
     async fn post_flight_meter(
         &self,
         resolved: &ResolvedGrant,

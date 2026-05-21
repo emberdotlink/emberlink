@@ -1,4 +1,4 @@
-//! Tier-0 daemon-managed ssh-agent (implementation-note-72).
+//! Tier-0 daemon-managed ssh-agent (implementation-note-83).
 //!
 //! Per the 2026-05-05 grill (Angle A1): the daemon IS the ssh-agent for a
 //! session. A fresh ed25519 keypair is minted in the daemon's address space,
@@ -1222,7 +1222,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Deploy-key T1 tests (implementation-note-73)
+    // Deploy-key T1 tests (implementation-note-84)
     // -----------------------------------------------------------------------
 
     use std::sync::atomic::{AtomicU64, Ordering};

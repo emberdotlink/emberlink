@@ -10,6 +10,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -70,8 +71,49 @@ pub fn call_daemon_rpc(
     method: &str,
     params: &Value,
 ) -> Result<Value, RpcError> {
+    call_daemon_rpc_inner(socket_path, method, params, None)
+}
+
+/// Like [`call_daemon_rpc`] but applies read+write timeouts to the socket.
+///
+/// Used by best-effort fire-and-forget callers that must not block on a
+/// hung daemon — e.g. `log_unsessioned_subprocess` in runtime.rs, which
+/// runs in the shim's passthrough branch and adds latency to every
+/// invocation of every wrapped tool. A daemon under load (or a stale UDS
+/// pointing at a dead socket file) would otherwise stall the shim past
+/// any reasonable threshold.
+///
+/// The timeout applies to each read/write operation, not the whole
+/// exchange — a malicious daemon that drips bytes could still extend the
+/// total runtime, but the worst case is bounded by the daemon's own
+/// per-request handler timeout. For best-effort callers the trade-off is
+/// acceptable.
+pub fn call_daemon_rpc_with_timeout(
+    socket_path: &std::path::Path,
+    method: &str,
+    params: &Value,
+    timeout: Duration,
+) -> Result<Value, RpcError> {
+    call_daemon_rpc_inner(socket_path, method, params, Some(timeout))
+}
+
+fn call_daemon_rpc_inner(
+    socket_path: &std::path::Path,
+    method: &str,
+    params: &Value,
+    timeout: Option<Duration>,
+) -> Result<Value, RpcError> {
     let stream = UnixStream::connect(socket_path)
         .map_err(|e| RpcError::DaemonUnavailable(format!("{}: {e}", socket_path.display())))?;
+
+    if let Some(t) = timeout {
+        stream
+            .set_read_timeout(Some(t))
+            .map_err(|e| RpcError::Io(format!("set_read_timeout: {e}")))?;
+        stream
+            .set_write_timeout(Some(t))
+            .map_err(|e| RpcError::Io(format!("set_write_timeout: {e}")))?;
+    }
 
     let mut writer = stream
         .try_clone()

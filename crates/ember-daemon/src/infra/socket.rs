@@ -81,14 +81,14 @@ pub enum SocketError {
     Bind(std::io::Error),
     #[error("socket path already bound")]
     AlreadyBound,
-    /// implementation-note-134 (CRIT-C): an inode already exists at the
+    /// implementation-note-150 (CRIT-C): an inode already exists at the
     /// per-agent socket path. Returned when the O_EXCL precondition under
     /// the parent-dir `flock()` fails, including the symlink-swap attack
     /// where a privileged container process pre-creates a symlink at the
     /// predictable path before emberd's permission check.
     #[error("per-agent socket path already exists: {0}")]
     AlreadyExists(PathBuf),
-    /// implementation-note-134: the UUID was previously tombstoned and
+    /// implementation-note-150: the UUID was previously tombstoned and
     /// is permanently retired. Tombstoning prevents agent-id recycling so
     /// a freshly-spawned agent cannot inherit a previous agent's grants
     /// or audit trail by replaying its UUID.
@@ -196,13 +196,13 @@ pub struct SocketListener {
     rate_limiter: Rc<RefCell<RateLimiter>>,
     events_tx: broadcast::Sender<GrantEvent>,
     sessions_dir: Option<PathBuf>,
-    /// implementation-note-233: bound LLM proxy
+    /// implementation-note-259: bound LLM proxy
     /// URL populated after the proxy listener binds in runtime.rs, then
     /// plumbed into every connection's RequestContext via handle_connection.
     llm_proxy_url: Option<String>,
-    /// implementation-note-233: bound git proxy URL.
+    /// implementation-note-259: bound git proxy URL.
     git_proxy_url: Option<String>,
-    /// implementation-note-235 — integration
+    /// implementation-note-261 — integration
     /// tests in sibling crates (`emberlink-cli/tests/*.rs`) link against
     /// `ember-daemon` as cfg(not(test)), so the `cfg(test)` synthesis on
     /// `RequestContext::socket` does not fire. When this flag is set,
@@ -242,7 +242,7 @@ impl SocketListener {
     /// `RequestContext::socket_for_test` (mints a synthetic presence_token
     /// bound to the peer-cred uid) instead of `RequestContext::socket` (no
     /// presence_token under cfg(not(test))). Production code MUST NOT call
-    /// this — see the field docstring. implementation-note-304-
+    /// this — see the field docstring. implementation-note-338-
     /// PRE-EXISTING-FAILURES.
     pub fn with_test_mode_synthetic_presence_token(mut self, enabled: bool) -> Self {
         self.test_mode_synthetic_presence_token = enabled;
@@ -374,7 +374,7 @@ impl SocketListener {
                             let peer_for_task = Some(peer);
                             #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                             let peer_for_task: Option<PeerIdentity> = None;
-                            // implementation-note-133: extract
+                            // implementation-note-149: extract
                             // the (uid, pid, socket_path) triple once per
                             // connection so every dispatch on this stream
                             // gets the same kernel-attested principal.
@@ -621,7 +621,7 @@ pub fn ensure_socket_perms(_path: &Path) -> Result<(), SocketError> {
 /// responsibility. `verify_peer_uid` is the existing wrapper that
 /// re-applies the strict uid-match on top of this function.
 ///
-/// implementation-note-305: Phase A design destination.
+/// implementation-note-339: Phase A design destination.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn read_peer_creds(stream: &UnixStream) -> Option<PeerCreds> {
     match stream.peer_cred() {
@@ -675,7 +675,7 @@ fn take_presence_token(
 ///
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 fn verify_peer_uid(stream: &UnixStream) -> Option<PeerIdentity> {
-    // bridge_widening_removed (implementation-note-306):
+    // bridge_widening_removed (implementation-note-340):
     // design bridge widening removed; per-method authority gate from
     // Phase D (WebAuthn presence-token cache) is the replacement.
     verify_peer_uid_with(
@@ -819,14 +819,14 @@ async fn handle_connection(
                 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
                 let peer_for_ctx: Option<crate::infra::handler::PeerCred> = None;
 
-                // implementation-note-235: when
+                // implementation-note-261: when
                 // the listener was constructed with
                 // `with_test_mode_synthetic_presence_token(true)`, build via
                 // `socket_for_test` so external integration tests
                 // (`emberlink-cli/tests/*.rs` link as cfg(not(test))) get the
                 // synthetic presence_token that satisfies OperatorPresence-
                 // class methods. Production daemons leave the flag false.
-                let base_ctx = match (test_mode_synthetic_presence_token, peer_for_ctx.clone()) {
+                let base_ctx = match (test_mode_synthetic_presence_token, peer_for_ctx) {
                     (true, Some(p)) => crate::infra::handler::RequestContext::socket_for_test(p),
                     _ => crate::infra::handler::RequestContext::socket(peer_for_ctx),
                 };
@@ -834,13 +834,13 @@ async fn handle_connection(
                 ctx.sessions_dir = sessions_dir.clone();
                 ctx.llm_proxy_url = llm_proxy_url.clone();
                 ctx.git_proxy_url = git_proxy_url.clone();
-                // implementation-note-133: stamp the
+                // implementation-note-149: stamp the
                 // kernel-attested principal captured at accept time so
                 // every dispatch on this connection inherits the same
                 // (uid, pid, socket_path) triple.
                 ctx.peer_cred_principal = peer_cred_principal.clone();
 
-                // implementation-note-97 — dispatch_method_panic_recovered.
+                // implementation-note-111 — dispatch_method_panic_recovered.
                 //
                 // prior change shipped `recover_rpc_panic` as a sync
                 // `std::panic::catch_unwind` wrapper, but `catch_unwind` doesn't
@@ -976,7 +976,7 @@ async fn write_notification(
     writer.write_all(&bytes).await
 }
 
-// ---- implementation-note-134 ------------------------------------------
+// ---- implementation-note-150 ------------------------------------------
 //
 // CRIT-1: a single shared daemon socket cannot distinguish two agents living
 // in different pid namespaces — `SO_PEERCRED.pid` is pid-namespace-relative,
@@ -1254,7 +1254,29 @@ mod tests {
         let store = make_store();
         let policy = Rc::new(PolicyEngine::default());
         let rate_limiter = Rc::new(RefCell::new(RateLimiter::default()));
-        let listener = SocketListener::new(path.clone(), rx, store, policy, rate_limiter);
+
+        // Three invariants the listener needs for OperatorPresence-class
+        // socket tests (create_persona, etc.) to pass the dispatch-time
+        // authority gates (prior change / #3822 / #3828). Methods that aren't
+        // OperatorPresence-classified (e.g. ping) are unaffected by either
+        // helper, so existing non-OP tests on the same `start_listener`
+        // still pass.
+        //
+        //   1. Daemon identity for mint_operator_presence_token
+        //      (idempotent; tempdir leaked since the singleton outlives
+        //      any one test).
+        //   2. presence::mark_unlocked so the unlocked-session gate
+        //      doesn't refuse with -32030.
+        //   3. with_test_mode_synthetic_presence_token(true) so every
+        //      accepted connection's RequestContext carries a synthetic
+        //      presence token (socket.rs:247).
+        let id_dir = tempfile::tempdir().expect("tempdir for daemon identity");
+        let _ = crate::infra::receipt::init_identity(id_dir.path());
+        std::mem::forget(id_dir);
+        crate::trust::presence::mark_unlocked();
+
+        let listener = SocketListener::new(path.clone(), rx, store, policy, rate_limiter)
+            .with_test_mode_synthetic_presence_token(true);
         tokio::task::spawn_local(async move {
             listener.run().await.unwrap();
         });
@@ -1510,7 +1532,7 @@ mod tests {
         assert_eq!(uid, expected);
     }
 
-    // ── read_peer_creds tests (implementation-note-305) ──────
+    // ── read_peer_creds tests (implementation-note-339) ──────
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
@@ -1872,7 +1894,7 @@ mod tests {
         );
     }
 
-    // ---- implementation-note-134 ------------------------------------
+    // ---- implementation-note-150 ------------------------------------
     //
     // CRIT-C symlink-swap rejection + tombstone UUID-recycling rejection.
     // Both tests use the `_with` seam so we can drive the would-be-path
@@ -2008,7 +2030,7 @@ mod tests {
         );
     }
 
-    // ─── implementation-note-97 ────────────────────
+    // ─── implementation-note-111 ────────────────────
     //
     // The dispatch-site wrapper in this file uses
     // `AssertUnwindSafe(future).catch_unwind().await` from

@@ -4,17 +4,17 @@
 # broker.resolve consults this to decide whether the action requires a
 # credential mint, an existing grant, or refuses.
 #
-# Credential injection: broker materializes CLOUDFLARE_API_TOKEN from vault
-# key cloudflare/account-c524597f/account/<scope>-token per design. The scope
-# (workers-deploy, r2-edit, kv-edit, d1-edit) is selected daemon-side per verb.
-# The shim declares CLOUDFLARE_API_TOKEN in env_passthrough; daemon zeroizes
-# on child exit.
+# Current runtime relies on caller-supplied CLOUDFLARE_API_TOKEN via
+# env_passthrough. A daemon-owned scoped Cloudflare token materialization lane
+# is still follow-up work; this Construct is action-gated today but not a
+# broker-shaped unattended authority seam.
 
 [meta]
 name = "ember-wrangler"
 version = "0.1.0"
 publisher = "did:emberlink"
-description = "Wrangler CLI Construct. Mediates `wrangler` invocations through ember's credential broker: deploy and all mutation operations require biometric approval; delete (Worker script removal) and r2 object delete are budget-capped; d1 execute (raw SQL) requires biometric; kv:key put/delete and secret put/delete are biometric-gated. CLOUDFLARE_API_TOKEN is injected from vault key cloudflare/account-c524597f/account/<scope>-token per design. Read-only verbs (dev, tail, whoami, version, login, logout, kv:key list/get, r2 object list/get, d1 list/info, secret list) are passthrough — no broker mediation."
+description = "Wrangler CLI Construct. Gates `wrangler` invocations through ember's action policy: deploy and all mutation operations require biometric approval; delete (Worker script removal) and r2 object delete are budget-capped; d1 execute (raw SQL) requires biometric; kv:key put/delete and secret put/delete are biometric-gated. Current runtime still relies on caller-supplied `CLOUDFLARE_API_TOKEN` passthrough rather than daemon-minted scoped Cloudflare credentials. Read-only verbs (dev, tail, whoami, version, login, logout, kv:key list/get, r2 object list/get, d1 list/info, secret list) are passthrough — no broker mediation."
+headless_requirements = ["env_passthrough_authority"]
 
 # Default policy for unlisted action keys.
 default = "deny"
@@ -104,7 +104,7 @@ key = "wrangler.pages.deploy"
 default = "permit"
 biometric = "required"
 
-# --- Gap-fill from construct-coverage-audit (implementation-note-80) ---
+# --- Gap-fill from construct-coverage-audit (implementation-note-92) ---
 # wrangler.secret.bulk: bulk-import secrets from JSON; same threat model as secret.put
 # wrangler.r2.bucket.create: persistent R2 bucket creation
 # wrangler.d1.create: persistent D1 database creation

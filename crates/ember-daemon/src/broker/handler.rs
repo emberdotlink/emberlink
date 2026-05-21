@@ -13,7 +13,7 @@
 //! - `broker_list`   → [`handle_broker_list`]
 //!
 //! Marker for headless ranker grep: **`BrokerIssue`** (this module path is
-//! `broker_handler`, satisfying the marker contract from implementation-note-117.)
+//! `broker_handler`, satisfying the marker contract from implementation-note-133.)
 //!
 //! ## Object-safety adapter
 //!
@@ -148,7 +148,7 @@ pub fn verify_binary_pin(manifest: &BinaryManifest, tool: &str) -> Result<Pinned
 /// parse is sub-millisecond. A daemon-global cached manifest is the
 /// natural follow-up but not required for correctness.
 fn lookup_binary_in_manifest(binary_path: &str) -> Option<(String, String)> {
-    // implementation-note-118: prefer the process-global
+    // implementation-note-134: prefer the process-global
     // manifest loaded at startup (runtime.rs PATH-PINNING-STARTUP-VERIFY).
     // That loader honors both `$HOME/.ember/binaries/manifest.toml` (per-user
     // install via `ember binary install`) and the system path
@@ -416,7 +416,7 @@ pub struct BrokerExecRequest {
     /// a daemon-managed ssh-agent socket. `SSH_AUTH_SOCK` is injected into
     /// the child env so git/ssh in the child tree find the daemon socket.
     /// The private key is held in the daemon's address space and zeroed on
-    /// session end (design / implementation-note-72).
+    /// session end (design / implementation-note-83).
     #[serde(default)]
     pub ssh_agent: bool,
     /// Per-action shim-EOF policy, sourced from `construct.toml`'s
@@ -452,7 +452,7 @@ pub struct BrokerExecRequest {
     #[serde(default)]
     pub action_env_allowlist: Option<Vec<String>>,
     /// Caller-claimed manifest action key for action-level policy gating
-    /// (implementation-note-119 / design). Distinct
+    /// (implementation-note-135 / design). Distinct
     /// from `claimed_action`: this key is matched against the bundled
     /// manifest's `[actions.*]` table after the daemon parses
     /// `construct_toml_bytes`, and an unknown key is refused with JSON-RPC
@@ -464,12 +464,12 @@ pub struct BrokerExecRequest {
     /// encoded for JSON wire safety. The daemon decodes + parses via
     /// [`core_events::construct_toml::parse_and_validate`] and consults
     /// the manifest's `[actions.*]` table to enforce the action-level
-    /// policy gate (implementation-note-119). When
+    /// policy gate (implementation-note-135). When
     /// omitted, the manifest gate is skipped (preserves pre-policy
     /// behavior for shims that don't yet emit this field).
     #[serde(default)]
     pub construct_toml_bytes: Option<String>,
-    /// implementation-note-95 — when set, the spawn
+    /// implementation-note-109 — when set, the spawn
     /// target lives inside an agent SCION container and emberd dispatches
     /// the binary via the in-container `ember-exec` listener at this UDS
     /// path (host-side absolute path bound into the container at the
@@ -485,7 +485,7 @@ pub struct BrokerExecRequest {
     /// host-side path stays the only `pty_socket_path` consumer.
     #[serde(default)]
     pub scion_exec_socket: Option<String>,
-    /// implementation-note-95 — target uid the in-container
+    /// implementation-note-109 — target uid the in-container
     /// `ember-exec` receiver drops privileges to before `execve` (subtask
     /// B's `drop_privileges`). Ignored when `scion_exec_socket` is `None`.
     /// Defaults to `0`: the receiver-side handler treats uid 0 as "no
@@ -493,14 +493,14 @@ pub struct BrokerExecRequest {
     /// before the operator wires real per-container uids.
     #[serde(default)]
     pub scion_target_uid: u32,
-    /// implementation-note-95 — target gid companion to
+    /// implementation-note-109 — target gid companion to
     /// `scion_target_uid`. Same uid=0 / dev-default semantics.
     #[serde(default)]
     pub scion_target_gid: u32,
     /// Opaque spawn-handle reference minted by `broker_resolve` for the
-    /// SCION shim resolve path (implementation-note-22).
+    /// SCION shim resolve path (implementation-note-25).
     /// The daemon uses this to look up the `PendingSpawnHandle` and enforce
-    /// the `SPAWN_HANDLE_TTL_SECS` deadline (implementation-note-120).
+    /// the `SPAWN_HANDLE_TTL_SECS` deadline (implementation-note-136).
     /// When absent the TTL gate is a no-op (legacy / non-SCION exec paths).
     #[serde(default)]
     pub secret_ref: Option<String>,
@@ -519,11 +519,11 @@ pub struct BrokerExecResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Spawn-handle TTL (implementation-note-120)
+// Spawn-handle TTL (implementation-note-136)
 // ---------------------------------------------------------------------------
 
 /// Seconds a minted spawn handle remains valid before `broker_exec` refuses
-/// it. Closes the resolve → exec replay window (implementation-note-120).
+/// it. Closes the resolve → exec replay window (implementation-note-136).
 pub const SPAWN_HANDLE_TTL_SECS: i64 = 30;
 
 /// Daemon-internal record of a pending (resolved but not yet executed) spawn
@@ -540,7 +540,7 @@ pub struct PendingSpawnHandle {
     pub not_after: chrono::DateTime<chrono::Utc>,
     /// True once the handle has been successfully consumed by `broker_exec`.
     /// Set inside the registry lock before the entry is moved to
-    /// `consumed_recent` (implementation-note-121).
+    /// `consumed_recent` (implementation-note-137).
     pub consumed: bool,
 }
 
@@ -553,7 +553,7 @@ pub struct PendingSpawnHandle {
 /// providers so `broker revoke <id>` can route to the right impl without
 /// the caller naming the provider.
 ///
-/// `mock_providers` (implementation-note-122 / design
+/// `mock_providers` (implementation-note-138 / design
 /// §Component 2): records which providers were registered with a
 /// `MockBroker` instance (opted in via `EMBER_ALLOW_MOCK_BROKERS`) so the
 /// receipt-emission path can stamp `mock_broker: true` on every Receipt
@@ -570,6 +570,23 @@ pub struct BrokerRegistry {
     state: Mutex<RegistryState>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ProviderRegistrationStatus {
+    pub provider: BrokerProvider,
+    pub mock: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct GithubProviderStatus {
+    pub lane: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installation_id: Option<String>,
+}
+
 #[derive(Default)]
 struct RegistryState {
     /// `materialization_id` → summary. Updated on issue, removed on
@@ -579,7 +596,7 @@ struct RegistryState {
     /// `materialization_id` → plaintext credential bound to its issuing
     /// persona. Retained inside the daemon so `broker_resolve` can hand
     /// the secret to the trust boundary (ember-proxy / ember-tools /
-    /// ember-kernel reconcilers) per implementation-note-12.
+    /// ember-kernel reconcilers) per implementation-note-15.
     /// Plaintext NEVER returns to the agent process — agents hold the
     /// opaque `SecretRef` (= the `materialization_id`) and present it
     /// to the trust boundary.
@@ -608,13 +625,13 @@ struct RegistryState {
     /// for the SCION shim resolve path. Consumed (removed) on the first
     /// `broker_exec` that presents the matching `secret_ref`, or refused
     /// with `SpawnHandleExpired` after `SPAWN_HANDLE_TTL_SECS` seconds
-    /// (implementation-note-120).
+    /// (implementation-note-136).
     pending_spawn_handles: HashMap<String, PendingSpawnHandle>,
     /// Recently consumed spawn handle IDs with their consumption timestamp.
     /// Retained for 60 seconds after consumption so that a second `broker_exec`
     /// attempt with the same handle ID returns `SpawnHandleAlreadyConsumed`
     /// instead of the generic "unknown handle" path — prevents leaking
-    /// handle-lifecycle information (implementation-note-121).
+    /// handle-lifecycle information (implementation-note-137).
     consumed_recent: VecDeque<(String, DateTime<Utc>)>,
 }
 
@@ -643,7 +660,7 @@ impl BrokerRegistry {
     /// Register a broker for a provider. The last registration wins so
     /// tests can swap implementations.
     ///
-    /// implementation-note-122 (design §Component 2):
+    /// implementation-note-138 (design §Component 2):
     /// This path is for REAL brokers — registering a `MockBroker` via
     /// this method does NOT flag the provider as mock-registered (the
     /// `mock_providers` set stays untouched). Use [`Self::register_mock`]
@@ -659,8 +676,8 @@ impl BrokerRegistry {
         self.mock_providers.remove(&provider);
     }
 
-    /// Register a `MockBroker` for a provider (implementation-note-123-
-    /// implementation-note-124 / design §Component 2). The provider is flagged
+    /// Register a `MockBroker` for a provider (implementation-note-139-
+    /// implementation-note-140 / design §Component 2). The provider is flagged
     /// in `mock_providers` so every Receipt emitted from this registry's
     /// materialization / revocation paths stamps `mock_broker: true`.
     ///
@@ -675,7 +692,7 @@ impl BrokerRegistry {
     }
 
     /// Returns true when the given provider was registered as a Mock
-    /// (implementation-note-122 / design §Component 2).
+    /// (implementation-note-138 / design §Component 2).
     /// Returns false when the provider is real-registered OR absent.
     pub fn is_mock(&self, provider: BrokerProvider) -> bool {
         self.mock_providers.contains(&provider)
@@ -684,6 +701,26 @@ impl BrokerRegistry {
     /// Returns true when the given provider has a registered impl.
     pub fn has_provider(&self, provider: BrokerProvider) -> bool {
         self.brokers.contains_key(&provider)
+    }
+
+    /// Count of providers with a registered broker implementation.
+    pub fn provider_count(&self) -> usize {
+        self.brokers.len()
+    }
+
+    /// Snapshot of registered providers with their real-vs-mock posture.
+    pub fn provider_statuses(&self) -> Vec<ProviderRegistrationStatus> {
+        let mut out: Vec<ProviderRegistrationStatus> = self
+            .brokers
+            .keys()
+            .copied()
+            .map(|provider| ProviderRegistrationStatus {
+                provider,
+                mock: self.mock_providers.contains(&provider),
+            })
+            .collect();
+        out.sort_by(|a, b| a.provider.as_str().cmp(b.provider.as_str()));
+        out
     }
 
     /// Snapshot of all currently-active materializations, sorted by
@@ -707,7 +744,7 @@ impl BrokerRegistry {
     /// holds plaintext, and only the trust boundary (ember-proxy /
     /// ember-tools / ember-kernel reconcilers) ever asks for it back
     /// via `broker_resolve_plaintext`. See
-    /// implementation-note-12.
+    /// implementation-note-15.
     fn record_plaintext(
         &self,
         materialization_id: String,
@@ -773,7 +810,7 @@ impl BrokerRegistry {
     /// Record a freshly-minted spawn handle so `broker_exec` can validate its
     /// TTL. Called from `resolve_with_registry` immediately after minting the
     /// `materialization_id` for the SCION shim resolve path.
-    /// (implementation-note-120)
+    /// (implementation-note-136)
     fn record_spawn_handle(&self, handle: PendingSpawnHandle) {
         let mut st = self.state.lock().expect("broker registry mutex");
         st.pending_spawn_handles
@@ -785,7 +822,7 @@ impl BrokerRegistry {
     /// issued via the SCION shim path, or already expired and GC'd).
     /// On successful removal, records the handle_id in `consumed_recent` for
     /// 60 seconds so replay attempts return `SpawnHandleAlreadyConsumed`
-    /// (implementation-note-120, implementation-note-121).
+    /// (implementation-note-136, implementation-note-137).
     pub fn consume_spawn_handle(&self, materialization_id: &str) -> Option<PendingSpawnHandle> {
         let mut st = self.state.lock().expect("broker registry mutex");
         let handle = st.pending_spawn_handles.remove(materialization_id)?;
@@ -809,7 +846,7 @@ impl BrokerRegistry {
     /// (consumed within the last 60 seconds). Used by `handle_broker_exec` to
     /// distinguish "already consumed" from "never issued" when
     /// `consume_spawn_handle` returns `None`
-    /// (implementation-note-121).
+    /// (implementation-note-137).
     pub fn was_recently_consumed(&self, materialization_id: &str) -> bool {
         let st = self.state.lock().expect("broker registry mutex");
         let cutoff = chrono::Utc::now() - chrono::Duration::seconds(60);
@@ -925,7 +962,7 @@ pub fn current_registry_authority() -> Option<BrokerRegistryAuthority> {
 
 // ---------------------------------------------------------------------------
 // Process-global signed binary manifest
-// (implementation-note-106)
+// (implementation-note-122)
 // ---------------------------------------------------------------------------
 
 /// Shared, immutable view of the signed `binaries/manifest.toml` the
@@ -996,7 +1033,7 @@ fn now_rfc3339_at(t: SystemTime) -> String {
         .to_rfc3339()
 }
 
-/// implementation-note-33 — best-effort caller for the
+/// implementation-note-43 — best-effort caller for the
 /// `exec.completion` Receipt v2 emission path. Bridges the
 /// `handle_broker_exec` in-container exec branch (which has access to
 /// `params`, `store`, the directive's binary path / verified blake3 /
@@ -1146,13 +1183,13 @@ fn emit_scion_exec_completion_receipt(
 /// failures here log a warning but do not fail the RPC response (the
 /// materialization already happened upstream).
 ///
-/// Per implementation-note-125: signs +
+/// Per implementation-note-141: signs +
 /// persists a v2 `ReceiptEnvelope` via Phase A substrate
 /// (`build_broker_materialization_envelope` + `sign_receipt_v2` +
 /// `store_broker_receipt_v2`). The audit-log shadow row stays for
 /// downstream observability/back-compat during the v1→v2 transition.
 ///
-/// `mock_broker` (implementation-note-122 / design
+/// `mock_broker` (implementation-note-138 / design
 /// §Component 2): `true` iff the registry has the request's provider in
 /// its `mock_providers` set. Threaded into the envelope body so audit
 /// readers can distinguish real vs. opted-in-mock credentials.
@@ -1228,11 +1265,11 @@ fn emit_materialization_receipt(
 /// materialization is unknown to the daemon (defense-in-depth for state
 /// drift between the daemon and the upstream provider).
 ///
-/// Per implementation-note-125: signs +
+/// Per implementation-note-141: signs +
 /// persists a v2 `ReceiptEnvelope` via Phase A substrate. The audit-log
 /// shadow row stays for downstream observability/back-compat.
 ///
-/// `mock_broker` (implementation-note-122 / design
+/// `mock_broker` (implementation-note-138 / design
 /// §Component 2): `true` iff the registry has the materialization's
 /// provider in its `mock_providers` set.
 fn emit_revocation_receipt(
@@ -1339,24 +1376,24 @@ pub async fn issue_with_registry(
     // dashboard recovery flow (PAM passphrase on session-open) before any
     // new credential mint is allowed. Legacy callers without caller_persona
     // bypass this gate (same no-op posture as the grant-scope check below).
-    if let Some(persona_id) = &req.caller_persona {
-        if registry.is_persona_frozen(persona_id) {
-            tracing::warn!(
-                persona_id = %persona_id,
-                provider = req.provider.as_str(),
-                "broker: issue refused — persona is frozen after WebAuthn verification failure"
-            );
-            return Err((
-                -32011,
-                format!(
-                    "persona {persona_id} is frozen after a WebAuthn verification failure — \
-                 complete dashboard recovery (PAM passphrase) before minting new credentials"
-                ),
-            ));
-        }
+    if let Some(persona_id) = &req.caller_persona
+        && registry.is_persona_frozen(persona_id)
+    {
+        tracing::warn!(
+            persona_id = %persona_id,
+            provider = req.provider.as_str(),
+            "broker: issue refused — persona is frozen after WebAuthn verification failure"
+        );
+        return Err((
+            -32011,
+            format!(
+                "persona {persona_id} is frozen after a WebAuthn verification failure — \
+             complete dashboard recovery (PAM passphrase) before minting new credentials"
+            ),
+        ));
     }
 
-    // implementation-note-126 (design):
+    // implementation-note-142 (design):
     // Resolve the per-cohort presence-ladder decision so the policy
     // predicate gate downstream can route to the right re-attestation
     // surface (FIDO2 only, FIDO2 + PAM fallback, FIDO2 + audit log, or
@@ -1374,7 +1411,7 @@ pub async fn issue_with_registry(
     // depend on `presence_fallback_ladder` being a named symbol.
     let _ladder_decision_placeholder = LadderDecision::FailClosed;
 
-    // implementation-note-127
+    // implementation-note-143
     let matched_grant_id: Option<String> = match &req.caller_persona {
         None => {
             tracing::warn!(
@@ -1394,7 +1431,7 @@ pub async fn issue_with_registry(
             });
             match matched {
                 Some(g) => {
-                    // implementation-note-51 — refuse a grant
+                    // implementation-note-62 — refuse a grant
                     // whose schema_version does not match this daemon's
                     // compiled-in pin BEFORE any provider IO or policy
                     // evaluation. A grant minted under a different
@@ -1412,7 +1449,7 @@ pub async fn issue_with_registry(
     };
     let _ = matched_grant_id;
 
-    // implementation-note-128
+    // implementation-note-144
     //
     // Skip policy + HITL when no caller_persona was provided — legacy
     // callers (CLI tests, daemon-internal smoke paths) lack a persona and
@@ -1432,7 +1469,7 @@ pub async fn issue_with_registry(
                 ));
             }
             ApprovalRequirement::Required => {
-                // implementation-note-129: shipped
+                // implementation-note-145: shipped
                 let persona_id = req.caller_persona.clone().unwrap_or_default();
                 let credential_name = req.provider.as_str();
                 let scope = serde_json::to_string(&req.scope).unwrap_or_else(|_| "{}".to_string());
@@ -1504,14 +1541,14 @@ pub async fn issue_with_registry(
         req.caller_persona.clone(),
     );
 
-    // Receipt event (design §c). implementation-note-122:
+    // Receipt event (design §c). implementation-note-138:
     // thread the registry's mock-flag into the envelope body so the audit
     // trail can distinguish real-broker credentials from
     // EMBER_ALLOW_MOCK_BROKERS-opted-in Mock credentials.
     let mock_broker = registry.is_mock(req.provider);
     emit_materialization_receipt(store, &req, &cred, mock_broker);
 
-    // implementation-note-12: response shape is
+    // implementation-note-15: response shape is
     // `{ secret_ref, materialization_id, expires_at, issued_at,
     //   provider }`. There is NO `token` / `value` raw-string field in
     // the response — agent processes never hold plaintext.
@@ -1561,7 +1598,7 @@ pub async fn revoke_with_registry(
     // (now-stale) summary so the receipt records the reason/provider
     // even though the active table no longer contains the row.
     let summary = registry.drop_active(&materialization_id);
-    // implementation-note-122: thread the registry's
+    // implementation-note-138: thread the registry's
     // mock-flag (looked up via the resolved provider) into the envelope.
     let mock_broker = registry.is_mock(provider);
     emit_revocation_receipt(store, &materialization_id, summary.as_ref(), mock_broker);
@@ -1578,9 +1615,72 @@ pub async fn list_with_registry(registry: &BrokerRegistry) -> Result<Value, (i32
     Ok(serde_json::to_value(&summaries).expect("MaterializationSummary always serializes"))
 }
 
+/// Report basic process-global broker registry shape for operator diagnostics.
+pub async fn registry_status_with_registry(
+    registry: &BrokerRegistry,
+) -> Result<Value, (i32, String)> {
+    Ok(json!({
+        "provider_count": registry.provider_count(),
+        "providers": registry.provider_statuses(),
+    }))
+}
+
+/// Report the effective GitHub authority lane for operator diagnostics.
+pub async fn github_status_with_registry_and_resolver(
+    registry: &BrokerRegistry,
+    resolver: &crate::broker::authority::BrokerAuthorityResolver,
+) -> Result<Value, (i32, String)> {
+    let (lane, detail, app_id, installation_id) = if registry.is_mock(BrokerProvider::Github) {
+        ("mock", None, None, None)
+    } else if !registry.has_provider(BrokerProvider::Github) {
+        ("absent", None, None, None)
+    } else {
+        match resolver.resolve(BrokerProvider::Github).await {
+            Ok(Some(crate::broker::authority::ResolvedBrokerAuthority::GithubApp(creds))) => (
+                "app",
+                None,
+                Some(creds.app_id),
+                Some(creds.installation_id),
+            ),
+            Ok(Some(crate::broker::authority::ResolvedBrokerAuthority::GithubPat(_))) => {
+                ("pat", None, None, None)
+            }
+            Err(err) => ("broken", Some(err.to_string()), None, None),
+            Ok(None) => match resolver
+                .startup_configured(
+                    BrokerProvider::Github,
+                    crate::broker::authority::StartupProbeMode::MetadataOnly,
+                )
+                .await
+            {
+                Ok(false) => ("absent", None, None, None),
+                Ok(true) => (
+                    "broken",
+                    Some(
+                        "GitHub authority metadata is present, but no usable App or PAT authority could be loaded"
+                            .to_string(),
+                    ),
+                    None,
+                    None,
+                ),
+                Err(err) => ("broken", Some(err.to_string()), None, None),
+            },
+            Ok(Some(_)) => ("broken", Some("unexpected non-GitHub authority".to_string()), None, None),
+        }
+    };
+
+    Ok(serde_json::to_value(GithubProviderStatus {
+        lane,
+        detail,
+        app_id,
+        installation_id,
+    })
+    .expect("GithubProviderStatus always serializes"))
+}
+
 // ---------------------------------------------------------------------------
 // broker_resolve_plaintext — daemon-side trust-boundary resolution
-// (implementation-note-130, design + 127)
+// (implementation-note-146, design + 127)
 // ---------------------------------------------------------------------------
 
 /// Errors surfaced by [`broker_resolve_plaintext`]. Distinct from
@@ -1650,7 +1750,7 @@ pub async fn broker_resolve_plaintext(
 /// resolve RPC dispatcher (which already holds a `&BrokerRegistry`)
 /// and tests, which build a fresh registry per case rather than
 /// poking the process-global `OnceCell`.
-pub async fn broker_resolve_plaintext_with_registry(
+pub(crate) async fn broker_resolve_plaintext_with_registry(
     registry: &BrokerRegistry,
     secret_ref: &SecretRef,
     persona_id: Option<&str>,
@@ -1750,7 +1850,7 @@ fn map_resolve_error(err: ResolveError) -> (i32, String) {
 
 /// Resolve a `SecretRef` → plaintext at the trust boundary.
 ///
-/// Per implementation-note-12 this is the only place
+/// Per implementation-note-15 this is the only place
 /// plaintext leaves the daemon, and it MUST emit a per-resolution
 /// Receipt so every materialization has a downstream audit trail of
 /// where the credential was actually used.
@@ -1764,12 +1864,12 @@ fn map_resolve_error(err: ResolveError) -> (i32, String) {
 ///    authoring path. Authoring-path callers get an `authoring = true`
 ///    accept Receipt and proceed.
 /// 2. **Plaintext resolution + persona-binding check**
-///    (implementation-note-130): when the caller presents a
+///    (implementation-note-146): when the caller presents a
 ///    `secret_ref`, the daemon enforces persona binding and returns
 ///    plaintext via [`broker_resolve_plaintext_with_registry`].
 ///    Resolves without a `secret_ref` preserve the legacy `-32001`
 ///    placeholder behaviour (the gate-only smoke-test surface).
-pub async fn resolve_with_registry(
+pub(crate) async fn resolve_with_registry(
     registry: &BrokerRegistry,
     store: &DaemonStore,
     params: &Value,
@@ -1782,7 +1882,7 @@ pub async fn resolve_with_registry(
     // no-op (production code path will set one of them; the legacy
     // smoke test paths set neither).
     //
-    // implementation-note-22: when the caller is a
+    // implementation-note-25: when the caller is a
     // Construct shim (core-construct-runtime), it passes a
     // `lease_request` object instead of a `secret_ref`. The lease
     // request shape is the construct shim's resolve-phase payload:
@@ -1790,7 +1890,7 @@ pub async fn resolve_with_registry(
     // The daemon returns a stub `SpawnHandle` bound to (binary,
     // env_allowlist, materialization_id, target_uid). The
     // construct-shim resolve path is forward-compatible with the legacy
-    // secret_ref → plaintext path (per implementation-note-12);
+    // secret_ref → plaintext path (per implementation-note-15);
     // the two shapes share the dispatch but never collide.
     #[derive(serde::Deserialize, Default)]
     struct ConstructLeaseRequest {
@@ -1830,8 +1930,8 @@ pub async fn resolve_with_registry(
         /// `caller_persona` recorded at issuance time.
         #[serde(default)]
         persona_id: Option<String>,
-        /// Construct-shim resolve-phase payload (implementation-note-131-
-        /// implementation-note-132). Mutually exclusive with `secret_ref`
+        /// Construct-shim resolve-phase payload (implementation-note-147-
+        /// implementation-note-148). Mutually exclusive with `secret_ref`
         /// — present iff the caller is a Construct shim asking for a
         /// spawn handle.
         #[serde(default)]
@@ -1936,7 +2036,7 @@ pub async fn resolve_with_registry(
         }));
     }
 
-    // implementation-note-22: Construct shim resolve
+    // implementation-note-25: Construct shim resolve
     // path. Returns a spawn handle binding (binary, env_allowlist,
     // materialization_id, target_uid). The daemon-side
     // `credential_provisioned` Receipt is NOT emitted here — the
@@ -1989,7 +2089,7 @@ pub async fn resolve_with_registry(
             );
         }
 
-        // spawn_handle_ttl (implementation-note-120) — record mint time
+        // spawn_handle_ttl (implementation-note-136) — record mint time
         // so broker_exec can enforce the 30-second replay window.
         let not_after = chrono::Utc::now() + chrono::Duration::seconds(SPAWN_HANDLE_TTL_SECS);
         registry.record_spawn_handle(PendingSpawnHandle {
@@ -2004,7 +2104,7 @@ pub async fn resolve_with_registry(
             "env_allowlist": lease.env_passthrough,
             // target_uid = 0 means "no privilege drop" until the
             // SCION container-id → uid binding lands (tracked by
-            // implementation-note-53). The construct
+            // implementation-note-64). The construct
             // shim treats this as a checkpoint meaning "daemon-tier
             // exec" rather than a privilege error.
             "target_uid": 0,
@@ -2017,7 +2117,7 @@ pub async fn resolve_with_registry(
     // rely on the -32001 checkpoint) continue to compile and pass.
     Err((
         -32001,
-        "broker_resolve plaintext path requires `secret_ref` param (implementation-note-130); authoring-path gate is active".to_string(),
+        "broker_resolve plaintext path requires `secret_ref` param (implementation-note-146); authoring-path gate is active".to_string(),
     ))
 }
 
@@ -2026,7 +2126,7 @@ pub async fn resolve_with_registry(
 // ---------------------------------------------------------------------------
 
 // `-32010` is reserved for `ERR_GRANT_SCHEMA_VERSION_MISMATCH`
-// (implementation-note-51) — see [`check_grant_schema_version`].
+// (implementation-note-62) — see [`check_grant_schema_version`].
 // ERR_NO_REGISTRY moved to `-32011` to free up `-32010` for the
 // schema-version gate.
 const ERR_NO_REGISTRY: (i32, &str) = (
@@ -2039,7 +2139,7 @@ fn err_no_registry() -> (i32, String) {
 }
 
 // ---------------------------------------------------------------------------
-// Grant schema-version pin (implementation-note-51)
+// Grant schema-version pin (implementation-note-62)
 // ---------------------------------------------------------------------------
 
 /// Error code for "the grant's schema_version does not match this
@@ -2133,14 +2233,14 @@ pub fn check_grants_schema_version_for_persona(
 }
 
 // ---------------------------------------------------------------------------
-// Peercred principal-binding gate (implementation-note-133)
+// Peercred principal-binding gate (implementation-note-149)
 // ---------------------------------------------------------------------------
 
 /// Enforce that the kernel-attested `PeerCredPrincipal.uid` matches
 /// the uid bound to the persona named by the request payload's
 /// `persona_id_field`. Mismatch is refused with the dedicated
 /// `-32004` "principal binding mismatch" code per the
-/// implementation-note-133 contract.
+/// implementation-note-149 contract.
 ///
 /// Resolution order:
 ///
@@ -2150,18 +2250,23 @@ pub fn check_grants_schema_version_for_persona(
 ///    operate under the legacy "warn but allow" posture documented in
 ///    `issue_with_registry`. The brief calls this out: the legacy
 ///    no-`caller_persona` path remains for daemon-internal smoke
-///    tests; the implementation-note-134 integration will make
+///    tests; the implementation-note-150 integration will make
 ///    `caller_persona` mandatory on the agent-process socket.
 /// 2. When `principal` is `None` (no kernel attestation available —
 ///    Internal source, or pre-migration entry point), the gate is a
 ///    no-op. Internal callers bypass principal binding by design.
-/// 3. When the persona has no bound uid in the per-process registry,
-///    the gate is a no-op. Personas that pre-date the agent-uid
-///    enrollment surface (legacy `create_persona`) carry no binding.
+/// 3. When the persona has no bound uid — consulted via
+///    `lookup_persona_uid_from_enrollments(store, persona_id)`, the
+///    per-agent UDS enrollment table, the sole source of truth per
+///    implementation-note-151.
+///    If the surface carries no binding, the gate is a no-op —
+///    legacy fail-open posture preserved for personas that pre-date
+///    the enrollment surface (legacy `create_persona`).
 /// 4. Otherwise: compare `principal.uid` with the bound uid; refuse
 ///    with `-32004` on mismatch.
 pub fn check_principal_against_persona(
     principal: Option<&crate::infra::runtime::PeerCredPrincipal>,
+    store: &DaemonStore,
     params: &Value,
     persona_id_field: &str,
 ) -> Result<(), (i32, String)> {
@@ -2171,8 +2276,13 @@ pub fn check_principal_against_persona(
     let Some(persona_id) = params.get(persona_id_field).and_then(|v| v.as_str()) else {
         return Ok(());
     };
-    let Some(bound_uid) = crate::infra::handler::lookup_persona_uid(persona_id) else {
-        return Ok(());
+    // implementation-note-151 — the
+    // enrollment table is now the sole source of truth. No-binding
+    // preserves the legacy fail-open posture for legacy personas that
+    // pre-date the per-agent UDS enrollment surface.
+    let bound_uid = match crate::infra::store::lookup_persona_uid_from_enrollments(store, persona_id) {
+        Ok(Some(uid)) => uid,
+        Ok(None) | Err(_) => return Ok(()),
     };
     if principal.uid != bound_uid {
         tracing::warn!(
@@ -2193,10 +2303,248 @@ pub fn check_principal_against_persona(
     Ok(())
 }
 
+/// implementation-note-152: fail-closed gate.
+/// Anchor: `fail_closed_broker_resolve`.
+///
+/// `check_principal_against_persona` (above) is fail-open by design — it
+/// no-ops when the persona has no enrollment row, preserving the legacy
+/// posture for callers that pre-date the per-agent UDS enrollment surface.
+/// `broker_resolve` is the first RPC to lose that posture per the locked
+/// rollout order (Step A of implementation-note-153);
+/// every other broker RPC keeps the fail-open gate until its rollout step
+/// (B/C/D) lands.
+///
+/// Returns `Err((-32401, _))` when:
+///   * `principal` is present (kernel attestation available), AND
+///   * `params[persona_id_field]` is a string, AND
+///   * `lookup_persona_uid_from_enrollments(store, persona_id)` returns
+///     `Ok(None)` — no active enrollment row keyed by `persona_id`.
+///
+/// Returns `Ok(())` when:
+///   * `principal` is None (Internal source / no kernel attestation —
+///     daemon-internal callers bypass kernel binding by design), OR
+///   * `params[persona_id_field]` is absent (legacy smoke callers), OR
+///   * an enrollment row exists for `persona_id` (the legacy gate's
+///     uid-match check already ran via `check_principal_against_persona`
+///     and produced its own refusal on mismatch — this gate only adds
+///     the missing-enrollment refusal).
+pub fn check_principal_enrollment_strict(
+    principal: Option<&crate::infra::runtime::PeerCredPrincipal>,
+    store: &DaemonStore,
+    params: &Value,
+    persona_id_field: &str,
+) -> Result<(), (i32, String)> {
+    if principal.is_none() {
+        return Ok(());
+    }
+    let Some(persona_id) = params.get(persona_id_field).and_then(|v| v.as_str()) else {
+        return Ok(());
+    };
+    match crate::infra::store::lookup_persona_uid_from_enrollments(store, persona_id) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err((
+            -32401,
+            format!(
+                "unenrolled persona '{persona_id}': PrincipalNotEnrolled (fail_closed_broker_resolve)"
+            ),
+        )),
+        Err(e) => Err((
+            -32401,
+            format!(
+                "unenrolled persona '{persona_id}': PrincipalNotEnrolled (enrollment lookup failed: {e})"
+            ),
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// resolve_legacy_socket_enrollment — shared `/var/run/emberd.sock` caller
+// classifier (implementation-note-154)
+// ---------------------------------------------------------------------------
+
+/// implementation-note-154 — resolution of
+/// a shared-socket RPC caller against the `agent_socket_enrollments`
+/// table.
+///
+/// Step B of the collapse plumbed the 6 shared `/var/run/emberd.sock`
+/// RPC entry points (broker_issue, broker_revoke, broker_list,
+/// broker_resolve, broker_exec, broker.bindings.{register,list,remove,
+/// move}) into one of three explicit branches so the legacy per-process
+/// `PERSONA_UID_REGISTRY` thread-local could retire (Step C, now
+/// landed). The variant names the caller's relationship to the
+/// per-agent UDS enrollment surface; downstream gates
+/// (`check_principal_against_persona`, `check_principal_is_alive`)
+/// continue to fire as today, but the resolution makes the "which
+/// trust lane is this caller on" decision auditable at the call site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LegacySocketResolution {
+    /// The caller's persona has an active row in `agent_socket_enrollments`.
+    /// Carries the row so downstream code can consult `peer_uid`,
+    /// `grant_id`, and the namespace-binding tuple without re-querying.
+    Enrolled(crate::infra::store::AgentSocketEnrollment),
+    /// The caller is daemon-internal (admin CLI, dashboard via HTTP-to-
+    /// socket, recovery flow, smoke test): no kernel-attested principal
+    /// was supplied. Peercred binding bypassed by design — the
+    /// in-process trust lane pre-dates kernel attestation and remains
+    /// the supported posture for these callers. The carried `reason`
+    /// string surfaces the bypass in operator logs.
+    Internal { reason: String },
+    /// No enrollment row keyed by the request's persona. Legacy fail-
+    /// open posture preserved post-Step-C — with the
+    /// `PERSONA_UID_REGISTRY` thread-local retired, the downstream
+    /// gate (`check_principal_against_persona`) sees no binding for
+    /// the persona and treats the call as a legacy / pre-enrollment
+    /// caller. The resolver itself does not refuse.
+    NoEnrollment,
+}
+
+/// implementation-note-154 — classify a
+/// shared-socket RPC caller against the per-agent UDS enrollment
+/// surface.
+///
+/// Resolution order:
+///
+/// 1. `principal` is `None` → `Internal { reason: "no-kernel-attested-principal" }`.
+///    The daemon-internal trust lane (admin CLI, dashboard, smoke tests)
+///    threads `None` for the kernel-attested principal because there is
+///    no peer socket to read peercred from; the call rides the
+///    pre-peercred in-process lane.
+/// 2. The request payload omits `persona_id_field` → `Internal {
+///    reason: "no-persona-claim" }`. Legacy entry points that don't
+///    name a calling persona (admin-issued grants, smoke harness)
+///    bypass enrollment by design.
+/// 3. An active `agent_socket_enrollments` row exists for the claimed
+///    persona → `Enrolled(row)`. The most-recently enrolled active row
+///    is returned when the persona has been re-enrolled (the
+///    `ORDER BY enrolled_at DESC LIMIT 1` deterministic tie-break).
+/// 4. Otherwise → `NoEnrollment`. The legacy fail-open posture is
+///    preserved; with the `PERSONA_UID_REGISTRY` thread-local retired
+///    in Step C, the downstream `check_principal_against_persona`
+///    gate sees no binding for the persona and treats the call as a
+///    legacy / pre-enrollment caller.
+///
+/// Returns `Err(StoreError::Sqlite)` only on a real SQLite error
+/// (corrupt db, schema mismatch); the no-row and missing-field cases
+/// resolve to `Ok(NoEnrollment)` / `Ok(Internal)` respectively so the
+/// caller can apply policy uniformly without unwrapping a separate
+/// error class.
+///
+/// Anchor: `fn resolve_legacy_socket_enrollment` is the brief's
+/// failing-test grep target.
+pub fn resolve_legacy_socket_enrollment(
+    principal: Option<&crate::infra::runtime::PeerCredPrincipal>,
+    store: &DaemonStore,
+    params: &Value,
+    persona_id_field: &str,
+) -> Result<LegacySocketResolution, crate::infra::store::StoreError> {
+    // (1) No kernel-attested principal → Internal trust lane.
+    let Some(_principal) = principal else {
+        return Ok(LegacySocketResolution::Internal {
+            reason: "no-kernel-attested-principal".to_string(),
+        });
+    };
+
+    // (2) No persona claim in payload → Internal trust lane (legacy
+    // shape: admin CLI / smoke harness that doesn't name a persona).
+    let Some(persona_id) = params.get(persona_id_field).and_then(|v| v.as_str()) else {
+        return Ok(LegacySocketResolution::Internal {
+            reason: "no-persona-claim".to_string(),
+        });
+    };
+
+    // (3) Active enrollment row exists for the claimed persona →
+    // surface it so the caller can read peer_uid / grant_id directly
+    // without re-querying. The query mirrors the
+    // `lookup_persona_uid_from_enrollments` shape: filter on
+    // state = 'active', tie-break by enrolled_at DESC for re-enrollment.
+    let result = store.conn().query_row(
+        "SELECT socket_path, persona_id, grant_id, brief_content_hash, \
+                enrolled_at, state, cgroup_v2_id, userns_inode, mnt_ns_inode \
+         FROM agent_socket_enrollments \
+         WHERE persona_id = ?1 AND state = 'active' \
+         ORDER BY enrolled_at DESC \
+         LIMIT 1",
+        rusqlite::params![persona_id],
+        |row| {
+            Ok(crate::infra::store::AgentSocketEnrollment {
+                socket_path: row.get(0)?,
+                persona_id: row.get(1)?,
+                grant_id: row.get(2)?,
+                brief_content_hash: row.get(3)?,
+                enrolled_at: row.get(4)?,
+                state: row.get(5)?,
+                cgroup_v2_id: row.get(6)?,
+                userns_inode: row.get(7)?,
+                mnt_ns_inode: row.get(8)?,
+            })
+        },
+    );
+    match result {
+        Ok(row) => Ok(LegacySocketResolution::Enrolled(row)),
+        // (4) No active enrollment → legacy fail-open posture.
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(LegacySocketResolution::NoEnrollment),
+        Err(e) => Err(crate::infra::store::StoreError::Sqlite(e)),
+    }
+}
+
+/// implementation-note-154 — emit a
+/// structured trace line classifying a shared-socket RPC call.
+///
+/// Wrapper around [`resolve_legacy_socket_enrollment`] that swallows
+/// the `StoreError` (treated as `NoEnrollment` for logging purposes;
+/// the downstream gate will surface the real refusal) and records the
+/// resolution variant against the supplied `method` label. Step B
+/// keeps the call observability-only — the legacy peercred-uid gate
+/// continues to enforce uid binding via the existing
+/// `check_principal_against_persona` chain. Step C will replace the
+/// fallback with a fail-closed posture once every legacy caller has
+/// been migrated.
+fn log_legacy_socket_resolution(
+    principal: Option<&crate::infra::runtime::PeerCredPrincipal>,
+    store: &DaemonStore,
+    params: &Value,
+    persona_id_field: &str,
+    method: &str,
+) {
+    match resolve_legacy_socket_enrollment(principal, store, params, persona_id_field) {
+        Ok(LegacySocketResolution::Enrolled(row)) => {
+            tracing::debug!(
+                method,
+                persona_id = %row.persona_id,
+                socket_path = %row.socket_path,
+                "legacy-socket-resolution: enrolled (per-agent UDS surface)"
+            );
+        }
+        Ok(LegacySocketResolution::Internal { reason }) => {
+            tracing::debug!(
+                method,
+                reason = %reason,
+                "legacy-socket-resolution: internal (daemon-internal trust lane)"
+            );
+        }
+        Ok(LegacySocketResolution::NoEnrollment) => {
+            tracing::debug!(
+                method,
+                "legacy-socket-resolution: no-enrollment (legacy fail-open — Step C retires this branch)"
+            );
+        }
+        Err(e) => {
+            // SQLite errors during classification are not fatal at
+            // Step B — the gate downstream still fires. Log so
+            // operators see the lookup failure.
+            tracing::warn!(
+                method,
+                error = %e,
+                "legacy-socket-resolution: store lookup failed (resolution treated as no-enrollment)"
+            );
+        }
+    }
+}
+
 /// Error code for "principal pidfd reports the bound peer process has
 /// been reaped" — distinct from `-32004` (uid binding mismatch) so
 /// operators can tell apart "wrong uid" from "PID-reuse / stale-PID
-/// attack". implementation-note-135.
+/// attack". implementation-note-155.
 pub const ERR_PRINCIPAL_NOT_ALIVE: i32 = -32007;
 
 /// Liveness gate paired with `check_principal_against_persona`.
@@ -2243,12 +2591,99 @@ pub fn check_principal_is_alive(
 /// (principal not alive), and `-32008` (unmanifested binary) so
 /// operators can tell apart "wrong uid", "stale PID", "unmanifested
 /// binary", and "namespace rebind" at the log line.
-/// implementation-note-136.
+/// implementation-note-156.
 pub const ERR_PRINCIPAL_NAMESPACE_MISMATCH: i32 = -32401;
+
+/// implementation-note-115 — pure-function result of comparing
+/// the recorded `agent_socket_enrollments` tuple against the live
+/// namespace inodes captured from the principal's `/proc/<pid>` view.
+///
+/// `Match` means every populated recorded column equals the live
+/// value. `Mismatch` carries one human-readable string per drifted
+/// column (e.g. `"cgroup_v2_id recorded=42 live=99"`) so operators
+/// can tell which namespace was swapped at the log line.
+///
+/// The comparator is factored out so the T1 property test
+/// (`compare_ns_inodes_property_round_trip` and family) can drive
+/// every mismatch permutation without I/O — it never reads `/proc`,
+/// never opens a store, just exercises the field-by-field equality.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NsCompareResult {
+    /// All populated (non-NULL) recorded columns match the live capture.
+    Match,
+    /// At least one populated recorded column drifted. `fields` is the
+    /// per-column diagnostic in the order `(cgroup_v2_id, userns_inode,
+    /// mnt_ns_inode)`. Empty `fields` is unreachable from
+    /// [`compare_ns_inodes`] (a no-mismatch result returns `Match`).
+    Mismatch { fields: Vec<String> },
+}
+
+/// implementation-note-115 — pure comparator factored out of
+/// [`check_principal_namespace_inodes`] for T1 property-test coverage.
+///
+/// `recorded` is the `(cgroup_v2_id, userns_inode, mnt_ns_inode)` triple
+/// projected from the `agent_socket_enrollments` row; each field is
+/// `Option<i64>` because legacy rows + non-Linux call sites carry NULL.
+/// `live` is the freshly-captured tuple from the principal's
+/// `/proc/<pid>` view (always all three fields populated on Linux).
+///
+/// Semantics:
+///
+/// - For each recorded `Some(want)`: compare against the corresponding
+///   live field. If `want != live`, push a per-column diagnostic.
+/// - Recorded `None` columns are SKIPPED — they were not enrolled, so
+///   they cannot drift.
+/// - All three recorded `None` (legacy NULL binding) → `Match` with
+///   zero comparisons. The wrapping
+///   [`check_principal_namespace_inodes`] short-circuits before
+///   calling the comparator in that case for parity with the legacy
+///   no-op posture, but the comparator itself is harmless if invoked.
+/// - Any non-empty `fields` → `Mismatch`. Order is canonical
+///   (`cgroup_v2_id` first, then `userns_inode`, then `mnt_ns_inode`).
+///
+/// Pure — no I/O, no allocations beyond the per-mismatch strings, no
+/// global state. Suitable for property-test fuzzing over arbitrary
+/// `(Option<i64>, Option<i64>, Option<i64>)` × `(i64, i64, i64)` inputs.
+pub(crate) fn compare_ns_inodes(
+    recorded: (Option<i64>, Option<i64>, Option<i64>),
+    live: crate::spawn::scion::NamespaceInodes,
+) -> NsCompareResult {
+    let (rec_cgroup, rec_userns, rec_mntns) = recorded;
+    let mut fields: Vec<String> = Vec::new();
+    if let Some(want) = rec_cgroup {
+        if want != live.cgroup_v2_id {
+            fields.push(format!(
+                "cgroup_v2_id recorded={want} live={}",
+                live.cgroup_v2_id
+            ));
+        }
+    }
+    if let Some(want) = rec_userns {
+        if want != live.userns_inode {
+            fields.push(format!(
+                "userns_inode recorded={want} live={}",
+                live.userns_inode
+            ));
+        }
+    }
+    if let Some(want) = rec_mntns {
+        if want != live.mnt_ns_inode {
+            fields.push(format!(
+                "mnt_ns_inode recorded={want} live={}",
+                live.mnt_ns_inode
+            ));
+        }
+    }
+    if fields.is_empty() {
+        NsCompareResult::Match
+    } else {
+        NsCompareResult::Mismatch { fields }
+    }
+}
 
 /// Container-binding gate paired with [`check_principal_is_alive`].
 ///
-/// implementation-note-136 — verify the peer process's
+/// implementation-note-156 — verify the peer process's
 /// kernel-observable namespace inodes still match the
 /// `(userns_inode, mnt_ns_inode, cgroup_v2_id)` tuple captured at
 /// spawn-completion and persisted on the
@@ -2376,55 +2811,68 @@ pub fn check_principal_namespace_inodes(
             }
         };
 
-        // Compare each non-NULL recorded column against the live
-        // value. Any mismatch refuses with -32401. We compare every
-        // populated column rather than short-circuiting on the
-        // first match so the log line names the specific column
-        // that drifted (useful for operator triage).
-        let mut mismatches: Vec<String> = Vec::new();
-        if let Some(want) = row.cgroup_v2_id {
-            if want != live.cgroup_v2_id {
-                mismatches.push(format!(
-                    "cgroup_v2_id recorded={want} live={}",
-                    live.cgroup_v2_id
-                ));
+        // implementation-note-115 — delegate the field-by-field
+        // equality to the pure `compare_ns_inodes` comparator. The
+        // comparator returns a typed result so the receipt-emission +
+        // log message path below can name the specific column(s) that
+        // drifted (operator triage).
+        match compare_ns_inodes(
+            (row.cgroup_v2_id, row.userns_inode, row.mnt_ns_inode),
+            live,
+        ) {
+            NsCompareResult::Match => Ok(()),
+            NsCompareResult::Mismatch { fields: mismatches } => {
+                tracing::warn!(
+                    peer_pid = principal.pid,
+                    peer_uid = principal.uid,
+                    socket_path = %path_str,
+                    mismatches = ?mismatches,
+                    "check_principal_namespace_inodes: refusing request — \
+                     namespace inode tuple drifted from spawn-time enrollment"
+                );
+                // implementation-note-115 — emit a refusal Receipt
+                // so the audit trail captures the namespace-rebind
+                // detection. The payload kind
+                // `namespace_inode_mismatch_refused` (checkpoint) is
+                // distinct from `broker_resolve_persona_binding_violation`
+                // so operators querying the audit log can filter on the
+                // namespace-drift cohort without conflating it with the
+                // persona-binding cohort. Best-effort: if the event-log
+                // write itself fails we still refuse the RPC (the
+                // primary trust-boundary action) and log the secondary
+                // failure to tracing.
+                let payload = serde_json::json!({
+                    "kind": "namespace_inode_mismatch_refused",
+                    "peer_pid": principal.pid,
+                    "peer_uid": principal.uid,
+                    "socket_path": path_str,
+                    "mismatches": mismatches,
+                });
+                if let Err(e) = store.log_event(
+                    None,
+                    "broker.resolve.refused",
+                    None,
+                    "denied",
+                    Some(&payload.to_string()),
+                ) {
+                    tracing::warn!(
+                        error = %e,
+                        peer_pid = principal.pid,
+                        socket_path = %path_str,
+                        "check_principal_namespace_inodes: failed to record \
+                         namespace_inode_mismatch_refused receipt (continuing with refusal)"
+                    );
+                }
+                Err((
+                    ERR_PRINCIPAL_NAMESPACE_MISMATCH,
+                    format!(
+                        "principal namespace mismatch: peer pid {} on {path_str} drifted from enrollment ({})",
+                        principal.pid,
+                        mismatches.join(", ")
+                    ),
+                ))
             }
         }
-        if let Some(want) = row.userns_inode {
-            if want != live.userns_inode {
-                mismatches.push(format!(
-                    "userns_inode recorded={want} live={}",
-                    live.userns_inode
-                ));
-            }
-        }
-        if let Some(want) = row.mnt_ns_inode {
-            if want != live.mnt_ns_inode {
-                mismatches.push(format!(
-                    "mnt_ns_inode recorded={want} live={}",
-                    live.mnt_ns_inode
-                ));
-            }
-        }
-        if !mismatches.is_empty() {
-            tracing::warn!(
-                peer_pid = principal.pid,
-                peer_uid = principal.uid,
-                socket_path = %path_str,
-                mismatches = ?mismatches,
-                "check_principal_namespace_inodes: refusing request — \
-                 namespace inode tuple drifted from spawn-time enrollment"
-            );
-            return Err((
-                ERR_PRINCIPAL_NAMESPACE_MISMATCH,
-                format!(
-                    "principal namespace mismatch: peer pid {} on {path_str} drifted from enrollment ({})",
-                    principal.pid,
-                    mismatches.join(", ")
-                ),
-            ));
-        }
-        Ok(())
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -2452,7 +2900,7 @@ pub fn check_principal_namespace_inodes(
 /// verification". Distinct from `-32004` (uid mismatch) and `-32007`
 /// (principal not alive) so operators can tell apart "wrong uid",
 /// "stale PID", and "unmanifested binary" at the log line.
-/// implementation-note-106.
+/// implementation-note-122.
 pub const ERR_BINARY_PIN_REFUSED: i32 = -32008;
 
 /// Verify the peer process's on-disk binary matches the signed
@@ -2561,7 +3009,7 @@ pub fn check_peer_binary_pinned_with(
 ///
 /// Response: `{ token, materialization_id, expires_at, provider }`.
 ///
-/// implementation-note-133: when `principal` is
+/// implementation-note-149: when `principal` is
 /// supplied, the kernel-attested uid is compared against the uid
 /// bound to the payload's `caller_persona` field. A mismatch is
 /// refused with `-32004` before any provider IO.
@@ -2570,17 +3018,30 @@ pub async fn handle_broker_issue(
     store: &DaemonStore,
     params: &Value,
 ) -> Result<Value, (i32, String)> {
-    // implementation-note-51 — refuse before any other gate
+    // implementation-note-62 — refuse before any other gate
     // when the caller persona owns any active grant whose
     // schema_version does not match this daemon's compiled-in pin.
     check_grants_schema_version_for_persona(store, params, "caller_persona")?;
     check_principal_is_alive(principal)?;
-    // implementation-note-136 — refuse when the peer's
+    // implementation-note-156 — refuse when the peer's
     // kernel-observable namespace inodes drifted from the
     // agent_socket_enrollments row recorded at spawn-completion.
     check_principal_namespace_inodes(principal, store)?;
     check_peer_binary_pinned(principal)?;
-    check_principal_against_persona(principal, params, "caller_persona")?;
+    // implementation-note-154 —
+    // classify the shared-socket caller against the per-agent UDS
+    // enrollment surface before the legacy peercred-uid gate fires.
+    // Resolution is observability-only at Step B; the gate downstream
+    // still enforces uid binding. Step C will retire the legacy
+    // thread-local registry fallback now that the enrollment surface
+    // is the documented source of truth.
+    log_legacy_socket_resolution(principal, store, params, "caller_persona", "broker_issue");
+    check_principal_against_persona(principal, store, params, "caller_persona")?;
+    // implementation-note-157: refuse unenrolled
+    // personas with -32401 (fail_closed_broker_issue). Other broker
+    // RPCs still operate under the fail-open legacy gate until their
+    // rollout step (D) lands.
+    check_principal_enrollment_strict(principal, store, params, "caller_persona")?;
     let registry = current_registry().ok_or_else(err_no_registry)?;
     issue_with_registry(
         registry,
@@ -2597,7 +3058,7 @@ pub async fn handle_broker_issue(
 ///
 /// Response: `{ revoked: true, materialization_id: <string> }`.
 ///
-/// implementation-note-133: when `principal` is
+/// implementation-note-149: when `principal` is
 /// supplied AND the payload names `caller_persona`, the peercred uid
 /// is matched against the persona's bound uid. Revoke is a
 /// privileged op (drops daemon-held plaintext); only the persona that
@@ -2607,15 +3068,23 @@ pub async fn handle_broker_revoke(
     store: &DaemonStore,
     params: &Value,
 ) -> Result<Value, (i32, String)> {
-    // implementation-note-51 — refuse before any other gate
+    // implementation-note-62 — refuse before any other gate
     // when the caller persona owns any active grant whose
     // schema_version does not match this daemon's compiled-in pin.
     check_grants_schema_version_for_persona(store, params, "caller_persona")?;
     check_principal_is_alive(principal)?;
-    // implementation-note-136 — refuse on namespace drift.
+    // implementation-note-156 — refuse on namespace drift.
     check_principal_namespace_inodes(principal, store)?;
     check_peer_binary_pinned(principal)?;
-    check_principal_against_persona(principal, params, "caller_persona")?;
+    // implementation-note-154 —
+    // classify shared-socket caller against the enrollment surface.
+    log_legacy_socket_resolution(principal, store, params, "caller_persona", "broker_revoke");
+    check_principal_against_persona(principal, store, params, "caller_persona")?;
+    // implementation-note-158: refuse unenrolled
+    // personas with -32401 (fail_closed_broker_revoke_list). This is
+    // the final flip in the A/B/C/D rollout — every broker RPC now
+    // refuses unenrolled callers.
+    check_principal_enrollment_strict(principal, store, params, "caller_persona")?;
     let registry = current_registry().ok_or_else(err_no_registry)?;
     revoke_with_registry(registry, store, params).await
 }
@@ -2629,22 +3098,28 @@ pub async fn handle_broker_revoke(
 /// Response: array of [`MaterializationSummary`] sorted by `issued_at`
 /// ascending. Empty when nothing has been issued.
 ///
-/// implementation-note-133: same gate as issue/revoke
+/// implementation-note-149: same gate as issue/revoke
 /// when `caller_persona` is present.
 pub async fn handle_broker_list(
     principal: Option<&crate::infra::runtime::PeerCredPrincipal>,
     store: &DaemonStore,
     params: &Value,
 ) -> Result<Value, (i32, String)> {
-    // implementation-note-51 — refuse before any other gate
+    // implementation-note-62 — refuse before any other gate
     // when the caller persona owns any active grant whose
     // schema_version does not match this daemon's compiled-in pin.
     check_grants_schema_version_for_persona(store, params, "caller_persona")?;
     check_principal_is_alive(principal)?;
-    // implementation-note-136 — refuse on namespace drift.
+    // implementation-note-156 — refuse on namespace drift.
     check_principal_namespace_inodes(principal, store)?;
     check_peer_binary_pinned(principal)?;
-    check_principal_against_persona(principal, params, "caller_persona")?;
+    // implementation-note-154 —
+    // classify shared-socket caller against the enrollment surface.
+    log_legacy_socket_resolution(principal, store, params, "caller_persona", "broker_list");
+    check_principal_against_persona(principal, store, params, "caller_persona")?;
+    // implementation-note-158: refuse unenrolled
+    // personas with -32401 (fail_closed_broker_revoke_list).
+    check_principal_enrollment_strict(principal, store, params, "caller_persona")?;
     let registry = current_registry().ok_or_else(err_no_registry)?;
     list_with_registry(registry).await
 }
@@ -2669,19 +3144,20 @@ pub async fn handle_broker_list(
 /// }
 /// ```
 ///
-/// Per implementation-note-12 this is the ONLY RPC that
+/// Per implementation-note-15 this is the ONLY RPC that
 /// returns plaintext. Two gates run in sequence:
 ///
 /// - **L1 authoring-path gate** (T-CONSTRUCT-AUTHORING-MODE-DEV-PATH-
 ///   REGISTRY): unsigned scripts outside any registered authoring
 ///   path are refused with `authoring_path_not_registered`.
-/// - **Persona-binding check** (implementation-note-130):
+/// - **Persona-binding check** (implementation-note-146):
 ///   only the persona that issued the materialization may resolve it.
 ///   Mismatches return `persona_binding_violation`.
-/// Outcome of the workflow-grant evaluation step inside
-/// `handle_broker_resolve`. Approve and the fall-through variants all let the
-/// caller continue to the per-action / JIT chain; `Deny`, `PersonaMismatch`,
-/// and `WorkflowGrantRequired` short-circuit with a wire-error.
+///   Outcome of the workflow-grant evaluation step inside
+///   `handle_broker_resolve`. Approve and the fall-through variants all let
+///   the caller continue to the per-action / JIT chain; `Deny`,
+///   `PersonaMismatch`, and `WorkflowGrantRequired` short-circuit with a
+///   wire-error.
 ///
 /// 2026-05-18 prior change adversarial-review extensions:
 /// - `PersonaMismatch` (CRIT-2): defense against grant-stuffing across
@@ -2802,13 +3278,13 @@ pub(crate) fn eval_workflow_for_action(
             // the grant-vs-request_persona equality to catch a session whose
             // workflow grant was issued for a different persona than the
             // current resolver.
-            if let Some(req_persona) = request_persona {
-                if grant.persona_id != req_persona {
-                    return WorkflowEvalOutcome::PersonaMismatch {
-                        grant_persona: grant.persona_id.clone(),
-                        request_persona: req_persona.to_string(),
-                    };
-                }
+            if let Some(req_persona) = request_persona
+                && grant.persona_id != req_persona
+            {
+                return WorkflowEvalOutcome::PersonaMismatch {
+                    grant_persona: grant.persona_id.clone(),
+                    request_persona: req_persona.to_string(),
+                };
             }
             match grant.evaluate(action_key, now) {
                 Some(core_grants::workflow::PregrantPath::Workflow) => {
@@ -2849,33 +3325,41 @@ pub async fn handle_broker_resolve(
     sessions_dir: Option<&std::path::Path>,
     params: &Value,
 ) -> Result<Value, (i32, String)> {
-    // implementation-note-51 — refuse before any other gate
+    // implementation-note-62 — refuse before any other gate
     // when the persona named by `persona_id` owns any active grant
     // whose schema_version does not match this daemon's pin.
     check_grants_schema_version_for_persona(store, params, "persona_id")?;
-    // implementation-note-135 — refuse before any provider IO if the
+    // implementation-note-155 — refuse before any provider IO if the
     // pidfd-attested peer is no longer alive (PID-reuse defence).
     check_principal_is_alive(principal)?;
-    // implementation-note-136 — refuse when the peer's
+    // implementation-note-156 — refuse when the peer's
     // kernel-observable namespace inodes drifted from the
     // agent_socket_enrollments tuple recorded at spawn-completion.
     check_principal_namespace_inodes(principal, store)?;
-    // implementation-note-106 — refuse if the
+    // implementation-note-122 — refuse if the
     // peer's on-disk binary is not in the signed manifest, or if a
     // debugger is attached.
     check_peer_binary_pinned(principal)?;
-    // implementation-note-133 — peercred uid must
+    // implementation-note-154 —
+    // classify shared-socket caller against the enrollment surface.
+    log_legacy_socket_resolution(principal, store, params, "persona_id", "broker_resolve");
+    // implementation-note-149 — peercred uid must
     // match the persona named by the request's `persona_id` field
     // (the resolver's claimed identity). The downstream persona-
     // binding check inside `broker_resolve_plaintext` enforces the
     // companion "the persona that materialised the credential is the
     // only persona allowed to resolve it" invariant — this gate adds
     // kernel attestation that the resolver is actually that persona.
-    check_principal_against_persona(principal, params, "persona_id")?;
+    check_principal_against_persona(principal, store, params, "persona_id")?;
+    // implementation-note-152: refuse unenrolled
+    // personas with -32401 (fail_closed_broker_resolve). Other broker
+    // RPCs still operate under the fail-open legacy gate until their
+    // rollout step (B/C/D) lands.
+    check_principal_enrollment_strict(principal, store, params, "persona_id")?;
 
     // design §Component 2 — workflow grant evaluation. Optional fast-path
     // authorization for sessions opened with a workflow template
-    // (implementation-note-137 writes the sidecar; this is the
+    // (implementation-note-159 writes the sidecar; this is the
     // read side).
     //
     // Ordered evaluation (per design):
@@ -3138,7 +3622,7 @@ pub async fn handle_broker_mint_gh_token(
 ///
 /// The inner `crate::infra::persona::mint_sub_persona` call is a scaffold
 /// stub (`unimplemented!`) — the real two-phase commit + spawn wiring is
-/// tracked in implementation-note-138. Input validation (missing
+/// tracked in implementation-note-160. Input validation (missing
 /// fields) runs before the stub fires so callers get proper -32602 errors
 /// rather than a panic on bad input.
 pub async fn handle_broker_mint_sub_persona(
@@ -3165,7 +3649,7 @@ pub async fn handle_broker_mint_sub_persona(
     let scope = params.get("scope").and_then(|v| v.as_str()).unwrap_or("*");
 
     // Delegate to the infra wrapper — real two-phase commit + spawn wiring
-    // is a follow-up (implementation-note-138 scaffold).
+    // is a follow-up (implementation-note-160 scaffold).
     let persona_id = crate::infra::persona::mint_sub_persona(parent_persona_id, child_label, scope)
         .await
         .map_err(|e| (-32000, format!("mint_sub_persona failed: {e}")))?;
@@ -3173,7 +3657,7 @@ pub async fn handle_broker_mint_sub_persona(
     Ok(json!({ "persona_id": persona_id }))
 }
 
-// implementation-note-139
+// implementation-note-161
 //
 // All host-direct broker_exec spawn paths drop to a per-spawn uid
 // from the configured pool before execve. See `broker/uid_alloc.rs`
@@ -3183,7 +3667,7 @@ pub async fn handle_broker_mint_sub_persona(
 // Refusal codes — chosen distinct from the existing -32010
 // (ERR_GRANT_SCHEMA_VERSION_MISMATCH, line ~1769) and -32011
 // (ERR_NO_REGISTRY / classification refusal / BrokerError::Upstream).
-// The implementation-note-140 brief originally proposed
+// The implementation-note-162 brief originally proposed
 // -32010/-32011; those were already taken when this task landed,
 // so we picked the next free block.
 //
@@ -3194,7 +3678,7 @@ pub async fn handle_broker_mint_sub_persona(
 //            route PTY constructs through the user-namespace primitive
 //            because forkpty's `setresuid` runs on the host side which
 //            requires CAP_SETUID; tracked under
-//            implementation-note-141 follow-up)
+//            implementation-note-163 follow-up)
 //
 // The SCION dispatch path (`scion_exec_socket = Some(_)`) bypasses
 // the local pool: the receiver-side ember-exec runtime owns its
@@ -3229,7 +3713,7 @@ fn resolve_broker_exec_uid_lease(
     let pool = uid_alloc::global_pool().ok_or((
         -32021,
         "spawn pool not configured — `ember daemon install` must provision the uid pool \
-         (implementation-note-140)"
+         (implementation-note-162)"
             .to_string(),
     ))?;
 
@@ -3249,7 +3733,7 @@ fn resolve_broker_exec_uid_lease(
     let lease = pool.checkout(&spawn_id).map_err(|e| match e {
         uid_alloc::UidAllocError::PoolEmpty | uid_alloc::UidAllocError::PoolExhausted { .. } => (
             -32021,
-            format!("spawn pool unavailable: {e} (implementation-note-140)"),
+            format!("spawn pool unavailable: {e} (implementation-note-162)"),
         ),
         uid_alloc::UidAllocError::AlreadyCheckedOut(_) => {
             (-32603, format!("spawn pool internal error: {e}"))
@@ -3274,7 +3758,7 @@ fn resolve_broker_exec_uid_lease(
                     "refusing to spawn child as daemon uid (Finding 14): \
                      pool allocated uid {} but daemon runs as uid {} — \
                      fix `[spawn_pool] uids = [...]` in config.toml \
-                     (implementation-note-140)",
+                     (implementation-note-162)",
                     lease.uid(),
                     daemon_uid
                 ),
@@ -3302,13 +3786,13 @@ fn resolve_broker_exec_uid_lease(
 /// verbatim — daemon-side argv re-classification is a follow-up
 /// (T-CONSTRUCT-EXEC-ARGV-CLASSIFIER) that can ride atop this scaffold.
 ///
-/// implementation-note-133: when `principal` is
+/// implementation-note-149: when `principal` is
 /// supplied, the kernel-attested uid is compared against the uid
 /// bound to the payload's `caller_persona` field — same gate shape
 /// as `handle_broker_issue`. A mismatch is refused with `-32004`
 /// before the daemon spawns any child process.
 ///
-/// implementation-note-140: every host-direct spawn path
+/// implementation-note-162: every host-direct spawn path
 /// (PTY + non-PTY) drops privileges into a per-spawn uid checked
 /// out from the configured pool before execve. See
 /// [`resolve_broker_exec_uid_lease`] for the refusal contracts
@@ -3320,57 +3804,65 @@ pub async fn handle_broker_exec(
     store: &DaemonStore,
     params: &Value,
 ) -> Result<Value, (i32, String)> {
-    // implementation-note-51 — refuse before any other gate
+    // implementation-note-62 — refuse before any other gate
     // when the caller persona owns any active grant whose
     // schema_version does not match this daemon's compiled-in pin.
     check_grants_schema_version_for_persona(store, params, "caller_persona")?;
     check_principal_is_alive(principal)?;
-    // implementation-note-136 — refuse on namespace drift.
+    // implementation-note-156 — refuse on namespace drift.
     check_principal_namespace_inodes(principal, store)?;
     check_peer_binary_pinned(principal)?;
-    check_principal_against_persona(principal, params, "caller_persona")?;
+    // implementation-note-154 —
+    // classify shared-socket caller against the enrollment surface.
+    log_legacy_socket_resolution(principal, store, params, "caller_persona", "broker_exec");
+    check_principal_against_persona(principal, store, params, "caller_persona")?;
+    // implementation-note-164: refuse unenrolled
+    // personas with -32401 (fail_closed_broker_exec). Other broker
+    // RPCs still operate under the fail-open legacy gate until their
+    // rollout step (C/D) lands.
+    check_principal_enrollment_strict(principal, store, params, "caller_persona")?;
     // PTY_BRIDGE_INTEGRATED
     let req: BrokerExecRequest = serde_json::from_value(params.clone())
         .map_err(|e| (-32602, format!("invalid broker_exec params: {e}")))?;
 
-    // spawn_handle_ttl (implementation-note-120) — close replay window.
+    // spawn_handle_ttl (implementation-note-136) — close replay window.
     // When the request carries a `secret_ref` (SCION shim resolve path), look
     // up the pending spawn handle and refuse if the 30-second TTL has elapsed.
     // Legacy / non-SCION exec paths omit `secret_ref` and skip this gate.
-    if let Some(ref mat_id) = req.secret_ref {
-        if let Some(registry) = current_registry() {
-            if let Some(handle) = registry.consume_spawn_handle(mat_id) {
-                if chrono::Utc::now() > handle.not_after {
-                    tracing::info!(
-                        target: "audit",
-                        spawn_handle_consumed = ?handle.handle_id,
-                        not_after = ?handle.not_after,
-                        "spawn handle exec refused: SpawnHandleExpired"
-                    );
-                    return Err((-32002, "SpawnHandleExpired".to_string()));
-                }
+    if let Some(ref mat_id) = req.secret_ref
+        && let Some(registry) = current_registry()
+    {
+        if let Some(handle) = registry.consume_spawn_handle(mat_id) {
+            if chrono::Utc::now() > handle.not_after {
                 tracing::info!(
                     target: "audit",
                     spawn_handle_consumed = ?handle.handle_id,
                     not_after = ?handle.not_after,
-                    "spawn handle exec"
+                    "spawn handle exec refused: SpawnHandleExpired"
                 );
-            } else {
-                // spawn_handle_single_use (implementation-note-121) — close replay attack.
-                // consume_spawn_handle returned None: the handle is not in pending_spawn_handles.
-                // If it appears in consumed_recent (consumed within last 60s), this is a replay
-                // attempt — return SpawnHandleAlreadyConsumed to distinguish from an unknown handle.
-                if registry.was_recently_consumed(mat_id) {
-                    tracing::info!(
-                        target: "audit",
-                        spawn_handle_id = %mat_id,
-                        "spawn handle exec refused: SpawnHandleAlreadyConsumed"
-                    );
-                    return Err((-32003, "SpawnHandleAlreadyConsumed".to_string()));
-                }
-                // Handle was never issued via the shim path or has aged out of consumed_recent —
-                // no TTL gate applies (legacy credential path).
+                return Err((-32002, "SpawnHandleExpired".to_string()));
             }
+            tracing::info!(
+                target: "audit",
+                spawn_handle_consumed = ?handle.handle_id,
+                not_after = ?handle.not_after,
+                "spawn handle exec"
+            );
+        } else {
+            // spawn_handle_single_use (implementation-note-137) — close replay attack.
+            // consume_spawn_handle returned None: the handle is not in pending_spawn_handles.
+            // If it appears in consumed_recent (consumed within last 60s), this is a replay
+            // attempt — return SpawnHandleAlreadyConsumed to distinguish from an unknown handle.
+            if registry.was_recently_consumed(mat_id) {
+                tracing::info!(
+                    target: "audit",
+                    spawn_handle_id = %mat_id,
+                    "spawn handle exec refused: SpawnHandleAlreadyConsumed"
+                );
+                return Err((-32003, "SpawnHandleAlreadyConsumed".to_string()));
+            }
+            // Handle was never issued via the shim path or has aged out of consumed_recent —
+            // no TTL gate applies (legacy credential path).
         }
     }
 
@@ -3382,7 +3874,7 @@ pub async fn handle_broker_exec(
         }
     }
 
-    // implementation-note-119: action-level policy
+    // implementation-note-135: action-level policy
     // gating. When the request carries `construct_toml_bytes` AND
     // `action_key`, the daemon decodes the base64 bytes, parses the
     // manifest, and refuses any action_key that is NOT declared in the
@@ -3497,7 +3989,7 @@ pub async fn handle_broker_exec(
 
     // Build env: allowlist baseline + caller-supplied passthrough (post-strip).
     //
-    // HOME is deliberately omitted from the inherited allowlist (implementation-note-112-
+    // HOME is deliberately omitted from the inherited allowlist (implementation-note-128-
     // EXEC-CLEAN-HOME). Inheriting the daemon's HOME leaks the operator's
     // `~/.config/` into the broker-spawned child — a separate-uid daemon
     // running as `ember` then tries to read operator-owned dotfiles
@@ -3549,7 +4041,7 @@ pub async fn handle_broker_exec(
         .clone()
         .unwrap_or_else(|| exec_home.path().to_string_lossy().into_owned());
 
-    // implementation-note-142: classification-file refusal under bot
+    // implementation-note-165: classification-file refusal under bot
     // identity. Migrated from `.claude/scripts/as-bot.sh` (deleted in
     // T-CONSTRUCT-SHIP-RS-MIGRATION) into the daemon's broker_exec —
     // the new trust boundary for bot-authored ops. Refuses any
@@ -3607,7 +4099,7 @@ pub async fn handle_broker_exec(
     // critically depend on the mint should declare `default = "deny"` in
     // construct.toml so unauthorized invocations fail at the gate.
     //
-    // implementation-note-41 Phase 1: snapshot env keys before
+    // implementation-note-52 Phase 1: snapshot env keys before
     // and after the mint so the seal-swap site downstream can identify
     // which env entries are credentials without re-parsing the broker
     // policy. `credential_env_keys` is the set of keys that
@@ -3616,8 +4108,8 @@ pub async fn handle_broker_exec(
     // through `exec_env::seal_credentials_for_exec` so `/proc/<pid>/environ`
     // exposes `<KEY>_FD=<n>` instead of `<KEY>=<plaintext>`.
 
-    // ALLOWLIST_GATE_HTTPS — implementation-note-143 closure
-    // (implementation-note-144, design).
+    // ALLOWLIST_GATE_HTTPS — implementation-note-166 closure
+    // (implementation-note-167, design).
     //
     // For git credential-bearing actions, the daemon refuses the broker_exec
     // unless a matching binding exists for (caller_persona, working_tree,
@@ -3770,7 +4262,7 @@ pub async fn handle_broker_exec(
     }
 
     let env_keys_pre_mint: std::collections::HashSet<String> = env.keys().cloned().collect();
-    // implementation-note-145 — thread the caller_persona JSON
+    // implementation-note-168 — thread the caller_persona JSON
     // field (the persona id string the client sent) through the mint
     // path so the operator log line names the resolver, not just the
     // action key. Falls back to "<no-persona>" inside the mint helper
@@ -3792,7 +4284,7 @@ pub async fn handle_broker_exec(
         .collect();
 
     // Spawn a daemon-managed ssh-agent for this session when requested
-    // (implementation-note-72). The handle lives for the duration of
+    // (implementation-note-83). The handle lives for the duration of
     // the exec; dropping it zeros the private key and unlinks the socket.
     let _ssh_agent_handle = if req.ssh_agent {
         let session_id = uuid::Uuid::new_v4().to_string();
@@ -3817,7 +4309,7 @@ pub async fn handle_broker_exec(
     let shim_eof_policy = ShimEofPolicy::from_toml_value(req.on_shim_eof.as_deref());
     let mut shim_outcome = ShimEofOutcome::ChildExitedFirst;
 
-    // implementation-note-140 — host-direct spawn paths drop
+    // implementation-note-162 — host-direct spawn paths drop
     // privileges to a per-spawn uid checked out from the configured
     // pool. The SCION dispatch path (scion_exec_socket = Some(_))
     // routes through the in-container `ember-exec` receiver which
@@ -3852,7 +4344,7 @@ pub async fn handle_broker_exec(
     // child exits 127 with a cryptic stderr.
     //
     // Routing PTY constructs through the user-namespace primitive is
-    // a follow-up scope (implementation-note-141) — the
+    // a follow-up scope (implementation-note-163) — the
     // namespace-spawn primitive doesn't currently expose a slave-fd
     // wire-up the way `forkpty` does. Until that lands we refuse the
     // combo cleanly here rather than letting the broker_exec call
@@ -3869,13 +4361,13 @@ pub async fn handle_broker_exec(
              subuid pool in use. Run the construct in non-PTY mode, \
              or migrate this construct's broker_exec to omit \
              pty_socket_path. Tracked under \
-             implementation-note-141 follow-up."
+             implementation-note-163 follow-up."
                 .to_string(),
         ));
     }
 
     let (exit_code, stderr_tail) = if let Some(ref scion_sock) = req.scion_exec_socket {
-        // implementation-note-95: in-container exec path.
+        // implementation-note-109: in-container exec path.
         // emberd dispatches the binary via the in-container `ember-exec`
         // listener — UDS connect, write `SpawnDirective`, drive frames
         // until `ExecFrame::Exit { code }`. The host-direct forkpty path
@@ -3914,7 +4406,7 @@ pub async fn handle_broker_exec(
                 env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             let env_allowlist: Vec<String> = env.keys().cloned().collect();
 
-            // implementation-note-33 — clone the verified
+            // implementation-note-43 — clone the verified
             // hash + binary path + target_uid BEFORE we hand the
             // directive to `send_spawn_directive` (which consumes it).
             // The receipt records "what emberd actually approved", so
@@ -3977,7 +4469,7 @@ pub async fn handle_broker_exec(
                 }
             }
 
-            // implementation-note-33 — Receipt v2 emission
+            // implementation-note-43 — Receipt v2 emission
             // on every Exit frame. Best-effort: a missing daemon
             // identity or a sign-side error logs a warning and does
             // NOT fail the RPC (the exec already happened upstream).
@@ -4022,7 +4514,7 @@ pub async fn handle_broker_exec(
             let cwd_clone = cwd.clone();
             let policy = shim_eof_policy;
 
-            // implementation-note-140 — read uid/gid out of the
+            // implementation-note-162 — read uid/gid out of the
             // lease BEFORE moving into the spawn_blocking closure (the
             // lease binding stays in the outer scope so it lives across
             // the .await below). The forkpty child branch calls
@@ -4072,7 +4564,7 @@ pub async fn handle_broker_exec(
         // mapping, then `execveat`s the verified binary as namespace
         // inner-root. The daemon never holds host-level CAP_SETUID.
         //
-        // The memfd-seal pre_exec stub (implementation-note-146-
+        // The memfd-seal pre_exec stub (implementation-note-169-
         // PHASE-2-LINUX-B) does NOT compose with this path in v0.3
         // — the namespace-spawn primitive doesn't expose a generic
         // pre_exec hook for sealed-env rewriting, and the same
@@ -4149,7 +4641,7 @@ pub async fn handle_broker_exec(
     } else {
         // Non-PTY path: tokio::process::Command with piped stderr.
         //
-        // implementation-note-41 Phase 1 (Linux only): when
+        // implementation-note-52 Phase 1 (Linux only): when
         // `EMBER_BROKER_SEAL_CREDS=1` is set on the daemon, replace any
         // credential env entries (populated by `mint_and_inject_for_action`
         // and tracked in `credential_env_keys`) with memfd-sealed file
@@ -4175,7 +4667,7 @@ pub async fn handle_broker_exec(
             maybe_seal_credentials_in_env(&mut env, &credential_env_keys);
         let _sealed_env = sealed_env_opt; // RAII: keep fds open across spawn
 
-        // implementation-note-140 + implementation-note-146-
+        // implementation-note-162 + implementation-note-169-
         // PHASE-2-LINUX-B: this command builder integrates two
         // post-fork pre-execve hooks:
         //
@@ -4392,7 +4884,7 @@ pub async fn handle_broker_exec(
 /// `.classification`. The daemon's `handle_broker_exec` aborts the
 /// invocation when this returns `Some`.
 ///
-/// implementation-note-142 port of the as-bot.sh refusal block
+/// implementation-note-165 port of the as-bot.sh refusal block
 /// (which was deleted alongside as-bot.sh in T-CONSTRUCT-SHIP-RS-
 /// MIGRATION). Maps the original three checks onto daemon-classified
 /// action keys:
@@ -4588,7 +5080,7 @@ fn apply_credential_to_env(
     }
 }
 
-/// implementation-note-41 Phase 1 (Linux memfd path).
+/// implementation-note-52 Phase 1 (Linux memfd path).
 ///
 /// When `EMBER_BROKER_SEAL_CREDS` is not explicitly set to `0`/`false`
 /// on the daemon's environment, replace credential env entries with
@@ -4602,7 +5094,7 @@ fn apply_credential_to_env(
 /// child spawn (its `Drop` closes the fds); `env_for_spawn` carries
 /// `<KEY>_FD=<n>` in place of the original `<KEY>=<plaintext>`.
 ///
-/// Default-on (implementation-note-147): the
+/// Default-on (implementation-note-170): the
 /// Phase 2 pre-exec stub in `handle_broker_exec` now rewrites the
 /// child's env back to plaintext immediately before execve, so
 /// existing consumers (`gh`, `aws`, `vault`, etc.) see plaintext
@@ -4623,7 +5115,7 @@ fn maybe_seal_credentials_in_env(
     Option<crate::broker::exec_env::SealedEnv>,
     std::collections::HashMap<String, String>,
 ) {
-    // implementation-note-147: default flipped to
+    // implementation-note-170: default flipped to
     // true now that Phase 2's pre-exec stub (in handle_broker_exec
     // above) rewrites the child env back to plaintext before execve.
     // Setting EMBER_BROKER_SEAL_CREDS=0 remains supported as an
@@ -4741,7 +5233,7 @@ async fn mint_and_inject_for_action_with_registry(
 
     apply_credential_to_env(cred.token.expose_secret(), &policy.injection, env);
 
-    // implementation-note-145 — emit a single operator-visible
+    // implementation-note-168 — emit a single operator-visible
     // line at info level so the demo recording (and post-hoc operators)
     // can see the broker minted a TTL'd credential bound to the caller
     // persona. The wider tracing event above carries the structured
@@ -4970,7 +5462,7 @@ unsafe fn install_parent_death_watchdog(parent_pid: libc::pid_t) -> std::io::Res
 /// or let it drain. The returned [`ShimEofOutcome`] feeds the
 /// `revoked_early` / `shim_disappeared_at` fields on the
 /// `session.construct_invocation` Receipt.
-/// implementation-note-140 — portable `errno()` read for the
+/// implementation-note-162 — portable `errno()` read for the
 /// forkpty child branch. macOS uses `__error()`; Linux exposes
 /// `__errno_location()`. The cfg-gated wrapper keeps the call site
 /// platform-agnostic. Only called from the Linux-gated privilege-drop
@@ -4997,7 +5489,7 @@ fn io_errno() -> i32 {
     }
 }
 
-// implementation-note-140 — `target_uid` / `target_gid` are
+// implementation-note-162 — `target_uid` / `target_gid` are
 // the per-spawn pool lease values. `None` means "don't drop privileges"
 // (test pools running as the test uid, or pre-pool legacy callers if
 // any). When `Some`, the child branch calls `setresgid` then `setresuid`
@@ -5081,7 +5573,7 @@ fn forkpty_exec_and_bridge(
         // chdir to requested working directory.
         unsafe { libc::chdir(cwd_c.as_ptr()) };
 
-        // implementation-note-140 — drop privileges to the
+        // implementation-note-162 — drop privileges to the
         // per-spawn pool uid before any exec'd code runs. We must
         // do this AFTER chdir (in case the target dir is only
         // readable by the daemon uid) and BEFORE
@@ -5114,7 +5606,7 @@ fn forkpty_exec_and_bridge(
             if rc != 0 {
                 let errno = io_errno();
                 let msg = format!(
-                    "implementation-note-140: setresgid({gid}) failed: errno={errno}\n"
+                    "implementation-note-162: setresgid({gid}) failed: errno={errno}\n"
                 );
                 unsafe {
                     libc::write(libc::STDERR_FILENO, msg.as_ptr() as *const _, msg.len());
@@ -5127,7 +5619,7 @@ fn forkpty_exec_and_bridge(
             if rc != 0 {
                 let errno = io_errno();
                 let msg = format!(
-                    "implementation-note-140: setresuid({uid}) failed: errno={errno}\n"
+                    "implementation-note-162: setresuid({uid}) failed: errno={errno}\n"
                 );
                 unsafe {
                     libc::write(libc::STDERR_FILENO, msg.as_ptr() as *const _, msg.len());
@@ -5741,7 +6233,7 @@ fn write_all_fd(fd: RawFd, mut buf: &[u8]) -> Result<(), PtyBridgeError> {
 
 // ---------------------------------------------------------------------------
 // PID watcher — auto-revoke grants on child shell exit
-// (implementation-note-148 §--inject)
+// (implementation-note-171 §--inject)
 // ---------------------------------------------------------------------------
 
 /// In-flight PID watcher entries. Each entry maps a watched OS PID to the
@@ -5775,7 +6267,7 @@ pub struct RegisterPidWatcherRequest {
 /// shell exits the daemon auto-revokes the grants, recorded via
 /// `broker_revocation` Receipt events.
 ///
-/// // ember broker issue --grants-file (implementation-note-148)
+/// // ember broker issue --grants-file (implementation-note-171)
 pub async fn handle_broker_register_pid_watcher(
     _store: &DaemonStore,
     params: &Value,
@@ -5904,7 +6396,7 @@ async fn poll_pid_until_exit(pid: u32, mat_ids: &[String]) {
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-149 — credential-binding admin RPCs.
+// implementation-note-172 — credential-binding admin RPCs.
 //
 // `ember bind {register, list, remove, move}` invokes these handlers via the
 // daemon's JSON-lines socket. The admin path does NOT require biometric:
@@ -5921,7 +6413,7 @@ async fn poll_pid_until_exit(pid: u32, mat_ids: &[String]) {
 //      audit rows.
 //
 // Marker for headless ranker grep: **`handle_broker_bindings_register`**
-// (lives in this module, satisfies the implementation-note-150 contract).
+// (lives in this module, satisfies the implementation-note-173 contract).
 // ---------------------------------------------------------------------------
 
 /// Pull `caller_persona` from a JSON params object, validate it is a
@@ -5968,7 +6460,16 @@ pub async fn handle_broker_bindings_register(
     store: &DaemonStore,
     params: &Value,
 ) -> Result<Value, (i32, String)> {
-    check_principal_against_persona(principal, params, "caller_persona")?;
+    // implementation-note-154 —
+    // classify shared-socket caller against the enrollment surface.
+    log_legacy_socket_resolution(
+        principal,
+        store,
+        params,
+        "caller_persona",
+        "broker.bindings.register",
+    );
+    check_principal_against_persona(principal, store, params, "caller_persona")?;
     let principal_id = extract_caller_persona(params)?;
 
     let working_tree_id = params
@@ -6050,7 +6551,16 @@ pub async fn handle_broker_bindings_list(
     store: &DaemonStore,
     params: &Value,
 ) -> Result<Value, (i32, String)> {
-    check_principal_against_persona(principal, params, "caller_persona")?;
+    // implementation-note-154 —
+    // classify shared-socket caller against the enrollment surface.
+    log_legacy_socket_resolution(
+        principal,
+        store,
+        params,
+        "caller_persona",
+        "broker.bindings.list",
+    );
+    check_principal_against_persona(principal, store, params, "caller_persona")?;
     let principal_id = extract_caller_persona(params)?;
 
     let working_tree_filter = params
@@ -6101,7 +6611,16 @@ pub async fn handle_broker_bindings_remove(
     store: &DaemonStore,
     params: &Value,
 ) -> Result<Value, (i32, String)> {
-    check_principal_against_persona(principal, params, "caller_persona")?;
+    // implementation-note-154 —
+    // classify shared-socket caller against the enrollment surface.
+    log_legacy_socket_resolution(
+        principal,
+        store,
+        params,
+        "caller_persona",
+        "broker.bindings.remove",
+    );
+    check_principal_against_persona(principal, store, params, "caller_persona")?;
     let principal_id = extract_caller_persona(params)?;
 
     let working_tree_id = params
@@ -6169,7 +6688,16 @@ pub async fn handle_broker_bindings_move(
     store: &DaemonStore,
     params: &Value,
 ) -> Result<Value, (i32, String)> {
-    check_principal_against_persona(principal, params, "caller_persona")?;
+    // implementation-note-154 —
+    // classify shared-socket caller against the enrollment surface.
+    log_legacy_socket_resolution(
+        principal,
+        store,
+        params,
+        "caller_persona",
+        "broker.bindings.move",
+    );
+    check_principal_against_persona(principal, store, params, "caller_persona")?;
     let principal_id = extract_caller_persona(params)?;
 
     let old_path = params
@@ -6243,7 +6771,7 @@ fn pid_is_alive(pid: u32) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Spawn-attenuation algebra (implementation-note-151)
+// Spawn-attenuation algebra (implementation-note-174)
 // ---------------------------------------------------------------------------
 //
 // HIGH-F invariant: `max_depth` MUST be decremented at every attenuation
@@ -6279,7 +6807,7 @@ pub struct SpawnGrant {
 ///
 /// `ChildSpawnSpec` captures the four spawn-specific fields requested by the
 /// calling agent. It is forward-compatible with `ResolveRequest` (from
-/// implementation-note-22): once that type lands, the broker
+/// implementation-note-25): once that type lands, the broker
 /// handler will parse the wire payload into a `ResolveRequest` and extract
 /// these fields from it.
 #[derive(Debug, Clone)]
@@ -6424,7 +6952,7 @@ pub fn evaluate_spawn_attenuation(
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-29
+// implementation-note-35
 // (design note D2)
 // ---------------------------------------------------------------------------
 //
@@ -6628,7 +7156,7 @@ pub fn handle_presence_verification_failure(
 
 // ---------------------------------------------------------------------------
 // Per-cohort presence fallback ladder (design)
-// implementation-note-126
+// implementation-note-142
 // ---------------------------------------------------------------------------
 
 /// Session phase classification supplied by the issuance caller. Determines
@@ -6726,7 +7254,7 @@ pub fn presence_fallback_ladder_unavailable(
 
 // ---------------------------------------------------------------------------
 // Presence-bridge first-run enrollment handler — `presence/enroll`
-// (implementation-note-152 /
+// (implementation-note-175 /
 //  design note)
 // ---------------------------------------------------------------------------
 //
@@ -6767,7 +7295,7 @@ pub fn handle_first_run_enrollment(
 
 // ---------------------------------------------------------------------------
 // Presence-bridge daemon RPC handler — `presence/request_proof`
-// (implementation-note-153 /
+// (implementation-note-176 /
 //  design note)
 // ---------------------------------------------------------------------------
 //
@@ -6790,7 +7318,7 @@ pub fn handle_first_run_enrollment(
 
 // `PresenceProofRequest` + `PresenceProofResponse` are imported from
 // `core_crypto::presence` (see `use` block above). They were lifted out of
-// this module by implementation-note-30 so client crates
+// this module by implementation-note-36 so client crates
 // (CLI, dashboard, future language bindings) can depend on the canonical
 // wire shape without taking a daemon-internal dependency. The handler
 // keeps using them unchanged below.
@@ -7007,12 +7535,12 @@ pub async fn handle_request_presence_proof(
         "presence/request_proof",
         "production wiring deferred — broker-side proof requests remain disabled \
          until TabChannel and AssertionVerifier are hoisted from the dashboard \
-         WebAuthn surface (implementation-note-153 follow-up)",
+         WebAuthn surface (implementation-note-176 follow-up)",
     ))
 }
 
 // ---------------------------------------------------------------------------
-// RPC panic-recovery middleware (implementation-note-154)
+// RPC panic-recovery middleware (implementation-note-177)
 // design §Component 9 (T2).
 // ---------------------------------------------------------------------------
 //
@@ -7023,7 +7551,7 @@ pub async fn handle_request_presence_proof(
 // connection's dispatch is its own catch_unwind boundary.
 //
 // catch_unwind dispatch_method — checkpoint for the target_state_anchor gate
-// of implementation-note-154. Although the production
+// of implementation-note-177. Although the production
 // async dispatch lives in `infra/handler.rs::dispatch_method` /
 // `dispatch_method_with_context`, this helper is the panic-recovery
 // primitive that the dispatch site composes with; the checkpoint records
@@ -7075,7 +7603,7 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// refresh_cert RPC (M3-A of design, implementation-note-155)
+// refresh_cert RPC (M3-A of design, implementation-note-178)
 //
 // Anchor: refresh_cert_dispatch_landed
 //
@@ -7159,7 +7687,7 @@ impl RefreshDenied {
 /// against an existing valid one and never escalates authority), and
 /// return a typed `RefreshDenied` stub. The identity-proof checks,
 /// atomic mint, rate-limit gate, and Receipt emission are wired by
-/// follow-up sibling tasks implementation-note-156-{B,C,D,E}.
+/// follow-up sibling tasks implementation-note-179-{B,C,D,E}.
 ///
 /// Anchor: `refresh_cert_dispatch_landed`.
 pub async fn handle_refresh_cert(
@@ -7167,7 +7695,7 @@ pub async fn handle_refresh_cert(
     store: &DaemonStore,
     _params: &Value,
 ) -> Result<Value, (i32, String)> {
-    // implementation-note-136 — wire the container-binding gate
+    // implementation-note-156 — wire the container-binding gate
     // ahead of the M3-B stub. Even with the rest of the surface
     // unimplemented, a caller whose namespace inodes have drifted from
     // their enrollment row must be refused at the broker boundary so
@@ -7203,8 +7731,10 @@ mod tests {
     use core_broker::MockBroker;
     use rusqlite;
 
+    use crate::infra::credential_store::CredentialStore;
+
     // -----------------------------------------------------------------------
-    // implementation-note-154 tests
+    // implementation-note-177 tests
     // -----------------------------------------------------------------------
 
     /// T1: panic→typed-error. A handler closure that deliberately panics
@@ -7360,7 +7890,7 @@ mod tests {
         reg
     }
 
-    /// implementation-note-140 — ensure the process-global uid
+    /// implementation-note-162 — ensure the process-global uid
     /// pool is installed for tests. Idempotent: subsequent calls are
     /// no-ops because `init_uid_pool*` uses `OnceLock::set`. Every
     /// test that calls `handle_broker_exec` MUST call this first or
@@ -7437,7 +7967,7 @@ mod tests {
 
     /// 1. Successful issue path: returns a `SecretRef` + materialization
     ///    id, AND emits a `broker.materialization` row in the audit log.
-    ///    Per implementation-note-12 the response MUST NOT
+    ///    Per implementation-note-15 the response MUST NOT
     ///    contain a raw `token` / `value` field — agent processes hold
     ///    only the opaque ref.
     #[tokio::test]
@@ -7619,7 +8149,7 @@ mod tests {
     async fn broker_issue_method_name_marker_present() {
         // The RPC method name is literally "broker_issue" — assert it
         // here so the marker grep stays load-bearing rather than a
-        // soft contract that drifts. See implementation-note-117 marker req.
+        // soft contract that drifts. See implementation-note-133 marker req.
         let probe = "broker_issue";
         assert_eq!(probe, "broker_issue");
         // Also verify provider names line up with `BrokerProvider::as_str`
@@ -8337,7 +8867,7 @@ mod tests {
     async fn resolve_accepts_authoring_script_from_registered_path() {
         // T2 acceptance for AUTHOR flow: register `~/code/my-construct/`,
         // run a script in that dir → daemon emits authoring receipt
-        // (`authoring = true`). Plaintext wiring still implementation-note-157-
+        // (`authoring = true`). Plaintext wiring still implementation-note-180-
         // IMPL so the call returns -32001, but the gate's authoring
         // accept Receipt fires first and is recorded.
         let _guard = AUTHORING_ENV_LOCK.lock().expect("env lock");
@@ -8479,7 +9009,7 @@ mod tests {
         );
     }
 
-    /// implementation-note-99 acceptance: the broker_exec child runs
+    /// implementation-note-113 acceptance: the broker_exec child runs
     /// with a per-spawn ephemeral HOME (a tempdir owned by the daemon uid),
     /// NEVER the operator's HOME inherited from the daemon's launchd env.
     /// This is the structural invariant that lets the broker's injected
@@ -8606,7 +9136,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // implementation-note-119 — action-level policy
+    // implementation-note-135 — action-level policy
     // gating via construct.toml manifest bytes.
     // ---------------------------------------------------------------------
 
@@ -8728,8 +9258,8 @@ classify_argv = "pr merge *"
     }
 
     // ---------------------------------------------------------------------
-    // ALLOWLIST_GATE_HTTPS — implementation-note-144
-    // implementation-note-143 closure tests.
+    // ALLOWLIST_GATE_HTTPS — implementation-note-167
+    // implementation-note-166 closure tests.
     // ---------------------------------------------------------------------
 
     /// Materialize a "git" binary inside `dir` that resolves to `/bin/true`.
@@ -9030,7 +9560,7 @@ classify_argv = "pr merge *"
             // and signal the still-running process. Original integration
             // intent here is "spawn → bridge → reap exit code".
             ShimEofPolicy::Drain,
-            // implementation-note-140 — no privilege drop in
+            // implementation-note-162 — no privilege drop in
             // this T1 unit test (running as the test process uid).
             None,
             None,
@@ -9108,7 +9638,7 @@ classify_argv = "pr merge *"
             "/tmp",
             &socket_path,
             ShimEofPolicy::Sigterm,
-            // implementation-note-140 — no privilege drop in
+            // implementation-note-162 — no privilege drop in
             // T1 unit tests (running as the test process uid).
             None,
             None,
@@ -9183,7 +9713,7 @@ classify_argv = "pr merge *"
             "/tmp",
             &socket_path,
             ShimEofPolicy::Drain,
-            // implementation-note-140 — no privilege drop in
+            // implementation-note-162 — no privilege drop in
             // T1 unit tests (running as the test process uid).
             None,
             None,
@@ -9356,7 +9886,7 @@ classify_argv = "pr merge *"
             // path. We expect the child to die from forwarded SIGINT before
             // the shim-EOF check matters.
             ShimEofPolicy::Drain,
-            // implementation-note-140 — no privilege drop in
+            // implementation-note-162 — no privilege drop in
             // T1 unit tests (running as the test process uid).
             None,
             None,
@@ -9554,7 +10084,7 @@ classify_argv = "pr merge *"
         let _ = mat_id; // re-revoke handled silently in production wrapper
     }
 
-    // implementation-note-145 — regression test that the
+    // implementation-note-168 — regression test that the
     // operator-visible "[broker] resolved <provider>-token to <persona> — TTL <m>m"
     // line is emitted on a successful credential mint. The demo recording's
     // overlay narrates this line; if it disappears, the storyboard breaks.
@@ -9606,7 +10136,7 @@ classify_argv = "pr merge *"
         );
     }
 
-    // ─── implementation-note-142 ──────────────────────────────────────
+    // ─── implementation-note-165 ──────────────────────────────────────
 
     /// Helper: init a tempdir as a git repo with one seed commit on `main`,
     /// `origin/main` ref pointing at the same SHA. Returns the path.
@@ -9755,15 +10285,39 @@ classify_argv = "pr merge *"
     }
 
     // -----------------------------------------------------------------------
-    // implementation-note-133 — kernel-attested principal
+    // implementation-note-149 — kernel-attested principal
     // binding gate. The broker handlers check the request payload's
     // `caller_persona` against the kernel-attested `PeerCredPrincipal.uid`
     // via the persona→uid binding registry; mismatch returns -32004.
     // -----------------------------------------------------------------------
 
-    use crate::infra::handler::{bind_persona_uid, clear_persona_uid_registry, lookup_persona_uid};
     use crate::infra::runtime::PeerCredPrincipal;
     use std::path::PathBuf;
+
+    /// Test helper: seed the agent_socket_enrollments table with a (persona, uid) binding.
+    /// Replaces the legacy `bind_persona_uid` thread-local writer (retired in
+    /// implementation-note-151).
+    fn seed_persona_uid_via_enrollments(store: &DaemonStore, persona_id: &str, uid: u32) {
+        let socket_path = format!("/run/emberd/test-agent-{persona_id}.sock");
+        store
+            .record_agent_socket_enrollment(
+                &socket_path,
+                persona_id,
+                "test-grant",
+                "test-hash",
+                None,
+                None,
+                None,
+            )
+            .expect("seed enrollment for test");
+        store
+            .conn()
+            .execute(
+                "UPDATE agent_socket_enrollments SET peer_uid = ?1 WHERE socket_path = ?2",
+                rusqlite::params![uid as i64, &socket_path],
+            )
+            .expect("seed peer_uid for test");
+    }
 
     fn test_principal(uid: u32, pid: i32) -> PeerCredPrincipal {
         PeerCredPrincipal::new(uid, pid, PathBuf::from("/tmp/test-agent.sock"))
@@ -9777,7 +10331,6 @@ classify_argv = "pr merge *"
     #[tokio::test]
     async fn handle_broker_issue_rejects_mismatched_principal() {
         let _identity = ensure_identity_for_broker_test();
-        clear_persona_uid_registry();
         let reg = fresh_registry();
         install_registry_for_test(reg);
         let store = DaemonStore::open_in_memory().unwrap();
@@ -9788,8 +10341,11 @@ classify_argv = "pr merge *"
             .unwrap();
 
         // The persona is bound to uid 1002, but the principal carries uid 1001.
-        bind_persona_uid(&persona.id, 1002);
-        assert_eq!(lookup_persona_uid(&persona.id), Some(1002));
+        seed_persona_uid_via_enrollments(&store, &persona.id, 1002);
+        assert_eq!(
+            crate::infra::store::lookup_persona_uid_from_enrollments(&store, &persona.id).unwrap(),
+            Some(1002)
+        );
         let principal = test_principal(1001, 9999);
 
         let mut params = cf_request(300, "principal-mismatch-test");
@@ -9821,13 +10377,14 @@ classify_argv = "pr merge *"
     /// `Auto` policy in.
     #[tokio::test]
     async fn handle_broker_issue_accepts_matched_principal() {
-        clear_persona_uid_registry();
         let persona_id = "matched-uid-persona";
-        bind_persona_uid(persona_id, 2002);
+        let gate_store = DaemonStore::open_in_memory().unwrap();
+        seed_persona_uid_via_enrollments(&gate_store, persona_id, 2002);
         let principal = test_principal(2002, 12345);
 
         let params = serde_json::json!({"caller_persona": persona_id});
-        let gate = check_principal_against_persona(Some(&principal), &params, "caller_persona");
+        let gate =
+            check_principal_against_persona(Some(&principal), &gate_store, &params, "caller_persona");
         assert!(
             gate.is_ok(),
             "matched-uid principal must pass the gate: {gate:?}"
@@ -9842,11 +10399,12 @@ classify_argv = "pr merge *"
         store
             .create_grant(&persona.id, "cloudflare", "dns:edit", None)
             .unwrap();
-        bind_persona_uid(&persona.id, 2002);
+        seed_persona_uid_via_enrollments(&store, &persona.id, 2002);
 
         let mut params = cf_request(300, "principal-match-test");
         params["caller_persona"] = serde_json::json!(persona.id);
-        let gate2 = check_principal_against_persona(Some(&principal), &params, "caller_persona");
+        let gate2 =
+            check_principal_against_persona(Some(&principal), &store, &params, "caller_persona");
         assert!(gate2.is_ok(), "matched gate must pass: {gate2:?}");
         let res = issue_with_registry(&reg, &store, &params, &auto_policy()).await;
         assert!(res.is_ok(), "matched principal must proceed: {res:?}");
@@ -9858,11 +10416,10 @@ classify_argv = "pr merge *"
     #[tokio::test]
     async fn handle_broker_revoke_rejects_mismatched_principal() {
         let _identity = ensure_identity_for_broker_test();
-        clear_persona_uid_registry();
         let store = DaemonStore::open_in_memory().unwrap();
 
         let persona = store.create_persona("revoke-mismatch-persona").unwrap();
-        bind_persona_uid(&persona.id, 3003);
+        seed_persona_uid_via_enrollments(&store, &persona.id, 3003);
 
         // No registry installation needed — the principal gate fires
         // before `current_registry()` is consulted.
@@ -9880,32 +10437,149 @@ classify_argv = "pr merge *"
     #[tokio::test]
     async fn handle_broker_list_rejects_mismatched_principal() {
         let _identity = ensure_identity_for_broker_test();
-        clear_persona_uid_registry();
 
         // Persona row not required — the gate operates on the
         // payload's `caller_persona` field + the binding registry.
-        bind_persona_uid("phony-persona-id", 5005);
+        let store = DaemonStore::open_in_memory().unwrap();
+        seed_persona_uid_via_enrollments(&store, "phony-persona-id", 5005);
         let principal = test_principal(6006, 1);
         let params = serde_json::json!({"caller_persona": "phony-persona-id"});
-        let store = DaemonStore::open_in_memory().unwrap();
         let res = handle_broker_list(Some(&principal), &store, &params).await;
         let (code, _) = res.expect_err("list must refuse mismatched principal");
         assert_eq!(code, -32004);
     }
 
+    /// implementation-note-152 acceptance test.
+    /// broker_resolve must refuse an unenrolled persona with -32401
+    /// (PrincipalNotEnrolled / fail_closed_broker_resolve checkpoint).
+    #[tokio::test]
+    async fn handle_broker_resolve_refuses_unenrolled_persona() {
+        let _identity = ensure_identity_for_broker_test();
+        let reg = fresh_registry();
+        install_registry_for_test(reg);
+        let store = DaemonStore::open_in_memory().unwrap();
+
+        let principal = test_principal(4242, 1);
+        let params = serde_json::json!({
+            "persona_id": "unenrolled-persona-fail-closed",
+            "secret_ref": "irrelevant-for-this-gate",
+        });
+        let res = handle_broker_resolve(Some(&principal), &store, None, &params).await;
+        let (code, msg) = res.expect_err("broker_resolve must refuse unenrolled persona");
+        assert_eq!(code, -32401, "expected -32401 PrincipalNotEnrolled, got {code}: {msg}");
+        assert!(
+            msg.contains("unenrolled persona") || msg.contains("PrincipalNotEnrolled"),
+            "error must mention unenrolled persona, got: {msg}"
+        );
+    }
+
+    /// implementation-note-164 acceptance test.
+    /// broker_exec must refuse an unenrolled caller_persona with -32401
+    /// (PrincipalNotEnrolled / fail_closed_broker_exec checkpoint).
+    #[tokio::test]
+    async fn handle_broker_exec_refuses_unenrolled_persona() {
+        let _identity = ensure_identity_for_broker_test();
+        let reg = fresh_registry();
+        install_registry_for_test(reg);
+        let store = DaemonStore::open_in_memory().unwrap();
+
+        let principal = test_principal(5151, 1);
+        let params = serde_json::json!({
+            "caller_persona": "unenrolled-exec-persona",
+            "action_key": "irrelevant-for-this-gate",
+            "binary": "/bin/true",
+        });
+        let res = handle_broker_exec(Some(&principal), &store, &params).await;
+        let (code, msg) = res.expect_err("broker_exec must refuse unenrolled persona");
+        assert_eq!(code, -32401, "expected -32401 PrincipalNotEnrolled, got {code}: {msg}");
+        assert!(
+            msg.contains("unenrolled persona") || msg.contains("PrincipalNotEnrolled"),
+            "error must mention unenrolled persona, got: {msg}"
+        );
+    }
+
+    /// implementation-note-157 acceptance test.
+    /// broker_issue must refuse an unenrolled caller_persona with -32401
+    /// (PrincipalNotEnrolled / fail_closed_broker_issue checkpoint).
+    #[tokio::test]
+    async fn handle_broker_issue_refuses_unenrolled_persona() {
+        let _identity = ensure_identity_for_broker_test();
+        let reg = fresh_registry();
+        install_registry_for_test(reg);
+        let store = DaemonStore::open_in_memory().unwrap();
+
+        let principal = test_principal(6262, 1);
+        let params = cf_request(300, "fail-closed-issue-probe");
+        let params = {
+            let mut p = params;
+            p["caller_persona"] = serde_json::json!("unenrolled-issue-persona");
+            p
+        };
+        let res = handle_broker_issue(Some(&principal), &store, &params).await;
+        let (code, msg) = res.expect_err("broker_issue must refuse unenrolled persona");
+        assert_eq!(code, -32401, "expected -32401 PrincipalNotEnrolled, got {code}: {msg}");
+        assert!(
+            msg.contains("unenrolled persona") || msg.contains("PrincipalNotEnrolled"),
+            "error must mention unenrolled persona, got: {msg}"
+        );
+    }
+
+    /// implementation-note-158 acceptance test (revoke half).
+    /// broker_revoke must refuse an unenrolled caller_persona with -32401
+    /// (PrincipalNotEnrolled / fail_closed_broker_revoke_list checkpoint).
+    #[tokio::test]
+    async fn handle_broker_revoke_refuses_unenrolled_persona() {
+        let _identity = ensure_identity_for_broker_test();
+        let store = DaemonStore::open_in_memory().unwrap();
+
+        let principal = test_principal(7373, 1);
+        let params = serde_json::json!({
+            "materialization_id": "irrelevant-mid",
+            "caller_persona": "unenrolled-revoke-persona",
+        });
+        let res = handle_broker_revoke(Some(&principal), &store, &params).await;
+        let (code, msg) = res.expect_err("broker_revoke must refuse unenrolled persona");
+        assert_eq!(code, -32401, "expected -32401 PrincipalNotEnrolled, got {code}: {msg}");
+        assert!(
+            msg.contains("unenrolled persona") || msg.contains("PrincipalNotEnrolled"),
+            "error must mention unenrolled persona, got: {msg}"
+        );
+    }
+
+    /// implementation-note-158 acceptance test (list half).
+    /// broker_list must refuse an unenrolled caller_persona with -32401
+    /// (PrincipalNotEnrolled / fail_closed_broker_revoke_list checkpoint).
+    #[tokio::test]
+    async fn handle_broker_list_refuses_unenrolled_persona() {
+        let _identity = ensure_identity_for_broker_test();
+        let store = DaemonStore::open_in_memory().unwrap();
+
+        let principal = test_principal(8484, 1);
+        let params = serde_json::json!({
+            "caller_persona": "unenrolled-list-persona",
+        });
+        let res = handle_broker_list(Some(&principal), &store, &params).await;
+        let (code, msg) = res.expect_err("broker_list must refuse unenrolled persona");
+        assert_eq!(code, -32401, "expected -32401 PrincipalNotEnrolled, got {code}: {msg}");
+        assert!(
+            msg.contains("unenrolled persona") || msg.contains("PrincipalNotEnrolled"),
+            "error must mention unenrolled persona, got: {msg}"
+        );
+    }
+
     /// Legacy path: when the payload omits `caller_persona`, the gate
     /// is a no-op (daemon-internal smoke callers). Sibling brief
-    /// implementation-note-134 makes `caller_persona` mandatory on
+    /// implementation-note-150 makes `caller_persona` mandatory on
     /// the agent-process socket; this gate is the structural seam.
     #[tokio::test]
     async fn handle_broker_issue_skips_gate_when_caller_persona_absent() {
-        clear_persona_uid_registry();
-
         // Even though the principal exists, the gate is bypassed when
         // the payload does not carry caller_persona.
         let principal = test_principal(7007, 1);
+        let store = DaemonStore::open_in_memory().unwrap();
         let params = serde_json::json!({"provider": "cloudflare"});
-        let gate = check_principal_against_persona(Some(&principal), &params, "caller_persona");
+        let gate =
+            check_principal_against_persona(Some(&principal), &store, &params, "caller_persona");
         assert!(
             gate.is_ok(),
             "no-caller_persona path must skip the gate: {gate:?}"
@@ -9918,12 +10592,12 @@ classify_argv = "pr merge *"
     /// bypass peercred binding by design.
     #[tokio::test]
     async fn handle_broker_issue_skips_gate_when_principal_absent() {
-        clear_persona_uid_registry();
-        bind_persona_uid("internal-persona", 8008);
+        let store = DaemonStore::open_in_memory().unwrap();
+        seed_persona_uid_via_enrollments(&store, "internal-persona", 8008);
 
         // Principal absent — even with a binding, the gate cannot fire.
         let params = serde_json::json!({"caller_persona": "internal-persona"});
-        let gate = check_principal_against_persona(None, &params, "caller_persona");
+        let gate = check_principal_against_persona(None, &store, &params, "caller_persona");
         assert!(
             gate.is_ok(),
             "no-principal path must skip the gate: {gate:?}"
@@ -9978,7 +10652,7 @@ classify_argv = "pr merge *"
     }
 
     // -----------------------------------------------------------------------
-    // implementation-note-135 — pidfd-backed reuse-immune liveness gate.
+    // implementation-note-155 — pidfd-backed reuse-immune liveness gate.
     // `handle_broker_issue` (and the other broker RPCs) refuse a request
     // whose pidfd reports the bound peer process has been reaped.
     // -----------------------------------------------------------------------
@@ -10017,7 +10691,6 @@ classify_argv = "pr merge *"
         use crate::infra::runtime::PeerCredPrincipal;
 
         let _identity = ensure_identity_for_broker_test();
-        clear_persona_uid_registry();
         let reg = fresh_registry();
         install_registry_for_test(reg);
         let store = DaemonStore::open_in_memory().unwrap();
@@ -10031,7 +10704,7 @@ classify_argv = "pr merge *"
         // gate would pass — the only thing failing the request must
         // be the pidfd liveness check.
         let euid = unsafe { libc::geteuid() };
-        bind_persona_uid(&persona.id, euid);
+        seed_persona_uid_via_enrollments(&store, &persona.id, euid);
 
         // Build a principal whose pidfd refers to an already-reaped
         // child. If pidfd_open is unavailable on this kernel, we
@@ -10144,7 +10817,7 @@ classify_argv = "pr merge *"
     }
 
     // -----------------------------------------------------------------------
-    // implementation-note-136 — container-binding gate. Refuses any
+    // implementation-note-156 — container-binding gate. Refuses any
     // peer whose kernel-observable namespace inodes drifted from the
     // (cgroup_v2_id, userns_inode, mnt_ns_inode) tuple recorded on the
     // `agent_socket_enrollments` row at spawn-completion. Tests drive
@@ -10247,7 +10920,314 @@ classify_argv = "pr merge *"
     }
 
     // -----------------------------------------------------------------------
-    // implementation-note-106 — peer binary pinning
+    // implementation-note-115 — T1 + T2 coverage for the
+    // namespace-inode comparator and the JSON-RPC error path. T1 is a
+    // proptest-driven property test over the pure `compare_ns_inodes`
+    // function; T2 is a fixture test that drives
+    // `check_principal_namespace_inodes` against an in-memory
+    // `agent_socket_enrollments` row and asserts the typed -32401
+    // refusal. T3 lives in `tests/container_persona_enrollment.rs`
+    // (real-socket integration test) and asserts the
+    // `namespace_inode_mismatch_refused` Receipt lands on the
+    // audit_log. Anchor: `namespace_inode_mismatch_refused`.
+    // -----------------------------------------------------------------------
+
+    /// T1 (property test) — for any captured inodes `(c, u, m)` and any
+    /// live inodes `(c', u', m')`, `compare_ns_inodes` returns `Match`
+    /// iff every populated recorded column equals the corresponding
+    /// live column; otherwise `Mismatch` with one diagnostic per
+    /// drifted column, in canonical order.
+    ///
+    /// The proptest generates the full Cartesian space:
+    ///   - three independent `Option<i64>` recorded columns (so the
+    ///     legacy-NULL, partially-NULL, and all-populated rows are
+    ///     all exercised).
+    ///   - three independent `i64` live columns.
+    /// Anchor: `namespace_inode_mismatch_refused` (matches the
+    /// payload kind the comparator's refusal path emits via
+    /// `store.log_event`).
+    #[test]
+    fn compare_ns_inodes_property_namespace_inode_mismatch_refused() {
+        use crate::spawn::scion::NamespaceInodes;
+        use proptest::prelude::*;
+
+        let mut runner = proptest::test_runner::TestRunner::default();
+        runner
+            .run(
+                &(
+                    proptest::option::of(any::<i64>()),
+                    proptest::option::of(any::<i64>()),
+                    proptest::option::of(any::<i64>()),
+                    any::<i64>(),
+                    any::<i64>(),
+                    any::<i64>(),
+                ),
+                |(rec_c, rec_u, rec_m, live_c, live_u, live_m)| {
+                    let live = NamespaceInodes {
+                        cgroup_v2_id: live_c,
+                        userns_inode: live_u,
+                        mnt_ns_inode: live_m,
+                    };
+                    let result = compare_ns_inodes((rec_c, rec_u, rec_m), live);
+
+                    // Independently compute the oracle: which populated
+                    // recorded columns differ from the live tuple?
+                    let cgroup_drifted = rec_c.map(|w| w != live_c).unwrap_or(false);
+                    let userns_drifted = rec_u.map(|w| w != live_u).unwrap_or(false);
+                    let mntns_drifted = rec_m.map(|w| w != live_m).unwrap_or(false);
+                    let any_drifted = cgroup_drifted || userns_drifted || mntns_drifted;
+
+                    match (any_drifted, &result) {
+                        (false, NsCompareResult::Match) => Ok(()),
+                        (true, NsCompareResult::Mismatch { fields }) => {
+                            // Canonical-order check: cgroup_v2_id is
+                            // always emitted before userns_inode, which
+                            // is emitted before mnt_ns_inode.
+                            let cgroup_idx = fields
+                                .iter()
+                                .position(|f| f.starts_with("cgroup_v2_id"));
+                            let userns_idx = fields
+                                .iter()
+                                .position(|f| f.starts_with("userns_inode"));
+                            let mntns_idx = fields
+                                .iter()
+                                .position(|f| f.starts_with("mnt_ns_inode"));
+                            prop_assert_eq!(
+                                cgroup_idx.is_some(),
+                                cgroup_drifted,
+                                "cgroup_v2_id presence must match drift: fields={:?}",
+                                fields
+                            );
+                            prop_assert_eq!(
+                                userns_idx.is_some(),
+                                userns_drifted,
+                                "userns_inode presence must match drift: fields={:?}",
+                                fields
+                            );
+                            prop_assert_eq!(
+                                mntns_idx.is_some(),
+                                mntns_drifted,
+                                "mnt_ns_inode presence must match drift: fields={:?}",
+                                fields
+                            );
+                            if let (Some(a), Some(b)) = (cgroup_idx, userns_idx) {
+                                prop_assert!(
+                                    a < b,
+                                    "cgroup_v2_id must precede userns_inode in fields: {:?}",
+                                    fields
+                                );
+                            }
+                            if let (Some(a), Some(b)) = (userns_idx, mntns_idx) {
+                                prop_assert!(
+                                    a < b,
+                                    "userns_inode must precede mnt_ns_inode in fields: {:?}",
+                                    fields
+                                );
+                            }
+                            Ok(())
+                        }
+                        (false, NsCompareResult::Mismatch { fields }) => Err(
+                            proptest::test_runner::TestCaseError::fail(format!(
+                                "no drift but Mismatch returned: fields={fields:?}"
+                            )),
+                        ),
+                        (true, NsCompareResult::Match) => Err(
+                            proptest::test_runner::TestCaseError::fail(format!(
+                                "drift in (c={cgroup_drifted}, u={userns_drifted}, m={mntns_drifted}) but Match returned"
+                            )),
+                        ),
+                    }
+                },
+            )
+            .expect("property holds for all generated tuples");
+    }
+
+    /// T1 corner case — explicit permutation table covering every
+    /// "exactly one column drifted" case, "exactly two drifted", "all
+    /// three drifted". Pinned cases so a CI-stable regression catches
+    /// any future refactor that scrambles the column order or drops
+    /// a column. Anchor: `namespace_inode_mismatch_refused`.
+    #[test]
+    fn compare_ns_inodes_permutations_namespace_inode_mismatch_refused_cases() {
+        use crate::spawn::scion::NamespaceInodes;
+
+        // Live capture used as the "current" tuple.
+        let live = NamespaceInodes {
+            cgroup_v2_id: 100,
+            userns_inode: 200,
+            mnt_ns_inode: 300,
+        };
+
+        // (recorded triple, expected mismatched columns, label)
+        let cases: &[(
+            (Option<i64>, Option<i64>, Option<i64>),
+            &[&str],
+            &str,
+        )] = &[
+            // All match — populated and equal.
+            ((Some(100), Some(200), Some(300)), &[], "all-match"),
+            // Exactly cgroup_v2_id drifted.
+            (
+                (Some(999), Some(200), Some(300)),
+                &["cgroup_v2_id"],
+                "cgroup-only-drifted",
+            ),
+            // Exactly userns_inode drifted.
+            (
+                (Some(100), Some(999), Some(300)),
+                &["userns_inode"],
+                "userns-only-drifted",
+            ),
+            // Exactly mnt_ns_inode drifted.
+            (
+                (Some(100), Some(200), Some(999)),
+                &["mnt_ns_inode"],
+                "mntns-only-drifted",
+            ),
+            // cgroup + userns drifted.
+            (
+                (Some(999), Some(998), Some(300)),
+                &["cgroup_v2_id", "userns_inode"],
+                "cgroup-userns-drifted",
+            ),
+            // cgroup + mnt drifted.
+            (
+                (Some(999), Some(200), Some(998)),
+                &["cgroup_v2_id", "mnt_ns_inode"],
+                "cgroup-mntns-drifted",
+            ),
+            // userns + mnt drifted.
+            (
+                (Some(100), Some(999), Some(998)),
+                &["userns_inode", "mnt_ns_inode"],
+                "userns-mntns-drifted",
+            ),
+            // All three drifted.
+            (
+                (Some(999), Some(998), Some(997)),
+                &["cgroup_v2_id", "userns_inode", "mnt_ns_inode"],
+                "all-three-drifted",
+            ),
+            // Legacy-NULL row — comparator must return Match.
+            ((None, None, None), &[], "legacy-null-binding"),
+            // Partial-NULL row — recorded cgroup drifted, others NULL.
+            (
+                (Some(999), None, None),
+                &["cgroup_v2_id"],
+                "partial-null-cgroup-drifted",
+            ),
+            // Partial-NULL row — recorded userns matches, others NULL.
+            ((None, Some(200), None), &[], "partial-null-userns-matches"),
+        ];
+
+        for (recorded, expected_cols, label) in cases {
+            let result = compare_ns_inodes(*recorded, live);
+            if expected_cols.is_empty() {
+                assert!(
+                    matches!(result, NsCompareResult::Match),
+                    "{label}: expected Match, got {result:?}"
+                );
+            } else {
+                let fields = match &result {
+                    NsCompareResult::Mismatch { fields } => fields.clone(),
+                    NsCompareResult::Match => {
+                        panic!("{label}: expected Mismatch, got Match")
+                    }
+                };
+                assert_eq!(
+                    fields.len(),
+                    expected_cols.len(),
+                    "{label}: expected {} mismatched columns, got {}: {fields:?}",
+                    expected_cols.len(),
+                    fields.len()
+                );
+                for (col, field) in expected_cols.iter().zip(fields.iter()) {
+                    assert!(
+                        field.starts_with(col),
+                        "{label}: expected field {col} at position, got: {field}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// T2 fixture — in-memory `agent_socket_enrollments` row with
+    /// captured inodes that cannot match the live capture from the
+    /// current test process pid. The gate's full path runs (store
+    /// lookup → live capture → comparator → log_event refusal Receipt
+    /// → typed `-32401` return). Asserts:
+    ///
+    ///   1. the return value carries `ERR_PRINCIPAL_NAMESPACE_MISMATCH`
+    ///      (`-32401`),
+    ///   2. the audit_log row with action `broker.resolve.refused`
+    ///      carries the `namespace_inode_mismatch_refused` payload
+    ///      kind.
+    ///
+    /// Anchor: `namespace_inode_mismatch_refused`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn check_principal_namespace_inodes_emits_namespace_inode_mismatch_refused_receipt() {
+        use crate::infra::audit::AuditFilter;
+
+        let store = DaemonStore::open_in_memory().expect("open in-memory store");
+        let socket_path = "/tmp/test-agent-mismatch-receipt.sock";
+        store
+            .record_agent_socket_enrollment(
+                socket_path,
+                "00000000-0000-0000-0000-000000000001",
+                "00000000-0000-0000-0000-0000000000aa",
+                "blake3:0",
+                Some(0x0dead_aaaa),
+                Some(0x0dead_bbbb),
+                Some(0x0dead_cccc),
+            )
+            .expect("record enrollment");
+
+        let principal =
+            PeerCredPrincipal::new(1000, std::process::id() as i32, PathBuf::from(socket_path));
+        let gate = check_principal_namespace_inodes(Some(&principal), &store);
+        let (code, msg) = gate.expect_err("drifted-tuple must refuse with -32401");
+        assert_eq!(
+            code, ERR_PRINCIPAL_NAMESPACE_MISMATCH,
+            "expected -32401, got {code}: {msg}"
+        );
+
+        // Verify the refusal Receipt landed on the audit_log.
+        let entries = store
+            .query_audit(&AuditFilter {
+                action: Some("broker.resolve.refused".to_string()),
+                ..Default::default()
+            })
+            .expect("query_audit must succeed");
+        let mismatch_rows: Vec<_> = entries
+            .iter()
+            .filter(|e| {
+                e.details
+                    .as_deref()
+                    .map(|d| d.contains("namespace_inode_mismatch_refused"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(
+            mismatch_rows.len(),
+            1,
+            "exactly one namespace_inode_mismatch_refused refusal Receipt expected, got: {entries:?}"
+        );
+        let row = mismatch_rows[0];
+        assert_eq!(row.outcome, "denied", "Receipt outcome must be denied");
+        let details = row.details.as_deref().expect("Receipt must carry details");
+        assert!(
+            details.contains("namespace_inode_mismatch_refused"),
+            "Receipt payload must name the checkpoint kind, got: {details}"
+        );
+        assert!(
+            details.contains(socket_path),
+            "Receipt payload must name the socket path, got: {details}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // implementation-note-122 — peer binary pinning
     // gate. The broker handlers consult the signed manifest at connect time
     // and refuse a request whose peer's on-disk binary is not in the
     // manifest. Tests drive `check_peer_binary_pinned_with` directly to
@@ -10340,7 +11320,7 @@ classify_argv = "pr merge *"
     }
 
     // -----------------------------------------------------------------------
-    // implementation-note-51 — pin the grant schema_version at the
+    // implementation-note-62 — pin the grant schema_version at the
     // broker boundary. A grant minted under a different schema interpretation
     // is refused with -32010 BEFORE any provider IO or policy evaluation.
     // -----------------------------------------------------------------------
@@ -10455,7 +11435,7 @@ classify_argv = "pr merge *"
     }
 
     // -----------------------------------------------------------------------
-    // implementation-note-151 — spawn-attenuation algebra, HIGH-F
+    // implementation-note-174 — spawn-attenuation algebra, HIGH-F
     // checkpoint test.
     //
     // T1: pure function, no I/O. Parent max_depth=2; child requesting
@@ -10490,7 +11470,7 @@ classify_argv = "pr merge *"
     }
 
     // -----------------------------------------------------------------------
-    // implementation-note-149 — admin RPCs for managing
+    // implementation-note-172 — admin RPCs for managing
     // credential bindings. The admin path does NOT require biometric;
     // callers authenticate to the daemon via PeerCred.
     // -----------------------------------------------------------------------
@@ -10678,7 +11658,7 @@ classify_argv = "pr merge *"
         assert_eq!(code, -32602);
     }
 
-    /// implementation-note-29:
+    /// implementation-note-35:
     /// the daemon-side issuance helper `issue_daemon_signed_handle`
     /// produces a handle whose signature verifies under the daemon's
     /// public key AND whose challenge_hash matches a recomputation of
@@ -10724,7 +11704,7 @@ classify_argv = "pr merge *"
 
     // -----------------------------------------------------------------------
     // T3: presence_verification_failure — revoke all + freeze + issuance gate
-    // (implementation-note-158)
+    // (implementation-note-181)
     // -----------------------------------------------------------------------
 
     /// Calling `handle_presence_verification_failure` for a persona must
@@ -10817,7 +11797,7 @@ classify_argv = "pr merge *"
 
     // -----------------------------------------------------------------------
     // T4: presence/request_proof — daemon-side cold-path handler
-    // (implementation-note-153)
+    // (implementation-note-176)
     // -----------------------------------------------------------------------
     //
     // These tests exercise `issue_presence_proof` (the testable seam)
@@ -10910,7 +11890,7 @@ classify_argv = "pr merge *"
         SigningKey::from_bytes(&seed)
     }
 
-    /// implementation-note-153 target_state_anchor anchor:
+    /// implementation-note-176 target_state_anchor anchor:
     /// `handle_request_presence_proof` MUST exist with the canonical
     /// dispatcher signature `(principal, store, params) -> Result<Value,
     /// (i32, String)>` so the JSON-RPC dispatch wiring is auditable.
@@ -11237,7 +12217,7 @@ classify_argv = "pr merge *"
 
     // -----------------------------------------------------------------------
     // T5: presence/enroll — first-run WebAuthn enrollment handler
-    // (implementation-note-152)
+    // (implementation-note-175)
     // -----------------------------------------------------------------------
 
     /// v0.3 posture: `presence/enroll` is recognized but disabled. Even a
@@ -11368,7 +12348,7 @@ classify_argv = "pr merge *"
     }
 
     // -----------------------------------------------------------------------
-    // implementation-note-126 (design)
+    // implementation-note-142 (design)
     // -----------------------------------------------------------------------
 
     /// dev0 + Open: PAM passphrase fallback is admissible alongside the
@@ -11476,7 +12456,7 @@ classify_argv = "pr merge *"
     }
 
     // ------------------------------------------------------------------
-    // implementation-note-138 — broker.mint_sub_persona input
+    // implementation-note-160 — broker.mint_sub_persona input
     // validation tests. These exercise the -32602 gate that runs BEFORE
     // the unimplemented! stub fires, so they must pass.
     // ------------------------------------------------------------------
@@ -11522,7 +12502,7 @@ classify_argv = "pr merge *"
     }
 
     // -----------------------------------------------------------------------
-    // implementation-note-120 — spawn handle expiry gate
+    // implementation-note-136 — spawn handle expiry gate
     // -----------------------------------------------------------------------
 
     /// `spawn_handle_within_ttl_succeeds`: a handle minted now and immediately
@@ -11595,7 +12575,7 @@ classify_argv = "pr merge *"
     }
 
     // -----------------------------------------------------------------------
-    // implementation-note-121 — single-use enforcement
+    // implementation-note-137 — single-use enforcement
     // -----------------------------------------------------------------------
 
     /// `spawn_handle_first_use_succeeds_second_refused`: mint a handle, consume
@@ -11629,7 +12609,7 @@ classify_argv = "pr merge *"
             "second consume must return None — handle was removed from pending map"
         );
 
-        // spawn_handle_single_use (implementation-note-121) — verify
+        // spawn_handle_single_use (implementation-note-137) — verify
         // that was_recently_consumed identifies this as a replay attempt.
         assert!(
             registry.was_recently_consumed(&mat_id),
@@ -11679,7 +12659,7 @@ classify_argv = "pr merge *"
             "handle must not be in pending_spawn_handles after consumption"
         );
 
-        // spawn_handle_single_use (implementation-note-121) — confirm
+        // spawn_handle_single_use (implementation-note-137) — confirm
         // consumed_recent still records the handle for replay detection.
         assert!(
             registry.was_recently_consumed(&mat_id),
@@ -12172,7 +13152,7 @@ classify_argv = "pr merge *"
         }
     }
 
-    // ----- implementation-note-155 tests -----
+    // ----- implementation-note-178 tests -----
 
     /// T1: the M3-A stub dispatch returns a well-formed RefreshDenied
     /// shape with `failure_cause: NotImplemented`. M3-B/C/D/E will
@@ -12250,5 +13230,338 @@ classify_argv = "pr merge *"
             let v = serde_json::to_value(&cause).expect("serialize");
             assert_eq!(v, json!(expected), "variant {cause:?} expected {expected}");
         }
+    }
+
+    #[test]
+    fn registry_status_with_registry_includes_provider_posture() {
+        let mut registry = BrokerRegistry::new();
+        registry.register(Box::new(core_broker::MockBroker::new(
+            BrokerProvider::AwsSts,
+        )));
+        registry.register_mock(Box::new(core_broker::MockBroker::new(
+            BrokerProvider::Github,
+        )));
+
+        let value = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(registry_status_with_registry(&registry))
+            .expect("registry status must serialize");
+
+        assert_eq!(value["provider_count"], json!(2));
+        let providers = value["providers"]
+            .as_array()
+            .expect("providers array must be present");
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers[0]["provider"], json!("aws_sts"));
+        assert_eq!(providers[0]["mock"], json!(false));
+        assert_eq!(providers[1]["provider"], json!("github"));
+        assert_eq!(providers[1]["mock"], json!(true));
+    }
+
+    #[test]
+    fn github_status_with_registry_and_resolver_reports_pat_lane() {
+        static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let _guard = ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("env lock");
+
+        let mut registry = BrokerRegistry::new();
+        registry.register(Box::new(core_broker::MockBroker::new(
+            BrokerProvider::Github,
+        )));
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let missing_env = tmp.path().join("missing.env");
+        let missing_pem = tmp.path().join("missing.pem");
+        let prev_env = std::env::var("EMBER_APP_ENV_PATH").ok();
+        let prev_pem = std::env::var("EMBER_APP_PEM_PATH").ok();
+        unsafe {
+            std::env::set_var("EMBER_APP_ENV_PATH", &missing_env);
+            std::env::set_var("EMBER_APP_PEM_PATH", &missing_pem);
+        }
+
+        let store = std::sync::Arc::new(
+            crate::infra::credential_store::test_helpers::MockCredentialStore::new(),
+        );
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            store
+                .put("github-pat", b"ghp_test_pat_value")
+                .await
+                .expect("store PAT");
+        });
+        let resolver = crate::broker::authority::BrokerAuthorityResolver::new(
+            store,
+            crate::broker::authority::CredentialPrecedence::VaultFirst,
+        );
+
+        let value = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(github_status_with_registry_and_resolver(&registry, &resolver))
+            .expect("github status must serialize");
+
+        unsafe {
+            match prev_env {
+                Some(v) => std::env::set_var("EMBER_APP_ENV_PATH", v),
+                None => std::env::remove_var("EMBER_APP_ENV_PATH"),
+            }
+            match prev_pem {
+                Some(v) => std::env::set_var("EMBER_APP_PEM_PATH", v),
+                None => std::env::remove_var("EMBER_APP_PEM_PATH"),
+            }
+        }
+
+        assert_eq!(value["lane"], json!("pat"));
+        assert_eq!(value["detail"], Value::Null);
+        assert_eq!(value["app_id"], Value::Null);
+        assert_eq!(value["installation_id"], Value::Null);
+    }
+
+    #[test]
+    fn github_status_with_registry_and_resolver_reports_app_identity_for_app_lane() {
+        let mut registry = BrokerRegistry::new();
+        registry.register(Box::new(core_broker::MockBroker::new(
+            BrokerProvider::Github,
+        )));
+
+        let store = std::sync::Arc::new(
+            crate::infra::credential_store::test_helpers::MockCredentialStore::new(),
+        );
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            store
+                .put("github/apps/ember-engine/install-42/private-key", b"pem")
+                .await
+                .expect("store private key leaf");
+            store
+                .put("github/apps/ember-engine/install-42/app-id", b"12345")
+                .await
+                .expect("store app-id leaf");
+            store
+                .put("github/apps/ember-engine/install-42/installation-id", b"42")
+                .await
+                .expect("store installation-id leaf");
+        });
+        let resolver = crate::broker::authority::BrokerAuthorityResolver::new(
+            store,
+            crate::broker::authority::CredentialPrecedence::VaultFirst,
+        );
+
+        let value = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(github_status_with_registry_and_resolver(&registry, &resolver))
+            .expect("github status must serialize");
+
+        assert_eq!(value["lane"], json!("app"));
+        assert_eq!(value["detail"], Value::Null);
+        assert_eq!(value["app_id"], json!("12345"));
+        assert_eq!(value["installation_id"], json!("42"));
+    }
+
+    #[test]
+    fn github_status_with_registry_and_resolver_reports_broken_detail_for_partial_app_triple() {
+        let mut registry = BrokerRegistry::new();
+        registry.register(Box::new(core_broker::MockBroker::new(
+            BrokerProvider::Github,
+        )));
+
+        let store = std::sync::Arc::new(
+            crate::infra::credential_store::test_helpers::MockCredentialStore::new(),
+        );
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            store
+                .put("github/apps/ember/install-123/private-key", b"pem")
+                .await
+                .expect("store private key leaf");
+            store
+                .put("github/apps/ember/install-123/app-id", b"123")
+                .await
+                .expect("store app-id leaf");
+        });
+        let resolver = crate::broker::authority::BrokerAuthorityResolver::new(
+            store,
+            crate::broker::authority::CredentialPrecedence::VaultFirst,
+        );
+
+        let value = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(github_status_with_registry_and_resolver(&registry, &resolver))
+            .expect("github status must serialize even when authority is broken");
+
+        assert_eq!(value["lane"], json!("broken"));
+        let detail = value["detail"]
+            .as_str()
+            .expect("broken github status must carry a detail string");
+        assert!(
+            detail.contains("partial credential triple"),
+            "broken detail should explain the local App triple problem: {detail}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // implementation-note-154 — T2 fixture
+    // tests on resolve_legacy_socket_enrollment. Each test covers one of the
+    // three resolution states the helper distinguishes for shared-socket
+    // (legacy /var/run/emberd.sock) RPC callers.
+    // -----------------------------------------------------------------------
+
+    /// Internal trust lane (1): when no kernel-attested principal is
+    /// supplied, the caller rides the daemon-internal in-process lane
+    /// (admin CLI / recovery / smoke harness). The resolver must surface
+    /// `Internal { reason: "no-kernel-attested-principal" }` so the gate
+    /// downstream understands peercred binding is bypassed by design.
+    #[test]
+    fn resolve_legacy_socket_enrollment_returns_internal_when_principal_absent() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let params = serde_json::json!({"caller_persona": "anything"});
+
+        let resolution =
+            resolve_legacy_socket_enrollment(None, &store, &params, "caller_persona")
+                .expect("resolver must succeed when principal absent");
+        match resolution {
+            LegacySocketResolution::Internal { reason } => {
+                assert_eq!(
+                    reason, "no-kernel-attested-principal",
+                    "no-principal lane must name itself in the reason field"
+                );
+            }
+            other => panic!("expected Internal, got {other:?}"),
+        }
+    }
+
+    /// Internal trust lane (2): kernel-attested principal supplied, but
+    /// the payload omits the named persona field. Legacy admin shapes
+    /// that don't claim a persona ride the Internal lane — the gate
+    /// downstream is a no-op (matches the existing
+    /// `check_principal_against_persona` posture for missing-field).
+    #[test]
+    fn resolve_legacy_socket_enrollment_returns_internal_when_persona_field_absent() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let principal = test_principal(1234, 1);
+        let params = serde_json::json!({"provider": "cloudflare"});
+
+        let resolution = resolve_legacy_socket_enrollment(
+            Some(&principal),
+            &store,
+            &params,
+            "caller_persona",
+        )
+        .expect("resolver must succeed when persona field absent");
+        match resolution {
+            LegacySocketResolution::Internal { reason } => {
+                assert_eq!(
+                    reason, "no-persona-claim",
+                    "no-persona-field lane must name itself in the reason field"
+                );
+            }
+            other => panic!("expected Internal, got {other:?}"),
+        }
+    }
+
+    /// Enrolled lane: kernel-attested principal supplied, payload names
+    /// a persona, and an active row exists in `agent_socket_enrollments`
+    /// for that persona. The resolver must surface the row so downstream
+    /// code can consult `peer_uid`, `grant_id`, and the binding tuple
+    /// without re-querying.
+    #[test]
+    fn resolve_legacy_socket_enrollment_returns_enrolled_when_active_row_present() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let persona_id = "persona-with-enrollment";
+        let socket_path = "/run/emberd/agent-resolve-enrolled.sock";
+        store
+            .record_agent_socket_enrollment(
+                socket_path,
+                persona_id,
+                "grant-resolve-enrolled",
+                "hash-resolve-enrolled",
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let principal = test_principal(4242, 9999);
+        let params = serde_json::json!({"caller_persona": persona_id});
+
+        let resolution = resolve_legacy_socket_enrollment(
+            Some(&principal),
+            &store,
+            &params,
+            "caller_persona",
+        )
+        .expect("resolver must succeed for active enrollment");
+        match resolution {
+            LegacySocketResolution::Enrolled(row) => {
+                assert_eq!(row.persona_id, persona_id);
+                assert_eq!(row.socket_path, socket_path);
+                assert_eq!(row.grant_id, "grant-resolve-enrolled");
+                assert_eq!(row.state, "active");
+            }
+            other => panic!("expected Enrolled, got {other:?}"),
+        }
+    }
+
+    /// NoEnrollment lane: kernel-attested principal supplied, payload
+    /// names a persona, but no active row exists for that persona. The
+    /// resolver must surface `NoEnrollment` so the legacy fail-open
+    /// posture is preserved (the downstream gate consults the legacy
+    /// per-process registry for these callers during Step B).
+    #[test]
+    fn resolve_legacy_socket_enrollment_returns_no_enrollment_when_persona_missing() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let principal = test_principal(7777, 1);
+        let params = serde_json::json!({"caller_persona": "persona-with-no-enrollment"});
+
+        let resolution = resolve_legacy_socket_enrollment(
+            Some(&principal),
+            &store,
+            &params,
+            "caller_persona",
+        )
+        .expect("resolver must succeed when no enrollment exists");
+        assert!(
+            matches!(resolution, LegacySocketResolution::NoEnrollment),
+            "expected NoEnrollment, got {resolution:?}"
+        );
+    }
+
+    /// Revoked enrollments are filtered out: an `agent_socket_enrollments`
+    /// row whose `state = 'revoked'` must not surface as Enrolled. The
+    /// resolver returns `NoEnrollment` so the gate downstream applies
+    /// the legacy fail-open posture rather than treating the revoked row
+    /// as live identity.
+    #[test]
+    fn resolve_legacy_socket_enrollment_skips_revoked_rows() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let persona_id = "persona-revoked";
+        let socket_path = "/run/emberd/agent-resolve-revoked.sock";
+        store
+            .record_agent_socket_enrollment(
+                socket_path,
+                persona_id,
+                "grant-resolve-revoked",
+                "hash-resolve-revoked",
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .revoke_agent_socket_enrollment(socket_path)
+            .expect("revoke");
+
+        let principal = test_principal(8888, 1);
+        let params = serde_json::json!({"caller_persona": persona_id});
+
+        let resolution = resolve_legacy_socket_enrollment(
+            Some(&principal),
+            &store,
+            &params,
+            "caller_persona",
+        )
+        .expect("resolver must succeed even when only revoked rows exist");
+        assert!(
+            matches!(resolution, LegacySocketResolution::NoEnrollment),
+            "revoked-only persona must resolve to NoEnrollment, got {resolution:?}"
+        );
     }
 }

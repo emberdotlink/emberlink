@@ -1,9 +1,9 @@
 //!
 //! design Phase 4 step 7: copy signed binaries to the dev install root.
 //!
-//! Uses `install_paths::DEV_INSTALL_ROOT`. Idempotent: only copies when
-//! the source SHA-256 differs from the destination. Returns the set of
-//! binaries that actually changed (for the downstream manifest re-gen
+//! Uses the current worktree's derived dev install root. Idempotent: only
+//! copies when the source SHA-256 differs from the destination. Returns the
+//! set of binaries that actually changed (for the downstream manifest re-gen
 //! decision).
 
 use std::fs;
@@ -14,9 +14,8 @@ use sha2::{Digest, Sha256};
 
 use super::CommandRunner;
 use crate::dev_install_slice_c::build_sign::BuildSignResult;
-use crate::install_paths::DEV_INSTALL_ROOT;
 
-/// Copy signed binaries from the build output into `DEV_INSTALL_ROOT`.
+/// Copy signed binaries from the build output into `install_root`.
 ///
 /// Only files whose SHA-256 differs from the currently-installed file are
 /// overwritten. Returns the list of destination paths that were actually
@@ -30,8 +29,8 @@ use crate::install_paths::DEV_INSTALL_ROOT;
 pub fn install_binaries(
     _runner: &dyn CommandRunner,
     build: &BuildSignResult,
+    install_root: &Path,
 ) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
-    let install_root = Path::new(DEV_INSTALL_ROOT);
     fs::create_dir_all(install_root)?;
 
     let mut changed = Vec::new();
@@ -85,17 +84,6 @@ mod tests {
     impl CommandRunner for NoopRunner {
         fn run(&self, _: &str, _: &[&str]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
             Ok(Vec::new())
-        }
-    }
-
-    fn make_build_result(dir: &Path) -> BuildSignResult {
-        let daemon = dir.join("emberd");
-        fs::write(&daemon, b"fake emberd bytes v1").unwrap();
-        let construct = dir.join("ember-construct");
-        fs::write(&construct, b"fake construct bytes v1").unwrap();
-        BuildSignResult {
-            daemon_signed_path: daemon,
-            construct_signed_paths: vec![construct],
         }
     }
 

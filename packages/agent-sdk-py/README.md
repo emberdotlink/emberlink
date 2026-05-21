@@ -1,6 +1,6 @@
 # emberlink-agent
 
-Client SDK for the Ember Warden daemon. Your agent calls this to request credential grants, check authorization, subscribe to grant lifecycle events, and receive real-time budget notifications.
+Experimental Python helper client for the Emberlink agent authorization protocol. It spawns the `emberlink-agent` helper subprocess, which routes daemon-backed methods through the local Ember daemon.
 
 See the [TypeScript counterpart SDK](../agent-sdk-ts/README.md) and the [Emberlink project README](../../README.md).
 
@@ -14,7 +14,9 @@ Requires Python 3.10 or later.
 
 ### Daemon prerequisite
 
-The `emberlink-agent` binary must be installed and in your PATH. The `EmberAgent` class spawns it as a subprocess and routes daemon-backed methods through the local Ember daemon.
+The `emberlink-agent` binary must be installed and in your PATH. The
+`EmberAgent` class spawns it as a subprocess and routes daemon-backed methods
+through the local Ember daemon.
 
 Download the binary for your platform from the [GitHub releases page](https://github.com/emberdotlink/emberlink/releases/latest):
 
@@ -47,6 +49,7 @@ from emberlink_agent import AgentConfig, EmberAgent, EmberAgentError
 config = AgentConfig(
     db_path=os.environ.get("EMBERLINK_DB", "./emberlink.db"),
     persona_id=os.environ.get("EMBERLINK_PERSONA", "my-agent-persona"),
+    daemon_socket=os.environ.get("EMBERLINK_DAEMON_SOCKET"),
 )
 
 # Subscribe before connecting so no notifications are missed.
@@ -64,8 +67,13 @@ try:
         me = agent.whoami()
         print("Connected as:", me.persona_id)
 
-        grant = agent.request_grant(scope="github-token", reason="CI run")
-        # status is "pending" until the human approves the request.
+        grant = agent.request_grant(
+            scope="repo:read",
+            resource_id="github-token",
+            reason="CI run",
+        )
+        # request_id is an approval id when status is "pending" and a grant id
+        # when status is "approved" (for auto-approved policy paths).
         print(f"Grant request: {grant.request_id} — {grant.status}")
 
         status = agent.grant_status(grant.request_id)
@@ -103,6 +111,7 @@ EmberAgent(config: AgentConfig)
 | `persona_id` | `str` | yes | Persona ID to operate as |
 | `binary_path` | `str` | no | Path to `emberlink-agent` binary (default: `"emberlink-agent"`, resolved from PATH) |
 | `label` | `str \| None` | no | Optional human-readable label for this persona session |
+| `daemon_socket` | `str \| None` | no | Override the daemon socket path instead of defaulting to `$HOME/.ember/run/daemon.sock` |
 
 Use as a context manager or call `connect()` / `close()` manually:
 
@@ -138,13 +147,25 @@ Returns all grants visible to this persona. Each `GrantInfo` has fields: `grant_
 Submits a grant request to the daemon. The daemon routes this through active policy; the human may need to approve it via the Ember Warden UI before the grant becomes active.
 
 Parameters: `scope: str` (required), `resource_id: str | None`, `duration_secs: int | None`, `reason: str | None`.
-Returns `RequestGrantResult` with fields `request_id: str` and `status: str` (typically `"pending"` until approved).
+For daemon-backed credential access, `resource_id` should name the credential so
+the helper can route the request through daemon policy.
+
+Returns `RequestGrantResult` with fields `request_id: str` and `status: str`:
+
+- `status == "pending"`: `request_id` is an approval/request id
+- `status == "approved"`: `request_id` is the issued grant id
 
 **`grant_status(grant_id: str) -> GrantStatusResult`**
-Polls the current status of a previously submitted grant request. Returns `GrantStatusResult` with fields `grant_id`, `status`, and optional `issuer_id`, `capability`, `expires_at`. Raises `EmberAgentError` with code `NOT_FOUND` if the grant ID is unknown.
+Polls the current status of a previously submitted grant request. Returns
+`GrantStatusResult` with:
+
+- `request_id` + `status` for a still-pending approval
+- `grant_id` + `status` and optional `issuer_id`, `capability`, `expires_at` for an issued grant
+
+Raises `EmberAgentError` with code `NOT_FOUND` if the daemon rejects the id as unknown.
 
 **`use_credential(grant_id: str, credential_name: str) -> UseCredentialResult`**
-Retrieves the credential value under an active grant. Returns `UseCredentialResult` with fields `status: str` and `credential: CredentialValue` (`value`, `scope`, `grant_id`). Raises `GRANT_INACTIVE` if the grant is not yet approved or has been revoked.
+Retrieves the credential value under an active grant. Returns `UseCredentialResult` with fields `status: str` and `credential: CredentialValue` (`value`, `scope`, `grant_id`). Raises `ACCESS_DENIED` when the daemon refuses the grant or credential access, and `DAEMON_UNAVAILABLE` when the helper cannot reach the daemon.
 
 #### Notification callbacks
 
@@ -170,8 +191,6 @@ class BudgetWarningNotification:
 
 **`on_budget_exhausted: Callable[[BudgetExhaustedNotification], None] | None`**
 Fires when a grant's budget reaches 100%. Fields are identical to `BudgetWarningNotification` except `threshold_band` is `'exhausted'`. After this fires the grant will be inactive; further `use_credential` calls will raise `GRANT_INACTIVE`.
-
----
 
 ### Exported types
 
@@ -210,12 +229,11 @@ Error codes:
 
 | Code | Meaning |
 |------|---------|
+| `DAEMON_UNAVAILABLE` | The helper could not reach the Ember daemon |
+| `ACCESS_DENIED` | The daemon refused the request or credential access |
 | `NOT_FOUND` | Grant ID is unknown |
-| `GRANT_INACTIVE` | Grant exists but is not in the active state |
-| `NO_CREDENTIAL` | No credential is attached to the grant |
 | `UNKNOWN_METHOD` | The agent subprocess does not recognize the method |
 | `INVALID_PARAMS` | Required parameters were missing or malformed |
-| `STORE_ERROR` | Persistence failure inside the agent |
 | `CLOSED` | The subprocess exited while a request was in flight |
 | `TIMEOUT` | No response within 30 seconds |
 

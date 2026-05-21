@@ -1,4 +1,4 @@
-//! implementation-note-447 — T3 end-to-end integration test for
+//! implementation-note-499 — T3 end-to-end integration test for
 //! `ember up` / `ember down`.
 //!
 //! Boots a container-mode session via `ember up --profile dev`,
@@ -43,7 +43,7 @@ fn container_runtime_available() -> bool {
     matches!(emberlink_cli::up::detect_runtime_engine(), Ok(Some(_)))
 }
 
-/// implementation-note-447 — full boot-push-receipt-verify round trip.
+/// implementation-note-499 — full boot-push-receipt-verify round trip.
 ///
 /// The test is intentionally a single function because the three
 /// substeps (`ember up`, in-container `git push`, `ember receipt
@@ -98,7 +98,7 @@ fn ember_up_e2e_boot_push_receipt_verify() {
     // The full implementation requires (a) a bridge cert provisioned
     // into the compose stack, and (b) the host emberd's broker socket
     // accessible from the worker container. Both depend on
-    // implementation-note-406 landing the presence-token
+    // implementation-note-454 landing the presence-token
     // RPC. Until that arrives, the test stops here with the compose
     // stack proven to boot and tear down cleanly, which is itself the
     // entire correctness gate for slices -A + -B.

@@ -1,7 +1,7 @@
 //!
 //! Launcher pidfd watch — fast-path detector for launcher-process exit.
 //!
-//! implementation-note-301 (Phase 1).
+//! implementation-note-335 (Phase 1).
 //!
 //! Per design note §D3: when a launcher process
 //! (e.g. `ember up` or the bridge launcher) exits, all in-flight workflow
@@ -197,7 +197,7 @@ pub async fn run(_daemon_store: Rc<DaemonStore>, sessions_dir: PathBuf) {
 
     info!(
         tick_secs = TICK.as_secs(),
-        "launcher_watch: starting (implementation-note-301 Phase 1)"
+        "launcher_watch: starting (implementation-note-335 Phase 1)"
     );
 
     loop {
@@ -340,7 +340,7 @@ fn launcher_is_dead(tracked: &TrackedLauncher) -> bool {
 ///
 /// Phase 1 emits a structured `info` event so the operator can see the exit
 /// land in real time. The revocation cascade is deferred — when
-/// `implementation-note-269` lands, replace the TODO with the call
+/// `implementation-note-297` lands, replace the TODO with the call
 /// into `infra::workflow_grant::revoke` (and any sibling cascade the
 /// parent-walk decides on).
 fn on_launcher_exit(sessions_dir: &std::path::Path, session_id: &str, launcher_pid: u32) {
@@ -382,7 +382,7 @@ mod tests {
         }
     }
 
-    /// Checkpoint anchor — implementation-note-301 Phase 1.
+    /// Checkpoint anchor — implementation-note-335 Phase 1.
     /// Presence of this test proves the launcher_watch module ships with the
     /// load-bearing surface: tick_once reconciles against SessionStore, and
     /// the platform-specific pidfd/kqueue path lives behind cfg gates.

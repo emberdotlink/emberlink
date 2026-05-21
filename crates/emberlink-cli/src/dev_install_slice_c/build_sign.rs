@@ -82,12 +82,11 @@ fn resolve_signing_identity(
             // Lines look like:
             //   1) HASH "Developer ID Application: Acme Corp (XXXXXXXXXX)"
             // Extract the quoted identity string.
-            if let Some(start) = line.find('"') {
-                if let Some(end) = line.rfind('"') {
-                    if end > start {
-                        return Ok(line[start + 1..end].to_string());
-                    }
-                }
+            if let Some(start) = line.find('"')
+                && let Some(end) = line.rfind('"')
+                && end > start
+            {
+                return Ok(line[start + 1..end].to_string());
             }
         }
     }

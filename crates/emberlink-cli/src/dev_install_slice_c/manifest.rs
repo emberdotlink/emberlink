@@ -7,7 +7,7 @@
 //! signed_at (RFC3339).
 //!
 //! Signed with the dev IdentityRoot (caller provides the `ed25519_dalek::SigningKey`);
-//! sidecar at `~/.ember-dev/binaries/manifest.toml.sig`.
+//! sidecar at the current worktree's dev runtime manifest path.
 
 use std::path::{Path, PathBuf};
 
@@ -16,8 +16,6 @@ use ed25519_dalek::{Signature, Signer as _, SigningKey};
 use sha2::{Digest, Sha256};
 
 use super::CommandRunner;
-use crate::install_paths::DEV_MANIFEST_PATH_REL;
-
 /// Tool names that ember gates. `scan_tool_binaries` locates each tool via
 /// `which` (best-effort; missing tools are silently omitted).
 const GATED_TOOLS: &[&str] = &[
@@ -167,14 +165,9 @@ pub fn write_manifest(
     Ok(())
 }
 
-/// Return the canonical destination directory for the dev manifest.
-///
-/// Resolves to `~/.ember-dev/binaries/` per `install_paths::DEV_MANIFEST_PATH_REL`.
-/// Returns `None` when `$HOME` is not resolvable.
-pub fn manifest_dest_dir() -> Option<PathBuf> {
-    let rel = Path::new(DEV_MANIFEST_PATH_REL); // ".ember-dev/binaries/manifest.toml"
-    let dir = rel.parent()?; // ".ember-dev/binaries"
-    dirs_next::home_dir().map(|h| h.join(dir))
+/// Return the destination directory that owns `manifest_path`.
+pub fn manifest_dest_dir(manifest_path: &Path) -> Option<PathBuf> {
+    manifest_path.parent().map(Path::to_path_buf)
 }
 
 #[cfg(test)]
@@ -304,19 +297,20 @@ mod tests {
     }
 
     #[test]
-    fn manifest_dest_dir_resolves_under_ember_dev_binaries() {
-        // Only meaningful when $HOME is set; skip gracefully otherwise.
-        if let Some(dest) = manifest_dest_dir() {
-            let dest_str = dest.to_string_lossy();
-            assert!(
-                dest_str.contains(".ember-dev"),
-                "manifest dest must be under .ember-dev: {dest_str}"
-            );
-            assert!(
-                dest_str.contains("binaries"),
-                "manifest dest must include binaries segment: {dest_str}"
-            );
-        }
+    fn manifest_dest_dir_resolves_from_worktree_manifest_path() {
+        let manifest_path = Path::new(
+            "/home/test-operator/.ember-dev/envs/worktree-a-123456789abc/binaries/manifest.toml",
+        );
+        let dest = manifest_dest_dir(manifest_path).expect("manifest dest dir");
+        let dest_str = dest.to_string_lossy();
+        assert!(
+            dest_str.contains(".ember-dev/envs/"),
+            "manifest dest must be under a worktree env: {dest_str}"
+        );
+        assert!(
+            dest_str.ends_with("/binaries"),
+            "manifest dest must end with binaries: {dest_str}"
+        );
     }
 
     // --- scan_tool_binaries test with stub runner ---

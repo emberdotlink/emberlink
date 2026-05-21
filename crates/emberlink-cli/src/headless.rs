@@ -1,6 +1,6 @@
-//! implementation-note-16 — Phase 1 substrate.
+//! implementation-note-19 — Phase 1 substrate.
 //!
-//! implementation-note-17
+//! implementation-note-20
 //!
 //! Per design §"Pre-flight scope check at enrollment" Layer 2
 //! (Historical): at enrollment time, the CLI surfaces recent
@@ -11,8 +11,8 @@
 //! ships the substrate — daemon socket call, CTA renderer, and
 //! [`PreflightDecision`] enum — without wiring it into an actual
 //! `ember headless enroll` command (that command does not yet exist;
-//! see the blocked-by dependency on implementation-note-18 in
-//! `release-checklist`). Phase 2 (implementation-note-420) will:
+//! see the blocked-by dependency on implementation-note-21 in
+//! `release-checklist`). Phase 2 (implementation-note-469) will:
 //!   - wire this helper into the enrollment flow,
 //!   - apply per-enrollment template amendments that revert at expiry,
 //!   - amend the enrollment Receipt with the widen-template evidence
@@ -22,12 +22,12 @@
 //! `crates/emberlink-cli/src/commands/headless.rs` because `commands.rs`
 //! is a single 300K-line file rather than a directory; converting it
 //! to a `commands/` directory is out of scope for Phase 1. The
-//! checkpoint `// implementation-note-17` lives in this file +
+//! checkpoint `// implementation-note-20` lives in this file +
 //! `crates/headless-runtime/src/permission_gaps.rs` +
 //! `crates/ember-daemon/src/infra/handler.rs` so the `target_state_anchor`
 //! signal in `release-checklist` resolves cleanly.
 
-// implementation-note-17
+// implementation-note-20
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -75,11 +75,14 @@ pub enum PreflightDecision {
 #[derive(Debug)]
 pub enum PreflightError {
     /// The daemon socket was unreachable. The CLI's caller should
-    /// surface the standard "start with `ember daemon start`" hint.
+    /// surface the standard `ember status` / `sudo ember daemon install`
+    /// repair hint.
     DaemonUnavailable {
         socket: PathBuf,
         source: std::io::Error,
     },
+    /// Operator-facing guidance for authority / locked-session failures.
+    Guidance(String),
     /// The daemon returned a JSON-RPC error.
     DaemonRpc { code: i32, message: String },
     /// Wire / I/O error talking to the daemon socket.
@@ -92,13 +95,9 @@ impl std::fmt::Display for PreflightError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PreflightError::DaemonUnavailable { socket, source } => {
-                write!(
-                    f,
-                    "daemon unavailable at {}: {} — start with 'ember daemon start'",
-                    socket.display(),
-                    source
-                )
+                write!(f, "{}", crate::format_daemon_unavailable(socket, source))
             }
+            PreflightError::Guidance(s) => write!(f, "{s}"),
             PreflightError::DaemonRpc { code, message } => {
                 write!(f, "daemon error ({code}): {message}")
             }
@@ -166,7 +165,7 @@ pub fn preflight_gaps_cta(
     let gaps = fetch_gaps(socket_path, persona, lookback)?;
     let cta = format_cta(persona, &gaps, lookback);
     // Phase 1 stub: return `Skip` unconditionally. Phase 2 (post
-    // implementation-note-18) wires the interactive prompt and
+    // implementation-note-21) wires the interactive prompt and
     // the per-enrollment template amendment path.
     Ok((PreflightDecision::Skip, cta))
 }
@@ -230,17 +229,46 @@ fn call_daemon(socket_path: &Path, method: &str, params: &Value) -> Result<Value
             .and_then(|m| m.as_str())
             .unwrap_or("unknown error")
             .to_string();
+        if let Some(guidance) = headless_guidance_for_rpc(method, code, &message) {
+            return Err(PreflightError::Guidance(guidance));
+        }
         return Err(PreflightError::DaemonRpc { code, message });
     }
 
     Ok(response.get("result").cloned().unwrap_or(Value::Null))
 }
 
-// ─── implementation-note-392 — enroll / revoke / status commands ──
+fn headless_guidance_for_rpc(method: &str, code: i32, message: &str) -> Option<String> {
+    let is_locked = code == -32030
+        && (message.contains("session is locked")
+            || message.contains("vault unavailable")
+            || message.contains("session auto-locked"));
+
+    if matches!(
+        method,
+        "headless_enroll"
+            | "headless_revoke"
+            | "headless_status"
+            | "headless_preflight_gaps"
+            | "headless_preflight_layer1"
+    ) && (is_locked || (code == -32001 && message.contains("authority_class_not_met")))
+    {
+        return Some(
+            "this headless action needs operator presence on the daemon-managed vault lane. \
+             Approve the unlock flow if prompted, or run `ember vault unlock` from an interactive \
+             operator shell and retry."
+                .to_string(),
+        );
+    }
+
+    None
+}
+
+// ─── implementation-note-439 — enroll / revoke / status commands ──
 //
 // CLI surface for the daemon-side `headless_enroll` / `headless_revoke` /
 // `headless_status` socket methods that shipped in prior change
-// (implementation-note-260 Phase 1). Per design §"Headless:
+// (implementation-note-286 Phase 1). Per design §"Headless:
 // attested device, variable enrollment". The daemon-side handlers
 // now ship a first real local enroll/revoke/status workflow. `headless_enroll`
 // installs a fresh headless MEK plus the currently configured local
@@ -516,9 +544,9 @@ pub fn cmd_status(socket_path: &Path) -> Result<(), HeadlessCommandError> {
     Ok(())
 }
 
-// ─── implementation-note-261 — CLI surface ─────────
+// ─── implementation-note-287 — CLI surface ─────────
 //
-// implementation-note-262
+// implementation-note-288
 //
 // `ember headless preflight` shells the daemon's
 // `headless_preflight_layer1` RPC, then renders the gap list as a
@@ -745,7 +773,7 @@ mod tests {
         requires_copy(PreflightDecision::Skip);
     }
 
-    // ─── implementation-note-392 helper tests ───────────────────
+    // ─── implementation-note-439 helper tests ───────────────────
 
     #[test]
     fn parse_duration_spec_recognizes_canonical_units() {
@@ -781,7 +809,7 @@ mod tests {
     #[test]
     fn render_enroll_cta_includes_locked_copy() {
         let cta = render_enroll_cta("4h");
-        // Spot-check the load-bearing lines from the implementation-note-421 lock.
+        // Spot-check the load-bearing lines from the implementation-note-470 lock.
         assert!(cta.contains("Enable headless — for how long?"));
         assert!(cta.contains("Default: 4 hours."));
         assert!(cta.contains("anything up to 7 days"));
@@ -822,7 +850,31 @@ mod tests {
         assert_eq!(format_duration_display(0), "0s");
     }
 
-    // ─── implementation-note-261 — CLI table tests ─
+    #[test]
+    fn headless_guidance_maps_missing_presence() {
+        let guidance = headless_guidance_for_rpc(
+            "headless_enroll",
+            -32001,
+            r#"{"error":"authority_class_not_met","reason":"missing"}"#,
+        )
+        .expect("expected guidance");
+        assert!(guidance.contains("operator presence"));
+        assert!(guidance.contains("ember vault unlock"));
+    }
+
+    #[test]
+    fn headless_guidance_maps_locked_session() {
+        let guidance = headless_guidance_for_rpc(
+            "headless_status",
+            -32030,
+            "headless_status denied: session is locked; reopen with `ember vault unlock`",
+        )
+        .expect("expected guidance");
+        assert!(guidance.contains("operator presence"));
+        assert!(guidance.contains("ember vault unlock"));
+    }
+
+    // ─── implementation-note-287 — CLI table tests ─
 
     #[test]
     fn preflight_table_renders_no_gaps_message_for_empty_input() {

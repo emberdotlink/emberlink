@@ -73,10 +73,40 @@ fn permissive_test_policy() -> PolicyEngine {
 /// LocalSet/spawn_blocking interaction issues: the listener owns its thread,
 /// and the sync SocketTransport client can be called from spawn_blocking on the
 /// test's multi-threaded runtime.
+///
+/// Three test-mode invariants the listener needs for the lifecycle tests in
+/// this file to pass the OperatorPresence authority gate (prior change / #3822 /
+/// #3828):
+///
+///   1. `init_identity` must be called once per process so
+///      `mint_operator_presence_token` (handler.rs:1231) has a daemon signer
+///      to mint synthetic tokens against. `init_identity` is idempotent
+///      (first caller wins); we call it from every listener spawn for
+///      defense in depth.
+///   2. `presence::mark_unlocked` so the dispatch-time unlocked-session gate
+///      (handler.rs:2593) doesn't refuse with -32030 before the test
+///      reaches its assertion. The lock is process-global; `mark_unlocked`
+///      is idempotent and cheap.
+///   3. `SocketListener::with_test_mode_synthetic_presence_token(true)` so
+///      every accepted connection's `RequestContext` carries a synthetic
+///      presence token bound to the peer uid (per the docstring at
+///      socket.rs:247). Without this the authority-class gate at
+///      handler.rs:2514 refuses with `authority_class_not_met / missing`.
 fn spawn_listener_thread(tmp: &TempDir) -> (std::path::PathBuf, watch::Sender<bool>) {
     let socket_path = tmp.path().join("test.sock");
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let path_for_thread = socket_path.clone();
+
+    // Install the process-singleton daemon identity (idempotent — first
+    // caller wins). The directory is leaked deliberately: the singleton
+    // outlives any single test, and tempfile dropping it would race the
+    // next test's reuse of the same identity.
+    let id_dir = tempfile::tempdir().expect("tempdir for daemon identity");
+    let _ = ember_daemon::infra::receipt::init_identity(id_dir.path());
+    std::mem::forget(id_dir);
+
+    // Flip presence to Unlocked before any RPC arrives (idempotent).
+    ember_daemon::trust::presence::mark_unlocked();
 
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -93,7 +123,8 @@ fn spawn_listener_thread(tmp: &TempDir) -> (std::path::PathBuf, watch::Sender<bo
             let policy = Rc::new(permissive_test_policy());
             let rate_limiter = Rc::new(RefCell::new(RateLimiter::default()));
             let listener =
-                SocketListener::new(path_for_thread, shutdown_rx, store, policy, rate_limiter);
+                SocketListener::new(path_for_thread, shutdown_rx, store, policy, rate_limiter)
+                    .with_test_mode_synthetic_presence_token(true);
             listener.run().await.unwrap();
         });
     });
@@ -342,7 +373,11 @@ async fn full_demo_flow() {
             .expect("our approval should be in the pending list");
         assert_eq!(our_approval["persona_id"], json!(persona_id));
         assert_eq!(our_approval["action"], json!("deploy.production"));
-        assert_eq!(our_approval["risk_level"], json!("high"));
+        // permissive_test_policy() classifies deploy.production as Critical
+        // (matches PolicyEngine::default() in core-approval/src/policy.rs:276).
+        // Pre-existing test drift: the assertion previously matched the
+        // earlier RiskLevel::High classification.
+        assert_eq!(our_approval["risk_level"], json!("critical"));
 
         // 11. Revoke the grant
         t.send("revoke_grant", json!({"id": grant_id})).unwrap();
@@ -733,7 +768,7 @@ async fn dashboard_csrf_protects_post_endpoints() {
     );
 
     // 4. POST with correct CSRF header AND matching Origin -> passes both checks,
-    //    fails downstream. implementation-note-91: with the WebAuthn gate active
+    //    fails downstream. implementation-note-105: with the WebAuthn gate active
     //    (no `EMBER_DISABLE_BIO=1`), an empty body reaches the gate and gets
     //    401 "missing webauthn challenge_id". Without the gate, the legacy
     //    path reaches the store and gets 400 "approval not found". Either
@@ -926,7 +961,7 @@ async fn dashboard_bind_failure_surfaced_via_channel() {
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-296 — auto-unseal vault from keyring on daemon startup.
+// implementation-note-326 — auto-unseal vault from keyring on daemon startup.
 //
 // The bug: `qember.sh demo up` finished, then `grant create` failed with
 // "persona '<id>' secret is vault-sealed but no vault is attached" because
@@ -942,7 +977,7 @@ async fn dashboard_bind_failure_surfaced_via_channel() {
 // flipping them simultaneously would interfere.
 // ---------------------------------------------------------------------------
 
-/// Serialize all implementation-note-296 tests that mutate process-global env vars
+/// Serialize all implementation-note-326 tests that mutate process-global env vars
 /// (`EMBER_VAULT_PASSPHRASE`, `EMBER_VAULT_TEST_KEYRING_PRESENT`). Without
 /// this, the parallel cargo test runner can interleave env writes between
 /// tests and cause spurious `Unsealed` / `NoKeyringEntry` flips.
@@ -1031,7 +1066,7 @@ fn auto_unseal_returns_unsealed_when_keyring_entry_present() {
 
     // Round-trip: attach to store, create a persona, retrieve its keypair.
     // This is the precise call sequence that `grant create` triggers and the
-    // path that was failing in implementation-note-296. If this works end-to-end, the
+    // path that was failing in implementation-note-326. If this works end-to-end, the
     // demo-blocking bug is fixed.
     let store = DaemonStore::open_in_memory().unwrap();
     store.set_vault(Rc::new(vault));

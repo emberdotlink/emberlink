@@ -1,0 +1,106 @@
+//! T2 integration coverage for shared daemon-guidance mapping.
+//!
+//! Exercises `emberlink_cli::call_daemon_method` against a fake Unix socket
+//! daemon so the library is compiled in normal mode (`cfg(not(test))` for the
+//! library itself). This pins the operator-facing contract after the auto-
+//! unlock retry path exhausts:
+//!
+//! - first RPC returns a locked-session daemon error
+//! - auto-unlock retry calls `vault_unlock`
+//! - `vault_unlock` also returns a locked-session daemon error
+//! - the surfaced `ValidationError` must contain guidance, not the raw daemon
+//!   payload
+
+use std::io::{BufRead, Write as _};
+use std::os::unix::net::UnixListener;
+use std::thread;
+use std::time::Duration;
+
+fn accept_with_timeout(listener: &UnixListener, timeout: Duration) -> std::os::unix::net::UnixStream {
+    listener
+        .set_nonblocking(true)
+        .expect("set_nonblocking on listener");
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream
+                    .set_nonblocking(false)
+                    .expect("restore blocking on accepted stream");
+                return stream;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    panic!("listener.accept() timed out after {timeout:?}");
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => panic!("listener.accept() error: {e}"),
+        }
+    }
+}
+
+#[test]
+fn call_daemon_method_locked_retry_exhaustion_surfaces_guidance() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let socket_path = tmp.path().join("daemon.sock");
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+
+    let server = thread::spawn({
+        let socket_path = socket_path.clone();
+        move || {
+            let _ = std::fs::remove_file(&socket_path);
+            let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+            ready_tx.send(()).expect("signal ready");
+
+            for expected_method in ["create_persona", "vault_unlock"] {
+                let mut stream = accept_with_timeout(&listener, Duration::from_secs(10));
+                let mut reader = std::io::BufReader::new(
+                    stream.try_clone().expect("clone fake daemon stream"),
+                );
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .expect("read fake daemon request");
+                let request: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("parse fake daemon request");
+                assert_eq!(request["method"], serde_json::json!(expected_method));
+
+                let response = serde_json::json!({
+                    "id": request["id"],
+                    "error": {
+                        "code": -32030,
+                        "message": "create_persona denied: session is locked; reopen with `ember vault unlock` or start a new session (`register_session` path). Ordinary lazy same-daemon re-auth is not fully wired yet",
+                    }
+                });
+
+                let mut encoded =
+                    serde_json::to_string(&response).expect("encode fake daemon response");
+                encoded.push('\n');
+                stream
+                    .write_all(encoded.as_bytes())
+                    .expect("write fake daemon response");
+            }
+        }
+    });
+
+    ready_rx.recv().expect("wait for fake daemon ready");
+    let err = emberlink_cli::call_daemon_method(
+        &socket_path,
+        "create_persona",
+        &serde_json::json!({"name": "needs-guidance"}),
+    )
+    .expect_err("retry exhaustion should surface guidance");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("operator presence"),
+        "expected operator-presence guidance, got: {msg}"
+    );
+    assert!(
+        msg.contains("ember vault unlock"),
+        "expected unlock hint, got: {msg}"
+    );
+
+    server.join().expect("fake daemon thread");
+}

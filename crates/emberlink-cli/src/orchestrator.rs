@@ -227,7 +227,7 @@ pub async fn cmd_orchestrator_spawn(
     //     *.anthropic.com, github.com (defaults from mint_per_agent_proxy_ca).
     //     The CA key is not written to disk — only the cert is needed by
     //     the container's trust-store install step. Single-tenant fixed
-    //     path for now; implementation-note-441
+    //     path for now; implementation-note-493
     //     tracks the per-container_id scoping work.
     // per_agent_ca_path_scoped_by_container_id
     let certs_dir = PathBuf::from(format!("/tmp/ember-agent-certs/{container_id}"));
@@ -261,8 +261,8 @@ pub async fn cmd_orchestrator_spawn(
     // 4f-mtls. Materialize per-agent mTLS client cert files so the container
     //     can authenticate to the bridge as a first-class principal (not just
     //     via the shared proxy CA). Content is placeholder until
-    //     implementation-note-31 publishes the real mint helper.
-    // orchestrator_spawn_mints_bridge_client_cert: per-agent mTLS materialization (implementation-note-442)
+    //     implementation-note-37 publishes the real mint helper.
+    // orchestrator_spawn_mints_bridge_client_cert: per-agent mTLS materialization (implementation-note-494)
     let cert_dir = PathBuf::from("/tmp/ember-agent-certs"); // per-container subdirs created inside
     let _materialized =
         materialize_bridge_client_cert_for_container(&container_id, &persona_id, &cert_dir)
@@ -284,7 +284,7 @@ pub async fn cmd_orchestrator_spawn(
     //    scion sees only its own native vocabulary. Per design §4 the shim
     //    is also the broker.resolve gate for spawn-subagent authority
     //    (capability check, scope attenuation, template-allowlist, depth cap).
-    //    Anchor: implementation-note-443.
+    //    Anchor: implementation-note-495.
     // 4f. Write a per-spawn SCION inline config carrying EMBER_PERSONA_ID
     //     and EMBER_DAEMON_SOCKET into the container's env. The base image
     //     (ember-claude-code:v1) requires EMBER_PERSONA_ID at startup for
@@ -297,7 +297,7 @@ pub async fn cmd_orchestrator_spawn(
     })?;
     // In-container daemon socket path. SCION template bind-mounts the host
     // socket (socket_path_str) → this path inside the container.
-    // implementation-note-369 tracks the uid bridge work
+    // implementation-note-413 tracks the uid bridge work
     // (Docker Desktop on macOS does not pass through Linux UDS peer-cred
     // identically; first connect will likely surface the bridge gap).
     let in_container_socket = "/run/ember/daemon.sock";
@@ -518,13 +518,13 @@ pub async fn cmd_orchestrator_stop(cfg: &DaemonConfig) -> Result<(), i32> {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Bridge client cert materialization (implementation-note-442)
+// Bridge client cert materialization (implementation-note-494)
 // ---------------------------------------------------------------------------
 
 /// Paths to the materialized per-agent mTLS client cert files.
 ///
 /// Returned by [`materialize_bridge_client_cert_for_container`]. Content is
-/// placeholder until `implementation-note-31` publishes the real
+/// placeholder until `implementation-note-37` publishes the real
 /// `mint_per_agent_mtls_client_cert` helper from `core-crypto`.
 /// Anchor: orchestrator_spawn_mints_bridge_client_cert
 #[derive(Debug)]
@@ -571,7 +571,7 @@ pub enum BridgeCertError {
 /// - `client-ca.crt` (mode 0644) — stub CA certificate
 ///
 /// All three files contain placeholder content (`b"# placeholder"`) until
-/// `implementation-note-31` ships the real SPIFFE-shape mint.
+/// `implementation-note-37` ships the real SPIFFE-shape mint.
 /// The directory is scoped per container so concurrent spawns don't collide.
 fn materialize_bridge_client_cert_for_container(
     container_id: &str,
@@ -803,6 +803,7 @@ enum OrchestratorRpcError {
         socket: PathBuf,
         source: std::io::Error,
     },
+    Guidance(String),
     Io(String),
     Protocol(String),
     DaemonRpc {
@@ -825,13 +826,9 @@ impl std::fmt::Display for OrchestratorRpcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::DaemonUnavailable { socket, source } => {
-                write!(
-                    f,
-                    "daemon unavailable at {}: {} — start with 'ember daemon start'",
-                    socket.display(),
-                    source
-                )
+                write!(f, "{}", crate::format_daemon_unavailable(socket, source))
             }
+            Self::Guidance(s) => write!(f, "{s}"),
             Self::Io(s) => write!(f, "socket I/O: {s}"),
             Self::Protocol(s) => write!(f, "protocol: {s}"),
             Self::DaemonRpc { code, message } => write!(f, "daemon error ({code}): {message}"),
@@ -853,6 +850,31 @@ impl std::fmt::Display for OrchestratorRpcError {
     }
 }
 
+fn orchestrator_guidance_for_rpc(code: i32, message: &str) -> Option<String> {
+    if code == -32001 && message.contains("authority_class_not_met") {
+        return Some(
+            "this orchestrator action needs operator presence on the daemon-managed vault lane. \
+             Re-run it from an interactive operator shell, approve the unlock flow if prompted, \
+             or run `ember vault unlock` first and retry."
+                .to_string(),
+        );
+    }
+
+    if code == -32030
+        && (message.contains("session is locked")
+            || message.contains("vault unavailable")
+            || message.contains("session auto-locked"))
+    {
+        return Some(
+            "this orchestrator action needs operator presence on the daemon-managed vault lane. \
+             Approve the unlock flow if prompted, or run `ember vault unlock` and retry."
+                .to_string(),
+        );
+    }
+
+    None
+}
+
 /// Send a synchronous JSON-RPC request over the daemon Unix socket and
 /// return the `result` value.
 fn call_daemon(
@@ -871,8 +893,8 @@ fn call_daemon(
         Err(crate::DaemonRpcError::Io(e)) => Err(OrchestratorRpcError::Io(format!("{e}"))),
         Err(crate::DaemonRpcError::Protocol(e)) => Err(OrchestratorRpcError::Protocol(e)),
         Err(crate::DaemonRpcError::Rpc { code, message }) => {
-            if code == -32001 && message.contains("authority_class_not_met") {
-                eprintln!("ember: presence proof expired; visit the dashboard to re-authenticate");
+            if let Some(guidance) = orchestrator_guidance_for_rpc(code, &message) {
+                return Err(OrchestratorRpcError::Guidance(guidance));
             }
             Err(OrchestratorRpcError::DaemonRpc { code, message })
         }
@@ -952,7 +974,7 @@ fn daemon_find_operator_persona(socket_path: &Path) -> Result<String, Orchestrat
 ///
 /// The grant uses a synthetic `credential_name` (`_orchestrator_root`)
 /// because `create_grant` is credential-shaped today; the destination work
-/// (implementation-note-444) replaces this with a proper
+/// (implementation-note-496) replaces this with a proper
 /// delegation primitive that doesn't piggyback on credential_name.
 ///
 /// When `create_grant` returns `{status:"pending_approval", approval_id}`,
@@ -1049,7 +1071,7 @@ fn daemon_await_grant_approval(
     _persona_id: &str,
     approval_id: &str,
 ) -> Result<(), OrchestratorRpcError> {
-    // Five minutes — matches the proxy hook's default (implementation-note-42).
+    // Five minutes — matches the proxy hook's default (implementation-note-53).
     const APPROVAL_TIMEOUT_SECS: u64 = 300;
 
     // Open a new socket connection with an extended read deadline so the
@@ -1163,10 +1185,11 @@ fn daemon_find_active_root_grant(
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let status = g.get("status").and_then(|v| v.as_str()).unwrap_or("");
-        if credential == "_orchestrator_root" && status == "active" {
-            if let Some(id) = g.get("id").and_then(|v| v.as_str()) {
-                return Ok(id.to_string());
-            }
+        if credential == "_orchestrator_root"
+            && status == "active"
+            && let Some(id) = g.get("id").and_then(|v| v.as_str())
+        {
+            return Ok(id.to_string());
         }
     }
     Err(OrchestratorRpcError::Protocol(format!(
@@ -1732,6 +1755,28 @@ mod tests {
             }
             other => panic!("expected ApprovalTimedOut, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn orchestrator_guidance_maps_missing_presence() {
+        let guidance = orchestrator_guidance_for_rpc(
+            -32001,
+            r#"{"error":"authority_class_not_met","reason":"missing"}"#,
+        )
+        .expect("expected guidance");
+        assert!(guidance.contains("operator presence"));
+        assert!(guidance.contains("ember vault unlock"));
+    }
+
+    #[test]
+    fn orchestrator_guidance_maps_locked_session() {
+        let guidance = orchestrator_guidance_for_rpc(
+            -32030,
+            "orchestrator_root denied: session is locked; reopen with `ember vault unlock`",
+        )
+        .expect("expected guidance");
+        assert!(guidance.contains("operator presence"));
+        assert!(guidance.contains("ember vault unlock"));
     }
 
     /// Beat 4 — proxy_call events render as the demo's display line.

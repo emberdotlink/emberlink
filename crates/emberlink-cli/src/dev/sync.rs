@@ -10,11 +10,13 @@
 //! - Step 1: incremental cargo build (`--release -p ember-daemon -p ember-construct`).
 //! - Step 2: content-hash diff (SHA-256) — detect which built binaries changed.
 //! - Step 3: copy changed binaries to the dev install root (code-signing is a
-//!   TODO stub; signing pipeline lands in implementation-note-419).
+//!   TODO stub; signing pipeline lands in implementation-note-468).
+//! - Step 4: re-generate and re-sign the dev manifest when synced binaries
+//!   changed.
 //! - Step 5: `launchctl kickstart -k system/sh.emberlink.daemon.dev` (skipped
 //!   when `--no-launchctl` is passed).
-//! - Steps 4 + 6 (manifest re-gen + daemon-verify) are TODO stubs; they depend
-//!   on EMBER-DEV-INSTALL slice-B (manifest gen) landing.
+//! - Step 6: post-kickstart readiness verification via the same install-time
+//!   runtime truth surface.
 //!
 //! # Checkpoint
 //!
@@ -24,10 +26,14 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
+use ed25519_dalek::SigningKey;
 use sha2::{Digest, Sha256};
 
-use crate::install_paths::DEV_INSTALL_ROOT;
+use crate::dev::identity_root;
+use crate::dev_runtime::{DevRuntimeEnv, resolve_dev_runtime_for_workspace_root, resolve_workspace_root};
+use crate::dev_install_slice_c::{CommandRunner, RealCommandRunner, manifest, verify};
 
 /// Checkpoint — `dev_prod_parity_ember_dev_sync_landed`.
 #[doc(hidden)]
@@ -36,6 +42,7 @@ pub const SENTINEL_DEV_PROD_PARITY_EMBER_DEV_SYNC_LANDED: &str =
 
 /// Binary targets built and synced by `ember dev sync`.
 const SYNC_TARGETS: &[&str] = &["ember-daemon", "ember-construct"];
+const SYNC_VERIFY_TIMEOUT_SECS: u64 = 10;
 
 /// Arguments for `ember dev sync`.
 pub struct SyncArgs {
@@ -56,15 +63,10 @@ pub fn sha256_hex(path: &Path) -> io::Result<String> {
     Ok(hex::encode(digest))
 }
 
-/// Returns the installed path for a built binary under `DEV_INSTALL_ROOT`.
-///
-/// The dev install root mirrors the prod layout:
-/// `{DEV_INSTALL_ROOT}/bin/<name>` on Linux, or
-/// `{DEV_INSTALL_ROOT}/emberd.app/Contents/MacOS/<name>` on macOS for the
-/// daemon binary. For phase-1 simplicity we use a flat `bin/` layout for all
-/// targets and leave the macOS bundle layout for the full install slice.
-pub fn installed_path(name: &str) -> PathBuf {
-    PathBuf::from(DEV_INSTALL_ROOT).join("bin").join(name)
+/// Returns the installed path for a built binary under the worktree-scoped
+/// dev runtime install root.
+pub fn installed_path(runtime: &DevRuntimeEnv, name: &str) -> PathBuf {
+    runtime.install_root.join(name)
 }
 
 /// Returns the `target/release/<name>` path for a built binary, relative to
@@ -105,6 +107,10 @@ fn copy_binary(src: &Path, dest: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn io_other(message: impl Into<String>) -> io::Error {
+    io::Error::other(message.into())
+}
+
 /// Run `cargo build --release` for the sync targets.
 ///
 /// Returns an error if `cargo` exits non-zero. Output (stdout + stderr) is
@@ -120,8 +126,7 @@ fn cargo_build(workspace_root: &Path) -> io::Result<()> {
         .current_dir(workspace_root)
         .status()?;
     if !status.success() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
+        return Err(io::Error::other(
             format!(
                 "cargo build --release exited {}",
                 status.code().unwrap_or(-1)
@@ -142,8 +147,7 @@ fn launchctl_kickstart(label: &str) -> io::Result<()> {
         .args(["kickstart", "-k", &target])
         .status()?;
     if !status.success() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
+        return Err(io::Error::other(
             format!(
                 "launchctl kickstart -k {target} exited {}",
                 status.code().unwrap_or(-1)
@@ -153,29 +157,76 @@ fn launchctl_kickstart(label: &str) -> io::Result<()> {
     Ok(())
 }
 
+fn rewrite_manifest_with(
+    runner: &dyn CommandRunner,
+    signer: &SigningKey,
+    dest_dir: &Path,
+) -> io::Result<usize> {
+    let entries = manifest::scan_tool_binaries(runner).map_err(|e| io_other(e.to_string()))?;
+    let toml = manifest::render_manifest(&entries);
+    let signature =
+        manifest::sign_manifest(toml.as_bytes(), signer).map_err(|e| io_other(e.to_string()))?;
+    manifest::write_manifest(&toml, &signature, dest_dir).map_err(|e| io_other(e.to_string()))?;
+    Ok(entries.len())
+}
+
+fn rewrite_dev_manifest(runtime: &DevRuntimeEnv) -> io::Result<usize> {
+    let signing_key = identity_root::read_existing_dev_identity_root_signing_key()
+        .map_err(io_other)?
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "dev IdentityRoot missing; run `ember dev install` first",
+            )
+        })?;
+    let dest_dir = manifest::manifest_dest_dir(&runtime.manifest_path).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "manifest destination not resolvable (no HOME?)",
+        )
+    })?;
+    rewrite_manifest_with(&RealCommandRunner, &signing_key, &dest_dir)
+}
+
+fn verify_report_ready(report: &verify::DevInstallVerifyReport) -> io::Result<()> {
+    let issues = verify::readiness_issues(report);
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        Err(io_other(format!(
+            "dev daemon not ready: {}",
+            issues.join("; ")
+        )))
+    }
+}
+
+fn verify_ready_with_timeout(timeout: Duration, runtime: &DevRuntimeEnv) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        let err = match verify::verify_dev_install_for(runtime) {
+            Ok(report) => match verify_report_ready(&report) {
+                Ok(()) => return Ok(()),
+                Err(err) => err,
+            },
+            Err(err) => io_other(err.to_string()),
+        };
+
+        if Instant::now() >= deadline {
+            return Err(err);
+        }
+
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 /// Resolve the workspace root: use `args.workspace_root` if set; otherwise
 /// walk up from `$PWD` looking for a `Cargo.toml`.
-fn resolve_workspace_root(args: &SyncArgs) -> io::Result<PathBuf> {
+fn resolve_workspace_root_arg(args: &SyncArgs) -> io::Result<PathBuf> {
     if let Some(ref root) = args.workspace_root {
         return Ok(root.clone());
     }
-    // Walk up from CWD to find the workspace Cargo.toml.
-    let cwd = std::env::current_dir()?;
-    let mut candidate = cwd.as_path();
-    loop {
-        if candidate.join("Cargo.toml").exists() {
-            return Ok(candidate.to_path_buf());
-        }
-        match candidate.parent() {
-            Some(p) => candidate = p,
-            None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "could not locate workspace Cargo.toml walking up from $PWD",
-                ));
-            }
-        }
-    }
+    resolve_workspace_root().map_err(io_other)
 }
 
 /// Run `ember dev sync`.
@@ -185,7 +236,9 @@ fn resolve_workspace_root(args: &SyncArgs) -> io::Result<PathBuf> {
 /// Returns an `io::Error` describing the first failure encountered. Partial
 /// progress is printed to stderr before returning.
 pub fn run(args: &SyncArgs) -> io::Result<()> {
-    let workspace_root = resolve_workspace_root(args)?;
+    let workspace_root = resolve_workspace_root_arg(args)?;
+    let runtime =
+        resolve_dev_runtime_for_workspace_root(&workspace_root).map_err(io_other)?;
 
     // --- Step 1: incremental cargo build ---
     eprintln!("[dev sync] building {} …", SYNC_TARGETS.join(", "));
@@ -196,7 +249,7 @@ pub fn run(args: &SyncArgs) -> io::Result<()> {
     let mut changed_count = 0usize;
     for &target in SYNC_TARGETS {
         let built = built_path(&workspace_root, target);
-        let installed = installed_path(target);
+        let installed = installed_path(&runtime, target);
 
         if !built.exists() {
             eprintln!(
@@ -209,7 +262,7 @@ pub fn run(args: &SyncArgs) -> io::Result<()> {
         let changed = binary_changed(&built, &installed)?;
         if changed {
             // TODO(phase-2): run the dev IdentityRoot sign pipeline here
-            // (implementation-note-419 phase 6) before copying.
+            // (implementation-note-468 phase 6) before copying.
             eprintln!(
                 "[dev sync] {} changed — copying to {}",
                 target,
@@ -222,10 +275,12 @@ pub fn run(args: &SyncArgs) -> io::Result<()> {
         }
     }
 
-    // --- Step 4: manifest re-gen (TODO stub) ---
+    // --- Step 4: manifest re-gen ---
     if changed_count > 0 {
+        let entry_count = rewrite_dev_manifest(&runtime)?;
         eprintln!(
-            "[dev sync] TODO: follow-up subtask — re-generate dev manifest (EMBER-DEV-INSTALL slice-B)"
+            "[dev sync] manifest refreshed — {entry_count} tool entr{} signed",
+            if entry_count == 1 { "y" } else { "ies" }
         );
     }
 
@@ -234,14 +289,17 @@ pub fn run(args: &SyncArgs) -> io::Result<()> {
         eprintln!("[dev sync] --no-launchctl set — skipping daemon kickstart");
     } else {
         eprintln!("[dev sync] kicking dev daemon …");
-        launchctl_kickstart(crate::install_paths::DEV_PLIST_LABEL)?;
+        launchctl_kickstart(&runtime.plist_label)?;
         eprintln!("[dev sync] daemon kickstarted");
     }
 
-    // --- Step 6: daemon verify (TODO stub) ---
-    eprintln!(
-        "[dev sync] TODO: follow-up subtask — poll dev socket + verify daemon liveness (EMBER-DEV-INSTALL slice-B)"
-    );
+    // --- Step 6: daemon verify ---
+    if args.no_launchctl {
+        eprintln!("[dev sync] --no-launchctl set — skipping daemon readiness verify");
+    } else {
+        verify_ready_with_timeout(Duration::from_secs(SYNC_VERIFY_TIMEOUT_SECS), &runtime)?;
+        eprintln!("[dev sync] daemon verify OK");
+    }
 
     if changed_count > 0 {
         eprintln!("[dev sync] done — {changed_count} binary(s) updated");
@@ -255,6 +313,7 @@ pub fn run(args: &SyncArgs) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
     use std::fs;
     use tempfile::TempDir;
 
@@ -355,12 +414,15 @@ mod tests {
     // --- installed_path / built_path shape checks ---
 
     #[test]
-    fn installed_path_is_under_dev_install_root() {
-        let p = installed_path("ember-daemon");
-        let root = PathBuf::from(DEV_INSTALL_ROOT);
+    fn installed_path_is_under_worktree_dev_install_root() {
+        let runtime = crate::dev_runtime::derive_dev_runtime_env(
+            Path::new("/home/test-operator"),
+            Path::new("/tmp/emberlink-dev/worktree-a"),
+        );
+        let p = installed_path(&runtime, "ember-daemon");
         assert!(
-            p.starts_with(&root),
-            "installed_path must be under DEV_INSTALL_ROOT: {}",
+            p.starts_with(&runtime.install_root),
+            "installed_path must be under worktree install root: {}",
             p.display()
         );
     }
@@ -378,11 +440,96 @@ mod tests {
 
     #[test]
     fn installed_paths_for_different_targets_are_distinct() {
-        let p1 = installed_path("ember-daemon");
-        let p2 = installed_path("ember-construct");
+        let runtime = crate::dev_runtime::derive_dev_runtime_env(
+            Path::new("/home/test-operator"),
+            Path::new("/tmp/emberlink-dev/worktree-a"),
+        );
+        let p1 = installed_path(&runtime, "ember-daemon");
+        let p2 = installed_path(&runtime, "ember-construct");
         assert_ne!(
             p1, p2,
             "different targets must have different install paths"
         );
+    }
+
+    #[test]
+    fn verify_report_ready_rejects_missing_runtime_truth() {
+        let report = verify::DevInstallVerifyReport {
+            daemon_pid: None,
+            manifest_fingerprint: Some("abc".to_string()),
+            registered_broker_count: Some(0),
+            trust_roots: Some(vec![]),
+        };
+        let err = verify_report_ready(&report).expect_err("missing readiness must fail");
+        assert!(
+            err.to_string().contains("not ready"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_report_ready_accepts_ready_report() {
+        let report = verify::DevInstallVerifyReport {
+            daemon_pid: Some(42),
+            manifest_fingerprint: Some("abc".to_string()),
+            registered_broker_count: Some(3),
+            trust_roots: Some(vec!["root".to_string()]),
+        };
+        verify_report_ready(&report).expect("populated report must be ready");
+    }
+
+    struct SyncManifestRunner {
+        tools: std::collections::HashMap<String, PathBuf>,
+    }
+
+    impl SyncManifestRunner {
+        fn new(tools: std::collections::HashMap<String, PathBuf>) -> Self {
+            Self { tools }
+        }
+    }
+
+    impl CommandRunner for SyncManifestRunner {
+        fn run(&self, program: &str, args: &[&str]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+            if program == "which" {
+                let tool = args.first().copied().unwrap_or_default();
+                return match self.tools.get(tool) {
+                    Some(path) => Ok(format!("{}\n", path.display()).into_bytes()),
+                    None => Err(format!("which: {tool} not found").into()),
+                };
+            }
+            let tool = self
+                .tools
+                .keys()
+                .find(|candidate| candidate.as_str() == program)
+                .ok_or_else(|| format!("{program}: command not found"))?;
+            Ok(format!("{tool} version 1.0.0\n").into_bytes())
+        }
+    }
+
+    #[test]
+    fn rewrite_manifest_with_writes_signed_manifest_files() {
+        let tmp = scratch();
+        let tools_dir = tmp.path().join("tools");
+        fs::create_dir_all(&tools_dir).unwrap();
+        let gh_path = tools_dir.join("gh");
+        let git_path = tools_dir.join("git");
+        fs::write(&gh_path, b"gh-binary").unwrap();
+        fs::write(&git_path, b"git-binary").unwrap();
+
+        let mut tools = std::collections::HashMap::new();
+        tools.insert("gh".to_string(), gh_path.clone());
+        tools.insert("git".to_string(), git_path.clone());
+
+        let runner = SyncManifestRunner::new(tools);
+        let dest_dir = tmp.path().join("manifest-out");
+        let signer = SigningKey::from_bytes(&[7u8; 32]);
+
+        let count = rewrite_manifest_with(&runner, &signer, &dest_dir).expect("rewrite manifest");
+        assert_eq!(count, 2, "expected gh + git entries");
+        assert!(dest_dir.join("manifest.toml").exists());
+        assert!(dest_dir.join("manifest.toml.sig").exists());
+        let manifest_text = fs::read_to_string(dest_dir.join("manifest.toml")).unwrap();
+        assert!(manifest_text.contains("name = \"gh\""));
+        assert!(manifest_text.contains("name = \"git\""));
     }
 }

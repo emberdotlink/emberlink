@@ -1,5 +1,5 @@
 //!
-//! T2 integration tests for the `EdgeListener` mTLS gate (implementation-note-362).
+//! T2 integration tests for the `EdgeListener` mTLS gate (implementation-note-405).
 //!
 //! These tests use fixture-generated CAs and certs — no real network, no real
 //! filesystem state, no keychain. They bind on ephemeral loopback ports

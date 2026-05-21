@@ -1,4 +1,4 @@
-//! Integration test for implementation-note-396.
+//! Integration test for implementation-note-445.
 //!
 //! Pins the load_config loud-fail contract: when no `--config`,
 //! `EMBER_CONFIG`, or `EMBER_DEMO_DIR` is set, AND `~/.ember/config.toml`

@@ -18,9 +18,9 @@
 //! methods just call through to the underlying sync `Vault` API
 //! directly rather than dispatching through `spawn_blocking`.
 //!
-//! # Receipt emission (implementation-note-116)
+//! # Receipt emission (implementation-note-132)
 //!
-//! Per implementation-note-185 security-review Findings 5 and 17 (audit-completeness
+//! Per implementation-note-208 security-review Findings 5 and 17 (audit-completeness
 //! gap for vault reads), every successful `get` emits a v2
 //! [`ReceiptEnvelope`] with `kind = "vault.read"`. Emission is
 //! best-effort — failures to sign or persist log a warning but do not
@@ -42,7 +42,7 @@ use crate::infra::vault::{VaultError, VaultScope, logical_name_from_storage};
 use super::{CredentialStore, StoreError};
 
 /// v2 kind discriminator for `LocalEncryptedStore::get` success-path
-/// audit. Per implementation-note-116 (Findings 5, 17 — daemon
+/// audit. Per implementation-note-132 (Findings 5, 17 — daemon
 /// vault reads must leave a signed receipt so post-hoc audit can
 /// reconstruct which credentials were read by whom and when).
 pub(crate) const RECEIPT_KIND_VAULT_READ: &str = "vault.read";
@@ -56,7 +56,7 @@ enum VaultSource {
 
 /// `CredentialStore` impl backed by the local sealed-credential vault.
 ///
-/// implementation-note-186: the live vault is resolved from the shared
+/// implementation-note-209: the live vault is resolved from the shared
 /// store slot at point of use instead of being owned directly here. That lets
 /// explicit lock cut off credential-store reads without needing to tear down
 /// the helper itself.
@@ -311,6 +311,30 @@ fn map_vault_error(e: VaultError, key: &str) -> StoreError {
             // human-readable rendering of the path-grammar violation.
             StoreError::Other(format!("invalid credential name: {}", name_err))
         }
+        // implementation-note-210 sealed-blob variants. These
+        // errors only surface from `export_mek_sealed`/`import_mek_sealed`
+        // (the vault-level sealed-export substrate), not from the
+        // get/list/add/remove credential paths this mapper serves. Map
+        // through `Other` with the variant's Display so an unexpected
+        // surface still produces a useful operator-facing message.
+        sealed @ (VaultError::SealedBlobInvalid(_)
+        | VaultError::SealedBlobTruncated { .. }
+        | VaultError::SealedBlobBadMagic { .. }
+        | VaultError::SealedBlobUnknownVersion { .. }
+        | VaultError::SealedBlobUnknownKdf { .. }
+        | VaultError::SealedBlobUnknownAead { .. }
+        | VaultError::SealedBlobFingerprintMismatch { .. }
+        | VaultError::SealedBlobAeadFailure) => {
+            StoreError::Other(format!("sealed-blob: {sealed}"))
+        }
+        // implementation-note-211 — same shape: surfaces
+        // from the rotation-witness emit path
+        // (`emit_identity_rotation_witness`) which the credential
+        // store does not call today, but the variant must still be
+        // covered so the match stays exhaustive.
+        emit @ VaultError::WitnessEmit(_) => {
+            StoreError::Other(format!("identity-rotation-witness: {emit}"))
+        }
     }
 }
 
@@ -322,7 +346,7 @@ impl CredentialStore for LocalEncryptedStore {
             .get(scope, &self.store, key)
             .map_err(|e| map_vault_error(e, key))?;
 
-        // implementation-note-116: emit a v2 `vault.read` Receipt
+        // implementation-note-132: emit a v2 `vault.read` Receipt
         // on the success path so the audit trail includes every
         // daemon-side credential read. Best-effort — emission failures
         // log a warning but do NOT fail the read.
@@ -372,7 +396,7 @@ impl CredentialStore for LocalEncryptedStore {
 }
 
 // ---------------------------------------------------------------------------
-// Receipt emission (implementation-note-116)
+// Receipt emission (implementation-note-132)
 // ---------------------------------------------------------------------------
 
 /// Best-effort: build, sign, and persist a v2 `vault.read` Receipt for
@@ -910,7 +934,7 @@ mod tests {
         });
     }
 
-    /// implementation-note-116: with the daemon identity
+    /// implementation-note-132: with the daemon identity
     /// initialised, a successful `get` must leave a signed
     /// `vault.read` row in the audit log carrying the credential
     /// name + the signed envelope JSON.
@@ -992,7 +1016,7 @@ mod tests {
         });
     }
 
-    /// implementation-note-116: a cache-miss `get` (NotFound)
+    /// implementation-note-132: a cache-miss `get` (NotFound)
     /// must NOT emit a vault.read audit row — emission is success-path
     /// only so the audit log reflects credentials actually exposed.
     #[test]

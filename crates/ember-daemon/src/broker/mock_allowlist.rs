@@ -1,5 +1,5 @@
 //!
-//! implementation-note-122 (design §Component 2) —
+//! implementation-note-138 (design §Component 2) —
 //! parser + helper for `EMBER_ALLOW_MOCK_BROKERS`. MockBroker registration
 //! is now an explicit opt-in: missing provider credentials FAIL daemon
 //! startup unless the operator has named the provider in this allowlist.

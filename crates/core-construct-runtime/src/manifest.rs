@@ -2,14 +2,15 @@
 //!
 //! Minimal in-crate parser scoped to the action surface that
 //! [`crate::preflight`] needs: the `[meta] name`, manifest/action
-//! `authority_refs`, and the union of `[[actions]] key` strings. The
+//! `authority_refs`, manifest-level `headless_requirements`, and the union of
+//! `[[actions]] key` strings. The
 //! canonical schema validator with all eight invariants lives in
 //! `core-events::construct_toml`; this reader is the smallest
 //! dependency-free surface runtime-layer needs to consume the legacy
 //! `[[actions]]` array-of-tables shape that the bundled cohort-A
 //! manifests in `crates/ember-construct/construct/*.toml` ship today.
 //!
-//! Phase 2 slice B (implementation-note-15): used by
+//! Phase 2 slice B (implementation-note-18): used by
 //! the Layer 1 pre-flight resolver to cross-reference task `constructs`
 //! declarations against the manifest action surface. The fuller
 //! `schema_version = "1"` shape validated by `core-events` is intended for
@@ -55,6 +56,13 @@ pub struct ConstructManifest {
     /// `"aws_sts"`). Empty means the manifest intentionally makes no claim
     /// yet; callers must treat that as unresolved rather than guessing.
     pub authority_refs: Vec<String>,
+    /// Extra unattended/headless runtime requirements this Construct carries
+    /// beyond direct broker-authority shaping. Empty means no extra
+    /// requirement is declared. Current values are intentionally stringly and
+    /// minimal; for example `"runtime_kms"` means the queue is only
+    /// canonically unattended when a runtime KMS-backed secrets-provider lane
+    /// is live, not when a legacy passphrase env passthrough path is in play.
+    pub headless_requirements: Vec<String>,
     /// Action keys declared in `[[actions]] key = "..."` blocks, in the
     /// verbatim order they appear in the file. Cohort-A manifests use
     /// either bare keys (`pr_merge`) or tool-prefixed keys
@@ -90,6 +98,8 @@ struct RawMeta {
     name: String,
     #[serde(default)]
     authority_refs: Vec<String>,
+    #[serde(default)]
+    headless_requirements: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -143,6 +153,7 @@ pub fn parse_construct_manifest_str(text: &str) -> Result<ConstructManifest, tom
     let RawMeta {
         name,
         authority_refs: meta_authority_refs,
+        headless_requirements,
     } = meta;
     Ok(ConstructManifest {
         name,
@@ -151,6 +162,7 @@ pub fn parse_construct_manifest_str(text: &str) -> Result<ConstructManifest, tom
         } else {
             authority_refs
         },
+        headless_requirements,
         action_keys: actions.iter().map(|a| a.key.clone()).collect(),
         actions,
     })
@@ -223,6 +235,7 @@ biometric = "required"
         let m = parse_construct_manifest_str(GH_MANIFEST).expect("parses");
         assert_eq!(m.name, "ember-gh");
         assert_eq!(m.authority_refs, vec!["github"]);
+        assert!(m.headless_requirements.is_empty());
         assert_eq!(m.action_keys, vec!["pr_create", "pr_merge", "pr_list"]);
     }
 
@@ -231,6 +244,7 @@ biometric = "required"
         let m = parse_construct_manifest_str(KUBECTL_MANIFEST).expect("parses");
         assert_eq!(m.name, "ember-kubectl");
         assert!(m.authority_refs.is_empty());
+        assert!(m.headless_requirements.is_empty());
         assert_eq!(m.action_keys, vec!["kubectl.apply", "kubectl.delete"]);
     }
 
@@ -262,6 +276,7 @@ name = "ember-empty"
         let m = parse_construct_manifest_str(s).expect("parses");
         assert_eq!(m.name, "ember-empty");
         assert!(m.authority_refs.is_empty());
+        assert!(m.headless_requirements.is_empty());
         assert!(m.action_keys.is_empty());
     }
 
@@ -280,6 +295,22 @@ authority_refs = ["github", "vercel"]
         assert_eq!(m.actions.len(), 1);
         assert_eq!(m.actions[0].key, "toy.deploy");
         assert_eq!(m.actions[0].authority_refs, vec!["github", "vercel"]);
+    }
+
+    #[test]
+    fn parses_headless_requirements() {
+        let s = r#"
+[meta]
+name = "ember-pulumi"
+headless_requirements = ["runtime_kms"]
+
+[[actions]]
+key = "pulumi.up"
+"#;
+        let m = parse_construct_manifest_str(s).expect("parses");
+        assert_eq!(m.name, "ember-pulumi");
+        assert!(m.authority_refs.is_empty());
+        assert_eq!(m.headless_requirements, vec!["runtime_kms"]);
     }
 
     #[test]

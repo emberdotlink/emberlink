@@ -13,7 +13,21 @@ fn ember_bin() -> &'static str {
 }
 
 fn run(args: &[&str]) -> (String, String, i32) {
+    // ember-cli eager-loads `~/.ember/config.toml` before dispatching subcommands
+    // (implementation-note-445 loud-fail). receipt verify --file/--tree/
+    // --materialization don't actually need the config, but the eager-load runs
+    // anyway — see implementation-note-502.
+    // Until the structural fix ships, point EMBER_CONFIG at a writable tempdir
+    // for these tests so they pass on hosts without a host-level ~/.ember/config.toml.
+    let tmp = tempfile::tempdir().expect("config tempdir");
+    let config_path = tmp.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        "# fixture for receipt verify --file integration tests\n",
+    )
+    .expect("write fixture config");
     let out = Command::new(ember_bin())
+        .env("EMBER_CONFIG", &config_path)
         .args(args)
         .output()
         .expect("spawn ember");
@@ -58,8 +72,18 @@ fn verify_file_with_nonexistent_path_errors() {
 
 #[test]
 fn verify_file_with_garbage_json_errors() {
+    // EMBER_CONFIG env-pin per the run() helper's rationale (see top of file +
+    // implementation-note-502).
+    let tmp = tempfile::tempdir().expect("config tempdir");
+    let config_path = tmp.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        "# fixture for receipt verify --file integration tests\n",
+    )
+    .expect("write fixture config");
     let (_stdout, stderr, code) = {
         let mut child = Command::new(ember_bin())
+            .env("EMBER_CONFIG", &config_path)
             .args(["receipt", "verify", "--file", "-"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -87,7 +111,7 @@ fn verify_file_with_garbage_json_errors() {
 }
 
 // ---------------------------------------------------------------------------
-// v2 dispatch tests (implementation-note-450)
+// v2 dispatch tests (implementation-note-503)
 // ---------------------------------------------------------------------------
 
 /// Build a signed v2 ReceiptEnvelope using the deterministic FixtureSigner,

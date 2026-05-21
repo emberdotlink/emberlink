@@ -5,7 +5,7 @@
 //! `spiffe://emberd/container/<container-ref>`).
 //!
 //! Anchor: `parse_spiffe_uri_container` —
-//! implementation-note-25.
+//! implementation-note-31.
 //!
 //! Pure tests — no filesystem, no network, no `SystemTime::now()`.
 

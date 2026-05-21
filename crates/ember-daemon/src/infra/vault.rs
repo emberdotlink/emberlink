@@ -1,6 +1,6 @@
 //! Vault MEK + sealed-credentials store.
 //!
-//! implementation-note-314 — -A
+//! implementation-note-352 — -A
 //! (`vault_macos_se::get_mek_passphrase` already returns
 //! `Zeroizing<String>`; the caller at `Vault::open_from_config` binds
 //! the result directly and passes `&passphrase`, so the buffer is
@@ -37,11 +37,16 @@
 //! subsequent high-risk ops don't double-prompt within the idle window.
 
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce, aead::Aead, aead::Payload};
+use chrono::{DateTime, Utc};
+use core_crypto::{PublicKey, Signer};
+use core_events::receipt::envelope::{ReceiptEnvelope, ReceiptVersion, TerminationAuthority};
+use core_events::receipt::sign::{SignError, sign_receipt_v2};
+use ed25519_dalek::VerifyingKey;
 use rusqlite::{OptionalExtension, params};
 use tracing::{info, warn};
 use uuid::Uuid;
 
-/// implementation-note-27 C5 — AAD domain-separator prefix byte. AEAD
+/// implementation-note-33 C5 — AAD domain-separator prefix byte. AEAD
 /// associated data for every C5+-sealed credential row is the byte
 /// sequence `[AAD_VERSION_BYTE] || uuid_bytes_of_row_id` (17 bytes).
 /// The literal `0x01` future-proofs the format: if we ever rotate the
@@ -74,7 +79,7 @@ pub const DEFAULT_KEYRING_SERVICE: &str = "ember-daemon";
 /// Compile-time default keyring account name.
 pub const DEFAULT_KEYRING_ACCOUNT: &str = "vault";
 
-// implementation-note-27 C4 — Argon2id KDF parameter pins. The MEK is
+// implementation-note-33 C4 — Argon2id KDF parameter pins. The MEK is
 // derived by `Vault::from_passphrase` via Argon2id; pinning the cost
 // parameters here (and writing them to `vault.params` next to
 // `vault.salt`) lets `Vault::open_from_config` refuse to unlock a vault
@@ -118,11 +123,47 @@ pub enum VaultError {
     /// Only fired by `vault_add` for NEW entries; existing non-conformant
     /// entries are grandfathered (per design §5.4).
     InvalidName(VaultNameError),
+    /// Sealed-blob (implementation-note-210) parse/structural
+    /// error: invalid argon2 parameters, malformed length fields, AEAD
+    /// key-init failure, etc. `String` carries human-readable detail.
+    SealedBlobInvalid(String),
+    /// Sealed blob is shorter than the wire format requires. `need` is
+    /// the cumulative byte offset the reader tried to advance to; `have`
+    /// is the blob length.
+    SealedBlobTruncated { need: usize, have: usize },
+    /// First 4 bytes of the sealed blob are not `b"EMVS"`. Returned as
+    /// raw bytes so the caller can log the actual value without lossy
+    /// UTF-8 conversion.
+    SealedBlobBadMagic { got: [u8; 4] },
+    /// Sealed-blob version is not the one this build knows how to read.
+    SealedBlobUnknownVersion { got: u16 },
+    /// kdf_id field is not a value this build recognises (currently
+    /// only `0x01` = argon2id).
+    SealedBlobUnknownKdf { got: u8 },
+    /// aead_id field is not a value this build recognises (currently
+    /// only `0x01` = XChaCha20-Poly1305).
+    SealedBlobUnknownAead { got: u8 },
+    /// The fingerprint embedded in the sealed blob (or recomputed from
+    /// the recovered MEK) does not match the value the caller supplied.
+    /// Indicates either operator error (wrong vault) or blob tampering.
+    SealedBlobFingerprintMismatch { expected: String, actual: String },
+    /// AEAD authentication tag failed during sealed-blob import.
+    /// Surfaces as a single variant rather than a free-form crypto
+    /// message so callers can fingerprint the wrong-passphrase /
+    /// tampered-ciphertext case explicitly.
+    SealedBlobAeadFailure,
+    /// implementation-note-316 — emission
+    /// of an `IdentityRotationWitness` Receipt failed. Surfaces signing
+    /// failures from `core_events::receipt::sign::sign_receipt_v2`
+    /// (canonicalize, serialize, etc.) so callers can distinguish
+    /// crypto-layer faults from store-layer faults when persistence
+    /// would otherwise mask the underlying signer error.
+    WitnessEmit(String),
 }
 
 /// Reasons a credential name fails the design path grammar.
 ///
-/// Grammar (per task brief implementation-note-315):
+/// Grammar (per task brief implementation-note-353):
 ///   - Lowercase ASCII letters `a-z`
 ///   - Digits `0-9`
 ///   - Hyphens `-`
@@ -263,6 +304,33 @@ impl std::fmt::Display for VaultError {
             VaultError::Io(s) => write!(f, "io error: {s}"),
             VaultError::ProductionSentinelMissing(s) => write!(f, "{s}"),
             VaultError::InvalidName(e) => write!(f, "invalid credential name: {e}"),
+            VaultError::SealedBlobInvalid(s) => write!(f, "sealed blob invalid: {s}"),
+            VaultError::SealedBlobTruncated { need, have } => write!(
+                f,
+                "sealed blob truncated: need {need} bytes, have {have}"
+            ),
+            VaultError::SealedBlobBadMagic { got } => write!(
+                f,
+                "sealed blob bad magic: expected EMVS, got {:02x}{:02x}{:02x}{:02x}",
+                got[0], got[1], got[2], got[3]
+            ),
+            VaultError::SealedBlobUnknownVersion { got } => {
+                write!(f, "sealed blob unknown version: {got:#06x}")
+            }
+            VaultError::SealedBlobUnknownKdf { got } => {
+                write!(f, "sealed blob unknown kdf_id: {got:#04x}")
+            }
+            VaultError::SealedBlobUnknownAead { got } => {
+                write!(f, "sealed blob unknown aead_id: {got:#04x}")
+            }
+            VaultError::SealedBlobFingerprintMismatch { expected, actual } => write!(
+                f,
+                "sealed blob fingerprint mismatch: expected {expected}, got {actual}"
+            ),
+            VaultError::SealedBlobAeadFailure => {
+                write!(f, "sealed blob AEAD authentication failed (wrong passphrase or tampered ciphertext)")
+            }
+            VaultError::WitnessEmit(s) => write!(f, "identity rotation witness emit failed: {s}"),
         }
     }
 }
@@ -275,6 +343,12 @@ impl From<StoreError> for VaultError {
     }
 }
 
+impl From<SignError> for VaultError {
+    fn from(e: SignError) -> Self {
+        VaultError::WitnessEmit(e.to_string())
+    }
+}
+
 pub struct CredentialInfo {
     pub id: String,
     pub name: String,
@@ -284,7 +358,7 @@ pub struct CredentialInfo {
 
 /// Which user-presence policy lane is calling into the vault.
 ///
-/// Phase 2A (`implementation-note-316`) makes the parameter
+/// Phase 2A (`implementation-note-354`) makes the parameter
 /// load-bearing for storage namespace selection: `Headless` now maps to a
 /// dedicated internal row-name prefix while `Interactive` preserves the
 /// historical flat names. The per-scope MEK split is still follow-up work.
@@ -396,11 +470,11 @@ pub enum VaultKeyStore {
 
 /// MEK holder for the daemon's sealed-credentials store.
 ///
-/// **implementation-note-27 C1**: `Vault` is `ZeroizeOnDrop` so the
+/// **implementation-note-33 C1**: `Vault` is `ZeroizeOnDrop` so the
 /// in-memory MEK is wiped on Drop (explicit lock, daemon shutdown, the
 /// final `Rc<Vault>` / `Arc<Vault>` reference going away).
 ///
-/// implementation-note-317 (F-S1-001 HIGH + F-S1-008 LOW): `Clone` is
+/// implementation-note-355 (F-S1-001 HIGH + F-S1-008 LOW): `Clone` is
 /// REMOVED. Prior to this commit `Vault` derived `Clone` so the in-memory
 /// MEK byte-array could be by-value-copied across LocalSet spawn boundaries
 /// (runtime.rs spawned each proxy + dashboard task with a fresh
@@ -429,7 +503,7 @@ impl Vault {
     /// compile-time-pinned parameters (`VAULT_ARGON2_*` constants).
     /// Matches `Argon2::default()` in argon2 v0.5 — existing vaults
     /// sealed under the default continue to decrypt without rotation
-    /// (implementation-note-27 C4).
+    /// (implementation-note-33 C4).
     pub fn from_passphrase(passphrase: &str, salt: &[u8; 16]) -> Self {
         let params = argon2::Params::new(
             VAULT_ARGON2_M_KIB,
@@ -528,7 +602,7 @@ fn open_from_config_with_presence(
     presence: PresenceAfterOpen,
 ) -> Result<Vault, VaultError> {
     let salt = vault_salt(config)?;
-    // implementation-note-27 C4: refuse to unlock if vault.params
+    // implementation-note-33 C4: refuse to unlock if vault.params
     // disagrees with the compile-time Argon2 pin. Runs BEFORE any
     // keyring access so a param mismatch aborts before a (potentially
     // user-presence-gated) Keychain prompt fires.
@@ -536,7 +610,7 @@ fn open_from_config_with_presence(
     let service = resolve_keyring_service(&config.keyring);
     let account = resolve_keyring_account(&config.keyring);
 
-    // implementation-note-318 — macOS separate-uid posture (design).
+    // implementation-note-356 — macOS separate-uid posture (design).
     // The system-uid LaunchDaemon install lane has no login keychain
     // and cannot reach the operator's SE-wrapped keychain entry, so we
     // route through the on-disk SE-wrapped MEK blob laid down at
@@ -578,7 +652,7 @@ fn open_with_key_store_and_presence(
     key_store: &VaultKeyStore,
     presence: PresenceAfterOpen,
 ) -> Result<Vault, VaultError> {
-    // implementation-note-27 C4: same params gate as
+    // implementation-note-33 C4: same params gate as
     // `open_from_config` — runs before any keyring access so a
     // mismatch aborts before a (potentially user-presence-gated)
     // Keychain prompt fires.
@@ -695,7 +769,7 @@ impl Vault {
         validate_credential_name(name).map_err(VaultError::InvalidName)?;
         let stored_name = storage_name_for_scope(scope, name);
 
-        // implementation-note-27 C5: mint the row id BEFORE encrypting
+        // implementation-note-33 C5: mint the row id BEFORE encrypting
         // so the AEAD AAD can be bound to the row's UUID. AAD format is
         // `[0x01, row_uuid_bytes...]` (17 bytes). Decrypt-side (Vault::get)
         // tries this AAD first, falling back to no-AAD for legacy rows.
@@ -781,7 +855,7 @@ impl Vault {
         store: &DaemonStore,
         name: &str,
     ) -> Result<Vec<u8>, VaultError> {
-        // implementation-note-27 C5: select the row id alongside
+        // implementation-note-33 C5: select the row id alongside
         // nonce/ciphertext so the AAD-aware decrypt can bind to it.
         // Legacy rows whose id parses cleanly still flow through the
         // AAD-aware path first; the fallback path below catches any
@@ -865,7 +939,7 @@ impl Vault {
     /// `UnlockPinTracker` calls into this method when the grace window
     /// expires with no live pins. Phase 1 logs the request but does not
     /// actually zero the MEK reference — the real implementation lands in
-    /// **Phase 2** (`implementation-note-313`) alongside the
+    /// **Phase 2** (`implementation-note-351`) alongside the
     /// session-lifecycle wiring that calls it. The Phase 1 stub exists so
     /// the substrate (the pin tracker + the API hook on Vault) can land in
     /// isolation without the multi-file lifecycle changes.
@@ -902,7 +976,7 @@ impl Vault {
         validate_credential_name(name).map_err(VaultError::InvalidName)?;
         let stored_name = storage_name_for_scope(scope, name);
 
-        // implementation-note-27 C5: mint id first, bind AAD to the
+        // implementation-note-33 C5: mint id first, bind AAD to the
         // new row's UUID. Same pattern as `Vault::add`.
         let id = format!("cred-{}", Uuid::new_v4());
         let aad = aad_for_row_id(&id).expect("freshly-minted cred-<uuid> id parses");
@@ -957,6 +1031,565 @@ impl Vault {
     }
 }
 
+// sealed_mek_blob_format_landed
+//
+// implementation-note-357 — sealed-blob
+// wire format + argon2id-KEK-wrapped MEK. Daemon-side substrate for
+// vault export/import (the CLI surface lands in a later slice).
+//
+// Wire format v1 (little-endian):
+//
+//   magic:       4B  = b"EMVS"           ("Ember MEK Vault Sealed")
+//   version:     2B  = 0x0001 (LE u16)
+//   kdf_id:      1B  = 0x01 (argon2id)
+//   aead_id:     1B  = 0x01 (xchacha20-poly1305)
+//   salt_len:    1B  = 32
+//   salt:        32B
+//   argon2_ops:  4B  (LE u32; min 3)
+//   argon2_mem:  4B  (LE u32 KiB; min 65536)
+//   argon2_par:  1B  (default 1)
+//   nonce_len:   1B  = 24
+//   nonce:       24B (xchacha20 nonce)
+//   fp_len:      1B
+//   fingerprint: <fp_len>B (BLAKE3-32 hex string, matches vault_meta.mek_fingerprint)
+//   ct_len:      4B  (LE u32)
+//   ciphertext:  <ct_len>B (AEAD(KEK, nonce, MEK))
+//
+// The KEK is derived from the operator passphrase via Argon2id over the
+// embedded salt with the embedded cost parameters. Refuses on bad
+// magic, unknown version, unknown kdf_id/aead_id, fingerprint mismatch,
+// AEAD tag failure, or any length/encoding violation.
+
+/// Sealed-blob format constants — pinned at compile time so the wire
+/// format is locked. Bumping the version requires explicit migration
+/// logic.
+pub(crate) const SEALED_BLOB_MAGIC: [u8; 4] = *b"EMVS";
+/// Sealed-blob format version (LE u16). Future format breaks bump this.
+pub(crate) const SEALED_BLOB_VERSION: u16 = 0x0001;
+/// KDF identifier for argon2id.
+pub(crate) const SEALED_BLOB_KDF_ARGON2ID: u8 = 0x01;
+/// AEAD identifier for XChaCha20-Poly1305.
+pub(crate) const SEALED_BLOB_AEAD_XCHACHA20POLY1305: u8 = 0x01;
+/// Fixed salt length for the embedded argon2id salt (bytes).
+pub(crate) const SEALED_BLOB_SALT_LEN: u8 = 32;
+/// Fixed nonce length for XChaCha20-Poly1305 (bytes).
+pub(crate) const SEALED_BLOB_NONCE_LEN: u8 = 24;
+/// Default argon2id ops parameter (interactive). Minimum per the format.
+pub(crate) const SEALED_BLOB_ARGON2_OPS_DEFAULT: u32 = 3;
+/// Default argon2id memory parameter in KiB (interactive, 64 MiB).
+pub(crate) const SEALED_BLOB_ARGON2_MEM_KIB_DEFAULT: u32 = 65536;
+/// Default argon2id parallelism factor.
+pub(crate) const SEALED_BLOB_ARGON2_PAR_DEFAULT: u8 = 1;
+/// Minimum permitted argon2id ops (refuse to import below this).
+pub(crate) const SEALED_BLOB_ARGON2_OPS_MIN: u32 = 3;
+/// Minimum permitted argon2id memory in KiB (refuse to import below this).
+pub(crate) const SEALED_BLOB_ARGON2_MEM_KIB_MIN: u32 = 65536;
+
+/// Derive a 32-byte KEK from a passphrase + salt + argon2id cost
+/// parameters. Used by both `export_mek_sealed` (to wrap the MEK) and
+/// `import_mek_sealed` (to unwrap it). The output is wrapped in
+/// `Zeroizing` so the KEK is overwritten on drop — the unwrap path
+/// borrows the bytes into the AEAD cipher and then drops the wrapper.
+fn derive_sealed_kek(
+    passphrase: &str,
+    salt: &[u8],
+    ops: u32,
+    mem_kib: u32,
+    par: u8,
+) -> Result<zeroize::Zeroizing<[u8; 32]>, VaultError> {
+    let params = argon2::Params::new(mem_kib, ops, par as u32, Some(32)).map_err(|e| {
+        VaultError::SealedBlobInvalid(format!("argon2 params invalid: {e}"))
+    })?;
+    let argon2 =
+        argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+    let mut kek = zeroize::Zeroizing::new([0u8; 32]);
+    argon2
+        .hash_password_into(passphrase.as_bytes(), salt, kek.as_mut_slice())
+        .map_err(|e| VaultError::SealedBlobInvalid(format!("argon2 derive failed: {e}")))?;
+    Ok(kek)
+}
+
+/// Compute the canonical MEK fingerprint — `blake3(MEK_bytes).hex()`.
+/// Matches `vault_meta.mek_fingerprint` (Slice B). Exposed here so
+/// callers building a sealed blob (`ember vault export --sealed`) can
+/// pass the same fingerprint they will record on import.
+pub fn mek_fingerprint_hex(mek: &[u8]) -> String {
+    hex::encode(blake3::hash(mek).as_bytes())
+}
+
+/// Sealed export of the live MEK. Wraps `mek` under an argon2id-derived
+/// KEK from `passphrase` using XChaCha20-Poly1305 AEAD. The returned
+/// blob is the v1 wire format documented above. `plaintext_fingerprint`
+/// MUST equal `mek_fingerprint_hex(mek)` — the caller is expected to
+/// pass the same fingerprint recorded in `vault_meta.mek_fingerprint`,
+/// and this function refuses on mismatch so an inconsistent blob is
+/// never produced.
+pub fn export_mek_sealed(
+    mek: &[u8],
+    passphrase: &str,
+    plaintext_fingerprint: &str,
+) -> Result<Vec<u8>, VaultError> {
+    if mek.is_empty() {
+        return Err(VaultError::SealedBlobInvalid(
+            "MEK bytes are empty".to_string(),
+        ));
+    }
+    let expected_fp = mek_fingerprint_hex(mek);
+    if expected_fp != plaintext_fingerprint {
+        return Err(VaultError::SealedBlobFingerprintMismatch {
+            expected: expected_fp,
+            actual: plaintext_fingerprint.to_string(),
+        });
+    }
+    if plaintext_fingerprint.len() > u8::MAX as usize {
+        return Err(VaultError::SealedBlobInvalid(format!(
+            "fingerprint too long: {} bytes (max {})",
+            plaintext_fingerprint.len(),
+            u8::MAX
+        )));
+    }
+
+    // Fresh salt + nonce for every export. Each call produces a distinct
+    // ciphertext even for the same (MEK, passphrase).
+    let mut salt = [0u8; SEALED_BLOB_SALT_LEN as usize];
+    getrandom::fill(&mut salt).expect("OS entropy failure");
+    let mut nonce_bytes = [0u8; SEALED_BLOB_NONCE_LEN as usize];
+    getrandom::fill(&mut nonce_bytes).expect("OS entropy failure");
+
+    let ops = SEALED_BLOB_ARGON2_OPS_DEFAULT;
+    let mem_kib = SEALED_BLOB_ARGON2_MEM_KIB_DEFAULT;
+    let par = SEALED_BLOB_ARGON2_PAR_DEFAULT;
+
+    let kek = derive_sealed_kek(passphrase, &salt, ops, mem_kib, par)?;
+    let cipher = XChaCha20Poly1305::new_from_slice(kek.as_slice())
+        .map_err(|e| VaultError::SealedBlobInvalid(format!("AEAD key init failed: {e}")))?;
+    let nonce = XNonce::from_slice(&nonce_bytes);
+    let ciphertext = cipher
+        .encrypt(nonce, mek)
+        .map_err(|e| VaultError::Crypto(e.to_string()))?;
+
+    if ciphertext.len() > u32::MAX as usize {
+        return Err(VaultError::SealedBlobInvalid(format!(
+            "ciphertext too long: {} bytes (max u32)",
+            ciphertext.len()
+        )));
+    }
+
+    // Assemble the wire format. The capacity reserve is tight — every
+    // field length is known up front.
+    let fp_bytes = plaintext_fingerprint.as_bytes();
+    let mut out = Vec::with_capacity(
+        4 + 2 + 1 + 1 + 1
+            + SEALED_BLOB_SALT_LEN as usize
+            + 4 + 4 + 1 + 1
+            + SEALED_BLOB_NONCE_LEN as usize
+            + 1 + fp_bytes.len()
+            + 4 + ciphertext.len(),
+    );
+    out.extend_from_slice(&SEALED_BLOB_MAGIC);
+    out.extend_from_slice(&SEALED_BLOB_VERSION.to_le_bytes());
+    out.push(SEALED_BLOB_KDF_ARGON2ID);
+    out.push(SEALED_BLOB_AEAD_XCHACHA20POLY1305);
+    out.push(SEALED_BLOB_SALT_LEN);
+    out.extend_from_slice(&salt);
+    out.extend_from_slice(&ops.to_le_bytes());
+    out.extend_from_slice(&mem_kib.to_le_bytes());
+    out.push(par);
+    out.push(SEALED_BLOB_NONCE_LEN);
+    out.extend_from_slice(&nonce_bytes);
+    out.push(fp_bytes.len() as u8);
+    out.extend_from_slice(fp_bytes);
+    out.extend_from_slice(&(ciphertext.len() as u32).to_le_bytes());
+    out.extend_from_slice(&ciphertext);
+
+    Ok(out)
+}
+
+/// Cursor-style reader over a sealed blob. Bounds-checked: every `take`
+/// returns `Err(VaultError::SealedBlobTruncated)` rather than panicking
+/// when the blob is shorter than expected.
+struct SealedBlobReader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> SealedBlobReader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8], VaultError> {
+        let end = self.pos.checked_add(n).ok_or_else(|| {
+            VaultError::SealedBlobInvalid("length overflow while reading blob".to_string())
+        })?;
+        if end > self.buf.len() {
+            return Err(VaultError::SealedBlobTruncated {
+                need: end,
+                have: self.buf.len(),
+            });
+        }
+        let out = &self.buf[self.pos..end];
+        self.pos = end;
+        Ok(out)
+    }
+
+    fn take_u8(&mut self) -> Result<u8, VaultError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn take_u16_le(&mut self) -> Result<u16, VaultError> {
+        let b = self.take(2)?;
+        Ok(u16::from_le_bytes([b[0], b[1]]))
+    }
+
+    fn take_u32_le(&mut self) -> Result<u32, VaultError> {
+        let b = self.take(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn remaining(&self) -> usize {
+        self.buf.len().saturating_sub(self.pos)
+    }
+}
+
+/// Verifies + unwraps a sealed blob. Returns the MEK bytes on success.
+/// `expected_fingerprint` MUST equal the fingerprint embedded in the
+/// blob; this is a defence-in-depth check so a caller that has a
+/// fingerprint commitment (e.g. from `vault_meta`) cannot accept a blob
+/// that decrypts to a different MEK than they expect. The recovered
+/// MEK is also re-fingerprinted post-decrypt and checked against the
+/// same value — so a tampered fingerprint field still cannot smuggle a
+/// substituted MEK past the import.
+///
+/// **Rotation-witness hook (anchor: `rotation_witness_emitted_at_mek_rotation`):**
+/// The caller of `import_mek_sealed` is responsible for invoking
+/// [`emit_identity_rotation_witness`] BEFORE the prior identity key is
+/// zeroized, so the chain-walking
+/// `verify_receipt_v2_with_rotation_chain` verifier (Slice E3) can
+/// thread a pre-rotation trust anchor forward across the rotation.
+/// `import_mek_sealed` itself is a low-level blob-unwrap primitive
+/// without access to a `DaemonStore` or the prior `DaemonPersona`, so
+/// the actual emission lives at the rotation-aware caller. See
+/// [`emit_identity_rotation_witness`] for the canonical emit-side
+/// contract and the M3 / explicit-rotation-RPC hook point.
+pub fn import_mek_sealed(
+    blob: &[u8],
+    passphrase: &str,
+    expected_fingerprint: &str,
+) -> Result<zeroize::Zeroizing<Vec<u8>>, VaultError> {
+    let mut r = SealedBlobReader::new(blob);
+
+    let magic = r.take(4)?;
+    if magic != SEALED_BLOB_MAGIC {
+        return Err(VaultError::SealedBlobBadMagic {
+            got: [magic[0], magic[1], magic[2], magic[3]],
+        });
+    }
+
+    let version = r.take_u16_le()?;
+    if version != SEALED_BLOB_VERSION {
+        return Err(VaultError::SealedBlobUnknownVersion { got: version });
+    }
+
+    let kdf_id = r.take_u8()?;
+    if kdf_id != SEALED_BLOB_KDF_ARGON2ID {
+        return Err(VaultError::SealedBlobUnknownKdf { got: kdf_id });
+    }
+
+    let aead_id = r.take_u8()?;
+    if aead_id != SEALED_BLOB_AEAD_XCHACHA20POLY1305 {
+        return Err(VaultError::SealedBlobUnknownAead { got: aead_id });
+    }
+
+    let salt_len = r.take_u8()?;
+    if salt_len != SEALED_BLOB_SALT_LEN {
+        return Err(VaultError::SealedBlobInvalid(format!(
+            "unexpected salt_len: {salt_len} (expected {})",
+            SEALED_BLOB_SALT_LEN
+        )));
+    }
+    let salt = r.take(salt_len as usize)?.to_vec();
+
+    let ops = r.take_u32_le()?;
+    if ops < SEALED_BLOB_ARGON2_OPS_MIN {
+        return Err(VaultError::SealedBlobInvalid(format!(
+            "argon2 ops below minimum: {ops} (min {})",
+            SEALED_BLOB_ARGON2_OPS_MIN
+        )));
+    }
+
+    let mem_kib = r.take_u32_le()?;
+    if mem_kib < SEALED_BLOB_ARGON2_MEM_KIB_MIN {
+        return Err(VaultError::SealedBlobInvalid(format!(
+            "argon2 mem_kib below minimum: {mem_kib} (min {})",
+            SEALED_BLOB_ARGON2_MEM_KIB_MIN
+        )));
+    }
+
+    let par = r.take_u8()?;
+    if par == 0 {
+        return Err(VaultError::SealedBlobInvalid(
+            "argon2 parallelism is zero".to_string(),
+        ));
+    }
+
+    let nonce_len = r.take_u8()?;
+    if nonce_len != SEALED_BLOB_NONCE_LEN {
+        return Err(VaultError::SealedBlobInvalid(format!(
+            "unexpected nonce_len: {nonce_len} (expected {})",
+            SEALED_BLOB_NONCE_LEN
+        )));
+    }
+    let nonce_bytes = r.take(nonce_len as usize)?.to_vec();
+
+    let fp_len = r.take_u8()? as usize;
+    let fp_bytes = r.take(fp_len)?;
+    let fingerprint = std::str::from_utf8(fp_bytes)
+        .map_err(|e| {
+            VaultError::SealedBlobInvalid(format!("fingerprint is not valid UTF-8: {e}"))
+        })?
+        .to_string();
+    if fingerprint != expected_fingerprint {
+        return Err(VaultError::SealedBlobFingerprintMismatch {
+            expected: expected_fingerprint.to_string(),
+            actual: fingerprint,
+        });
+    }
+
+    let ct_len = r.take_u32_le()? as usize;
+    let ciphertext = r.take(ct_len)?.to_vec();
+    if r.remaining() != 0 {
+        return Err(VaultError::SealedBlobInvalid(format!(
+            "trailing bytes after ciphertext: {} byte(s)",
+            r.remaining()
+        )));
+    }
+
+    let kek = derive_sealed_kek(passphrase, &salt, ops, mem_kib, par)?;
+    let cipher = XChaCha20Poly1305::new_from_slice(kek.as_slice())
+        .map_err(|e| VaultError::SealedBlobInvalid(format!("AEAD key init failed: {e}")))?;
+    let nonce = XNonce::from_slice(&nonce_bytes);
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext.as_slice())
+        .map_err(|_| VaultError::SealedBlobAeadFailure)?;
+
+    // Defence in depth: re-fingerprint the recovered MEK and confirm it
+    // still matches `expected_fingerprint`. A tampered fingerprint field
+    // that happens to match the caller-supplied value would have passed
+    // the embedded check above, but if the AEAD also tampered (or if a
+    // future format change accidentally decoupled fingerprint from MEK),
+    // this catches it.
+    let recovered_fp = mek_fingerprint_hex(&plaintext);
+    if recovered_fp != expected_fingerprint {
+        return Err(VaultError::SealedBlobFingerprintMismatch {
+            expected: expected_fingerprint.to_string(),
+            actual: recovered_fp,
+        });
+    }
+
+    Ok(zeroize::Zeroizing::new(plaintext))
+}
+
+// implementation-note-316 —
+// rotation_witness_emitted_at_mek_rotation
+//
+// At every identity-key rotation point (today: alongside the MEK
+// rotation flow that runs through `import_mek_sealed`; tomorrow:
+// alongside any explicit `vault.rotate` / `identity.rotate` RPC the
+// daemon grows under M3 of the umbrella task), the daemon emits an
+// `IdentityRotationWitness` Receipt v2 envelope bridging the prior and
+// new identity-key epochs. The witness envelope is signed by the PRIOR
+// identity key over the new identity's public key, so a verifier
+// holding only the pre-rotation trust anchor can still verify Receipts
+// minted by the post-rotation identity via Slice E3's chain-walking
+// `verify_receipt_v2_with_rotation_chain`.
+//
+// Call site discipline:
+// - This is the canonical emit-side; the caller MUST invoke this
+//   function BEFORE zeroizing or replacing the prior identity key, as
+//   the witness signature requires the prior key's live signing
+//   material.
+// - The signing path routes through `sign_receipt_v2` (the only
+//   canonical Receipt v2 signer per `.claude/rules/daemon.md`); no
+//   inline blake3 / JCS / signature assembly is permitted.
+// - The body matches Slice E1's `IdentityRotationWitnessBody` shape
+//   (`prev_epoch_root_id`, `next_epoch_root_id`, `rotated_at_epoch_secs`,
+//   `signature_by_prev_root`, `signature_by_next_root`, optional
+//   `rotation_reason`).
+// - The signed envelope is persisted via
+//   `DaemonStore::store_identity_rotation_witness_receipt` so the
+//   witness survives a daemon restart and the chain-walk verifier can
+//   reassemble it from the local Receipt store.
+//
+// Where M3's explicit-rotation RPC will hook this: when the umbrella
+// grows a dedicated `identity.rotate` / `vault.rotate` RPC, that
+// handler MUST call `emit_identity_rotation_witness` immediately
+// after deriving the new identity but BEFORE the prior key's Drop
+// scrubs the signing material. The MEK-import path
+// (`import_mek_sealed` above) is the substrate for today's recovery
+// flow; the witness emission belongs at the rotation-aware caller
+// (which has both the prior signer and the new identity public key
+// in hand), not inside `import_mek_sealed` itself — that function is
+// a low-level blob-unwrap primitive without access to a `DaemonStore`
+// or the prior `DaemonPersona`. Documented here so future authors of
+// `import_mek_sealed` callers know the contract.
+
+/// Emit an `IdentityRotationWitness` Receipt v2 envelope bridging the
+/// prior and new identity-key epochs at MEK / identity rotation time.
+///
+/// **Pre:**
+/// - `prior_signer` is the soon-to-be-retired identity key and is
+///   still alive (NOT yet zeroized) — its signing material is required
+///   to mint the outer envelope signature.
+/// - `new_identity_pub` is the new identity's verifying key (the key
+///   that will sign Receipts after this rotation).
+/// - The prior signer's public key MUST differ from
+///   `new_identity_pub` (a "rotation" between equal keys is not a
+///   rotation and would defeat the chain-continuity property).
+///
+/// **Post:**
+/// - A signed `ReceiptEnvelope` is returned with
+///   `kind == RECEIPT_KIND_IDENTITY_ROTATION_WITNESS`, `receipt_id`
+///   populated by `sign_receipt_v2`, and a non-empty
+///   `signature` field.
+/// - The envelope has been persisted into the daemon's local Receipt
+///   store (`receipts` table) via
+///   `DaemonStore::store_identity_rotation_witness_receipt`.
+/// - The body matches Slice E1's `IdentityRotationWitnessBody` shape;
+///   the body's `signature_by_prev_root` is the prior signer's
+///   Ed25519 signature over the new identity's raw 32-byte public key
+///   bytes (the explicit "prior co-signs over the new identity"
+///   attestation the brief calls out), while `signature_by_next_root`
+///   is a deterministic non-empty placeholder because the new
+///   identity is not yet active and cannot co-sign at rotation time —
+///   the chain-walk verifier checks only the outer envelope signature
+///   (Slice E3's `verify_receipt_v2_with_rotation_chain` per the
+///   algorithm in `core_events::receipt::sign`), so body-level inner
+///   signatures are advisory metadata rather than part of the
+///   chain-walk trust check.
+///
+/// **Errors:**
+/// - `VaultError::WitnessEmit(_)` when `sign_receipt_v2` fails
+///   (canonicalize / serialize), or when the prior signer's
+///   `public_key()` is malformed (cannot recover its raw bytes for
+///   the `daemon_root_id` field).
+/// - `VaultError::Store(_)` when the persistence step fails.
+pub fn emit_identity_rotation_witness(
+    store: &DaemonStore,
+    prior_signer: &dyn Signer,
+    new_identity_pub: &VerifyingKey,
+    rotation_at: DateTime<Utc>,
+) -> Result<ReceiptEnvelope, VaultError> {
+    // Epoch root IDs: hex-encoded 32-byte verifying keys. Stable across
+    // restarts and recoverable from the public key handle the daemon
+    // already publishes via `GET /daemon/identity.json`, so the
+    // chain-walk consumer can correlate body epoch IDs back to the
+    // `RotationWitnessEntry::prior_identity_pub` /
+    // `new_identity_pub` keys it carries alongside the envelope.
+    let prior_pub_handle = prior_signer.public_key();
+    let prior_epoch_root_id = strip_ed25519_prefix(&prior_pub_handle.0).ok_or_else(|| {
+        VaultError::WitnessEmit(format!(
+            "prior signer public_key handle '{}' missing expected 'ed25519:' prefix",
+            prior_pub_handle.0
+        ))
+    })?;
+    let new_pub_bytes = new_identity_pub.to_bytes();
+    let new_epoch_root_id = hex::encode(new_pub_bytes);
+
+    // Defence in depth: refuse to emit a witness when the prior and
+    // new epoch roots are identical — that is not a rotation and would
+    // also fail Slice E1's `IdentityRotationWitnessBody::validate()`.
+    if prior_epoch_root_id == new_epoch_root_id {
+        return Err(VaultError::WitnessEmit(
+            "prior and new identity public keys are identical — \
+             rotation between equal epochs is rejected"
+                .to_string(),
+        ));
+    }
+
+    // The "prior co-signs over the new identity's public key" claim
+    // the brief mentions: the prior signer signs the new pub key's
+    // raw 32 bytes. The chain-walker does not inspect this field
+    // (only the outer envelope signature), but the body carries it so
+    // future offline auditors can re-prove the rotation independently.
+    let sig_by_prev = prior_signer.sign(&new_pub_bytes);
+    let signature_by_prev_root = sig_by_prev.0;
+
+    // The new identity is not yet active and cannot co-sign at
+    // rotation time. Slice E1's `validate()` requires this field be
+    // non-empty; an explicit placeholder distinguishes "no co-sign
+    // yet" from "co-signed by zero" and matches the precedent in the
+    // chain-walk tests at
+    // `core-events/src/receipt/sign.rs::witness_envelope`.
+    let signature_by_next_root = "ed25519sig:pending-next-root-cosign".to_string();
+
+    let rotated_at_epoch_secs: u64 = rotation_at
+        .timestamp()
+        .try_into()
+        .map_err(|_| VaultError::WitnessEmit(format!(
+            "rotation_at timestamp {} is negative — cannot encode as u64 epoch seconds",
+            rotation_at.timestamp(),
+        )))?;
+
+    let body = serde_json::json!({
+        "prev_epoch_root_id": prior_epoch_root_id,
+        "next_epoch_root_id": new_epoch_root_id,
+        "rotated_at_epoch_secs": rotated_at_epoch_secs,
+        "signature_by_prev_root": signature_by_prev_root,
+        "signature_by_next_root": signature_by_next_root,
+        "rotation_reason": "mek_rotation",
+    });
+
+    let mut envelope = ReceiptEnvelope {
+        version: ReceiptVersion::default(),
+        kind: core_events::receipt::RECEIPT_KIND_IDENTITY_ROTATION_WITNESS.to_string(),
+        receipt_id: String::new(),
+        // daemon_root_id: the prior epoch's root id — mirrors the
+        // chain-walk test fixture's convention at
+        // `core-events/src/receipt/sign.rs::witness_envelope` and
+        // anchors the envelope to the epoch whose signer minted it.
+        daemon_root_id: prior_epoch_root_id.clone(),
+        traceparent: None,
+        // The daemon (acting as Persona) terminates this Receipt — it
+        // is a daemon-emitted attestation, not a user-session lifecycle
+        // event.
+        termination_authority: TerminationAuthority::DaemonPersona,
+        presence_kind: None,
+        body,
+        signature: None,
+        calling_principal: None,
+        presence_reason: None,
+        handle_id: None,
+        challenge_hash: None,
+        verifier_aaguid: None,
+    };
+
+    // Canonical builder — no inline crypto. Populates `receipt_id`
+    // and `signature` on `envelope` in place.
+    sign_receipt_v2(&mut envelope, prior_signer)?;
+
+    store.store_identity_rotation_witness_receipt(&envelope)?;
+
+    info!(
+        receipt_id = %envelope.receipt_id,
+        prev_epoch_root_id = %prior_epoch_root_id,
+        new_epoch_root_id = %new_epoch_root_id,
+        rotated_at = %rotation_at.to_rfc3339(),
+        "identity rotation witness emitted"
+    );
+
+    Ok(envelope)
+}
+
+/// Strip the `ed25519:` wire-form prefix from a `core_crypto::PublicKey`
+/// handle, returning the underlying 64-character hex string. Returns
+/// `None` when the prefix is absent so the caller can surface a clear
+/// error rather than silently propagating a malformed identifier into a
+/// signed Receipt body.
+fn strip_ed25519_prefix(handle: &str) -> Option<String> {
+    handle.strip_prefix("ed25519:").map(|s| s.to_string())
+}
+
 /// Outcome of `try_auto_unseal_from_keyring` — the daemon/CLI startup helper
 /// that opens the vault from a keyring-stored passphrase. Designed as an enum
 /// (rather than `Result<Option<Vault>, _>`) so callers can branch on the
@@ -994,7 +1627,7 @@ pub enum AutoUnsealOutcome {
 ///   each re-implementing keyring lookup.
 ///
 /// Always-attempted: there is no relay/hosted/first-party mode flag in
-/// `DaemonConfig` today (implementation-note-296 task instructions explicitly note this).
+/// `DaemonConfig` today (implementation-note-326 task instructions explicitly note this).
 /// If one is added later, gate auto-unseal on first-party mode here.
 pub fn try_auto_unseal_from_keyring(config: &DaemonConfig) -> AutoUnsealOutcome {
     try_auto_unseal_from_keyring_with_presence(config, PresenceAfterOpen::MarkUnlocked)
@@ -1041,7 +1674,7 @@ fn try_auto_unseal_from_keyring_with_presence(
         Err(e) => return AutoUnsealOutcome::Error(e),
     };
 
-    // implementation-note-27 C4: refuse to auto-unseal if the
+    // implementation-note-33 C4: refuse to auto-unseal if the
     // vault.params sidecar disagrees with the compile-time Argon2 pin.
     // Same enforcement as `open_from_config`.
     if let Err(e) = check_or_write_vault_params(config) {
@@ -1153,11 +1786,11 @@ pub(crate) fn resolve_passphrase_no_provision(
     }
 
     // 4. System keyring lookup — read-only, no provisioning.
-    let entry = keyring::Entry::new(service, account)
+    let entry = keyring_core::Entry::new(service, account)
         .map_err(|e| VaultError::Keyring(format!("init: {e}")))?;
     match entry.get_password() {
         Ok(p) => Ok(Some(p)),
-        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(keyring_core::Error::NoEntry) => Ok(None),
         Err(e) => Err(VaultError::Keyring(format!("read: {e}"))),
     }
 }
@@ -1273,7 +1906,7 @@ pub struct MigrateMekAclResult {
 /// (biometric on macOS via `kSecAttrAccessControl`).
 ///
 /// This migrates a pre-existing MEK entry created before
-/// implementation-note-100 shipped so subsequent vault operations
+/// implementation-note-114 shipped so subsequent vault operations
 /// use Touch ID instead of the plain keychain password.
 ///
 /// Safety contract:
@@ -1325,11 +1958,11 @@ pub fn migrate_mek_acl(service: &str, account: &str) -> Result<MigrateMekAclResu
 
             // Read via the plain system keyring (pre-migration ACL).
             let passphrase = {
-                let entry = keyring::Entry::new(service, account)
+                let entry = keyring_core::Entry::new(service, account)
                     .map_err(|e| VaultError::Keyring(format!("migrate: init: {e}")))?;
                 match entry.get_password() {
                     Ok(p) => Zeroizing::new(p),
-                    Err(keyring::Error::NoEntry) => {
+                    Err(keyring_core::Error::NoEntry) => {
                         return Err(VaultError::Keyring(
                             "migrate_mek_acl: no MEK entry found in keychain; \
                              run `ember init` first"
@@ -1357,7 +1990,7 @@ pub fn migrate_mek_acl(service: &str, account: &str) -> Result<MigrateMekAclResu
                     error = %e,
                     "migrate_mek_acl: biometric re-store failed; falling back to system keyring"
                 );
-                let entry = keyring::Entry::new(service, account)
+                let entry = keyring_core::Entry::new(service, account)
                     .map_err(|fe| VaultError::Keyring(format!("migrate: fallback init: {fe}")))?;
                 entry
                     .set_password(&passphrase)
@@ -1451,22 +2084,22 @@ pub fn is_cargo_test_binary() -> bool {
 /// macOS-only: the SE-wrapped MEK lane only exists on macOS; Linux daemons
 /// always fall through to the system keyring branch.
 #[cfg(target_os = "macos")]
-fn is_separate_uid_posture() -> bool {
+pub(crate) fn is_separate_uid_posture() -> bool {
     // Read the daemon's effective uid's passwd entry directly, NOT the
     // `HOME` env var. The launchd plist injects HOME=<operator_home>
     // (see install.rs::render_launchd_plist_body), so any env-var-based
     // home resolution would see the operator's home and miss the
     // /var/empty checkpoint that signals the design separate-uid posture.
-    // Per adversarial review implementation-note-62-(-B).
+    // Per adversarial review implementation-note-73-(-B).
     //
     // The Ok(None) and Err(e) arms both return false but log distinctly
     // so an operator debugging "why did the daemon land on the keychain
     // branch instead of SE?" can tell apart a provisioning race (uid
     // exists in kernel but passwd entry not yet written) from a real
     // passwd-database I/O failure. Per self-review 
-    // (implementation-note-319).
+    // (implementation-note-358).
     //
-    // implementation-note-320: all three 
+    // implementation-note-359: all three 
     // findings from the 2026-05-13 self-review are now closed.
     // (this site): Ok(None) / Err distinguished above.
     // : TOCTOU on file-based MEK blob — obviated by the
@@ -1498,7 +2131,7 @@ fn is_separate_uid_posture() -> bool {
 /// True when raw keyring writes must be suppressed: a cargo test binary is
 /// running, or the `EMBER_VAULT_MOCK` opt-out is set. Downstream callers
 /// (e.g., `ember init` in `emberlink-cli`) must consult this before
-/// invoking `keyring::Entry::new(...).set_password(...)` directly — the
+/// invoking `keyring_core::Entry::new(...).set_password(...)` directly — the
 /// three-axis gate that lives inside `resolve_passphrase` does not cover
 /// raw keyring access, and missing it was the leak that fired real
 /// keychain popups from the emberlink-cli test suite on 2026-04-22.
@@ -1516,7 +2149,7 @@ pub fn verify_keyring_roundtrip(
     if cfg!(test) || std::env::var("EMBER_VAULT_MOCK").is_ok() || is_cargo_test_binary() {
         return Ok(());
     }
-    let verify_entry = keyring::Entry::new(service, account)
+    let verify_entry = keyring_core::Entry::new(service, account)
         .map_err(|e| VaultError::Keyring(format!("verify: {e}")))?;
     let read_back = verify_entry
         .get_password()
@@ -1586,12 +2219,12 @@ fn resolve_passphrase(service: &str, account: &str) -> Result<String, VaultError
     }
 
     // 3. System keyring (non-macOS, or macOS dev/QA service name).
-    let entry = keyring::Entry::new(service, account)
+    let entry = keyring_core::Entry::new(service, account)
         .map_err(|e| VaultError::Keyring(format!("init: {e}")))?;
 
     match entry.get_password() {
         Ok(p) => Ok(p),
-        Err(keyring::Error::NoEntry) => {
+        Err(keyring_core::Error::NoEntry) => {
             // 4. Generate and store a random passphrase, then verify cross-handle read-back
             let p = generate_passphrase();
             entry
@@ -1639,7 +2272,7 @@ fn vault_salt(config: &DaemonConfig) -> Result<[u8; 16], VaultError> {
     }
 }
 
-/// implementation-note-27 C4: enforce Argon2 parameter pinning via a
+/// implementation-note-33 C4: enforce Argon2 parameter pinning via a
 /// `<data_dir>/vault.params` sidecar file.
 ///
 /// - If the file exists, parse it and refuse to proceed if any value
@@ -1818,7 +2451,7 @@ mod tests {
         [99u8; 32]
     }
 
-    /// implementation-note-27 C5: a roundtrip through `add` → `get`
+    /// implementation-note-33 C5: a roundtrip through `add` → `get`
     /// succeeds when the row carries per-row AAD bound to the row's
     /// UUID. The shape of the test is intentionally minimal — the
     /// existing `add_list_get_roundtrip` test exercises the happy path
@@ -1847,7 +2480,7 @@ mod tests {
         assert_eq!(value, b"some-secret-value");
     }
 
-    /// implementation-note-27 C5: a credentials row whose ciphertext
+    /// implementation-note-33 C5: a credentials row whose ciphertext
     /// was written WITHOUT AAD (legacy daemon before C5 shipped) must
     /// still decrypt through `Vault::get` via the no-AAD fallback path.
     /// The test synthesises a legacy row directly via SQL so the
@@ -1893,7 +2526,7 @@ mod tests {
         assert_eq!(value, b"legacy-plaintext");
     }
 
-    /// implementation-note-27 C4: when `vault.params` contains values
+    /// implementation-note-33 C4: when `vault.params` contains values
     /// that do not match the compile-time-pinned Argon2 parameters,
     /// `Vault::open_from_config` refuses to proceed with
     /// `VaultError::Crypto("argon2 params mismatch...")`. The file is
@@ -1943,7 +2576,7 @@ ver = "V0x13"
         }
     }
 
-    /// implementation-note-27 C4 partner: a fresh vault (no
+    /// implementation-note-33 C4 partner: a fresh vault (no
     /// `vault.params` on disk) lays one down on first open with the
     /// pinned params, and a subsequent open against the same data_dir
     /// succeeds (the params file now exists and matches).
@@ -1981,7 +2614,7 @@ ver = "V0x13"
         assert!(contents.contains("V0x13"));
     }
 
-    /// implementation-note-27 C1: `Vault` must implement
+    /// implementation-note-33 C1: `Vault` must implement
     /// `ZeroizeOnDrop` so the MEK is wiped from memory when the Vault is
     /// dropped (explicit lock, daemon shutdown, or any Rc going to zero
     /// references). Compile-time trait assertion: the function body
@@ -2640,7 +3273,7 @@ ver = "V0x13"
         unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
     }
 
-    // --- implementation-note-321: migrate_mek_acl ---
+    // --- implementation-note-360: migrate_mek_acl ---
 
     // Serial lock: tests that mutate EMBER_VAULT_TEST_KEYRING_PRESENT must not
     // run concurrently — cargo test threads share the process environment.
@@ -2755,7 +3388,7 @@ mod name_validation_tests {
         assert!(validate_credential_name("a/b/c/d/e/f/g").is_ok());
     }
 
-    /// implementation-note-322 Phase 1 — the v2 path grammar
+    /// implementation-note-361 Phase 1 — the v2 path grammar
     /// (design §5.3) introduces credential-type intermediate segments like
     /// `github/apps/<slug>/install-<id>/private-key` which are 5 segments
     /// deep. The previous `> 4` cap rejected these; the lifted `> 7` cap
@@ -2850,5 +3483,452 @@ mod name_validation_tests {
         let bytes: [u8; 16] = [7u8; 16];
         let salt = Argon2Salt::from(bytes);
         assert_eq!(salt.as_bytes(), &bytes);
+    }
+
+    // sealed_mek_blob_format_landed tests.
+    // implementation-note-357 — T1 round-trip
+    // and the five negative cases (wrong passphrase, tampered magic,
+    // tampered ciphertext, tampered fingerprint, version mismatch).
+
+    /// Random MEK + passphrase → export → import yields the same MEK.
+    #[test]
+    fn test_sealed_blob_round_trip() {
+        let mut mek = [0u8; 32];
+        getrandom::fill(&mut mek).unwrap();
+        let passphrase = "correct horse battery staple";
+        let fp = mek_fingerprint_hex(&mek);
+
+        let blob = export_mek_sealed(&mek, passphrase, &fp).expect("export");
+        let recovered = import_mek_sealed(&blob, passphrase, &fp).expect("import");
+        assert_eq!(recovered.as_slice(), &mek);
+    }
+
+    /// Successive exports of the same (MEK, passphrase) produce
+    /// distinct blobs (fresh salt + fresh nonce).
+    #[test]
+    fn test_sealed_blob_export_is_randomised() {
+        let mek = [3u8; 32];
+        let passphrase = "rotate-test";
+        let fp = mek_fingerprint_hex(&mek);
+
+        let a = export_mek_sealed(&mek, passphrase, &fp).unwrap();
+        let b = export_mek_sealed(&mek, passphrase, &fp).unwrap();
+        assert_ne!(a, b, "two exports of same MEK must produce distinct blobs");
+
+        // Both still import to the same MEK.
+        let ra = import_mek_sealed(&a, passphrase, &fp).unwrap();
+        let rb = import_mek_sealed(&b, passphrase, &fp).unwrap();
+        assert_eq!(ra.as_slice(), &mek);
+        assert_eq!(rb.as_slice(), &mek);
+    }
+
+    /// Export with a fingerprint that does not match the MEK bytes is
+    /// refused — keeps inconsistent blobs from ever being produced.
+    #[test]
+    fn test_sealed_blob_export_refuses_wrong_fingerprint() {
+        let mek = [5u8; 32];
+        let fp = mek_fingerprint_hex(&[6u8; 32]); // intentionally wrong
+        let err = export_mek_sealed(&mek, "p", &fp).unwrap_err();
+        assert!(
+            matches!(err, VaultError::SealedBlobFingerprintMismatch { .. }),
+            "expected fingerprint mismatch, got: {err}"
+        );
+    }
+
+    /// Wrong passphrase on import → AEAD failure (NOT a fingerprint
+    /// mismatch, because the embedded fingerprint still matches the
+    /// caller-supplied one — only the AEAD tag tells the truth).
+    #[test]
+    fn test_sealed_blob_wrong_passphrase_aead_fail() {
+        let mek = [7u8; 32];
+        let fp = mek_fingerprint_hex(&mek);
+
+        let blob = export_mek_sealed(&mek, "correct", &fp).unwrap();
+        let err = import_mek_sealed(&blob, "wrong", &fp).unwrap_err();
+        assert!(
+            matches!(err, VaultError::SealedBlobAeadFailure),
+            "expected AEAD failure, got: {err}"
+        );
+    }
+
+    /// Magic field tampered → bad-magic refusal before any crypto runs.
+    #[test]
+    fn test_sealed_blob_tampered_magic() {
+        let mek = [8u8; 32];
+        let fp = mek_fingerprint_hex(&mek);
+
+        let mut blob = export_mek_sealed(&mek, "p", &fp).unwrap();
+        blob[0] ^= 0xFF;
+        let err = import_mek_sealed(&blob, "p", &fp).unwrap_err();
+        assert!(
+            matches!(err, VaultError::SealedBlobBadMagic { .. }),
+            "expected bad-magic refusal, got: {err}"
+        );
+    }
+
+    /// Ciphertext byte flipped → AEAD failure.
+    #[test]
+    fn test_sealed_blob_tampered_ciphertext() {
+        let mek = [9u8; 32];
+        let fp = mek_fingerprint_hex(&mek);
+
+        let mut blob = export_mek_sealed(&mek, "p", &fp).unwrap();
+        // The last ciphertext byte is at the very end of the blob.
+        let last = blob.len() - 1;
+        blob[last] ^= 0x01;
+        let err = import_mek_sealed(&blob, "p", &fp).unwrap_err();
+        assert!(
+            matches!(err, VaultError::SealedBlobAeadFailure),
+            "expected AEAD failure on tampered ciphertext, got: {err}"
+        );
+    }
+
+    /// Fingerprint field tampered → import refuses with fingerprint
+    /// mismatch (the embedded fp no longer equals the caller-supplied
+    /// expected fp). Also confirms the embedded-fp check happens before
+    /// the (expensive) argon2 derive.
+    #[test]
+    fn test_sealed_blob_tampered_fingerprint() {
+        let mek = [10u8; 32];
+        let fp = mek_fingerprint_hex(&mek);
+        let blob = export_mek_sealed(&mek, "p", &fp).unwrap();
+
+        // Locate the fp_len byte (everything before it is fixed-size).
+        // Offset = 4 (magic) + 2 (version) + 1 (kdf) + 1 (aead) + 1
+        //  (salt_len) + 32 (salt) + 4 (ops) + 4 (mem) + 1 (par) + 1
+        //  (nonce_len) + 24 (nonce) = 75.
+        let fp_len_offset = 4 + 2 + 1 + 1 + 1 + 32 + 4 + 4 + 1 + 1 + 24;
+        let fp_offset = fp_len_offset + 1;
+        let fp_len = blob[fp_len_offset] as usize;
+        assert_eq!(fp_len, fp.len(), "fp_len byte matches fingerprint length");
+
+        let mut tampered = blob.clone();
+        // Flip a byte inside the fingerprint string.
+        tampered[fp_offset] ^= 0x20; // ASCII case-flip of a hex digit
+        let err = import_mek_sealed(&tampered, "p", &fp).unwrap_err();
+        assert!(
+            matches!(err, VaultError::SealedBlobFingerprintMismatch { .. }),
+            "expected fingerprint mismatch on tampered fp, got: {err}"
+        );
+    }
+
+    /// Version byte forced to a value this build does not know → refusal.
+    #[test]
+    fn test_sealed_blob_version_mismatch() {
+        let mek = [11u8; 32];
+        let fp = mek_fingerprint_hex(&mek);
+        let mut blob = export_mek_sealed(&mek, "p", &fp).unwrap();
+
+        // Version field is at offset 4 (LE u16). Bump to 0xFFFF.
+        blob[4] = 0xFF;
+        blob[5] = 0xFF;
+        let err = import_mek_sealed(&blob, "p", &fp).unwrap_err();
+        match err {
+            VaultError::SealedBlobUnknownVersion { got } => assert_eq!(got, 0xFFFF),
+            other => panic!("expected unknown-version, got: {other}"),
+        }
+    }
+
+    /// kdf_id and aead_id values outside the recognised set are refused.
+    #[test]
+    fn test_sealed_blob_unknown_kdf_or_aead() {
+        let mek = [12u8; 32];
+        let fp = mek_fingerprint_hex(&mek);
+        let original = export_mek_sealed(&mek, "p", &fp).unwrap();
+
+        // kdf_id is at offset 4 (magic) + 2 (version) = 6.
+        let mut bad_kdf = original.clone();
+        bad_kdf[6] = 0xEE;
+        let err = import_mek_sealed(&bad_kdf, "p", &fp).unwrap_err();
+        assert!(
+            matches!(err, VaultError::SealedBlobUnknownKdf { got: 0xEE }),
+            "expected unknown-kdf, got: {err}"
+        );
+
+        // aead_id is at offset 7.
+        let mut bad_aead = original.clone();
+        bad_aead[7] = 0xDD;
+        let err = import_mek_sealed(&bad_aead, "p", &fp).unwrap_err();
+        assert!(
+            matches!(err, VaultError::SealedBlobUnknownAead { got: 0xDD }),
+            "expected unknown-aead, got: {err}"
+        );
+    }
+
+    /// Truncated blob (any cut point past the magic) is refused with a
+    /// truncation error rather than a panic.
+    #[test]
+    fn test_sealed_blob_truncated() {
+        let mek = [13u8; 32];
+        let fp = mek_fingerprint_hex(&mek);
+        let blob = export_mek_sealed(&mek, "p", &fp).unwrap();
+        // Cut just past the magic — every subsequent field is missing.
+        let cut = &blob[..6];
+        let err = import_mek_sealed(cut, "p", &fp).unwrap_err();
+        assert!(
+            matches!(err, VaultError::SealedBlobTruncated { .. }),
+            "expected truncation error, got: {err}"
+        );
+    }
+
+    /// argon2 ops field forced below the documented minimum (3) is
+    /// refused. Forging the field requires editing the blob in place,
+    /// which is the same threat model as "attacker presents a sealed
+    /// blob with weak KDF cost".
+    #[test]
+    fn test_sealed_blob_refuses_weak_argon2_ops() {
+        let mek = [14u8; 32];
+        let fp = mek_fingerprint_hex(&mek);
+        let mut blob = export_mek_sealed(&mek, "p", &fp).unwrap();
+
+        // argon2_ops is a LE u32 at offset 4 (magic) + 2 (version) + 1
+        // (kdf) + 1 (aead) + 1 (salt_len) + 32 (salt) = 41.
+        let ops_offset = 41;
+        blob[ops_offset] = 1;
+        blob[ops_offset + 1] = 0;
+        blob[ops_offset + 2] = 0;
+        blob[ops_offset + 3] = 0;
+        let err = import_mek_sealed(&blob, "p", &fp).unwrap_err();
+        assert!(
+            matches!(&err, VaultError::SealedBlobInvalid(s) if s.contains("ops below minimum")),
+            "expected ops-below-minimum invalid, got: {err}"
+        );
+    }
+
+    /// MEK fingerprint format matches `blake3(MEK).hex()` exactly (the
+    /// Slice B encoding). Locks cross-slice compatibility.
+    #[test]
+    fn test_mek_fingerprint_hex_matches_blake3() {
+        let mek = [0u8; 32];
+        let fp = mek_fingerprint_hex(&mek);
+        let expected = hex::encode(blake3::hash(&mek).as_bytes());
+        assert_eq!(fp, expected);
+        // BLAKE3 output is 32 bytes → 64 hex chars.
+        assert_eq!(fp.len(), 64);
+    }
+
+    // ============================================================
+    // implementation-note-316 — T2
+    // round-trip: emit witness → chain-verify via Slice E3's
+    // `verify_receipt_v2_with_rotation_chain`.
+    //
+    // Anchor: rotation_witness_emitted_at_mek_rotation
+    // ============================================================
+
+    /// T2 round-trip — the witness envelope emitted by
+    /// `emit_identity_rotation_witness` bridges a pre-rotation trust
+    /// anchor (the prior signer's pub) forward to a post-rotation
+    /// signer, so a Receipt signed by the new signer verifies against
+    /// the prior anchor via Slice E3's
+    /// `verify_receipt_v2_with_rotation_chain`.
+    #[test]
+    fn rotation_witness_emit_chain_verifies_against_prior_anchor() {
+        use core_crypto::{FixtureSigner, FixtureVerifier, Signer};
+        use core_events::receipt::sign::{
+            RotationWitnessEntry, sign_receipt_v2, verify_receipt_v2_with_rotation_chain,
+        };
+        use ed25519_dalek::SigningKey;
+
+        let store = DaemonStore::open_in_memory().unwrap();
+
+        // Prior identity — about to be retired.
+        let prior_signer = FixtureSigner::new("e2-prior-epoch");
+        let prior_pub = prior_signer.public_key();
+
+        // New identity — generate a fresh dalek key. `SigningKey::from_bytes`
+        // is deterministic so the test is reproducible.
+        let new_seed: [u8; 32] = [
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+            0xff, 0x00, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xa0, 0xb0, 0xc0,
+            0xd0, 0xe0, 0xf0, 0x01,
+        ];
+        let new_signing_key = SigningKey::from_bytes(&new_seed);
+        let new_verifying_key = new_signing_key.verifying_key();
+
+        // Emit witness from prior signer over new identity pub.
+        let rotation_at = chrono::Utc::now();
+        let witness_env = emit_identity_rotation_witness(
+            &store,
+            &prior_signer,
+            &new_verifying_key,
+            rotation_at,
+        )
+        .expect("witness emission must succeed");
+
+        assert_eq!(
+            witness_env.kind,
+            core_events::receipt::RECEIPT_KIND_IDENTITY_ROTATION_WITNESS,
+            "witness envelope must carry the rotation-witness kind discriminator"
+        );
+        assert!(
+            !witness_env.receipt_id.is_empty(),
+            "sign_receipt_v2 must have populated receipt_id"
+        );
+        assert!(
+            witness_env.signature.is_some(),
+            "sign_receipt_v2 must have populated signature"
+        );
+
+        // Synthesise a fresh `core_crypto::Signer` that produces wire-form
+        // signatures under the new key — needed so the chain-walk
+        // verifier can verify a target receipt signed by the new
+        // identity.
+        struct DalekFixtureSigner {
+            verifying_key: ed25519_dalek::VerifyingKey,
+            signing_key: ed25519_dalek::SigningKey,
+        }
+        impl core_crypto::Signer for DalekFixtureSigner {
+            fn sign(&self, payload: &[u8]) -> core_crypto::Signature {
+                use ed25519_dalek::Signer as _;
+                let sig = self.signing_key.sign(payload);
+                core_crypto::Signature(format!(
+                    "ed25519sig:{}",
+                    hex::encode(sig.to_bytes())
+                ))
+            }
+            fn public_key(&self) -> core_crypto::PublicKey {
+                core_crypto::PublicKey(format!(
+                    "ed25519:{}",
+                    hex::encode(self.verifying_key.to_bytes())
+                ))
+            }
+        }
+        let new_signer = DalekFixtureSigner {
+            verifying_key: new_verifying_key,
+            signing_key: new_signing_key,
+        };
+        let new_pub = new_signer.public_key();
+
+        // Build a target Receipt signed by the new identity.
+        let mut target = ReceiptEnvelope {
+            version: ReceiptVersion::default(),
+            kind: "atomic.tool_call".into(),
+            receipt_id: String::new(),
+            daemon_root_id: hex::encode(new_verifying_key.to_bytes()),
+            traceparent: None,
+            termination_authority: TerminationAuthority::UserSession,
+            presence_kind: None,
+            body: serde_json::json!({ "tool": "post-rotation-target" }),
+            signature: None,
+            calling_principal: None,
+            presence_reason: None,
+            handle_id: None,
+            challenge_hash: None,
+            verifier_aaguid: None,
+        };
+        sign_receipt_v2(&mut target, &new_signer).expect("target sign");
+
+        // Build the chain entry that threads the trust set forward.
+        let rotation_at_secs: u64 = rotation_at
+            .timestamp()
+            .try_into()
+            .expect("test clock must be non-negative");
+        let chain = vec![RotationWitnessEntry {
+            envelope: witness_env.clone(),
+            prior_identity_pub: prior_pub.clone(),
+            new_identity_pub: new_pub.clone(),
+            rotation_at: rotation_at_secs,
+        }];
+
+        // Pre-rotation trust anchor reaches post-rotation signer via
+        // the single-hop chain.
+        verify_receipt_v2_with_rotation_chain(&target, &[prior_pub.clone()], &chain, &FixtureVerifier)
+            .expect("emitted witness must let chain-walk reach the post-rotation signer");
+
+        // Negative: without the chain, the verifier MUST reject the
+        // target (the prior anchor cannot directly verify a Receipt
+        // signed by a different key).
+        let err = verify_receipt_v2_with_rotation_chain(&target, &[prior_pub.clone()], &[], &FixtureVerifier)
+            .expect_err("without the witness chain the target must not verify");
+        assert!(
+            matches!(err, core_events::receipt::sign::SignError::UntrustedSigner),
+            "expected UntrustedSigner without the rotation chain, got: {err:?}"
+        );
+    }
+
+    /// The emitted witness is persisted to the local Receipt store and
+    /// retrievable through `get_receipt_v2_envelope_json`'s sibling
+    /// scan — confirmed by re-parsing the row JSON and checking the
+    /// kind discriminator matches.
+    #[test]
+    fn rotation_witness_emit_persists_to_local_receipt_store() {
+        use core_crypto::FixtureSigner;
+        use ed25519_dalek::SigningKey;
+
+        let store = DaemonStore::open_in_memory().unwrap();
+        let prior_signer = FixtureSigner::new("e2-persist-prior");
+        let new_seed: [u8; 32] = [7u8; 32];
+        let new_verifying_key = SigningKey::from_bytes(&new_seed).verifying_key();
+
+        let env = emit_identity_rotation_witness(
+            &store,
+            &prior_signer,
+            &new_verifying_key,
+            chrono::Utc::now(),
+        )
+        .expect("emit");
+
+        // Scan the receipts table directly — the unified table carries
+        // the row under `kind = 'identity.rotation_witness'`.
+        let row_json: String = store
+            .conn()
+            .query_row(
+                "SELECT receipt_json FROM receipts WHERE id = ?1 AND kind = ?2",
+                rusqlite::params![
+                    env.receipt_id,
+                    core_events::receipt::RECEIPT_KIND_IDENTITY_ROTATION_WITNESS,
+                ],
+                |row| row.get(0),
+            )
+            .expect("witness row must be retrievable by receipt_id+kind");
+
+        let parsed: ReceiptEnvelope =
+            serde_json::from_str(&row_json).expect("row JSON must parse back to ReceiptEnvelope");
+        assert_eq!(parsed.receipt_id, env.receipt_id);
+        assert_eq!(
+            parsed.kind,
+            core_events::receipt::RECEIPT_KIND_IDENTITY_ROTATION_WITNESS,
+        );
+    }
+
+    /// Defence in depth: emitting a witness with prior == new
+    /// (identical keys) is rejected so the body never violates Slice
+    /// E1's `IdentityRotationWitnessBody::validate()` (which requires
+    /// distinct prev/next epoch ids).
+    #[test]
+    fn rotation_witness_emit_refuses_equal_prior_and_new_pub() {
+        use core_crypto::{FixtureSigner, Signer};
+        use ed25519_dalek::VerifyingKey;
+
+        let store = DaemonStore::open_in_memory().unwrap();
+        let prior_signer = FixtureSigner::new("e2-equal-keys");
+        let prior_pub_handle = prior_signer.public_key();
+
+        // Reconstruct the dalek VerifyingKey from the prior signer's
+        // wire-form pub so prior_pub == new_pub by construction.
+        let hex_part = prior_pub_handle
+            .0
+            .strip_prefix("ed25519:")
+            .expect("prior pub handle has ed25519: prefix");
+        let mut bytes = [0u8; 32];
+        hex::decode_to_slice(hex_part, &mut bytes).expect("decode prior pub hex");
+        let equal_pub = VerifyingKey::from_bytes(&bytes).expect("valid pub bytes");
+
+        let err = emit_identity_rotation_witness(
+            &store,
+            &prior_signer,
+            &equal_pub,
+            chrono::Utc::now(),
+        )
+        .expect_err("emission with identical prior/new pub must be refused");
+        match err {
+            VaultError::WitnessEmit(msg) => {
+                assert!(
+                    msg.contains("identical"),
+                    "expected 'identical' in error, got: {msg}"
+                );
+            }
+            other => panic!("expected WitnessEmit error, got: {other}"),
+        }
     }
 }

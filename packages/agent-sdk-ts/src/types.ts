@@ -3,6 +3,7 @@ export interface AgentConfig {
   dbPath: string;
   personaId: string;
   label?: string;
+  daemonSocket?: string;
 }
 
 export interface AgentRequest {
@@ -43,10 +44,20 @@ export interface RequestGrantResult {
   status: string;
 }
 
-export interface GrantStatusResult {
-  grant_id: string;
+export interface PendingGrantStatusResult {
+  request_id: string;
   status: string;
 }
+
+export interface ActiveGrantStatusResult {
+  grant_id: string;
+  status: string;
+  issuer_id?: string;
+  capability?: string;
+  expires_at?: number;
+}
+
+export type GrantStatusResult = PendingGrantStatusResult | ActiveGrantStatusResult;
 
 export interface UseCredentialParams {
   [key: string]: unknown;

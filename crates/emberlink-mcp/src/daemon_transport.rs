@@ -438,7 +438,7 @@ impl std::error::Error for BridgeCertError {}
 
 /// Default in-container path for the per-agent client cert bundle. The
 /// orchestrator's spawn flow mounts these into the container at this
-/// path (implementation-note-442). Overridable via
+/// path (implementation-note-494). Overridable via
 /// `EMBER_BRIDGE_CERT_DIR` for tests + alternate deployment shapes.
 pub const DEFAULT_BRIDGE_CERT_DIR: &str = "/run/ember/client-cert";
 

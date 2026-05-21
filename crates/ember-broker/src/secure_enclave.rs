@@ -65,6 +65,15 @@ pub enum SeKeychainTarget {
     SystemKeychain,
 }
 
+/// Access-control posture for a Secure Enclave key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeAccessPolicy {
+    /// Headless daemon posture: the key must be usable without a GUI session.
+    Headless,
+    /// Interactive host posture: private-key use requires Touch ID.
+    BiometricCurrentSet,
+}
+
 impl std::error::Error for SeError {}
 
 // ---------------------------------------------------------------------------
@@ -164,6 +173,15 @@ pub fn generate_secure_enclave_key(
     label: &str,
     target: SeKeychainTarget,
 ) -> Result<SeKeyHandle, SeError> {
+    generate_secure_enclave_key_with_policy(label, target, SeAccessPolicy::Headless)
+}
+
+/// Generate a Secure Enclave key with an explicit access-control policy.
+pub fn generate_secure_enclave_key_with_policy(
+    label: &str,
+    target: SeKeychainTarget,
+    policy: SeAccessPolicy,
+) -> Result<SeKeyHandle, SeError> {
     // -------------------------------------------------------------------------
     // Real path — enabled only when compiled with `--features se-real` on a
     // signed macOS binary. The `security-framework` crate wraps the FFI.
@@ -186,27 +204,32 @@ pub fn generate_secure_enclave_key(
         // keys (it enables `decrypt_data` / `create_signature` against the
         // private half).
         //
-        // Headless-daemon posture: we deliberately do NOT add
-        // `BIOMETRY_CURRENT_SET` here. The design separate-uid daemon runs
-        // under launchd as the `ember` system user with no GUI session — it
-        // cannot satisfy a Touch ID prompt at vault-unseal time, and macOS's
-        // keychain lookup framework treats biometric-only items as
-        // unenumerable from a non-GUI context (the daemon got
-        // `errSecItemNotFound` even though the key existed; see
-        // implementation-note-69 shipped checkpoint
-        // below).
-        //
-        // The user-presence property the original
-        // `BIOMETRY_CURRENT_SET` was reaching for is recovered at a higher
-        // layer by `implementation-note-70` — the daemon-MEK
-        // unwrap is autonomous (no Touch ID per daemon-start, which would be
-        // terrible UX anyway), but the FIRST per-session vault operation
-        // prompts Touch ID via cross-uid SecurityAgent. The SE-blob is still
-        // hardware-bound: the SE key cannot be exported off the device, so
-        // root-on-this-device is required to use it.
-        //
-        // Anchor: implementation-note-71
-        let flags = AccessControlOptions::PRIVATE_KEY_USAGE.bits();
+        let flags = match policy {
+            // Headless-daemon posture: we deliberately do NOT add
+            // `BIOMETRY_CURRENT_SET` here. The design separate-uid daemon runs
+            // under launchd as the `ember` system user with no GUI session — it
+            // cannot satisfy a Touch ID prompt at vault-unseal time, and macOS's
+            // keychain lookup framework treats biometric-only items as
+            // unenumerable from a non-GUI context (the daemon got
+            // `errSecItemNotFound` even though the key existed; see
+            // implementation-note-80 shipped checkpoint
+            // below).
+            //
+            // The user-presence property the original
+            // `BIOMETRY_CURRENT_SET` was reaching for is recovered at a higher
+            // layer by `implementation-note-81` — the daemon-MEK
+            // unwrap is autonomous (no Touch ID per daemon-start, which would be
+            // terrible UX anyway), but the FIRST per-session vault operation
+            // prompts Touch ID via cross-uid SecurityAgent. The SE-blob is still
+            // hardware-bound: the SE key cannot be exported off the device, so
+            // root-on-this-device is required to use it.
+            //
+            // Anchor: implementation-note-82
+            SeAccessPolicy::Headless => AccessControlOptions::PRIVATE_KEY_USAGE.bits(),
+            SeAccessPolicy::BiometricCurrentSet => (AccessControlOptions::PRIVATE_KEY_USAGE
+                | AccessControlOptions::BIOMETRY_CURRENT_SET)
+                .bits(),
+        };
         let access = SecAccessControl::create_with_protection(
             Some(ProtectionMode::AccessibleAfterFirstUnlockThisDeviceOnly),
             flags,
@@ -237,7 +260,7 @@ pub fn generate_secure_enclave_key(
     // -------------------------------------------------------------------------
     #[allow(unreachable_code)]
     {
-        let _ = (label, target);
+        let _ = (label, target, policy);
         Err(SeError::NotSupported)
     }
 }
@@ -262,42 +285,43 @@ pub fn se_sign_with_touch_id(key: &SeKeyHandle, data: &[u8]) -> Result<Vec<u8>, 
         }
 
         SeKeyInner::Stub { private_bytes, .. } => {
-            // T1 stub: produce a deterministic synthetic "signature" so the
-            // SSH framing tests can exercise encode/decode without Touch ID.
-            // The bytes are NOT a valid ECDSA signature — real ECDSA signing
-            // requires either the SE (hardware) or a software P-256 impl.
-            // Tests that need a verifiable signature should use a software
-            // P-256 crate (e.g. `p256`) directly; these tests only exercise
-            // the SSH agent framing layer.
-            let mut sig = vec![0u8; 71]; // Typical DER ECDSA-sig length
-            sig[0] = 0x30; // SEQUENCE tag
-            // Mix in some data bytes so the stub isn't all-zero
-            for (i, b) in data.iter().take(32).enumerate() {
-                sig[i % 71] ^= b;
-            }
-            for (i, b) in private_bytes.iter().take(32).enumerate() {
-                sig[(i + 32) % 71] ^= b;
-            }
-            Ok(sig)
+            use p256::SecretKey;
+            use p256::ecdsa::{Signature, SigningKey, signature::hazmat::PrehashSigner};
+            use sha2::{Digest, Sha256};
+
+            let secret = SecretKey::from_slice(private_bytes)
+                .map_err(|e| SeError::SignFailed(format!("stub secret key decode: {e}")))?;
+            let signing_key = SigningKey::from(secret);
+            let digest = Sha256::digest(data);
+            let signature: Signature = signing_key
+                .sign_prehash(&digest)
+                .map_err(|e| SeError::SignFailed(format!("stub sign prehash: {e}")))?;
+            Ok(signature.to_der().as_bytes().to_vec())
         }
     }
 }
 
 /// Extract the uncompressed P-256 public key bytes (65 bytes: 0x04 || X || Y).
 ///
-/// On the real SE path: calls `SecKeyCopyExternalRepresentation`.
+/// On the real SE path: derives the public half via `SecKeyCopyPublicKey`,
+/// then exports that public key via `SecKeyCopyExternalRepresentation`.
 /// On the stub path: returns the pre-generated public bytes.
 pub fn se_pubkey_bytes(key: &SeKeyHandle) -> Result<Vec<u8>, SeError> {
     match &key.inner {
         #[cfg(feature = "se-real")]
-        SeKeyInner::Real(sec_key) => sec_key
-            .external_representation()
-            .map(|d| d.to_vec())
-            .ok_or_else(|| {
+        SeKeyInner::Real(sec_key) => {
+            let public_key = sec_key.public_key().ok_or_else(|| {
                 SeError::PubkeyExportFailed(
-                    "SecKey::external_representation returned None".to_string(),
+                    "SecKeyCopyPublicKey returned None".to_string(),
                 )
-            }),
+            })?;
+            public_key.external_representation().map(|d| d.to_vec()).ok_or_else(|| {
+                SeError::PubkeyExportFailed(
+                    "SecKeyCopyExternalRepresentation returned None for the public key"
+                        .to_string(),
+                )
+            })
+        }
 
         SeKeyInner::Stub { public_bytes, .. } => Ok(public_bytes.clone()),
     }
@@ -361,6 +385,34 @@ fn find_se_key_by_label(label: &str) -> Result<security_framework::key::SecKey, 
     ))
 }
 
+/// Re-open a previously-created Secure Enclave key by label.
+pub fn find_secure_enclave_key(label: &str) -> Result<SeKeyHandle, SeError> {
+    #[cfg(feature = "se-real")]
+    {
+        let key = find_se_key_by_label(label).map_err(SeError::KeyGenFailed)?;
+        Ok(SeKeyHandle {
+            label: label.to_string(),
+            inner: SeKeyInner::Real(key),
+        })
+    }
+
+    #[cfg(not(feature = "se-real"))]
+    let maybe_stub = STUB_KEY_STORE.with(|store| store.borrow().get(label).cloned());
+    #[cfg(not(feature = "se-real"))]
+    if let Some(material) = maybe_stub {
+        return Ok(SeKeyHandle {
+            label: label.to_string(),
+            inner: SeKeyInner::Stub {
+                private_bytes: material.private_bytes,
+                public_bytes: material.public_bytes,
+            },
+        });
+    }
+
+    #[cfg(not(feature = "se-real"))]
+    Err(SeError::NotSupported)
+}
+
 // ---------------------------------------------------------------------------
 // ECIES wrap / unwrap
 // ---------------------------------------------------------------------------
@@ -374,7 +426,7 @@ fn find_se_key_by_label(label: &str) -> Result<security_framework::key::SecKey, 
 /// On the stub path: derives a 32-byte key from `SHA-256(label || private_bytes)`,
 /// then produces `nonce(16) || auth_tag(32) || xor_stream(plaintext)` where the
 /// auth tag is `SHA-256(0xFF || nonce || key || ciphertext)` (encrypt-then-MAC,
-/// per implementation-note-63 -B) and the stream key is
+/// per implementation-note-74 -B) and the stream key is
 /// `SHA-256(counter || nonce || key)` per 32-byte block.
 ///
 /// # Errors
@@ -386,7 +438,7 @@ pub fn se_wrap(label: &str, plaintext: &[u8]) -> Result<Vec<u8>, SeError> {
     let maybe_key = STUB_KEY_STORE.with(|store| store.borrow().get(label).cloned());
 
     match maybe_key {
-        Some(private_bytes) => stub_wrap(&private_bytes, label, plaintext),
+        Some(material) => stub_wrap(&material.private_bytes, label, plaintext),
         None => {
             // Real ECIES path via security-framework's SecKey::encrypt_data,
             // routed through the SE-resident public key derived from the
@@ -438,7 +490,7 @@ pub fn se_wrap(label: &str, plaintext: &[u8]) -> Result<Vec<u8>, SeError> {
 /// Inverse of [`se_wrap`]. On the stub path, **verifies the auth tag
 /// constant-time first, then XOR-decrypts** (encrypt-then-MAC + verify-
 /// then-decrypt; see [`stub_unwrap`] for the per-byte invariant and the
-/// implementation-note-63 -B rationale).
+/// implementation-note-74 -B rationale).
 ///
 /// # Errors
 ///
@@ -448,14 +500,14 @@ pub fn se_unwrap(label: &str, ciphertext: &[u8]) -> Result<Vec<u8>, SeError> {
     let maybe_key = STUB_KEY_STORE.with(|store| store.borrow().get(label).cloned());
 
     match maybe_key {
-        Some(private_bytes) => stub_unwrap(&private_bytes, label, ciphertext),
+        Some(material) => stub_unwrap(&material.private_bytes, label, ciphertext),
         None => {
             // Real ECIES path. SecKey::decrypt_data routes through the SE for
             // the ECDH-derive step; any SAC attached to the key (e.g. the
             // BiometryCurrentSet protection set by `generate_secure_enclave_key`)
             // triggers a biometric prompt here. For the daemon's separate-uid
             // posture (design) the install-side followup
-            // (implementation-note-63) pins the key to
+            // (implementation-note-74) pins the key to
             // the SystemKeychain without biometric protection so the daemon
             // can decrypt at startup without operator presence.
             #[cfg(feature = "se-real")]
@@ -489,21 +541,36 @@ pub fn se_unwrap(label: &str, ciphertext: &[u8]) -> Result<Vec<u8>, SeError> {
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+#[derive(Clone)]
+struct StubKeyMaterial {
+    private_bytes: Vec<u8>,
+    #[allow(dead_code)]
+    public_bytes: Vec<u8>,
+}
+
 thread_local! {
-    static STUB_KEY_STORE: RefCell<HashMap<String, Vec<u8>>> = RefCell::new(HashMap::new());
+    static STUB_KEY_STORE: RefCell<HashMap<String, StubKeyMaterial>> = RefCell::new(HashMap::new());
 }
 
 /// Register a stub key for `label` so [`se_wrap`] / [`se_unwrap`] can operate
 /// without a real SE key handle. Only available in test and stub builds.
 #[cfg(any(test, feature = "se-stub"))]
 pub fn se_register_stub_key(label: &str, handle: &SeKeyHandle) {
-    if let SeKeyInner::Stub { private_bytes, .. } = &handle.inner {
-        STUB_KEY_STORE.with(|store| {
-            store
-                .borrow_mut()
-                .insert(label.to_string(), private_bytes.clone());
-        });
-    }
+    let private_bytes = match &handle.inner {
+        SeKeyInner::Stub { private_bytes, .. } => private_bytes,
+        #[cfg(feature = "se-real")]
+        SeKeyInner::Real(_) => return,
+    };
+    STUB_KEY_STORE.with(|store| {
+        let public_bytes = se_pubkey_bytes(handle).expect("stub pubkey bytes");
+        store.borrow_mut().insert(
+            label.to_string(),
+            StubKeyMaterial {
+                private_bytes: private_bytes.clone(),
+                public_bytes,
+            },
+        );
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -531,7 +598,7 @@ fn keystream_block(counter: u8, nonce: &[u8; 16], key: &[u8; 32]) -> [u8; 32] {
 
 /// Compute encrypt-then-MAC auth tag: `SHA-256(0xFF || nonce || key || ciphertext)`.
 ///
-/// implementation-note-63 -B — the tag MUST be
+/// implementation-note-74 -B — the tag MUST be
 /// computed over the CIPHERTEXT (encrypt-then-MAC), not the plaintext.
 /// Tag-over-plaintext requires decryption before verification, which
 /// turned `stub_unwrap` into a padding/timing oracle on a malformed
@@ -599,7 +666,7 @@ fn stub_wrap(private_bytes: &[u8], label: &str, plaintext: &[u8]) -> Result<Vec<
 /// Stub unwrap: verify tag (constant-time, against ciphertext) **then**
 /// XOR-decrypt.
 ///
-/// implementation-note-63 -B — the prior
+/// implementation-note-74 -B — the prior
 /// implementation decrypted before verifying, which:
 ///   1. Did work the attacker controlled (touched every ciphertext byte
 ///      before the tag check), and
@@ -660,16 +727,20 @@ fn stub_unwrap(private_bytes: &[u8], label: &str, ciphertext: &[u8]) -> Result<V
 /// framing layer without Touch ID hardware.
 #[cfg(any(test, feature = "se-stub"))]
 pub fn new_stub_key(label: &str) -> SeKeyHandle {
-    // Generate 32 bytes of entropy for the stub private scalar.
-    let mut private_bytes = vec![0u8; 32];
-    getrandom::fill(&mut private_bytes).expect("getrandom for SE stub key");
+    use p256::SecretKey;
+    use p256::ecdsa::SigningKey;
 
-    // Produce a plausible 65-byte uncompressed P-256 public key blob.
-    // For testing the SSH framing layer, the exact cryptographic validity
-    // is irrelevant — we just need a non-empty byte string.
-    let mut public_bytes = vec![0x04u8]; // uncompressed point tag
-    public_bytes.extend_from_slice(&[0xABu8; 32]); // X coordinate stub
-    public_bytes.extend_from_slice(&[0xCDu8; 32]); // Y coordinate stub
+    let secret = loop {
+        let mut candidate = [0u8; 32];
+        getrandom::fill(&mut candidate).expect("getrandom for SE stub key");
+        if let Ok(secret) = SecretKey::from_slice(&candidate) {
+            break secret;
+        }
+    };
+    let signing_key = SigningKey::from(secret);
+    let verifying_key = signing_key.verifying_key();
+    let public_bytes = verifying_key.to_encoded_point(false).as_bytes().to_vec();
+    let private_bytes = signing_key.to_bytes().to_vec();
 
     SeKeyHandle {
         label: label.to_string(),
@@ -755,7 +826,7 @@ mod tests {
         assert_eq!(pt, b"hello");
     }
 
-    /// T1 — implementation-note-63 -B: stub_unwrap
+    /// T1 — implementation-note-74 -B: stub_unwrap
     /// must reject tampered ciphertext via the auth tag before producing
     /// any plaintext. Exercises the encrypt-then-MAC + verify-then-decrypt
     /// invariant on the stub path (deterministic, no SE hardware needed).
@@ -791,7 +862,7 @@ mod tests {
         }
     }
 
-    /// T1 — implementation-note-63 -B: tampering
+    /// T1 — implementation-note-74 -B: tampering
     /// with the stored auth-tag region (offset 16..48) must also be
     /// rejected. Complement to the body-tamper test — both attacker-
     /// reachable regions of the blob are covered.

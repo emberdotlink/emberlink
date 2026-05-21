@@ -65,6 +65,9 @@ export class EmberAgent {
       if (this.config.label) {
         args.push('--label', this.config.label);
       }
+      if (this.config.daemonSocket) {
+        args.push('--daemon-socket', this.config.daemonSocket);
+      }
 
       const proc = spawn(binary, args, { stdio: ['pipe', 'pipe', 'inherit'] });
       this.proc = proc;
@@ -159,6 +162,10 @@ export class EmberAgent {
   }
 
   useCredential(params: UseCredentialParams): Promise<CredentialResult> {
-    return this.send<CredentialResult>('use_credential', params as Record<string, unknown>);
+    const { credential_name, ...rest } = params;
+    return this.send<CredentialResult>('use_credential', {
+      ...rest,
+      credential_id: credential_name,
+    });
   }
 }

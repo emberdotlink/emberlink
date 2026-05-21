@@ -60,6 +60,8 @@ class EmberAgent:
         ]
         if self._config.label is not None:
             cmd += ["--label", self._config.label]
+        if self._config.daemon_socket is not None:
+            cmd += ["--daemon-socket", self._config.daemon_socket]
         self._process = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -241,15 +243,19 @@ class EmberAgent:
     def grant_status(self, grant_id: str) -> GrantStatusResult:
         result = self._send("grant_status", {"grant_id": grant_id})
         return GrantStatusResult(
-            grant_id=result["grant_id"],
             status=result["status"],
+            grant_id=result.get("grant_id"),
+            request_id=result.get("request_id"),
             issuer_id=result.get("issuer_id"),
             capability=result.get("capability"),
             expires_at=result.get("expires_at"),
         )
 
     def use_credential(self, grant_id: str, credential_name: str) -> UseCredentialResult:
-        result = self._send("use_credential", {"grant_id": grant_id, "credential_name": credential_name})
+        result = self._send(
+            "use_credential",
+            {"grant_id": grant_id, "credential_id": credential_name},
+        )
         cred = result["credential"]
         return UseCredentialResult(
             status=result["status"],

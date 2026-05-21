@@ -1,7 +1,7 @@
 
 //! `emberd-spawn-shim` — MACOS-PRIMITIVES Decision 5 shim.
 //!
-//! implementation-note-161
+//! implementation-note-184
 //!
 //! ## Why this binary exists
 //!

@@ -1,14 +1,13 @@
 //!
 //! design Phase 4 steps 9 + 10: render plist + launchctl bootstrap.
 //!
-//! Uses `dev_install::install_plist` (the helper shipped in prior change) to
-//! write the plist; then runs `sudo launchctl bootstrap system
-//! /Library/LaunchDaemons/sh.emberlink.daemon.dev.plist`.
+//! Syncs the managed dev runtime config, stages a plist with the operator-home
+//! environment baked in, copies it into `/Library/LaunchDaemons/`, then runs
+//! `sudo launchctl bootstrap system <worktree-specific plist>`.
 
 use super::CommandRunner;
-
-const PLIST_PATH: &str = "/Library/LaunchDaemons/sh.emberlink.daemon.dev.plist";
-const PLIST_LABEL: &str = "sh.emberlink.daemon.dev";
+use crate::dev_install::{DevInstallVars, render_plist};
+use crate::dev_runtime::DevRuntimeEnv;
 
 /// Write the dev LaunchDaemon plist (via `dev_install::install_plist`) and
 /// bootstrap it with `launchctl`.
@@ -26,28 +25,60 @@ const PLIST_LABEL: &str = "sh.emberlink.daemon.dev";
 pub fn install_and_bootstrap(
     runner: &dyn CommandRunner,
     identity_fingerprint: &str,
+    runtime: &DevRuntimeEnv,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Step 9: render + write plist via `sudo plutil` / filesystem.
-    // We use the CommandRunner pattern here so tests can stub out launchctl.
-    // The real path calls dev_install::install_plist; we do an idempotency
-    // check by querying `launchctl print` first.
-    let already_loaded = check_service_loaded(runner, PLIST_LABEL)?;
+    let runtime = super::config::sync_dev_runtime_files_with(runtime)?;
+    install_and_bootstrap_with_paths(runner, identity_fingerprint, &runtime)
+}
+
+fn install_and_bootstrap_with_paths(
+    runner: &dyn CommandRunner,
+    identity_fingerprint: &str,
+    runtime: &DevRuntimeEnv,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let vars = DevInstallVars {
+        label: runtime.plist_label.clone(),
+        ember_dev_bin: runtime.install_root.join("emberd").display().to_string(),
+        trust_roots: identity_fingerprint.to_string(),
+        home: runtime.home.display().to_string(),
+        config_path: runtime.config_path.display().to_string(),
+        socket_path: runtime.socket_path.display().to_string(),
+        gh_app_env_path: runtime.gh_app_env_path.display().to_string(),
+        gh_app_pem_path: runtime.gh_app_pem_path.display().to_string(),
+        vault_dir: runtime.vault_dir.display().to_string(),
+        manifest_path: runtime.manifest_path.display().to_string(),
+        stderr_path: runtime.stderr_log_path.display().to_string(),
+    };
+    let rendered = render_plist(&vars);
+    let staged_path =
+        std::env::temp_dir().join(format!("{}-{}.plist", runtime.plist_label, uuid::Uuid::new_v4()));
+    std::fs::write(&staged_path, rendered.as_bytes())?;
+    let staged_path_str = staged_path
+        .to_str()
+        .ok_or("staged plist path is not valid UTF-8")?;
+
+    let plist_path = runtime.plist_path.to_string_lossy().into_owned();
+    let already_loaded = check_service_loaded(runner, &runtime.plist_label)?;
+
+    runner.run("sudo", &["cp", staged_path_str, &plist_path])?;
 
     if already_loaded {
         // Bootout so we can re-bootstrap with fresh plist content.
         runner.run(
             "sudo",
-            &["launchctl", "bootout", &format!("system/{PLIST_LABEL}")],
+            &["launchctl", "bootout", &format!("system/{}", runtime.plist_label)],
         )?;
     }
 
     // Step 10: bootstrap the (potentially updated) plist.
-    runner.run("sudo", &["launchctl", "bootstrap", "system", PLIST_PATH])?;
+    runner.run("sudo", &["launchctl", "bootstrap", "system", &plist_path])?;
 
     // Verify the service came up.
-    let _ = runner.run("launchctl", &["print", &format!("system/{PLIST_LABEL}")]);
-
-    let _ = identity_fingerprint; // embedded by install_plist upstream
+    let _ = runner.run(
+        "launchctl",
+        &["print", &format!("system/{}", runtime.plist_label)],
+    );
+    let _ = std::fs::remove_file(&staged_path);
     Ok(())
 }
 
@@ -66,7 +97,9 @@ fn check_service_loaded(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dev_runtime::derive_dev_runtime_env;
     use std::cell::RefCell;
+    use std::path::Path;
 
     struct RecordingRunner {
         calls: RefCell<Vec<(String, Vec<String>)>>,
@@ -119,9 +152,19 @@ mod tests {
     #[test]
     fn install_and_bootstrap_calls_launchctl_bootstrap() {
         let runner = RecordingRunner::new_service_not_loaded();
-        install_and_bootstrap(&runner, "sha256:abc123").expect("should succeed");
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = derive_dev_runtime_env(tmp.path(), Path::new("/tmp/emberlink-dev/worktree-a"));
+        install_and_bootstrap_with_paths(&runner, "sha256:abc123", &runtime)
+            .expect("should succeed");
 
         let calls = runner.recorded();
+        let cp_call = calls
+            .iter()
+            .find(|(_, args)| args.contains(&"cp".to_string()));
+        assert!(
+            cp_call.is_some(),
+            "sudo cp must be invoked; calls: {calls:?}"
+        );
         let bootstrap_call = calls
             .iter()
             .find(|(_, args)| args.contains(&"bootstrap".to_string()));
@@ -136,7 +179,7 @@ mod tests {
             "bootstrap must target 'system' domain"
         );
         assert!(
-            bargs.contains(&PLIST_PATH.to_string()),
+            bargs.contains(&runtime.plist_path.display().to_string()),
             "bootstrap must reference the dev plist path"
         );
     }
@@ -144,7 +187,10 @@ mod tests {
     #[test]
     fn install_and_bootstrap_boots_out_when_service_already_loaded() {
         let runner = RecordingRunner::new_service_loaded();
-        install_and_bootstrap(&runner, "sha256:abc123").expect("should succeed");
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = derive_dev_runtime_env(tmp.path(), Path::new("/tmp/emberlink-dev/worktree-a"));
+        install_and_bootstrap_with_paths(&runner, "sha256:abc123", &runtime)
+            .expect("should succeed");
 
         let calls = runner.recorded();
         let bootout_call = calls
@@ -159,7 +205,10 @@ mod tests {
     #[test]
     fn install_and_bootstrap_skips_bootout_when_service_not_loaded() {
         let runner = RecordingRunner::new_service_not_loaded();
-        install_and_bootstrap(&runner, "sha256:abc123").expect("should succeed");
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = derive_dev_runtime_env(tmp.path(), Path::new("/tmp/emberlink-dev/worktree-a"));
+        install_and_bootstrap_with_paths(&runner, "sha256:abc123", &runtime)
+            .expect("should succeed");
 
         let calls = runner.recorded();
         let bootout_call = calls
@@ -191,7 +240,10 @@ mod tests {
             }
         }
 
-        let result = install_and_bootstrap(&FailingBootstrapRunner, "sha256:abc123");
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = derive_dev_runtime_env(tmp.path(), Path::new("/tmp/emberlink-dev/worktree-a"));
+        let result =
+            install_and_bootstrap_with_paths(&FailingBootstrapRunner, "sha256:abc123", &runtime);
         assert!(result.is_err(), "must propagate bootstrap failure");
     }
 }

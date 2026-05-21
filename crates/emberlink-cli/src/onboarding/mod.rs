@@ -2,10 +2,10 @@
 //!
 //! Per design §2. The `claude_code` submodule is the orchestration layer for
 //! the one-command first-run flow (persona create, scope template, grant
-//! create, settings.json patch, optional GH PAT capture). The
+//! create, settings.json patch, and GitHub setup guidance). The
 //! `settings_patch` submodule holds the lower-level JSON-patch primitives
 //! that both `init --for claude-code` and `uninstall --for claude-code`
-//! call into. The `github_app` submodule (implementation-note-437)
+//! call into. The `github_app` submodule (implementation-note-489)
 //! exposes the public GitHub App manifest doc and install URL for adopters
 //! who want to install Emberlink against a real GitHub account or org.
 

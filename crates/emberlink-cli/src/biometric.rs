@@ -1,4 +1,4 @@
-//! implementation-note-205 — biometric (Touch ID / device passcode) gate for high-risk
+//! implementation-note-230 — biometric (Touch ID / device passcode) gate for high-risk
 //! CLI operations like `ember approval approve <id>`.
 //!
 //! ## Goal

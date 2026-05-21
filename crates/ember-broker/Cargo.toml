@@ -7,7 +7,7 @@ description = "Approval delivery channels + grant-request routing for ember-brok
 publish = false
 
 [features]
-# implementation-note-62-: gates the real Secure-Enclave wrap/unwrap
+# implementation-note-73-: gates the real Secure-Enclave wrap/unwrap
 # code path in `secure_enclave.rs`. Without this feature the `#[cfg(feature =
 # "se-real")]` blocks are excluded and `se_wrap` / `se_unwrap` fall through to
 # the stub-key registry path used by unit tests. With it enabled (on macOS
@@ -44,7 +44,8 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# implementation-note-63 -B: constant-time byte
+p256 = { version = "0.13", features = ["ecdsa"] }
+# implementation-note-74 -B: constant-time byte
 # comparison for the stub_unwrap auth-tag check. The prior implementation
 # used hand-rolled XOR-accumulate + `core::hint::black_box` barriers; the
 # brief specifies `subtle::ConstantTimeEq` as the canonical primitive so

@@ -3,6 +3,7 @@
 //! Provides preflight validation + the env-var fallback when the runtime doesn't
 //! honor `userns_mode`.
 
+#[cfg(target_os = "linux")]
 use std::fs;
 
 /// User-namespace mode requested for the container.
@@ -76,7 +77,7 @@ pub fn detect_runtime_support() -> Result<UsernsSupport, UsernsError> {
     // callers can skip kernel-specific validation without panicking.
     #[cfg(not(target_os = "linux"))]
     {
-        return Ok(UsernsSupport::NotLinux);
+        Ok(UsernsSupport::NotLinux)
     }
 
     #[cfg(target_os = "linux")]

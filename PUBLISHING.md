@@ -1,9 +1,13 @@
 # Publishing
 
 
-This repository is a curated downstream of an active development monorepo.
+This repository is a curated public downstream of an active development
+monorepo. Public `main` is a publication surface, not the primary maintainer
+work branch.
 
-PRs are welcome, subject to maintainer review. Any change that touches code
+PRs are welcome, subject to maintainer review. Public `main` is write-locked to
+the sync bot, and accepted changes are replayed through the maintainer's
+upstream review path before they sync back here. Any change that touches code
 also requires a security review.
 
 All accepted contributions are cherry-picked through the maintainer's

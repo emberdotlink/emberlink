@@ -38,6 +38,24 @@ use ember_daemon::infra::runtime::DaemonRuntime;
 use ember_daemon::infra::store::DaemonStore;
 use ember_daemon::infra::vault::{Vault, VaultError, VaultScope, validate_credential_name};
 
+fn uses_managed_separate_uid_topology(config: &DaemonConfig) -> bool {
+    if !ember_daemon::install::is_separate_uid_posture() {
+        return false;
+    }
+    let Some(home) = dirs_next::home_dir() else {
+        return false;
+    };
+    let ember_root = home.join(".ember");
+    config.socket_dir == ember_root.join("run")
+        && config.data_dir == ember_root.join("data")
+        && config.pid_file == ember_root.join("run").join("emberd.pid")
+}
+
+fn managed_local_vault_fallback_message() -> &'static str {
+    "daemon is not running on the managed separate-uid path; local vault fallback is refused. \
+     Run `ember status` to inspect daemon posture and `sudo ember daemon install` to repair it."
+}
+
 /// Run `ember cluster bootstrap <cluster-id> [--two-phase]`.
 ///
 /// When `two_phase` is true, this function prints documentation about the
@@ -52,6 +70,10 @@ pub fn cmd_cluster_bootstrap(
     if two_phase {
         cmd_cluster_bootstrap_two_phase_doc(cluster_id, json_output);
         return;
+    }
+    if uses_managed_separate_uid_topology(config) {
+        eprintln!("error: {}", managed_local_vault_fallback_message());
+        process::exit(1);
     }
 
     // Validate cluster_id: must be a valid vault path segment (lowercase,
@@ -171,6 +193,11 @@ pub fn cmd_cluster_restore(
     config: &DaemonConfig,
     json_output: bool,
 ) {
+    if uses_managed_separate_uid_topology(config) {
+        eprintln!("error: {}", managed_local_vault_fallback_message());
+        process::exit(1);
+    }
+
     let vault_key = vault_key_for_cluster(cluster_id);
 
     // Open daemon store + vault.
@@ -333,14 +360,16 @@ impl RecoveryStatus {
 /// Probe the local daemon socket to check if the daemon is up.
 fn probe_daemon_readiness(config: &DaemonConfig) -> RecoveryStatus {
     let runtime = DaemonRuntime::new(config.clone());
-    match runtime.status() {
-        Ok(status) if status.running => RecoveryStatus {
+    let runtime_status = runtime.status().ok();
+    match crate::probe_live_daemon_status(&config.socket_dir.join("daemon.sock"), &config.pid_file)
+    {
+        Ok(Some(live)) => RecoveryStatus {
             daemon_running: true,
-            pid: Some(status.pid),
+            pid: live.pid.or_else(|| runtime_status.map(|status| status.pid)),
         },
         _ => RecoveryStatus {
             daemon_running: false,
-            pid: None,
+            pid: runtime_status.and_then(|status| (!status.running).then_some(status.pid)),
         },
     }
 }
@@ -600,5 +629,18 @@ mod tests {
             pid: None,
         };
         assert_eq!(not_running.status_label(), "partial");
+    }
+
+    #[test]
+    fn managed_local_vault_fallback_message_points_to_repair() {
+        let msg = managed_local_vault_fallback_message();
+        assert!(
+            msg.contains("local vault fallback is refused"),
+            "managed cluster fallback message must explain why the local path is blocked: {msg}"
+        );
+        assert!(
+            msg.contains("sudo ember daemon install"),
+            "managed cluster fallback message must point at the canonical repair path: {msg}"
+        );
     }
 }

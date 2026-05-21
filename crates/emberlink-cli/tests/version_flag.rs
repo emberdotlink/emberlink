@@ -28,7 +28,18 @@ fn ember_bin() -> &'static str {
 /// must complete without touching the filesystem or the keychain — that's
 /// the whole point of the flag.
 fn run_ember(args: &[&str]) -> (String, String, i32) {
+    // ember-cli eager-loads ~/.ember/config.toml before dispatching subcommands
+    // (implementation-note-445 loud-fail). `version` subcommand doesn't
+    // need the config but the eager-load fires anyway — see
+    // implementation-note-502 for the
+    // structural fix. Until that ships, point EMBER_CONFIG at a fixture so
+    // tests pass on hosts without ~/.ember/config.toml.
+    let tmp = tempfile::tempdir().expect("config tempdir");
+    let config_path = tmp.path().join("config.toml");
+    std::fs::write(&config_path, "# fixture for version_flag tests\n")
+        .expect("write fixture config");
     let out = Command::new(ember_bin())
+        .env("EMBER_CONFIG", &config_path)
         .args(args)
         .output()
         .expect("spawn ember");

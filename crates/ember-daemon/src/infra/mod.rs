@@ -15,6 +15,7 @@ pub mod init_first_grant;
 pub mod interactive_unlock;
 pub mod kms;
 pub mod kms_edge;
+pub mod native_biometric_unlock;
 pub mod notification;
 pub mod notify;
 pub mod outbound_leak;

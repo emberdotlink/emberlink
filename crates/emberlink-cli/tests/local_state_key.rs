@@ -216,7 +216,11 @@ fn daemon_unavailable_returns_structured_error() {
         "expected 'daemon unavailable' in error, got: {msg}"
     );
     assert!(
-        msg.contains("ember daemon start"),
-        "expected 'ember daemon start' hint in error, got: {msg}"
+        msg.contains("ember status"),
+        "expected 'ember status' hint in error, got: {msg}"
+    );
+    assert!(
+        msg.contains("sudo ember daemon install"),
+        "expected 'sudo ember daemon install' hint in error, got: {msg}"
     );
 }

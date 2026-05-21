@@ -2,7 +2,7 @@
 //! .B: Tier 1/2 approvals consult an attester before flipping
 //! approved state. Real macOS SE wiring deferred to .B-SE-WIRE.
 //!
-//! implementation-note-28 (design note D2):
+//! implementation-note-34 (design note D2):
 //! [`bind_presence_challenge`] (a.k.a. `presence_challenge_bind`) computes the
 //! per-request challenge that the browser presence prompter signs. The challenge
 //! is `SHA-256` over the length-prefixed canonical encoding of
@@ -123,7 +123,7 @@ fn write_length_prefixed(hasher: &mut Sha256, bytes: &[u8]) {
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-29
+// implementation-note-35
 // ---------------------------------------------------------------------------
 //
 // Per design note D2: after the daemon verifies the
@@ -159,13 +159,13 @@ const DOMAIN_PRESENCE_HANDLE: &[u8] = b"emberlink/v1/presence-handle";
 /// The envelope binds:
 ///
 /// - `challenge_hash`    — output of [`bind_presence_challenge`] for the
-///                          authorizing request; ties the handle to the exact
-///                          `(workflow_id, action_key, spiffe_uri, nonce)`
-///                          tuple the user attested to.
+///   authorizing request; ties the handle to the exact
+///   `(workflow_id, action_key, spiffe_uri, nonce)`
+///   tuple the user attested to.
 /// - `persona_id`        — the persona on whose behalf the handle was issued.
 /// - `issued_at_unix_ms` — daemon clock at mint time.
 /// - `ttl_ms`            — handle lifetime; verify rejects when
-///                          `now > issued_at + ttl_ms`.
+///   `now > issued_at + ttl_ms`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DaemonSignedHandle {
     pub challenge_hash: [u8; 32],
@@ -294,7 +294,7 @@ pub fn verify_presence_handle(
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-30
+// implementation-note-36
 // (design note D2)
 // ---------------------------------------------------------------------------
 //
@@ -570,7 +570,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // implementation-note-29 tests
+    // implementation-note-35 tests
     // -----------------------------------------------------------------
 
     /// Deterministic Ed25519 keypair for handle-signing tests. Derived
@@ -744,7 +744,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // implementation-note-30 tests — wire-format
+    // implementation-note-36 tests — wire-format
     // round-trip + ChallengeBinding determinism.
     // -----------------------------------------------------------------
 

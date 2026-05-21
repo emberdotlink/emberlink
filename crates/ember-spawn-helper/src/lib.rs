@@ -5,13 +5,13 @@
 //!
 //! Path B reconciliation drop. Two upstream sentinels feed this crate:
 //!
-//! - `implementation-note-159`
+//! - `implementation-note-182`
 //!   contributed the three-module structure (lib + `hash.rs` +
 //!   `peercred.rs`), the `HelperFrame` reply-enum shape (Spawn / Exit /
 //!   HashMismatch / Refused), the hex-string `content_hash_blake3`
 //!   field, tokio-async I/O, the 16 MiB `MAX_FRAME_BYTES` cap, and
 //!   little-endian length framing.
-//! - `implementation-note-160`
+//! - `implementation-note-183`
 //!   contributed [`WIRE_VERSION`] as a stable invariant constant, the
 //!   `seccomp_filter` directive field (Linux-only), `invocation_id` for
 //!   Receipt-chain correlation, the explicit env-name shape validator

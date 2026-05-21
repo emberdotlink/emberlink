@@ -23,7 +23,7 @@
 //! `infra::runtime`'s vault-sealed persistence layer until the ember-kms path
 //! supersedes it.
 //!
-//! ## Sibling server-cert mint (implementation-note-98)
+//! ## Sibling server-cert mint (implementation-note-112)
 //!
 //! Anchor: `ember_rpc_sibling_server_cert_minted_at_startup`.
 //!
@@ -188,7 +188,7 @@ impl BridgeCa {
                 .map_err(|_| BridgeCaError::PubkeyPublishFailed)?;
         }
 
-        let sealed = !placeholder.is_empty();
+        let sealed = false;
         let mut seed = [0u8; 32];
         getrandom::fill(&mut seed).expect("OS entropy failure");
         let key = SigningKey::from_bytes(&seed);
@@ -595,7 +595,7 @@ mod tests {
         ca.unseal(kms_path).expect("unseal idempotent second call");
     }
 
-    // ─── sign_server_cert (implementation-note-98 T2) ───
+    // ─── sign_server_cert (implementation-note-112 T2) ───
 
     /// Pre: minted BridgeCa, valid subject + SANs + TTL.
     /// Post: returned PEMs parse; leaf cert validates against the BridgeCa's

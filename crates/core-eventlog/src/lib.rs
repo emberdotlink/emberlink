@@ -4,6 +4,7 @@ pub mod materialize;
 pub use materialize::{advance_chain_head, check_chain};
 mod memory;
 mod types;
+pub mod verify;
 
 pub use authorize::{AllowAllAuthorizer, Authorizer, IdentityAuthorizer, sanitize_authorize_error};
 pub use event_log::EventLog;

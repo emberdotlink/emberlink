@@ -7,13 +7,21 @@
 //!
 //! # Signing payload
 //!
-//! The Ed25519 signature covers:
+//! The Ed25519 signature covers, in order, each component length-prefixed with a
+//! `u64` big-endian length:
 //!
-//! 1. Domain-separation prefix `"emberlink/v1/in-toto-statement"` (length-prefixed, u64 BE).
-//! 2. JCS-canonical encoding of the predicate (length-prefixed, u64 BE).
+//! 1. Domain-separation prefix `"emberlink/v1/in-toto-statement"`.
+//! 2. JCS-canonical encoding of `_type`.
+//! 3. JCS-canonical encoding of `subject`.
+//! 4. JCS-canonical encoding of `predicate_type`.
+//! 5. JCS-canonical encoding of `predicate`.
 //!
-//! This binds the signature to both the Emberlink context and the exact predicate
-//! bytes, preventing cross-context signature reuse.
+//! Binding `_type`, `subject`, and `predicate_type` into the signed bytes
+//! prevents a "signature lift" attack where an attacker takes a valid
+//! `(signature, predicate)` pair from statement A and swaps in a different
+//! `subject` or `predicate_type` to forge statement B. Without binding these
+//! envelope fields, the signature would still verify, allowing an attacker to
+//! re-target a legitimately-signed provenance predicate at a malicious artifact.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier as _, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -38,7 +46,7 @@ pub struct Subject {
 /// in-toto Statement v1 envelope wrapping a JCS-canonicalized predicate `P`.
 ///
 /// The anchor type name `InTotoStatementV1` is the `target_state_anchor` anchor
-/// for this task (implementation-note-379).
+/// for this task (implementation-note-424).
 ///
 /// # Field semantics
 ///
@@ -98,36 +106,68 @@ pub enum EnvelopeError {
     SignatureInvalid,
 }
 
-/// JCS-canonicalize a predicate value.
+/// JCS-canonicalize an arbitrary serializable value.
 ///
-/// Serializes `p` to `serde_json::Value` then applies RFC 8785 key ordering
+/// Serializes `v` to `serde_json::Value` then applies RFC 8785 key ordering
 /// so the canonical byte sequence is stable across map insertion order.
 ///
-/// Used internally by [`sign`] and [`verify`]; exposed so callers can inspect
-/// or log the canonical bytes before committing.
-pub fn canonicalize_predicate(p: &impl Serialize) -> Result<Vec<u8>, EnvelopeError> {
-    let value = serde_json::to_value(p).map_err(|e| EnvelopeError::Canonicalize(e.to_string()))?;
+/// Used internally by [`sign`] and [`verify`] for every envelope field that
+/// participates in the signing payload (`_type`, `subject`, `predicate_type`,
+/// `predicate`).
+pub fn canonicalize_value(v: &impl Serialize) -> Result<Vec<u8>, EnvelopeError> {
+    let value = serde_json::to_value(v).map_err(|e| EnvelopeError::Canonicalize(e.to_string()))?;
     let s = serde_jcs::to_string(&value).map_err(|e| EnvelopeError::Canonicalize(e.to_string()))?;
     Ok(s.into_bytes())
 }
 
+/// JCS-canonicalize a predicate value.
+///
+/// Thin wrapper around [`canonicalize_value`] retained as the predicate-specific
+/// entry point used by external callers that want to inspect or log the
+/// canonical predicate bytes before committing.
+pub fn canonicalize_predicate(p: &impl Serialize) -> Result<Vec<u8>, EnvelopeError> {
+    canonicalize_value(p)
+}
+
+/// Append a length-prefixed (`u64 BE`) byte slice to `buf`.
+fn append_length_prefixed(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+    buf.extend_from_slice(bytes);
+}
+
 /// Build the signing payload for an `InTotoStatementV1<P>`.
 ///
-/// Layout:
-/// 1. `u64 BE` length of domain prefix, then domain prefix bytes.
-/// 2. `u64 BE` length of canonical predicate bytes, then those bytes.
+/// Each component is encoded as `u64 BE` length followed by the canonical
+/// bytes. Layout:
+///
+/// 1. Domain-separation prefix.
+/// 2. JCS-canonical `_type` (a JSON string).
+/// 3. JCS-canonical `subject` (a JSON array of resource descriptors).
+/// 4. JCS-canonical `predicate_type` (a JSON string).
+/// 5. JCS-canonical `predicate`.
+///
+/// Binding `_type`, `subject`, and `predicate_type` into the signed bytes
+/// prevents a "signature lift" attack where an attacker swaps envelope fields
+/// while keeping a valid signature from a different statement.
 fn signing_payload<P: Serialize>(stmt: &InTotoStatementV1<P>) -> Result<Vec<u8>, EnvelopeError> {
-    let canonical = canonicalize_predicate(&stmt.predicate)?;
+    let canonical_type = canonicalize_value(&stmt._type)?;
+    let canonical_subject = canonicalize_value(&stmt.subject)?;
+    let canonical_predicate_type = canonicalize_value(&stmt.predicate_type)?;
+    let canonical_predicate = canonicalize_value(&stmt.predicate)?;
 
     let mut buf = Vec::new();
 
     // Domain-separation prefix
-    buf.extend_from_slice(&(DOMAIN_PREFIX.len() as u64).to_be_bytes());
-    buf.extend_from_slice(DOMAIN_PREFIX);
+    append_length_prefixed(&mut buf, DOMAIN_PREFIX);
+
+    // Envelope fields — bound so a signature cannot be lifted onto a different
+    // _type / subject / predicate_type.
+    append_length_prefixed(&mut buf, &canonical_type);
+    append_length_prefixed(&mut buf, &canonical_subject);
+    append_length_prefixed(&mut buf, &canonical_predicate_type);
 
     // Canonical predicate
-    buf.extend_from_slice(&(canonical.len() as u64).to_be_bytes());
-    buf.extend_from_slice(&canonical);
+    append_length_prefixed(&mut buf, &canonical_predicate);
 
     Ok(buf)
 }
@@ -269,5 +309,90 @@ mod tests {
     fn in_toto_statement_v1_type_field_is_correct() {
         let stmt = test_statement();
         assert_eq!(stmt._type, IN_TOTO_STATEMENT_V1_TYPE);
+    }
+
+    /// Cross-statement signature-lift attack must be rejected.
+    ///
+    /// An attacker takes a valid signature from statement A (signed over its
+    /// `_type` / `subject` / `predicate_type` / `predicate`) and pastes it onto
+    /// statement B whose `subject` and `predicate_type` differ but whose
+    /// `predicate` bytes are identical. Before the
+    /// implementation-note-425 fix the signed bytes only covered the
+    /// predicate, so this lift verified successfully — letting an attacker
+    /// re-target a legitimately-signed provenance predicate at a malicious
+    /// artifact name or claim it under a different predicate schema URI.
+    ///
+    /// After the fix the signing payload binds `_type`, `subject`, and
+    /// `predicate_type`, so the lifted signature must not verify.
+    #[test]
+    fn signature_lifted_from_other_statement_rejected() {
+        let sk = test_signing_key();
+        let vk = sk.verifying_key();
+
+        // Statement A: legitimate provenance for the real installer.
+        let stmt_a = test_statement();
+        let signed_a = sign(stmt_a, &sk).expect("sign A should succeed");
+
+        // Statement B: same predicate bytes, but the attacker has swapped the
+        // subject (different artifact name + digest) and predicate_type
+        // (different schema URI). If only the predicate is bound, signed_a's
+        // signature still verifies over the predicate bytes.
+        let mut evil_digest = BTreeMap::new();
+        evil_digest.insert(
+            "sha256".to_string(),
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string(),
+        );
+        let evil_subject = Subject {
+            name: "ember-installer-evil.tar.gz".to_string(),
+            digest: evil_digest,
+        };
+        let lifted = SignedEnvelope {
+            statement: InTotoStatementV1::new(
+                vec![evil_subject],
+                "https://attacker.example/predicate/v1".to_string(),
+                signed_a.statement.predicate.clone(),
+            ),
+            signature: signed_a.signature.clone(),
+        };
+
+        let err = verify(&lifted, &vk).expect_err("lifted signature must not verify");
+        assert_eq!(err, EnvelopeError::SignatureInvalid);
+
+        // Sanity: lifting just the subject (keeping predicate_type intact) is
+        // also rejected — proves `subject` alone is part of the binding.
+        let mut evil_digest2 = BTreeMap::new();
+        evil_digest2.insert(
+            "sha256".to_string(),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+        );
+        let subject_only_swap = SignedEnvelope {
+            statement: InTotoStatementV1::new(
+                vec![Subject {
+                    name: "ember-installer-imposter.tar.gz".to_string(),
+                    digest: evil_digest2,
+                }],
+                signed_a.statement.predicate_type.clone(),
+                signed_a.statement.predicate.clone(),
+            ),
+            signature: signed_a.signature.clone(),
+        };
+        let err = verify(&subject_only_swap, &vk)
+            .expect_err("subject-only lift must not verify");
+        assert_eq!(err, EnvelopeError::SignatureInvalid);
+
+        // Sanity: lifting just the predicate_type (keeping subject intact) is
+        // also rejected — proves `predicate_type` alone is part of the
+        // binding.
+        let predicate_type_only_swap = SignedEnvelope {
+            statement: InTotoStatementV1::new(
+                signed_a.statement.subject.clone(),
+                "https://attacker.example/predicate/v1".to_string(),
+                signed_a.statement.predicate.clone(),
+            ),
+            signature: signed_a.signature.clone(),
+        };
+        let err = verify(&predicate_type_only_swap, &vk)
+            .expect_err("predicate_type-only lift must not verify");
+        assert_eq!(err, EnvelopeError::SignatureInvalid);
     }
 }

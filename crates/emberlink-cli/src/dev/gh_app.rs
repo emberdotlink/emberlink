@@ -6,8 +6,9 @@
 //!
 
 use std::fs;
+use std::io::{self, IsTerminal as _, Write as _};
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The pre-filled GitHub App creation URL for the dev ember GH App.
 pub fn gh_app_creation_url() -> &'static str {
@@ -48,6 +49,64 @@ pub fn copy_pem_with_mode(src_bytes: &[u8], dest: &PathBuf) -> Result<String, St
     Ok(hex::encode(hash.as_bytes()))
 }
 
+fn parse_app_id_value(raw: &str, source: &str) -> Result<u64, String> {
+    raw.trim()
+        .parse::<u64>()
+        .map_err(|e| format!("{source} must be a positive integer: {e}"))
+}
+
+fn validate_pem_bytes(src_bytes: &[u8]) -> Result<(), String> {
+    let pem_str =
+        std::str::from_utf8(src_bytes).map_err(|e| format!("PEM is not valid UTF-8 text: {e}"))?;
+    let pem = pem::parse(pem_str).map_err(|e| format!("PEM parse failed: {e}"))?;
+    if !pem.tag().contains("PRIVATE KEY") {
+        return Err(format!(
+            "PEM must contain a private key block, got {}",
+            pem.tag()
+        ));
+    }
+    Ok(())
+}
+
+fn persist_gh_app(
+    config_dir: &PathBuf,
+    app_id: u64,
+    pem_bytes: &[u8],
+) -> Result<GhAppRecord, String> {
+    validate_pem_bytes(pem_bytes)?;
+    fs::create_dir_all(config_dir)
+        .map_err(|e| format!("failed to create config dir {}: {e}", config_dir.display()))?;
+
+    let env_path = config_dir.join("github.env");
+    let pem_dest = config_dir.join("github-app.pem");
+    let hash_hex = copy_pem_with_mode(pem_bytes, &pem_dest)?;
+    println!(
+        "  PEM copied to {} (blake3: {})",
+        pem_dest.display(),
+        hash_hex
+    );
+
+    write_github_env(config_dir, app_id)?;
+    println!("  App ID {app_id} written to {}", env_path.display());
+
+    Ok(GhAppRecord {
+        app_id,
+        pem_path: pem_dest,
+    })
+}
+
+fn prompt_line(prompt: &str) -> Result<String, String> {
+    print!("{prompt}");
+    io::stdout()
+        .flush()
+        .map_err(|e| format!("flush prompt: {e}"))?;
+    let mut buf = String::new();
+    io::stdin()
+        .read_line(&mut buf)
+        .map_err(|e| format!("read prompt response: {e}"))?;
+    Ok(buf.trim().to_string())
+}
+
 /// Write `EMBER_ENGINE_APP_ID=<app_id>` to `config_dir/github.env`.
 pub fn write_github_env(config_dir: &PathBuf, app_id: u64) -> Result<(), String> {
     fs::create_dir_all(config_dir)
@@ -71,47 +130,80 @@ fn parse_app_id_from_env(content: &str) -> Result<u64, String> {
     Err("EMBER_ENGINE_APP_ID not found in github.env".to_string())
 }
 
+fn existing_gh_app_record(config_dir: &Path) -> Result<Option<GhAppRecord>, String> {
+    let env_path = config_dir.join("github.env");
+    let pem_dest = config_dir.join("github-app.pem");
+
+    if !env_path.exists() || !pem_dest.exists() {
+        return Ok(None);
+    }
+
+    let env_content = fs::read_to_string(&env_path)
+        .map_err(|e| format!("failed to read {}: {e}", env_path.display()))?;
+    let pem_content =
+        fs::read(&pem_dest).map_err(|e| format!("failed to read {}: {e}", pem_dest.display()))?;
+
+    if env_content.trim().is_empty() || pem_content.is_empty() {
+        return Ok(None);
+    }
+
+    let app_id = parse_app_id_from_env(&env_content)
+        .map_err(|e| format!("existing github.env has invalid EMBER_ENGINE_APP_ID: {e}"))?;
+    validate_pem_bytes(&pem_content)
+        .map_err(|e| format!("existing github-app.pem is invalid: {e}"))?;
+    Ok(Some(GhAppRecord {
+        app_id,
+        pem_path: pem_dest,
+    }))
+}
+
+/// Read the existing dev GitHub App record without prompting or mutating
+/// filesystem state.
+pub fn read_existing_gh_app() -> Result<Option<GhAppRecord>, String> {
+    let config_dir = dev_config_dir()?;
+    existing_gh_app_record(&config_dir)
+}
+
 /// Idempotent: if `~/.config/emberlink-dev/github.env` and
 /// `~/.config/emberlink-dev/github-app.pem` both exist with non-empty content,
 /// return the existing record.
 ///
-/// Otherwise print the creation URL and attempt env-var bypass for CI, or
-/// return an error asking the operator to provision manually.
+/// Otherwise print the creation URL, accept either env-var bypass input or
+/// interactive stdin prompts, and persist the resulting App ID + PEM.
 pub fn ensure_gh_app() -> Result<GhAppRecord, String> {
     let config_dir = dev_config_dir()?;
-    let env_path = config_dir.join("github.env");
-    let pem_dest = config_dir.join("github-app.pem");
 
     // Idempotency check: both files must exist and be non-empty.
-    if env_path.exists() && pem_dest.exists() {
-        let env_content = fs::read_to_string(&env_path)
-            .map_err(|e| format!("failed to read {}: {e}", env_path.display()))?;
-        let pem_content = fs::read(&pem_dest)
-            .map_err(|e| format!("failed to read {}: {e}", pem_dest.display()))?;
-
-        if !env_content.trim().is_empty() && !pem_content.is_empty() {
-            let app_id = parse_app_id_from_env(&env_content)
-                .map_err(|e| format!("existing github.env has invalid EMBER_ENGINE_APP_ID: {e}"))?;
-            return Ok(GhAppRecord {
-                app_id,
-                pem_path: pem_dest,
-            });
-        }
+    if let Some(record) = existing_gh_app_record(&config_dir)? {
+        return Ok(record);
     }
 
-    // Interactive provisioning stub: print the URL.
     println!("[ember dev install] phase 2: GH App provisioning");
     println!("  Open this URL in your browser to create the ember-dev GitHub App:");
     println!("  {}", gh_app_creation_url());
     println!();
-    println!("  After creating the App, set EMBER_DEV_GH_APP_ID and EMBER_DEV_GH_APP_PEM");
-    println!("  env vars and re-run 'ember dev install'.");
+    println!("  You can either set EMBER_DEV_GH_APP_ID + EMBER_DEV_GH_APP_PEM");
+    println!("  or paste the values here when the App is ready.");
 
     // Try env-var bypass (for CI / non-interactive).
     let app_id_str = std::env::var("EMBER_DEV_GH_APP_ID").unwrap_or_default();
     let pem_path_str = std::env::var("EMBER_DEV_GH_APP_PEM").unwrap_or_default();
 
-    if app_id_str.is_empty() || pem_path_str.is_empty() {
+    if !app_id_str.is_empty() || !pem_path_str.is_empty() {
+        if app_id_str.is_empty() || pem_path_str.is_empty() {
+            return Err(
+                "GH App provisioning requires both EMBER_DEV_GH_APP_ID and EMBER_DEV_GH_APP_PEM"
+                    .to_string(),
+            );
+        }
+        let app_id = parse_app_id_value(&app_id_str, "EMBER_DEV_GH_APP_ID")?;
+        let src_path = PathBuf::from(pem_path_str.trim());
+        let pem_bytes = fs::read(&src_path)
+            .map_err(|e| format!("failed to read PEM from {}: {e}", src_path.display()))?;
+        return persist_gh_app(&config_dir, app_id, &pem_bytes);
+    }
+
+    if !io::stdin().is_terminal() {
         return Err(
             "GH App not provisioned: set EMBER_DEV_GH_APP_ID and EMBER_DEV_GH_APP_PEM \
              env vars, or run 'ember dev install' interactively after visiting the URL above"
@@ -119,32 +211,12 @@ pub fn ensure_gh_app() -> Result<GhAppRecord, String> {
         );
     }
 
-    let app_id: u64 = app_id_str
-        .trim()
-        .parse()
-        .map_err(|e| format!("EMBER_DEV_GH_APP_ID must be a positive integer: {e}"))?;
-
-    let src_path = PathBuf::from(pem_path_str.trim());
-    let pem_bytes = fs::read(&src_path)
-        .map_err(|e| format!("failed to read PEM from {}: {e}", src_path.display()))?;
-
-    fs::create_dir_all(&config_dir)
-        .map_err(|e| format!("failed to create config dir {}: {e}", config_dir.display()))?;
-
-    let hash_hex = copy_pem_with_mode(&pem_bytes, &pem_dest)?;
-    println!(
-        "  PEM copied to {} (blake3: {})",
-        pem_dest.display(),
-        hash_hex
-    );
-
-    write_github_env(&config_dir, app_id)?;
-    println!("  App ID {app_id} written to {}", env_path.display());
-
-    Ok(GhAppRecord {
-        app_id,
-        pem_path: pem_dest,
-    })
+    println!();
+    let app_id = parse_app_id_value(&prompt_line("  GitHub App ID: ")?, "GitHub App ID")?;
+    let pem_path = PathBuf::from(prompt_line("  PEM path: ")?);
+    let pem_bytes = fs::read(&pem_path)
+        .map_err(|e| format!("failed to read PEM from {}: {e}", pem_path.display()))?;
+    persist_gh_app(&config_dir, app_id, &pem_bytes)
 }
 
 #[cfg(test)]
@@ -220,5 +292,63 @@ mod tests {
         let content = "EMBER_ENGINE_APP_ID=99999\n";
         let id = parse_app_id_from_env(content).unwrap();
         assert_eq!(id, 99999);
+    }
+
+    #[test]
+    fn parse_app_id_value_rejects_non_numeric_input() {
+        let err = parse_app_id_value("abc", "GitHub App ID").expect_err("must reject non-numeric");
+        assert!(err.contains("positive integer"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validate_pem_bytes_accepts_private_key_pem() {
+        let pem_bytes = b"\x2d----BEGIN PRIVATE KEY-----\nRkFLRQ==\n-----END PRIVATE KEY-----\n";
+        validate_pem_bytes(pem_bytes).expect("valid private key PEM must pass");
+    }
+
+    #[test]
+    fn validate_pem_bytes_rejects_non_pem_input() {
+        let err = validate_pem_bytes(b"not a pem").expect_err("non-PEM must fail");
+        assert!(err.contains("PEM"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn existing_gh_app_record_returns_none_when_files_absent() {
+        let tmp = TempDir::new().unwrap();
+        let record = existing_gh_app_record(&tmp.path().to_path_buf()).unwrap();
+        assert!(record.is_none(), "missing config must return None");
+    }
+
+    #[test]
+    fn existing_gh_app_record_reads_existing_files() {
+        let tmp = TempDir::new().unwrap();
+        let config_dir = tmp.path().to_path_buf();
+        write_github_env(&config_dir, 424242).unwrap();
+        copy_pem_with_mode(
+            b"\x2d----BEGIN PRIVATE KEY-----\nRkFLRQ==\n-----END PRIVATE KEY-----\n",
+            &config_dir.join("github-app.pem"),
+        )
+        .unwrap();
+
+        let record = existing_gh_app_record(&config_dir)
+            .unwrap()
+            .expect("record must be present");
+        assert_eq!(record.app_id, 424242);
+        assert_eq!(record.pem_path, config_dir.join("github-app.pem"));
+    }
+
+    #[test]
+    fn persist_gh_app_writes_env_and_pem() {
+        let tmp = TempDir::new().unwrap();
+        let config_dir = tmp.path().to_path_buf();
+        let record = persist_gh_app(
+            &config_dir,
+            31337,
+            b"\x2d----BEGIN PRIVATE KEY-----\nRkFLRQ==\n-----END PRIVATE KEY-----\n",
+        )
+        .expect("persist must succeed");
+        assert_eq!(record.app_id, 31337);
+        assert!(config_dir.join("github.env").exists());
+        assert!(config_dir.join("github-app.pem").exists());
     }
 }

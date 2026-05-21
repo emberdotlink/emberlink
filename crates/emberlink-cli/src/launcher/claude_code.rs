@@ -1,6 +1,6 @@
 //! `ember claude-code` launcher.
 //!
-//! Per design §2 / implementation-note-389 + design §3 (PATH-shadow wiring, sub-B).
+//! Per design §2 / implementation-note-478 + design §3 (PATH-shadow wiring, sub-B).
 //! Real daemon RPC shipped in #2318 (LAUNCHER-SESSION-RPC); see design §2
 //! for the full protocol contract.
 //!
@@ -15,7 +15,7 @@
 //! 3. Set `EMBER_GRANT_ID` / `EMBER_PROXY_URL` / `EMBER_SESSION_ID` in
 //!    the child env. `HTTPS_PROXY` is intentionally NOT set — the
 //!    daemon's LLM proxy isn't CONNECT-compatible (see
-//!    implementation-note-429). Claude Code talks
+//!    implementation-note-479). Claude Code talks
 //!    to api.anthropic.com directly with the friendly's own auth.
 //! 4. Prepend `shadow_dir` to the child's `PATH` via `Command::env` so that
 //!    tool invocations like `gh pr create` resolve to the ember Construct
@@ -28,7 +28,7 @@
 //!    a signed Receipt with `termination_reason = clean_exit`.
 //! 7. Exit with the child's status code.
 //!
-//! implementation-note-430
+//! implementation-note-480
 //!
 //! The launcher uses `std::process::Command::status` (parent-and-child
 //! model) rather than `execve`. Terminal SIGINT/SIGTERM go to the
@@ -47,6 +47,7 @@ use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::install_paths::PROD_MANIFEST_PATH;
 use crate::launcher::path_shadow::{ConstructSpec, install_path_shadow, shadow_bin_dir};
 use crate::launcher::presence;
 use crate::launcher::session_prefs;
@@ -59,13 +60,21 @@ pub struct SessionRegistration {
     pub session_id: String,
     pub grant_id: String,
     pub proxy_url: String,
-    /// Git credential-injection proxy URL (implementation-note-267).
+    /// Optional Anthropic gateway base URL for launcher-mediated Claude Code
+    /// sessions. Present only when the daemon has already resolved the active
+    /// session grant to a composite Anthropic grant shape.
+    pub anthropic_base_url: Option<String>,
+    /// Newline-separated `Name: Value` headers for Claude Code's
+    /// `ANTHROPIC_CUSTOM_HEADERS` env var. Present only alongside
+    /// `anthropic_base_url`.
+    pub anthropic_custom_headers: Option<String>,
+    /// Git credential-injection proxy URL (implementation-note-294).
     /// When `Some`, the child process receives `EMBER_GIT_PROXY_URL=<url>`.
     /// `None` when the daemon did not allocate a git proxy (git proxy disabled
     /// or pre-fix daemon).
     pub git_proxy_url: Option<String>,
     /// Path to the daemon-managed ssh-agent socket for this session
-    /// (implementation-note-72). When `Some`, the child process
+    /// (implementation-note-83). When `Some`, the child process
     /// receives `SSH_AUTH_SOCK=<path>` so git/ssh in the child tree find
     /// the daemon socket. `None` when the daemon did not allocate an
     /// ssh-agent for this session (e.g. pre-design daemon).
@@ -111,7 +120,7 @@ fn parse_register_session_result(
         .as_str()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "daemon: missing grant_id"))?
         .to_string();
-    // implementation-note-267: the daemon should always include
+    // implementation-note-294: the daemon should always include
     // proxy_url in the register_session response (it reads EMBER_PROXY_URL
     // from runtime state). If the fallback to 8484 fires it means the daemon
     // is pre-fix or the LLM proxy failed to bind — Claude Code will hit
@@ -123,18 +132,25 @@ fn parse_register_session_result(
                 "ember claude-code: WARNING — daemon did not return proxy_url in \
                  register_session response; falling back to http://127.0.0.1:8484 which \
                  is likely not bound. Claude Code may fail with ECONNREFUSED. \
-                 (implementation-note-267)"
+                 (implementation-note-294)"
             );
             "http://127.0.0.1:8484".to_string()
         }
     };
+    let anthropic_base_url = result["anthropic_base_url"].as_str().map(|s| s.to_string());
+    let anthropic_custom_headers = result["anthropic_custom_headers"]
+        .as_str()
+        .map(|s| s.to_string());
     let git_proxy_url = result["git_proxy_url"].as_str().map(|s| s.to_string());
+    let ssh_auth_sock = result["ssh_auth_sock"].as_str().map(|s| s.to_string());
     Ok(SessionRegistration {
         session_id,
         grant_id,
         proxy_url,
+        anthropic_base_url,
+        anthropic_custom_headers,
         git_proxy_url,
-        ssh_auth_sock: None,
+        ssh_auth_sock,
     })
 }
 
@@ -179,6 +195,53 @@ pub fn resolve_shadow_dir() -> PathBuf {
 pub const COHORT_A_TOOLS: &[&str] = &[
     "gh", "git", "kubectl", "npm", "docker", "wrangler", "pulumi",
 ];
+
+fn normalize_lexical_path(path: PathBuf) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn resolve_symlink_target(path: &Path, target: &Path) -> PathBuf {
+    if target.is_absolute() {
+        normalize_lexical_path(target.to_path_buf())
+    } else {
+        normalize_lexical_path(path.parent().unwrap_or_else(|| Path::new("/")).join(target))
+    }
+}
+
+fn resolve_terminal_candidate(path: &Path) -> PathBuf {
+    let mut current = path.to_path_buf();
+    for _ in 0..8 {
+        let Ok(target) = std::fs::read_link(&current) else {
+            return current;
+        };
+        current = resolve_symlink_target(&current, &target);
+    }
+    current
+}
+
+fn path_looks_like_repo_build_artifact(path: &Path) -> bool {
+    path.components().any(|component| component.as_os_str() == "target")
+}
+
+fn prod_safe_construct_candidate(candidate: &Path) -> bool {
+    if !candidate.exists() {
+        return false;
+    }
+    let terminal = resolve_terminal_candidate(candidate);
+    terminal.exists() && !path_looks_like_repo_build_artifact(&terminal)
+}
 
 /// Build the [`ConstructSpec`] list for the cohort-A Construct set.
 ///
@@ -227,6 +290,84 @@ pub fn cohort_a_construct_specs() -> Vec<ConstructSpec> {
         .collect()
 }
 
+fn managed_prod_construct_specs_from_sources(
+    manifest: Option<&ember_daemon::binary_manifest::BinaryManifest>,
+    bundled_dir: &Path,
+    path_var: Option<&str>,
+) -> Vec<ConstructSpec> {
+    if let Some(manifest) = manifest {
+        let specs: Vec<ConstructSpec> = COHORT_A_TOOLS
+            .iter()
+            .filter_map(|tool| {
+                let ember_name = format!("ember-{tool}");
+                let entry = ember_daemon::binary_manifest::lookup_construct(manifest, &ember_name)
+                    .ok()?;
+                if prod_safe_construct_candidate(&entry.absolute_path) {
+                    Some(ConstructSpec {
+                        tool_name: (*tool).to_string(),
+                        target_binary: entry.absolute_path.clone(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !specs.is_empty() {
+            return specs;
+        }
+    }
+
+    let bundled_specs: Vec<ConstructSpec> = COHORT_A_TOOLS
+        .iter()
+        .filter_map(|tool| {
+            let ember_name = format!("ember-{tool}");
+            let candidate = bundled_dir.join(&ember_name);
+            if prod_safe_construct_candidate(&candidate) {
+                Some(ConstructSpec {
+                    tool_name: (*tool).to_string(),
+                    target_binary: candidate,
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+    if !bundled_specs.is_empty() {
+        return bundled_specs;
+    }
+
+    let mut specs = Vec::new();
+    if let Some(path_var) = path_var {
+        for tool in COHORT_A_TOOLS {
+            let ember_name = format!("ember-{tool}");
+            for entry in std::env::split_paths(path_var) {
+                let candidate = entry.join(&ember_name);
+                if prod_safe_construct_candidate(&candidate) {
+                    specs.push(ConstructSpec {
+                        tool_name: (*tool).to_string(),
+                        target_binary: candidate,
+                    });
+                    break;
+                }
+            }
+        }
+    }
+    specs
+}
+
+pub fn managed_prod_construct_specs() -> Vec<ConstructSpec> {
+    let manifest =
+        ember_daemon::binary_manifest::load_manifest(Path::new(PROD_MANIFEST_PATH)).ok();
+    let bundled_dir = ember_daemon::binary_manifest::bundled_install_dir();
+    managed_prod_construct_specs_from_sources(manifest.as_ref(), &bundled_dir, std::env::var("PATH").ok().as_deref())
+}
+
+pub fn prod_required_constructs_present(specs: &[ConstructSpec]) -> bool {
+    ["gh", "git"]
+        .into_iter()
+        .all(|tool| specs.iter().any(|spec| spec.tool_name == tool))
+}
+
 /// Resolve the child binary. `$EMBER_CLAUDE_BIN` overrides the default
 /// `claude` lookup so test harnesses can substitute `/usr/bin/true` etc.
 pub fn resolve_claude_bin() -> String {
@@ -265,29 +406,40 @@ pub fn run_with_registration(
     cmd.args(extra_args)
         .env("EMBER_GRANT_ID", &registration.grant_id)
         .env("EMBER_PROXY_URL", &registration.proxy_url)
-        // implementation-note-429: do NOT inject
+        .env("EMBER_SOCKET_PATH", socket_path.as_os_str())
+        .env("EMBER_DAEMON_SOCKET", socket_path.as_os_str())
+        // implementation-note-479: do NOT inject
         // HTTPS_PROXY for Claude Code. The daemon's LLM proxy
         // (`infra::proxy::run_proxy`) is a custom POST endpoint for the
         // Anthropic SDK base_url use case — NOT a CONNECT-supporting
         // transparent HTTPS_PROXY. Claude Code uses HTTPS_PROXY
         // semantics (sends `CONNECT api.anthropic.com:443`), and
         // run_proxy returns 400 (ERR_BAD_REQUEST) on CONNECT. Cohort-A
-        // value prop is the broker for credentialed SUBPROCESS calls
-        // (gh / git push / kubectl) via Constructs + shadow PATH —
-        // Claude Code's API connection is the friendly's own concern
-        // (subscription / API key). EMBER_PROXY_URL is still injected
-        // so Constructs can use it via different code paths if needed.
+        // value prop is still the broker for credentialed SUBPROCESS calls
+        // (gh / git push / kubectl) via Constructs + shadow PATH. Claude
+        // runtime mediation now lands via `ANTHROPIC_BASE_URL` +
+        // `ANTHROPIC_CUSTOM_HEADERS` when the session grant carries the
+        // right composite shape; without that bundle, Claude Code's own API
+        // auth remains the friendly's concern. EMBER_PROXY_URL is still
+        // injected so Constructs can use it via different code paths if
+        // needed.
         .env("EMBER_SESSION_ID", &registration.session_id)
         .env("PATH", &child_path)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    // Inject the git proxy URL when the daemon provided one (implementation-note-267).
+    if let Some(ref base_url) = registration.anthropic_base_url {
+        cmd.env("ANTHROPIC_BASE_URL", base_url);
+    }
+    if let Some(ref headers) = registration.anthropic_custom_headers {
+        cmd.env("ANTHROPIC_CUSTOM_HEADERS", headers);
+    }
+    // Inject the git proxy URL when the daemon provided one (implementation-note-294).
     if let Some(ref gpu) = registration.git_proxy_url {
         cmd.env("EMBER_GIT_PROXY_URL", gpu);
     }
     // Inject daemon-managed ssh-agent socket when the broker provided one
-    // (implementation-note-72). git/ssh in the child tree pick this up
+    // (implementation-note-83). git/ssh in the child tree pick this up
     // automatically without any additional configuration.
     if let Some(ref sock) = registration.ssh_auth_sock {
         cmd.env("SSH_AUTH_SOCK", sock);
@@ -387,14 +539,42 @@ pub fn maybe_print_host_mode_disclaimer() -> io::Result<()> {
 /// the child, then `close_session_rpc` on exit. The socket path is
 /// `~/.ember/run/daemon.sock` by default, overridable via `socket_path`.
 pub fn launch_claude_code(extra_args: &[String], socket_path: &Path) -> io::Result<i32> {
+    launch_claude_code_with_shadow_dir(extra_args, socket_path, None)
+}
+
+pub fn launch_claude_code_with_shadow_dir(
+    extra_args: &[String],
+    socket_path: &Path,
+    shadow_dir_override: Option<&Path>,
+) -> io::Result<i32> {
     let bin = resolve_claude_bin();
     let persona = resolve_persona_name();
 
     // Step 1: Install PATH-shadow symlinks before registering the session so
     // the shadow dir is ready before the child process is spawned.
-    let shadow_dir = resolve_shadow_dir();
+    let shadow_dir = shadow_dir_override
+        .map(PathBuf::from)
+        .unwrap_or_else(resolve_shadow_dir);
     let construct_specs = cohort_a_construct_specs();
-    install_path_shadow(&shadow_dir, &construct_specs)?;
+    launch_claude_code_with_shadow_dir_and_constructs(
+        extra_args,
+        socket_path,
+        &shadow_dir,
+        &bin,
+        &persona,
+        &construct_specs,
+    )
+}
+
+pub fn launch_claude_code_with_shadow_dir_and_constructs(
+    extra_args: &[String],
+    socket_path: &Path,
+    shadow_dir: &Path,
+    bin: &str,
+    persona: &str,
+    construct_specs: &[ConstructSpec],
+) -> io::Result<i32> {
+    install_path_shadow(shadow_dir, construct_specs)?;
 
     // Step 2: Register session with the daemon (mints EMBER_SESSION_ID).
     let registration = register_session_rpc(&persona, socket_path).map_err(|e| {
@@ -424,8 +604,8 @@ pub fn launch_claude_code(extra_args: &[String], socket_path: &Path) -> io::Resu
 
     // Step 4: Spawn child with shadow/bin PATH prepended and all ember env vars set.
     // The bin/ subdirectory holds the shim binaries; the root holds creds/config.
-    let bin_dir = shadow_bin_dir(&shadow_dir);
-    run_with_registration(&bin, extra_args, &registration, socket_path, &bin_dir)
+    let bin_dir = shadow_bin_dir(shadow_dir);
+    run_with_registration(bin, extra_args, &registration, socket_path, &bin_dir)
 }
 
 /// Send a synchronous JSON-RPC request over the daemon's Unix socket and
@@ -438,21 +618,53 @@ fn call_daemon(socket_path: &Path, method: &str, params: &Value) -> io::Result<V
             e.kind(),
             format!(
                 "ember claude-code: daemon not running (socket: {}): {e}; \
-                 start with 'ember daemon start'",
+                 run `ember status` or repair/install with `sudo ember daemon install`",
                 socket_path.display()
             ),
         )),
         Err(crate::DaemonRpcError::Io(e)) => Err(io::Error::new(
             e.kind(),
-            format!("daemon socket error: {e}"),
+            crate::format_daemon_socket_io_error(&e),
         )),
         Err(crate::DaemonRpcError::Protocol(e)) => {
             Err(io::Error::new(io::ErrorKind::InvalidData, e))
         }
-        Err(crate::DaemonRpcError::Rpc { message, .. }) => {
+        Err(crate::DaemonRpcError::Rpc { code, message }) => {
+            if let Some(guidance) = launcher_guidance_for_rpc(method, code, &message) {
+                return Err(io::Error::other(guidance));
+            }
             Err(io::Error::other(format!("daemon error: {message}")))
         }
     }
+}
+
+fn launcher_guidance_for_rpc(method: &str, code: i32, message: &str) -> Option<String> {
+    let is_locked = code == -32030
+        && (message.contains("session is locked")
+            || message.contains("vault unavailable")
+            || message.contains("session auto-locked"));
+    let is_quarantined =
+        message.contains("daemon quarantined") && message.contains("write-class method");
+
+    if method == "register_session"
+        && (is_locked || (code == -32001 && message.contains("authority_class_not_met")))
+    {
+        return Some(
+            "this Claude Code session needs operator presence on the daemon-managed vault lane. \
+             Approve the unlock flow if prompted, or run `ember vault unlock` from an interactive \
+             operator shell and then re-run `ember claude-code`."
+                .to_string(),
+        );
+    }
+
+    if method == "register_session" && is_quarantined {
+        return Some(
+            "this Claude Code session is blocked because the daemon quarantined write-class methods after an audit-chain integrity failure. Run `ember audit verify` to inspect the chain, then repair the daemon before re-running `ember claude-code`."
+                .to_string(),
+        );
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -464,9 +676,149 @@ mod tests {
             session_id: "sess_fixture".to_string(),
             grant_id: "grt_fixture".to_string(),
             proxy_url: "http://127.0.0.1:9999".to_string(),
+            anthropic_base_url: None,
+            anthropic_custom_headers: None,
             git_proxy_url: None,
             ssh_auth_sock: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prod_safe_construct_candidate_rejects_repo_target_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let launcher = tmp.path().join("ember-git");
+        let repo_target = tmp.path().join("target/release/ember-git");
+        std::fs::create_dir_all(repo_target.parent().unwrap()).unwrap();
+        std::fs::write(&repo_target, b"binary").unwrap();
+        std::os::unix::fs::symlink(&repo_target, &launcher).unwrap();
+        assert!(
+            !prod_safe_construct_candidate(&launcher),
+            "prod path must reject repo-target construct candidates"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prod_safe_construct_candidate_accepts_managed_install_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let launcher = tmp.path().join("ember-git");
+        let installed_target = tmp
+            .path()
+            .join("usr/local/lib/ember/binaries/ember-git");
+        std::fs::create_dir_all(installed_target.parent().unwrap()).unwrap();
+        std::fs::write(&installed_target, b"binary").unwrap();
+        std::os::unix::fs::symlink(&installed_target, &launcher).unwrap();
+        assert!(
+            prod_safe_construct_candidate(&launcher),
+            "prod path must accept managed-install construct candidates"
+        );
+    }
+
+    #[test]
+    fn prod_required_constructs_present_requires_gh_and_git() {
+        let both = vec![
+            ConstructSpec {
+                tool_name: "gh".to_string(),
+                target_binary: PathBuf::from("/usr/local/lib/ember/binaries/ember-gh"),
+            },
+            ConstructSpec {
+                tool_name: "git".to_string(),
+                target_binary: PathBuf::from("/usr/local/lib/ember/binaries/ember-git"),
+            },
+        ];
+        let gh_only = vec![ConstructSpec {
+            tool_name: "gh".to_string(),
+            target_binary: PathBuf::from("/usr/local/lib/ember/binaries/ember-gh"),
+        }];
+        assert!(prod_required_constructs_present(&both));
+        assert!(!prod_required_constructs_present(&gh_only));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_prod_construct_specs_from_sources_prefers_manifest_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let managed_gh = tmp.path().join("managed/ember-gh");
+        let managed_git = tmp.path().join("managed/ember-git");
+        std::fs::create_dir_all(managed_gh.parent().unwrap()).unwrap();
+        std::fs::write(&managed_gh, b"binary").unwrap();
+        std::fs::write(&managed_git, b"binary").unwrap();
+
+        let manifest = ember_daemon::binary_manifest::BinaryManifest {
+            entries: vec![
+                ember_daemon::binary_manifest::BinaryManifestEntry {
+                    tool_name: "ember-gh".to_string(),
+                    version: "0.3.0".to_string(),
+                    content_hash: "blake3:test".to_string(),
+                    absolute_path: managed_gh.clone(),
+                    installed_at: 0,
+                    publisher: "did:emberlink".to_string(),
+                    channel: ember_daemon::binary_manifest::BinaryDistributionChannel::Bundled,
+                },
+                ember_daemon::binary_manifest::BinaryManifestEntry {
+                    tool_name: "ember-git".to_string(),
+                    version: "0.3.0".to_string(),
+                    content_hash: "blake3:test".to_string(),
+                    absolute_path: managed_git.clone(),
+                    installed_at: 0,
+                    publisher: "did:emberlink".to_string(),
+                    channel: ember_daemon::binary_manifest::BinaryDistributionChannel::Bundled,
+                },
+            ],
+        };
+
+        let specs =
+            managed_prod_construct_specs_from_sources(Some(&manifest), tmp.path(), Some(""));
+        assert!(
+            specs.iter().any(|spec| spec.tool_name == "gh" && spec.target_binary == managed_gh)
+        );
+        assert!(
+            specs.iter().any(|spec| spec.tool_name == "git" && spec.target_binary == managed_git)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_prod_construct_specs_from_sources_falls_back_to_bundled_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundled_dir = tmp.path().join("bundled");
+        std::fs::create_dir_all(&bundled_dir).unwrap();
+        let bundled_gh = bundled_dir.join("ember-gh");
+        let bundled_git = bundled_dir.join("ember-git");
+        std::fs::write(&bundled_gh, b"binary").unwrap();
+        std::fs::write(&bundled_git, b"binary").unwrap();
+
+        let specs = managed_prod_construct_specs_from_sources(None, &bundled_dir, Some(""));
+        assert!(
+            specs.iter().any(|spec| spec.tool_name == "gh" && spec.target_binary == bundled_gh)
+        );
+        assert!(
+            specs.iter().any(|spec| spec.tool_name == "git" && spec.target_binary == bundled_git)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_prod_construct_specs_from_sources_rejects_repo_target_path_fallbacks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path_dir = tmp.path().join("path");
+        let repo_target_dir = tmp.path().join("target/release");
+        std::fs::create_dir_all(&path_dir).unwrap();
+        std::fs::create_dir_all(&repo_target_dir).unwrap();
+        let repo_gh = repo_target_dir.join("ember-gh");
+        let repo_git = repo_target_dir.join("ember-git");
+        std::fs::write(&repo_gh, b"binary").unwrap();
+        std::fs::write(&repo_git, b"binary").unwrap();
+        std::os::unix::fs::symlink(&repo_gh, path_dir.join("ember-gh")).unwrap();
+        std::os::unix::fs::symlink(&repo_git, path_dir.join("ember-git")).unwrap();
+        let path_var = path_dir.to_string_lossy().to_string();
+
+        let specs = managed_prod_construct_specs_from_sources(None, tmp.path(), Some(&path_var));
+        assert!(
+            specs.is_empty(),
+            "prod path fallback must reject repo-target construct shims: {specs:?}"
+        );
     }
 
     #[test]
@@ -564,6 +916,45 @@ mod tests {
     }
 
     #[test]
+    fn launcher_guidance_maps_missing_presence_for_register_session() {
+        let guidance = launcher_guidance_for_rpc(
+            "register_session",
+            -32001,
+            r#"{"error":"authority_class_not_met","reason":"missing"}"#,
+        )
+        .expect("expected guidance");
+        assert!(guidance.contains("operator presence"));
+        assert!(guidance.contains("ember vault unlock"));
+        assert!(guidance.contains("ember claude-code"));
+    }
+
+    #[test]
+    fn launcher_guidance_maps_locked_session_for_register_session() {
+        let guidance = launcher_guidance_for_rpc(
+            "register_session",
+            -32030,
+            "register_session denied: session is locked; reopen with `ember vault unlock`",
+        )
+        .expect("expected guidance");
+        assert!(guidance.contains("operator presence"));
+        assert!(guidance.contains("ember vault unlock"));
+        assert!(guidance.contains("ember claude-code"));
+    }
+
+    #[test]
+    fn launcher_guidance_maps_quarantined_register_session() {
+        let guidance = launcher_guidance_for_rpc(
+            "register_session",
+            -32603,
+            "daemon quarantined; write-class method `register_session` refused",
+        )
+        .expect("expected guidance");
+        assert!(guidance.contains("daemon quarantined"));
+        assert!(guidance.contains("ember audit verify"));
+        assert!(guidance.contains("ember claude-code"));
+    }
+
+    #[test]
     fn close_session_rpc_is_silent_on_failure() {
         // close_session_rpc must not panic when the daemon is unreachable —
         // the child has already exited and the launcher still needs to return.
@@ -576,7 +967,10 @@ mod tests {
             "session_id": "sess_fixture",
             "grant_id": "grt_fixture",
             "proxy_url": "http://127.0.0.1:7001",
+            "anthropic_base_url": "http://127.0.0.1:7001",
+            "anthropic_custom_headers": "X-Ember-Persona: persona-main\nX-Ember-Credential: anthropic-key",
             "git_proxy_url": "http://127.0.0.1:7002",
+            "ssh_auth_sock": "/tmp/ember-ssh-agent.sock",
         });
         let parsed = parse_register_session_result(&raw, Path::new("/tmp/daemon.sock"))
             .expect("direct result must parse");
@@ -584,8 +978,20 @@ mod tests {
         assert_eq!(parsed.grant_id, "grt_fixture");
         assert_eq!(parsed.proxy_url, "http://127.0.0.1:7001");
         assert_eq!(
+            parsed.anthropic_base_url.as_deref(),
+            Some("http://127.0.0.1:7001")
+        );
+        assert_eq!(
+            parsed.anthropic_custom_headers.as_deref(),
+            Some("X-Ember-Persona: persona-main\nX-Ember-Credential: anthropic-key")
+        );
+        assert_eq!(
             parsed.git_proxy_url.as_deref(),
             Some("http://127.0.0.1:7002")
+        );
+        assert_eq!(
+            parsed.ssh_auth_sock.as_deref(),
+            Some("/tmp/ember-ssh-agent.sock")
         );
     }
 
@@ -611,7 +1017,7 @@ mod tests {
         );
     }
 
-    // ── persona resolution tests (implementation-note-431) ──
+    // ── persona resolution tests (implementation-note-481) ──
 
     #[test]
     fn persona_defaults_to_cohort_a_when_env_unset() {
@@ -709,17 +1115,19 @@ mod tests {
         );
     }
 
-    // ── implementation-note-267: launcher env injection tests ──
+    // ── implementation-note-294: launcher env injection tests ──
 
     #[test]
     fn registration_with_real_proxy_url_is_not_8484() {
-        // implementation-note-267: verify that a registration
+        // implementation-note-294: verify that a registration
         // carrying a daemon-provided URL (non-8484) is accepted without
         // falling back. This is the T1 launcher acceptance condition.
         let reg = SessionRegistration {
             session_id: "sess_test".to_string(),
             grant_id: "grt_test".to_string(),
             proxy_url: "http://127.0.0.1:61169".to_string(),
+            anthropic_base_url: None,
+            anthropic_custom_headers: None,
             git_proxy_url: Some("http://127.0.0.1:61170".to_string()),
             ssh_auth_sock: None,
         };
@@ -740,7 +1148,7 @@ mod tests {
 
     #[test]
     fn run_with_registration_injects_daemon_proxy_url_not_8484() {
-        // implementation-note-267: T2 launcher — assert that the
+        // implementation-note-294: T2 launcher — assert that the
         // child env receives the daemon-returned proxy URL. We verify this
         // indirectly by confirming run_with_registration succeeds (returns 0)
         // with a registration carrying an ephemeral port. The real child-env
@@ -749,6 +1157,8 @@ mod tests {
             session_id: "sess_proxy_wire".to_string(),
             grant_id: "grt_proxy_wire".to_string(),
             proxy_url: "http://127.0.0.1:62000".to_string(),
+            anthropic_base_url: None,
+            anthropic_custom_headers: None,
             git_proxy_url: None,
             ssh_auth_sock: None,
         };
@@ -772,7 +1182,7 @@ mod tests {
         );
     }
 
-    // ── host-mode mediation disclaimer tests (implementation-note-432) ──
+    // ── host-mode mediation disclaimer tests (implementation-note-482) ──
 
     #[test]
     fn disclaimer_skipped_when_stderr_not_tty() {

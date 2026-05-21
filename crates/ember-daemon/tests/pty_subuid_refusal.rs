@@ -18,7 +18,7 @@
 //! `test_mode = true` bypasses the Finding-14 refusal so the test
 //! process's own uid can be checked out.
 //!
-//! implementation-note-141 — follow-up task name for the
+//! implementation-note-163 — follow-up task name for the
 //! future state where PTY constructs ARE routed through the
 //! user-namespace primitive; until then the refusal here is the
 //! correct behavior.
@@ -75,7 +75,7 @@ async fn pty_subuid_routing_refused_with_clear_error() {
         "error must explain PTY-not-yet-routed: got {msg}"
     );
     assert!(
-        msg.contains("implementation-note-141"),
+        msg.contains("implementation-note-163"),
         "error must name the follow-up task: got {msg}"
     );
     assert!(

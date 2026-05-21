@@ -2,7 +2,7 @@ mod activity_support;
 pub mod audit;
 pub mod binary;
 mod biometric;
-// implementation-note-149 — `ember bind …` admin path
+// implementation-note-172 — `ember bind …` admin path
 // for credential bindings. See `bind.rs` doc-comment.
 pub mod bind;
 pub mod broker;
@@ -10,17 +10,18 @@ pub mod cli;
 pub mod cluster;
 pub mod construct;
 pub mod grants;
-// implementation-note-16 — Phase 1 substrate. The
+// implementation-note-19 — Phase 1 substrate. The
 // `commands.rs` file is a single 300K-line module rather than a
 // `commands/` directory; the `headless` substrate lands as a
 // top-level sibling module per the brief's
 // "(or wherever sibling commands are declared)" clause.
 //
-// implementation-note-17
+// implementation-note-20
 pub mod claude_code_launcher;
 mod commands;
 pub mod demo;
 pub mod dev;
+pub mod dev_runtime;
 pub mod dev_install;
 pub mod dev_install_slice_c;
 pub mod headless;
@@ -36,6 +37,7 @@ mod recovery;
 mod screens;
 pub mod session;
 mod sync_support;
+pub mod trust;
 pub mod up;
 pub mod vault_io;
 mod vault_support;
@@ -78,6 +80,17 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(all(not(test), target_os = "macos"))]
+use ember_broker::secure_enclave::{
+    SeAccessPolicy, SeKeychainTarget, generate_secure_enclave_key_with_policy,
+};
+#[cfg(target_os = "macos")]
+use ember_broker::secure_enclave::{
+    SeKeyHandle, find_secure_enclave_key, se_pubkey_bytes, se_sign_with_touch_id,
+};
+#[cfg(all(test, target_os = "macos"))]
+use ember_broker::secure_enclave::{new_stub_key, se_register_stub_key};
 
 use self::sync_support::{SyncAdmissionOutcome, SyncExportOptions};
 
@@ -1655,6 +1668,39 @@ fn authority_error_reason(message: &str) -> Option<String> {
         .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(str::to_string))
 }
 
+pub(crate) fn is_daemon_socket_permission_denied(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::PermissionDenied || matches!(err.raw_os_error(), Some(1 | 13))
+}
+
+pub(crate) fn format_daemon_socket_io_error(err: &std::io::Error) -> String {
+    if is_daemon_socket_permission_denied(err) {
+        return "daemon socket access is denied for this shell. Confirm the operator is in the `ember-clients` group, start a fresh login shell (or relogin), and retry. If the managed socket or daemon install drifted, repair with `sudo ember daemon install`.".to_string();
+    }
+
+    format!("daemon socket error: {err}")
+}
+
+pub(crate) fn format_daemon_unavailable(
+    socket_path: &std::path::Path,
+    source: &std::io::Error,
+) -> String {
+    if is_daemon_socket_permission_denied(source) {
+        return format!(
+            "daemon socket access is denied at {}. Confirm the operator is in the `ember-clients` group, start a fresh login shell (or relogin), and retry. If the managed socket or daemon install drifted, repair with `sudo ember daemon install`.",
+            socket_path.display()
+        );
+    }
+
+    format!(
+        "daemon unavailable at {}: {} — run `ember status` to inspect posture or repair with `sudo ember daemon install`",
+        socket_path.display(),
+        source
+    )
+}
+
+#[cfg(target_os = "macos")]
+const NATIVE_VAULT_UNLOCK_KEY_LABEL: &str = "sh.emberlink.cli.native-vault-unlock";
+
 fn call_daemon_rpc_once(
     socket_path: &std::path::Path,
     method: &str,
@@ -1714,11 +1760,96 @@ fn call_daemon_rpc_once(
         .unwrap_or(serde_json::Value::Null))
 }
 
+#[cfg(target_os = "macos")]
+fn load_or_create_native_vault_unlock_key() -> Result<SeKeyHandle, DaemonRpcError> {
+    #[cfg(test)]
+    {
+        if let Ok(handle) = find_secure_enclave_key(NATIVE_VAULT_UNLOCK_KEY_LABEL) {
+            return Ok(handle);
+        }
+        let handle = new_stub_key(NATIVE_VAULT_UNLOCK_KEY_LABEL);
+        se_register_stub_key(NATIVE_VAULT_UNLOCK_KEY_LABEL, &handle);
+        return Ok(handle);
+    }
+
+    #[cfg(not(test))]
+    match find_secure_enclave_key(NATIVE_VAULT_UNLOCK_KEY_LABEL) {
+        Ok(handle) => Ok(handle),
+        Err(_) => generate_secure_enclave_key_with_policy(
+            NATIVE_VAULT_UNLOCK_KEY_LABEL,
+            SeKeychainTarget::SystemKeychain,
+            SeAccessPolicy::BiometricCurrentSet,
+        )
+        .map_err(|e| {
+            DaemonRpcError::Protocol(format!(
+                "native vault-unlock key unavailable: {e}. \
+                 Use the signed Ember preview artifact on macOS for Touch ID-backed unlock."
+            ))
+        }),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn perform_vault_unlock_ceremony(
+    socket_path: &std::path::Path,
+) -> Result<serde_json::Value, DaemonRpcError> {
+    let begin =
+        match call_daemon_rpc_once(socket_path, "vault_unlock_begin", &serde_json::Value::Null) {
+            Ok(value) => value,
+            Err(DaemonRpcError::Rpc { code, message })
+                if code == -32601
+                    || message
+                        .contains("only required on the separate-uid managed daemon path")
+                    || message.contains("only supported on macOS managed-daemon installs") =>
+            {
+                return call_daemon_rpc_once(socket_path, "vault_unlock", &serde_json::Value::Null);
+            }
+            Err(err) => return Err(err),
+        };
+
+    let request_id = begin
+        .get("request_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            DaemonRpcError::Protocol("vault_unlock_begin: missing request_id".to_string())
+        })?;
+    let challenge_hex = begin
+        .get("challenge_hex")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            DaemonRpcError::Protocol("vault_unlock_begin: missing challenge_hex".to_string())
+        })?;
+    let challenge = hex::decode(challenge_hex).map_err(|e| {
+        DaemonRpcError::Protocol(format!("vault_unlock_begin: challenge hex decode: {e}"))
+    })?;
+
+    let handle = load_or_create_native_vault_unlock_key()?;
+    let signature_der = se_sign_with_touch_id(&handle, &challenge)
+        .map_err(|e| DaemonRpcError::Protocol(format!("native biometric unlock failed: {e}")))?;
+    let public_key = se_pubkey_bytes(&handle).map_err(|e| {
+        DaemonRpcError::Protocol(format!("native biometric pubkey export failed: {e}"))
+    })?;
+
+    let complete_params = serde_json::json!({
+        "request_id": request_id,
+        "public_key_hex": hex::encode(public_key),
+        "signature_der_hex": hex::encode(signature_der),
+    });
+    call_daemon_rpc_once(socket_path, "vault_unlock_complete", &complete_params)
+}
+
 pub(crate) fn call_daemon_rpc(
     socket_path: &std::path::Path,
     method: &str,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, DaemonRpcError> {
+    #[cfg(target_os = "macos")]
+    if method == "vault_unlock" {
+        let value = perform_vault_unlock_ceremony(socket_path)?;
+        maybe_cache_presence_token_from_result(&value)?;
+        return Ok(value);
+    }
+
     match call_daemon_rpc_once(socket_path, method, params) {
         Ok(value) => {
             maybe_cache_presence_token_from_result(&value)?;
@@ -1731,6 +1862,9 @@ pub(crate) fn call_daemon_rpc(
             if should_retry_with_vault_unlock(method, code, &message) =>
         {
             set_cached_operator_presence_token(None);
+            #[cfg(target_os = "macos")]
+            let unlock = perform_vault_unlock_ceremony(socket_path)?;
+            #[cfg(not(target_os = "macos"))]
             let unlock =
                 call_daemon_rpc_once(socket_path, "vault_unlock", &serde_json::Value::Null)?;
             maybe_cache_presence_token_from_result(&unlock)?;
@@ -1776,6 +1910,108 @@ fn should_retry_with_vault_unlock(method: &str, code: i32, message: &str) -> boo
     code == -32000 && message.contains("no vault is attached")
 }
 
+fn daemon_rpc_guidance(method: &str, code: i32, message: &str) -> Option<String> {
+    let presence_missing = code == -32001
+        && authority_error_reason(message)
+            .as_deref()
+            .is_some_and(|reason| {
+                matches!(
+                    reason,
+                    "missing"
+                        | "expired"
+                        | "uid-mismatch"
+                        | "sig-invalid"
+                        | "scope-mismatch"
+                        | "identity-missing"
+                )
+            });
+    let session_locked = code == -32030
+        && (message.contains("session is locked")
+            || message.contains("vault unavailable")
+            || message.contains("session auto-locked"));
+    let live_vault_missing = code == -32000 && message.contains("no vault is attached");
+    let daemon_quarantined =
+        message.contains("daemon quarantined") && message.contains("write-class method");
+
+    if daemon_quarantined {
+        return Some(
+            "this command is blocked because the daemon quarantined write-class methods after an audit-chain integrity failure. Run `ember audit verify` to inspect the chain, then repair the daemon before retrying write operations."
+                .to_string(),
+        );
+    }
+
+    if presence_missing || session_locked || live_vault_missing {
+        if matches!(method, "register_session" | "vault_unlock" | "vault_lock") {
+            return Some(
+                "this command needs operator presence on the daemon-managed vault lane. \
+                 Retry from an interactive operator shell, approve the unlock flow if prompted, \
+                 or run `ember vault unlock` first and then retry."
+                    .to_string(),
+            );
+        }
+
+        return Some(
+            "this command needs operator presence on the daemon-managed vault lane. \
+             Approve the unlock flow if prompted, or run `ember vault unlock` from \
+             an interactive operator shell and retry."
+                .to_string(),
+        );
+    }
+
+    None
+}
+
+#[derive(Debug, Clone)]
+pub struct LiveDaemonStatus {
+    pub pid: Option<u32>,
+    pub socket: std::path::PathBuf,
+    pub summary: ember_daemon::infra::status::StatusSummary,
+}
+
+fn read_daemon_pid_hint(pid_file: &std::path::Path) -> Option<u32> {
+    std::fs::read_to_string(pid_file)
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()
+}
+
+/// Probe whether the daemon is live on the socket/RPC seam.
+///
+/// This deliberately treats the daemon's own `status` RPC as the source of
+/// truth once the socket path exists. Operator-facing posture/reporting should
+/// not depend only on a PID-file race or launchd bookkeeping when the managed
+/// daemon is already up and serving read-class methods.
+pub fn probe_live_daemon_status(
+    socket_path: &std::path::Path,
+    pid_file: &std::path::Path,
+) -> Result<Option<LiveDaemonStatus>, ValidationError> {
+    if !socket_path.exists() {
+        return Ok(None);
+    }
+
+    match call_daemon_rpc(socket_path, "status", &serde_json::Value::Null) {
+        Ok(result) => {
+            let summary = serde_json::from_value(result)
+                .map_err(|e| ValidationError::new(format!("daemon status: {e}")))?;
+            Ok(Some(LiveDaemonStatus {
+                pid: read_daemon_pid_hint(pid_file),
+                socket: socket_path.to_path_buf(),
+                summary,
+            }))
+        }
+        Err(DaemonRpcError::Unavailable(_)) => Ok(None),
+        Err(DaemonRpcError::Io(e)) => Err(ValidationError::new(format_daemon_socket_io_error(&e))),
+        Err(DaemonRpcError::Protocol(e)) => Err(ValidationError::new(e)),
+        Err(DaemonRpcError::Rpc { code, message }) => {
+            if let Some(guidance) = daemon_rpc_guidance("status", code, &message) {
+                return Err(ValidationError::new(guidance));
+            }
+            Err(ValidationError::new(format!("daemon rpc error: {message}")))
+        }
+    }
+}
+
 /// Resolve the daemon Unix-domain socket path.
 ///
 /// Precedence:
@@ -1804,13 +2040,14 @@ pub fn call_daemon_method(
     match call_daemon_rpc(socket_path, method, params) {
         Ok(result) => Ok(result),
         Err(DaemonRpcError::Unavailable(_)) => Err(ValidationError::new(
-            "daemon unavailable; start with 'ember daemon start'",
+            "daemon unavailable; run 'ember status' to inspect posture or repair with 'sudo ember daemon install'",
         )),
-        Err(DaemonRpcError::Io(e)) => {
-            Err(ValidationError::new(format!("daemon socket error: {e}")))
-        }
+        Err(DaemonRpcError::Io(e)) => Err(ValidationError::new(format_daemon_socket_io_error(&e))),
         Err(DaemonRpcError::Protocol(e)) => Err(ValidationError::new(e)),
-        Err(DaemonRpcError::Rpc { message, .. }) => {
+        Err(DaemonRpcError::Rpc { code, message }) => {
+            if let Some(guidance) = daemon_rpc_guidance(method, code, &message) {
+                return Err(ValidationError::new(guidance));
+            }
             Err(ValidationError::new(format!("daemon rpc error: {message}")))
         }
     }
@@ -1864,7 +2101,7 @@ fn resolve_encryption_key() -> Result<String, ValidationError> {
         const LEGACY_USER: &str = "local-state-key";
 
         // Peek the legacy keychain (best-effort; may be absent).
-        let legacy_entry = keyring::Entry::new(LEGACY_SERVICE, LEGACY_USER).ok();
+        let legacy_entry = keyring_core::Entry::new(LEGACY_SERVICE, LEGACY_USER).ok();
         let legacy_key = legacy_entry.as_ref().and_then(|e| e.get_password().ok());
 
         // Fetch daemon's current key (auto-generates if missing).
@@ -2055,6 +2292,7 @@ mod tests {
     use super::*;
 
     static TEMP_STATE_COUNTER: AtomicU64 = AtomicU64::new(0);
+    static OPERATOR_PRESENCE_TOKEN_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn temp_state_file(tag: &str) -> PathBuf {
         let timestamp = SystemTime::now()
@@ -2102,11 +2340,51 @@ mod tests {
         .expect("presence token value")
     }
 
+    /// Accept a Unix-socket connection with a wall-clock timeout, ensuring
+    /// tests never hang indefinitely on `__skb_wait_for_more_packets` when
+    /// a client thread crashes before connecting. Replaces bare
+    /// `listener.accept().expect(...)` calls in this module. Mirrors the
+    /// same-name helper in `crates/emberlink-cli/src/bin/ember.rs`.
+    ///
+    /// anchor: emberlink_cli_lib_test_listener_timeout_landed
+    fn accept_with_timeout(
+        listener: &std::os::unix::net::UnixListener,
+        timeout: std::time::Duration,
+    ) -> std::os::unix::net::UnixStream {
+        listener
+            .set_nonblocking(true)
+            .expect("set_nonblocking on listener");
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream
+                        .set_nonblocking(false)
+                        .expect("restore blocking on accepted stream");
+                    return stream;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        panic!(
+                            "listener.accept() timed out after {:?} — implementation-note-485 guard fired",
+                            timeout
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(e) => panic!("listener.accept() error: {}", e),
+            }
+        }
+    }
+
     #[test]
     fn call_daemon_rpc_unlocks_and_retries_once_for_missing_presence_token() {
         use std::io::{BufRead, Write as _};
         use std::os::unix::net::UnixListener;
 
+        let _guard = OPERATOR_PRESENCE_TOKEN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         set_cached_operator_presence_token(None);
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let socket_path = tmp.path().join("daemon.sock");
@@ -2118,8 +2396,19 @@ mod tests {
                 let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
                 ready_tx.send(()).expect("signal ready");
 
-                for expected_method in ["create_persona", "vault_unlock", "create_persona"] {
-                    let (mut stream, _) = listener.accept().expect("accept fake daemon client");
+                let expected_methods: Vec<&str> = if cfg!(target_os = "macos") {
+                    vec![
+                        "create_persona",
+                        "vault_unlock_begin",
+                        "vault_unlock_complete",
+                        "create_persona",
+                    ]
+                } else {
+                    vec!["create_persona", "vault_unlock", "create_persona"]
+                };
+                for expected_method in expected_methods {
+                    let mut stream =
+                        accept_with_timeout(&listener, std::time::Duration::from_secs(10));
                     let mut reader = std::io::BufReader::new(
                         stream.try_clone().expect("clone fake daemon stream"),
                     );
@@ -2155,7 +2444,16 @@ mod tests {
                                 })
                             }
                         }
-                        "vault_unlock" => serde_json::json!({
+                        "vault_unlock_begin" => serde_json::json!({
+                            "id": request["id"],
+                            "result": {
+                                "request_id": "req-123",
+                                "challenge_hex": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+                                "expires_at_unix_ms": 9999999999999u64,
+                                "reason": "Unlock the daemon vault for operator commands"
+                            }
+                        }),
+                        "vault_unlock_complete" | "vault_unlock" => serde_json::json!({
                             "id": request["id"],
                             "result": {
                                 "unlocked": true,
@@ -2194,6 +2492,9 @@ mod tests {
         use std::io::{BufRead, Write as _};
         use std::os::unix::net::UnixListener;
 
+        let _guard = OPERATOR_PRESENCE_TOKEN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         set_cached_operator_presence_token(None);
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let socket_path = tmp.path().join("daemon.sock");
@@ -2206,8 +2507,19 @@ mod tests {
                 ready_tx.send(()).expect("signal ready");
                 let mut create_persona_calls = 0usize;
 
-                for expected_method in ["create_persona", "vault_unlock", "create_persona"] {
-                    let (mut stream, _) = listener.accept().expect("accept fake daemon client");
+                let expected_methods: Vec<&str> = if cfg!(target_os = "macos") {
+                    vec![
+                        "create_persona",
+                        "vault_unlock_begin",
+                        "vault_unlock_complete",
+                        "create_persona",
+                    ]
+                } else {
+                    vec!["create_persona", "vault_unlock", "create_persona"]
+                };
+                for expected_method in expected_methods {
+                    let mut stream =
+                        accept_with_timeout(&listener, std::time::Duration::from_secs(10));
                     let mut reader = std::io::BufReader::new(
                         stream.try_clone().expect("clone fake daemon stream"),
                     );
@@ -2235,7 +2547,16 @@ mod tests {
                                 }
                             })
                         }
-                        "vault_unlock" => serde_json::json!({
+                        "vault_unlock_begin" => serde_json::json!({
+                            "id": request["id"],
+                            "result": {
+                                "request_id": "req-locked",
+                                "challenge_hex": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+                                "expires_at_unix_ms": 9999999999999u64,
+                                "reason": "Unlock the daemon vault for operator commands"
+                            }
+                        }),
+                        "vault_unlock_complete" | "vault_unlock" => serde_json::json!({
                             "id": request["id"],
                             "result": {
                                 "unlocked": true,
@@ -2273,10 +2594,95 @@ mod tests {
     }
 
     #[test]
+    fn daemon_rpc_guidance_maps_locked_retry_exhaustion() {
+        let guidance = daemon_rpc_guidance(
+            "create_persona",
+            -32030,
+            "create_persona denied: session is locked; reopen with `ember vault unlock` or start a new session (`register_session` path). Ordinary lazy same-daemon re-auth is not fully wired yet",
+        )
+        .expect("expected guidance");
+        assert!(guidance.contains("operator presence"));
+        assert!(guidance.contains("ember vault unlock"));
+    }
+
+    #[test]
+    fn daemon_rpc_guidance_maps_quarantined_write_class_refusal() {
+        let guidance = daemon_rpc_guidance(
+            "broker.github_status",
+            -32603,
+            "daemon quarantined; write-class method `broker.github_status` refused",
+        )
+        .expect("expected quarantine guidance");
+        assert!(guidance.contains("daemon quarantined"), "got: {guidance}");
+        assert!(guidance.contains("ember audit verify"), "got: {guidance}");
+        assert!(guidance.contains("repair the daemon"), "got: {guidance}");
+    }
+
+    #[test]
+    fn format_daemon_socket_io_error_maps_eperm_to_shell_guidance() {
+        let err = std::io::Error::from_raw_os_error(1);
+        let message = format_daemon_socket_io_error(&err);
+        assert!(message.contains("ember-clients"), "got: {message}");
+        assert!(message.contains("fresh login shell"), "got: {message}");
+        assert!(
+            message.contains("sudo ember daemon install"),
+            "got: {message}"
+        );
+    }
+
+    #[test]
+    fn format_daemon_socket_io_error_maps_eacces_to_shell_guidance() {
+        let err = std::io::Error::from_raw_os_error(13);
+        let message = format_daemon_socket_io_error(&err);
+        assert!(message.contains("ember-clients"), "got: {message}");
+        assert!(message.contains("fresh login shell"), "got: {message}");
+        assert!(
+            message.contains("sudo ember daemon install"),
+            "got: {message}"
+        );
+    }
+
+    #[test]
+    fn format_daemon_socket_io_error_preserves_non_permission_failures() {
+        let err = std::io::Error::other("boom");
+        let message = format_daemon_socket_io_error(&err);
+        assert_eq!(message, "daemon socket error: boom");
+    }
+
+    #[test]
+    fn format_daemon_unavailable_maps_permission_denied_to_shell_guidance() {
+        let socket = std::path::Path::new("/tmp/.ember/run/daemon.sock");
+        let err = std::io::Error::from_raw_os_error(13);
+        let message = format_daemon_unavailable(socket, &err);
+        assert!(message.contains(socket.to_str().unwrap()), "got: {message}");
+        assert!(message.contains("ember-clients"), "got: {message}");
+        assert!(
+            message.contains("sudo ember daemon install"),
+            "got: {message}"
+        );
+    }
+
+    #[test]
+    fn format_daemon_unavailable_preserves_missing_socket_guidance() {
+        let socket = std::path::Path::new("/tmp/.ember/run/daemon.sock");
+        let err = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let message = format_daemon_unavailable(socket, &err);
+        assert!(message.contains("daemon unavailable"), "got: {message}");
+        assert!(message.contains("ember status"), "got: {message}");
+        assert!(
+            message.contains("sudo ember daemon install"),
+            "got: {message}"
+        );
+    }
+
+    #[test]
     fn call_daemon_rpc_unlocks_and_retries_once_for_missing_live_vault_error() {
         use std::io::{BufRead, Write as _};
         use std::os::unix::net::UnixListener;
 
+        let _guard = OPERATOR_PRESENCE_TOKEN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         set_cached_operator_presence_token(None);
         let tmp = tempfile::TempDir::new().expect("temp dir");
         let socket_path = tmp.path().join("daemon.sock");
@@ -2289,8 +2695,19 @@ mod tests {
                 ready_tx.send(()).expect("signal ready");
                 let mut create_persona_calls = 0usize;
 
-                for expected_method in ["create_persona", "vault_unlock", "create_persona"] {
-                    let (mut stream, _) = listener.accept().expect("accept fake daemon client");
+                let expected_methods: Vec<&str> = if cfg!(target_os = "macos") {
+                    vec![
+                        "create_persona",
+                        "vault_unlock_begin",
+                        "vault_unlock_complete",
+                        "create_persona",
+                    ]
+                } else {
+                    vec!["create_persona", "vault_unlock", "create_persona"]
+                };
+                for expected_method in expected_methods {
+                    let mut stream =
+                        accept_with_timeout(&listener, std::time::Duration::from_secs(10));
                     let mut reader = std::io::BufReader::new(
                         stream.try_clone().expect("clone fake daemon stream"),
                     );
@@ -2318,7 +2735,16 @@ mod tests {
                                 }
                             })
                         }
-                        "vault_unlock" => serde_json::json!({
+                        "vault_unlock_begin" => serde_json::json!({
+                            "id": request["id"],
+                            "result": {
+                                "request_id": "req-boot",
+                                "challenge_hex": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+                                "expires_at_unix_ms": 9999999999999u64,
+                                "reason": "Unlock the daemon vault for operator commands"
+                            }
+                        }),
+                        "vault_unlock_complete" | "vault_unlock" => serde_json::json!({
                             "id": request["id"],
                             "result": {
                                 "unlocked": true,
@@ -6198,8 +6624,7 @@ mod tests {
     fn multi_device_vault_access_after_grant() {
         // Alice creates identity from scratch, writes vault data on device A,
         // adds device B, grants access, verifies device B can decrypt vault data
-        let state_file =
-            std::env::temp_dir().join(format!("multi-device-{}.tsv", std::process::id()));
+        let state_file = temp_state_file("multi-device");
         let mut app = DemoApp::with_state_file(state_file);
 
         // Create identity: root + device A + persona
@@ -6229,8 +6654,8 @@ mod tests {
 
         // Grant persona access to device B — should trigger re-wrap
         let grant = app.handle_command(&format!(
-            "persona grant-device --persona {} --device tablet",
-            persona_id
+            "persona grant-device --persona {} --device {}",
+            persona_id, device_b_id
         ));
         assert!(
             grant.contains("granted persona device access"),

@@ -1,7 +1,7 @@
 //! PATH-shadow directory installer for `ember claude-code` and analogous launchers.
 //!
 //!
-//! Implements design §3 PATH-shadow doctrine sub-A (implementation-note-434).
+//! Implements design §3 PATH-shadow doctrine sub-A (implementation-note-484).
 //! The launcher prepends `~/.ember/shadow/bin/` to the child process's PATH so that
 //! tool invocations like `gh pr create` transparently resolve to the ember-gh
 //! Construct binary rather than the system binary. This module populates the

@@ -67,7 +67,7 @@ pub fn clear_headless_scope(store: &DaemonStore) -> Result<usize, Error> {
                 "DELETE FROM credentials WHERE name = ?1",
                 params![stored_name],
             )
-            .map_err(StoreError::Sqlite)? as usize;
+            .map_err(StoreError::Sqlite)?;
     }
     Ok(deleted)
 }

@@ -35,7 +35,7 @@ impl TokenPricing {
     /// by floor-dividing micro-cents to whole cents — kept for callers and
     /// tests that only need the human-readable cent value. Use
     /// `cents_micro_for` when the value will be summed across calls or
-    /// compared to a budget cap (implementation-note-45: per-side
+    /// compared to a budget cap (implementation-note-56: per-side
     /// truncation zeroed every sub-cent call, making the cap unreachable).
     pub fn cents_for(&self, input_tokens: u64, output_tokens: u64) -> u64 {
         self.cents_micro_for(input_tokens, output_tokens) / 1_000_000
@@ -59,7 +59,7 @@ impl TokenPricing {
 /// price as `claude-haiku-4-5`. Without this, the pricing match falls
 /// through to `UNKNOWN { 0, 0 }` every time Anthropic rolls a new
 /// date-pinned alias and budget enforcement silently breaks at the wire
-/// (implementation-note-45: shipped on `claude-haiku-4-5-20251001`).
+/// (implementation-note-56: shipped on `claude-haiku-4-5-20251001`).
 ///
 /// Only matches Anthropic's `-YYYYMMDD` shape (8 digits, no separators).
 /// OpenAI's `-YYYY-MM-DD` form has internal hyphens and falls through
@@ -909,7 +909,7 @@ mod tests {
         // Haiku 3 (legacy, used by May-3 demo runner): 25/125 per MTok.
         // 1M+1M = 150 cents. Regression guard against the bug where this
         // model fell through to UNKNOWN { 0, 0 } and the cents budget
-        // never incremented. (implementation-note-336)
+        // never incremented. (implementation-note-378)
         assert_eq!(
             cents_for("claude-3-haiku-20240307", "anthropic", 1_000_000, 1_000_000),
             150
@@ -931,7 +931,7 @@ mod tests {
         assert_eq!(cents_for("gpt-4.1", "openai", 1_000_000, 1_000_000), 1_500);
     }
 
-    /// implementation-note-45 regression: a date-pinned Anthropic
+    /// implementation-note-56 regression: a date-pinned Anthropic
     /// model alias must bill at the same rate as its bare-name parent.
     /// Before the fix the pricing match fell through to UNKNOWN { 0, 0 }
     /// and budget enforcement silently broke at the wire — every Anthropic

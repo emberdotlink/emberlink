@@ -1,0 +1,18 @@
+# Full Compose V2 fixture exercising every field the translator maps.
+# Used by tests/compose_fixtures.rs T2 round-trip property test.
+version: "3.8"
+services:
+  api:
+    image: ghcr.io/example/api:1.2.3
+    command: ["sh", "-c", "echo hi"]
+    entrypoint: /bin/bash
+    environment:
+      LOG_LEVEL: debug
+      MODE: production
+    volumes:
+      - /host/data:/data
+      - /host/cache:/cache:ro
+    network_mode: bridge
+    labels:
+      owner: alice
+      service: api

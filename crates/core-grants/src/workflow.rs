@@ -106,6 +106,7 @@ pub enum WorkflowGrantError {
 
 impl WorkflowGrant {
     /// Construct + validate. Computes `expires_at = issued_at + ttl_seconds`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         workflow_id: WorkflowId,
         template_name: String,

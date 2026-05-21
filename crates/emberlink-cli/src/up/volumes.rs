@@ -68,8 +68,7 @@ pub fn purge_per_agent_volumes(agent_ids: &[&str]) -> io::Result<Vec<String>> {
                 if stderr.contains("No such volume") {
                     warnings.push(vol_name);
                 } else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Other,
+                    return Err(io::Error::other(
                         format!("docker volume rm {vol_name} failed: {stderr}"),
                     ));
                 }

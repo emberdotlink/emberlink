@@ -278,7 +278,7 @@ pub struct Usage {
     /// `emit_threshold_crossings` compare this against the budget cap
     /// scaled to the same unit. Without this, a single Haiku-4.5 call
     /// (~0.1¢ per call) rounds to 0¢ via integer division and the cap
-    /// can never accumulate enough to trip — implementation-note-45.
+    /// can never accumulate enough to trip — implementation-note-56.
     /// Defaults to 0 on legacy grants; the next `increment_statement_usage`
     /// call re-derives the displayed `cents` from this field, so
     /// pre-existing (non-zero `cents`, zero `cents_micro`) grants flush
@@ -559,7 +559,7 @@ impl Statement {
             return false;
         }
         if let Some(cap) = b.cents {
-            // implementation-note-45: budget enforcement runs on the
+            // implementation-note-56: budget enforcement runs on the
             // sub-cent `cents_micro` accumulator. Sub-cent calls (typical for
             // Haiku-4.5 pricing) round the integer `cents` field to 0 per
             // call, so a cents-only check would never trip. Compare against

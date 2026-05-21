@@ -8,7 +8,7 @@
 //! The frame is written ONCE by the VM-side relay immediately after the TLS
 //! handshake completes, before any agent bytes flow. The host-side relay
 //! forwards it verbatim to the daemon (which interprets the
-//! `claimed_persona` field per implementation-note-374).
+//! `claimed_persona` field per implementation-note-418).
 //!
 //! `relay_protocol_version` is bumped whenever the frame schema changes in a
 //! way the daemon must observe.

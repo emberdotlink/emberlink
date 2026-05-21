@@ -1,4 +1,4 @@
-//! implementation-note-238 (design §"In-container
+//! implementation-note-264 (design §"In-container
 //! extension") — T2 integration tests for per-socket Persona
 //! enrollment.
 //!
@@ -72,7 +72,7 @@ fn ensure_test_identity() -> tempfile::TempDir {
 /// Build a `RequestContext` from a per-agent socket path so the
 /// dispatch layer takes the enrolled-principal branch.
 // container_persona_enrollment_tests_green_sentinel
-// (implementation-note-235):
+// (implementation-note-261):
 // Use `RequestContext::socket_for_test(peer)` to get a ctx with a
 // synthetic presence_token bound to `peer.uid`. The cfg(test)
 // synthesis in `RequestContext::socket` is unreachable from
@@ -108,6 +108,13 @@ fn ctx_for_per_agent_socket(socket_path: PathBuf) -> RequestContext {
 #[tokio::test]
 async fn test_rpc_on_agent_socket_uses_enrollment_not_wire() {
     let _id = ensure_test_identity();
+    // prior change hard-lock: delegate_grant is OperatorPresence-class.
+    // Pin presence to Unlocked so the gate doesn't refuse with -32030
+    // before the test reaches the principal-resolution assertion it
+    // exercises.
+    let _presence_test_guard = ember_daemon::trust::presence::test_state_guard();
+    ember_daemon::trust::presence::mark_unlocked();
+
     let store = store_with_vault();
     let policy = test_policy();
     let rl = test_rl();
@@ -233,6 +240,10 @@ async fn test_rpc_on_unenrolled_socket_refused() {
 #[tokio::test]
 async fn test_worker_b_cannot_impersonate_orchestrator() {
     let _id = ensure_test_identity();
+    // prior change hard-lock: see test_rpc_on_agent_socket_uses_enrollment_not_wire.
+    let _presence_test_guard = ember_daemon::trust::presence::test_state_guard();
+    ember_daemon::trust::presence::mark_unlocked();
+
     let store = store_with_vault();
     let policy = test_policy();
     let rl = test_rl();
@@ -395,5 +406,165 @@ async fn test_revoked_enrollment_refuses_rpcs() {
         code,
         HandlerError::PrincipalNotEnrolled.to_jsonrpc().0,
         "expected PrincipalNotEnrolled JSON-RPC code, got {code}: {msg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 5. T3 — implementation-note-115 —
+//    test_broker_resolve_refuses_namespace_inode_mismatch_refused_receipt
+// ---------------------------------------------------------------------------
+
+/// T3 (real-socket, dispatch-level) — enroll a persona on a per-agent
+/// UDS socket path with deliberately-bogus namespace inodes (A/B/C),
+/// then drive `broker_resolve` via the full `dispatch_method_with_context`
+/// pipeline. The live `/proc/<pid>/ns/{user,mnt}` capture for the test
+/// process pid produces real inodes which cannot match the synthetic
+/// `0xdead`-shaped recorded values, so the namespace-inode gate
+/// (implementation-note-156/D) fires:
+///
+///   1. dispatch returns `Err((-32401, _))`
+///   2. the audit_log carries one row with action
+///      `broker.resolve.refused` whose payload kind is
+///      `namespace_inode_mismatch_refused`
+///
+/// The brief calls for "spawn a container, enroll with inodes A/B/C,
+/// mutate the principal pidfd's `/proc` view OR simulate via a fixture
+/// that returns inverted inodes." Spawning a real container is not
+/// feasible in a unit-test integration setting (requires docker +
+/// privileges); the fixture path is the operative one — recording
+/// synthetic inode sentinels guarantees a mismatch against the live
+/// capture without depending on container orchestration.
+///
+/// Linux-only: the namespace-inode capture surface is `/proc/<pid>/ns`
+/// + `/sys/fs/cgroup`, which is Linux-kernel-specific. On non-Linux
+/// targets the gate is a documented no-op (see
+/// `check_principal_namespace_inodes` resolution step 4) and the
+/// refusal cannot fire.
+///
+/// Anchor: `namespace_inode_mismatch_refused`.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_broker_resolve_refuses_namespace_inode_mismatch_refused_receipt() {
+    let _id = ensure_test_identity();
+    // broker_resolve is OperatorPresence-class — pin presence to
+    // Unlocked so the per-method authority gate (line ~2472 of
+    // `infra/handler.rs`) doesn't refuse with -32030 before the
+    // request reaches the namespace-inode gate this test exercises.
+    let _presence_test_guard = ember_daemon::trust::presence::test_state_guard();
+    ember_daemon::trust::presence::mark_unlocked();
+
+    let store = store_with_vault();
+    let policy = test_policy();
+    let rl = test_rl();
+    let vault = test_vault();
+
+    // Enroll a per-agent socket path with synthetic bogus inodes —
+    // production inodes are small positive integers, so the live
+    // capture for the test pid cannot collide with these `0xdead`
+    // sentinels by accident.
+    let persona = store
+        .create_persona("persona-namespace-mismatch")
+        .expect("create persona");
+    let grant = store
+        .create_grant(&persona.id, "test-cred", "read", Some(3600))
+        .expect("create grant");
+
+    let tmp = tempfile::tempdir().expect("tempdir for sockets");
+    let socket_path = tmp.path().join("agent-ffffffff.sock");
+    store
+        .record_agent_socket_enrollment(
+            socket_path.to_str().unwrap(),
+            &persona.id,
+            &grant.id,
+            "blake3:namespace-mismatch-brief",
+            Some(0x0dead_a000), // synthetic cgroup_v2_id (A)
+            Some(0x0dead_b000), // synthetic userns_inode (B)
+            Some(0x0dead_c000), // synthetic mnt_ns_inode (C)
+        )
+        .expect("record enrollment with bogus inodes");
+
+    // Build the dispatch context. The principal carries the test
+    // process pid (so `check_principal_is_alive` returns true), the
+    // socket path matches the enrollment row, and the live ns-inode
+    // capture for this pid will return REAL inodes which cannot
+    // equal the synthetic 0xdead values recorded above.
+    let principal = PeerCredPrincipal::new(
+        1001,
+        std::process::id() as i32,
+        socket_path.clone(),
+    );
+    let peer = ember_daemon::infra::handler::PeerCred {
+        uid: 1001,
+        pid: Some(std::process::id() as i32),
+    };
+    let ctx = ember_daemon::infra::handler::RequestContext::socket_for_test(peer)
+        .with_peer_cred_principal(Some(principal));
+
+    // Drive `broker_resolve` through the dispatcher. The namespace-
+    // inode gate fires at line 2963 of broker/handler.rs (BEFORE any
+    // provider IO or persona-binding check), so the refusal carries
+    // -32401 and the gate's log_event call lands a refusal Receipt.
+    let result = dispatch_method_with_context(
+        &store,
+        &vault,
+        &policy,
+        &rl,
+        None,
+        ctx,
+        "broker_resolve",
+        &json!({
+            // `persona_id` is required by the overlay path but the
+            // enrollment overlay will REWRITE it to the enrolled
+            // persona's id regardless of what we pass. Empty object
+            // is sufficient — the schema-version + ns-inode gates
+            // both pre-date the provider-call params.
+        }),
+    )
+    .await;
+
+    let (code, msg) = result.expect_err(
+        "broker_resolve must refuse when the principal's live ns inodes drifted from enrollment",
+    );
+    assert_eq!(
+        code, -32401,
+        "expected ERR_PRINCIPAL_NAMESPACE_MISMATCH (-32401), got {code}: {msg}"
+    );
+
+    // Verify the refusal Receipt landed on the audit_log.
+    // namespace_inode_mismatch_refused: the checkpoint kind the gate
+    // emits via `store.log_event` on the mismatch path.
+    let entries = store
+        .query_audit(&ember_daemon::infra::audit::AuditFilter {
+            action: Some("broker.resolve.refused".to_string()),
+            ..Default::default()
+        })
+        .expect("query_audit must succeed");
+    let mismatch_rows: Vec<_> = entries
+        .iter()
+        .filter(|e| {
+            e.details
+                .as_deref()
+                .map(|d| d.contains("namespace_inode_mismatch_refused"))
+                .unwrap_or(false)
+        })
+        .collect();
+    assert_eq!(
+        mismatch_rows.len(),
+        1,
+        "exactly one namespace_inode_mismatch_refused Receipt expected on audit_log, got: {entries:?}"
+    );
+    let row = mismatch_rows[0];
+    assert_eq!(row.outcome, "denied", "Receipt outcome must be denied");
+    let details = row
+        .details
+        .as_deref()
+        .expect("Receipt must carry payload details");
+    assert!(
+        details.contains("namespace_inode_mismatch_refused"),
+        "Receipt payload must name the checkpoint kind, got: {details}"
+    );
+    assert!(
+        details.contains(socket_path.to_str().unwrap()),
+        "Receipt payload must name the socket path, got: {details}"
     );
 }

@@ -6,12 +6,14 @@
 //!
 //! Failure modes: socket unreachable → return Err with operator CTA.
 //!
-//! Used by `ember dev info` (already wired in slice-A) AND as the final
-//! step of `ember dev install` (integration PR will wire it).
+//! Used by `ember dev info` and as the final step of `ember dev install`.
 
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
-use crate::install_paths::{DEV_DAEMON_SOCKET_REL, DEV_MANIFEST_PATH_REL};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use crate::dev_runtime::DevRuntimeEnv;
 
 /// Post-install verification report produced by `verify_dev_install`.
 #[derive(Debug, Default)]
@@ -24,6 +26,11 @@ pub struct DevInstallVerifyReport {
     pub registered_broker_count: Option<usize>,
     /// Ed25519 fingerprints of registered trust roots (hex-encoded).
     pub trust_roots: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BrokerRegistryStatusResponse {
+    provider_count: usize,
 }
 
 /// Run post-install verification and return a [`DevInstallVerifyReport`].
@@ -43,25 +50,33 @@ pub struct DevInstallVerifyReport {
 /// the report meaningless — e.g. $HOME cannot be resolved. Missing socket or
 /// missing manifest are non-fatal and surface as `None` fields.
 pub fn verify_dev_install() -> Result<DevInstallVerifyReport, Box<dyn std::error::Error>> {
-    verify_dev_install_with(&DefaultVerifyOps)
+    let runtime = crate::dev_runtime::resolve_current_dev_runtime()?;
+    verify_dev_install_with(&DefaultVerifyOps, &runtime)
+}
+
+pub fn verify_dev_install_for(
+    runtime: &DevRuntimeEnv,
+) -> Result<DevInstallVerifyReport, Box<dyn std::error::Error>> {
+    verify_dev_install_with(&DefaultVerifyOps, runtime)
 }
 
 /// Testable variant — caller supplies a `VerifyOps` implementation.
 pub fn verify_dev_install_with(
     ops: &dyn VerifyOps,
+    runtime: &DevRuntimeEnv,
 ) -> Result<DevInstallVerifyReport, Box<dyn std::error::Error>> {
-    let mut report = DevInstallVerifyReport::default();
-
-    // Daemon PID.
-    report.daemon_pid = ops.read_daemon_pid();
+    let mut report = DevInstallVerifyReport {
+        daemon_pid: ops.read_daemon_pid(&runtime.plist_label),
+        ..DevInstallVerifyReport::default()
+    };
 
     // Manifest fingerprint.
-    if let Some(manifest_sig_path) = manifest_sig_path() {
+    if let Some(manifest_sig_path) = manifest_sig_path(runtime) {
         report.manifest_fingerprint = ops.read_manifest_fingerprint(&manifest_sig_path);
     }
 
     // Broker count + trust roots (best-effort via socket RPC).
-    if let Some(socket_path) = dev_socket_path() {
+    if let Some(socket_path) = dev_socket_path(runtime) {
         report.registered_broker_count = ops.query_broker_count(&socket_path);
         report.trust_roots = ops.query_trust_roots(&socket_path);
     }
@@ -69,11 +84,36 @@ pub fn verify_dev_install_with(
     Ok(report)
 }
 
+/// Return the readiness gaps that still block the dev install from being
+/// treated as fully usable.
+pub fn readiness_issues(report: &DevInstallVerifyReport) -> Vec<String> {
+    let mut issues = Vec::new();
+
+    if report.daemon_pid.is_none() {
+        issues.push("dev daemon PID not detectable".to_string());
+    }
+    if report.manifest_fingerprint.is_none() {
+        issues.push("dev manifest signature missing".to_string());
+    }
+    match report.registered_broker_count {
+        None => issues.push("registered broker count unavailable".to_string()),
+        Some(0) => issues.push("no credential brokers registered".to_string()),
+        Some(_) => {}
+    }
+    match report.trust_roots.as_ref() {
+        None => issues.push("trust roots unavailable".to_string()),
+        Some(roots) if roots.is_empty() => issues.push("trust root set is empty".to_string()),
+        Some(_) => {}
+    }
+
+    issues
+}
+
 /// Operations abstraction for `verify_dev_install_with`. Tests supply a stub;
 /// production uses `DefaultVerifyOps`.
 pub trait VerifyOps {
     /// Return the PID of the running dev daemon, if detectable.
-    fn read_daemon_pid(&self) -> Option<u32>;
+    fn read_daemon_pid(&self, plist_label: &str) -> Option<u32>;
     /// Read and return the first line of the manifest signature file at `path`.
     fn read_manifest_fingerprint(&self, path: &Path) -> Option<String>;
     /// Query the dev daemon socket for the number of registered brokers.
@@ -86,10 +126,10 @@ pub trait VerifyOps {
 struct DefaultVerifyOps;
 
 impl VerifyOps for DefaultVerifyOps {
-    fn read_daemon_pid(&self) -> Option<u32> {
+    fn read_daemon_pid(&self, plist_label: &str) -> Option<u32> {
         // Query launchctl for the running PID.
         let output = std::process::Command::new("launchctl")
-            .args(["print", "system/sh.emberlink.daemon.dev"])
+            .args(["print", &format!("system/{plist_label}")])
             .output()
             .ok()?;
         let text = String::from_utf8_lossy(&output.stdout);
@@ -102,50 +142,108 @@ impl VerifyOps for DefaultVerifyOps {
         if line.is_empty() { None } else { Some(line) }
     }
 
-    fn query_broker_count(&self, _socket: &Path) -> Option<usize> {
-        // Real implementation would open a Unix-domain socket and issue a
-        // JSON-RPC "list_brokers" call. Stubbed for now — integration PR wires
-        // the actual RPC client once the dev daemon RPC surface is finalised.
-        None
+    fn query_broker_count(&self, socket: &Path) -> Option<usize> {
+        fetch_broker_registry_status(socket)
+            .ok()
+            .map(|resp| resp.provider_count)
     }
 
-    fn query_trust_roots(&self, _socket: &Path) -> Option<Vec<String>> {
-        // As above — stubbed until the RPC surface lands.
-        None
+    fn query_trust_roots(&self, socket: &Path) -> Option<Vec<String>> {
+        crate::trust::list::fetch_trust_list(socket)
+            .ok()
+            .map(|resp| {
+                resp.roots
+                    .into_iter()
+                    .map(|root| root.fingerprint_hex)
+                    .collect()
+            })
     }
+}
+
+fn fetch_broker_registry_status(
+    socket_path: &Path,
+) -> Result<BrokerRegistryStatusResponse, String> {
+    let body = call_daemon(
+        socket_path,
+        "broker.registry_status",
+        &Value::Object(Default::default()),
+    )?;
+    parse_broker_registry_status_response(&body)
+}
+
+fn parse_broker_registry_status_response(
+    body: &Value,
+) -> Result<BrokerRegistryStatusResponse, String> {
+    serde_json::from_value(body.clone())
+        .map_err(|e| format!("decode broker.registry_status response: {e}"))
+}
+
+fn call_daemon(socket_path: &Path, method: &str, params: &Value) -> Result<Value, String> {
+    let stream = std::os::unix::net::UnixStream::connect(socket_path)
+        .map_err(|e| format!("connect {method}: {e}"))?;
+    let mut writer = stream
+        .try_clone()
+        .map_err(|e| format!("clone socket for {method}: {e}"))?;
+    let mut reader = BufReader::new(stream);
+
+    let request = json!({
+        "id": "1",
+        "method": method,
+        "params": params,
+    });
+    let mut line =
+        serde_json::to_string(&request).map_err(|e| format!("serialize {method} request: {e}"))?;
+    line.push('\n');
+
+    writer
+        .write_all(line.as_bytes())
+        .map_err(|e| format!("write {method} request: {e}"))?;
+
+    let mut response_line = String::new();
+    reader
+        .read_line(&mut response_line)
+        .map_err(|e| format!("read {method} response: {e}"))?;
+
+    let response: Value = serde_json::from_str(response_line.trim())
+        .map_err(|e| format!("parse {method} response JSON: {e}"))?;
+    if let Some(err) = response.get("error").filter(|value| !value.is_null()) {
+        let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(-32000);
+        let message = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown daemon error");
+        return Err(format!("{method} daemon error {code}: {message}"));
+    }
+    Ok(response.get("result").cloned().unwrap_or(Value::Null))
 }
 
 /// Parse `pid = <N>` from `launchctl print` output.
 fn parse_launchctl_pid(text: &str) -> Option<u32> {
     for line in text.lines() {
         let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("pid = ") {
-            if let Ok(pid) = rest.trim().parse::<u32>() {
-                return Some(pid);
-            }
+        if let Some(rest) = trimmed.strip_prefix("pid = ")
+            && let Ok(pid) = rest.trim().parse::<u32>()
+        {
+            return Some(pid);
         }
     }
     None
 }
 
-/// Resolve `~/.ember-dev/binaries/manifest.toml.sig`.
-fn manifest_sig_path() -> Option<PathBuf> {
-    let rel = Path::new(DEV_MANIFEST_PATH_REL); // ".ember-dev/binaries/manifest.toml"
-    dirs_next::home_dir().map(|h| {
-        let mut p = h.join(rel);
-        // Append ".sig" extension.
-        let name = p
-            .file_name()
-            .map(|n| format!("{}.sig", n.to_string_lossy()))
-            .unwrap_or_else(|| "manifest.toml.sig".to_string());
-        p.set_file_name(name);
-        p
-    })
+/// Resolve the worktree-scoped manifest signature sidecar path.
+fn manifest_sig_path(runtime: &DevRuntimeEnv) -> Option<PathBuf> {
+    let mut p = runtime.manifest_path.clone();
+    let name = p
+        .file_name()
+        .map(|n| format!("{}.sig", n.to_string_lossy()))
+        .unwrap_or_else(|| "manifest.toml.sig".to_string());
+    p.set_file_name(name);
+    Some(p)
 }
 
-/// Resolve `~/<DEV_DAEMON_SOCKET_REL>` to the dev daemon Unix-domain socket path.
-fn dev_socket_path() -> Option<PathBuf> {
-    dirs_next::home_dir().map(|h| h.join(DEV_DAEMON_SOCKET_REL))
+/// Resolve the worktree-scoped dev daemon Unix-domain socket path.
+fn dev_socket_path(runtime: &DevRuntimeEnv) -> Option<PathBuf> {
+    Some(runtime.socket_path.clone())
 }
 
 #[cfg(test)]
@@ -171,6 +269,24 @@ mod tests {
         assert_eq!(pid, None, "must return None when pid field is absent");
     }
 
+    #[test]
+    fn parse_broker_registry_status_extracts_provider_count() {
+        let body = json!({"provider_count": 7});
+        let parsed = parse_broker_registry_status_response(&body).expect("valid response");
+        assert_eq!(parsed.provider_count, 7);
+    }
+
+    #[test]
+    fn parse_broker_registry_status_rejects_missing_provider_count() {
+        let body = json!({});
+        let err = parse_broker_registry_status_response(&body)
+            .expect_err("missing field must be rejected");
+        assert!(
+            err.contains("provider_count"),
+            "unexpected parse error: {err}"
+        );
+    }
+
     // --- stub-based verify_dev_install_with tests ---
 
     struct StubVerifyOps {
@@ -181,7 +297,7 @@ mod tests {
     }
 
     impl VerifyOps for StubVerifyOps {
-        fn read_daemon_pid(&self) -> Option<u32> {
+        fn read_daemon_pid(&self, _: &str) -> Option<u32> {
             self.pid
         }
         fn read_manifest_fingerprint(&self, _: &Path) -> Option<String> {
@@ -197,13 +313,17 @@ mod tests {
 
     #[test]
     fn verify_dev_install_with_happy_path() {
+        let runtime = crate::dev_runtime::derive_dev_runtime_env(
+            Path::new("/home/tester"),
+            Path::new("/tmp/emberlink-dev/worktree-a"),
+        );
         let ops = StubVerifyOps {
             pid: Some(42),
             fingerprint: Some("abcdef1234".to_string()),
             broker_count: Some(3),
             trust_roots: Some(vec!["sha256:aabbcc".to_string()]),
         };
-        let report = verify_dev_install_with(&ops).expect("verify must succeed");
+        let report = verify_dev_install_with(&ops, &runtime).expect("verify must succeed");
         assert_eq!(report.daemon_pid, Some(42));
         assert_eq!(report.manifest_fingerprint.as_deref(), Some("abcdef1234"));
         assert_eq!(report.registered_broker_count, Some(3));
@@ -215,6 +335,10 @@ mod tests {
 
     #[test]
     fn verify_dev_install_with_daemon_unreachable() {
+        let runtime = crate::dev_runtime::derive_dev_runtime_env(
+            Path::new("/home/tester"),
+            Path::new("/tmp/emberlink-dev/worktree-a"),
+        );
         // When daemon is not running: pid = None, broker count = None, trust_roots = None.
         let ops = StubVerifyOps {
             pid: None,
@@ -222,7 +346,7 @@ mod tests {
             broker_count: None,
             trust_roots: None,
         };
-        let report = verify_dev_install_with(&ops)
+        let report = verify_dev_install_with(&ops, &runtime)
             .expect("verify must return Ok even when daemon unreachable");
         assert!(
             report.daemon_pid.is_none(),
@@ -240,28 +364,69 @@ mod tests {
         assert_eq!(report.manifest_fingerprint.as_deref(), Some("aabbcc112233"));
     }
 
+    #[test]
+    fn readiness_issues_flags_missing_runtime_truth() {
+        let report = DevInstallVerifyReport {
+            daemon_pid: None,
+            manifest_fingerprint: Some("abc".to_string()),
+            registered_broker_count: None,
+            trust_roots: Some(Vec::new()),
+        };
+        let issues = readiness_issues(&report);
+        assert!(issues.iter().any(|item| item.contains("PID")));
+        assert!(
+            issues
+                .iter()
+                .any(|item| item.contains("registered broker count unavailable"))
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|item| item.contains("trust root set is empty"))
+        );
+    }
+
+    #[test]
+    fn readiness_issues_accepts_populated_report() {
+        let report = DevInstallVerifyReport {
+            daemon_pid: Some(7),
+            manifest_fingerprint: Some("abc".to_string()),
+            registered_broker_count: Some(3),
+            trust_roots: Some(vec!["root".to_string()]),
+        };
+        assert!(
+            readiness_issues(&report).is_empty(),
+            "fully-populated report must be ready"
+        );
+    }
+
     // --- manifest_sig_path tests ---
 
     #[test]
     fn manifest_sig_path_ends_with_toml_sig() {
-        if let Some(p) = manifest_sig_path() {
-            let name = p.file_name().unwrap().to_string_lossy();
-            assert!(
-                name.ends_with(".toml.sig"),
-                "manifest sig path must end with .toml.sig; got: {name}"
-            );
-        }
-        // If $HOME is not set, skip — not a failure.
+        let runtime = crate::dev_runtime::derive_dev_runtime_env(
+            Path::new("/home/tester"),
+            Path::new("/tmp/emberlink-dev/worktree-a"),
+        );
+        let p = manifest_sig_path(&runtime).expect("manifest sig path");
+        let name = p.file_name().unwrap().to_string_lossy();
+        assert!(
+            name.ends_with(".toml.sig"),
+            "manifest sig path must end with .toml.sig; got: {name}"
+        );
     }
 
     #[test]
-    fn manifest_sig_path_is_under_ember_dev() {
-        if let Some(p) = manifest_sig_path() {
-            let path_str = p.to_string_lossy();
-            assert!(
-                path_str.contains(".ember-dev"),
-                "manifest sig path must be under .ember-dev; got: {path_str}"
-            );
-        }
+    fn manifest_sig_path_is_under_worktree_env() {
+        let runtime = crate::dev_runtime::derive_dev_runtime_env(
+            Path::new("/home/tester"),
+            Path::new("/tmp/emberlink-dev/worktree-a"),
+        );
+        let p = manifest_sig_path(&runtime).expect("manifest sig path");
+        let path_str = p.to_string_lossy();
+        assert!(
+            path_str.contains(".ember-dev/envs/"),
+            "manifest sig path must be under a worktree env: {path_str}"
+        );
     }
 }

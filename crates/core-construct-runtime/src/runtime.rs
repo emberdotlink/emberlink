@@ -11,7 +11,7 @@
 //!   broker_exec RPC → PTY bridge → exit). Takes a [`ConstructConfig`] impl.
 //!   This is the entry point used by production Construct shims (ember-gh etc.).
 //!
-//! ## Resolve → exec two-phase invariant (implementation-note-22)
+//! ## Resolve → exec two-phase invariant (implementation-note-25)
 //!
 //! Per design §9, the construct shim MUST call `broker.resolve` BEFORE
 //! `broker.exec`. Resolve returns a [`SpawnHandle`] binding the four
@@ -34,6 +34,7 @@ use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use serde_json::json;
 
@@ -53,6 +54,107 @@ fn parent_has_tty() -> bool {
     std::io::stdin().is_terminal()
         || std::io::stdout().is_terminal()
         || std::io::stderr().is_terminal()
+}
+
+// ---------------------------------------------------------------------------
+// Unsessioned subprocess audit log (implementation-note-26-
+// WARNING, Tier 1) — best-effort logging from the passthrough branches.
+// ---------------------------------------------------------------------------
+
+/// Outcome tag for [`log_unsessioned_subprocess`]. Mirrors the daemon's
+/// `subprocess_audit_log` `outcome` enum.
+#[derive(Debug, Clone, Copy)]
+pub enum UnsessionedOutcome {
+    /// Env-detect branch: `EMBER_SESSION_ID` was unset and the action was
+    /// classified as credential-bearing. The shim refused before exec so the
+    /// audit row carries `outcome = "denied_no_session"`.
+    DeniedNoSession,
+    /// Env-detect branch: `EMBER_SESSION_ID` was unset and the wrapped
+    /// binary will inherit whatever credentials the parent process already
+    /// has, so the audit row carries `outcome = "ambient_credential_used"`
+    /// as a defensive label even when no credential was actually present.
+    AmbientCredentialUsed,
+    /// Classify-None branch: session active, but the shim's argv classifier
+    /// returned `None` (read-only / safe-write verb that does not need
+    /// broker mediation). The audit row carries
+    /// `outcome = "passthrough_no_classify"`.
+    PassthroughNoClassify,
+}
+
+impl UnsessionedOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DeniedNoSession => "denied_no_session",
+            Self::AmbientCredentialUsed => "ambient_credential_used",
+            Self::PassthroughNoClassify => "passthrough_no_classify",
+        }
+    }
+}
+
+/// Best-effort, fire-and-forget RPC that records an unsessioned subprocess
+/// invocation in the daemon's tamper-evident audit chain.
+///
+/// Called from `run_construct_full`'s no-session branches before the shim
+/// either execs the wrapped binary or fails closed. Acceptance:
+///
+/// * Daemon up + reachable → one new row in `audit_log` with action
+///   `subprocess.<vendor>.invoke_no_session`, before exec or deny returns.
+/// * Daemon unreachable / timeout / RPC error → silently swallowed; the
+///   shim continues to exec. Logging a subprocess invocation must NEVER
+///   block the underlying tool.
+///
+/// The 50 ms per-syscall timeout matches the Tier 1 spec: <100 ms total
+/// added latency in the daemon-up case, immediate failure in the down
+/// case (UDS `connect` returns `ECONNREFUSED` / `ENOENT` synchronously).
+pub fn log_unsessioned_subprocess<C: ConstructConfig>(
+    config: &C,
+    argv: &[String],
+    outcome: UnsessionedOutcome,
+) {
+    let vendor = config.vendor();
+    // "unknown" is the default the trait returns when a config impl forgot
+    // to override `vendor()`. The daemon's whitelist would reject it; skip
+    // the RPC entirely so we don't burn a connect+timeout per invocation.
+    if vendor == "unknown" {
+        return;
+    }
+
+    let verb = config
+        .classify(argv)
+        .map(|k| k.0)
+        .or_else(|| argv.first().cloned())
+        .unwrap_or_else(|| "unclassified".to_string());
+
+    let mut argv_summary: String = argv.iter().take(3).cloned().collect::<Vec<_>>().join(" ");
+    if argv_summary.len() > 256 {
+        // char_indices() so we don't slice mid-UTF-8.
+        if let Some((cut, _)) = argv_summary.char_indices().nth(255) {
+            argv_summary.truncate(cut);
+        }
+    }
+
+    let params = json!({
+        "vendor": vendor,
+        "verb": verb,
+        "outcome": outcome.as_str(),
+        "argv_summary": argv_summary,
+    });
+
+    let socket_path = crate::rpc::daemon_socket_path();
+    let timeout = Duration::from_millis(50);
+    if let Err(e) = crate::rpc::call_daemon_rpc_with_timeout(
+        &socket_path,
+        "subprocess_audit_log",
+        &params,
+        timeout,
+    ) {
+        tracing::debug!(
+            vendor = %vendor,
+            verb = %verb,
+            error = %e,
+            "subprocess_audit_log: best-effort failure (continuing to passthrough exec)"
+        );
+    }
 }
 
 /// Build the `broker_exec` JSON-RPC params object.
@@ -90,7 +192,7 @@ fn build_broker_exec_params(
 }
 
 // ---------------------------------------------------------------------------
-// Two-phase resolve → exec (implementation-note-22)
+// Two-phase resolve → exec (implementation-note-25)
 // ---------------------------------------------------------------------------
 
 /// Opaque spawn handle returned by [`resolve_via_broker`].
@@ -249,7 +351,7 @@ pub trait BrokerTransport {
 /// construct_toml_bytes) and receives a [`SpawnHandle`] binding
 /// (binary, env_allowlist, materialization_id, target_uid). The
 /// `materialization_id` carries the daemon's credential reference;
-/// plaintext is NEVER returned over this RPC (per implementation-note-23-
+/// plaintext is NEVER returned over this RPC (per implementation-note-27-
 /// SECRETREF-CONTRACT — only `handle_broker_resolve`'s legacy
 /// secret-ref → plaintext path returns raw credentials, and that path
 /// is gated to trust-boundary callers).
@@ -556,15 +658,60 @@ pub fn run_construct<C: ClassifyArgv>(spec: ConstructSpec<C>) -> ExitCode {
 /// The `config` parameter supplies all construct-specific details via the
 /// [`ConstructConfig`] trait. `argv` is the process argv with argv[0] stripped.
 pub fn run_construct_full<C: ConstructConfig>(argv: &[String], config: &C) -> ExitCode {
-    // 1. env-detect: no session → passthrough exec.
+    // 1. Pre-classify so the no-session branch can distinguish brokered,
+    //    credential-bearing actions from read-only passthrough verbs.
+    let classified = config.classify(argv);
+
+    // 2. env-detect:
+    //    - no session + classified action → fail closed
+    //    - no session + classify=None → passthrough exec
     if std::env::var_os(config.session_id_env()).is_none() {
-        let binary = config.resolve_binary();
-        let err = Command::new(&binary).args(argv).exec();
-        eprintln!("ember-construct: failed to exec {binary}: {err}");
-        return ExitCode::from(126u8);
+        match classified.as_ref() {
+            Some(action_key) => {
+                log_unsessioned_subprocess(config, argv, UnsessionedOutcome::DeniedNoSession);
+                eprintln!(
+                    "ember-construct: {} requires a brokered ember session",
+                    action_key
+                );
+                eprintln!(
+                    "ember-construct: launch the canonical brokered session with `ember claude-code`"
+                );
+                eprintln!(
+                    "ember-construct: outside a session, only unclassified read-only passthrough verbs are allowed"
+                );
+                return ExitCode::from(1u8);
+            }
+            None => {
+                log_unsessioned_subprocess(config, argv, UnsessionedOutcome::PassthroughNoClassify);
+                let binary = config.resolve_binary();
+                let err = Command::new(&binary).args(argv).exec();
+                eprintln!("ember-construct: failed to exec {binary}: {err}");
+                return ExitCode::from(126u8);
+            }
+        }
     }
 
-    // 2. classify argv → action_key.
+    // v0.3.0 friendly truth gate: a shell that only carries the session id
+    // is not the same thing as the canonical `ember claude-code` launcher
+    // posture. The launcher also injects EMBER_GRANT_ID, and construct
+    // shims without it fall into a partial host/session shape that produces
+    // confusing daemon authority failures. Refuse early and point the
+    // operator back to the supported launcher path.
+    if std::env::var_os("EMBER_GRANT_ID").is_none() {
+        eprintln!(
+            "ember-construct: partial ember session detected ({} is set, but EMBER_GRANT_ID is missing)",
+            config.session_id_env()
+        );
+        eprintln!(
+            "ember-construct: for v0.3.0, launch the canonical brokered session with `ember claude-code`"
+        );
+        eprintln!(
+            "ember-construct: host/headless shells are not yet a full substitute for the launcher path"
+        );
+        return ExitCode::from(1u8);
+    }
+
+    // 3. classify argv → action_key.
     //
     // The per-shim classifier returns `None` for read-only and safe-write
     // verbs that don't need broker mediation (per ember-git/src/classify.rs
@@ -580,13 +727,17 @@ pub fn run_construct_full<C: ConstructConfig>(argv: &[String], config: &C) -> Ex
     // return `Some(git.<verb>)` for read-only verbs (mirroring the
     // daemon-side `ember_construct::GitClassifier`'s "always
     // classify" behaviour) so they round-trip through broker_exec.
-    let classified = match config.classify(argv) {
+    let classified = match classified {
         Some(k) => k,
         None => {
             tracing::debug!(
                 argv = ?argv,
                 "ember-construct: classify=None; passthrough exec (no broker mediation)"
             );
+            // implementation-note-28 (Tier 1): log
+            // the classify=None passthrough so read-only / safe-write verbs
+            // still appear in the chain (verb name from argv[0]).
+            log_unsessioned_subprocess(config, argv, UnsessionedOutcome::PassthroughNoClassify);
             let binary = config.resolve_binary();
             let err = Command::new(&binary).args(argv).exec();
             eprintln!("ember-construct: failed to exec {binary}: {err}");
@@ -675,7 +826,7 @@ pub fn run_construct_full<C: ConstructConfig>(argv: &[String], config: &C) -> Ex
     };
 
     // 6. Translate emberlink-shaped argv to wrapped-tool-native argv
-    //    (implementation-note-24 / Q5 grill-pair LOCK):
+    //    (implementation-note-29 / Q5 grill-pair LOCK):
     //    `ConstructConfig::translate_argv` strips/renames emberlink-specific
     //    flags the upstream binary doesn't understand. Default is identity;
     //    scion strips `--persona`/`--max-depth`/`--brief`, renames
@@ -741,7 +892,9 @@ pub fn run_construct_full<C: ConstructConfig>(argv: &[String], config: &C) -> Ex
         }
         Err(crate::rpc::RpcError::DaemonUnavailable(msg)) => {
             eprintln!("ember-construct: daemon unavailable — {msg}");
-            eprintln!("ember-construct: start emberd with 'ember daemon start'");
+            eprintln!(
+                "ember-construct: inspect posture with 'ember status' or repair with 'sudo ember daemon install'"
+            );
             ExitCode::from(2u8)
         }
         Err(crate::rpc::RpcError::DaemonRpc { code, message }) => {
@@ -956,7 +1109,7 @@ mod tests {
         }
     }
 
-    /// implementation-note-22 acceptance 1+2:
+    /// implementation-note-25 acceptance 1+2:
     /// run_construct calls resolve_via_broker before exec_via_broker.
     /// The mock transport records the call order and the spawn handle
     /// must bind binary + env + credential + target_uid.
@@ -1019,7 +1172,7 @@ mod tests {
         );
     }
 
-    /// implementation-note-22 acceptance 3:
+    /// implementation-note-25 acceptance 3:
     /// Receipt emitted only on resolve+exec succeeding as a transaction.
     /// When exec fails after a successful resolve, the audit kind is
     /// `credential_resolve_aborted`, never `credential_provisioned`.
@@ -1077,7 +1230,7 @@ mod tests {
         assert_eq!(kind.map(|k| k.as_str()), Some("credential_resolve_aborted"));
     }
 
-    /// implementation-note-22 acceptance 2:
+    /// implementation-note-25 acceptance 2:
     /// spawn_handle binds binary + env + credential + target_uid.
     /// Constructs a handle directly and asserts the four fields exist
     /// with the expected types — guards against accidental field drops
@@ -1098,7 +1251,7 @@ mod tests {
         assert_eq!(handle.target_uid, 1500);
     }
 
-    /// implementation-note-22: resolve failure short-
+    /// implementation-note-25: resolve failure short-
     /// circuits before exec is reached. No audit kind is emitted
     /// because resolve never produced a credential to begin with.
     #[test]
@@ -1262,6 +1415,31 @@ mod tests {
         }
     }
 
+    struct StubConfigClassifyNone {
+        env: &'static str,
+    }
+
+    impl ClassifyArgv for StubConfigClassifyNone {
+        fn classify(&self, _argv: &[String]) -> Option<ActionKey> {
+            None
+        }
+    }
+
+    impl ConstructConfig for StubConfigClassifyNone {
+        fn session_id_env(&self) -> &'static str {
+            self.env
+        }
+        fn construct_toml_bytes(&self) -> &'static [u8] {
+            b""
+        }
+        fn resolve_binary(&self) -> String {
+            "/usr/bin/false-fake-ccr-test-nonexistent".to_string()
+        }
+        fn env_passthrough(&self) -> &'static [&'static str] {
+            &[]
+        }
+    }
+
     /// When the parent has no TTY, `run_construct_full` MUST NOT bind a UDS
     /// at `/tmp/ember-construct-pty-<pid>.sock`. We exercise the function
     /// against a daemon socket that doesn't exist; the call returns
@@ -1324,5 +1502,238 @@ mod tests {
             "non-TTY run_construct_full must not bind {} (file present after call)",
             pty_path.display(),
         );
+    }
+
+    #[test]
+    fn run_construct_full_partial_session_env_fails_fast_before_rpc() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let env_var = "EMBER_SESSION_ID_PARTIAL_TEST";
+        let pty_path = std::path::PathBuf::from(format!(
+            "/tmp/ember-construct-pty-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&pty_path);
+
+        // SAFETY: tests are serialized via ENV_LOCK.
+        unsafe {
+            std::env::set_var(env_var, "session-partial");
+            std::env::remove_var("EMBER_GRANT_ID");
+            std::env::set_var(
+                "EMBER_SOCKET_PATH",
+                "/tmp/ember-construct-runtime-partial-env-NONEXISTENT.sock",
+            );
+        }
+
+        let config = StubConfig { env: env_var };
+        let argv: Vec<String> = vec!["push".to_string(), "origin".to_string()];
+        let exit = run_construct_full(&argv, &config);
+
+        // SAFETY: tests are serialized via ENV_LOCK.
+        unsafe {
+            std::env::remove_var(env_var);
+            std::env::remove_var("EMBER_SOCKET_PATH");
+        }
+
+        assert_eq!(
+            exit,
+            ExitCode::from(1u8),
+            "partial session env must fail fast"
+        );
+        assert!(
+            !pty_path.exists(),
+            "partial session env must fail before any PTY socket bind"
+        );
+    }
+
+    #[test]
+    fn run_construct_full_env_absent_classified_action_fails_closed() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let env_var = "EMBER_SESSION_ID_ENV_ABSENT_CLASSIFIED_TEST";
+        let pty_path = std::path::PathBuf::from(format!(
+            "/tmp/ember-construct-pty-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&pty_path);
+
+        // SAFETY: tests are serialized via ENV_LOCK.
+        unsafe {
+            std::env::remove_var(env_var);
+            std::env::remove_var("EMBER_GRANT_ID");
+        }
+
+        let config = StubConfig { env: env_var };
+        let argv: Vec<String> = vec!["push".to_string(), "origin".to_string()];
+        let exit = run_construct_full(&argv, &config);
+
+        assert_eq!(
+            exit,
+            ExitCode::from(1u8),
+            "classified no-session action must fail closed"
+        );
+        assert!(
+            !pty_path.exists(),
+            "classified no-session action must fail before any PTY socket bind"
+        );
+    }
+
+    #[test]
+    fn run_construct_full_env_absent_classify_none_passthrough_execs() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let env_var = "EMBER_SESSION_ID_ENV_ABSENT_NONE_TEST";
+
+        // SAFETY: tests are serialized via ENV_LOCK.
+        unsafe {
+            std::env::remove_var(env_var);
+            std::env::remove_var("EMBER_GRANT_ID");
+        }
+
+        let config = StubConfigClassifyNone { env: env_var };
+        let argv: Vec<String> = vec!["status".to_string()];
+        let exit = run_construct_full(&argv, &config);
+
+        assert_eq!(
+            exit,
+            ExitCode::from(126u8),
+            "classify=None no-session path should still passthrough-exec"
+        );
+    }
+
+    #[test]
+    fn run_construct_full_sessioned_classify_none_skips_broker_rpc() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let env_var = "EMBER_SESSION_ID_CLASSIFY_NONE_TEST";
+        let pty_path = std::path::PathBuf::from(format!(
+            "/tmp/ember-construct-pty-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&pty_path);
+
+        // SAFETY: tests are serialized via ENV_LOCK.
+        unsafe {
+            std::env::set_var(env_var, "session-classify-none");
+            std::env::set_var("EMBER_GRANT_ID", "grt-classify-none");
+            std::env::set_var(
+                "EMBER_SOCKET_PATH",
+                "/tmp/ember-construct-runtime-classify-none-NONEXISTENT.sock",
+            );
+        }
+
+        let config = StubConfigClassifyNone { env: env_var };
+        let argv: Vec<String> = vec!["status".to_string()];
+        let exit = run_construct_full(&argv, &config);
+
+        // SAFETY: tests are serialized via ENV_LOCK.
+        unsafe {
+            std::env::remove_var(env_var);
+            std::env::remove_var("EMBER_GRANT_ID");
+            std::env::remove_var("EMBER_SOCKET_PATH");
+        }
+
+        assert_eq!(
+            exit,
+            ExitCode::from(126u8),
+            "sessioned classify=None path must passthrough-exec, not hit broker RPC"
+        );
+        assert!(
+            !pty_path.exists(),
+            "classify=None passthrough must return before any PTY socket bind"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // implementation-note-28 (Tier 1) tests for
+    // log_unsessioned_subprocess. The daemon-up happy-path is exercised by
+    // ember-daemon's handle_subprocess_audit_log tests; here we pin the
+    // best-effort failure modes — vendor=="unknown" short-circuit, and
+    // daemon-unreachable returning without panic.
+    // -----------------------------------------------------------------------
+
+    struct StubConfigWithVendor {
+        env: &'static str,
+        vendor: &'static str,
+    }
+    impl ClassifyArgv for StubConfigWithVendor {
+        fn classify(&self, _argv: &[String]) -> Option<ActionKey> {
+            Some(ActionKey("git.push".to_string()))
+        }
+    }
+    impl ConstructConfig for StubConfigWithVendor {
+        fn vendor(&self) -> &'static str {
+            self.vendor
+        }
+        fn session_id_env(&self) -> &'static str {
+            self.env
+        }
+        fn construct_toml_bytes(&self) -> &'static [u8] {
+            b""
+        }
+        fn resolve_binary(&self) -> String {
+            "/usr/bin/false-fake-ccr-test-nonexistent".to_string()
+        }
+        fn env_passthrough(&self) -> &'static [&'static str] {
+            &[]
+        }
+    }
+
+    #[test]
+    fn log_unsessioned_subprocess_skips_when_vendor_unknown() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // SAFETY: tests are serialized via ENV_LOCK.
+        unsafe {
+            // Even with a never-existent socket path, an "unknown" vendor
+            // must not even attempt the RPC — it would otherwise burn a
+            // connect+timeout on every invocation.
+            std::env::set_var(
+                "EMBER_SOCKET_PATH",
+                "/tmp/ember-construct-runtime-unknown-vendor-NONEXISTENT.sock",
+            );
+        }
+        let config = StubConfigWithVendor {
+            env: "EMBER_SESSION_ID_VENDOR_UNKNOWN_TEST",
+            vendor: "unknown",
+        };
+        let argv: Vec<String> = vec!["push".to_string()];
+        // Must return without panic. We can't easily prove "no connect
+        // attempt" from outside, but the test will hang past the 50ms
+        // timeout if the short-circuit broke.
+        let start = std::time::Instant::now();
+        log_unsessioned_subprocess(&config, &argv, UnsessionedOutcome::AmbientCredentialUsed);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(20),
+            "vendor=unknown must short-circuit before the RPC timeout; took {elapsed:?}"
+        );
+        // SAFETY: tests are serialized via ENV_LOCK.
+        unsafe {
+            std::env::remove_var("EMBER_SOCKET_PATH");
+        }
+    }
+
+    #[test]
+    fn log_unsessioned_subprocess_swallows_daemon_unreachable() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // SAFETY: tests are serialized via ENV_LOCK.
+        unsafe {
+            std::env::set_var(
+                "EMBER_SOCKET_PATH",
+                "/tmp/ember-construct-runtime-daemon-down-NONEXISTENT.sock",
+            );
+        }
+        let config = StubConfigWithVendor {
+            env: "EMBER_SESSION_ID_DAEMON_DOWN_TEST",
+            vendor: "git",
+        };
+        let argv: Vec<String> = vec!["push".to_string(), "origin".to_string()];
+        // Returns without panic / propagation. UDS connect returns
+        // ECONNREFUSED / ENOENT synchronously — no timeout needed.
+        log_unsessioned_subprocess(&config, &argv, UnsessionedOutcome::AmbientCredentialUsed);
+        // SAFETY: tests are serialized via ENV_LOCK.
+        unsafe {
+            std::env::remove_var("EMBER_SOCKET_PATH");
+        }
     }
 }

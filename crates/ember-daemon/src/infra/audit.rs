@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::infra::store::{DaemonStore, StoreError};
 
-/// implementation-note-166 — convert unix-ms to an RFC3339 string so
+/// implementation-note-189 — convert unix-ms to an RFC3339 string so
 /// the date-range filter compares lexicographically against the existing TEXT
 /// `timestamp` column. Negative or out-of-range values clamp to the unix epoch.
 fn ms_to_rfc3339(ms: i64) -> String {
@@ -34,25 +34,70 @@ pub struct AuditFilter {
     pub agent_id: Option<String>,
     pub action: Option<String>,
     pub limit: Option<usize>,
-    /// implementation-note-167 — filter to actions that start with this prefix,
+    /// implementation-note-190 — filter to actions that start with this prefix,
     /// e.g. `"grant."` shows only grant-family events. Rendering-layer only;
     /// applied after the SQL fetch so the limit still governs the fetch window.
     pub action_prefix: Option<String>,
-    /// implementation-note-166 — alias for `agent_id`. Both populate
+    /// implementation-note-189 — alias for `agent_id`. Both populate
     /// the `agent_id = ?` clause; if both are set, `persona_id` wins.
     pub persona_id: Option<String>,
-    /// implementation-note-166 — narrow to rows whose `credential`
+    /// implementation-note-189 — narrow to rows whose `credential`
     /// column starts with this prefix. SQL `LIKE` with appended `%`.
     pub scope: Option<String>,
-    /// implementation-note-166 — inclusive lower bound (unix ms).
+    /// implementation-note-189 — inclusive lower bound (unix ms).
     /// Converted to RFC3339 before binding so it compares against the
     /// existing TEXT timestamp column.
     pub since_ms: Option<i64>,
-    /// implementation-note-166 — inclusive upper bound (unix ms).
+    /// implementation-note-189 — inclusive upper bound (unix ms).
     pub before_ms: Option<i64>,
 }
 
 impl DaemonStore {
+    /// Append an audit event to `audit_log`.
+    ///
+    /// # Audit-chain semantics
+    ///
+    /// Every audit write — including ones that historically used the
+    /// NULL-hash legacy path — is now routed through the tamper-evident
+    /// chain (`append_audit_event_with_chain` / `_in_tx`). The old
+    /// behaviour (raw INSERT with NULL `row_hash` and `prev_hash`) is gone:
+    /// it produced "pre-chain history" rows that the verifier ignored, and
+    /// it polluted the next chained write's `prev_hash` lookup whenever a
+    /// log_event row was the most recent in the table. That polluted
+    /// lookup was the root cause of the 2026-05-19/20 quarantine cascade
+    /// (rows 291 + 293, both `grant.revoked`, both inserted right after a
+    /// `log_event` row and both ending up with NULL `prev_hash` despite
+    /// valid `row_hash`).
+    ///
+    /// The structural fix per `[[feedback_root_cause_over_patch]]`: do the
+    /// hard thing — every audit write joins the chain. NULL-hash rows
+    /// become a migration artifact in existing DBs; new DBs never see one.
+    /// Anchor: `audit_log_routes_through_chained_writer`.
+    ///
+    /// # Transaction context
+    ///
+    /// The two chained writers differ in whether they manage their own
+    /// `BEGIN IMMEDIATE`:
+    ///
+    /// - `append_audit_event_with_chain` (free fn) opens its own write
+    ///   transaction. Use when the caller is in SQLite autocommit mode.
+    /// - `append_audit_event_with_chain_in_tx` (in-tx variant) assumes the
+    ///   caller already holds a write lock. Use from inside
+    ///   `revoke_grant_sql`-style envelopes that wrap several writes in one
+    ///   transaction.
+    ///
+    /// `log_event` picks the right one by probing `conn.is_autocommit()`.
+    /// Nesting `BEGIN IMMEDIATE` inside an open transaction would otherwise
+    /// fail with "cannot start a transaction within a transaction"; calling
+    /// the in-tx variant outside a transaction would race the prev_hash
+    /// lookup against another writer. The probe keeps the API ergonomic
+    /// while preserving the atomicity contract.
+    ///
+    /// # Quarantine
+    ///
+    /// Both downstream writers gate on
+    /// `crate::infra::handler::is_quarantined()` and return
+    /// `StoreError::Quarantined`. No separate gate is needed here.
     pub fn log_event(
         &self,
         agent_id: Option<&str>,
@@ -61,20 +106,25 @@ impl DaemonStore {
         outcome: &str,
         details: Option<&str>,
     ) -> Result<i64, StoreError> {
-        let timestamp = Utc::now().to_rfc3339();
-        self.conn().execute(
-            "INSERT INTO audit_log (timestamp, agent_id, action, credential, outcome, details)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![timestamp, agent_id, action, credential, outcome, details],
-        )?;
-        Ok(self.conn().last_insert_rowid())
+        if self.conn().is_autocommit() {
+            append_audit_event_with_chain(self, agent_id, action, credential, outcome, details)
+        } else {
+            append_audit_event_with_chain_in_tx(
+                self.conn(),
+                agent_id,
+                action,
+                credential,
+                outcome,
+                details,
+            )
+        }
     }
 
     pub fn query_audit(&self, filter: &AuditFilter) -> Result<Vec<AuditEntry>, StoreError> {
-        // implementation-note-166 — dynamic positional binding so we
+        // implementation-note-189 — dynamic positional binding so we
         // can compose any combination of {agent_id, action, persona_id, scope,
         // since_ms, before_ms} without the previous hand-numbered ladder.
-        // implementation-note-168: filter out the chain-anchor checkpoint row.
+        // implementation-note-191: filter out the chain-anchor checkpoint row.
         // It's an internal artifact of the tamper-evident chain (see
         // migrate() in store.rs); not a user-visible audit event. The
         // chain verifier (subtask C) reads the table directly and DOES see
@@ -143,7 +193,7 @@ impl DaemonStore {
             .query_map(rusqlite::params_from_iter(binds.iter()), map_row)?
             .collect::<Result<Vec<_>, _>>()?;
 
-        // implementation-note-167 — action_prefix filter applied post-fetch so
+        // implementation-note-190 — action_prefix filter applied post-fetch so
         // the SQL limit governs the fetch window; the prefix narrows what
         // the dashboard displays. Empty/whitespace prefix is a no-op.
         if let Some(ref prefix) = filter.action_prefix {
@@ -156,9 +206,13 @@ impl DaemonStore {
         Ok(entries)
     }
 
-    /// implementation-note-166 — test helper to insert an audit row
+    /// implementation-note-189 — test helper to insert an audit row
     /// with an explicit timestamp string (so date-range tests can pin
     /// timestamps without sleeping).
+    ///
+    /// Inserts at `segment_id = 0` (the cordoned-legacy / pre-chain segment
+    /// where NULL hashes are admitted by the CHECK constraint). Test helper
+    /// rows are not chained.
     #[cfg(test)]
     pub(crate) fn log_event_with_timestamp(
         &self,
@@ -169,15 +223,15 @@ impl DaemonStore {
         outcome: &str,
     ) -> Result<i64, StoreError> {
         self.conn().execute(
-            "INSERT INTO audit_log (timestamp, agent_id, action, credential, outcome, details)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+            "INSERT INTO audit_log (timestamp, agent_id, action, credential, outcome, details, segment_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, 0)",
             params![timestamp, agent_id, action, credential, outcome],
         )?;
         Ok(self.conn().last_insert_rowid())
     }
 
     pub fn audit_count(&self) -> Result<u64, StoreError> {
-        // implementation-note-168: same internal-checkpoint exclusion as
+        // implementation-note-191: same internal-checkpoint exclusion as
         // query_audit so the user-facing count matches what query_audit
         // returns.
         let count: i64 = self.conn().query_row(
@@ -190,7 +244,7 @@ impl DaemonStore {
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-168 — tamper-evident audit chain
+// implementation-note-191 — tamper-evident audit chain
 // ---------------------------------------------------------------------------
 
 /// Append an audit event to `audit_log` with a blake3 chain hash linking it
@@ -219,6 +273,21 @@ pub fn append_audit_event_with_chain(
     outcome: &str,
     details: Option<&str>,
 ) -> Result<i64, StoreError> {
+    // quarantine_serve_mode_audit_writes_refused — gate the chained writer
+    // BEFORE BEGIN IMMEDIATE so the daemon doesn't spuriously serialize
+    // callers behind a write-lock that will immediately roll back. The
+    // `_in_tx` variant has its own gate inside the lock for callers that
+    // already hold one. Per design v2 §1 + adversarial review CRIT-1.
+    if crate::infra::handler::is_quarantined() {
+        tracing::warn!(
+            action,
+            outcome,
+            "daemon quarantined; refusing audit-chain extension"
+        );
+        return Err(StoreError::Quarantined {
+            action: action.to_string(),
+        });
+    }
     let conn = store.conn();
     conn.execute("BEGIN IMMEDIATE", [])?;
     let result =
@@ -248,10 +317,49 @@ pub(crate) fn append_audit_event_with_chain_in_tx(
     outcome: &str,
     details: Option<&str>,
 ) -> Result<i64, StoreError> {
+    // quarantine_serve_mode_audit_writes_refused — also gate the in-tx path
+    // so callers that already hold a write-lock (e.g. `resolve_approval` →
+    // `dashboard.rs` POST handlers, `revoke_grant_sql`) cannot extend the
+    // chain over a known-broken tail. The caller's surrounding transaction
+    // will see `Err(Quarantined)` and roll back. Per design v2 §1 +
+    // adversarial review CRIT-1 (the dashboard write-path was the primary
+    // bypass the v1 gate missed).
+    if crate::infra::handler::is_quarantined() {
+        tracing::warn!(
+            action,
+            outcome,
+            "daemon quarantined; refusing audit-chain extension (in-tx)"
+        );
+        return Err(StoreError::Quarantined {
+            action: action.to_string(),
+        });
+    }
+
+    // audit_writer_prevhash_seed_segment_scoped — the writer always extends
+    // the latest segment. `MAX(segment_id)` is the operational segment; on a
+    // fresh DB it's 0 (epoch-zero / pre-cordon), post-cordon it advances to
+    // 1 (operator's host bridge) and incrementally past each repair tombstone.
+    let current_segment_id: u64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(segment_id), 0) FROM audit_log",
+            [],
+            |row| row.get::<_, i64>(0).map(|v| v as u64),
+        )
+        .unwrap_or(0);
+
+    // audit_writer_prevhash_seed_segment_scoped — seed the chain from the
+    // latest CHAINED row in the current segment, skipping NULL-hash legacy
+    // rows. This is THE bug-2 root-cause fix: under the old seed
+    // (`ORDER BY id DESC LIMIT 1`), the latest row could be a NULL-hash
+    // legacy log_event, producing `prev_hash = NULL`. The verifier expects
+    // `prev_hash` to equal the prior CHAINED row's `row_hash` and surfaces a
+    // ForwardLinkMismatch quarantine. Per locked decision #3 + migration D6.
     let prev_hash: Option<String> = conn
         .query_row(
-            "SELECT row_hash FROM audit_log ORDER BY id DESC LIMIT 1",
-            [],
+            "SELECT row_hash FROM audit_log \
+             WHERE row_hash IS NOT NULL AND segment_id = ?1 \
+             ORDER BY id DESC LIMIT 1",
+            rusqlite::params![current_segment_id as i64],
             |row| row.get(0),
         )
         .ok()
@@ -268,12 +376,27 @@ pub(crate) fn append_audit_event_with_chain_in_tx(
     hasher.update(&canonical);
     let row_hash = hasher.finalize().to_hex().to_string();
 
+    // Writer EXPLICITLY names `segment_id` in the INSERT (per pass-2 finding
+    // #4 fix): segment_id is NOT NULL with no DEFAULT, so an older binary
+    // that doesn't know about the column will fail loudly instead of
+    // silently corrupting topology via DEFAULT 0. `is_segment_genesis` keeps
+    // its DEFAULT 0 — chain extensions are never segment-genesis rows; the
+    // only `is_segment_genesis = 1` rows are the chain-v1 genesis (migrate)
+    // and the cordon bridge / repair tombstones.
     conn.execute(
         "INSERT INTO audit_log \
-         (timestamp, agent_id, action, credential, outcome, details, prev_hash, row_hash) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         (timestamp, agent_id, action, credential, outcome, details, prev_hash, row_hash, segment_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
-            timestamp, agent_id, action, credential, outcome, details, prev_hash, row_hash
+            timestamp,
+            agent_id,
+            action,
+            credential,
+            outcome,
+            details,
+            prev_hash,
+            row_hash,
+            current_segment_id as i64,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -283,6 +406,21 @@ pub(crate) fn append_audit_event_with_chain_in_tx(
 /// are sorted alphabetically; `null` is the absence checkpoint for
 /// `Option<&str>` fields. The verifier (subtask C) reconstructs this exact
 /// byte sequence from the stored row to recompute the row hash.
+///
+/// `pub(crate)` so the cordon-migration path in `store.rs` can canonicalize
+/// the bridge row's body with the same byte sequence the verifier will
+/// reconstruct when walking the chain post-migration.
+pub(crate) fn canonical_audit_row_bytes_pub(
+    timestamp: &str,
+    agent_id: Option<&str>,
+    action: &str,
+    credential: Option<&str>,
+    outcome: &str,
+    details: Option<&str>,
+) -> Vec<u8> {
+    canonical_audit_row_bytes(timestamp, agent_id, action, credential, outcome, details)
+}
+
 fn canonical_audit_row_bytes(
     timestamp: &str,
     agent_id: Option<&str>,
@@ -310,33 +448,164 @@ fn canonical_audit_row_bytes(
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-169 — chain verifier
+// implementation-note-192 — chain verifier
 // ---------------------------------------------------------------------------
 
-/// Outcome of a chain-verification walk.
+/// audit_verifier_outcome_v2 — outcome of a chain-verification walk.
+///
+/// Extended from the original 2-variant enum per design v2 + design review
+/// 20260521-134520 (DIGEST + adversarial-2 R3/R7). New variants distinguish
+/// migration-artifact rows from real breaks, surface topology-invariant
+/// violations distinct from chain breaks, and split the daemon-crashed-mid-
+/// repair recovery surface into two symmetric variants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerifyOutcome {
     /// Every row in the walked range recomputes to its stored `row_hash`
-    /// and links to the prior row via `prev_hash == prior.row_hash`.
-    Ok { rows_walked: u64 },
-    /// A row's recomputed hash diverged from its stored hash, OR its
-    /// `prev_hash` did not equal the prior row's `row_hash`.
-    ///
-    /// `at_row_id` is the SQLite `id` of the broken row; `expected_hash`
-    /// is what the verifier recomputed; `stored_hash` is what was in the
-    /// row.
+    /// and links to the prior row via `prev_hash == prior.row_hash`. The
+    /// `segments_walked` field counts how many distinct segment_id values
+    /// the walker saw; `sample_mode` records which cadence the walker ran.
+    Ok {
+        rows_walked: u64,
+        segments_walked: u32,
+        sample_mode: SampleMode,
+    },
+    /// A row's chain invariant failed. The `kind` bifurcates the failure
+    /// shape so the diagnostic surface can name "row_hash recomputed
+    /// differently" vs "prev_hash didn't link to predecessor's row_hash"
+    /// without text parsing.
     Break {
+        kind: BreakKind,
+    },
+    /// Pre-chain NULL-hash legacy rows are present in the DB. This is the
+    /// post-cordon expected steady state on the operator's host (290 such
+    /// rows in segment 0). NOT a quarantine condition — operator runs
+    /// `ember audit migrate-chain --acknowledge` to mint the Phase 2
+    /// attested receipt. Per design review verifier D2 + locked decision #13.
+    LegacyRowsPresent {
+        count: u64,
+        max_legacy_id: i64,
+        chain_resumes_at_id: i64,
+    },
+    /// A segment-topology invariant was violated (e.g. multiple segment-
+    /// genesis rows for the same segment, post-migration NULL row_hash in
+    /// segment > 0, non-monotonic segment_id). Quarantines under a distinct
+    /// authority from `Break` so the repair flow can branch on the cause.
+    ChainTopologyInvariantViolation {
+        kind: TopologyViolation,
         at_row_id: i64,
-        expected_hash: String,
-        stored_hash: Option<String>,
         rows_walked_before: u64,
     },
+    /// Daemon crashed mid-repair: the repair receipt was minted but the
+    /// tombstone row never committed. Per design v2 §6.
+    IncompleteRepair {
+        receipt_id_orphan: String,
+    },
+    /// Symmetric to `IncompleteRepair`: the tombstone row committed but
+    /// the repair receipt never minted. Recovered via the
+    /// `ember audit chain-repair-finalize` CLI verb. Per locked decision
+    /// #11 + repair D6.
+    IncompleteRepairReceipt {
+        tombstone_row_id: i64,
+    },
+}
+
+/// audit_verifier_outcome_v2 — bifurcated break shape. Each variant is the
+/// SAME quarantine class on dev0 (any break quarantines), but the
+/// diagnostic + remediation surface differs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BreakKind {
+    /// `blake3(prev_hash || canonical_row_bytes)` recomputed != stored
+    /// `row_hash`. Classic in-row tamper.
+    RowHashMismatch {
+        at_row_id: i64,
+        expected_hash: String,
+        stored_hash: String,
+        rows_walked_before: u64,
+    },
+    /// `prev_hash` did not equal the prior chained row's `row_hash`.
+    /// Carries `predecessor_row_id` distinct from `at_row_id` (per R7 /
+    /// pass-2 finding #7): `at_row_id` is the row whose `prev_hash`
+    /// mismatched; `predecessor_row_id` is the prior chained row whose
+    /// `row_hash` should have been the seed.
+    ForwardLinkMismatch {
+        at_row_id: i64,
+        predecessor_row_id: i64,
+        expected_prev_hash: String,
+        stored_prev_hash: Option<String>,
+        rows_walked_before: u64,
+    },
+}
+
+/// audit_verifier_outcome_v2 — topology-invariant categories surfaced via
+/// `ChainTopologyInvariantViolation`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopologyViolation {
+    /// More than one row in a single segment carries `is_segment_genesis =
+    /// 1`. The partial unique index structurally prevents this at INSERT
+    /// time, but a raw-SQL writer that bypassed the index (or a partial
+    /// migration) can produce it.
+    MultipleGenesis,
+    /// A row in `segment_id > 0` carries `row_hash IS NULL`. Post-
+    /// migration, only the original chain-v1 genesis + the cordoned legacy
+    /// block (segment 0) are allowed to have NULL hashes; any further
+    /// segment's rows must be fully chained. Caught by the CHECK
+    /// constraint structurally, but the verifier surfaces it explicitly
+    /// for diagnostic clarity if the constraint was bypassed.
+    PostMigrationNullRowHash,
+    /// Row id-order does not match segment_id non-decreasing order
+    /// (e.g. an older binary wrote a `segment_id = 0` row AFTER a
+    /// segment-1 row already existed). Surfaces the downgrade-write
+    /// failure mode from pass-2 finding #4.
+    SegmentIdNonMonotonic,
+}
+
+/// audit_verifier_outcome_v2 — how the verifier sampled the chain on the
+/// current call. Surfaces in `Ok` so operators can see whether full-walk
+/// or sampling fired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleMode {
+    /// Walked every row in `audit_log`. The dev0 default when N < 100k
+    /// per design v2 §6 (locked decision #17).
+    FullWalk,
+    /// Walked the last N rows. Used for tail-1000 cadence past the
+    /// full-walk threshold.
+    Tail { n: u32 },
+    /// Walked one row per segment_id boundary only.
+    PerSegmentGenesis,
+}
+
+/// audit_verifier_outcome_v2 — inter-segment seed query helper (R3 /
+/// pass-2 finding #5). Returns the most-recent chained row's `row_hash`
+/// strictly across PRIOR segments (i.e. `segment_id < ?1`), skipping NULL
+/// rows.
+///
+/// Locked SQL (R3): `SELECT row_hash FROM audit_log WHERE segment_id <
+/// ?1 AND row_hash IS NOT NULL ORDER BY id DESC LIMIT 1`.
+///
+/// Called when the walker crosses a segment-genesis boundary: a segment-1
+/// bridge row's `prev_hash` chains to the v1 genesis row's `row_hash`
+/// (the only chained row in segment 0 on the operator's host).
+pub(crate) fn inter_segment_seed_row_hash(
+    conn: &rusqlite::Connection,
+    segment_id: u64,
+) -> Result<Option<String>, rusqlite::Error> {
+    let seed: Option<String> = conn
+        .query_row(
+            "SELECT row_hash FROM audit_log \
+             WHERE segment_id < ?1 AND row_hash IS NOT NULL \
+             ORDER BY id DESC LIMIT 1",
+            rusqlite::params![segment_id as i64],
+            |row| row.get(0),
+        )
+        .ok()
+        .flatten();
+    Ok(seed)
 }
 
 /// Walk the audit chain forward from the genesis row, recomputing each
 /// row's `blake3(prev_hash || canonical_row_bytes)` and asserting it
 /// matches the stored `row_hash`. Pre-chain rows (NULL `row_hash`,
-/// inserted before the implementation-note-168 migration landed) are
+/// inserted before the implementation-note-191 migration landed) are
 /// skipped — the verifier walks only chained rows.
 ///
 /// `tail` limits the walk to the most recent N rows (for sampling startup
@@ -356,15 +625,19 @@ pub fn run_audit_verify(
     conn: &rusqlite::Connection,
     tail: Option<usize>,
 ) -> Result<VerifyOutcome, StoreError> {
-    // Collect (id, prev_hash, row_hash, raw fields) in chronological order.
-    // For sampling-mode we want the LAST N rows, so we ORDER BY id DESC
+    let sample_mode = match tail {
+        None => SampleMode::FullWalk,
+        Some(n) => SampleMode::Tail { n: n as u32 },
+    };
+    // Collect (id, prev_hash, row_hash, segment_id, raw fields) in chronological
+    // order. For sampling-mode we want the LAST N rows, so we ORDER BY id DESC
     // LIMIT N then reverse for forward iteration.
     let order_clause = match tail {
         Some(n) => format!("ORDER BY id DESC LIMIT {}", n),
         None => "ORDER BY id ASC".to_string(),
     };
     let sql = format!(
-        "SELECT id, timestamp, agent_id, action, credential, outcome, details, prev_hash, row_hash \
+        "SELECT id, timestamp, agent_id, action, credential, outcome, details, prev_hash, row_hash, segment_id, is_segment_genesis \
          FROM audit_log {}",
         order_clause
     );
@@ -380,6 +653,8 @@ pub fn run_audit_verify(
         Option<String>,
         Option<String>,
         Option<String>,
+        i64, // segment_id
+        i64, // is_segment_genesis (SQLite stores INTEGER for bool)
     );
 
     let mut rows: Vec<Row> = stmt
@@ -394,6 +669,8 @@ pub fn run_audit_verify(
                 row.get::<_, Option<String>>(6)?,
                 row.get::<_, Option<String>>(7)?,
                 row.get::<_, Option<String>>(8)?,
+                row.get::<_, i64>(9)?,
+                row.get::<_, i64>(10)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -401,59 +678,144 @@ pub fn run_audit_verify(
         rows.reverse(); // restore chronological order after DESC fetch
     }
 
-    // implementation-note-169 — sampling-mode seed. When `tail` limits
-    // the walk to the last N rows, the cross-row chain check on the first
-    // row of the window has no in-walk predecessor; without seeding, every
-    // tail walk would false-positive a Break. Read the row immediately
-    // before the window from the database to anchor the chain.
+    // audit_verifier_outcome_v2 — sampling-mode seed. When `tail` limits the
+    // walk to the last N rows, the cross-row chain check on the first row of
+    // the window has no in-walk predecessor; without seeding, every tail
+    // walk would false-positive a Break. Seed from the immediate prior
+    // CHAINED row in the same segment (or, if the window starts at a
+    // segment-genesis boundary, use the inter-segment seed query — R3).
     let mut prior_row_hash: Option<String> = None;
+    let mut last_predecessor_id: i64 = 0;
+    let mut current_segment: Option<u64> = None;
     if let Some(first) = rows.first() {
         let first_id = first.0;
+        let first_segment = first.9 as u64;
+        // Look for the prior chained row in the SAME segment with id <
+        // first_id. If none, fall back to the inter-segment seed (a
+        // segment-genesis boundary case).
         let seed: Option<String> = conn
             .query_row(
-                "SELECT row_hash FROM audit_log WHERE id < ?1 ORDER BY id DESC LIMIT 1",
-                rusqlite::params![first_id],
+                "SELECT row_hash FROM audit_log \
+                 WHERE id < ?1 AND segment_id = ?2 AND row_hash IS NOT NULL \
+                 ORDER BY id DESC LIMIT 1",
+                rusqlite::params![first_id, first_segment as i64],
                 |row| row.get(0),
             )
             .ok()
             .flatten();
-        prior_row_hash = seed;
+        prior_row_hash = match seed {
+            Some(h) => Some(h),
+            None => inter_segment_seed_row_hash(conn, first_segment)
+                .ok()
+                .flatten(),
+        };
+        if prior_row_hash.is_some() {
+            // Walker has an in-DB predecessor whose id we don't track here;
+            // ForwardLinkMismatch reporting falls back to id=0 in that
+            // case — acceptable because sampling-mode seeds rarely fire.
+            last_predecessor_id = 0;
+        }
     }
+
     let mut walked: u64 = 0;
-    for (id, timestamp, agent_id, action, credential, outcome, details, prev_hash, row_hash) in rows
+    let mut segments_walked: u32 = 0;
+    let mut legacy_count: u64 = 0;
+    let mut max_legacy_id: i64 = 0;
+    let mut chain_resumes_at_id: i64 = 0;
+
+    for (
+        id,
+        timestamp,
+        agent_id,
+        action,
+        credential,
+        outcome,
+        details,
+        prev_hash,
+        row_hash,
+        segment_id_raw,
+        is_segment_genesis_raw,
+    ) in rows
     {
-        // Pre-chain rows have NULL row_hash; treat as "not part of the
-        // chain" and skip. The chain anchor (`audit.chain_v1_genesis`)
-        // has a non-NULL row_hash and DOES enter the walk; its prev_hash
-        // is NULL by definition.
+        let row_segment = segment_id_raw as u64;
+        let is_segment_genesis = is_segment_genesis_raw != 0;
+
+        // Track segment crossings.
+        match current_segment {
+            None => {
+                current_segment = Some(row_segment);
+                segments_walked = 1;
+            }
+            Some(prev) if prev != row_segment => {
+                // Segment boundary: re-seed from the inter-segment query.
+                if let Ok(Some(new_seed)) = inter_segment_seed_row_hash(conn, row_segment) {
+                    prior_row_hash = Some(new_seed);
+                } else {
+                    prior_row_hash = None;
+                }
+                current_segment = Some(row_segment);
+                segments_walked += 1;
+            }
+            Some(_) => {}
+        }
+
+        // Pre-chain / legacy rows have NULL row_hash. Segment 0's NULL block
+        // is the cordoned-legacy artifact (locked decision #19): walk-skipped
+        // but COUNTED toward `LegacyRowsPresent`. A NULL row_hash in segment
+        // > 0 is a topology violation (the CHECK constraint structurally
+        // forbids it, but the verifier surfaces it explicitly).
         let stored_hash = match row_hash {
             Some(h) => h,
-            None => continue,
+            None => {
+                if row_segment == 0 && action != "audit.chain_v1_genesis" {
+                    legacy_count += 1;
+                    if id > max_legacy_id {
+                        max_legacy_id = id;
+                    }
+                    continue;
+                }
+                if row_segment > 0 {
+                    return Ok(VerifyOutcome::ChainTopologyInvariantViolation {
+                        kind: TopologyViolation::PostMigrationNullRowHash,
+                        at_row_id: id,
+                        rows_walked_before: walked,
+                    });
+                }
+                continue;
+            }
         };
 
-        // The chain forward starts at the genesis row. For the genesis
-        // row, `prev_hash` is NULL by contract. For all subsequent rows,
-        // `prev_hash` must equal the prior row's `row_hash`.
-        if action != "audit.chain_v1_genesis" {
+        // The chain forward starts at the genesis row. For the genesis row,
+        // `prev_hash` is NULL by contract. For segment-genesis rows (bridge,
+        // repair tombstones), `prev_hash` must equal the inter-segment seed
+        // (the prior segment's last chained row's row_hash). For all other
+        // rows, `prev_hash` must equal the prior chained row's `row_hash`.
+        let is_chain_v1_genesis = action == "audit.chain_v1_genesis";
+        if !is_chain_v1_genesis {
             let expected_prev = prior_row_hash.as_deref();
             let actual_prev = prev_hash.as_deref();
             if expected_prev != actual_prev {
                 return Ok(VerifyOutcome::Break {
-                    at_row_id: id,
-                    expected_hash: format!(
-                        "prev_hash should be {:?}",
-                        expected_prev.unwrap_or("NULL")
-                    ),
-                    stored_hash: actual_prev.map(str::to_string),
-                    rows_walked_before: walked,
+                    kind: BreakKind::ForwardLinkMismatch {
+                        at_row_id: id,
+                        predecessor_row_id: last_predecessor_id,
+                        expected_prev_hash: expected_prev.unwrap_or("NULL").to_string(),
+                        stored_prev_hash: actual_prev.map(str::to_string),
+                        rows_walked_before: walked,
+                    },
                 });
             }
+        }
+
+        // Track first-non-null id past the legacy block (R-revisions).
+        if legacy_count > 0 && chain_resumes_at_id == 0 && !is_chain_v1_genesis {
+            chain_resumes_at_id = id;
         }
 
         // For the genesis row, the canonical body is "audit.chain_v1_genesis"
         // (the literal bytes used by `migrate()` to seed the anchor).
         // For all other rows, recompute blake3(prev_hash || canonical_body).
-        let recomputed = if action == "audit.chain_v1_genesis" {
+        let recomputed = if is_chain_v1_genesis {
             blake3::hash(b"audit.chain_v1_genesis").to_hex().to_string()
         } else {
             let canonical = canonical_audit_row_bytes(
@@ -474,19 +836,40 @@ pub fn run_audit_verify(
 
         if recomputed != stored_hash {
             return Ok(VerifyOutcome::Break {
-                at_row_id: id,
-                expected_hash: recomputed,
-                stored_hash: Some(stored_hash),
-                rows_walked_before: walked,
+                kind: BreakKind::RowHashMismatch {
+                    at_row_id: id,
+                    expected_hash: recomputed,
+                    stored_hash,
+                    rows_walked_before: walked,
+                },
             });
         }
 
+        // Mark `_` to acknowledge `is_segment_genesis` is read but its only
+        // structural use is the partial unique index at the schema layer
+        // (R6) — the walker doesn't need to gate on it once the chain
+        // arithmetic passes.
+        let _ = is_segment_genesis;
         prior_row_hash = Some(stored_hash);
+        last_predecessor_id = id;
         walked += 1;
+    }
+
+    // If the chain walked cleanly and there's a legacy block, surface it as
+    // a distinct outcome so the operator knows Phase 2 attestation is still
+    // pending (per locked decision #13 + verifier D2).
+    if legacy_count > 0 {
+        return Ok(VerifyOutcome::LegacyRowsPresent {
+            count: legacy_count,
+            max_legacy_id,
+            chain_resumes_at_id,
+        });
     }
 
     Ok(VerifyOutcome::Ok {
         rows_walked: walked,
+        segments_walked,
+        sample_mode,
     })
 }
 
@@ -623,7 +1006,7 @@ mod tests {
 
     #[test]
     fn persona_filter_isolates_rows() {
-        // implementation-note-166 — persona_id targets the agent_id
+        // implementation-note-189 — persona_id targets the agent_id
         // column; a row tagged "persona-x" should not surface when querying
         // for "persona-y".
         let store = DaemonStore::open_in_memory().unwrap();
@@ -646,7 +1029,7 @@ mod tests {
 
     #[test]
     fn since_before_bound_timestamps() {
-        // implementation-note-166 — since_ms / before_ms inclusive
+        // implementation-note-189 — since_ms / before_ms inclusive
         // bounds. Insert three rows at t=100/200/300 ms; query [150, 250]
         // expects only the t=200 row.
         let store = DaemonStore::open_in_memory().unwrap();
@@ -701,7 +1084,7 @@ mod tests {
         );
     }
 
-    /// implementation-note-169 — verifier walks a fresh chain and reports Ok.
+    /// implementation-note-192 — verifier walks a fresh chain and reports Ok.
     #[test]
     fn audit_verify_chain_passes_on_untampered_log() {
         let store = DaemonStore::open_in_memory().unwrap();
@@ -715,26 +1098,18 @@ mod tests {
 
         let outcome = run_audit_verify(store.conn(), None).expect("verify");
         match outcome {
-            VerifyOutcome::Ok { rows_walked } => {
+            VerifyOutcome::Ok { rows_walked, .. } => {
                 assert_eq!(
                     rows_walked, 4,
                     "expected 4 chain rows walked (genesis + 3 appends), got {}",
                     rows_walked
                 );
             }
-            VerifyOutcome::Break {
-                at_row_id,
-                expected_hash,
-                stored_hash,
-                ..
-            } => panic!(
-                "unexpected chain break at row {} (expected {:?}, stored {:?})",
-                at_row_id, expected_hash, stored_hash
-            ),
+            other => panic!("expected Ok, got {other:?}"),
         }
     }
 
-    /// implementation-note-169 — verifier detects a tampered row.
+    /// implementation-note-192 — verifier detects a tampered row.
     /// Seeds 3 chained events, hand-corrupts row 2's `details` column
     /// (bypassing the chain primitive's hash recompute), asserts the
     /// verifier emits `VerifyOutcome::Break` at the corrupted row.
@@ -770,20 +1145,22 @@ mod tests {
         let outcome = run_audit_verify(store.conn(), None).expect("verify");
         match outcome {
             VerifyOutcome::Break {
-                at_row_id,
-                expected_hash: _,
-                stored_hash: Some(_),
-                rows_walked_before,
+                kind:
+                    BreakKind::RowHashMismatch {
+                        at_row_id,
+                        rows_walked_before,
+                        ..
+                    },
             } => {
                 assert_eq!(at_row_id, id1, "break must surface at the tampered row");
                 // Genesis walked; tampered row is the next one — so 1 row walked before break.
                 assert_eq!(rows_walked_before, 1);
             }
-            other => panic!("expected Break, got {:?}", other),
+            other => panic!("expected Break::RowHashMismatch, got {:?}", other),
         }
     }
 
-    /// implementation-note-169 — sampling mode walks only the last N rows.
+    /// implementation-note-192 — sampling mode walks only the last N rows.
     #[test]
     fn audit_verify_chain_tail_walks_only_last_n() {
         let store = DaemonStore::open_in_memory().unwrap();
@@ -801,14 +1178,14 @@ mod tests {
 
         let outcome = run_audit_verify(store.conn(), Some(3)).expect("verify --tail 3");
         match outcome {
-            VerifyOutcome::Ok { rows_walked } => {
+            VerifyOutcome::Ok { rows_walked, .. } => {
                 assert_eq!(rows_walked, 3, "tail=3 should walk exactly 3 rows");
             }
             other => panic!("expected Ok, got {:?}", other),
         }
     }
 
-    /// implementation-note-168 — chain advances: every row's `prev_hash`
+    /// implementation-note-191 — chain advances: every row's `prev_hash`
     /// equals the prior row's `row_hash`. Genesis row carries `prev_hash =
     /// NULL`. Two back-to-back appends must produce a row whose `prev_hash`
     /// matches the genesis row's `row_hash`, then another whose `prev_hash`

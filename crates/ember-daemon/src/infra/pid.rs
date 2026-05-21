@@ -5,8 +5,13 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum PidError {
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
+    #[error("I/O error during {op} {path}: {source}")]
+    Io {
+        op: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("daemon already running with PID {0}")]
     AlreadyRunning(u32),
     #[error("invalid PID in file: {0}")]
@@ -40,10 +45,18 @@ impl PidFile {
                 return Err(PidError::AlreadyRunning(existing));
             }
             // Stale PID file from a crashed process — remove it before overwriting.
-            let _ = fs::remove_file(&self.path);
+            fs::remove_file(&self.path).map_err(|source| PidError::Io {
+                op: "removing stale pid file",
+                path: self.path.clone(),
+                source,
+            })?;
         }
         let pid = std::process::id();
-        fs::write(&self.path, format!("{pid}\n"))?;
+        fs::write(&self.path, format!("{pid}\n")).map_err(|source| PidError::Io {
+            op: "writing pid file",
+            path: self.path.clone(),
+            source,
+        })?;
         self.owns_file.set(true);
         Ok(())
     }
@@ -58,7 +71,11 @@ impl PidFile {
                     .map_err(|_| PidError::InvalidPid(trimmed.to_string()))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(PidError::Io(e)),
+            Err(source) => Err(PidError::Io {
+                op: "reading pid file",
+                path: self.path.clone(),
+                source,
+            }),
         }
     }
 
@@ -70,7 +87,11 @@ impl PidFile {
     }
 
     pub fn remove(&self) -> Result<(), PidError> {
-        fs::remove_file(&self.path)?;
+        fs::remove_file(&self.path).map_err(|source| PidError::Io {
+            op: "removing pid file",
+            path: self.path.clone(),
+            source,
+        })?;
         self.owns_file.set(false);
         Ok(())
     }
@@ -84,7 +105,7 @@ impl Drop for PidFile {
     }
 }
 
-/// `daemon_status_pid_liveness_check` — implementation-note-270.
+/// `daemon_status_pid_liveness_check` — implementation-note-298.
 ///
 /// Discriminate `kill(0)` errno states so cross-uid daemons aren't
 /// misclassified as gone under design separate-uid posture:
@@ -190,6 +211,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn read_error_reports_operation_and_path() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("pid-dir");
+        fs::create_dir(&path).unwrap();
+        let pf = PidFile::new(path.clone());
+        match pf.read() {
+            Err(PidError::Io {
+                op, path: err_path, ..
+            }) => {
+                assert_eq!(op, "reading pid file");
+                assert_eq!(err_path, path);
+            }
+            other => panic!("expected Io read error, got {other:?}"),
+        }
+    }
+
     // Regression: CLI `daemon status` / `daemon stop` construct a PidFile purely
     // to read the running daemon's PID. That transient handle dropping must NOT
     // remove the file — the daemon still owns it. ()
@@ -217,7 +255,7 @@ mod tests {
         assert_eq!(writer.read().unwrap(), Some(std::process::id()));
     }
 
-    /// implementation-note-270 — regression test
+    /// implementation-note-298 — regression test
     /// for the cross-uid case under design separate-uid posture.
     ///
     /// PID 1 (init/launchd) always exists and is owned by root. When the

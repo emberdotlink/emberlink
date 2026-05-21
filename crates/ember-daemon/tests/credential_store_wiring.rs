@@ -1,4 +1,4 @@
-//! implementation-note-297 (design sub-piece D) — T2 wiring test.
+//! implementation-note-331 (design sub-piece D) — T2 wiring test.
 //!
 //! This test pins the daemon-startup contract for the pluggable
 //! `CredentialStore` backend selector. Sub-pieces A, B, C all shipped on

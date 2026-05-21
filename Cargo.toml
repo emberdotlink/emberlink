@@ -62,6 +62,19 @@ resolver = "2"
 [profile.release]
 debug-assertions = false
 
+# host_linker_oom_remediation_landed —
+# ember_daemon_test_link_oom_resolved (implementation-note-6).
+# Strip debug info from test binaries. The ember-daemon test crate links
+# ~300 rlibs; full debuginfo pushes peak linker working set to 6-8 GB on
+# aarch64-linux, OOM-killing `ld` on the 15 GB headless VM. `panic!`
+# still shows file:line via `RUST_BACKTRACE`; only source-level debugger
+# attachment is lost. No coverage tooling in CI today needs debuginfo
+# (verified: no llvm-cov / tarpaulin / grcov references in
+# .github/workflows/ or .claude/scripts/). Paired with `.cargo/config.toml`
+# wiring the mold linker for the real memory-and-time win.
+[profile.test]
+debug = 0
+
 [workspace.package]
 edition = "2024"
 license = "Apache-2.0"
@@ -72,3 +85,9 @@ version = "0.3.0"
 blake3 = "1"
 sha2 = "0.11"
 toml = "1.0"
+# toml_edit_dependency_landed — implementation-note-7.
+# Comment- + field-order-preserving TOML round-trip. Consumed by
+# `headless-runtime::tasks::index` to fix the serializer-side-effects bug
+# tracked by implementation-note-8
+# (slice B does the save() rewrite).
+toml_edit = "0.22"

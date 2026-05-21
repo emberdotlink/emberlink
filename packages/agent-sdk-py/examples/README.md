@@ -32,34 +32,31 @@ Before running any example you need:
 
 ## Examples
 
-### `basic_agent.py`
-
-Demonstrates the full `SocketTransport` flow against the running daemon:
-
-- Connect to the Unix socket
-- Ping the daemon
-- Request a grant for a named credential (`request_grant`)
-- Handle the three outcomes: `approved`, `pending`, `denied`
-- If approved, redeem the grant (`use_credential`) and print the first four characters
-
-```bash
-EMBER_PERSONA_ID=persona-xxx EMBER_CREDENTIAL=github-token \
-    python examples/basic_agent.py
-```
-
-Environment variables:
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `EMBER_PERSONA_ID` | `persona-xxx` | ID of the agent persona |
-| `EMBER_CREDENTIAL` | `github-token` | Name of the stored credential |
-
 ### `request_credential.py`
 
-Uses the higher-level `EmberAgent` client (wraps the `emberlink-agent` subprocess) to demonstrate `whoami`, `request_grant`, and `grant_status`.
+Uses the public `EmberAgent` helper client. The Python package does not expose
+its own direct socket transport; it spawns `emberlink-agent`, which then talks
+to the local daemon for daemon-backed methods.
+
+The example demonstrates:
+
+- `whoami`
+- `request_grant(scope, resource_id=...)`
+- `grant_status`
+- `use_credential`
 
 ```bash
-EMBERLINK_PERSONA=my-agent-persona python examples/request_credential.py
+EMBERLINK_PERSONA=my-agent-persona \
+EMBERLINK_CREDENTIAL=github-token \
+python examples/request_credential.py
+```
+
+Optional:
+
+```bash
+EMBERLINK_DAEMON_SOCKET=/path/to/daemon.sock \
+EMBERLINK_PERSONA=my-agent-persona \
+python examples/request_credential.py
 ```
 
 ## Pending approvals

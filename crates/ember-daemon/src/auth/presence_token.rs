@@ -25,7 +25,7 @@
 //! A minimal local abstraction that supports both sign and verify in a single
 //! trait object.  `core_crypto::Signer` only exposes `sign` + `public_key`; a
 //! full consolidation (re-exporting from `core-crypto`) is tracked in
-//! `implementation-note-104`.
+//! `implementation-note-119`.
 
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -103,6 +103,12 @@ pub struct PresenceTokenCache {
     entries: std::cell::RefCell<HashMap<(u32, ScopeKey), PresenceToken>>,
 }
 
+impl Default for PresenceTokenCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PresenceTokenCache {
     pub fn new() -> Self {
         Self {
@@ -157,7 +163,7 @@ pub enum AuthError {
 ///
 /// `core_crypto::Signer` only exposes `sign` and `public_key`; a full
 /// consolidation that makes this trait redundant is tracked in
-/// `implementation-note-104`.
+/// `implementation-note-119`.
 pub trait DaemonSigner {
     fn sign(&self, msg: &[u8]) -> Bytes;
     fn verify(&self, msg: &[u8], sig: &[u8]) -> bool;

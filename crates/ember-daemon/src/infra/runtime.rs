@@ -25,6 +25,20 @@ use crate::infra::vault::{
 use crate::trust::bridge_ca::{BridgeCa, BridgeCaError};
 use crate::trust::policy::{PolicyEngine, PolicyError};
 
+fn daemon_socket_path_with(
+    config: &DaemonConfig,
+    env_override: Option<std::ffi::OsString>,
+) -> PathBuf {
+    env_override
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| config.socket_dir.join("daemon.sock"))
+}
+
+fn daemon_socket_path(config: &DaemonConfig) -> PathBuf {
+    daemon_socket_path_with(config, std::env::var_os("EMBER_DAEMON_SOCKET"))
+}
+
 #[derive(Debug, Error)]
 pub enum DaemonError {
     #[error("config error: {0}")]
@@ -43,12 +57,12 @@ pub enum DaemonError {
     NotRunning,
     #[error("signal error: {0}")]
     Signal(std::io::Error),
-    /// implementation-note-230 (D): startup sampling verify
+    /// implementation-note-255 (D): startup sampling verify
     /// detected a chain break. The daemon refused normal-serve and
     /// entered quarantine. Recovery requires operator intervention.
     #[error("audit chain break detected at startup: {0}")]
     AuditChainBreak(String),
-    /// implementation-note-230 (E) / F-S5-013 HIGH: the
+    /// implementation-note-255 (E) / F-S5-013 HIGH: the
     /// daemon's long-lived identity key could not be initialised, so
     /// the daemon refuses startup (fail-closed). Receipts are
     /// load-bearing for the audit chain and the broker; running
@@ -56,7 +70,7 @@ pub enum DaemonError {
     /// state.
     #[error("identity init failed: {0}")]
     IdentityInitFailed(String),
-    /// implementation-note-122 (design §Component 2):
+    /// implementation-note-138 (design §Component 2):
     /// broker credentials are missing for a provider AND the provider is
     /// not in `EMBER_ALLOW_MOCK_BROKERS`. Silent fallback to `MockBroker`
     /// is the credential-isolation invariant violation this gates against
@@ -73,7 +87,7 @@ pub enum DaemonError {
          per project design notes)"
     )]
     BrokerCredsMissing { provider: &'static str },
-    /// implementation-note-290: the explicit bridge
+    /// implementation-note-319: the explicit bridge
     /// bootstrap path (design component 3) could not load or mint the
     /// Bridge CA. When the bridge lane is enabled, fail closed rather than
     /// starting with a missing CA or unreadable sibling cert.
@@ -97,6 +111,34 @@ enum VaultUnsealStatus {
     Fallback,
 }
 
+/// Startup action for providers that are optional on the operator/dev0 lane.
+/// GitHub stays load-bearing; every other provider may be:
+/// - registered as real when configured
+/// - registered as Mock when explicitly allow-listed
+/// - skipped when absent or currently malformed
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OptionalBrokerStartupAction {
+    RegisterReal,
+    RegisterMock,
+    Skip,
+}
+
+fn optional_broker_startup_action(
+    configured: &Result<bool, crate::broker::authority::BrokerAuthorityError>,
+    mock_opted_in: bool,
+) -> OptionalBrokerStartupAction {
+    match configured {
+        Ok(true) => OptionalBrokerStartupAction::RegisterReal,
+        Ok(false) | Err(_) => {
+            if mock_opted_in {
+                OptionalBrokerStartupAction::RegisterMock
+            } else {
+                OptionalBrokerStartupAction::Skip
+            }
+        }
+    }
+}
+
 /// The outcome of a dashboard TCP bind attempt. Sent to `run()`'s `start_notify`
 /// callback after the bind (or timeout) so the CLI can print the correct banner line.
 #[derive(Debug, Clone)]
@@ -111,7 +153,7 @@ pub enum DashboardBind {
     Timeout,
 }
 
-/// implementation-note-172: outcome of the git-echo credential-injection proxy bind.
+/// implementation-note-195: outcome of the git-echo credential-injection proxy bind.
 /// Mirrors `DashboardBind` semantics. Sent to `run()`'s `start_notify`
 /// callback so the CLI can print `EMBER_PROXY_URL=…` for qember.sh +
 /// ember-git.sh consumers.
@@ -127,7 +169,7 @@ pub enum GitProxyBind {
     Timeout,
 }
 
-/// implementation-note-173: outcome of the general LLM/HTTP credential-
+/// implementation-note-196: outcome of the general LLM/HTTP credential-
 /// injection proxy bind. Mirrors `GitProxyBind` semantics. The LLM proxy
 /// (`run_proxy` / `handle_request`) is what the Anthropic SDK demo path
 /// posts to; its bound URL is exposed via `EMBER_PROXY_URL` and the
@@ -147,12 +189,12 @@ pub enum LlmProxyBind {
 /// Aggregate bind report passed to `run()`'s `start_notify` callback. Carries
 /// every listener that may have raced to bind during startup so the CLI can
 /// render a consolidated banner. New listeners get a new field here rather
-/// than a parallel callback. implementation-note-172.
+/// than a parallel callback. implementation-note-195.
 #[derive(Debug, Clone)]
 pub struct StartupBinds {
     pub dashboard: DashboardBind,
     pub git_proxy: GitProxyBind,
-    /// implementation-note-173: bind outcome for the LLM proxy.
+    /// implementation-note-196: bind outcome for the LLM proxy.
     pub llm_proxy: LlmProxyBind,
     /// Daemon's Ed25519 signing-identity pubkey (64-hex). Empty string if
     /// identity initialisation failed at startup. Used by the CLI to render
@@ -160,7 +202,131 @@ pub struct StartupBinds {
     pub identity_pubkey: String,
 }
 
-/// implementation-note-191 — render a 64-hex Ed25519 pubkey as a
+/// emberd_sandbox_startup_probe (implementation-note-121).
+///
+/// Verifies the daemon is actually running under a kernel-level sandbox
+/// (seccomp on Linux, sandbox-exec on macOS) at startup. Designed to
+/// catch the silent-passthrough failure mode where the systemd unit
+/// (slice B) or LaunchDaemon plist (slice D) wiring is missing or
+/// misconfigured, leaving the daemon running un-sandboxed despite the
+/// profile JSON shipping (slice A) and `.sb` file (slice C) being
+/// present.
+///
+/// Detection paths:
+/// - Linux: read `/proc/self/status`, check the `Seccomp:` field.
+///   Value 2 = filter mode (the expected state under SystemCallFilter=),
+///   value 1 = strict mode, value 0 = no filter installed.
+/// - macOS: invoke `sandbox_check(getpid(), "default", 0)` via FFI to
+///   libsandbox.dylib (private but stable since macOS 10.7). Returns
+///   non-zero when the process is sandboxed.
+///
+/// Failure mode: emit a loud `WARN` log + best-effort one-shot startup
+/// event (audit-log path). Don't refuse to start by default — too risky
+/// on dev workstations where systemd/launchd aren't configured.
+/// Optional strict mode via env var `EMBER_REQUIRE_SANDBOX=1` refuses
+/// to start on detection failure (returns `Err(SandboxProbeFailure)`).
+///
+/// Returns:
+/// - `Ok(SandboxState::SeccompFilter)` — Linux daemon running under
+///   seccomp filter mode (expected state for production)
+/// - `Ok(SandboxState::SeccompStrict)` — Linux daemon under strict-mode
+///   seccomp (rare; not the SystemCallFilter= path but still sandboxed)
+/// - `Ok(SandboxState::MacosSandbox)` — macOS daemon running under
+///   sandbox-exec (expected state for production)
+/// - `Ok(SandboxState::Unsandboxed)` — no kernel sandbox active; logs
+///   a WARN with operator guidance
+/// - `Err(SandboxProbeFailure)` — strict mode enabled and not sandboxed
+pub fn check_sandbox_at_startup() -> Result<SandboxState, SandboxProbeFailure> {
+    let state = probe_sandbox_state();
+    if matches!(state, SandboxState::Unsandboxed) {
+        tracing::warn!(
+            "daemon is NOT running under a kernel sandbox; ensure systemd \
+             SystemCallFilter= (Linux) or LaunchDaemon sandbox-exec (macOS) \
+             is wired. Set EMBER_REQUIRE_SANDBOX=1 to refuse-on-detect. \
+             Per implementation-note-320."
+        );
+        if std::env::var("EMBER_REQUIRE_SANDBOX").is_ok_and(|v| v == "1") {
+            return Err(SandboxProbeFailure::StrictModeUnsandboxed);
+        }
+    } else {
+        tracing::info!(state = ?state, "sandbox startup probe — daemon is sandboxed");
+    }
+    Ok(state)
+}
+
+/// Outcome of the kernel-sandbox startup probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxState {
+    /// Linux: seccomp filter mode active (SystemCallFilter= or BPF program installed).
+    SeccompFilter,
+    /// Linux: strict-mode seccomp (only read/write/_exit/sigreturn allowed). Rare.
+    SeccompStrict,
+    /// macOS: sandbox-exec profile active.
+    MacosSandbox,
+    /// Neither sandbox primitive detected — daemon runs un-sandboxed.
+    Unsandboxed,
+}
+
+/// Returned when `EMBER_REQUIRE_SANDBOX=1` is set and the probe finds
+/// no kernel-level sandbox.
+#[derive(Debug, Error)]
+pub enum SandboxProbeFailure {
+    #[error(
+        "EMBER_REQUIRE_SANDBOX=1 set but no kernel sandbox detected at startup; \
+         wire systemd SystemCallFilter= (Linux) or LaunchDaemon sandbox-exec (macOS)"
+    )]
+    StrictModeUnsandboxed,
+}
+
+#[cfg(target_os = "linux")]
+fn probe_sandbox_state() -> SandboxState {
+    // /proc/self/status carries a `Seccomp:` line; value is 0/1/2 per
+    // <linux/seccomp.h>. Filter mode (2) is what SystemCallFilter= installs.
+    match std::fs::read_to_string("/proc/self/status") {
+        Ok(status) => {
+            for line in status.lines() {
+                if let Some(value) = line.strip_prefix("Seccomp:") {
+                    let trimmed = value.trim();
+                    return match trimmed {
+                        "2" => SandboxState::SeccompFilter,
+                        "1" => SandboxState::SeccompStrict,
+                        _ => SandboxState::Unsandboxed,
+                    };
+                }
+            }
+            SandboxState::Unsandboxed
+        }
+        Err(_) => SandboxState::Unsandboxed,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn probe_sandbox_state() -> SandboxState {
+    // sandbox_check() from libsandbox.dylib. Private API but stable since
+    // macOS 10.7 and used by Apple's own daemons. Returns non-zero when
+    // the process is sandboxed; we use the "default" operation as a
+    // generic probe.
+    unsafe extern "C" {
+        fn sandbox_check(pid: libc::pid_t, operation: *const libc::c_char, flags: u32) -> i32;
+    }
+    let op = c"default".as_ptr();
+    let pid = unsafe { libc::getpid() };
+    let rc = unsafe { sandbox_check(pid, op, 0) };
+    if rc != 0 {
+        SandboxState::MacosSandbox
+    } else {
+        SandboxState::Unsandboxed
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn probe_sandbox_state() -> SandboxState {
+    // No kernel-sandbox primitive on this platform (e.g. Windows targets).
+    // Return Unsandboxed so the WARN fires; strict mode then refuses.
+    SandboxState::Unsandboxed
+}
+
+/// implementation-note-216 — render a 64-hex Ed25519 pubkey as a
 /// short SSH-style fingerprint (`4a5d:a587:dd36:53b2`) using the first
 /// 8 bytes / 16 hex chars. The dashboard, the receipt detail page, and
 /// the demo teardown printout all use the same shape so a viewer can
@@ -229,7 +395,7 @@ pub fn authenticate_peer_creds(
 
 // ---------------------------------------------------------------------------
 // PeerCredPrincipal — kernel-attested per-call identity
-// (implementation-note-133, design + design §"Decision §2")
+// (implementation-note-149, design + design §"Decision §2")
 // ---------------------------------------------------------------------------
 
 /// Kernel-attested identity of the caller on the other end of a Unix
@@ -245,10 +411,10 @@ pub fn authenticate_peer_creds(
 ///   broker handlers: a caller whose kernel uid does not match the
 ///   persona's bound uid is refused with `-32004`.
 /// - `pid`         — pid-namespace-scoped peer pid. Diagnostics only:
-///   the bare PID is reuse-prone (see sibling implementation-note-135
+///   the bare PID is reuse-prone (see sibling implementation-note-155
 ///   for the pidfd-based reuse-immune surface).
 /// - `socket_path` — per-agent UDS path the connection accepted on.
-///   Per implementation-note-134 each agent gets its own socket;
+///   Per implementation-note-150 each agent gets its own socket;
 ///   the path is the cohesive identity binding the OS uid to a
 ///   specific persona. For Phase 1 (this task) the daemon's single
 ///   socket path is used uniformly.
@@ -261,7 +427,7 @@ pub fn authenticate_peer_creds(
 /// drop. Using `Arc` rather than `dup(2)`-on-clone keeps the fd count
 /// constant and avoids leaking fds across the per-RPC clone path.
 ///
-/// implementation-note-135.
+/// implementation-note-155.
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub struct PidFdOwner {
@@ -326,11 +492,11 @@ pub struct PeerCredPrincipal {
     /// consults the bound pidfd) over inspecting this field directly — the
     /// bare PID is reuse-prone, and the pidfd is the reuse-immune anchor.
     pub pid: i32,
-    /// Per-agent UDS socket path. Per implementation-note-134 each
+    /// Per-agent UDS socket path. Per implementation-note-150 each
     /// agent gets its own socket; for Phase 1 the daemon's single
     /// socket path is used uniformly.
     pub socket_path: PathBuf,
-    /// implementation-note-135 — pidfd opened at accept time against the
+    /// implementation-note-155 — pidfd opened at accept time against the
     /// peer's PID. `Some(_)` when `pidfd_open(2)` succeeded; `None` when
     /// the syscall is unavailable (pre-5.3 kernel) or the process exited
     /// between `accept()` and `pidfd_open()`. `Arc`-wrapped so the
@@ -361,12 +527,12 @@ impl PeerCredPrincipal {
     /// the per-agent socket path the connection landed on.
     ///
     /// `socket_path` is the listener path the connection accepted on
-    /// (per implementation-note-134) — passed in so the constructor
+    /// (per implementation-note-150) — passed in so the constructor
     /// is independent of the listener's address API which is not always
     /// usable on a connected stream.
     ///
     /// On Linux this also issues `pidfd_open(pid, 0)` to bind a
-    /// reuse-immune handle to the peer process (implementation-note-291-
+    /// reuse-immune handle to the peer process (implementation-note-321-
     /// BINDING). The pidfd is `None` on legacy kernels — broker handlers
     /// fall back to the bare-PID surface in that case.
     ///
@@ -455,7 +621,7 @@ impl PeerCredPrincipal {
     /// etc.). Tests that depend on pidfd behaviour should skip on a
     /// `None` return rather than panic.
     ///
-    /// implementation-note-135 — test seam so the dead-pid rejection
+    /// implementation-note-155 — test seam so the dead-pid rejection
     /// test can build a principal with a real pidfd against an already-
     /// exited child.
     #[cfg(target_os = "linux")]
@@ -653,7 +819,7 @@ pub struct DaemonRuntime {
     /// Path the config was loaded from — used for the vault identity warning in `run()`.
     /// `None` when config came from defaults (no file on disk).
     config_path: Option<std::path::PathBuf>,
-    /// implementation-note-188: actual address the dashboard
+    /// implementation-note-213: actual address the dashboard
     /// listener bound to (`Some(addr)`) or absent when the dashboard is
     /// disabled / failed to bind / timed out (`None`). Populated from inside
     /// `run()` after the bind result arrives. `Mutex` (not `RefCell`)
@@ -661,7 +827,7 @@ pub struct DaemonRuntime {
     /// the test harness reads it from a different thread than the one
     /// driving the daemon.
     pub dashboard_actual_addr: Mutex<Option<SocketAddr>>,
-    /// implementation-note-290: the SE-sealed Bridge
+    /// implementation-note-319: the SE-sealed Bridge
     /// CA (design component 3). `None` until an explicit bridge bootstrap
     /// path opens the vault and loads-or-mints the CA via
     /// [`load_or_mint_bridge_ca`]. Startup on the default local path now
@@ -707,10 +873,30 @@ impl DaemonRuntime {
         &self,
         start_notify: Option<Box<dyn FnOnce(StartupBinds)>>,
     ) -> Result<(), DaemonError> {
+        // keyring-core 1.0 split — the macOS Keychain backend lives in a
+        // separate crate (`apple-native-keyring-store`) and must be
+        // registered as the default store before any `keyring_core::Entry`
+        // call. The legacy `keyring` v3 crate auto-registered via its
+        // `apple-native` feature at link time; v1+ requires explicit
+        // registration. Idempotent: re-registering replaces the previous
+        // store. Failures are logged + warn; subsequent Entry::new() calls
+        // outside the EMBER_VAULT_MOCK three-axis gate will return
+        // NoDefaultStore.
+        #[cfg(target_os = "macos")]
+        {
+            match apple_native_keyring_store::keychain::Store::new() {
+                Ok(store) => keyring_core::set_default_store(store),
+                Err(e) => tracing::warn!(
+                    error = ?e,
+                    "keyring-core: failed to register apple-native-keyring-store at daemon startup"
+                ),
+            }
+        }
+
         self.config.ensure_dirs()?;
         self.pid_file.write()?;
 
-        // implementation-note-173 fix: install the rustls process-wide
+        // implementation-note-196 fix: install the rustls process-wide
         // CryptoProvider once at daemon startup. Both the LLM proxy
         // (`run_proxy`) and the git-echo proxy (`run_git_echo_proxy`) call
         // `HttpsConnectorBuilder::with_webpki_roots()` which panics on the
@@ -722,11 +908,11 @@ impl DaemonRuntime {
         // Err if already installed, which we ignore.
         let _ = rustls::crypto::ring::default_provider().install_default();
 
-        let socket_path = self.config.socket_dir.join("daemon.sock");
+        let socket_path = daemon_socket_path(&self.config);
         info!(pid = std::process::id(), socket = %socket_path.display(), "ember daemon starting");
         // CLI-VERSION-FLAG: log the binary's compile-time version + git SHA +
         // build timestamp at INFO so a stale binary running against a newer
-        // codebase (the implementation-note-101 root cause) is
+        // codebase (the implementation-note-116 root cause) is
         // identifiable in seconds via `tail daemon.log`. Also surfaces the
         // `(no-git)` fallback if the build script ran without a working repo.
         info!(
@@ -763,7 +949,7 @@ impl DaemonRuntime {
                  filtering is still partial; some persona-keyed reads now principal-scope or \
                  fail closed and OperatorPresence methods now fail closed without a \
                  presence-token, but the broader ConnectOnly surface is not yet uniformly \
-                 filtered by peer.uid. See implementation-note-171; the \
+                 filtered by peer.uid. See implementation-note-194; the \
                  historical-revision file-ACL accept path is dev0-correct and team0-incomplete."
             );
         }
@@ -795,91 +981,145 @@ impl DaemonRuntime {
         let db_path = self.config.data_dir.join("daemon.db");
         let store = Rc::new(DaemonStore::open(&db_path)?);
 
-        // implementation-note-292 —
-        // pre-verifier recovery pass. A chain row whose `prev_hash` is
-        // NULL but whose `row_hash` is set (and which is not the genesis
-        // anchor) is the half-write signature: the row was committed but
-        // its prev_hash lookup landed on a legacy `log_event` row with a
-        // NULL `row_hash`. The verifier would otherwise emit a
-        // false-positive `VerifyOutcome::Break` after a clean
-        // bootout+bootstrap. Truncating the half-written tail row is
-        // strictly latest-row-only — a non-NULL but wrong `prev_hash`
-        // mid-chain (a real attacker rewrite) is unaffected and remains
-        // a tamper. See `DaemonStore::recover_audit_chain_tail` for the
-        // detailed signature contract.
-        match store.recover_audit_chain_tail() {
-            Ok(crate::infra::store::AuditChainTailRecovery::NoOp) => {}
-            Ok(crate::infra::store::AuditChainTailRecovery::Truncated { id, action }) => {
-                tracing::warn!(
-                    truncated_row_id = id,
-                    truncated_row_action = %action,
-                    "implementation-note-292: \
-                     audit-chain tail recovery truncated a half-written row \
-                     (NULL prev_hash on chained-row tail) before startup verify"
-                );
-            }
-            Err(e) => {
-                // Recovery is best-effort; a SQL failure here is not
-                // grounds to refuse startup. The verifier still runs
-                // and will either pass or surface a real break.
-                tracing::warn!(
-                    error = %e,
-                    "implementation-note-292: \
-                     audit-chain tail recovery failed; continuing to verifier"
-                );
-            }
-        }
+        // audit_chain_v2_schema_landed — the pre-verifier `recover_audit_
+        // chain_tail` call was DELETED per R4 / pass-2 finding #3. The
+        // CHECK constraint on `audit_log` (`segment_id = 0 OR action =
+        // genesis OR (row_hash IS NOT NULL AND prev_hash IS NOT NULL)`)
+        // structurally precludes the half-write input that primitive was
+        // designed to clean up. Keeping it around shipped dead-code-with-
+        // live-tests; the v2 redesign removes it cleanly.
 
-        // implementation-note-230 (D): startup sampling verify.
-        // Walk the last 1000 rows of the audit chain. On Break, flip the
-        // process-global quarantine latch and refuse to enter normal-serve.
-        // The quarantine latch causes every write-class socket method to
-        // return a `Quarantined` error while read-class methods (audit
-        // queries, ping, health) still proceed — operators can diagnose
-        // without extending the tampered chain.
-        //
-        // A verifier-internal error (SQL failure, empty DB before migration
-        // landed) is NOT a chain break — log a warning and continue. The
-        // verifier only quarantines on a confirmed `VerifyOutcome::Break`.
+        // implementation-note-255 + audit_verifier_outcome_v2:
+        // startup verify. Walk the last 1000 rows of the audit chain (the
+        // verifier-startup-cadence task implementation-note-322-
+        // CADENCE will upgrade this to full-walk-if-N<100k in Phase B).
+        // On Break / TopologyViolation / IncompleteRepair*, flip the
+        // process-global quarantine latch under a distinct authority
+        // class so the operator-facing diagnostic can branch on cause.
+        // LegacyRowsPresent is NOT a quarantine — it's the post-cordon
+        // expected state (segment 0 carries the legacy NULL block).
         match crate::infra::audit::run_audit_verify(store.conn(), Some(1000)) {
-            Ok(crate::infra::audit::VerifyOutcome::Ok { rows_walked }) => {
+            Ok(crate::infra::audit::VerifyOutcome::Ok {
+                rows_walked,
+                segments_walked,
+                ..
+            }) => {
                 tracing::info!(
                     rows_walked,
-                    "implementation-note-230: audit chain startup sample verify ok"
+                    segments_walked,
+                    "implementation-note-255: audit chain startup sample verify ok"
                 );
             }
-            Ok(crate::infra::audit::VerifyOutcome::Break {
+            Ok(crate::infra::audit::VerifyOutcome::LegacyRowsPresent {
+                count,
+                max_legacy_id,
+                chain_resumes_at_id,
+            }) => {
+                // Phase-2 attestation pending — NOT a quarantine. The
+                // operator can clear this by running `ember audit
+                // migrate-chain --acknowledge` to mint the Phase 2
+                // attested receipt (the cordon migration's
+                // `_attested` companion to `_unattested`).
+                tracing::warn!(
+                    legacy_rows = count,
+                    max_legacy_id,
+                    chain_resumes_at_id,
+                    "implementation-note-255: legacy NULL-hash block present \
+                     in segment 0 (post-cordon expected state); Phase 2 attestation pending"
+                );
+            }
+            Ok(crate::infra::audit::VerifyOutcome::Break { kind }) => {
+                let reason = match &kind {
+                    crate::infra::audit::BreakKind::RowHashMismatch {
+                        at_row_id,
+                        expected_hash,
+                        stored_hash,
+                        rows_walked_before,
+                    } => format!(
+                        "audit chain RowHashMismatch at row {at_row_id} \
+                         (walked {rows_walked_before} before): expected {expected_hash}, stored {stored_hash}"
+                    ),
+                    crate::infra::audit::BreakKind::ForwardLinkMismatch {
+                        at_row_id,
+                        predecessor_row_id,
+                        expected_prev_hash,
+                        stored_prev_hash,
+                        rows_walked_before,
+                    } => format!(
+                        "audit chain ForwardLinkMismatch at row {at_row_id} \
+                         (predecessor row {predecessor_row_id}, walked {rows_walked_before} before): \
+                         expected prev_hash {expected_prev_hash}, stored {stored_prev_hash:?}"
+                    ),
+                };
+                tracing::error!(
+                    reason = %reason,
+                    "implementation-note-255: audit-chain TAMPER DETECTED at startup; \
+                     entering quarantine, binding socket, and refusing non-read-class methods"
+                );
+                crate::infra::handler::enter_quarantine(
+                    crate::infra::handler::QuarantineAuthority::StartupAuditChainBreak,
+                    reason,
+                );
+            }
+            Ok(crate::infra::audit::VerifyOutcome::ChainTopologyInvariantViolation {
+                kind,
                 at_row_id,
-                expected_hash,
-                stored_hash,
                 rows_walked_before,
             }) => {
                 let reason = format!(
-                    "audit chain break at row {at_row_id} (walked {rows_walked_before} before): \
-                     expected {expected_hash}, stored {stored_hash:?}"
+                    "audit chain topology violation {kind:?} at row {at_row_id} \
+                     (walked {rows_walked_before} before)"
                 );
                 tracing::error!(
+                    ?kind,
                     at_row_id,
-                    expected_hash = %expected_hash,
-                    ?stored_hash,
                     rows_walked_before,
-                    "implementation-note-230: audit-chain TAMPER DETECTED at startup; \
-                     entering quarantine and refusing normal-serve"
+                    "implementation-note-255: audit-chain TOPOLOGY VIOLATION at startup"
                 );
-                crate::infra::handler::enter_quarantine(reason.clone());
-                return Err(DaemonError::AuditChainBreak(reason));
+                crate::infra::handler::enter_quarantine(
+                    crate::infra::handler::QuarantineAuthority::TopologyViolation,
+                    reason,
+                );
+            }
+            Ok(crate::infra::audit::VerifyOutcome::IncompleteRepair { receipt_id_orphan }) => {
+                let reason = format!(
+                    "audit chain IncompleteRepair: receipt {receipt_id_orphan} \
+                     was minted but the tombstone row never committed"
+                );
+                tracing::error!(
+                    %receipt_id_orphan,
+                    "implementation-note-255: audit-chain INCOMPLETE REPAIR at startup"
+                );
+                crate::infra::handler::enter_quarantine(
+                    crate::infra::handler::QuarantineAuthority::IncompleteRepair,
+                    reason,
+                );
+            }
+            Ok(crate::infra::audit::VerifyOutcome::IncompleteRepairReceipt { tombstone_row_id }) => {
+                let reason = format!(
+                    "audit chain IncompleteRepairReceipt: tombstone row {tombstone_row_id} \
+                     committed but the repair receipt was never minted"
+                );
+                tracing::error!(
+                    tombstone_row_id,
+                    "implementation-note-255: audit-chain INCOMPLETE REPAIR RECEIPT at startup"
+                );
+                crate::infra::handler::enter_quarantine(
+                    crate::infra::handler::QuarantineAuthority::IncompleteRepairReceipt,
+                    reason,
+                );
             }
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "implementation-note-230: audit chain startup verify could not \
+                    "implementation-note-255: audit chain startup verify could not \
                      run (pre-migration DB or SQL failure); skipping (NOT entering quarantine)"
                 );
             }
         }
 
         // PATH-PINNING-STARTUP-VERIFY: daemon refuses startup on manifest sig mismatch.
-        // implementation-note-106: the loaded
+        // implementation-note-122: the loaded
         // manifest is also installed into the process-global
         // `broker::handler::MANIFEST` so every per-connection broker
         // handler can verify the peer binary against it without
@@ -895,7 +1135,7 @@ impl DaemonRuntime {
                 // design §Component 1 — trust-root SET verification.
                 //
                 // Replaces the previous `dev_mode_enabled()` bypass branch
-                // (implementation-note-293, commit historical_revision).
+                // (implementation-note-323, commit historical_revision).
                 // The verifier ALWAYS runs; what differs between dev and
                 // prod daemons is the SET of acceptable signers,
                 // parameterized via `EMBER_TRUST_ROOTS` (parsed in
@@ -988,11 +1228,11 @@ impl DaemonRuntime {
                 // non-release root is in the trust set (i.e. the
                 // operator added an additional signer via
                 // `EMBER_TRUST_ROOTS`). The Receipt-body wiring lives in
-                // implementation-note-294; this call site
+                // implementation-note-324; this call site
                 // is the canonical input.
                 crate::binary_manifest::set_dev_mode_active(n_user_roots > 0);
 
-                // design §Component 2 / implementation-note-295.
+                // design §Component 2 / implementation-note-325.
                 // Capture the trust-root set as a structured snapshot
                 // so `trust.list` (and future `trust.show` /
                 // `trust.explain`) can answer "what is this daemon
@@ -1064,7 +1304,7 @@ impl DaemonRuntime {
         // consumer of a direct bootstrap handle.
         let live_vault_slot = store.vault_slot();
 
-        // implementation-note-27 C2: register the store with the
+        // implementation-note-33 C2: register the store with the
         // presence module so an explicit `vault_lock` RPC clears the
         // shared live-vault slot (hard-lock semantics — main local
         // helper lanes lose live vault access). Idle auto-lock keeps the
@@ -1088,7 +1328,7 @@ impl DaemonRuntime {
                     fingerprint = %fingerprint,
                     "daemon identity key loaded"
                 );
-                // implementation-note-191 — emit a structured
+                // implementation-note-216 — emit a structured
                 // operator-facing log line that the demo teardown
                 // script (and any future tooling) can grep without
                 // re-deriving the fingerprint or hitting an HTTP
@@ -1104,7 +1344,7 @@ impl DaemonRuntime {
                 );
             }
             Err(e) => {
-                // implementation-note-230 (E) / F-S5-013 HIGH:
+                // implementation-note-255 (E) / F-S5-013 HIGH:
                 // fail-closed at startup. Receipts are load-bearing for
                 // the audit chain (signed evidence) and the broker
                 // (credential-access proof); a daemon that boots without
@@ -1112,7 +1352,7 @@ impl DaemonRuntime {
                 // downstream can verify. Refuse to enter normal-serve.
                 tracing::error!(
                     error = %e,
-                    "implementation-note-230 (F-S5-013): daemon identity key \
+                    "implementation-note-255 (F-S5-013): daemon identity key \
                      unavailable; refusing startup (fail-closed)"
                 );
                 return Err(DaemonError::IdentityInitFailed(e.to_string()));
@@ -1146,7 +1386,7 @@ impl DaemonRuntime {
         }
 
         if let Some(bridge_bind) = self.config.bridge_bind {
-            // implementation-note-296: auto-unseal the vault from the system keyring. The
+            // implementation-note-326: auto-unseal the vault from the system keyring. The
             // helper's contract: it succeeds only if a keyring entry already
             // exists (or `EMBER_VAULT_PASSPHRASE` is set) — never
             // auto-provisions on daemon start so a wiped keyring can't
@@ -1156,8 +1396,54 @@ impl DaemonRuntime {
             let (vault, vault_status) = match try_bootstrap_auto_unseal_from_keyring(&self.config) {
                 AutoUnsealOutcome::Unsealed(v) => (Rc::new(v), VaultUnsealStatus::FromKeyring),
                 AutoUnsealOutcome::NoKeyringEntry => {
+                    // mek_missing_with_state_refuses_start
+                    // (implementation-note-327).
+                    //
+                    // Without this guard, the daemon would silently
+                    // re-provision a FRESH MEK on top of pre-existing
+                    // encrypted state — destroying every prior vault row,
+                    // persona key, and grant. The 2026-05-14 SCION-demo-prep
+                    // incident was this exact shape: keychain regen left
+                    // daemon.db intact but unrecoverable because the new
+                    // MEK couldn't decrypt rows sealed under the old one.
+                    //
+                    // Detection: query the store for state-bearing rows
+                    // (personas, grants, receipts, credentials). If any
+                    // exist, REFUSE TO START with a structured diagnostic
+                    // pointing at the recovery path. If empty, the
+                    // historical first-run path is safe to take.
+                    match store.has_state_bearing_rows() {
+                        Ok(true) => {
+                            tracing::error!(
+                                "vault: MEK absent from keychain but daemon.db has state-bearing rows; \
+                                 REFUSING TO START to prevent silent re-provision (would destroy vault data). \
+                                 Run `ember daemon recover-fresh --archive-to <path>` (implementation-note-328) \
+                                 OR `ember vault import --sealed --recovery-passphrase` \
+                                 (implementation-note-329) when those CLIs ship. \
+                                 Today, archive ~/.ember/data/ manually and re-init."
+                            );
+                            return Err(DaemonError::Vault(
+                                "MEK-missing-with-state refusal: daemon.db has rows but keychain has no MEK; \
+                                 refusing silent re-provision per implementation-note-330".to_string(),
+                            ));
+                        }
+                        Ok(false) => {
+                            // State-empty — historical first-run path is safe.
+                        }
+                        Err(e) => {
+                            // Probe failed; fail open with a WARN so the
+                            // daemon can still start in legitimate
+                            // first-run scenarios where the tables don't
+                            // yet exist. The next-startup state will be
+                            // probable-able.
+                            tracing::warn!(
+                                error = %e,
+                                "vault: has_state_bearing_rows probe failed; proceeding to first-run path"
+                            );
+                        }
+                    }
                     tracing::info!(
-                        "vault: no keyring entry yet — falling back to open_from_config (will provision on first call)"
+                        "vault: no keyring entry yet AND no state-bearing rows — falling back to open_from_config (first-run provision)"
                     );
                     let v = Vault::open_bootstrap_from_config(&self.config)
                         .map_err(|e| DaemonError::Vault(e.to_string()))?;
@@ -1178,7 +1464,7 @@ impl DaemonRuntime {
             };
             log_vault_identity(&self.config, self.config_path.as_deref());
 
-            // implementation-note-296: emit an audit event for the explicit bridge bootstrap
+            // implementation-note-326: emit an audit event for the explicit bridge bootstrap
             // open so operators running `audit show` see exactly when (and
             // how) the vault came online before serve. Failures here are
             // non-fatal — the audit log is for observability, not correctness.
@@ -1202,7 +1488,7 @@ impl DaemonRuntime {
                 );
             }
 
-            // bridge_ca_startup_wired — implementation-note-290.
+            // bridge_ca_startup_wired — implementation-note-319.
             // Explicit bridge bootstrap still load-or-mints the SE-sealed
             // Bridge CA (design component 3). Stores the sealed signing key +
             // a sealed module wrapping key (vault-wrapped) under `<data_dir>`;
@@ -1228,7 +1514,7 @@ impl DaemonRuntime {
             }
             store.set_bridge_ca_fingerprint(bridge_ca.fingerprint());
 
-            // implementation-note-98 — mint the ember-rpc
+            // implementation-note-112 — mint the ember-rpc
             // sibling's TLS server cert + key at startup, but only when the
             // operator has explicitly enabled the bridge lane.
             if let Err(e) = mint_or_rotate_ember_rpc_server_cert(
@@ -1246,7 +1532,7 @@ impl DaemonRuntime {
             );
         }
 
-        // implementation-note-297 (design sub-piece D): construct the
+        // implementation-note-331 (design sub-piece D): construct the
         // pluggable `CredentialStore` trait object from the
         // `[credential_store]` config section. Defaults to the
         // `LocalEncryptedStore` (which adapts the existing Vault) when
@@ -1323,7 +1609,7 @@ impl DaemonRuntime {
                         }
                     }
                     "aws" => {
-                        // implementation-note-92: AWS IAM auth.
+                        // implementation-note-106: AWS IAM auth.
                         // Daemon proves its surrounding AWS IAM
                         // identity (env vars / instance metadata
                         // / IRSA / ECS task role / Fargate) via a
@@ -1339,7 +1625,7 @@ impl DaemonRuntime {
                         HashiVaultAuth::Aws { role }
                     }
                     "hcp-service-principal" => {
-                        // implementation-note-176: HashiCorp Cloud
+                        // implementation-note-199: HashiCorp Cloud
                         // Platform service-principal auth. Exchange
                         // (client_id, client_secret) at HCP IdP's
                         // OAuth2 client_credentials endpoint for an
@@ -1441,21 +1727,27 @@ impl DaemonRuntime {
         let runtime_cred_store: Arc<dyn crate::infra::credential_store::CredentialStore> =
             Arc::clone(&cred_store);
 
-        // implementation-note-117 (design Phase 2): install the credential
+        // implementation-note-133 (design Phase 2): install the credential
         // broker registry. Real provider implementations replace
         // `MockBroker` as their downstream tasks ship — currently the
-        // GitHub App broker is wired (T-CONSTRUCT-DAEMON-GH-implementation-note-298);
+        // GitHub App broker is wired (T-CONSTRUCT-DAEMON-GH-implementation-note-332);
         // Anthropic and Cloudflare follow. Calling `install_registry`
         // multiple times is a no-op after the first call (`OnceCell`).
         //
-        // implementation-note-122 (design §Component 2):
+        // implementation-note-138 (design §Component 2):
         // MockBroker registration is now an explicit opt-in via
-        // `EMBER_ALLOW_MOCK_BROKERS`. Missing real-broker creds for a
-        // provider NOT in the allowlist FAIL daemon startup with
-        // `DaemonError::BrokerCredsMissing`. Each Mock registration logs
-        // INFO ("opted in via EMBER_ALLOW_MOCK_BROKERS") instead of the
-        // old WARN-fallback shape. Anchor:
-        // `dev_prod_parity_mock_broker_explicit_landed`.
+        // `EMBER_ALLOW_MOCK_BROKERS`.
+        //
+        // v0.3 operator/dev0 startup policy:
+        // - GitHub remains load-bearing and fails startup when absent.
+        // - Other providers are optional: register real when configured,
+        //   register Mock only when explicitly allow-listed, otherwise
+        //   skip them without killing the daemon.
+        //
+        // This keeps the GitHub-friendly drop honest while avoiding
+        // unrelated provider absence (for example `aws_sts`) taking down
+        // the managed daemon on a host that is not using those lanes.
+        // Anchor: `dev_prod_parity_mock_broker_explicit_landed`.
         {
             use crate::broker::authority::{
                 BrokerAuthorityResolver, CredentialPrecedence, ReloadingBroker, StartupProbeMode,
@@ -1463,7 +1755,7 @@ impl DaemonRuntime {
             use core_broker::{BrokerProvider, MockBroker};
             let mut registry = crate::broker::handler::BrokerRegistry::new();
 
-            // implementation-note-122: read the
+            // implementation-note-138: read the
             // opt-in allowlist once at the top of the registration
             // block so every per-provider gate uses the same parsed
             // set. Unknown tokens get surfaced as a structured WARN
@@ -1489,7 +1781,7 @@ impl DaemonRuntime {
                 );
             }
 
-            // implementation-note-116: precedence-flag for the
+            // implementation-note-132: precedence-flag for the
             // file/vault lookup order in each provider block below.
             //
             // - `EMBER_VAULT_FIRST=1` → vault-first (try the
@@ -1512,6 +1804,7 @@ impl DaemonRuntime {
                 Arc::clone(&runtime_cred_store),
                 precedence,
             ));
+            BrokerAuthorityResolver::install_current(Arc::clone(&runtime_resolver));
             let startup_probe_mode = match &self.config.credential_store {
                 None => StartupProbeMode::MetadataOnly,
                 Some(cs) if cs.backend == "local" => StartupProbeMode::MetadataOnly,
@@ -1532,7 +1825,7 @@ impl DaemonRuntime {
             // exist; MockBroker fallback otherwise so dev hosts without
             // GH App config still answer broker_issue without a panic.
             //
-            // implementation-note-297 + implementation-note-116:
+            // implementation-note-331 + implementation-note-132:
             // try the higher-priority lane first (per `vault_first`),
             // fall back to the other lane so operators who haven't
             // migrated keep working.
@@ -1550,7 +1843,7 @@ impl DaemonRuntime {
                         "broker registered: ReloadingBroker (GH App config detected at startup; reloads from runtime seam)"
                     );
                 }
-                // implementation-note-122: missing or
+                // implementation-note-138: missing or
                 // malformed creds — Mock only if explicitly allow-listed,
                 // else fail-loud.
                 creds_outcome => {
@@ -1587,13 +1880,16 @@ impl DaemonRuntime {
             // MockBroker fallback otherwise so dev hosts without AWS
             // config still answer broker_issue without a panic.
             //
-            // implementation-note-297 + implementation-note-116:
+            // implementation-note-331 + implementation-note-132:
             // honor `vault_first` precedence.
-            match runtime_resolver
+            let aws_sts_probe = runtime_resolver
                 .startup_configured(BrokerProvider::AwsSts, startup_probe_mode)
-                .await
-            {
-                Ok(true) => {
+                .await;
+            match optional_broker_startup_action(
+                &aws_sts_probe,
+                mock_allow.contains(&BrokerProvider::AwsSts),
+            ) {
+                OptionalBrokerStartupAction::RegisterReal => {
                     registry.register(Box::new(ReloadingBroker::new(
                         BrokerProvider::AwsSts,
                         Arc::clone(&runtime_resolver),
@@ -1603,25 +1899,34 @@ impl DaemonRuntime {
                         "broker registered: ReloadingBroker (AWS STS config detected at startup; reloads from runtime seam)"
                     );
                 }
-                _ => {
-                    if mock_allow.contains(&BrokerProvider::AwsSts) {
+                OptionalBrokerStartupAction::RegisterMock => {
+                    if let Err(e) = aws_sts_probe {
+                        info!(
+                            provider = "aws_sts",
+                            error = %e,
+                            "mock broker registered: aws_sts (opted in via EMBER_ALLOW_MOCK_BROKERS; \
+                             startup config probe failed)"
+                        );
+                    } else {
                         registry.register_mock(Box::new(MockBroker::new(BrokerProvider::AwsSts)));
                         info!(
                             provider = "aws_sts",
                             "mock broker registered: aws_sts (opted in via EMBER_ALLOW_MOCK_BROKERS)"
                         );
-                    } else {
-                        tracing::error!(
-                            provider = "aws_sts",
-                            env = crate::broker::mock_allowlist::ALLOW_MOCK_BROKERS_ENV,
-                            "broker creds missing for aws_sts and 'aws_sts' not in EMBER_ALLOW_MOCK_BROKERS; \
-                             refusing silent MockBroker fallback (design §Component 2)"
-                        );
-                        return Err(DaemonError::BrokerCredsMissing {
-                            provider: "aws_sts",
-                        });
                     }
                 }
+                OptionalBrokerStartupAction::Skip => match aws_sts_probe {
+                    Ok(false) => info!(
+                        provider = "aws_sts",
+                        "broker not configured at startup; skipping optional provider"
+                    ),
+                    Err(e) => tracing::warn!(
+                        provider = "aws_sts",
+                        error = %e,
+                        "broker startup probe failed; skipping optional provider until config is repaired"
+                    ),
+                    Ok(true) => unreachable!("real provider handled above"),
+                },
             }
 
             // GCP: real broker when ~/.config/emberlink/gcp.env points
@@ -1629,13 +1934,16 @@ impl DaemonRuntime {
             // MockBroker fallback otherwise so dev hosts without GCP
             // config still answer broker_issue without a panic.
             //
-            // implementation-note-297 + implementation-note-116:
+            // implementation-note-331 + implementation-note-132:
             // honor `vault_first` precedence.
-            match runtime_resolver
+            let gcp_probe = runtime_resolver
                 .startup_configured(BrokerProvider::Gcp, startup_probe_mode)
-                .await
-            {
-                Ok(true) => {
+                .await;
+            match optional_broker_startup_action(
+                &gcp_probe,
+                mock_allow.contains(&BrokerProvider::Gcp),
+            ) {
+                OptionalBrokerStartupAction::RegisterReal => {
                     registry.register(Box::new(ReloadingBroker::new(
                         BrokerProvider::Gcp,
                         Arc::clone(&runtime_resolver),
@@ -1645,23 +1953,34 @@ impl DaemonRuntime {
                         "broker registered: ReloadingBroker (GCP config detected at startup; reloads from runtime seam)"
                     );
                 }
-                _ => {
-                    if mock_allow.contains(&BrokerProvider::Gcp) {
+                OptionalBrokerStartupAction::RegisterMock => {
+                    if let Err(e) = gcp_probe {
+                        info!(
+                            provider = "gcp",
+                            error = %e,
+                            "mock broker registered: gcp (opted in via EMBER_ALLOW_MOCK_BROKERS; \
+                             startup config probe failed)"
+                        );
+                    } else {
                         registry.register_mock(Box::new(MockBroker::new(BrokerProvider::Gcp)));
                         info!(
                             provider = "gcp",
                             "mock broker registered: gcp (opted in via EMBER_ALLOW_MOCK_BROKERS)"
                         );
-                    } else {
-                        tracing::error!(
-                            provider = "gcp",
-                            env = crate::broker::mock_allowlist::ALLOW_MOCK_BROKERS_ENV,
-                            "broker creds missing for gcp and 'gcp' not in EMBER_ALLOW_MOCK_BROKERS; \
-                             refusing silent MockBroker fallback (design §Component 2)"
-                        );
-                        return Err(DaemonError::BrokerCredsMissing { provider: "gcp" });
                     }
                 }
+                OptionalBrokerStartupAction::Skip => match gcp_probe {
+                    Ok(false) => info!(
+                        provider = "gcp",
+                        "broker not configured at startup; skipping optional provider"
+                    ),
+                    Err(e) => tracing::warn!(
+                        provider = "gcp",
+                        error = %e,
+                        "broker startup probe failed; skipping optional provider until config is repaired"
+                    ),
+                    Ok(true) => unreachable!("real provider handled above"),
+                },
             }
 
             // Azure: real broker when ~/.config/emberlink/azure.env
@@ -1670,13 +1989,16 @@ impl DaemonRuntime {
             // so dev hosts without Azure config still answer
             // broker_issue without a panic.
             //
-            // implementation-note-297 + implementation-note-116:
+            // implementation-note-331 + implementation-note-132:
             // honor `vault_first` precedence.
-            match runtime_resolver
+            let azure_probe = runtime_resolver
                 .startup_configured(BrokerProvider::AzureCli, startup_probe_mode)
-                .await
-            {
-                Ok(true) => {
+                .await;
+            match optional_broker_startup_action(
+                &azure_probe,
+                mock_allow.contains(&BrokerProvider::AzureCli),
+            ) {
+                OptionalBrokerStartupAction::RegisterReal => {
                     registry.register(Box::new(ReloadingBroker::new(
                         BrokerProvider::AzureCli,
                         Arc::clone(&runtime_resolver),
@@ -1686,25 +2008,34 @@ impl DaemonRuntime {
                         "broker registered: ReloadingBroker (Azure config detected at startup; reloads from runtime seam)"
                     );
                 }
-                _ => {
-                    if mock_allow.contains(&BrokerProvider::AzureCli) {
+                OptionalBrokerStartupAction::RegisterMock => {
+                    if let Err(e) = azure_probe {
+                        info!(
+                            provider = "azure_cli",
+                            error = %e,
+                            "mock broker registered: azure_cli (opted in via EMBER_ALLOW_MOCK_BROKERS; \
+                             startup config probe failed)"
+                        );
+                    } else {
                         registry.register_mock(Box::new(MockBroker::new(BrokerProvider::AzureCli)));
                         info!(
                             provider = "azure_cli",
                             "mock broker registered: azure_cli (opted in via EMBER_ALLOW_MOCK_BROKERS)"
                         );
-                    } else {
-                        tracing::error!(
-                            provider = "azure_cli",
-                            env = crate::broker::mock_allowlist::ALLOW_MOCK_BROKERS_ENV,
-                            "broker creds missing for azure_cli and 'azure_cli' not in EMBER_ALLOW_MOCK_BROKERS; \
-                             refusing silent MockBroker fallback (design §Component 2)"
-                        );
-                        return Err(DaemonError::BrokerCredsMissing {
-                            provider: "azure_cli",
-                        });
                     }
                 }
+                OptionalBrokerStartupAction::Skip => match azure_probe {
+                    Ok(false) => info!(
+                        provider = "azure_cli",
+                        "broker not configured at startup; skipping optional provider"
+                    ),
+                    Err(e) => tracing::warn!(
+                        provider = "azure_cli",
+                        error = %e,
+                        "broker startup probe failed; skipping optional provider until config is repaired"
+                    ),
+                    Ok(true) => unreachable!("real provider handled above"),
+                },
             }
 
             // Fly.io: real broker when ~/.config/emberlink/fly.env
@@ -1712,13 +2043,16 @@ impl DaemonRuntime {
             // dev hosts without Fly config still answer broker_issue
             // without a panic.
             //
-            // implementation-note-297 + implementation-note-116:
+            // implementation-note-331 + implementation-note-132:
             // honor `vault_first` precedence.
-            match runtime_resolver
+            let fly_probe = runtime_resolver
                 .startup_configured(BrokerProvider::FlyIo, startup_probe_mode)
-                .await
-            {
-                Ok(true) => {
+                .await;
+            match optional_broker_startup_action(
+                &fly_probe,
+                mock_allow.contains(&BrokerProvider::FlyIo),
+            ) {
+                OptionalBrokerStartupAction::RegisterReal => {
                     registry.register(Box::new(ReloadingBroker::new(
                         BrokerProvider::FlyIo,
                         Arc::clone(&runtime_resolver),
@@ -1728,23 +2062,34 @@ impl DaemonRuntime {
                         "broker registered: ReloadingBroker (Fly config detected at startup; reloads from runtime seam)"
                     );
                 }
-                _ => {
-                    if mock_allow.contains(&BrokerProvider::FlyIo) {
+                OptionalBrokerStartupAction::RegisterMock => {
+                    if let Err(e) = fly_probe {
+                        info!(
+                            provider = "fly_io",
+                            error = %e,
+                            "mock broker registered: fly_io (opted in via EMBER_ALLOW_MOCK_BROKERS; \
+                             startup config probe failed)"
+                        );
+                    } else {
                         registry.register_mock(Box::new(MockBroker::new(BrokerProvider::FlyIo)));
                         info!(
                             provider = "fly_io",
                             "mock broker registered: fly_io (opted in via EMBER_ALLOW_MOCK_BROKERS)"
                         );
-                    } else {
-                        tracing::error!(
-                            provider = "fly_io",
-                            env = crate::broker::mock_allowlist::ALLOW_MOCK_BROKERS_ENV,
-                            "broker creds missing for fly_io and 'fly_io' not in EMBER_ALLOW_MOCK_BROKERS; \
-                             refusing silent MockBroker fallback (design §Component 2)"
-                        );
-                        return Err(DaemonError::BrokerCredsMissing { provider: "fly_io" });
                     }
                 }
+                OptionalBrokerStartupAction::Skip => match fly_probe {
+                    Ok(false) => info!(
+                        provider = "fly_io",
+                        "broker not configured at startup; skipping optional provider"
+                    ),
+                    Err(e) => tracing::warn!(
+                        provider = "fly_io",
+                        error = %e,
+                        "broker startup probe failed; skipping optional provider until config is repaired"
+                    ),
+                    Ok(true) => unreachable!("real provider handled above"),
+                },
             }
 
             // HashiCorp Vault: real broker when
@@ -1753,13 +2098,16 @@ impl DaemonRuntime {
             // without Vault config still answer broker_issue without a
             // panic.
             //
-            // implementation-note-297 + implementation-note-116:
+            // implementation-note-331 + implementation-note-132:
             // honor `vault_first` precedence.
-            match runtime_resolver
+            let hashi_probe = runtime_resolver
                 .startup_configured(BrokerProvider::HashiVault, startup_probe_mode)
-                .await
-            {
-                Ok(true) => {
+                .await;
+            match optional_broker_startup_action(
+                &hashi_probe,
+                mock_allow.contains(&BrokerProvider::HashiVault),
+            ) {
+                OptionalBrokerStartupAction::RegisterReal => {
                     registry.register(Box::new(ReloadingBroker::new(
                         BrokerProvider::HashiVault,
                         Arc::clone(&runtime_resolver),
@@ -1769,26 +2117,35 @@ impl DaemonRuntime {
                         "broker registered: ReloadingBroker (HashiVault config detected at startup; reloads from runtime seam)"
                     );
                 }
-                _ => {
-                    if mock_allow.contains(&BrokerProvider::HashiVault) {
+                OptionalBrokerStartupAction::RegisterMock => {
+                    if let Err(e) = hashi_probe {
+                        info!(
+                            provider = "hashi_vault",
+                            error = %e,
+                            "mock broker registered: hashi_vault (opted in via EMBER_ALLOW_MOCK_BROKERS; \
+                             startup config probe failed)"
+                        );
+                    } else {
                         registry
                             .register_mock(Box::new(MockBroker::new(BrokerProvider::HashiVault)));
                         info!(
                             provider = "hashi_vault",
                             "mock broker registered: hashi_vault (opted in via EMBER_ALLOW_MOCK_BROKERS)"
                         );
-                    } else {
-                        tracing::error!(
-                            provider = "hashi_vault",
-                            env = crate::broker::mock_allowlist::ALLOW_MOCK_BROKERS_ENV,
-                            "broker creds missing for hashi_vault and 'hashi_vault' not in EMBER_ALLOW_MOCK_BROKERS; \
-                             refusing silent MockBroker fallback (design §Component 2)"
-                        );
-                        return Err(DaemonError::BrokerCredsMissing {
-                            provider: "hashi_vault",
-                        });
                     }
                 }
+                OptionalBrokerStartupAction::Skip => match hashi_probe {
+                    Ok(false) => info!(
+                        provider = "hashi_vault",
+                        "broker not configured at startup; skipping optional provider"
+                    ),
+                    Err(e) => tracing::warn!(
+                        provider = "hashi_vault",
+                        error = %e,
+                        "broker startup probe failed; skipping optional provider until config is repaired"
+                    ),
+                    Ok(true) => unreachable!("real provider handled above"),
+                },
             }
 
             // Okta: real broker when ~/.config/emberlink/okta.env
@@ -1798,13 +2155,16 @@ impl DaemonRuntime {
             // dev hosts without Okta config still answer broker_issue
             // without a panic.
             //
-            // implementation-note-297 + implementation-note-116:
+            // implementation-note-331 + implementation-note-132:
             // honor `vault_first` precedence.
-            match runtime_resolver
+            let okta_probe = runtime_resolver
                 .startup_configured(BrokerProvider::Okta, startup_probe_mode)
-                .await
-            {
-                Ok(true) => {
+                .await;
+            match optional_broker_startup_action(
+                &okta_probe,
+                mock_allow.contains(&BrokerProvider::Okta),
+            ) {
+                OptionalBrokerStartupAction::RegisterReal => {
                     registry.register(Box::new(ReloadingBroker::new(
                         BrokerProvider::Okta,
                         Arc::clone(&runtime_resolver),
@@ -1814,23 +2174,34 @@ impl DaemonRuntime {
                         "broker registered: ReloadingBroker (Okta config detected at startup; reloads from runtime seam)"
                     );
                 }
-                _ => {
-                    if mock_allow.contains(&BrokerProvider::Okta) {
+                OptionalBrokerStartupAction::RegisterMock => {
+                    if let Err(e) = okta_probe {
+                        info!(
+                            provider = "okta",
+                            error = %e,
+                            "mock broker registered: okta (opted in via EMBER_ALLOW_MOCK_BROKERS; \
+                             startup config probe failed)"
+                        );
+                    } else {
                         registry.register_mock(Box::new(MockBroker::new(BrokerProvider::Okta)));
                         info!(
                             provider = "okta",
                             "mock broker registered: okta (opted in via EMBER_ALLOW_MOCK_BROKERS)"
                         );
-                    } else {
-                        tracing::error!(
-                            provider = "okta",
-                            env = crate::broker::mock_allowlist::ALLOW_MOCK_BROKERS_ENV,
-                            "broker creds missing for okta and 'okta' not in EMBER_ALLOW_MOCK_BROKERS; \
-                             refusing silent MockBroker fallback (design §Component 2)"
-                        );
-                        return Err(DaemonError::BrokerCredsMissing { provider: "okta" });
                     }
                 }
+                OptionalBrokerStartupAction::Skip => match okta_probe {
+                    Ok(false) => info!(
+                        provider = "okta",
+                        "broker not configured at startup; skipping optional provider"
+                    ),
+                    Err(e) => tracing::warn!(
+                        provider = "okta",
+                        error = %e,
+                        "broker startup probe failed; skipping optional provider until config is repaired"
+                    ),
+                    Ok(true) => unreachable!("real provider handled above"),
+                },
             }
 
             // Vercel: real broker when ~/.config/emberlink/vercel.env
@@ -1838,13 +2209,16 @@ impl DaemonRuntime {
             // dev hosts without Vercel config still answer broker_issue
             // without a panic.
             //
-            // implementation-note-297 + implementation-note-116:
+            // implementation-note-331 + implementation-note-132:
             // honor `vault_first` precedence.
-            match runtime_resolver
+            let vercel_probe = runtime_resolver
                 .startup_configured(BrokerProvider::Vercel, startup_probe_mode)
-                .await
-            {
-                Ok(true) => {
+                .await;
+            match optional_broker_startup_action(
+                &vercel_probe,
+                mock_allow.contains(&BrokerProvider::Vercel),
+            ) {
+                OptionalBrokerStartupAction::RegisterReal => {
                     registry.register(Box::new(ReloadingBroker::new(
                         BrokerProvider::Vercel,
                         Arc::clone(&runtime_resolver),
@@ -1854,36 +2228,40 @@ impl DaemonRuntime {
                         "broker registered: ReloadingBroker (Vercel config detected at startup; reloads from runtime seam)"
                     );
                 }
-                _ => {
-                    if mock_allow.contains(&BrokerProvider::Vercel) {
+                OptionalBrokerStartupAction::RegisterMock => {
+                    if let Err(e) = vercel_probe {
+                        info!(
+                            provider = "vercel",
+                            error = %e,
+                            "mock broker registered: vercel (opted in via EMBER_ALLOW_MOCK_BROKERS; \
+                             startup config probe failed)"
+                        );
+                    } else {
                         registry.register_mock(Box::new(MockBroker::new(BrokerProvider::Vercel)));
                         info!(
                             provider = "vercel",
                             "mock broker registered: vercel (opted in via EMBER_ALLOW_MOCK_BROKERS)"
                         );
-                    } else {
-                        tracing::error!(
-                            provider = "vercel",
-                            env = crate::broker::mock_allowlist::ALLOW_MOCK_BROKERS_ENV,
-                            "broker creds missing for vercel and 'vercel' not in EMBER_ALLOW_MOCK_BROKERS; \
-                             refusing silent MockBroker fallback (design §Component 2)"
-                        );
-                        return Err(DaemonError::BrokerCredsMissing { provider: "vercel" });
                     }
                 }
+                OptionalBrokerStartupAction::Skip => match vercel_probe {
+                    Ok(false) => info!(
+                        provider = "vercel",
+                        "broker not configured at startup; skipping optional provider"
+                    ),
+                    Err(e) => tracing::warn!(
+                        provider = "vercel",
+                        error = %e,
+                        "broker startup probe failed; skipping optional provider until config is repaired"
+                    ),
+                    Ok(true) => unreachable!("real provider handled above"),
+                },
             }
 
             // All other providers still on MockBroker pending their
             // downstream wiring tasks. Keep this list explicit (not a
             // catch-all loop) so adding a real impl is a deliberate
             // edit, not a silent default.
-            //
-            // implementation-note-122 (design §Component 2):
-            // each of these providers must also be in EMBER_ALLOW_MOCK_BROKERS
-            // for a Mock to register. There is no real-broker fallback
-            // for these yet — the only choice is "opted-in Mock" or
-            // "fail-loud." Once a real broker lands for one of these, it
-            // graduates into the matching `match` block above.
             for (provider, name) in [
                 (BrokerProvider::Cloudflare, "cloudflare"),
                 (BrokerProvider::Anthropic, "anthropic"),
@@ -1897,14 +2275,10 @@ impl DaemonRuntime {
                          no real broker yet)"
                     );
                 } else {
-                    tracing::error!(
+                    info!(
                         provider = name,
-                        env = crate::broker::mock_allowlist::ALLOW_MOCK_BROKERS_ENV,
-                        "broker creds missing for {name} (no real broker implementation yet) and \
-                         '{name}' not in EMBER_ALLOW_MOCK_BROKERS; refusing silent MockBroker \
-                         fallback (design §Component 2)"
+                        "broker not configured at startup; skipping optional provider (no real broker yet)"
                     );
-                    return Err(DaemonError::BrokerCredsMissing { provider: name });
                 }
             }
             crate::broker::handler::install_registry_with_authority(
@@ -1924,7 +2298,7 @@ impl DaemonRuntime {
         drop(cred_store);
         drop(runtime_cred_store);
 
-        // implementation-note-140 — install the process-global
+        // implementation-note-162 — install the process-global
         // uid pool from `[spawn_pool]` in config.toml. Absent ⇒ pool
         // stays uninstalled and `handle_broker_exec` refuses with
         // `-32021` until the operator runs `ember daemon install`.
@@ -1945,7 +2319,7 @@ impl DaemonRuntime {
                     tracing::warn!(
                         "spawn_pool: no [spawn_pool] section in config.toml — \
                          broker_exec will refuse with -32021 until operator runs \
-                         `ember daemon install` (implementation-note-140)"
+                         `ember daemon install` (implementation-note-162)"
                     );
                 }
             }
@@ -2023,7 +2397,7 @@ impl DaemonRuntime {
             }
         });
 
-        // implementation-note-196 — background sweep marks pending
+        // implementation-note-221 — background sweep marks pending
         // approvals older than `stale_approval_threshold_secs` as `timed_out`.
         // Runs every 60 seconds. Complements the startup sweep (line ~261) which
         // only catches requests left pending from prior sessions. This sweep
@@ -2047,8 +2421,8 @@ impl DaemonRuntime {
             }
         });
 
-        // implementation-note-96 — 60-second revocation document poller.
-        // implementation-note-299: fetch path now wired.
+        // implementation-note-110 — 60-second revocation document poller.
+        // implementation-note-333: fetch path now wired.
         // Fetches `revocations/current.json` on each tick and applies a
         // severity-driven response (critical=IsolateDrainKill, high=DrainToTtl,
         // medium/low=Log). Stale documents (>30 min) fail-closed regardless of
@@ -2127,7 +2501,7 @@ impl DaemonRuntime {
         });
         tracing::info!("image revocations poller started (60s interval)");
 
-        // implementation-note-300 — session heartbeat + TTL watcher.
+        // implementation-note-334 — session heartbeat + TTL watcher.
         // Runs every 60 s. Closes orphaned sessions (launcher PID dead > 5 min)
         // and sessions whose grant is past the 24-hour TTL backstop.
         let session_store_clone = Rc::clone(&store);
@@ -2137,7 +2511,7 @@ impl DaemonRuntime {
         });
         tracing::info!("session heartbeat watcher started");
 
-        // implementation-note-301 (Phase 1) —
+        // implementation-note-335 (Phase 1) —
         // fast-path launcher exit detector. Polls per-session pidfds every
         // 1 s on Linux (kqueue stub on macOS) so launcher exit fires the
         // revocation-cascade placeholder within ~1 s, complementing the
@@ -2192,7 +2566,7 @@ impl DaemonRuntime {
             }
         }
 
-        // implementation-note-174 — periodic cluster snapshot pull task.
+        // implementation-note-197 — periodic cluster snapshot pull task.
         // Runs every `snapshot_pull_interval_secs` (default 600, i.e. 10 min).
         // Only active when both `snapshot_pull_endpoint` and
         // `snapshot_pull_cluster_id` are configured. On each tick it calls
@@ -2304,7 +2678,7 @@ impl DaemonRuntime {
             None
         };
 
-        // implementation-note-172: spawn the git-echo credential-injection proxy if
+        // implementation-note-195: spawn the git-echo credential-injection proxy if
         // configured. Bind result is captured via a oneshot channel and
         // driven below alongside the dashboard's. Each proxy task gets its
         // own DaemonStore (rusqlite Connection is !Send) but shares the
@@ -2318,7 +2692,7 @@ impl DaemonRuntime {
             let proxy_shutdown = shutdown_tx.subscribe();
             let (bind_tx, bind_rx) = oneshot::channel::<Result<SocketAddr, std::io::Error>>();
             let proxy_vault_slot = live_vault_slot.clone();
-            // implementation-note-172 marker: spawn_local run_git_echo_proxy via this LocalSet.
+            // implementation-note-195 marker: spawn_local run_git_echo_proxy via this LocalSet.
             local.spawn_local(async move {
                     let store = match crate::infra::store::DaemonStore::open(&proxy_db_path) {
                         Ok(s) => s,
@@ -2337,7 +2711,7 @@ impl DaemonRuntime {
                     // the Arc is used only within this LocalSet (single-threaded runtime),
                     // mirroring run_proxy / run_git_echo_proxy themselves.
                     //
-                    // implementation-note-45: attach the vault to this fresh
+                    // implementation-note-56: attach the vault to this fresh
                     // store. Without this, increment_statement_usage's re-sign of
                     // block 0 calls persona_root_keypair → self.vault() → None →
                     // "no vault is attached", silently dropping every meter delta
@@ -2345,7 +2719,7 @@ impl DaemonRuntime {
                     store.replace_vault_slot(proxy_vault_slot.clone());
                     #[allow(clippy::arc_with_non_send_sync)]
                     let state = std::sync::Arc::new(crate::infra::proxy::ProxyState::new(store));
-                    // implementation-note-273: install the
+                    // implementation-note-301: install the
                     // `DaemonEventSink` immediately after construction.
                     // The git-echo proxy does not broadcast grant events
                     // (no SDK subscribers reach this listener), so the
@@ -2378,7 +2752,7 @@ impl DaemonRuntime {
             None
         };
 
-        // implementation-note-173: spawn the general LLM/HTTP credential-
+        // implementation-note-196: spawn the general LLM/HTTP credential-
         // injection proxy (`run_proxy` — provider-aware auth, X-Ember-* header
         // protocol). This is the listener the Anthropic SDK demo posts to via
         // `base_url=$EMBER_PROXY_URL`; previously `run_proxy` was defined but
@@ -2405,14 +2779,14 @@ impl DaemonRuntime {
                             return;
                         }
                     };
-                    // implementation-note-45: attach vault to the fresh store
+                    // implementation-note-56: attach vault to the fresh store
                     // so increment_statement_usage's block-0 re-sign can read the
                     // issuing persona's root keypair (vault-sealed). Same fix as
                     // the git-echo proxy spawn block above.
                     store.replace_vault_slot(proxy_vault_slot.clone());
                     #[allow(clippy::arc_with_non_send_sync)]
                     let state = std::sync::Arc::new(crate::infra::proxy::ProxyState::new(store));
-                    // implementation-note-273: install the
+                    // implementation-note-301: install the
                     // `DaemonEventSink` immediately after construction.
                     // The LLM proxy currently runs without a broadcast
                     // channel here (the SocketListener owns the
@@ -2468,7 +2842,7 @@ impl DaemonRuntime {
             });
         }
 
-        // implementation-note-302: spawn the mTLS edge listener when the edge CA
+        // implementation-note-336: spawn the mTLS edge listener when the edge CA
         // has been provisioned by `kms init-edge`. The CA is stored at
         // `<data_dir>/kms/edge-ca/ca.seed` (32-byte raw Ed25519 seed).
         // When absent, log and degrade gracefully — the loopback path remains
@@ -2603,7 +2977,7 @@ impl DaemonRuntime {
                 // launchers (qember.sh demo up) can pick the URL up after
                 // forking the daemon and exiting the parent.
                 //
-                // implementation-note-173: this URL now lives at
+                // implementation-note-196: this URL now lives at
                 // `EMBER_GIT_PROXY_URL` + `<data_dir>/run/git-proxy.url`. The
                 // bare `EMBER_PROXY_URL` and `proxy.url` names are claimed by
                 // the LLM proxy below — that is the listener the Anthropic
@@ -2683,7 +3057,7 @@ impl DaemonRuntime {
             (Some(_), None) => LlmProxyBind::Disabled,
         };
 
-        // implementation-note-233: extract the
+        // implementation-note-259: extract the
         // bound proxy URLs from the bind results and wire them into the
         // SocketListener. This makes the URLs available in RequestContext for
         // every inbound RPC without relying on std::env::var across tokio
@@ -2703,7 +3077,7 @@ impl DaemonRuntime {
             .with_llm_proxy_url(resolved_llm_proxy_url)
             .with_git_proxy_url(resolved_git_proxy_url);
 
-        // implementation-note-188: persist the resolved bind
+        // implementation-note-213: persist the resolved bind
         // address on the runtime so out-of-band readers (tests, future
         // introspection helpers) see the same truth as `/api/status`. Only
         // the `Bound` variant maps to `Some`; `Failed`/`Disabled`/`Timeout`
@@ -2770,7 +3144,7 @@ impl DaemonRuntime {
     pub fn status(&self) -> Result<DaemonStatus, DaemonError> {
         match self.pid_file.read() {
             Ok(Some(pid)) if self.pid_file.is_running() => {
-                let socket_path = self.config.socket_dir.join("daemon.sock");
+                let socket_path = daemon_socket_path(&self.config);
                 Ok(DaemonStatus {
                     pid,
                     socket: socket_path,
@@ -2779,7 +3153,7 @@ impl DaemonRuntime {
             }
             Ok(Some(pid)) => Ok(DaemonStatus {
                 pid,
-                socket: self.config.socket_dir.join("daemon.sock"),
+                socket: daemon_socket_path(&self.config),
                 running: false,
             }),
             Ok(None) => Err(DaemonError::NotRunning),
@@ -2813,7 +3187,7 @@ pub struct DaemonStatus {
     pub running: bool,
 }
 
-// ─── Bridge CA load-or-mint (implementation-note-290) ───
+// ─── Bridge CA load-or-mint (implementation-note-319) ───
 //
 // On-disk layout under `<data_dir>`:
 //
@@ -3007,7 +3381,7 @@ pub fn load_or_mint_bridge_ca(
     Ok(Arc::new(bridge_ca))
 }
 
-// ─── ember-rpc sibling server-cert mint (implementation-note-98) ───
+// ─── ember-rpc sibling server-cert mint (implementation-note-112) ───
 //
 // Checkpoint mirror: `ember_rpc_sibling_server_cert_minted_at_startup` (also
 // stamped on `crates/ember-daemon/src/trust/bridge_ca.rs`).
@@ -3565,8 +3939,35 @@ mod bridge_ca_tests {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        OptionalBrokerStartupAction, SandboxProbeFailure, SandboxState, check_sandbox_at_startup,
+        daemon_socket_path_with, optional_broker_startup_action, probe_sandbox_state,
+    };
+    use crate::broker::authority::BrokerAuthorityError;
+    use crate::infra::config::DaemonConfig;
     use std::io::Write as _;
     use tempfile::TempDir;
+
+    #[test]
+    fn daemon_socket_path_defaults_to_config_socket_dir() {
+        let tmp = TempDir::new().unwrap();
+        let config = DaemonConfig::for_test(tmp.path());
+        let resolved = daemon_socket_path_with(&config, None);
+
+        assert_eq!(resolved, tmp.path().join("daemon.sock"));
+    }
+
+    #[test]
+    fn daemon_socket_path_uses_env_override_when_present() {
+        let tmp = TempDir::new().unwrap();
+        let config = DaemonConfig::for_test(tmp.path());
+        let resolved = daemon_socket_path_with(
+            &config,
+            Some(std::ffi::OsString::from("/tmp/daemon.dev.sock")),
+        );
+
+        assert_eq!(resolved, std::path::PathBuf::from("/tmp/daemon.dev.sock"));
+    }
 
     /// Verifies that the rolling file appender creates `daemon.log.*` in the
     /// data directory and accepts writes. The global tracing subscriber is NOT
@@ -3597,6 +3998,51 @@ mod tests {
         assert!(
             contents.contains("daemon-log-test-probe"),
             "expected probe string in log file, got: {contents:?}"
+        );
+    }
+
+    #[test]
+    fn optional_broker_startup_registers_real_when_configured() {
+        let configured = Ok(true);
+        assert_eq!(
+            optional_broker_startup_action(&configured, false),
+            OptionalBrokerStartupAction::RegisterReal
+        );
+    }
+
+    #[test]
+    fn optional_broker_startup_skips_absent_provider_without_mock_opt_in() {
+        let configured = Ok(false);
+        assert_eq!(
+            optional_broker_startup_action(&configured, false),
+            OptionalBrokerStartupAction::Skip
+        );
+    }
+
+    #[test]
+    fn optional_broker_startup_registers_mock_when_absent_but_allow_listed() {
+        let configured = Ok(false);
+        assert_eq!(
+            optional_broker_startup_action(&configured, true),
+            OptionalBrokerStartupAction::RegisterMock
+        );
+    }
+
+    #[test]
+    fn optional_broker_startup_registers_mock_when_probe_errors_but_allow_listed() {
+        let configured = Err(BrokerAuthorityError::Message("broken metadata".into()));
+        assert_eq!(
+            optional_broker_startup_action(&configured, true),
+            OptionalBrokerStartupAction::RegisterMock
+        );
+    }
+
+    #[test]
+    fn optional_broker_startup_skips_when_probe_errors_without_mock_opt_in() {
+        let configured = Err(BrokerAuthorityError::Message("broken metadata".into()));
+        assert_eq!(
+            optional_broker_startup_action(&configured, false),
+            OptionalBrokerStartupAction::Skip
         );
     }
 
@@ -3765,6 +4211,71 @@ mod tests {
             assert_eq!(creds.gid, 7777);
             assert_eq!(creds.pid, Some(99));
         }
+    }
+
+    // emberd_sandbox_startup_probe (implementation-note-121).
+    //
+    // The probe is best-effort by design (WARN-on-unsandboxed unless
+    // EMBER_REQUIRE_SANDBOX=1). These tests verify the probe runs without
+    // panicking + the strict-mode env-gate fires correctly. We don't assert
+    // the SandboxState variant because test environments are inherently
+    // unsandboxed (cargo test runs without launchd/systemd wrapping).
+    #[test]
+    fn sandbox_probe_runs_without_panic_in_test_env() {
+        let _state = probe_sandbox_state();
+        // No assertion on variant — test env is Unsandboxed by design.
+    }
+
+    #[test]
+    fn sandbox_probe_default_mode_returns_ok_even_when_unsandboxed() {
+        // SAFETY: this test reads + sets env via std::env. Other tests in
+        // the same binary may race; we use a unique-name strategy by
+        // explicitly unsetting before + after. The probe runs synchronously
+        // so the env-state snapshot is consistent within one call.
+        let prev = std::env::var("EMBER_REQUIRE_SANDBOX").ok();
+        // SAFETY: see above.
+        unsafe { std::env::remove_var("EMBER_REQUIRE_SANDBOX") };
+        let result = check_sandbox_at_startup();
+        // Restore.
+        // SAFETY: see above.
+        unsafe {
+            if let Some(v) = prev {
+                std::env::set_var("EMBER_REQUIRE_SANDBOX", v);
+            }
+        }
+        assert!(
+            result.is_ok(),
+            "default mode must return Ok regardless of sandbox state"
+        );
+    }
+
+    #[test]
+    fn sandbox_probe_strict_mode_refuses_when_unsandboxed() {
+        // Test env is Unsandboxed by design; strict mode must refuse.
+        // Run only on platforms where the test env reliably reports Unsandboxed
+        // (Linux containers + non-launchd-wrapped macOS shells). Cargo test on
+        // a developer macOS workstation might run inside a sandboxed environment
+        // (e.g. Xcode's test runner) — gate so we don't false-fail there.
+        let baseline = probe_sandbox_state();
+        if !matches!(baseline, SandboxState::Unsandboxed) {
+            return; // test env IS sandboxed; can't exercise strict refusal here
+        }
+        let prev = std::env::var("EMBER_REQUIRE_SANDBOX").ok();
+        // SAFETY: serial-mutation of env within a test that also restores.
+        unsafe { std::env::set_var("EMBER_REQUIRE_SANDBOX", "1") };
+        let result = check_sandbox_at_startup();
+        // Restore.
+        // SAFETY: see above.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("EMBER_REQUIRE_SANDBOX", v),
+                None => std::env::remove_var("EMBER_REQUIRE_SANDBOX"),
+            }
+        }
+        assert!(
+            matches!(result, Err(SandboxProbeFailure::StrictModeUnsandboxed)),
+            "strict mode must refuse when probe reports Unsandboxed; got: {result:?}"
+        );
     }
 }
 

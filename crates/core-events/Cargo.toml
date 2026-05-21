@@ -18,4 +18,5 @@ toml = { version = "1.0", default-features = false, features = ["parse", "serde"
 
 [dev-dependencies]
 core-receipts = { path = "../core-receipts" }
+proptest = "1"
 

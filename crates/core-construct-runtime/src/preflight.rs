@@ -11,7 +11,7 @@
 //! ## Phase 2 slice B (this slice) — manifest-backed resolver
 //!
 //! [`resolve_queued_task_permissions`] now consumes each task's
-//! `constructs` field (implementation-note-19) and a
+//! `constructs` field (implementation-note-22) and a
 //! registry of parsed `construct.toml` manifests
 //! ([`crate::manifest::ConstructManifest`]). For every
 //! `"<construct>.<action>"` declaration the task carries, the resolver
@@ -30,7 +30,7 @@
 //! matches `kubectl.toml`'s `key = "kubectl.apply"` when the construct
 //! is `ember-kubectl`).
 //!
-//! implementation-note-20 — checkpoint for stale_check; do not remove.
+//! implementation-note-23 — checkpoint for stale_check; do not remove.
 //!
 
 use std::collections::HashMap;
@@ -84,12 +84,25 @@ pub struct AuthorityRefResolution {
     pub fully_declared: bool,
 }
 
+/// Extra unattended/headless runtime requirements declared by a queued task
+/// set's Constructs.
+///
+/// `requirements_by_task` is the union of manifest-declared runtime
+/// requirements for each task. `fully_declared = false` means at least one
+/// declaration was malformed, unknown, or referred to an unknown action, so
+/// callers must not treat the returned requirements as complete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeadlessRequirementResolution {
+    pub requirements_by_task: HashMap<TaskId, Vec<String>>,
+    pub fully_declared: bool,
+}
+
 /// Resolve, for each task, the union of permissions implied by the
 /// Constructs that task declares it invokes.
 ///
 /// **Pre:** every entry in `tasks` is a `(task_id, task.constructs)` pair
 /// where each construct declaration is the
-/// implementation-note-19 shape
+/// implementation-note-22 shape
 /// `"<construct>.<action>"` (e.g. `"ember-gh.pr_merge"`,
 /// `"ember-kubectl.apply"`). `registry` maps a manifest's `[meta] name`
 /// (e.g. `"ember-gh"`) to its parsed [`ConstructManifest`].
@@ -181,6 +194,44 @@ pub fn resolve_queued_task_authority_refs(
     }
 }
 
+/// Resolve, for each task, the manifest-declared unattended/headless runtime
+/// requirements its declared Constructs carry.
+///
+/// This is intentionally manifest-scoped for the first slice because current
+/// bundled uses are construct-wide posture claims such as "this queue is only
+/// canonically unattended when a runtime KMS-backed secrets-provider lane is
+/// live."
+pub fn resolve_queued_task_headless_requirements(
+    tasks: &[(TaskId, Vec<String>)],
+    registry: &HashMap<String, ConstructManifest>,
+) -> HeadlessRequirementResolution {
+    let mut out = HashMap::with_capacity(tasks.len());
+    let mut fully_declared = true;
+    for (task_id, declarations) in tasks {
+        let mut requirements = std::collections::BTreeSet::new();
+        for decl in declarations {
+            let Some((construct_name, action_suffix)) = decl.split_once('.') else {
+                fully_declared = false;
+                continue;
+            };
+            let Some(manifest) = lookup(registry, construct_name) else {
+                fully_declared = false;
+                continue;
+            };
+            if !action_key_present(manifest, action_suffix) {
+                fully_declared = false;
+                continue;
+            }
+            requirements.extend(manifest.headless_requirements.iter().cloned());
+        }
+        out.insert(task_id.clone(), requirements.into_iter().collect());
+    }
+    HeadlessRequirementResolution {
+        requirements_by_task: out,
+        fully_declared,
+    }
+}
+
 /// True when `action_suffix` resolves to a declared action key in
 /// `manifest`, trying the suffix verbatim and the short-name-prepended
 /// variant. See [`resolve_queued_task_permissions`] for the convention
@@ -267,6 +318,18 @@ key = "kubectl.apply"
 
 [[actions]]
 key = "kubectl.delete"
+"#;
+
+    const PULUMI_MANIFEST: &str = r#"
+[meta]
+name = "ember-pulumi"
+
+headless_requirements = ["runtime_kms"]
+
+default = "deny"
+
+[[actions]]
+key = "pulumi.up"
 "#;
 
     fn registry_with(manifests: &[&str]) -> HashMap<String, ConstructManifest> {
@@ -366,6 +429,36 @@ key = "kubectl.delete"
         let resolved = resolve_queued_task_authority_refs(&tasks, &registry);
         assert!(!resolved.fully_declared);
         assert!(resolved.refs_by_task.get("TASK-J").unwrap().is_empty());
+    }
+
+    #[test]
+    fn headless_requirements_round_trip_manifest_default() {
+        let registry = registry_with(&[PULUMI_MANIFEST]);
+        let tasks = vec![("TASK-K".to_string(), vec!["ember-pulumi.up".to_string()])];
+        let resolved = resolve_queued_task_headless_requirements(&tasks, &registry);
+        assert!(resolved.fully_declared);
+        assert_eq!(
+            resolved.requirements_by_task.get("TASK-K"),
+            Some(&vec!["runtime_kms".to_string()])
+        );
+    }
+
+    #[test]
+    fn unknown_construct_marks_headless_requirement_resolution_incomplete() {
+        let registry = registry_with(&[PULUMI_MANIFEST]);
+        let tasks = vec![(
+            "TASK-L".to_string(),
+            vec!["ember-unknown.do_thing".to_string()],
+        )];
+        let resolved = resolve_queued_task_headless_requirements(&tasks, &registry);
+        assert!(!resolved.fully_declared);
+        assert!(
+            resolved
+                .requirements_by_task
+                .get("TASK-L")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

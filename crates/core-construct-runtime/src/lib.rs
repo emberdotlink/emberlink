@@ -3,8 +3,10 @@
 //! Per design §1, every Construct binary (e.g. `ember-gh`, `ember-git`,
 //! `ember-kubectl`) follows the same lifecycle:
 //!
-//! 1. **env-detect** — if the session env var is absent, exec the wrapped
-//!    binary directly (passthrough; no broker round-trip).
+//! 1. **env-detect** — if the session env var is absent, the production
+//!    `run_construct_full` path fails closed for classified credential-bearing
+//!    actions and only passthrough-execs unclassified/read-only verbs.
+//!    (`run_construct` keeps the older stub-mode direct-passthrough contract.)
 //! 2. **classify** — turn argv into a stable `ActionKey` for policy lookup.
 //! 3. **broker.resolve** — ask the daemon for a credential lease (stubbed).
 //! 4. **broker.exec** — invoke the wrapped binary with the lease (stubbed).
@@ -20,8 +22,9 @@ pub mod runtime;
 
 pub use runtime::{
     BrokerTransactionError, BrokerTransport, ConstructSpec, CredentialAuditKind,
-    DaemonRpcTransport, ExecOutcome, SpawnHandle, exec_via_broker, resolve_via_broker,
-    run_construct, run_construct_full, run_construct_with_transport,
+    DaemonRpcTransport, ExecOutcome, SpawnHandle, UnsessionedOutcome, exec_via_broker,
+    log_unsessioned_subprocess, resolve_via_broker, run_construct, run_construct_full,
+    run_construct_with_transport,
 };
 
 /// Stable identifier for a classified Construct action.
@@ -55,8 +58,26 @@ pub trait ClassifyArgv {
 /// bits. [`run_construct`] uses these to drive env-detect → classify →
 /// broker.exec → PTY bridge → exit.
 pub trait ConstructConfig: ClassifyArgv {
+    /// Stable vendor identifier for this Construct (e.g. `"gh"`, `"git"`,
+    /// `"kubectl"`). Used by `run_construct_full`'s env-detect passthrough
+    /// branch to tag best-effort `subprocess_audit_log` RPC calls with the
+    /// vendor name, so an unsessioned subprocess invocation appears in the
+    /// daemon's tamper-evident audit chain under
+    /// `subprocess.<vendor>.invoke_no_session` even though no broker
+    /// mediation occurred.
+    ///
+    /// Default implementation returns `"unknown"` for back-compat with
+    /// existing test scaffolding; production shims (ember-construct's
+    /// `ManifestConfig`) override this to forward the
+    /// `VendorManifest::name` row.
+    fn vendor(&self) -> &'static str {
+        "unknown"
+    }
+
     /// Env var that signals we're inside an ember session (e.g. `"EMBER_SESSION_ID"`).
-    /// If absent at runtime, the shim execs the wrapped binary directly.
+    /// If absent at runtime, `run_construct_full` refuses classified
+    /// credential-bearing actions and only passthrough-execs
+    /// unclassified/read-only verbs.
     fn session_id_env(&self) -> &'static str;
 
     /// Embedded `Construct.toml` bytes (for future broker.resolve payload).
@@ -91,7 +112,7 @@ pub trait ConstructConfig: ClassifyArgv {
     /// classify=None bypass) do NOT translate — those branches exit the shim
     /// contract entirely. The fix for emberlink-flag passthrough in those
     /// branches is to eliminate the bypass (e.g. broker.exec default per
-    /// implementation-note-14 step 3), not to add
+    /// implementation-note-17 step 3), not to add
     /// translation here.
     ///
     /// Anchor: `construct_config_translate_argv_hook_landed`.

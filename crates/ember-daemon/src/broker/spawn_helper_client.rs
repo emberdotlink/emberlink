@@ -2,9 +2,9 @@
 //! Daemon-side client for the spawn-helper sibling daemon (design
 //! Components 2 + 3 + MACOS-PRIMITIVES Decision 5).
 //!
-//! implementation-note-159
-//! implementation-note-160
-//! implementation-note-161
+//! implementation-note-182
+//! implementation-note-183
+//! implementation-note-184
 //!
 //! ## Architecture
 //!

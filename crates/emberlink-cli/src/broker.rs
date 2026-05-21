@@ -1,7 +1,7 @@
 //! `ember broker {issue, revoke, list, register}` — operator + wrapper-script entry
 //! point for the credential broker (design / design).
 //!
-//! The daemon RPC handlers shipped in implementation-note-117
+//! The daemon RPC handlers shipped in implementation-note-133
 //! (`crates/ember-daemon/src/broker_handler.rs`); this module is the CLI
 //! surface that wraps them. Subcommands:
 //!
@@ -15,10 +15,10 @@
 //! - [`register`] — register a GitHub App credential triple in the vault
 //!   (`vault_add` daemon RPC × 3). Calls `GET /apps/<slug>` to canonicalize
 //!   the operator-supplied slug before writing (Finding 12 /
-//!   implementation-note-384). `--allow-unverified-slug` bypasses
+//!   implementation-note-430). `--allow-unverified-slug` bypasses
 //!   the network round-trip for offline / suspended-app scenarios.
 //!
-//! ## Grants-file flow (implementation-note-148)
+//! ## Grants-file flow (implementation-note-171)
 //!
 //! `ember broker issue --grants-file <path> --credential <name>` reads a
 //! `GrantsManifest` TOML, locates the named credential entry, and issues a
@@ -32,11 +32,11 @@
 //!
 //! ## Marker for `target_state_anchor`
 //!
-//! implementation-note-416 uses `BrokerCmd|broker_command` as its grep gate;
+//! implementation-note-465 uses `BrokerCmd|broker_command` as its grep gate;
 //! both literals appear in this file (`pub enum BrokerCmd` below and
 //! `pub fn broker_command` below).
 //!
-//! implementation-note-148 uses `ember broker issue.*grants-file` as its
+//! implementation-note-171 uses `ember broker issue.*grants-file` as its
 //! grep gate; see `#[arg(long = "grants-file")]` on `BrokerCmd::Issue` below.
 //!
 //! ## Secret handling
@@ -60,7 +60,7 @@ use core_grants_toml::{Credential, GrantsManifest};
 /// CLI subcommand surface for `ember broker`.
 ///
 /// Mirrors the daemon's three RPC methods one-to-one. The literal
-/// `BrokerCmd` is the load-bearing marker for the implementation-note-416
+/// `BrokerCmd` is the load-bearing marker for the implementation-note-465
 /// `target_state_anchor`.
 #[derive(Subcommand, Debug)]
 pub enum BrokerCmd {
@@ -105,7 +105,7 @@ pub enum BrokerCmd {
         json: bool,
     },
 
-    /// Issue grants from a TOML grants file (design / implementation-note-148).
+    /// Issue grants from a TOML grants file (design / implementation-note-171).
     ///
     /// Reads a `GrantsManifest` TOML via `core-grants-toml`, locates the
     /// credential entry named by `--credential`, and issues a scoped grant
@@ -117,11 +117,11 @@ pub enum BrokerCmd {
     ///
     /// ## Checkpoint for target_state_anchor
     ///
-    /// `ember broker issue --grants-file` (implementation-note-148)
+    /// `ember broker issue --grants-file` (implementation-note-171)
     #[command(name = "issue-file")]
     IssueFromFile {
         /// Path to the grants manifest TOML file.
-        // ember broker issue --grants-file (implementation-note-148)
+        // ember broker issue --grants-file (implementation-note-171)
         #[arg(long = "grants-file")]
         grants_file: PathBuf,
 
@@ -147,7 +147,7 @@ pub enum BrokerCmd {
     },
 
     /// Register a GitHub App credential in the daemon vault (design path
-    /// grammar — Finding 12 / implementation-note-384).
+    /// grammar — Finding 12 / implementation-note-430).
     ///
     /// Writes three vault entries under
     /// `github/apps/<canonical-slug>/install-<installation-id>/`:
@@ -237,7 +237,7 @@ pub enum RegisterProvider {
     ///   `private-key`, `app-id`, `installation-id`.
     ///
     /// The slug is verified against GitHub's API (Finding 12 /
-    /// implementation-note-384). Pass `--allow-unverified-slug`
+    /// implementation-note-430). Pass `--allow-unverified-slug`
     /// to skip the verification (offline / app-suspended scenarios).
     Github {
         /// Path to the GitHub App's RSA private key (PEM-encoded PKCS#8
@@ -389,7 +389,7 @@ pub fn issue(
 
     let result = call_daemon(&opts.socket_path, "broker_issue", &params)?;
 
-    // Result shape (implementation-note-12):
+    // Result shape (implementation-note-15):
     //   { secret_ref, materialization_id, expires_at, issued_at, provider }
     // The opaque `secret_ref` is what callers pass back to ember-proxy /
     // ember-tools when the actual credential is needed at a trust
@@ -423,14 +423,14 @@ pub fn issue(
 }
 
 /// `ember broker issue-file --grants-file <path> --credential <name>`
-/// (implementation-note-148)
+/// (implementation-note-171)
 ///
 /// Reads a `GrantsManifest` TOML, locates the named credential, issues a
 /// scoped grant stamped with `grants_file_rev` (SHA-256 of file bytes) and
 /// `credential_name`. With `--inject` spawns a child shell and registers the
 /// PID for daemon auto-revoke.
 ///
-/// // ember broker issue --grants-file (implementation-note-148)
+/// // ember broker issue --grants-file (implementation-note-171)
 pub fn issue_from_grants_file(
     opts: &GlobalOpts,
     grants_file: &Path,
@@ -824,6 +824,13 @@ pub fn register_github(
     let path_app_id = format!("{vault_prefix}/app-id");
     let path_installation_id = format!("{vault_prefix}/installation-id");
 
+    // Establish operator presence explicitly before the vault mutation flow.
+    // The generic daemon RPC helper can retry lazily via `vault_unlock`, but
+    // `register_github` performs multiple writes after an optional existence
+    // probe. Unlocking once up front keeps the operator flow deterministic and
+    // avoids swallowing an initial authority error in the preflight branch.
+    call_daemon(&opts.socket_path, "vault_unlock", &Value::Null)?;
+
     // 4. If not replacing, check for existing entries.
     if !replace {
         // Try vault_get — if it succeeds, the entry already exists.
@@ -834,16 +841,11 @@ pub fn register_github(
             "vault_get",
             &json!({"name": path_private_key}),
         );
-        match check {
-            Ok(_) => {
-                return Err(BrokerCliError::InvalidArgs(format!(
-                    "vault entry '{path_private_key}' already exists; \
-                     pass --replace to overwrite"
-                )));
-            }
-            // Any RPC error means not-found (or daemon unavailable — the latter
-            // will surface again on the vault_add call below).
-            Err(_) => {}
+        if check.is_ok() {
+            return Err(BrokerCliError::InvalidArgs(format!(
+                "vault entry '{path_private_key}' already exists; \
+                 pass --replace to overwrite"
+            )));
         }
     }
 
@@ -947,7 +949,7 @@ fn canonicalize_github_slug(
 
     // GET /app using the App JWT.
     //
-    // implementation-note-417 — previously this called
+    // implementation-note-466 — previously this called
     // `GET /apps/<slug>`, which rejects App JWT auth with 401 Bad
     // credentials (the endpoint is documented for App-JWT but in practice
     // requires Installation-token or user auth — confirmed on
@@ -1110,7 +1112,7 @@ fn load_scope_json(arg: &str) -> Result<Value, BrokerCliError> {
 }
 
 /// Compute the SHA-256 hex digest of raw bytes. Used to populate
-/// `grants_file_rev` in the broker Receipt (implementation-note-148).
+/// `grants_file_rev` in the broker Receipt (implementation-note-171).
 fn sha256_hex(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -1118,63 +1120,82 @@ fn sha256_hex(data: &[u8]) -> String {
     hex::encode(h.finalize())
 }
 
+fn authority_error_reason(message: &str) -> Option<String> {
+    serde_json::from_str::<Value>(message)
+        .ok()
+        .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(str::to_string))
+}
+
+fn broker_guidance_for_rpc(method: &str, code: i32, message: &str) -> Option<String> {
+    let presence_reason = authority_error_reason(message);
+    let presence_missing = code == -32001
+        && presence_reason.as_deref().is_some_and(|reason| {
+            matches!(
+                reason,
+                "missing"
+                    | "expired"
+                    | "uid-mismatch"
+                    | "sig-invalid"
+                    | "scope-mismatch"
+                    | "identity-missing"
+            )
+        });
+    let session_locked = code == -32030
+        && (message.contains("session is locked")
+            || message.contains("vault unavailable")
+            || message.contains("session auto-locked"));
+
+    if method == "broker_list" && (presence_missing || session_locked) {
+        return Some(
+            "ember broker list is an advanced operator surface, not part of the \
+             friendly `ember init --for claude-code` path. Use `ember claude-code` \
+             for construct-time brokering. If you intentionally need broker admin \
+             state, approve the unlock flow or run `ember vault unlock` and retry."
+                .to_string(),
+        );
+    }
+
+    if matches!(
+        method,
+        "vault_unlock" | "vault_add" | "vault_get" | "vault_list" | "vault_remove"
+    ) && (presence_missing
+        || (code == -32030
+            && (message.contains("session is locked")
+                || message.contains("vault unavailable")
+                || message.contains("session auto-locked"))))
+    {
+        return Some(
+            "this command needs operator presence on the daemon-managed vault lane. \
+             Approve the unlock flow if prompted, or run `ember vault unlock` from \
+             an interactive operator shell and retry."
+                .to_string(),
+        );
+    }
+
+    None
+}
+
 /// Send a synchronous JSON-RPC request over the daemon's Unix socket
 /// and return the `result` value. Mirrors the
 /// `emberlink-mcp::daemon_transport` shape so behaviour is identical to
 /// the MCP path.
 fn call_daemon(socket_path: &Path, method: &str, params: &Value) -> Result<Value, BrokerCliError> {
-    use std::io::{BufRead, BufReader, Write};
-
-    let stream =
-        std::os::unix::net::UnixStream::connect(socket_path).map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
-                BrokerCliError::DaemonUnavailable {
-                    socket: socket_path.to_path_buf(),
-                    source: e,
-                }
+    match crate::call_daemon_rpc(socket_path, method, params) {
+        Ok(value) => Ok(value),
+        Err(crate::DaemonRpcError::Unavailable(source)) => Err(BrokerCliError::DaemonUnavailable {
+            socket: socket_path.to_path_buf(),
+            source,
+        }),
+        Err(crate::DaemonRpcError::Io(err)) => Err(BrokerCliError::Io(err.to_string())),
+        Err(crate::DaemonRpcError::Protocol(message)) => Err(BrokerCliError::Protocol(message)),
+        Err(crate::DaemonRpcError::Rpc { code, message }) => {
+            if let Some(guidance) = broker_guidance_for_rpc(method, code, &message) {
+                Err(BrokerCliError::Guidance(guidance))
+            } else {
+                Err(BrokerCliError::DaemonRpc { code, message })
             }
-            _ => BrokerCliError::DaemonUnavailable {
-                socket: socket_path.to_path_buf(),
-                source: e,
-            },
-        })?;
-
-    let mut writer = stream
-        .try_clone()
-        .map_err(|e| BrokerCliError::Io(format!("clone socket: {e}")))?;
-    let mut reader = BufReader::new(stream);
-
-    let request = json!({
-        "id": "1",
-        "method": method,
-        "params": params,
-    });
-    let mut line = serde_json::to_string(&request).expect("serialize request");
-    line.push('\n');
-
-    writer
-        .write_all(line.as_bytes())
-        .map_err(|e| BrokerCliError::Io(format!("write request: {e}")))?;
-
-    let mut response_line = String::new();
-    reader
-        .read_line(&mut response_line)
-        .map_err(|e| BrokerCliError::Io(format!("read response: {e}")))?;
-
-    let response: Value = serde_json::from_str(response_line.trim())
-        .map_err(|e| BrokerCliError::Protocol(format!("invalid JSON-RPC response: {e}")))?;
-
-    if let Some(err) = response.get("error").filter(|v| !v.is_null()) {
-        let code = err.get("code").and_then(|c| c.as_i64()).unwrap_or(-32000) as i32;
-        let message = err
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("unknown error")
-            .to_string();
-        return Err(BrokerCliError::DaemonRpc { code, message });
+        }
     }
-
-    Ok(response.get("result").cloned().unwrap_or(Value::Null))
 }
 
 // ---------------------------------------------------------------------------
@@ -1188,6 +1209,9 @@ pub enum BrokerCliError {
     /// Caller-side validation failure (bad `--provider`, malformed
     /// scope JSON, malformed TTL). Maps to exit 1.
     InvalidArgs(String),
+
+    /// Operator-facing refusal/guidance for hidden broker-admin surfaces.
+    Guidance(String),
 
     /// Daemon socket unreachable. Maps to exit 2.
     DaemonUnavailable {
@@ -1211,6 +1235,7 @@ impl BrokerCliError {
     pub fn exit_code(&self) -> i32 {
         match self {
             BrokerCliError::InvalidArgs(_) => 1,
+            BrokerCliError::Guidance(_) => 1,
             BrokerCliError::DaemonUnavailable { .. } => 2,
             BrokerCliError::DaemonRpc { code, .. } => {
                 // Map common daemon codes to operator-friendly exits.
@@ -1227,12 +1252,10 @@ impl std::fmt::Display for BrokerCliError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BrokerCliError::InvalidArgs(m) => write!(f, "{m}"),
-            BrokerCliError::DaemonUnavailable { socket, source } => write!(
-                f,
-                "ember daemon not running (socket: {}; underlying: {source}); \
-                 start with 'ember daemon start'",
-                socket.display()
-            ),
+            BrokerCliError::Guidance(m) => write!(f, "{m}"),
+            BrokerCliError::DaemonUnavailable { socket, source } => {
+                write!(f, "{}", crate::format_daemon_unavailable(socket, source))
+            }
             BrokerCliError::DaemonRpc { code, message } => {
                 write!(f, "daemon error (code {code}): {message}")
             }
@@ -1330,8 +1353,76 @@ mod tests {
     }
 
     #[test]
+    fn broker_list_authority_error_maps_to_guidance() {
+        let message = r#"{"error":"authority_class_not_met","reason":"missing"}"#;
+        let guidance = broker_guidance_for_rpc("broker_list", -32001, message)
+            .expect("expected friendly guidance");
+        assert!(guidance.contains("advanced operator surface"));
+        assert!(guidance.contains("ember claude-code"));
+    }
+
+    #[test]
+    fn broker_list_locked_session_maps_to_guidance() {
+        let guidance = broker_guidance_for_rpc(
+            "broker_list",
+            -32030,
+            "broker_list denied: session is locked; reopen with `ember vault unlock`",
+        )
+        .expect("expected friendly guidance");
+        assert!(guidance.contains("advanced operator surface"));
+        assert!(guidance.contains("ember vault unlock"));
+    }
+
+    #[test]
+    fn broker_issue_authority_error_does_not_map_to_guidance() {
+        let message = r#"{"error":"authority_class_not_met","reason":"missing"}"#;
+        assert!(broker_guidance_for_rpc("broker_issue", -32001, message).is_none());
+    }
+
+    #[test]
+    fn vault_add_authority_error_maps_to_unlock_guidance() {
+        let message = r#"{"error":"authority_class_not_met","reason":"missing"}"#;
+        let guidance =
+            broker_guidance_for_rpc("vault_add", -32001, message).expect("expected vault guidance");
+        assert!(guidance.contains("operator presence"));
+        assert!(guidance.contains("ember vault unlock"));
+    }
+
+    #[test]
+    fn vault_unlock_authority_error_maps_to_unlock_guidance() {
+        let message = r#"{"error":"authority_class_not_met","reason":"missing"}"#;
+        let guidance = broker_guidance_for_rpc("vault_unlock", -32001, message)
+            .expect("expected vault guidance");
+        assert!(guidance.contains("operator presence"));
+        assert!(guidance.contains("ember vault unlock"));
+    }
+
+    #[test]
+    fn vault_add_locked_session_maps_to_unlock_guidance() {
+        let guidance = broker_guidance_for_rpc(
+            "vault_add",
+            -32030,
+            "vault_add denied: session is locked; reopen with `ember vault unlock`",
+        )
+        .expect("expected locked-session guidance");
+        assert!(guidance.contains("ember vault unlock"));
+    }
+
+    #[test]
+    fn vault_remove_locked_session_maps_to_unlock_guidance() {
+        let guidance = broker_guidance_for_rpc(
+            "vault_remove",
+            -32030,
+            "vault_remove denied: session is locked; reopen with `ember vault unlock`",
+        )
+        .expect("expected locked-session guidance");
+        assert!(guidance.contains("ember vault unlock"));
+    }
+
+    #[test]
     fn exit_code_mapping_is_stable() {
         assert_eq!(BrokerCliError::InvalidArgs("x".into()).exit_code(), 1);
+        assert_eq!(BrokerCliError::Guidance("x".into()).exit_code(), 1);
         let unavailable = BrokerCliError::DaemonUnavailable {
             socket: PathBuf::from("/nonexistent.sock"),
             source: std::io::Error::from(std::io::ErrorKind::NotFound),
@@ -1500,5 +1591,127 @@ mod tests {
             matches!(err, BrokerCliError::DaemonUnavailable { .. }),
             "expected DaemonUnavailable (daemon socket not found), got: {err:?}"
         );
+    }
+
+    #[test]
+    fn register_github_unlocks_once_then_writes_with_presence_token() {
+        use std::io::{BufRead, Write as _};
+        use std::os::unix::net::UnixListener;
+        use std::time::{Duration, SystemTime};
+
+        #[derive(serde::Serialize)]
+        struct FakePresenceToken<'a> {
+            uid: u32,
+            scope: &'a str,
+            expiry: SystemTime,
+            signature: Vec<u8>,
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let pem_path = dir.path().join("key.pem");
+        std::fs::write(
+            &pem_path,
+            b"\x2d----BEGIN RSA PRIVATE KEY-----\nfake\n-----END RSA PRIVATE KEY-----\n",
+        )
+        .unwrap();
+
+        let socket_path = dir.path().join("daemon.sock");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn({
+            let socket_path = socket_path.clone();
+            move || {
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+                ready_tx.send(()).expect("signal ready");
+
+                for expected_method in [
+                    "vault_unlock_begin",
+                    "vault_unlock_complete",
+                    "vault_get",
+                    "vault_add",
+                    "vault_add",
+                    "vault_add",
+                ] {
+                    let (mut stream, _) = listener.accept().expect("accept fake daemon client");
+                    let mut reader = std::io::BufReader::new(
+                        stream.try_clone().expect("clone fake daemon stream"),
+                    );
+                    let mut line = String::new();
+                    reader
+                        .read_line(&mut line)
+                        .expect("read fake daemon request");
+                    let request: serde_json::Value =
+                        serde_json::from_str(line.trim()).expect("parse fake daemon request");
+                    assert_eq!(request["method"], serde_json::json!(expected_method));
+
+                    let response = match expected_method {
+                        "vault_unlock_begin" => serde_json::json!({
+                            "id": request["id"],
+                            "result": {
+                                "request_id": "req-gh-register",
+                                "challenge_hex": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+                                "expires_at_unix_ms": 9999999999999u64,
+                                "reason": "Unlock the daemon vault for operator commands"
+                            }
+                        }),
+                        "vault_unlock_complete" | "vault_unlock" => serde_json::json!({
+                            "id": request["id"],
+                            "result": {
+                                "unlocked": true,
+                                "presence_token": FakePresenceToken {
+                                    uid: 501,
+                                    scope: "*",
+                                    expiry: SystemTime::now() + Duration::from_secs(60),
+                                    signature: vec![1, 2, 3, 4],
+                                }
+                            }
+                        }),
+                        "vault_get" => {
+                            assert!(
+                                request["params"].get("_presence_token").is_some(),
+                                "preflight vault_get must carry the cached presence token"
+                            );
+                            serde_json::json!({
+                                "id": request["id"],
+                                "error": {
+                                    "code": -32000,
+                                    "message": "not found",
+                                }
+                            })
+                        }
+                        "vault_add" => {
+                            assert!(
+                                request["params"].get("_presence_token").is_some(),
+                                "vault_add must carry the cached presence token after upfront unlock"
+                            );
+                            serde_json::json!({
+                                "id": request["id"],
+                                "result": { "ok": true }
+                            })
+                        }
+                        other => panic!("unexpected method sequence item: {other}"),
+                    };
+
+                    let mut encoded =
+                        serde_json::to_string(&response).expect("encode fake daemon response");
+                    encoded.push('\n');
+                    stream
+                        .write_all(encoded.as_bytes())
+                        .expect("write fake daemon response");
+                }
+            }
+        });
+
+        ready_rx.recv().expect("wait for fake daemon ready");
+
+        let opts = GlobalOpts {
+            socket_path: socket_path.clone(),
+        };
+        register_github(
+            &opts, &pem_path, "123456", "789", "my-app", true, false, false,
+        )
+        .expect("register_github must unlock once and then write through the daemon");
+
+        server.join().expect("fake daemon thread");
     }
 }

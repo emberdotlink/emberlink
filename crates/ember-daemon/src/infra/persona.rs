@@ -6,6 +6,10 @@
 //! - `container_id`, `parent_grant_id` (design §"In-container extension")
 //! - `client_cert_fingerprint`, `client_cert_not_after` (design (d) cert
 //!   refresh chain, M1) — `personas_client_cert_columns_landed`
+//! - `client_cert_refresh_seq` (design (d) cert refresh chain, M2 of the
+//!   CRIT-1 fix chain) — durable monotone counter for
+//!   `bridge.cert_refreshed` Receipt bodies (design Extension 4/5).
+//!   See [`DaemonStore::increment_refresh_seq`] for the atomic increment.
 //!
 //! Anchor: `personas_client_cert_columns_landed`.
 
@@ -23,7 +27,7 @@ use x509_parser::prelude::FromDer;
 use crate::infra::store::{DaemonStore, StoreError};
 use crate::infra::vault::Vault;
 
-/// implementation-note-263 — RAII wrapper around a heap-allocated
+/// implementation-note-290 — RAII wrapper around a heap-allocated
 /// secret byte buffer that pins its backing pages in physical memory via
 /// `mlock(2)`. The Drop impl calls `munlock(2)` to release the pin.
 ///
@@ -177,14 +181,14 @@ pub struct PersonaInfo {
     pub public_key: String,
     pub created_at: String,
     pub status: String,
-    /// implementation-note-53 — container identity this
+    /// implementation-note-64 — container identity this
     /// persona was minted for. `None` for personas created via the
     /// legacy `create_persona` path (no container binding); `Some` for
     /// workload personas created via `create_agent_persona`. Used by
     /// the reconciler to refuse a duplicate spawn into the same
     /// container slot when the daemon restarts mid-spawn.
     pub container_id: Option<String>,
-    /// implementation-note-53 — parent grant this persona's
+    /// implementation-note-64 — parent grant this persona's
     /// attenuated child grant was delegated from. Lets the reconciler
     /// and receipt pipeline correlate "which agent runs under whose
     /// authority" without walking the grant chain.
@@ -226,7 +230,7 @@ impl DaemonStore {
         })
     }
 
-    /// implementation-note-53 — phase 1 of the atomic
+    /// implementation-note-64 — phase 1 of the atomic
     /// `create_agent_persona` two-phase commit. Inserts a workload
     /// persona row with `status = 'enrolling'` and binds it to the
     /// supplied `container_id` + `parent_grant_id`.
@@ -251,7 +255,7 @@ impl DaemonStore {
         container_id: &str,
         parent_grant_id: &str,
     ) -> Result<PersonaInfo, StoreError> {
-        // implementation-note-53 CRIT-4 — refuse a second
+        // implementation-note-64 CRIT-4 — refuse a second
         // spawn into a container slot that already has an enrolling
         // OR active persona bound to it. The check is racy in the
         // multi-thread sense, but the daemon's single-threaded
@@ -317,7 +321,7 @@ impl DaemonStore {
         })
     }
 
-    /// implementation-note-53 — phase 2 of the two-phase
+    /// implementation-note-64 — phase 2 of the two-phase
     /// commit. Flips a persona row from `enrolling` to `active`. The
     /// transition is gated on the row currently being in `enrolling`
     /// state: a row that has already been activated, revoked, or never
@@ -356,7 +360,7 @@ impl DaemonStore {
         Ok(())
     }
 
-    /// implementation-note-53 — reconciler entry point. Look
+    /// implementation-note-64 — reconciler entry point. Look
     /// up an enrolling persona by its bound `container_id`. The
     /// reconciler calls this before spawning into a container slot;
     /// a `Some(_)` return means a previous spawn attempt crashed
@@ -576,7 +580,7 @@ impl DaemonStore {
         })
     }
 
-    /// implementation-note-263 — return the persona's raw 32-byte
+    /// implementation-note-290 — return the persona's raw 32-byte
     /// Ed25519 seed bytes after decrypting via the attached vault.
     ///
     /// Used by [`agent_persona_two_phase_commit`] to wrap the generated
@@ -650,7 +654,64 @@ impl DaemonStore {
         Ok(())
     }
 
-    /// implementation-note-269 — return the ancestry chain for a
+    /// implementation-note-296 — atomically
+    /// increment a persona's `client_cert_refresh_seq` and return the
+    /// post-increment value.
+    ///
+    /// Backing column: `personas.client_cert_refresh_seq INTEGER NOT NULL
+    /// DEFAULT 0`. The increment uses SQLite 3.35+'s `RETURNING` clause so
+    /// the read-and-write happens in a single statement — no separate
+    /// SELECT + UPDATE that would expose a TOCTOU window. A fresh persona
+    /// row's first call returns `1`, the next returns `2`, etc.
+    ///
+    /// The counter feeds the `refresh_seq: u32` field that design
+    /// Extension 4/5 locks into the `bridge.cert_refreshed` Receipt body,
+    /// and underpins the three `verify --strict` monotonicity invariants
+    /// of the design (d) Bridge Cert Refresh chain (M3 `refresh_cert`
+    /// RPC handler).
+    ///
+    /// # Errors
+    ///
+    /// - `StoreError::NotFound` if no persona row exists with the given
+    ///   `persona_id`. The `RETURNING` clause's "no rows updated" path
+    ///   maps to `rusqlite::Error::QueryReturnedNoRows`, which we surface
+    ///   as `NotFound` rather than letting it bubble as `Sqlite(...)` —
+    ///   the caller treats a missing persona distinctly from a real DB
+    ///   failure.
+    /// - `StoreError::Sqlite` for any other underlying rusqlite error.
+    ///
+    /// # Concurrency
+    ///
+    /// The daemon's `DaemonStore` is `!Send + !Sync` and lives on a
+    /// single-threaded `tokio::task::LocalSet`, so the atomicity guarantee
+    /// is per-LocalSet-task: any two concurrent `spawn_local` callers on
+    /// the same persona observe contiguous, non-duplicate sequence values
+    /// because each `UPDATE ... RETURNING` is a single SQLite statement
+    /// and SQLite serializes writes on a single connection.
+    ///
+    /// # Return value
+    ///
+    /// `u32` — the post-increment counter. The column is stored as
+    /// SQLite `INTEGER` (i64); the cast to u32 reflects the
+    /// `refresh_seq: u32` shape design Extension 4/5 locks into the
+    /// Receipt body. Counter overflow at u32::MAX (≈ 4.3B refreshes) is
+    /// not handled here — the production cert-refresh cadence (~hourly)
+    /// would take ~500k years to reach that ceiling.
+    pub fn increment_refresh_seq(&self, persona_id: &str) -> Result<u32, StoreError> {
+        let result = self.conn().query_row(
+            "UPDATE personas SET client_cert_refresh_seq = client_cert_refresh_seq + 1 \
+             WHERE id = ?1 RETURNING client_cert_refresh_seq",
+            rusqlite::params![persona_id],
+            |row| row.get::<_, i64>(0),
+        );
+        match result {
+            Ok(v) => Ok(v as u32),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Err(StoreError::NotFound),
+            Err(e) => Err(StoreError::Sqlite(e)),
+        }
+    }
+
+    /// implementation-note-297 — return the ancestry chain for a
     /// persona starting with the persona itself, then its parent, then the
     /// parent's parent, up to `MAX_PARENT_PERSONA_CHAIN_HOPS` ancestors total
     /// (per design §Component 6 — practical chains are 3 links).
@@ -726,19 +787,19 @@ impl DaemonStore {
     }
 }
 
-/// implementation-note-269 — hop cap for `parent_persona_chain`.
+/// implementation-note-297 — hop cap for `parent_persona_chain`.
 /// design §Component 6 expects practical chains of three links
 /// (root → orchestrator → worker). The cap is also the cycle-safety
 /// fallback — see `parent_persona_chain_handles_cycle_safely`.
 pub const MAX_PARENT_PERSONA_CHAIN_HOPS: usize = 3;
 
-/// implementation-note-263 — atomic enroll → delegate → activate
+/// implementation-note-290 — atomic enroll → delegate → activate
 /// wrapper that mlocks the new persona's secret-key bytes for the
 /// duration of the commit.
 ///
 /// This is the single transactional entry-point that composes the
 /// already-shipped three-phase primitives from
-/// implementation-note-53:
+/// implementation-note-64:
 ///
 /// 1. [`DaemonStore::create_agent_persona_enrolling`] — phase 1 (insert
 ///    enrolling row, bind container slot).
@@ -773,7 +834,7 @@ pub const MAX_PARENT_PERSONA_CHAIN_HOPS: usize = 3;
 /// `PersonaInfo`. In practice the daemon attaches one vault for the
 /// entire process lifetime; the explicit arg is for documentation +
 /// future-proofing against per-call vault rotation.
-/// implementation-note-263 — compute a child TTL bounded by the
+/// implementation-note-290 — compute a child TTL bounded by the
 /// parent's remaining lifetime.
 ///
 /// Returns `Some(seconds)` capped at the parent's remaining lifetime
@@ -863,7 +924,7 @@ pub fn agent_persona_two_phase_commit(
     Ok(activated)
 }
 
-/// implementation-note-138 scaffold — thin wrapper over the
+/// implementation-note-160 scaffold — thin wrapper over the
 /// existing two-phase commit + spawn machinery for the `broker.mint_sub_persona`
 /// RPC adapter. Real implementation wires `agent_persona_two_phase_commit`
 /// with a parent-persona lookup and scope attenuation.
@@ -871,7 +932,7 @@ pub fn agent_persona_two_phase_commit(
 /// # TODO
 ///
 /// Wire the actual two-phase commit + spawn here once
-/// implementation-note-138 follow-up lands. The real body:
+/// implementation-note-160 follow-up lands. The real body:
 ///   1. Resolve `parent_persona_id` to its active grant.
 ///   2. Call `agent_persona_two_phase_commit(store, vault, child_label, grant_id)`.
 ///   3. Attenuate child grant scope to `scope` parameter.
@@ -883,7 +944,7 @@ pub async fn mint_sub_persona(
 ) -> Result<String, StoreError> {
     let _ = (parent_persona_id, child_label, scope);
     unimplemented!(
-        "two-phase commit + spawn wiring TBD - implementation-note-138 scaffold"
+        "two-phase commit + spawn wiring TBD - implementation-note-160 scaffold"
     )
 }
 
@@ -1063,6 +1124,133 @@ mod tests {
         assert!(matches!(result, Err(StoreError::NotFound)));
     }
 
+    // ------------------------------------------------------------------
+    // implementation-note-296 —
+    // `increment_refresh_seq` atomic counter on personas.
+    // ------------------------------------------------------------------
+
+    /// T1 property: 1000 sequential increments against a single persona
+    /// row must yield contiguous post-increment values 1..=1000, ending
+    /// at exactly 1000. Verifies the column starts at 0 and the
+    /// `UPDATE ... RETURNING` increments by one each call.
+    #[test]
+    fn increment_refresh_seq_1000_serial_yields_contiguous_sequence() {
+        let (store, _vault) = store_with_vault();
+        let persona = store.create_persona("agent-refresh-seq-serial").unwrap();
+
+        for expected in 1u32..=1000 {
+            let got = store.increment_refresh_seq(&persona.id).unwrap();
+            assert_eq!(
+                got, expected,
+                "increment_refresh_seq must produce contiguous post-increment values"
+            );
+        }
+
+        // Final SELECT confirms the column persisted the last value.
+        let final_val: i64 = store
+            .conn()
+            .query_row(
+                "SELECT client_cert_refresh_seq FROM personas WHERE id = ?1",
+                rusqlite::params![persona.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(final_val, 1000);
+    }
+
+    /// T1 corollary: a freshly-created persona row starts at
+    /// `client_cert_refresh_seq = 0` (the column default) and the first
+    /// `increment_refresh_seq` call returns 1.
+    #[test]
+    fn increment_refresh_seq_starts_at_zero_first_call_returns_one() {
+        let (store, _vault) = store_with_vault();
+        let persona = store.create_persona("agent-refresh-seq-zero").unwrap();
+
+        // Pre-increment value must be 0 (the column default).
+        let pre: i64 = store
+            .conn()
+            .query_row(
+                "SELECT client_cert_refresh_seq FROM personas WHERE id = ?1",
+                rusqlite::params![persona.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pre, 0, "new persona row must default to refresh_seq = 0");
+
+        let first = store.increment_refresh_seq(&persona.id).unwrap();
+        assert_eq!(first, 1, "first increment must return 1");
+    }
+
+    /// `increment_refresh_seq` against an unknown persona id surfaces
+    /// `StoreError::NotFound` (not a generic Sqlite error) so callers can
+    /// distinguish "persona was hard-deleted" from "DB failure".
+    #[test]
+    fn increment_refresh_seq_unknown_persona_returns_not_found() {
+        let (store, _vault) = store_with_vault();
+        let err = store
+            .increment_refresh_seq("persona-does-not-exist")
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NotFound));
+    }
+
+    /// T2 concurrency: N concurrent `spawn_local` tasks on the same
+    /// `LocalSet` each call `increment_refresh_seq` once on the same
+    /// persona. The collected post-increment values must be the
+    /// contiguous set `{1, 2, ..., N}` — no duplicates, no gaps — and
+    /// the final column value must equal N.
+    ///
+    /// The daemon is single-threaded by design (`DaemonStore` is
+    /// `!Send + !Sync`, lives on a `tokio::task::LocalSet`), so this
+    /// test exercises the atomicity property the runtime depends on:
+    /// even with interleaved task scheduling on the same thread, the
+    /// `UPDATE ... RETURNING` statement is indivisible from the point
+    /// of view of any other task.
+    #[tokio::test]
+    async fn increment_refresh_seq_concurrent_localset_no_gaps_no_duplicates() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (store, _vault) = store_with_vault();
+                let store = Rc::new(store);
+                let persona = store.create_persona("agent-refresh-seq-concurrent").unwrap();
+
+                const N: u32 = 256;
+                let mut handles = Vec::with_capacity(N as usize);
+                for _ in 0..N {
+                    let store_c = Rc::clone(&store);
+                    let pid = persona.id.clone();
+                    handles.push(tokio::task::spawn_local(async move {
+                        store_c.increment_refresh_seq(&pid).unwrap()
+                    }));
+                }
+
+                let mut observed: Vec<u32> = Vec::with_capacity(N as usize);
+                for h in handles {
+                    observed.push(h.await.unwrap());
+                }
+                observed.sort_unstable();
+
+                // No duplicates, no gaps: sorted observed values are 1..=N.
+                let expected: Vec<u32> = (1..=N).collect();
+                assert_eq!(
+                    observed, expected,
+                    "concurrent increments must produce contiguous sequence with no gaps/duplicates"
+                );
+
+                // Final column value is N.
+                let final_val: i64 = store
+                    .conn()
+                    .query_row(
+                        "SELECT client_cert_refresh_seq FROM personas WHERE id = ?1",
+                        rusqlite::params![persona.id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(final_val, N as i64);
+            })
+            .await;
+    }
+
     #[test]
     fn persona_root_keypair_round_trips_signing() {
         use core_crypto::grant_chain::{sign_block_zero, verify_chain};
@@ -1194,7 +1382,7 @@ mod tests {
 
     #[test]
     fn separate_store_connections_each_need_vault_attached() {
-        // implementation-note-91 follow-up — regression for the dashboard task
+        // implementation-note-105 follow-up — regression for the dashboard task
         // opening its own DaemonStore connection and never calling
         // set_vault. Two stores against the same on-disk DB are independent
         // RefCell<Option<Rc<Vault>>> handles — each must attach the vault
@@ -1237,7 +1425,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // implementation-note-53 — two-phase commit lifecycle.
+    // implementation-note-64 — two-phase commit lifecycle.
     // ------------------------------------------------------------------
 
     #[test]
@@ -1328,7 +1516,7 @@ mod tests {
 
     #[test]
     fn enrolling_persona_for_container_blocks_reconciler_spawn() {
-        // implementation-note-53 acceptance criterion —
+        // implementation-note-64 acceptance criterion —
         // simulate emberd restart mid-spawn: create a persona in
         // `enrolling` state (phase 1 committed) but never activate
         // (phase 3 lost to crash). The reconciler's lookup must
@@ -1378,7 +1566,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // implementation-note-263 — mlock + two-phase commit.
+    // implementation-note-290 — mlock + two-phase commit.
     // ------------------------------------------------------------------
 
     /// Mint a parent grant suitable for delegation by
@@ -1565,7 +1753,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // implementation-note-269 — parent_persona_chain helper.
+    // implementation-note-297 — parent_persona_chain helper.
     // ------------------------------------------------------------------
 
     /// Build a three-generation ancestry: root persona A with grant g_a,

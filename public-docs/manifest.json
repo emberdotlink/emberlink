@@ -1,0 +1,191 @@
+{
+  "generated_from": "docs/public-site/",
+  "pages": [
+    {
+      "page": "build/choosing-an-integration-surface.md",
+      "title": "Choose an Integration Surface",
+      "support_level": "Preview",
+      "source_truth": [
+        "QUICKSTART.md",
+        "docs/current-architecture.md",
+        "crates/emberlink-mcp/README.md",
+        "packages/agent-sdk-ts/README.md",
+        "packages/agent-sdk-py/README.md",
+        "project design notes"
+      ]
+    },
+    {
+      "page": "build/constructs-and-mediated-tools.md",
+      "title": "Constructs and Mediated Tools",
+      "support_level": "Preview",
+      "source_truth": [
+        "README.md",
+        "QUICKSTART.md",
+        "docs/current-architecture.md",
+        "docs/cli-reference.md"
+      ]
+    },
+    {
+      "page": "build/mcp-integration.md",
+      "title": "MCP Integration",
+      "support_level": "Preview",
+      "source_truth": [
+        "docs/current-architecture.md",
+        "crates/emberlink-mcp/README.md",
+        "docs/cli-reference.md"
+      ]
+    },
+    {
+      "page": "concepts/architecture.md",
+      "title": "Architecture Overview",
+      "support_level": "Preview",
+      "source_truth": [
+        "docs/current-architecture.md",
+        "docs/cli-reference.md",
+        "README.md"
+      ]
+    },
+    {
+      "page": "concepts/grant-warden.md",
+      "title": "The Grant Warden Model",
+      "support_level": "Preview",
+      "source_truth": [
+        "README.md",
+        "CONTEXT.md",
+        "docs/current-architecture.md"
+      ]
+    },
+    {
+      "page": "concepts/receipts-and-audit.md",
+      "title": "Receipts and Audit",
+      "support_level": "Supported",
+      "source_truth": [
+        "README.md",
+        "QUICKSTART.md",
+        "docs/current-architecture.md",
+        "docs/cli-reference.md"
+      ]
+    },
+    {
+      "page": "experimental/sdk-python.md",
+      "title": "Python SDK",
+      "support_level": "Experimental",
+      "source_truth": [
+        "packages/agent-sdk-py/README.md"
+      ]
+    },
+    {
+      "page": "experimental/sdk-typescript.md",
+      "title": "TypeScript SDK",
+      "support_level": "Experimental",
+      "source_truth": [
+        "packages/agent-sdk-ts/README.md"
+      ]
+    },
+    {
+      "page": "get-started/install-and-first-run.md",
+      "title": "Install and First Run",
+      "support_level": "Supported",
+      "source_truth": [
+        "QUICKSTART.md",
+        "README.md",
+        "docs/cli-reference.md"
+      ]
+    },
+    {
+      "page": "get-started/support-levels-and-release-posture.md",
+      "title": "Support Levels and Release Posture",
+      "support_level": "Preview",
+      "source_truth": [
+        "README.md",
+        "QUICKSTART.md",
+        "project design notes",
+        "release-notes"
+      ]
+    },
+    {
+      "page": "index.md",
+      "title": "Emberlink Docs",
+      "support_level": "Preview",
+      "source_truth": [
+        "README.md",
+        "QUICKSTART.md",
+        "docs/current-architecture.md"
+      ]
+    },
+    {
+      "page": "reference/cli-reference.md",
+      "title": "CLI Reference",
+      "support_level": "Supported",
+      "source_truth": [
+        "docs/cli-reference.md",
+        "QUICKSTART.md",
+        "docs/current-architecture.md"
+      ]
+    },
+    {
+      "page": "reference/evidence-reference.md",
+      "title": "Evidence Reference",
+      "support_level": "Supported",
+      "source_truth": [
+        "docs/cli-reference.md",
+        "docs/current-architecture.md",
+        "QUICKSTART.md",
+        "crates/emberlink-cli/src/bin/ember.rs"
+      ]
+    },
+    {
+      "page": "reference/grants-and-approvals.md",
+      "title": "Grants and Approvals",
+      "support_level": "Supported",
+      "source_truth": [
+        "docs/cli-reference.md",
+        "docs/current-architecture.md"
+      ]
+    },
+    {
+      "page": "reference/sandbox-and-isolated-execution.md",
+      "title": "Sandbox and Isolated Execution",
+      "support_level": "Preview",
+      "source_truth": [
+        "docs/cli-reference.md",
+        "docs/current-architecture.md",
+        "QUICKSTART.md",
+        "crates/emberlink-cli/src/bin/ember.rs"
+      ]
+    },
+    {
+      "page": "reference/trust-and-verification.md",
+      "title": "Trust and Verification",
+      "support_level": "Preview",
+      "source_truth": [
+        "docs/cli-reference.md",
+        "docs/current-architecture.md",
+        "crates/emberlink-cli/src/trust/list.rs",
+        "crates/emberlink-cli/src/trust/show.rs",
+        "crates/emberlink-cli/src/trust/explain.rs"
+      ]
+    },
+    {
+      "page": "use/cli-and-troubleshooting.md",
+      "title": "CLI and Troubleshooting",
+      "support_level": "Supported",
+      "source_truth": [
+        "docs/cli-reference.md",
+        "QUICKSTART.md",
+        "docs/current-architecture.md"
+      ]
+    },
+    {
+      "page": "use/github-setup-and-auth.md",
+      "title": "GitHub Setup and Auth",
+      "support_level": "Preview",
+      "source_truth": [
+        "docs/cli-reference.md",
+        "docs/current-architecture.md",
+        "docs/emberlink-github-app-manifest.md",
+        "docs/launch/v0.3.0-operator-rc-runbook.md"
+      ]
+    }
+  ]
+}

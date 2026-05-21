@@ -11,7 +11,7 @@ publish = false
 name = "ember_exec"
 path = "src/lib.rs"
 
-# implementation-note-367: production-shape binary target alongside the
+# implementation-note-411: production-shape binary target alongside the
 # spike library. The bin owns the CLI + UDS accept loop; the lib retains
 # the PtyBridge spike for the spawn-integration subtask (C) to wire in.
 [[bin]]
@@ -19,7 +19,7 @@ name = "ember-exec"
 path = "src/main.rs"
 
 [dependencies]
-# implementation-note-368: blake3 for the content-hash gate;
+# implementation-note-412: blake3 for the content-hash gate;
 # nix for `setresuid` / `setresgid` privilege drop.
 blake3 = "1"
 clap = { version = "4", features = ["derive"] }

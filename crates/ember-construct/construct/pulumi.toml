@@ -4,16 +4,20 @@
 # broker.resolve consults this to decide whether the action requires a
 # credential mint, an existing grant, or refuses.
 #
-# Credential injection: broker materializes PULUMI_CONFIG_PASSPHRASE from
-# vault key pulumi/<fqn> (where <fqn> is <org>/<project>/<stack>) per design.
-# The shim declares PULUMI_CONFIG_PASSPHRASE in env_passthrough; daemon
-# zeroizes on child exit.
+# Legacy credential injection: broker can materialize
+# PULUMI_CONFIG_PASSPHRASE from vault key pulumi/<fqn> (where <fqn> is
+# <org>/<project>/<stack>) per design. That path predates ember-kms and is no
+# longer the canonical unattended posture. Canonical unattended Pulumi uses a
+# runtime KMS-backed secrets provider (`hashivault://...` / ember-kms per ADR
+# 100). The shim still declares PULUMI_CONFIG_PASSPHRASE in env_passthrough for
+# legacy/dev stacks; daemon zeroizes on child exit.
 
 [meta]
 name = "ember-pulumi"
 version = "0.1.0"
 publisher = "did:emberlink"
-description = "Pulumi CLI Construct. Mediates `pulumi` invocations through ember's credential broker: destructive operations (up, destroy, import) require biometric approval; config mutations (config set, config rm) require biometric approval to protect PULUMI_CONFIG_PASSPHRASE-encrypted secrets; destroy is budget-capped at 1 per session. PULUMI_CONFIG_PASSPHRASE is injected from vault key pulumi/<fqn> per design. Read-only verbs (preview, stack ls, config get, about, version) are passthrough — no broker mediation."
+description = "Pulumi CLI Construct. Mediates `pulumi` invocations through ember's credential broker: destructive operations (up, destroy, import) require biometric approval; config mutations (config set, config rm) require biometric approval to protect stack-secret state; destroy is budget-capped at 1 per session. Canonical unattended posture is a runtime KMS-backed secrets provider (`hashivault://...` / ember-kms per design). Legacy `PULUMI_CONFIG_PASSPHRASE` injection from vault key pulumi/<fqn> per design remains for dev/local stacks only. Read-only verbs (preview, stack ls, config get, about, version) are passthrough — no broker mediation."
+headless_requirements = ["runtime_kms"]
 
 # Default policy for unlisted action keys.
 default = "deny"

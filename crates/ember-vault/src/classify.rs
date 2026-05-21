@@ -159,7 +159,7 @@ fn is_strict_read_only(verb: &str) -> bool {
 /// kv verb. Returns `None` if the path is missing or starts with `-`.
 ///
 /// WIP-FOR: daemon-side scope-check consumer (no specific task ID
-/// yet; tracked under the implementation-note-380 + ember-vault Construct
+/// yet; tracked under the implementation-note-426 + ember-vault Construct
 /// gating series). The classifier itself does not consume the path;
 /// this helper is provided so the future daemon-side authorization
 /// path can validate `kv` operations against the persona's vault scope
@@ -824,7 +824,7 @@ mod tests {
     // hold a `MockBroker::new(BrokerProvider::HashiVault)`, and a request
     // that declares `provider = HashiVault` round-trips through issue →
     // revoke without panicking. Real HashiVault impl is
-    // implementation-note-381 (separate task).
+    // implementation-note-427 (separate task).
 
     use core_broker::{Broker, BrokerError, BrokerProvider, BrokerRequest, MockBroker};
     use std::time::Duration;

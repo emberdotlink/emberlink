@@ -1,5 +1,5 @@
 //!
-//! Pins implementation-note-360 acceptance: dropping a
+//! Pins implementation-note-403 acceptance: dropping a
 //! `TestDaemonHandle` reaps the wrapped child via SIGTERM (with SIGKILL
 //! fallback) so a panicking test cannot leak the spawned daemon process.
 

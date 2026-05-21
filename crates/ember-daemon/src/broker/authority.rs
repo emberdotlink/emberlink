@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use chrono::Utc;
 use core_broker::{Broker, BrokerError, BrokerProvider, BrokerRequest, BrokeredCredential};
@@ -18,6 +19,8 @@ use uuid::Uuid;
 
 use crate::broker::handler::DynBroker;
 use crate::infra::credential_store::{CredentialStore, StoreError};
+
+const GITHUB_PAT_STORE_KEY: &str = "github-pat";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialPrecedence {
@@ -60,9 +63,20 @@ pub struct BrokerAuthorityResolver {
     precedence: CredentialPrecedence,
 }
 
+static CURRENT_RESOLVER: once_cell::sync::OnceCell<Arc<BrokerAuthorityResolver>> =
+    once_cell::sync::OnceCell::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GithubAuthoritySource {
+    App,
+    Pat,
+}
+
 #[derive(Clone)]
 pub enum ResolvedBrokerAuthority {
-    Github(GhAppCredentials),
+    GithubApp(GhAppCredentials),
+    GithubPat(SecretString),
     AwsSts((AwsLongLivedCredentials, Option<String>)),
     Gcp((GcpServiceAccountKey, Option<String>)),
     AzureCli(AzureServicePrincipal),
@@ -75,7 +89,7 @@ pub enum ResolvedBrokerAuthority {
 impl ResolvedBrokerAuthority {
     fn provider(&self) -> BrokerProvider {
         match self {
-            Self::Github(_) => BrokerProvider::Github,
+            Self::GithubApp(_) | Self::GithubPat(_) => BrokerProvider::Github,
             Self::AwsSts(_) => BrokerProvider::AwsSts,
             Self::Gcp(_) => BrokerProvider::Gcp,
             Self::AzureCli(_) => BrokerProvider::AzureCli,
@@ -90,6 +104,14 @@ impl ResolvedBrokerAuthority {
 impl BrokerAuthorityResolver {
     pub fn new(store: Arc<dyn CredentialStore>, precedence: CredentialPrecedence) -> Self {
         Self { store, precedence }
+    }
+
+    pub fn install_current(resolver: Arc<Self>) {
+        let _ = CURRENT_RESOLVER.set(resolver);
+    }
+
+    pub fn current() -> Option<Arc<Self>> {
+        CURRENT_RESOLVER.get().cloned()
     }
 
     pub fn precedence(&self) -> CredentialPrecedence {
@@ -112,10 +134,7 @@ impl BrokerAuthorityResolver {
         provider: BrokerProvider,
     ) -> Result<Option<ResolvedBrokerAuthority>, BrokerAuthorityError> {
         match provider {
-            BrokerProvider::Github => self
-                .resolve_github()
-                .await
-                .map(|opt| opt.map(ResolvedBrokerAuthority::Github)),
+            BrokerProvider::Github => self.resolve_github().await,
             BrokerProvider::AwsSts => self
                 .resolve_aws_sts()
                 .await
@@ -150,20 +169,28 @@ impl BrokerAuthorityResolver {
         }
     }
 
-    async fn resolve_github(&self) -> Result<Option<GhAppCredentials>, BrokerAuthorityError> {
-        match self.precedence {
+    pub async fn github_authority_source(
+        &self,
+    ) -> Result<Option<GithubAuthoritySource>, BrokerAuthorityError> {
+        Ok(self.resolve_github().await?.map(|authority| match authority {
+            ResolvedBrokerAuthority::GithubApp(_) => GithubAuthoritySource::App,
+            ResolvedBrokerAuthority::GithubPat(_) => GithubAuthoritySource::Pat,
+            _ => unreachable!("resolve_github only returns github authority"),
+        }))
+    }
+
+    async fn resolve_github(&self) -> Result<Option<ResolvedBrokerAuthority>, BrokerAuthorityError> {
+        let app = match self.precedence {
             CredentialPrecedence::VaultFirst => {
                 match crate::broker::github_config::github_config_from_store(&*self.store).await {
-                    Ok(Some(creds)) => Ok(Some(creds)),
-                    Ok(None) => Ok(crate::broker::github_config::load_gh_app_credentials()
-                        .map_err(|err| self.file_error(BrokerProvider::Github, err))?),
+                    Ok(Some(creds)) => Some(creds),
+                    Ok(None) => crate::broker::github_config::load_gh_app_credentials()
+                        .map_err(|err| self.file_error(BrokerProvider::Github, err))?,
                     Err(err) => {
                         warn_store_fallback(BrokerProvider::Github, &err);
-                        Ok(
-                            crate::broker::github_config::load_gh_app_credentials().map_err(
-                                |load_err| self.file_error(BrokerProvider::Github, load_err),
-                            )?,
-                        )
+                        crate::broker::github_config::load_gh_app_credentials().map_err(
+                            |load_err| self.file_error(BrokerProvider::Github, load_err),
+                        )?
                     }
                 }
             }
@@ -171,20 +198,53 @@ impl BrokerAuthorityResolver {
                 match crate::broker::github_config::load_gh_app_credentials()
                     .map_err(|err| self.file_error(BrokerProvider::Github, err))?
                 {
-                    Some(creds) => Ok(Some(creds)),
+                    Some(creds) => Some(creds),
                     None => {
                         match crate::broker::github_config::github_config_from_store(&*self.store)
                             .await
                         {
-                            Ok(opt) => Ok(opt),
+                            Ok(opt) => opt,
                             Err(err) => {
                                 warn_store_absent(BrokerProvider::Github, &err);
-                                Ok(None)
+                                None
                             }
                         }
                     }
                 }
             }
+        };
+
+        if let Some(creds) = app {
+            return Ok(Some(ResolvedBrokerAuthority::GithubApp(creds)));
+        }
+
+        Ok(self
+            .resolve_github_pat()
+            .await?
+            .map(ResolvedBrokerAuthority::GithubPat))
+    }
+
+    async fn resolve_github_pat(&self) -> Result<Option<SecretString>, BrokerAuthorityError> {
+        match self.store.get(GITHUB_PAT_STORE_KEY).await {
+            Ok(bytes) => {
+                let token = String::from_utf8(bytes).map_err(|e| {
+                    BrokerAuthorityError::Message(format!(
+                        "{GITHUB_PAT_STORE_KEY} present but not valid UTF-8: {e}"
+                    ))
+                })?;
+                if token.trim().is_empty() {
+                    return Err(BrokerAuthorityError::Message(format!(
+                        "{GITHUB_PAT_STORE_KEY} present but empty"
+                    )));
+                }
+                Ok(Some(SecretString::from(token)))
+            }
+            Err(StoreError::NotFound(_)) => Ok(None),
+            Err(err) => Err(BrokerAuthorityError::Message(format!(
+                "provider github PAT fallback load failed under {} precedence: {}",
+                self.precedence.as_str(),
+                err
+            ))),
         }
     }
 
@@ -650,7 +710,14 @@ async fn github_store_configured_from_metadata(
         }
     }
 
-    Ok(false)
+    github_pat_store_configured_from_metadata(store).await
+}
+
+async fn github_pat_store_configured_from_metadata(
+    store: &dyn CredentialStore,
+) -> Result<bool, StoreError> {
+    let keys = store.list_metadata(None).await?;
+    Ok(keys.iter().any(|found| found == GITHUB_PAT_STORE_KEY))
 }
 
 async fn azure_store_configured_from_metadata(
@@ -816,6 +883,10 @@ pub(crate) fn local_store_authority_keys_for_refs(
         }
     }
 
+    if wants("github") && has(GITHUB_PAT_STORE_KEY) {
+        enrolled.insert(GITHUB_PAT_STORE_KEY.to_string());
+    }
+
     Ok(enrolled.into_iter().collect())
 }
 
@@ -875,9 +946,10 @@ impl ReloadingBroker {
     ) -> Result<BrokeredCredential, BrokerError> {
         debug_assert_eq!(authority.provider(), self.provider);
         match authority {
-            ResolvedBrokerAuthority::Github(creds) => {
+            ResolvedBrokerAuthority::GithubApp(creds) => {
                 Broker::issue(&GitHubBroker::new(creds), req).await
             }
+            ResolvedBrokerAuthority::GithubPat(token) => issue_github_pat(req, token),
             ResolvedBrokerAuthority::AwsSts((creds, default_role_arn)) => {
                 Broker::issue(&AwsStsBroker::new(creds, default_role_arn), req).await
             }
@@ -921,7 +993,8 @@ impl ReloadingBroker {
             ResolvedBrokerAuthority::Vercel(parent) => {
                 self.revoke_vercel(parent, materialization_id).await
             }
-            ResolvedBrokerAuthority::Github(_)
+            ResolvedBrokerAuthority::GithubApp(_)
+            | ResolvedBrokerAuthority::GithubPat(_)
             | ResolvedBrokerAuthority::AwsSts(_)
             | ResolvedBrokerAuthority::AzureCli(_) => Ok(()),
         }
@@ -1254,6 +1327,29 @@ fn required_plaintext(
     plaintext.ok_or_else(|| BrokerError::UnknownMaterialization(materialization_id.to_string()))
 }
 
+fn issue_github_pat(
+    req: BrokerRequest,
+    token: SecretString,
+) -> Result<BrokeredCredential, BrokerError> {
+    if req.provider != BrokerProvider::Github {
+        return Err(BrokerError::InvalidScope(format!(
+            "GitHub PAT fallback received request for {}",
+            req.provider.as_str()
+        )));
+    }
+
+    let expires_at = SystemTime::now()
+        .checked_add(req.ttl.max(Duration::from_secs(1)))
+        .unwrap_or(SystemTime::now() + Duration::from_secs(3600));
+    let materialization_id = format!("gh-pat-{}", Uuid::new_v4());
+
+    Ok(BrokeredCredential {
+        token,
+        expires_at,
+        materialization_id,
+    })
+}
+
 fn embedded_token_id(prefix: &str, materialization_id: &str) -> Result<String, BrokerError> {
     let suffix = materialization_id.strip_prefix(prefix).ok_or_else(|| {
         BrokerError::Other(format!(
@@ -1418,6 +1514,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_metadata_probe_accepts_github_pat_without_app() {
+        let store = Arc::new(MetadataOnlyStore {
+            keys: Mutex::new(vec![GITHUB_PAT_STORE_KEY.to_string()]),
+        });
+        let resolver = BrokerAuthorityResolver::new(store, CredentialPrecedence::VaultFirst);
+        assert!(
+            resolver
+                .startup_configured(BrokerProvider::Github, StartupProbeMode::MetadataOnly)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn github_resolution_falls_back_to_pat_when_app_absent() {
+        static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let _guard = ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("env lock");
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let missing_env = tmp.path().join("missing.env");
+        let missing_pem = tmp.path().join("missing.pem");
+        let prev_env = std::env::var("EMBER_APP_ENV_PATH").ok();
+        let prev_pem = std::env::var("EMBER_APP_PEM_PATH").ok();
+        unsafe {
+            std::env::set_var("EMBER_APP_ENV_PATH", &missing_env);
+            std::env::set_var("EMBER_APP_PEM_PATH", &missing_pem);
+        }
+
+        let store = Arc::new(MockCredentialStore::new());
+        store
+            .put(GITHUB_PAT_STORE_KEY, b"ghp_test_pat_value")
+            .await
+            .unwrap();
+        let resolver = BrokerAuthorityResolver::new(store, CredentialPrecedence::VaultFirst);
+
+        let authority = resolver
+            .resolve(BrokerProvider::Github)
+            .await
+            .unwrap()
+            .expect("PAT fallback authority present");
+        let source = resolver
+            .github_authority_source()
+            .await
+            .unwrap()
+            .expect("PAT source present");
+
+        let ResolvedBrokerAuthority::GithubPat(token) = authority else {
+            panic!("expected PAT-backed github authority");
+        };
+        unsafe {
+            match prev_env {
+                Some(v) => std::env::set_var("EMBER_APP_ENV_PATH", v),
+                None => std::env::remove_var("EMBER_APP_ENV_PATH"),
+            }
+            match prev_pem {
+                Some(v) => std::env::set_var("EMBER_APP_PEM_PATH", v),
+                None => std::env::remove_var("EMBER_APP_PEM_PATH"),
+            }
+        }
+        assert_eq!(token.expose_secret(), "ghp_test_pat_value");
+        assert_eq!(source, GithubAuthoritySource::Pat);
+    }
+
+    #[tokio::test]
     async fn startup_metadata_probe_accepts_azure_oidc_variant() {
         let store = Arc::new(MetadataOnlyStore {
             keys: Mutex::new(vec![
@@ -1504,6 +1667,14 @@ mod tests {
                 "github/apps/ember/install-123/private-key".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn local_store_authority_keys_for_refs_includes_github_pat() {
+        let keys =
+            local_store_authority_keys_for_refs(&[GITHUB_PAT_STORE_KEY.to_string()], &["github".to_string()])
+                .unwrap();
+        assert_eq!(keys, vec![GITHUB_PAT_STORE_KEY.to_string()]);
     }
 
     #[tokio::test(flavor = "current_thread")]

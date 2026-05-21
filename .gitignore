@@ -37,4 +37,8 @@ web/dist/
 .playwright-cli/
 demo/screenshots/
 build/
+!docs/public-site/build/
+!docs/public-site/build/*.md
+!public-docs/build/
+!public-docs/build/*.md
 infra/pulumi/codegen/helm-values-cache/

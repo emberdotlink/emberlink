@@ -22,6 +22,8 @@ const PLIST_LABEL: &str = "sh.emberlink.daemon.dev";
 /// sites; a missing value would leave a `{{…}}` token in the rendered plist,
 /// which `plutil -lint` would reject.
 pub struct DevInstallVars {
+    /// Launchd label for this worktree-scoped dev runtime.
+    pub label: String,
     /// Absolute path to the dev `emberd` binary, e.g.
     /// `/usr/local/bin/emberd-dev`.
     pub ember_dev_bin: String,
@@ -29,9 +31,24 @@ pub struct DevInstallVars {
     /// `sha256:abc123:sha256:def456`. Injected verbatim as
     /// `EMBER_TRUST_ROOTS`.
     pub trust_roots: String,
-    /// Value for the `{{HOME}}` placeholder. Typically the home directory of
-    /// the `_ember_dev` system user, e.g. `/var/lib/ember-dev`.
+    /// Operator home directory baked into the dev LaunchDaemon environment so
+    /// the separate-uid daemon resolves dev-owned files under the operator's
+    /// tree rather than `_ember_dev`'s directory-service home.
     pub home: String,
+    /// Absolute config file path passed through `EMBER_CONFIG`.
+    pub config_path: String,
+    /// Absolute daemon socket path passed through `EMBER_DAEMON_SOCKET`.
+    pub socket_path: String,
+    /// Absolute GitHub App env-file path for the dev daemon.
+    pub gh_app_env_path: String,
+    /// Absolute GitHub App PEM path for the dev daemon.
+    pub gh_app_pem_path: String,
+    /// Absolute vault directory path for the dev daemon.
+    pub vault_dir: String,
+    /// Absolute binary manifest path for the dev daemon.
+    pub manifest_path: String,
+    /// Per-runtime stderr log path.
+    pub stderr_path: String,
 }
 
 /// Render the plist template by substituting all `{{…}}` placeholders.
@@ -39,9 +56,17 @@ pub struct DevInstallVars {
 /// Returns the rendered XML string. Does not write to disk.
 pub fn render_plist(vars: &DevInstallVars) -> String {
     PLIST_TEMPLATE
+        .replace("{{PLIST_LABEL}}", &vars.label)
         .replace("{{EMBER_DEV_BIN}}", &vars.ember_dev_bin)
         .replace("{{TRUST_ROOTS}}", &vars.trust_roots)
         .replace("{{HOME}}", &vars.home)
+        .replace("{{CONFIG_PATH}}", &vars.config_path)
+        .replace("{{SOCKET_PATH}}", &vars.socket_path)
+        .replace("{{GH_APP_ENV_PATH}}", &vars.gh_app_env_path)
+        .replace("{{GH_APP_PEM_PATH}}", &vars.gh_app_pem_path)
+        .replace("{{VAULT_DIR}}", &vars.vault_dir)
+        .replace("{{MANIFEST_PATH}}", &vars.manifest_path)
+        .replace("{{STDERR_PATH}}", &vars.stderr_path)
 }
 
 /// Abstraction over launchctl + filesystem writes so tests can inject stubs
@@ -98,6 +123,7 @@ impl InstallOps for RealInstallOps {
     fn acquire_lock(&self, path: &str) -> io::Result<LockGuard> {
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .write(true)
             .mode(0o600)
             .open(path)?;
@@ -113,10 +139,9 @@ impl InstallOps for RealInstallOps {
         if !status.success() {
             let code = status.code().unwrap_or(-1);
             if code != 113 {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("launchctl bootout exited {code}"),
-                ));
+                return Err(io::Error::other(format!(
+                    "launchctl bootout exited {code}"
+                )));
             }
         }
         Ok(())
@@ -128,10 +153,9 @@ impl InstallOps for RealInstallOps {
             .status()?;
         if !status.success() {
             let code = status.code().unwrap_or(-1);
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("launchctl bootstrap exited {code}"),
-            ));
+            return Err(io::Error::other(format!(
+                "launchctl bootstrap exited {code}"
+            )));
         }
         Ok(())
     }
@@ -192,9 +216,21 @@ mod tests {
 
     fn test_vars() -> DevInstallVars {
         DevInstallVars {
-            ember_dev_bin: "/usr/local/bin/emberd-dev".to_string(),
+            label: "sh.emberlink.daemon.dev.worktree-a-123456789abc".to_string(),
+            ember_dev_bin: "/home/test-operator/.ember-dev/envs/worktree-a-123456789abc/binaries/emberd".to_string(),
             trust_roots: "sha256:abc123def456".to_string(),
-            home: "/var/lib/ember-dev".to_string(),
+            home: "/home/test-operator".to_string(),
+            config_path: "/home/test-operator/.ember-dev/envs/worktree-a-123456789abc/config.toml".to_string(),
+            socket_path: "/home/test-operator/.ember-dev/envs/worktree-a-123456789abc/run/daemon.sock".to_string(),
+            gh_app_env_path: "/home/test-operator/.config/emberlink-dev/github.env".to_string(),
+            gh_app_pem_path: "/home/test-operator/.config/emberlink-dev/github-app.pem"
+                .to_string(),
+            vault_dir: "/home/test-operator/.ember-dev/envs/worktree-a-123456789abc/vault"
+                .to_string(),
+            manifest_path:
+                "/home/test-operator/.ember-dev/envs/worktree-a-123456789abc/binaries/manifest.toml"
+                    .to_string(),
+            stderr_path: "/var/log/emberd.dev.worktree-a-123456789abc.err".to_string(),
         }
     }
 
@@ -225,30 +261,47 @@ mod tests {
         let rendered = render_plist(&vars);
 
         assert!(
-            rendered.contains("/usr/local/bin/emberd-dev"),
+            rendered.contains(
+                "/home/test-operator/.ember-dev/envs/worktree-a-123456789abc/binaries/emberd"
+            ),
             "binary path missing from rendered plist"
         );
         assert!(
             rendered.contains("sha256:abc123def456"),
             "trust roots missing from rendered plist"
         );
-        // HOME substitution applies to multiple keys; check at least one
         assert!(
-            rendered.contains("/var/lib/ember-dev/.ember-dev/vault"),
+            rendered.contains("/home/test-operator/.ember-dev/envs/worktree-a-123456789abc/vault"),
             "HOME-derived vault path missing from rendered plist"
         );
         assert!(
-            rendered.contains("/var/lib/ember-dev/.ember-dev/run/daemon.dev.sock"),
-            "HOME-derived socket path missing from rendered plist"
+            rendered.contains(
+                "/home/test-operator/.ember-dev/envs/worktree-a-123456789abc/run/daemon.sock"
+            ),
+            "explicit socket path missing from rendered plist"
+        );
+        assert!(
+            rendered.contains(
+                "/home/test-operator/.ember-dev/envs/worktree-a-123456789abc/config.toml"
+            ),
+            "explicit config path missing from rendered plist"
+        );
+        assert!(
+            rendered.contains("/home/test-operator/.config/emberlink-dev/github.env"),
+            "explicit GitHub env path missing from rendered plist"
+        );
+        assert!(
+            rendered.contains("/home/test-operator/.config/emberlink-dev/github-app.pem"),
+            "explicit GitHub PEM path missing from rendered plist"
         );
     }
 
     #[test]
-    fn render_preserves_static_label() {
+    fn render_inserts_dynamic_label() {
         let vars = test_vars();
         let rendered = render_plist(&vars);
         assert!(
-            rendered.contains("sh.emberlink.daemon.dev"),
+            rendered.contains("sh.emberlink.daemon.dev.worktree-a-123456789abc"),
             "plist label missing from rendered output"
         );
     }
@@ -263,7 +316,7 @@ mod tests {
         assert!(rendered.contains("<string>dev</string>"), "flavor missing");
         // StandardErrorPath
         assert!(
-            rendered.contains("/var/log/emberd.dev.err"),
+            rendered.contains("/var/log/emberd.dev.worktree-a-123456789abc.err"),
             "stderr log path missing"
         );
         // KeepAlive

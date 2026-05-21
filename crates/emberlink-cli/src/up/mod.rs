@@ -19,7 +19,18 @@ use std::process::Command;
 use crate::launcher::claude_code::SessionRegistration;
 use crate::launcher::presence;
 
-/// implementation-note-382 — container runtime engines `ember up`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IsolatedClaudeCodeCapability {
+    Ready {
+        engine: RuntimeEngine,
+        template_path: PathBuf,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
+/// implementation-note-428 — container runtime engines `ember up`
 /// detects on the host. Order tracks design review 2026-05-15 compose-
 /// topology D7 (Docker first, then OrbStack on macOS, then Podman, then
 /// the SCION ephemeral runtime).
@@ -36,6 +47,24 @@ pub enum RuntimeEngine {
 }
 
 impl RuntimeEngine {
+    pub fn from_backend_hint(hint: &str) -> io::Result<Self> {
+        match hint {
+            "docker" => Ok(RuntimeEngine::Docker),
+            "orbstack" => Ok(RuntimeEngine::OrbStack),
+            "podman" => Ok(RuntimeEngine::Podman),
+            "scion" => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "backend hint `scion` is not wired on current main; use Docker, OrbStack, or Podman for the isolated path",
+            )),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "unknown backend hint `{other}`. Supported isolated backends on current main: docker | orbstack | podman"
+                ),
+            )),
+        }
+    }
+
     /// Binary the compose-up shell-out invokes. OrbStack ships a
     /// `docker` shim so the compose path is identical.
     pub fn compose_binary(self) -> &'static str {
@@ -81,6 +110,21 @@ pub fn detect_runtime_engine() -> io::Result<Option<RuntimeEngine>> {
     Ok(None)
 }
 
+pub fn detect_runtime_engine_with_hint(hint: Option<&str>) -> io::Result<Option<RuntimeEngine>> {
+    match hint {
+        None => detect_runtime_engine(),
+        Some(hint) => {
+            let wanted = RuntimeEngine::from_backend_hint(hint)?;
+            let present = match wanted {
+                RuntimeEngine::Docker => which_on_path("docker")?.is_some(),
+                RuntimeEngine::OrbStack => which_on_path("orbctl")?.is_some(),
+                RuntimeEngine::Podman => which_on_path("podman")?.is_some(),
+            };
+            if present { Ok(Some(wanted)) } else { Ok(None) }
+        }
+    }
+}
+
 /// Best-effort `which`-style lookup. Returns the absolute path of the
 /// first PATH entry that contains `binary`, `Ok(None)` if no PATH
 /// entry resolves.
@@ -115,12 +159,106 @@ pub fn missing_runtime_remediation() -> &'static str {
     }
 }
 
+fn resolve_profile(profile: Option<&str>) -> io::Result<String> {
+    let profile = profile.unwrap_or("dev").to_string();
+    if matches!(profile.as_str(), "dev" | "headless" | "demo") {
+        Ok(profile)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unknown profile: {profile}. Supported: dev | headless | demo"),
+        ))
+    }
+}
+
+fn resolve_compose_template_path(current_dir: &Path) -> PathBuf {
+    if let Ok(path) = std::env::var("EMBER_COMPOSE_TEMPLATE") {
+        return PathBuf::from(path);
+    }
+    current_dir.join("crates/headless-runtime/templates/compose.yml.j2")
+}
+
+pub fn detect_isolated_claude_code_capability(
+    current_dir: &Path,
+    backend_hint: Option<&str>,
+) -> io::Result<IsolatedClaudeCodeCapability> {
+    let Some(engine) = detect_runtime_engine_with_hint(backend_hint)? else {
+        return Ok(IsolatedClaudeCodeCapability::Unavailable {
+            reason: missing_runtime_remediation().to_string(),
+        });
+    };
+
+    let template_path = resolve_compose_template_path(current_dir);
+    if !template_path.exists() {
+        return Ok(IsolatedClaudeCodeCapability::Unavailable {
+            reason: format!(
+                "compose template not found at {} — isolated launch must run from the emberlink workspace root, or set EMBER_COMPOSE_TEMPLATE",
+                template_path.display()
+            ),
+        });
+    }
+
+    Ok(IsolatedClaudeCodeCapability::Ready {
+        engine,
+        template_path,
+    })
+}
+
+pub fn open_claude_code_isolated(
+    profile: Option<&str>,
+    backend_hint: Option<&str>,
+) -> io::Result<()> {
+    let profile = resolve_profile(profile)?;
+    let workspace_root = std::env::current_dir()?;
+    let capability = detect_isolated_claude_code_capability(&workspace_root, backend_hint)?;
+    let (engine, template_path) = match capability {
+        IsolatedClaudeCodeCapability::Ready {
+            engine,
+            template_path,
+        } => (engine, template_path),
+        IsolatedClaudeCodeCapability::Unavailable { reason } => {
+            return Err(io::Error::new(io::ErrorKind::NotFound, reason));
+        }
+    };
+
+    println!(
+        "Runtime: {} ({})",
+        engine.display_name(),
+        engine.compose_binary()
+    );
+
+    let run_dir = dirs_next::home_dir()
+        .ok_or_else(|| io::Error::other("could not resolve $HOME for ~/.ember/run"))?
+        .join(".ember/run")
+        .join(format!("{}-{}", profile, chrono::Utc::now().timestamp()));
+    std::fs::create_dir_all(&run_dir)?;
+    let bridge_cert_dir = run_dir.join("certs");
+    std::fs::create_dir_all(&bridge_cert_dir)?;
+    let compose_path = run_dir.join("compose.yml");
+
+    let context = ComposeRenderContext::default_for_profile(profile.clone(), bridge_cert_dir);
+    let rendered = render_compose_template(&template_path, &context)?;
+    std::fs::write(&compose_path, &rendered)?;
+    println!("Compose: {}", compose_path.display());
+
+    let (stdout, _stderr) = compose_up(engine, &compose_path, &profile)?;
+    if !stdout.trim().is_empty() {
+        println!("{}", stdout.trim_end());
+    }
+
+    eprintln!(
+        "note: bridge cert provisioning + `bridge-cli ping` healthcheck land once implementation-note-454 wires the daemon presence RPC. The compose stack is up; the trust handshake is not yet enforced from this verb."
+    );
+    println!("\nember up: session ready (profile={profile})");
+    Ok(())
+}
+
 /// Render the compose template at `template_path` (a Jinja2 file —
 /// canonical location `crates/headless-runtime/templates/compose.yml.j2`)
 /// with the supplied per-run context variables. Returns the rendered
 /// YAML as a UTF-8 string.
 ///
-/// implementation-note-382: uses minijinja's strict-undefined mode so
+/// implementation-note-428: uses minijinja's strict-undefined mode so
 /// missing required variables surface as render errors at boot time
 /// rather than silently leaving the template with `{{ var }}` markers
 /// that `docker compose` would refuse to parse later.
@@ -320,13 +458,20 @@ pub fn parse_session_open_response(
             .as_str()
             .unwrap_or("http://127.0.0.1:8484")
             .to_string();
+        let anthropic_base_url = raw["anthropic_base_url"].as_str().map(|s| s.to_string());
+        let anthropic_custom_headers = raw["anthropic_custom_headers"]
+            .as_str()
+            .map(|s| s.to_string());
         let git_proxy_url = raw["git_proxy_url"].as_str().map(|s| s.to_string());
+        let ssh_auth_sock = raw["ssh_auth_sock"].as_str().map(|s| s.to_string());
         return Ok(Ok(SessionRegistration {
             session_id: session_id.to_string(),
             grant_id: grant_id.to_string(),
             proxy_url,
+            anthropic_base_url,
+            anthropic_custom_headers,
             git_proxy_url,
-            ssh_auth_sock: None,
+            ssh_auth_sock,
         }));
     }
 
@@ -379,13 +524,43 @@ mod tests {
             "grant_id": "grt_abc",
             "proxy_url": "http://127.0.0.1:9001",
             "git_proxy_url": "http://127.0.0.1:9002",
+            "ssh_auth_sock": "/tmp/ember-ssh-agent.sock",
         });
         let result = parse_session_open_response(&raw).expect("should parse");
         let reg = result.expect("should be Ok(registration), not Err(presence)");
         assert_eq!(reg.session_id, "sess_abc");
         assert_eq!(reg.grant_id, "grt_abc");
         assert_eq!(reg.proxy_url, "http://127.0.0.1:9001");
+        assert_eq!(reg.anthropic_base_url, None);
+        assert_eq!(reg.anthropic_custom_headers, None);
         assert_eq!(reg.git_proxy_url.as_deref(), Some("http://127.0.0.1:9002"));
+        assert_eq!(
+            reg.ssh_auth_sock.as_deref(),
+            Some("/tmp/ember-ssh-agent.sock")
+        );
+    }
+
+    #[test]
+    fn parse_registration_with_anthropic_gateway_bundle() {
+        let raw = json!({
+            "session_id": "sess_abc",
+            "grant_id": "grt_abc",
+            "proxy_url": "http://127.0.0.1:9001",
+            "anthropic_base_url": "http://127.0.0.1:9001",
+            "anthropic_custom_headers": "X-Ember-Persona: persona-main\nX-Ember-Credential: anthropic-key\nX-Ember-Target: https://api.anthropic.com",
+        });
+        let result = parse_session_open_response(&raw).expect("should parse");
+        let reg = result.expect("should be Ok(registration), not Err(presence)");
+        assert_eq!(
+            reg.anthropic_base_url.as_deref(),
+            Some("http://127.0.0.1:9001")
+        );
+        assert_eq!(
+            reg.anthropic_custom_headers.as_deref(),
+            Some(
+                "X-Ember-Persona: persona-main\nX-Ember-Credential: anthropic-key\nX-Ember-Target: https://api.anthropic.com"
+            )
+        );
     }
 
     #[test]
@@ -463,7 +638,7 @@ mod tests {
 
     #[test]
     fn render_compose_template_substitutes_context() {
-        // implementation-note-382 — minimal smoke against a one-line
+        // implementation-note-428 — minimal smoke against a one-line
         // Jinja fragment so the renderer wiring is exercised without
         // depending on the bundled compose.yml.j2's full surface.
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -481,7 +656,7 @@ mod tests {
 
     #[test]
     fn render_compose_template_strict_undefined_refuses_missing_var() {
-        // implementation-note-382 — UndefinedBehavior::Strict means a
+        // implementation-note-428 — UndefinedBehavior::Strict means a
         // template referencing an unset variable surfaces as an error
         // at boot time rather than silently rendering "" into the YAML.
         let tmp = tempfile::tempdir().expect("tempdir");

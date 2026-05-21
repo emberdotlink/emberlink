@@ -18,9 +18,15 @@ pub const RECEIPT_KIND_BINDING_DELETED: &str = "binding.deleted";
 pub const RECEIPT_KIND_SEAL_UNSEALED: &str = "seal.unsealed";
 pub const RECEIPT_KIND_SNAPSHOT_EMITTED: &str = "snapshot.emitted";
 pub const RECEIPT_KIND_IDENTITY_ROTATED: &str = "identity.rotated";
+/// implementation-note-42 —
+/// co-signed attestation that bridges between identity-key epochs at
+/// MEK rotation time. Per design Receipt v2 chain-continuity rule +
+/// design catalog discipline. Anchor:
+/// `identity_rotation_witness_body_landed`.
+pub const RECEIPT_KIND_IDENTITY_ROTATION_WITNESS: &str = "identity.rotation_witness";
 pub const RECEIPT_KIND_LOCAL_STATE_KEY_RESOLVE: &str = "local_state.key_resolve";
 pub const RECEIPT_KIND_LOCAL_STATE_KEY_ROTATION: &str = "local_state.key_rotation";
-/// implementation-note-33 — emberd emits this kind on every
+/// implementation-note-43 — emberd emits this kind on every
 /// `ExecFrame::Exit` arriving from the in-container `ember-exec`
 /// sidecar. The body shape ([`ExecCompletionBody`]) carries the seven
 /// fields design §"Body shape per kind" pins for the in-container
@@ -88,6 +94,66 @@ pub struct IdentityRotatedBody {
     pub rotation_authority: String,
 }
 
+/// Body for `identity.rotation_witness` — co-signed attestation that
+/// bridges between identity-key epochs at MEK rotation time. Per
+/// design Receipt v2 chain-continuity rule + design catalog
+/// discipline.
+///
+/// Anchor: `identity_rotation_witness_body_landed`.
+///
+/// **Pre:** `prev_epoch_root_id != next_epoch_root_id` — the bridge
+/// must connect distinct epochs; an identity-rotation witness would
+/// defeat the chain-continuity purpose.
+///
+/// **Pre:** `signature_by_prev_root` non-empty AND
+/// `signature_by_next_root` non-empty — co-signature is required to
+/// bind both epochs; a one-sided witness cannot bridge.
+///
+/// **Post:** round-trips through JCS canonicalization → blake3
+/// receipt-id derivation → serde deserialization preserving all
+/// fields byte-for-byte (verified by T1 property test).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IdentityRotationWitnessBody {
+    /// Identity-root ID prior to the rotation.
+    pub prev_epoch_root_id: String,
+    /// Identity-root ID after the rotation.
+    pub next_epoch_root_id: String,
+    /// Timestamp of the rotation (epoch seconds, UTC).
+    pub rotated_at_epoch_secs: u64,
+    /// Signature over the rotation by the *previous* epoch root key.
+    pub signature_by_prev_root: String,
+    /// Signature over the rotation by the *next* epoch root key.
+    pub signature_by_next_root: String,
+    /// Optional human-readable rotation reason (e.g., `"scheduled"`,
+    /// `"key-compromise"`, `"operator-init"`).
+    pub rotation_reason: Option<String>,
+}
+
+impl IdentityRotationWitnessBody {
+    /// Validate the body's `Pre:` invariants documented on the struct.
+    ///
+    /// Returns `Ok(())` when:
+    /// - `prev_epoch_root_id != next_epoch_root_id`
+    /// - `signature_by_prev_root` is non-empty
+    /// - `signature_by_next_root` is non-empty
+    ///
+    /// Returns `Err(&'static str)` naming the violated invariant
+    /// otherwise. The error strings are stable and may be matched in
+    /// tests.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.prev_epoch_root_id == self.next_epoch_root_id {
+            return Err("prev_epoch_root_id must differ from next_epoch_root_id");
+        }
+        if self.signature_by_prev_root.is_empty() {
+            return Err("signature_by_prev_root must be non-empty");
+        }
+        if self.signature_by_next_root.is_empty() {
+            return Err("signature_by_next_root must be non-empty");
+        }
+        Ok(())
+    }
+}
+
 /// Body for `local_state.key_resolve` — daemon vended the per-caller
 /// local-state content key. Emitted per `daemon-sole-keychain-client`
 /// proposal §"Three new daemon socket methods" + design separate-uid
@@ -119,8 +185,8 @@ pub struct LocalStateKeyRotationBody {
 /// Body for `exec.completion` — emberd-side Receipt v2 emission on every
 /// `ExecFrame::Exit` arriving from the in-container `ember-exec` sidecar.
 ///
-/// Per implementation-note-33 and the parent
-/// implementation-note-34 acceptance — emberd (not ember-exec) is
+/// Per implementation-note-43 and the parent
+/// implementation-note-44 acceptance — emberd (not ember-exec) is
 /// the receipt signer; the in-container sidecar reports the child's
 /// exit code over the UDS frame protocol, and emberd composes the
 /// signed v2 envelope.
@@ -183,6 +249,10 @@ mod tests {
             "local_state.key_rotation"
         );
         assert_eq!(RECEIPT_KIND_EXEC_COMPLETION, "exec.completion");
+        assert_eq!(
+            RECEIPT_KIND_IDENTITY_ROTATION_WITNESS,
+            "identity.rotation_witness"
+        );
     }
 
     #[test]
@@ -340,5 +410,147 @@ mod tests {
         };
         sign_receipt_v2(&mut env, &signer).unwrap();
         verify_receipt_v2(&env, &pk, &core_crypto::FixtureVerifier).unwrap();
+    }
+
+    #[test]
+    fn identity_rotation_witness_body_round_trips() {
+        let body = IdentityRotationWitnessBody {
+            prev_epoch_root_id: "persona-epoch-old".into(),
+            next_epoch_root_id: "persona-epoch-new".into(),
+            rotated_at_epoch_secs: 1_715_000_000,
+            signature_by_prev_root: "ed25519sig:abcdef".into(),
+            signature_by_next_root: "ed25519sig:fedcba".into(),
+            rotation_reason: Some("scheduled".into()),
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        let back: IdentityRotationWitnessBody = serde_json::from_value(v).unwrap();
+        assert_eq!(body, back);
+    }
+
+    #[test]
+    fn identity_rotation_witness_rejects_same_epoch_ids() {
+        let body = IdentityRotationWitnessBody {
+            prev_epoch_root_id: "persona-epoch-same".into(),
+            next_epoch_root_id: "persona-epoch-same".into(),
+            rotated_at_epoch_secs: 1_715_000_000,
+            signature_by_prev_root: "ed25519sig:abc".into(),
+            signature_by_next_root: "ed25519sig:def".into(),
+            rotation_reason: None,
+        };
+        let err = body
+            .validate()
+            .expect_err("identity rotation between equal epoch ids must be rejected");
+        assert!(
+            err.contains("prev_epoch_root_id"),
+            "error must name the violated invariant; got {err}"
+        );
+    }
+
+    #[test]
+    fn identity_rotation_witness_rejects_empty_prev_signature() {
+        let body = IdentityRotationWitnessBody {
+            prev_epoch_root_id: "persona-epoch-old".into(),
+            next_epoch_root_id: "persona-epoch-new".into(),
+            rotated_at_epoch_secs: 1_715_000_000,
+            signature_by_prev_root: String::new(),
+            signature_by_next_root: "ed25519sig:def".into(),
+            rotation_reason: None,
+        };
+        let err = body
+            .validate()
+            .expect_err("empty signature_by_prev_root must be rejected");
+        assert!(
+            err.contains("signature_by_prev_root"),
+            "error must name the violated invariant; got {err}"
+        );
+    }
+
+    #[test]
+    fn identity_rotation_witness_rejects_empty_next_signature() {
+        let body = IdentityRotationWitnessBody {
+            prev_epoch_root_id: "persona-epoch-old".into(),
+            next_epoch_root_id: "persona-epoch-new".into(),
+            rotated_at_epoch_secs: 1_715_000_000,
+            signature_by_prev_root: "ed25519sig:abc".into(),
+            signature_by_next_root: String::new(),
+            rotation_reason: None,
+        };
+        let err = body
+            .validate()
+            .expect_err("empty signature_by_next_root must be rejected");
+        assert!(
+            err.contains("signature_by_next_root"),
+            "error must name the violated invariant; got {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod proptests {
+    //! T1 property tests for `IdentityRotationWitnessBody`.
+    //!
+    //! Per `.claude/rules/test-tiers.md` — every new body shape on a
+    //! `core-*` crate ships at least one T1 property test that
+    //! exercises the documented Pre/Post conditions. Here the Post
+    //! contract is "JCS canonicalize → serde round-trip preserves all
+    //! fields"; the Pre contract is validated by the
+    //! `validate_round_trip_witness_passes_validate` property.
+    //!
+    //! Anchor: `identity_rotation_witness_body_landed`.
+    use super::*;
+    use core_crypto::canonicalize_jcs;
+    use proptest::prelude::*;
+
+    fn arb_witness() -> impl Strategy<Value = IdentityRotationWitnessBody> {
+        // Generate distinct prev/next epoch ids so the body is valid;
+        // negative cases are covered by the unit tests above.
+        (
+            "[a-z0-9-]{1,32}",
+            "[a-z0-9-]{1,32}",
+            any::<u64>(),
+            "ed25519sig:[a-f0-9]{2,64}",
+            "ed25519sig:[a-f0-9]{2,64}",
+            prop::option::of("[a-z_-]{1,32}"),
+        )
+            .prop_filter("prev/next epoch ids must differ", |t| t.0 != t.1)
+            .prop_map(|(prev, next, ts, sig_p, sig_n, reason)| {
+                IdentityRotationWitnessBody {
+                    prev_epoch_root_id: prev,
+                    next_epoch_root_id: next,
+                    rotated_at_epoch_secs: ts,
+                    signature_by_prev_root: sig_p,
+                    signature_by_next_root: sig_n,
+                    rotation_reason: reason,
+                }
+            })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Post-condition: JCS canonicalization is stable across the
+        /// serde round-trip. Encoding the body, deserializing the JSON
+        /// form, and re-encoding must produce byte-identical JCS
+        /// output. Drift here invalidates persisted receipt-ids.
+        #[test]
+        fn jcs_round_trip_is_stable(body in arb_witness()) {
+            let v1 = serde_json::to_value(&body).expect("serialize");
+            let jcs1 = canonicalize_jcs(&v1).expect("jcs1");
+            let back: IdentityRotationWitnessBody =
+                serde_json::from_value(v1).expect("deserialize");
+            prop_assert_eq!(&body, &back);
+            let v2 = serde_json::to_value(&back).expect("re-serialize");
+            let jcs2 = canonicalize_jcs(&v2).expect("jcs2");
+            prop_assert_eq!(jcs1, jcs2);
+        }
+
+        /// Pre-condition: every body produced by the arb_witness
+        /// generator satisfies `validate()`. This pins the generator
+        /// to the valid region so the round-trip property does not
+        /// accidentally exercise invariant-violating inputs.
+        #[test]
+        fn arb_witness_passes_validate(body in arb_witness()) {
+            prop_assert!(body.validate().is_ok());
+        }
     }
 }

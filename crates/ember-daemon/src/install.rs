@@ -64,7 +64,7 @@ pub enum InstallError {
 /// row to the table above, widen the substring set below, and extend the
 /// unit tests.
 ///
-/// Anchor: `implementation-note-324`
+/// Anchor: `implementation-note-364`
 fn already_exists(stderr: &str) -> bool {
     let s = stderr.to_lowercase();
     s.contains("already exists")
@@ -163,7 +163,7 @@ pub fn is_separate_uid_posture() -> bool {
 ///
 /// ## Checkpoint
 ///
-/// implementation-note-325
+/// implementation-note-365
 #[cfg(target_os = "macos")]
 fn dseditgroup_tolerant_inner<R, C>(
     cmd_string: &str,
@@ -210,11 +210,10 @@ where
     if !checkmember() {
         return Err(InstallError::Subprocess {
             cmd: cmd_string.to_string(),
-            stderr: format!(
-                "dseditgroup reported success (or tolerated macOS 26 'could not be replaced') \
+            stderr: "dseditgroup reported success (or tolerated macOS 26 'could not be replaced') \
                  but post-condition check failed: user is NOT a member of the group. \
                  Run `sudo dseditgroup -o edit -a \"$USER\" -t user ember-clients` manually."
-            ),
+                .to_string(),
             exit_code,
         });
     }
@@ -226,22 +225,25 @@ where
 /// `inspect_and_heal_ember_user_inner` for the policy that consumes these.
 ///
 /// `EMBER_USER_HOME` and `EMBER_USER_SHELL` mirror the literals fed to
-/// `sysadminctl -addUser` in [`provision_ember_user`]; they are the
-/// post-condition the installer asserts when an `ember` user already
+/// the explicit `dscl` create path in [`provision_ember_user`]; they are
+/// the post-condition the installer asserts when an `ember` user already
 /// exists from an earlier (possibly partial) install run.
 #[cfg(target_os = "macos")]
 const EMBER_USER_HOME: &str = "/var/empty";
 #[cfg(target_os = "macos")]
 const EMBER_USER_SHELL: &str = "/usr/bin/false";
+#[cfg(target_os = "macos")]
+const EMBER_USER_REALNAME: &str = "Emberlink Daemon";
+#[cfg(target_os = "macos")]
+const EMBER_USER_MIN_DYNAMIC_UID: u32 = 450;
 
 /// macOS uses uids `< 500` for system users (Apple convention; the
 /// Login window in `/System/Library/.../loginwindow.plist` hides
-/// `Hide500Users=YES` by default). `sysadminctl -addUser` without
-/// `-UID` picks from this range. A uid `>= 500` means the existing
-/// `ember` record came from a different package or a manual `dscl`
-/// invocation — renumbering it would orphan every file the existing
-/// daemon already owns, so we refuse to heal it and surface a
-/// remediation command instead.
+/// `Hide500Users=YES` by default). A uid `>= 500` means the existing
+/// `ember` record came from a different package or a prior install that
+/// allocated from the human-login range — renumbering it would orphan every
+/// file the existing daemon already owns, so we refuse to heal it and
+/// surface a remediation command instead.
 #[cfg(target_os = "macos")]
 const EMBER_USER_MAX_SYSTEM_UID: u32 = 500;
 
@@ -265,7 +267,8 @@ struct EmberUserShape {
 ///
 /// Drives the macOS `provision_ember_user` flow:
 /// - `Create` — the inspector confirmed the user is absent; run the
-///   normal `sysadminctl -addUser` path.
+///   explicit `dscl` create path with a free daemon uid from the
+///   reserved system-user range.
 /// - `SkipHealthy` — the user is already present and matches the
 ///   canonical shape exactly; skip the create step.
 /// - `HealedThenSkip` — the user is present but had narrow,
@@ -301,7 +304,7 @@ enum EmberUserInspectAction {
 /// Closure injection means unit tests can simulate any shape (canonical,
 /// missing-shell, wrong-uid, absent) without touching real Open Directory.
 ///
-/// Anchor: `implementation-note-326`
+/// Anchor: `implementation-note-366`
 #[cfg(target_os = "macos")]
 fn read_ember_user_shape_inner<R>(mut reader: R) -> Result<Option<EmberUserShape>, InstallError>
 where
@@ -353,7 +356,7 @@ where
 /// real dscl mutation. `changer(prop, current, desired)` is invoked
 /// once per divergent property.
 ///
-/// Anchor: `implementation-note-326`
+/// Anchor: `implementation-note-366`
 #[cfg(target_os = "macos")]
 fn inspect_and_heal_ember_user_inner<R, C>(
     reader: R,
@@ -426,10 +429,10 @@ where
 /// then heal-or-surface via [`inspect_and_heal_ember_user_inner`].
 ///
 /// Used by [`provision_ember_user`] to decide whether to run
-/// `sysadminctl -addUser` (user absent) or skip the create step
+/// the explicit `dscl` create path (user absent) or skip the create step
 /// (user present + canonical, possibly after healing).
 ///
-/// Anchor: `implementation-note-326`
+/// Anchor: `implementation-note-366`
 #[cfg(target_os = "macos")]
 fn inspect_and_heal_ember_user() -> Result<EmberUserInspectAction, InstallError> {
     inspect_and_heal_ember_user_inner(
@@ -481,6 +484,122 @@ fn inspect_and_heal_ember_user() -> Result<EmberUserInspectAction, InstallError>
             )
         },
     )
+}
+
+#[cfg(target_os = "macos")]
+fn ember_group_gid() -> Option<libc::gid_t> {
+    use std::ffi::CString;
+    let cgroup = CString::new("ember").ok()?;
+    let mut buf = vec![0 as libc::c_char; 4096];
+    let mut grp: libc::group = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::group = std::ptr::null_mut();
+    let rc = unsafe {
+        libc::getgrnam_r(
+            cgroup.as_ptr(),
+            &mut grp,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut result,
+        )
+    };
+    if rc != 0 || result.is_null() {
+        return None;
+    }
+    Some(grp.gr_gid)
+}
+
+#[cfg(target_os = "macos")]
+fn system_uid_is_occupied(uid: u32) -> bool {
+    // SAFETY: `getpwuid` is thread-safe for read-only probing on Darwin when
+    // the returned pointer is inspected immediately and not retained.
+    unsafe { !libc::getpwuid(uid as libc::uid_t).is_null() }
+}
+
+#[cfg(target_os = "macos")]
+fn allocate_ember_system_uid_inner<F>(mut is_occupied: F) -> Result<u32, InstallError>
+where
+    F: FnMut(u32) -> bool,
+{
+    for uid in EMBER_USER_MIN_DYNAMIC_UID..EMBER_USER_MAX_SYSTEM_UID {
+        if !is_occupied(uid) {
+            return Ok(uid);
+        }
+    }
+    Err(InstallError::Subprocess {
+        cmd: "allocate_ember_system_uid".to_string(),
+        stderr: format!(
+            "no free macOS system uid available in reserved range {}..{}",
+            EMBER_USER_MIN_DYNAMIC_UID,
+            EMBER_USER_MAX_SYSTEM_UID - 1
+        ),
+        exit_code: None,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn allocate_ember_system_uid() -> Result<u32, InstallError> {
+    allocate_ember_system_uid_inner(system_uid_is_occupied)
+}
+
+#[cfg(target_os = "macos")]
+fn create_ember_user_dscl_args(uid: u32, primary_gid: libc::gid_t) -> Vec<Vec<String>> {
+    let uid_str = uid.to_string();
+    let gid_str = primary_gid.to_string();
+    let user_path = "/Users/ember".to_string();
+    vec![
+        vec![".".to_string(), "-create".to_string(), user_path.clone()],
+        vec![
+            ".".to_string(),
+            "-create".to_string(),
+            user_path.clone(),
+            "RealName".to_string(),
+            EMBER_USER_REALNAME.to_string(),
+        ],
+        vec![
+            ".".to_string(),
+            "-create".to_string(),
+            user_path.clone(),
+            "UniqueID".to_string(),
+            uid_str,
+        ],
+        vec![
+            ".".to_string(),
+            "-create".to_string(),
+            user_path.clone(),
+            "PrimaryGroupID".to_string(),
+            gid_str,
+        ],
+        vec![
+            ".".to_string(),
+            "-create".to_string(),
+            user_path.clone(),
+            "UserShell".to_string(),
+            EMBER_USER_SHELL.to_string(),
+        ],
+        vec![
+            ".".to_string(),
+            "-create".to_string(),
+            user_path,
+            "NFSHomeDirectory".to_string(),
+            EMBER_USER_HOME.to_string(),
+        ],
+    ]
+}
+
+#[cfg(target_os = "macos")]
+fn create_ember_user() -> Result<(), InstallError> {
+    let ember_gid = ember_group_gid().ok_or_else(|| InstallError::Subprocess {
+        cmd: "getgrnam_r ember".to_string(),
+        stderr: "the `ember` group is not provisioned — group creation must succeed before user creation"
+            .to_string(),
+        exit_code: None,
+    })?;
+    let ember_uid = allocate_ember_system_uid()?;
+    for argv in create_ember_user_dscl_args(ember_uid, ember_gid) {
+        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        run("dscl", &argv_refs, false)?;
+    }
+    Ok(())
 }
 
 /// Real-subprocess wrapper: add `user` to `group` via `dseditgroup -o edit`,
@@ -536,13 +655,14 @@ fn dseditgroup_add_operator_to_group(user: &str, group: &str) -> Result<(), Inst
 /// - `dseditgroup -o create ember` — group create (idempotent).
 /// - **Inspect-and-heal step** (see [`inspect_and_heal_ember_user_inner`]):
 ///   probe the existing `ember` user via `dscl . -read /Users/ember`; if
-///   absent run `sysadminctl -addUser ember ...`; if present + canonical
-///   skip the create; if present with narrow divergence (wrong shell, wrong
-///   home) heal via `dscl . -change`; if present with wide divergence
-///   (uid outside the system range) surface a hard `InstallError` with the
+///   absent run the explicit `dscl` create path with a free system uid in
+///   the reserved range `{EMBER_USER_MIN_DYNAMIC_UID}..499`; if present + canonical skip the
+///   create; if present with narrow divergence (wrong shell, wrong home)
+///   heal via `dscl . -change`; if present with wide divergence (uid
+///   outside the system range) surface a hard `InstallError` with the
 ///   manual remediation command. Replaces the naive `if !id ember` check
 ///   that silently kept divergent records around — see
-///   `implementation-note-326`.
+///   `implementation-note-366`.
 /// - `dseditgroup -o create ember-clients` — connect-group create.
 /// - `dseditgroup -o edit -a "$USER" -t user ember-clients` — add the
 ///   invoking operator to the connect group.
@@ -565,15 +685,15 @@ pub fn provision_ember_user() -> Result<(), InstallError> {
 
     // 2) ember user — inspect-and-heal before any create.
     //
-    // implementation-note-326: a previous
+    // implementation-note-366: a previous
     // partial install (or a different package that also created an `ember`
     // record) can leave the user present with wrong shape (e.g. shell !=
-    // /usr/bin/false). The naive `if !user_exists` check skipped sysadminctl
+    // /usr/bin/false). The naive `if !user_exists` check skipped user creation
     // but never normalized the divergent fields; downstream consumers
     // (launchd plist, vault sockets) then hit cryptic permission errors.
     //
     // `inspect_and_heal_ember_user` returns one of three actions:
-    // - Create        → user absent, fall through to sysadminctl -addUser
+    // - Create        → user absent, run the explicit dscl create path
     // - SkipHealthy   → user present + canonical shape, skip create
     // - HealedThenSkip → user present with narrow divergence; dscl . -change
     //                    ops applied; skip create
@@ -582,20 +702,7 @@ pub fn provision_ember_user() -> Result<(), InstallError> {
     // InstallError with the manual remediation command.
     let action = inspect_and_heal_ember_user()?;
     if matches!(action, EmberUserInspectAction::Create) {
-        run(
-            "sysadminctl",
-            &[
-                "-addUser",
-                "ember",
-                "-fullName",
-                "Emberlink Daemon",
-                "-home",
-                "/var/empty",
-                "-shell",
-                "/usr/bin/false",
-            ],
-            true,
-        )?;
+        create_ember_user()?;
     }
 
     // 3) ember-clients connect group
@@ -603,7 +710,7 @@ pub fn provision_ember_user() -> Result<(), InstallError> {
 
     // 4) add the ember user to ember-clients
     //
-    // implementation-note-327: the
+    // implementation-note-367: the
     // launchd plist's `GroupName=ember-clients` (formerly `ember` — a group
     // that was never created on macOS, falling back silently to `staff`)
     // requires the ember user to be a member of `ember-clients` so launchd's
@@ -679,7 +786,7 @@ pub fn provision_ember_user() -> Result<(), InstallError> {
     })
 }
 
-// implementation-note-140 — per-spawn uid pool provisioning.
+// implementation-note-162 — per-spawn uid pool provisioning.
 // The installer creates N `ember-spawn-<i>` system users with
 // pre-assigned uids in the 10010-10099 range. The daemon's
 // `[spawn_pool]` config references this set. See design (amendment
@@ -783,7 +890,7 @@ pub enum SpawnPoolProvisioning {
 /// dscl commands as `manual_commands` when the installer is not
 /// running as root.
 ///
-/// implementation-note-140 — checkpoint for callers that grep
+/// implementation-note-162 — checkpoint for callers that grep
 /// for the install integration point.
 pub fn provision_spawn_pool(pool_size: usize) -> Result<SpawnPoolProvisioning, InstallError> {
     if pool_size == 0 {
@@ -986,7 +1093,7 @@ pub fn render_spawn_pool_toml(provisioning: &SpawnPoolProvisioning) -> String {
             range_start,
             slot_count,
         } => format!(
-            "\n[spawn_pool]\n# implementation-note-163 — design Component 2\n# modern-Linux subuid range. The daemon calls `clone3(CLONE_NEWUSER \\\n# | ...)` at spawn time, becomes namespace-owner (kernel grants all\n# caps inside the new namespace), then setresuid's to a uid mapped\n# from this range. No system users to provision — the kernel-side\n# `/etc/subuid` entry IS the pool.\nsubuid_range_start = {range_start}\nsubuid_range_slots = {slot_count}\n"
+            "\n[spawn_pool]\n# implementation-note-186 — design Component 2\n# modern-Linux subuid range. The daemon calls `clone3(CLONE_NEWUSER \\\n# | ...)` at spawn time, becomes namespace-owner (kernel grants all\n# caps inside the new namespace), then setresuid's to a uid mapped\n# from this range. No system users to provision — the kernel-side\n# `/etc/subuid` entry IS the pool.\nsubuid_range_start = {range_start}\nsubuid_range_slots = {slot_count}\n"
         ),
         SpawnPoolProvisioning::SystemUsers { uids, gid }
         | SpawnPoolProvisioning::ManualCommands { uids, gid, .. } => {
@@ -996,17 +1103,17 @@ pub fn render_spawn_pool_toml(provisioning: &SpawnPoolProvisioning) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(
-                "\n[spawn_pool]\n# implementation-note-140 — per-spawn uid pool. The daemon\n# leases a uid from this set before fork+execve in `broker_exec`.\nuids = [{uids_str}]\ngid = {gid}\n"
+                "\n[spawn_pool]\n# implementation-note-162 — per-spawn uid pool. The daemon\n# leases a uid from this set before fork+execve in `broker_exec`.\nuids = [{uids_str}]\ngid = {gid}\n"
             )
         }
     }
 }
 
-// implementation-note-163 — checkpoint for callers that grep
+// implementation-note-186 — checkpoint for callers that grep
 // for the modern-Linux subuid install integration point. design
 // Component 2.
 //
-// implementation-note-328
+// implementation-note-368
 
 /// Detect whether the running kernel supports unprivileged user
 /// namespace clone (design Component 2 modern-Linux gate). Reads
@@ -1263,7 +1370,7 @@ fn ensure_subuid_entry(
 /// this into the daemon's `[spawn_pool]` config via
 /// [`render_spawn_pool_toml`].
 ///
-/// implementation-note-163 — checkpoint for callers that
+/// implementation-note-186 — checkpoint for callers that
 /// grep for the modern-Linux subuid install integration point.
 #[cfg(target_os = "linux")]
 pub fn provision_subuid_range() -> Result<SpawnPoolProvisioning, InstallError> {
@@ -1528,7 +1635,7 @@ pub fn install_pem_to_etc(operator_home: &Path) -> Result<(), InstallError> {
         })?;
 
         run("chmod", &["0440", dst_path], false)?;
-        // implementation-note-327:
+        // implementation-note-367:
         // `root:ember-clients` (formerly `root:ember`) so the daemon — running
         // with `ember-clients` as primary group per the matching plist change
         // in `render_launchd_plist_body` — can read the credential.
@@ -1742,14 +1849,14 @@ fn chown_emberd_binary(dst_str: &str) -> Result<(), InstallError> {
 ///
 /// ## Checkpoint
 ///
-/// implementation-note-329
+/// implementation-note-369
 pub fn chown_ember_data_dirs(home: &Path) -> Result<(), InstallError> {
     chown_ember_data_dirs_inner(home, &mut |path, is_dir| {
         let path_str = path.to_string_lossy().into_owned();
         run("chown", &["ember:ember-clients", &path_str], false)?;
         // Signing-key material (daemon_identity.key, daemon_persona.key)
         // must be 0600 (owner-only) per the daemon's fail-closed check
-        // in `infra::runtime` (implementation-note-230 F-S5-013).
+        // in `infra::runtime` (implementation-note-255 F-S5-013).
         // The default 0640 lets the ember-clients group read non-secret
         // state (SQLite, snapshots, vault.salt, etc.) but is too
         // permissive for private keys.
@@ -1815,6 +1922,13 @@ where
     F: FnMut(&Path, bool) -> Result<(), InstallError>,
 {
     let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        // Shadow shims under ~/.ember/shadow are symlinks into operator-owned
+        // tool wrappers. Some can be intentionally absent on a host, so
+        // following them via plain chown/chmod would fail on dangling targets.
+        // The daemon does not rely on symlink ownership here; skip them.
+        return Ok(());
+    }
     let is_dir = metadata.is_dir();
 
     // chown applies to the current entry (symlinks are not followed; the
@@ -1894,13 +2008,13 @@ const VAULT_MEK_FILENAME: &str = "vault-mek.bin";
 ///
 /// ## Known follow-up
 ///
-/// `implementation-note-330`: the shell-out to
+/// `implementation-note-370`: the shell-out to
 /// `/usr/bin/security` passes the passphrase in `argv` for the duration
 /// of the subprocess (~50ms on a single-user dev box). Long-term fix is
 /// raw FFI to `SecKeychainAddGenericPassword` + `SecAccessCreate` with
 /// an explicit permissive ACL, which avoids the argv leak entirely.
 ///
-/// Anchor: `implementation-note-331`
+/// Anchor: `implementation-note-371`
 pub fn provision_se_mek(home: &Path) -> Result<(), InstallError> {
     let data_dir = home.join(".ember").join("data");
 
@@ -1987,7 +2101,7 @@ pub fn provision_se_mek(home: &Path) -> Result<(), InstallError> {
 /// root, the audience is "processes I'm already trusting." Acceptable
 /// for the dev0 wedge. Long-term: raw FFI to
 /// `SecKeychainAddGenericPassword` + `SecAccessCreate` with an explicit
-/// permissive ACL. Filed as `implementation-note-330`.
+/// permissive ACL. Filed as `implementation-note-370`.
 #[cfg(target_os = "macos")]
 fn provision_vault_mek_in_system_keychain() -> Result<(), InstallError> {
     use crate::infra::vault_macos_se::{
@@ -2085,6 +2199,29 @@ fn provision_vault_mek_in_system_keychain() -> Result<(), InstallError> {
 /// Path on disk for the macOS LaunchDaemon plist.
 #[cfg(target_os = "macos")]
 const LAUNCHD_PLIST_PATH: &str = "/Library/LaunchDaemons/sh.emberlink.daemon.plist";
+#[cfg(target_os = "macos")]
+const LAUNCHD_SANDBOX_DIR: &str = "/usr/local/lib/ember/sandbox";
+#[cfg(target_os = "macos")]
+const LAUNCHD_SANDBOX_PROFILE_PATH: &str = "/usr/local/lib/ember/sandbox/emberd.sb";
+#[cfg(target_os = "macos")]
+const EMBERD_SANDBOX_PROFILE_TEMPLATE: &str = include_str!("../templates/sandbox/emberd.sb");
+#[cfg(target_os = "macos")]
+const EMBERD_SANDBOX_WRITE_ALLOWLIST_TOKEN: &str = "__EMBERD_WRITE_ALLOWLIST__";
+
+#[cfg(target_os = "macos")]
+fn render_launchd_sandbox_profile_body(operator_home: &Path) -> String {
+    let ember_root = operator_home.join(".ember");
+    let ember_root_regex = regex::escape(&ember_root.to_string_lossy());
+    let allowlist = format!(
+        "(allow file-write*\n  \
+         (regex #\"^{ember_root_regex}(/|$)\")\n  \
+         (regex #\"^/var/log/emberd(/|$)\")\n  \
+         (regex #\"^/tmp/emberd-\")\n  \
+         (regex #\"^/private/tmp/emberd-\")\n  \
+         (regex #\"^/private/var/log/emberd(/|$)\"))"
+    );
+    EMBERD_SANDBOX_PROFILE_TEMPLATE.replace(EMBERD_SANDBOX_WRITE_ALLOWLIST_TOKEN, &allowlist)
+}
 
 /// Path on disk for the Linux systemd unit.
 #[cfg(target_os = "linux")]
@@ -2099,6 +2236,23 @@ const SYSTEMD_UNIT_PATH: &str = "/etc/systemd/system/emberd.service";
 #[allow(dead_code)]
 pub(crate) fn render_launchd_plist_body(operator_home: &Path) -> String {
     let home = operator_home.display();
+    // emberd_launchd_sandbox_wired (implementation-note-372).
+    //
+    // ProgramArguments wrap `emberd` invocation in `sandbox-exec -f
+    // <profile>` so the daemon process runs under the macOS TrustedBSD
+    // MAC layer with the policy DSL from slice C
+    // (`infra/sandbox/emberd.sb`, prior change merged). macOS has no
+    // direct seccomp equivalent; sandbox-exec is the closest primitive.
+    //
+    // The startup probe (slice E, prior change) invokes sandbox_check()
+    // via libsandbox.dylib FFI at boot to verify the wrapper took
+    // effect. On mismatch the daemon emits a loud WARN (or refuses
+    // to start when EMBER_REQUIRE_SANDBOX=1 is in the EnvironmentVariables
+    // block).
+    //
+    // Profile path: /usr/local/lib/ember/sandbox/emberd.sb (installed
+    // by the daemon install path as a sibling of the binary; matches
+    // design install convention).
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
@@ -2113,8 +2267,12 @@ pub(crate) fn render_launchd_plist_body(operator_home: &Path) -> String {
              <key>EMBER_APP_PEM_PATH</key><string>/etc/emberlink/ember-engine-app.pem</string>\n    \
              <key>EMBER_APP_ENV_PATH</key><string>/etc/emberlink/ember-engine.env</string>\n  \
            </dict>\n  \
+           <!-- emberd_launchd_sandbox_wired — sandbox-exec wrap per implementation-note-320. -->\n  \
            <key>ProgramArguments</key>\n  \
            <array>\n    \
+             <string>/usr/bin/sandbox-exec</string>\n    \
+             <string>-f</string>\n    \
+             <string>/usr/local/lib/ember/sandbox/emberd.sb</string>\n    \
              <string>/usr/local/bin/emberd</string>\n    \
              <string>--foreground</string>\n  \
            </array>\n  \
@@ -2136,6 +2294,27 @@ pub(crate) fn render_launchd_plist_body(operator_home: &Path) -> String {
 #[allow(dead_code)]
 pub(crate) fn render_systemd_unit_body(operator_home: &Path) -> String {
     let home = operator_home.display();
+    // emberd_systemd_seccomp_wired (implementation-note-373).
+    //
+    // `SystemCallFilter=` directives below apply systemd's seccomp wrapper
+    // around the daemon process. The allowlist mirrors the JSON profile
+    // shipped in `infra/seccomp/emberd-seccomp.json` (prior change, slice A),
+    // expressed via systemd's pre-defined sets to avoid re-enumerating
+    // ~193 syscalls inline. `@system-service` is systemd's curated
+    // baseline for long-running services (covers file I/O, network,
+    // signal, memory, time, IPC, basic process); we layer additional
+    // explicit allows for fork/execve (broker-supervisor exec path,
+    // design) + mlock (zeroize-on-drop credential handling).
+    //
+    // `~` prefix denies the named call. We deny @raw-io, @reboot,
+    // @swap, @cpu-emulation, @debug, @mount, @module, @obsolete,
+    // @privileged, @resources — the privileged surfaces emberd has no
+    // business using.
+    //
+    // The startup probe (slice E, prior change) reads /proc/self/status
+    // Seccomp: field at boot to verify this directive took effect. On
+    // mismatch the daemon emits a loud WARN (or refuses to start when
+    // EMBER_REQUIRE_SANDBOX=1 is in the Environment= block).
     format!(
         "[Unit]\n\
          Description=Emberlink Grant Warden daemon\n\
@@ -2151,6 +2330,29 @@ pub(crate) fn render_systemd_unit_body(operator_home: &Path) -> String {
          ExecStart=/usr/local/bin/emberd --foreground\n\
          Restart=on-failure\n\
          RestartSec=5\n\
+         \n\
+         # emberd_systemd_seccomp_wired — kernel sandbox per implementation-note-320.\n\
+         # Allowlist: systemd-curated baseline + explicit fork/exec/mlock.\n\
+         SystemCallFilter=@system-service @ipc @memlock\n\
+         SystemCallFilter=~@raw-io ~@reboot ~@swap ~@cpu-emulation ~@debug ~@mount ~@module ~@obsolete ~@privileged ~@resources\n\
+         SystemCallErrorNumber=EPERM\n\
+         SystemCallArchitectures=native\n\
+         \n\
+         # Defense-in-depth hardening — systemd primitives complement seccomp.\n\
+         NoNewPrivileges=true\n\
+         ProtectSystem=strict\n\
+         ProtectHome=read-only\n\
+         PrivateTmp=true\n\
+         PrivateDevices=true\n\
+         ProtectKernelTunables=true\n\
+         ProtectKernelModules=true\n\
+         ProtectKernelLogs=true\n\
+         ProtectControlGroups=true\n\
+         RestrictNamespaces=true\n\
+         RestrictRealtime=true\n\
+         RestrictSUIDSGID=true\n\
+         LockPersonality=true\n\
+         MemoryDenyWriteExecute=true\n\
          \n\
          [Install]\n\
          WantedBy=multi-user.target\n"
@@ -2250,6 +2452,7 @@ pub fn install_launchd_plist(operator_home: &Path) -> Result<(), InstallError> {
     // references /usr/local/bin/emberd; bootstrap silently exec-fails
     // with ENOENT if the binary is missing.
     install_emberd_binary()?;
+    install_launchd_sandbox_profile(operator_home)?;
 
     let path = Path::new(LAUNCHD_PLIST_PATH);
     let body = render_launchd_plist_body(operator_home);
@@ -2268,7 +2471,14 @@ pub fn install_launchd_plist(operator_home: &Path) -> Result<(), InstallError> {
         .map(|existing| existing == body)
         .unwrap_or(false);
 
-    if !already_matches || !is_launchd_service_loaded() {
+    let log_paths_repaired = ensure_emberd_log_paths()?;
+    let stale_runtime_cleared = clear_stale_launchd_runtime_artifacts(operator_home)?;
+
+    if !already_matches
+        || !is_launchd_service_active()
+        || log_paths_repaired
+        || stale_runtime_cleared
+    {
         std::fs::write(path, &body).map_err(|e| InstallError::Subprocess {
             cmd: format!("write {LAUNCHD_PLIST_PATH}"),
             stderr: format!("write failed: {e}"),
@@ -2282,37 +2492,182 @@ pub fn install_launchd_plist(operator_home: &Path) -> Result<(), InstallError> {
         // is the macOS-launchctl analogue of `groupadd --force`.
         bootout_tolerant()?;
 
-        // Pre-create the log files with ember:ember ownership BEFORE bootstrap.
-        // launchd opens StandardErrorPath/StandardOutPath as root then passes
-        // the fds to the daemon; if the files don't exist the ember user can't
-        // create them (mode 755 root:wheel on /var/log) and launchd surfaces
-        // EX_CONFIG (78), KeepAlive respawns, daemon never starts.
-        ensure_emberd_log_paths()?;
-
         run(
             "launchctl",
             &["bootstrap", "system", LAUNCHD_PLIST_PATH],
             false,
         )?;
+
+        wait_for_launchd_runtime_artifacts(operator_home)?;
     }
 
     Ok(())
 }
 
-/// True if `launchctl print system/sh.emberlink.daemon` succeeds (exit
-/// code 0), meaning the daemon is currently registered with launchd in
-/// the system domain. Used by [`install_launchd_plist`]'s idempotency
-/// check to detect the "matching plist on disk but service not loaded"
-/// case (e.g., after an operator manually unloaded the service or after
-/// a previous install's bootout succeeded but its bootstrap failed).
 #[cfg(target_os = "macos")]
-fn is_launchd_service_loaded() -> bool {
+fn clear_stale_launchd_runtime_artifacts(operator_home: &Path) -> Result<bool, InstallError> {
+    let run_dir = operator_home.join(".ember").join("run");
+    let mut changed = false;
+    for path in [run_dir.join("emberd.pid"), run_dir.join("daemon.sock")] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => changed = true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(InstallError::Subprocess {
+                    cmd: format!("rm {}", path.display()),
+                    stderr: format!("remove_file failed: {e}"),
+                    exit_code: None,
+                });
+            }
+        }
+    }
+    Ok(changed)
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_launchd_runtime_artifacts(operator_home: &Path) -> Result<(), InstallError> {
+    const MAX_ATTEMPTS: usize = 50;
+    const SLEEP_MS: u64 = 100;
+
+    let run_dir = operator_home.join(".ember").join("run");
+    let pid_path = run_dir.join("emberd.pid");
+    let socket_path = run_dir.join("daemon.sock");
+
+    wait_for_launchd_runtime_artifacts_inner(
+        MAX_ATTEMPTS,
+        || pid_path.exists() && socket_path.exists(),
+        || std::thread::sleep(std::time::Duration::from_millis(SLEEP_MS)),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_launchd_runtime_artifacts_inner<P, S>(
+    max_attempts: usize,
+    probe: P,
+    sleep: S,
+) -> Result<(), InstallError>
+where
+    P: Fn() -> bool,
+    S: Fn(),
+{
+    for attempt in 0..max_attempts {
+        if probe() {
+            return Ok(());
+        }
+        if attempt + 1 < max_attempts {
+            sleep();
+        }
+    }
+
+    Err(InstallError::Subprocess {
+        cmd: "launchctl bootstrap system sh.emberlink.daemon".to_string(),
+        stderr: "daemon install completed but the managed runtime artifacts never reappeared"
+            .to_string(),
+        exit_code: None,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn install_launchd_sandbox_profile(operator_home: &Path) -> Result<(), InstallError> {
+    let dir = Path::new(LAUNCHD_SANDBOX_DIR);
+    std::fs::create_dir_all(dir).map_err(|e| InstallError::Subprocess {
+        cmd: format!("mkdir -p {}", dir.display()),
+        stderr: format!("create_dir_all failed: {e}"),
+        exit_code: None,
+    })?;
+
+    install_launchd_sandbox_profile_into(Path::new(LAUNCHD_SANDBOX_PROFILE_PATH), operator_home)?;
+
+    run("chmod", &["0755", LAUNCHD_SANDBOX_DIR], false)?;
+    run("chmod", &["0644", LAUNCHD_SANDBOX_PROFILE_PATH], false)?;
+    run("chown", &["root:wheel", LAUNCHD_SANDBOX_DIR], false)?;
+    run(
+        "chown",
+        &["root:wheel", LAUNCHD_SANDBOX_PROFILE_PATH],
+        false,
+    )?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn install_launchd_sandbox_profile_into(
+    dst: &Path,
+    operator_home: &Path,
+) -> Result<(), InstallError> {
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| InstallError::Subprocess {
+            cmd: format!("mkdir -p {}", parent.display()),
+            stderr: format!("create_dir_all failed: {e}"),
+            exit_code: None,
+        })?;
+    }
+
+    let rendered = render_launchd_sandbox_profile_body(operator_home);
+    let existing = std::fs::read_to_string(dst).ok();
+    if existing.as_deref() != Some(rendered.as_str()) {
+        std::fs::write(dst, rendered).map_err(|e| InstallError::Subprocess {
+            cmd: format!("write {}", dst.display()),
+            stderr: format!("write failed: {e}"),
+            exit_code: None,
+        })?;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o644)).map_err(|e| {
+            InstallError::Subprocess {
+                cmd: format!("chmod 0644 {}", dst.display()),
+                stderr: format!("set_permissions failed: {e}"),
+                exit_code: None,
+            }
+        })?;
+    }
+
+    Ok(())
+}
+
+/// True when `launchctl print system/sh.emberlink.daemon` shows the
+/// daemon is both registered and has an active process. A dead
+/// crash-looping service still appears in `launchctl print`, but with
+/// `active count = 0`; reinstall must treat that as unhealthy and
+/// re-run the bootout/bootstrap path instead of silently no-oping.
+#[cfg(target_os = "macos")]
+fn is_launchd_service_active() -> bool {
     let label = "system/sh.emberlink.daemon";
     Command::new("launchctl")
         .args(["print", label])
         .output()
-        .map(|out| out.status.success())
+        .map(|out| {
+            out.status.success()
+                && launchd_service_has_active_process(&String::from_utf8_lossy(&out.stdout))
+        })
         .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_service_has_active_process(print_output: &str) -> bool {
+    let mut active_count: Option<u32> = None;
+    let mut execs: Option<u32> = None;
+    let mut state_xpcproxy = false;
+
+    for line in print_output.lines() {
+        let trimmed = line.trim();
+        if let Some(count) = trimmed.strip_prefix("active count = ") {
+            active_count = count.parse::<u32>().ok();
+            continue;
+        }
+        if let Some(count) = trimmed.strip_prefix("execs = ") {
+            execs = count.parse::<u32>().ok();
+            continue;
+        }
+        if trimmed == "state = xpcproxy" {
+            state_xpcproxy = true;
+        }
+    }
+
+    active_count.is_some_and(|n| n > 0) && execs.is_some_and(|n| n > 0) && !state_xpcproxy
 }
 
 /// `launchctl bootout system <plist>` that tolerates the
@@ -2345,7 +2700,7 @@ fn is_launchd_service_loaded() -> bool {
 ///
 /// ## Checkpoint
 ///
-/// implementation-note-332
+/// implementation-note-374
 #[cfg(target_os = "macos")]
 fn bootout_tolerant() -> Result<(), InstallError> {
     let cmd_string = format!("launchctl bootout system {LAUNCHD_PLIST_PATH}");
@@ -2439,9 +2794,9 @@ const EMBERD_LOG_OUT: &str = "/var/log/emberd.out";
 ///
 /// ## Checkpoint
 ///
-/// implementation-note-333
+/// implementation-note-375
 #[cfg(target_os = "macos")]
-pub fn ensure_emberd_log_paths() -> Result<(), InstallError> {
+pub fn ensure_emberd_log_paths() -> Result<bool, InstallError> {
     ensure_emberd_log_paths_inner(
         Path::new(EMBERD_LOG_ERR),
         Path::new(EMBERD_LOG_OUT),
@@ -2514,13 +2869,13 @@ fn ensure_emberd_log_paths_inner<L, C>(
     out_path: &Path,
     lookup_uid_gid: L,
     mut chown_file: C,
-) -> Result<(), InstallError>
+) -> Result<bool, InstallError>
 where
     L: FnOnce() -> Option<(libc::uid_t, libc::gid_t)>,
     C: FnMut(&Path, libc::uid_t, libc::gid_t) -> Result<(), InstallError>,
 {
     use std::fs::{OpenOptions, Permissions};
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     // Fail clearly when the ember user hasn't been provisioned yet.
     let (uid, gid) = lookup_uid_gid().ok_or_else(|| InstallError::Subprocess {
@@ -2529,7 +2884,14 @@ where
         exit_code: None,
     })?;
 
+    let mut changed = false;
     for path in &[err_path, out_path] {
+        let prior_meta = std::fs::metadata(path).ok();
+        let prior_mode = prior_meta
+            .as_ref()
+            .map(|meta| meta.permissions().mode() & 0o777);
+        let prior_owner = prior_meta.as_ref().map(|meta| (meta.uid(), meta.gid()));
+
         // Create the file if it doesn't exist; leave existing content intact
         // (truncate=false) so a running daemon's appended lines survive
         // an idempotent re-install.
@@ -2555,9 +2917,13 @@ where
         })?;
 
         chown_file(path, uid, gid)?;
+
+        if prior_meta.is_none() || prior_mode != Some(0o644) || prior_owner != Some((uid, gid)) {
+            changed = true;
+        }
     }
 
-    Ok(())
+    Ok(changed)
 }
 
 /// Non-macOS fallback for [`install_launchd_plist`]. The launchd flow
@@ -2639,9 +3005,9 @@ pub fn install_systemd_unit(_operator_home: &Path) -> Result<(), InstallError> {
 // spawn-helper + spawn-shim install integration.
 // ============================================================================
 //
-// implementation-note-160
-// implementation-note-159
-// implementation-note-161
+// implementation-note-183
+// implementation-note-182
+// implementation-note-184
 //
 // The spawn-helper is a root-privileged sibling daemon (LaunchDaemon
 // on macOS, systemd unit on hardened Linux) that accepts
@@ -2728,7 +3094,7 @@ pub fn detect_hardened_linux() -> Result<bool, InstallError> {
 /// size` with no defaults; this renderer is the single producer of
 /// those values for production systemd.
 ///
-/// implementation-note-160
+/// implementation-note-183
 #[allow(dead_code)]
 pub(crate) fn render_spawn_helper_unit_body(
     ember_uid: u32,
@@ -2786,7 +3152,7 @@ pub(crate) fn render_spawn_helper_unit_body(
 /// installed rewrites only when the body differs; `daemon-reload` +
 /// `enable --now` are always issued so the active state converges.
 ///
-/// implementation-note-160
+/// implementation-note-183
 #[cfg(target_os = "linux")]
 pub fn install_spawn_helper_unit(
     ember_uid: u32,
@@ -2872,7 +3238,7 @@ fn ember_clients_group_exists() -> bool {
 /// - `{{POOL_SIZE}}` → number of slots in the pool
 /// - `{{EXPECTED_SHIM_HASH}}` → blake3 hex of the shipped shim
 ///
-/// implementation-note-159
+/// implementation-note-182
 #[cfg(target_os = "macos")]
 #[allow(dead_code)]
 pub(crate) fn render_spawn_helper_plist_body(
@@ -2939,8 +3305,8 @@ pub(crate) fn render_spawn_helper_plist_body(
 /// 6. Write the plist (mode 0644), `launchctl bootout`-tolerant,
 ///    `launchctl bootstrap system`.
 ///
-/// implementation-note-159
-/// implementation-note-161
+/// implementation-note-182
+/// implementation-note-184
 #[cfg(target_os = "macos")]
 pub fn install_spawn_helper_plist(pool_uid_base: u32, pool_size: u32) -> Result<(), InstallError> {
     // 1) Probe ember-clients group. Refuse install if missing — the
@@ -3077,7 +3443,7 @@ fn install_spawn_helper_binary() -> Result<(), InstallError> {
 /// Returns the install destination so the caller can hash it for
 /// `EXPECTED_SHIM_HASH`.
 ///
-/// implementation-note-161
+/// implementation-note-184
 #[cfg(target_os = "macos")]
 fn install_spawn_shim_binary() -> Result<PathBuf, InstallError> {
     install_libexec_binary(SPAWN_SHIM_BINARY_NAME)
@@ -3371,6 +3737,45 @@ mod tests {
         );
     }
 
+    /// T1 — chown_ember_data_dirs_inner skips symlink entries entirely.
+    ///
+    /// Regression: the managed install can encounter dangling shadow shims
+    /// like `~/.ember/shadow/docker -> ~/.cargo/bin/ember-docker` on hosts
+    /// where the target wrapper is absent. Plain `chmod`/`chown` on macOS
+    /// follows the link and fails with ENOENT. The chown walk must leave
+    /// symlink ownership alone instead of treating this as an install error.
+    #[test]
+    fn chown_ember_data_dirs_skips_dangling_symlink_entries() {
+        #[cfg(unix)]
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ember_root = tmp.path().join(".ember");
+        let shadow_dir = ember_root.join("shadow");
+        std::fs::create_dir_all(&shadow_dir).expect("mkdir .ember/shadow");
+        let symlink_path = shadow_dir.join("docker");
+        #[cfg(unix)]
+        symlink("/nonexistent/ember-docker", &symlink_path).expect("create dangling symlink");
+
+        let mut visited: Vec<std::path::PathBuf> = Vec::new();
+        let result = chown_ember_data_dirs_inner(tmp.path(), &mut |path, _is_dir| {
+            visited.push(path.to_path_buf());
+            Ok(())
+        });
+        assert!(
+            result.is_ok(),
+            "chown_ember_data_dirs_inner must ignore dangling symlinks, got: {result:?}"
+        );
+        assert!(
+            visited.contains(&shadow_dir),
+            "containing shadow dir must still be visited; visited={visited:?}"
+        );
+        assert!(
+            !visited.contains(&symlink_path),
+            "dangling symlink entry must be skipped; visited={visited:?}"
+        );
+    }
+
     /// Integration-tier — exercises the real `provision_ember_user`
     /// path. Requires sudo + a clean macOS/Linux host, mutates system
     /// state (creates a real system user + group), so it is `#[ignore]`
@@ -3382,6 +3787,112 @@ mod tests {
     fn provision_ember_user_idempotent_on_second_call() {
         provision_ember_user().expect("first call");
         provision_ember_user().expect("second call must be a no-op");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn clear_stale_launchd_runtime_artifacts_removes_pid_and_socket() {
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let run_dir = tmp.path().join(".ember").join("run");
+        std::fs::create_dir_all(&run_dir).expect("mkdir .ember/run");
+
+        let pid_path = run_dir.join("emberd.pid");
+        std::fs::write(&pid_path, b"12345\n").expect("write pid file");
+
+        let sock_path = run_dir.join("daemon.sock");
+        let _listener = UnixListener::bind(&sock_path).expect("bind daemon.sock");
+
+        let changed =
+            clear_stale_launchd_runtime_artifacts(tmp.path()).expect("cleanup must succeed");
+
+        assert!(
+            !pid_path.exists(),
+            "stale pid file must be removed before bootstrap"
+        );
+        assert!(
+            !sock_path.exists(),
+            "stale daemon socket must be removed before bootstrap"
+        );
+        assert!(
+            changed,
+            "cleanup must report when stale artifacts were removed"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn clear_stale_launchd_runtime_artifacts_false_when_nothing_to_remove() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let run_dir = tmp.path().join(".ember").join("run");
+        std::fs::create_dir_all(&run_dir).expect("mkdir .ember/run");
+
+        let changed =
+            clear_stale_launchd_runtime_artifacts(tmp.path()).expect("cleanup must succeed");
+
+        assert!(
+            !changed,
+            "cleanup must report false when no stale runtime artifacts existed"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn wait_for_launchd_runtime_artifacts_inner_succeeds_once_probe_turns_true() {
+        let attempts = std::cell::Cell::new(0usize);
+        let sleeps = std::cell::Cell::new(0usize);
+
+        wait_for_launchd_runtime_artifacts_inner(
+            5,
+            || {
+                let next = attempts.get() + 1;
+                attempts.set(next);
+                next >= 3
+            },
+            || sleeps.set(sleeps.get() + 1),
+        )
+        .expect("probe should eventually succeed");
+
+        assert_eq!(attempts.get(), 3, "probe should stop once artifacts appear");
+        assert_eq!(
+            sleeps.get(),
+            2,
+            "sleep should run only between failed probes"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn wait_for_launchd_runtime_artifacts_inner_times_out_when_probe_stays_false() {
+        let attempts = std::cell::Cell::new(0usize);
+        let sleeps = std::cell::Cell::new(0usize);
+
+        let err = wait_for_launchd_runtime_artifacts_inner(
+            4,
+            || {
+                attempts.set(attempts.get() + 1);
+                false
+            },
+            || sleeps.set(sleeps.get() + 1),
+        )
+        .expect_err("probe should time out");
+
+        match err {
+            InstallError::Subprocess { stderr, .. } => {
+                assert!(
+                    stderr.contains("runtime artifacts never reappeared"),
+                    "unexpected timeout stderr: {stderr}"
+                );
+            }
+            other => panic!("expected subprocess timeout error, got {other:?}"),
+        }
+        assert_eq!(attempts.get(), 4, "probe count should match max attempts");
+        assert_eq!(
+            sleeps.get(),
+            3,
+            "sleep should not run after the final attempt"
+        );
     }
 
     /// T1 — under Plan 2A, `provision_se_mek` creates the data dir,
@@ -3484,8 +3995,13 @@ mod tests {
             "    <key>EMBER_APP_PEM_PATH</key><string>/etc/emberlink/ember-engine-app.pem</string>",
             "    <key>EMBER_APP_ENV_PATH</key><string>/etc/emberlink/ember-engine.env</string>",
             "  </dict>",
+            // emberd_launchd_sandbox_wired (implementation-note-372).
+            "  <!-- emberd_launchd_sandbox_wired — sandbox-exec wrap per implementation-note-320. -->",
             "  <key>ProgramArguments</key>",
             "  <array>",
+            "    <string>/usr/bin/sandbox-exec</string>",
+            "    <string>-f</string>",
+            "    <string>/usr/local/lib/ember/sandbox/emberd.sb</string>",
             "    <string>/usr/local/bin/emberd</string>",
             "    <string>--foreground</string>",
             "  </array>",
@@ -3528,6 +4044,30 @@ mod tests {
             "ExecStart=/usr/local/bin/emberd --foreground",
             "Restart=on-failure",
             "RestartSec=5",
+            "",
+            // emberd_systemd_seccomp_wired (implementation-note-373).
+            "# emberd_systemd_seccomp_wired — kernel sandbox per implementation-note-320.",
+            "# Allowlist: systemd-curated baseline + explicit fork/exec/mlock.",
+            "SystemCallFilter=@system-service @ipc @memlock",
+            "SystemCallFilter=~@raw-io ~@reboot ~@swap ~@cpu-emulation ~@debug ~@mount ~@module ~@obsolete ~@privileged ~@resources",
+            "SystemCallErrorNumber=EPERM",
+            "SystemCallArchitectures=native",
+            "",
+            "# Defense-in-depth hardening — systemd primitives complement seccomp.",
+            "NoNewPrivileges=true",
+            "ProtectSystem=strict",
+            "ProtectHome=read-only",
+            "PrivateTmp=true",
+            "PrivateDevices=true",
+            "ProtectKernelTunables=true",
+            "ProtectKernelModules=true",
+            "ProtectKernelLogs=true",
+            "ProtectControlGroups=true",
+            "RestrictNamespaces=true",
+            "RestrictRealtime=true",
+            "RestrictSUIDSGID=true",
+            "LockPersonality=true",
+            "MemoryDenyWriteExecute=true",
             "",
             "[Install]",
             "WantedBy=multi-user.target",
@@ -3594,6 +4134,101 @@ mod tests {
         let home = resolve_operator_home().expect("operator home");
         install_launchd_plist(&home).expect("first call");
         install_launchd_plist(&home).expect("second call must be a no-op");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn install_launchd_sandbox_profile_into_writes_repo_asset() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dst = tmp.path().join("sandbox").join("emberd.sb");
+        let operator_home = Path::new("/home/test-operator");
+
+        install_launchd_sandbox_profile_into(&dst, operator_home).expect("write sandbox profile");
+        install_launchd_sandbox_profile_into(&dst, operator_home)
+            .expect("second write must be idempotent");
+
+        let body = std::fs::read_to_string(&dst).expect("read sandbox profile");
+        assert_eq!(body, render_launchd_sandbox_profile_body(operator_home));
+        assert!(
+            body.contains(r#"^/home/test\-operator/\.ember(/|$)"#),
+            "sandbox profile must allow writes to the operator chowned ~/.ember tree"
+        );
+        assert!(
+            !body.contains(EMBERD_SANDBOX_WRITE_ALLOWLIST_TOKEN),
+            "installed sandbox profile must not leave the template token behind"
+        );
+
+        let meta = std::fs::metadata(&dst).expect("sandbox profile metadata");
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o644,
+            "sandbox profile must be world-readable for launchd/sandbox-exec"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn render_launchd_sandbox_profile_body_targets_operator_home_tree() {
+        let body = render_launchd_sandbox_profile_body(Path::new("/home/test-operator"));
+        assert!(
+            body.contains(r#"^/home/test\-operator/\.ember(/|$)"#),
+            "sandbox profile must match the operator-home runtime tree"
+        );
+        assert!(
+            body.contains(r#"^/var/log/emberd(/|$)"#),
+            "sandbox profile must keep the launchd log path allowlist"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launchd_service_has_active_process_true_when_active_count_positive() {
+        let print_output = "\
+system/sh.emberlink.daemon = {\n\
+\tactive count = 1\n\
+\tstate = running\n\
+\texecs = 1\n\
+}\n";
+
+        assert!(
+            launchd_service_has_active_process(print_output),
+            "launchd print output with active count > 0 and real execs must be treated as live"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launchd_service_has_active_process_false_when_active_count_zero() {
+        let print_output = "\
+system/sh.emberlink.daemon = {\n\
+\tactive count = 0\n\
+\tstate = spawn scheduled\n\
+\tlast exit code = 78: EX_CONFIG\n\
+}\n";
+
+        assert!(
+            !launchd_service_has_active_process(print_output),
+            "launchd print output with active count = 0 must force reinstall bootstrap"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launchd_service_has_active_process_false_when_stuck_in_xpcproxy() {
+        let print_output = "\
+system/sh.emberlink.daemon = {\n\
+\tactive count = 1\n\
+\tstate = xpcproxy\n\
+\texecs = 0\n\
+\tlast exit code = (never exited)\n\
+}\n";
+
+        assert!(
+            !launchd_service_has_active_process(print_output),
+            "launchd xpcproxy placeholder without daemon exec must force reinstall bootstrap"
+        );
     }
 
     /// Integration-tier — exercises the real Linux systemd install
@@ -3823,7 +4458,57 @@ mod tests {
         );
     }
 
-    // ── implementation-note-334 — resolve_emberd_source + install_emberd_binary_at ────
+    // emberd_systemd_seccomp_wired tests
+    // (implementation-note-373).
+
+    #[test]
+    fn systemd_unit_body_contains_seccomp_filter() {
+        let body = render_systemd_unit_body(Path::new("/home/test-operator"));
+        assert!(
+            body.contains("SystemCallFilter=@system-service"),
+            "systemd unit must wire @system-service syscall allowlist"
+        );
+        assert!(
+            body.contains("SystemCallErrorNumber=EPERM"),
+            "systemd unit must set EPERM as the seccomp error return"
+        );
+        assert!(
+            body.contains("~@privileged"),
+            "systemd unit must explicitly deny @privileged syscall set"
+        );
+    }
+
+    #[test]
+    fn systemd_unit_body_contains_defense_in_depth_hardening() {
+        let body = render_systemd_unit_body(Path::new("/home/test-operator"));
+        // Spot-check a few key hardening directives. Full enumeration
+        // would over-specify and fight legitimate iteration on the
+        // systemd profile; these are the load-bearing few that pair
+        // with the seccomp filter to deny common privilege-escalation
+        // paths even if a syscall slips through.
+        for directive in [
+            "NoNewPrivileges=true",
+            "ProtectKernelModules=true",
+            "RestrictSUIDSGID=true",
+            "MemoryDenyWriteExecute=true",
+        ] {
+            assert!(
+                body.contains(directive),
+                "systemd unit must contain hardening directive `{directive}`"
+            );
+        }
+    }
+
+    #[test]
+    fn systemd_unit_body_contains_seccomp_sentinel() {
+        let body = render_systemd_unit_body(Path::new("/home/test-operator"));
+        assert!(
+            body.contains("emberd_systemd_seccomp_wired"),
+            "systemd unit must carry the checkpoint comment for grep-based detection"
+        );
+    }
+
+    // ── implementation-note-376 — resolve_emberd_source + install_emberd_binary_at ────
 
     /// Serialize tests that mutate process env. `EMBER_EMBERD_BIN_PATH`
     /// is process-global; two override tests racing under cargo's
@@ -4092,9 +4777,10 @@ mod tests {
             },
         );
 
-        assert!(
-            result.is_ok(),
-            "ensure_emberd_log_paths_inner must succeed with mocked ember user, got: {result:?}"
+        assert_eq!(
+            result.expect("ensure_emberd_log_paths_inner must succeed with mocked ember user"),
+            true,
+            "fresh log-path install must report that it repaired host state"
         );
 
         // Both files must exist.
@@ -4170,7 +4856,41 @@ mod tests {
         );
     }
 
-    // ── implementation-note-163 — T2 tests ───────────────────────
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn ensure_emberd_log_paths_false_when_files_already_match() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let err_path = tmp.path().join("emberd.err");
+        let out_path = tmp.path().join("emberd.out");
+
+        std::fs::write(&err_path, b"existing stderr").expect("seed err log");
+        std::fs::write(&out_path, b"existing stdout").expect("seed out log");
+        std::fs::set_permissions(&err_path, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod err");
+        std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod out");
+
+        let err_meta = std::fs::metadata(&err_path).expect("err metadata");
+        let mock_uid = err_meta.uid();
+        let mock_gid = err_meta.gid();
+
+        let changed = ensure_emberd_log_paths_inner(
+            &err_path,
+            &out_path,
+            || Some((mock_uid, mock_gid)),
+            |_path, _uid, _gid| Ok(()),
+        )
+        .expect("matching log files must succeed");
+
+        assert!(
+            !changed,
+            "already-correct log paths must not force a launchd restart"
+        );
+    }
+
+    // ── implementation-note-186 — T2 tests ───────────────────────
     //
     // design Component 2 modern-Linux subuid install path. Tests use
     // `provision_subuid_range_at` against tempdir-scoped `subuid` /
@@ -4836,7 +5556,7 @@ mod tests {
 
     // ── T3: inspect_and_heal_ember_user_inner — partial-state collision ──────
     //
-    // implementation-note-326.
+    // implementation-note-366.
     //
     // These tests exercise the inspect-and-heal step that gates the
     // sysadminctl -addUser call. They use injected closures (mirroring
@@ -4987,5 +5707,74 @@ mod tests {
         assert_eq!(prop, "UserShell");
         assert_eq!(current, "/bin/bash");
         assert_eq!(desired, EMBER_USER_SHELL);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn create_ember_user_dscl_args_pin_reserved_uid_and_group() {
+        let args = create_ember_user_dscl_args(450, 321);
+
+        assert!(
+            args.iter().any(|argv| {
+                argv == &vec![
+                    ".".to_string(),
+                    "-create".to_string(),
+                    "/Users/ember".to_string(),
+                    "UniqueID".to_string(),
+                    "450".to_string(),
+                ]
+            }),
+            "create path must pin the allocated system uid, got: {args:?}"
+        );
+        assert!(
+            args.iter().any(|argv| {
+                argv == &vec![
+                    ".".to_string(),
+                    "-create".to_string(),
+                    "/Users/ember".to_string(),
+                    "PrimaryGroupID".to_string(),
+                    "321".to_string(),
+                ]
+            }),
+            "create path must set the resolved primary group gid, got: {args:?}"
+        );
+        assert!(
+            args.iter().any(|argv| {
+                argv == &vec![
+                    ".".to_string(),
+                    "-create".to_string(),
+                    "/Users/ember".to_string(),
+                    "RealName".to_string(),
+                    EMBER_USER_REALNAME.to_string(),
+                ]
+            }),
+            "create path must set RealName for the service account, got: {args:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn allocate_ember_system_uid_prefers_first_free_high_system_uid() {
+        let mut occupied = std::collections::BTreeSet::new();
+        occupied.insert(450);
+        occupied.insert(451);
+        occupied.insert(452);
+
+        let chosen = allocate_ember_system_uid_inner(|uid| occupied.contains(&uid))
+            .expect("allocator must pick the first free system uid");
+
+        assert_eq!(chosen, 453);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn allocate_ember_system_uid_errors_when_reserved_range_is_full() {
+        let err = allocate_ember_system_uid_inner(|_| true)
+            .expect_err("allocator must fail closed when every reserved uid is occupied");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("no free macOS system uid available"),
+            "error must explain the exhausted system-uid range, got: {msg}"
+        );
     }
 }

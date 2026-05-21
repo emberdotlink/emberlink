@@ -54,7 +54,9 @@ pub enum AgentError {
         status: String,
         stderr: String,
     },
-    #[error("daemon is not running — run `ember daemon start` or `ember daemon install-agent`")]
+    #[error(
+        "daemon is not running — run `ember status` to inspect and `sudo ember daemon install` to install or repair the managed daemon"
+    )]
     DaemonNotRunning,
     #[error("daemon reload timed out after {secs}s")]
     ReloadTimeout { secs: u64 },
@@ -581,6 +583,13 @@ pub struct ReloadOutcome {
     pub managed: bool,
 }
 
+fn daemon_reload_ready(pid_file: &Path, socket_path: &Path) -> bool {
+    matches!(
+        emberlink_cli::probe_live_daemon_status(socket_path, pid_file),
+        Ok(Some(_))
+    )
+}
+
 /// Read the daemon PID file. Returns Ok(None) if absent.
 fn read_pid(pid_file: &Path) -> Result<Option<u32>, AgentError> {
     match fs::read_to_string(pid_file) {
@@ -661,14 +670,15 @@ pub fn reload_daemon(
         std::thread::sleep(RELOAD_POLL_INTERVAL);
     }
 
-    // Phase 2 — wait for a NEW daemon to come up (managed service auto-restart,
-    // or caller starts --background manually).
+    // Phase 2 — wait for a NEW daemon to come up and answer the live status
+    // RPC. A new PID plus socket inode is not enough; operator-facing reload
+    // should only succeed once the replacement daemon is actually serving.
     let new_deadline = Instant::now() + timeout;
     loop {
         if let Some(new_pid) = read_pid(pid_file)?
             && new_pid != old_pid
             && pid_alive(new_pid)
-            && socket_path.exists()
+            && daemon_reload_ready(pid_file, socket_path)
         {
             return Ok(ReloadOutcome {
                 old_pid,

@@ -2,7 +2,7 @@
 //! `emberd-spawn-helper-linux` — design Component 2 hardened-Linux
 //! helper.
 //!
-//! implementation-note-160
+//! implementation-note-183
 //!
 //! Privileged sibling daemon (systemd unit, `User=root`) that performs
 //! the `setuid → chroot → seccomp → execve` chain on behalf of the

@@ -55,7 +55,7 @@ pub enum PresenceKind {
     RevokedBefore,
 }
 
-/// receipt_v2_presence_reason — per design Topic 6 D5 / implementation-note-37.
+/// receipt_v2_presence_reason — per design Topic 6 D5 / implementation-note-47.
 /// *Why* the presence proof was requested. Distinct from [`PresenceKind`]
 /// (which is *what kind* of presence the receipt witnesses): `PresenceReason`
 /// records the lifecycle event that triggered re-prompting the user for
@@ -134,7 +134,7 @@ pub struct ReceiptEnvelope {
     /// add-scope / jit / re-auth). `None` on receipts where presence wasn't
     /// re-elicited (mid-session tool calls riding an existing handle). See
     /// [`PresenceReason`] for the variants. Per design Topic 6 D5 /
-    /// implementation-note-37.
+    /// implementation-note-47.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presence_reason: Option<PresenceReason>,
     /// Opaque handle ID for the presence-proof binding this call rode (or

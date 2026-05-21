@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EmberConfig {
-    /// implementation-note-13: when true, hook unreachable/panic paths permit. When false, all deny.
+    /// implementation-note-16: when true, hook unreachable/panic paths permit. When false, all deny.
     /// Default: true (fail-open during cohort A friendly-dev rollout).
     pub explicit_fail_open: bool,
 }

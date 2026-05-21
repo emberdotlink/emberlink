@@ -3,6 +3,6 @@
 //! Agents run Wasm modules through a capability-scoped runtime; never see
 //! raw credentials. This crate provides the trait surface (`WasmTool`) and a
 //! `StubRuntime` that returns `ToolError::NotImplemented` until the real
-//! wasmtime integration lands in `implementation-note-378`.
+//! wasmtime integration lands in `implementation-note-423`.
 
 pub mod runtime;

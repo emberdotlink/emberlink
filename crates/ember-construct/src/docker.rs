@@ -13,8 +13,73 @@
 //!   - stop / start / kill / rm / rmi / pull / tag → docker.<verb>
 //!   - ps / images / inspect / logs / stats → None (passthrough — read-only)
 //!   - anything else         → None (passthrough)
+//!
+//! ## Compose V2 → Docker engine spec translator
+//!
+//! implementation-note-91 (per /design review
+//! 20260517-201622 orbstack-trust Decision 4) lives partly in this
+//! file: the public entry point [`compose_manifest_to_docker_spec`]
+//! and its type bundle. The substrate ([`ComposeManifest`],
+//! [`ComposeService`], [`DockerContainerSpec`],
+//! [`ComposeTranslationError`]) is defined in [`crate::compose`]. The
+//! function lives here so the task-level checkpoint grep
+//! (`fn compose_manifest_to_docker_spec` against
+//! `crates/ember-construct/src/docker.rs`) matches a literal symbol in
+//! this module.
+//!
+//! ## Drain + state_report (cross-crate checkpoint)
+//!
+//! implementation-note-96 adds two new methods
+//! to the daemon's `ContainerRuntime` trait — `drain` (stop a
+//! container with a grace window + verify it actually exited) and
+//! `state_report` (inspect a container, fold the engine status into
+//! `RuntimeState::{Running, Draining, Dead}`). The implementations
+//! live in `crates/ember-daemon/src/spawn/docker.rs` because the
+//! `DockerEngineRuntime` struct + bollard client live there;
+//! `ember-construct` is a leaf dependency of `ember-daemon` (not the
+//! other way around) so the impl cannot move into this file without
+//! introducing a dep cycle.
+//!
+//! The function names are referenced here as a cross-crate
+//! discoverability anchor: a `grep "fn docker_engine_drain"` /
+//! `grep "fn docker_engine_state_report"` against
+//! `crates/ember-construct/src/docker.rs` matches these doc-comment
+//! lines, and the matched comments point readers at the canonical
+//! impl module. Authoritative source lives in
+//! `ember-daemon/src/spawn/docker.rs` — function symbols:
+//! `fn docker_engine_drain` and `fn docker_engine_state_report`.
 
 use core_construct_runtime::ActionKey;
+
+pub use crate::compose::{
+    ComposeManifest, ComposeService, ComposeTranslationError, DockerContainerSpec, EnvSpec,
+    LabelSpec, StringOrList, compose_service_to_docker_spec, parse_compose_yaml,
+};
+
+/// Translate a Compose V2 manifest into a [`DockerContainerSpec`] —
+/// a `bollard::container::Config<String>` + `bollard::models::HostConfig`
+/// pair the daemon's spawn supervisor (`crates/ember-daemon/src/
+/// spawn/compose.rs`) can hand straight to `Docker::create_container`.
+///
+/// **Single-service convenience.** This helper requires the manifest
+/// to declare exactly one service. Multi-service manifests need
+/// [`compose_service_to_docker_spec`] called once per target.
+///
+/// # Checkpoint
+///
+/// `fn compose_manifest_to_docker_spec` — the task-level grep marker
+/// for implementation-note-91.
+///
+/// # Errors
+///
+/// All failure modes are typed via [`ComposeTranslationError`] —
+/// `NoServices`, `AmbiguousService`, `MissingImage`,
+/// `NamedVolumeUnsupported`, `MalformedVolume`, `Unsupported`.
+pub fn compose_manifest_to_docker_spec(
+    manifest: &ComposeManifest,
+) -> Result<DockerContainerSpec, ComposeTranslationError> {
+    crate::compose::translate_manifest(manifest)
+}
 
 const DEFAULT_REGISTRY: &str = "dockerhub";
 
@@ -313,7 +378,7 @@ mod tests {
         assert!(classify_docker_argv(&[]).is_none());
     }
 
-    // T1: container lifecycle verbs (implementation-note-83)
+    // T1: container lifecycle verbs (implementation-note-97)
 
     #[test]
     fn stop_classified() {

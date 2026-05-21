@@ -37,7 +37,7 @@
 //!
 //! Spawn witnesses are emitted at parent→child grant edge creation time by
 //! `crate::trust::grant::delegate_grant_full_sql` and persisted via
-//! `DaemonStore::store_spawn_witness_receipt` (implementation-note-94,
+//! `DaemonStore::store_spawn_witness_receipt` (implementation-note-108,
 //! shipped 2026-05-15). `build_tree` reads them back via
 //! `DaemonStore::list_spawn_witnesses_for_grants`; the demo-seam synthesis
 //! path that previously fabricated witnesses at export time was removed in
@@ -175,7 +175,7 @@ pub struct TreeSpawnWitness {
     pub spawn_grant_id: String,
     /// `ed25519:<hex>` trust anchor used to verify the inner
     /// `parent_signature` field on the body. Sourced from the parent
-    /// persona's row at tree-build time (implementation-note-94);
+    /// persona's row at tree-build time (implementation-note-108);
     /// `verify_spawn_witness_parent_signature` succeeds iff the parent
     /// persona authorised the spawn at delegation time.
     pub parent_pubkey_hex: String,
@@ -304,7 +304,7 @@ pub fn build_tree(
 
     // ---- Load spawn witnesses persisted at parent→child delegation time. ----
     //
-    // implementation-note-94 (2026-05-15): the daemon
+    // implementation-note-108 (2026-05-15): the daemon
     // emits + persists a spawn.witness Receipt v2 envelope for every
     // parent→child grant edge inside `delegate_grant_full_sql`, signed by
     // the parent persona (body) and the daemon persona (envelope). We
@@ -696,7 +696,7 @@ mod tests {
         assert!(matches!(err, TreeError::Io(_)));
     }
 
-    // --- v2 envelope inclusion (implementation-note-288) ---
+    // --- v2 envelope inclusion (implementation-note-317) ---
 
     fn fixture_tree_with_v2_receipt() -> TreeExport {
         let mut t = fixture_tree();

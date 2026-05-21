@@ -4,7 +4,7 @@ Summary:
 - Decision status: accepted
 - Authority state: current
 - Implementation status: shipped
-- Last reviewed: 2026-05-18
+- Last reviewed: 2026-05-20
 - Supersedes: docs/getting-started.md
 
 # Quickstart
@@ -13,41 +13,49 @@ Summary:
 
 This is the canonical install and onboarding path for the current product surface.
 
+The source mirror may be public before the first public supported build. Until `v0.3.1`, treat this guide as the **current pre-release / friendly-preview path**, not as a broad GA promise. The release boundary lives in design and release-notes.
+
 ## Prerequisites
 
-- **Rust 1.75+** — install via [rustup.rs](https://rustup.rs)
+- **Rust 1.95.0** if building from source — install via [rustup.rs](https://rustup.rs)
 - **Docker** (optional) — required only for `ember sandbox` commands
 
 ## 1. Install the CLI
 
-```bash
-cargo install --path crates/emberlink-cli --bin ember
-```
+If you are in the named `v0.3.0` friendly cohort, install the signed preview
+artifact that was distributed with your invite. Once `ember` is on your
+`PATH`, continue here.
 
-## 2. Provision the daemon
-
-```bash
-sudo ember daemon install
-```
-
-This is the only canonical install posture. Per design, the daemon runs under a dedicated `ember` service account; the old single-uid / `install-system` split is retired.
-
-## 3. Initialize operator state
+If you are evaluating from the public source mirror rather than the invite-only
+friendly-preview build, use the source-build path:
 
 ```bash
-ember init --name "your-name"
+git clone https://github.com/emberdotlink/emberlink.git
+cd emberlink
+cargo install --locked --path crates/emberlink-cli --bin ember
 ```
 
-`ember init` is idempotent. It creates:
+## 2. Run the canonical onboarding flow
 
-- `~/.ember/config.toml`
-- `~/.ember/policy.toml`
-- `~/.ember/data/daemon.db`
-- your initial identity and vault metadata
+```bash
+ember init --for claude-code
+```
 
-If the daemon is not yet installed, `ember init` offers to run `sudo ember daemon install` for you and then resumes.
+This is the load-bearing first-run path for friendly testers. It is
+idempotent, wires the Claude Code shadow shims, and if the daemon is not yet
+installed it offers to run `sudo ember daemon install` for you and then
+resumes. Per design, the
+daemon runs under a dedicated `ember` service account; the old single-uid /
+`install-system` split is retired.
 
-## 4. Confirm the daemon is up
+Claude runtime auth is conditional, not magic. If `ANTHROPIC_API_KEY` is in
+your environment when you run init, Ember stores it as `anthropic-key` and the
+launcher can reuse a brokered Claude runtime grant. Otherwise Claude's own
+upstream auth stays ambient while Ember still brokers the Git/GitHub/tool lane.
+To switch later, rerun `ember init --for claude-code` with
+`ANTHROPIC_API_KEY` exported or run `ember vault add --name anthropic-key`.
+
+## 3. Confirm the daemon is up
 
 ```bash
 ember status
@@ -57,41 +65,26 @@ ember status
 
 Use `ember daemon start` only for manual foreground/dev starts.
 
-## 5. Create a persona and first grant
+## 4. Launch Claude Code through ember
 
 ```bash
-ember persona create --name "coding-agent"
-ember vault add --name "github-token" --value "ghp_yourtoken"
-ember grant create \
-  --persona <persona-id> \
-  --credential github-token \
-  --scope read \
-  --ttl 3600
-ember grant list
+ember claude-code
 ```
 
-That gives you a real persona, one credential in the vault, and one scoped grant to verify the end-to-end loop.
+`ember init --for claude-code` creates or reuses the persona/grant surfaces it
+needs and patches the Claude settings the launcher depends on. If the shadow
+shims are missing, raw `gh` / `git` calls bypass the broker.
 
-## 6. Check the audit surface
+## 5. Check the audit surface after your first classified action
 
 ```bash
 ember status
 ember receipt list
 ```
 
-The grant boundary only counts if you can see it. The daemon should now be emitting Receipts for credential-bearing actions and state changes.
-
-## Claude Code path
-
-For host-level Claude Code use, the current canonical path is:
-
-```bash
-ember init --for claude-code
-ls ~/.ember/shadow/gh ~/.ember/shadow/git
-ember claude-code
-```
-
-`ember init --for claude-code` is the load-bearing step. It installs the shadowed tool shims under `~/.ember/shadow/` and patches the Claude settings the launcher depends on. If the shadow shims are missing, raw `gh` / `git` calls bypass the broker.
+The grant boundary only counts if you can see it. After the first brokered
+action, the daemon should be emitting Receipts for credential-bearing actions
+and state changes.
 
 ### Optional MCP wiring
 

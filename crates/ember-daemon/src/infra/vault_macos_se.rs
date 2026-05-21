@@ -113,14 +113,24 @@ mod tests {
     /// `ember daemon install`. This is the operator-facing "you forgot
     /// to install" diagnostic; the error text is part of the UX contract.
     ///
-    /// The test relies on the assumption that the dev runner does NOT
-    /// have a `vault-mek` item in System.keychain (which would only be
-    /// the case if the operator runs `ember daemon install` on the same
-    /// machine the tests execute on). If you hit a false pass / failure,
-    /// run `sudo security delete-generic-password -a vault-mek
+    /// `#[ignore]` because the test reads a process-global hardcoded
+    /// service/account (`sh.emberlink.daemon` / `vault-mek`) from the
+    /// real System.keychain and expects ABSENCE. On any host that has
+    /// run `ember daemon install` (i.e. the operator's dev host running
+    /// the production daemon) the item is present and the test fails —
+    /// even when invoked through `cargo-env.sh --keyring-service
+    /// ember-daemon-qa --keyring-account qa`, because `get_mek_passphrase`
+    /// uses the hardcoded constants instead of the env-overridable
+    /// `EMBER_KEYRING_SERVICE` the rest of the suite respects. Run with
+    /// `cargo test -- --ignored` on a fresh dev host where install has
+    /// not run, or `sudo security delete-generic-password -a vault-mek
     /// -s sh.emberlink.daemon /Library/Keychains/System.keychain` to
-    /// clear state and re-run.
+    /// clear state first (DESTRUCTIVE — breaks the live daemon's vault).
+    /// Filed as `implementation-note-363` to
+    /// refactor `get_mek_passphrase` to accept service/account args so
+    /// the test can use unique strings that are guaranteed absent.
     #[test]
+    #[ignore]
     fn missing_keychain_item_returns_install_hint() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let err =

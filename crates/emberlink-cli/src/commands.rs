@@ -203,9 +203,9 @@ impl DemoApp {
             ["import", rest @ ..] => self.handle_import(rest),
             ["show", "vault", rest @ ..] | ["vault", rest @ ..] => self.handle_vault(rest),
             ["show", "grant", rest @ ..] | ["grant", rest @ ..] => self.handle_grant(rest),
-            // EMBER-implementation-note-244: Subcommand::Audit — query the receipts table.
+            // EMBER-implementation-note-270: Subcommand::Audit — query the receipts table.
             ["audit", rest @ ..] => self.handle_audit(rest),
-            // implementation-note-205 — `ember approval approve|deny <id>` is the
+            // implementation-note-230 — `ember approval approve|deny <id>` is the
             // demo-grade approval command. On macOS it triggers
             // LocalAuthentication (Touch ID / device passcode) before
             // mutating state; declined biometric refuses the approval.
@@ -2003,7 +2003,7 @@ impl DemoApp {
         Ok(lines)
     }
 
-    /// EMBER-implementation-note-244 — Subcommand::Audit dispatch for the demo shell.
+    /// EMBER-implementation-note-270 — Subcommand::Audit dispatch for the demo shell.
     ///
     /// Accepts the same filter flags as `ember audit query` (`--actor`,
     /// `--kind`, `--grant-id`, `--since`, `--limit`, `--format`). In the
@@ -6634,7 +6634,7 @@ impl DemoApp {
         }
     }
 
-    // ── implementation-note-205: hardware-attested approval ─────────────────────
+    // ── implementation-note-230: hardware-attested approval ─────────────────────
     //
     // `ember approval approve|deny <id> [--no-biometric] [--reason <r>]`
     //
@@ -6734,7 +6734,7 @@ impl DemoApp {
             Ok(()) => {
                 // Audit line — surfaced in `ember show audit` and tee'd into
                 // the daemon log. The `biometric` + `credential_id` fields
-                // satisfy the implementation-note-205 acceptance criterion.
+                // satisfy the implementation-note-230 acceptance criterion.
                 let cred = credential_id.as_deref().unwrap_or("");
                 format!(
                     "approved\t{}\tbiometric={}\tcredential_id={}\n",

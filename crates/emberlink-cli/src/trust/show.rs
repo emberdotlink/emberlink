@@ -49,19 +49,14 @@ pub fn fetch_trust_show(
     socket_path: &Path,
     root_id: &str,
 ) -> Result<TrustRootShowResponse, TrustShowError> {
-    let response = call_daemon(
-        socket_path,
-        "trust.show",
-        &json!({"root_id": root_id}),
-    )?;
+    let response = call_daemon(socket_path, "trust.show", &json!({"root_id": root_id}))?;
     parse_trust_show_response(&response)
 }
 
 /// Parse the daemon's `trust.show` response body into a typed struct.
 pub fn parse_trust_show_response(body: &Value) -> Result<TrustRootShowResponse, TrustShowError> {
-    serde_json::from_value(body.clone()).map_err(|e| {
-        TrustShowError::Protocol(format!("decode trust.show response: {e}"))
-    })
+    serde_json::from_value(body.clone())
+        .map_err(|e| TrustShowError::Protocol(format!("decode trust.show response: {e}")))
 }
 
 /// Render the response as a human-readable detail block — a vertical
@@ -85,9 +80,8 @@ pub fn run(socket_path: &Path, root_id: &str) -> i32 {
         }
         Err(TrustShowError::DaemonUnavailable { socket, source }) => {
             eprintln!(
-                "ember trust show: daemon socket at {} unreachable ({source}). \
-                 Is emberd running? (ember daemon status)",
-                socket.display()
+                "ember trust show: {}",
+                crate::format_daemon_unavailable(&socket, &source)
             );
             2
         }
@@ -105,11 +99,7 @@ pub fn run(socket_path: &Path, root_id: &str) -> i32 {
     }
 }
 
-fn call_daemon(
-    socket_path: &Path,
-    method: &str,
-    params: &Value,
-) -> Result<Value, TrustShowError> {
+fn call_daemon(socket_path: &Path, method: &str, params: &Value) -> Result<Value, TrustShowError> {
     let stream = std::os::unix::net::UnixStream::connect(socket_path).map_err(|e| {
         TrustShowError::DaemonUnavailable {
             socket: socket_path.to_path_buf(),

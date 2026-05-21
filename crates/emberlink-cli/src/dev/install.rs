@@ -1,10 +1,9 @@
 //! `ember dev install` — dev daemon install flow (design Phase 4).
 //!
-//! This file ships phase 1 (key generation + Keychain stash) and phases 2-4
-//! (GH App provisioning + macOS uid/group provisioning). Phases 5-10 are
-//! stubbed with explicit "TODO: phase X" markers and will be wired into the
-//! slice-C helper modules (`dev_install_slice_c::*`) by a follow-up
-//! integration PR.
+//! This file ships the full design Phase 4 dev-install path: dev
+//! IdentityRoot generation, GH App provisioning, uid/group provisioning,
+//! release build + signing, binary install, manifest signing, launchctl
+//! bootstrap, and post-install verify.
 //!
 
 use super::gh_app;
@@ -18,8 +17,18 @@ use super::uids;
 /// Phase 2: GH App interactive provisioning (idempotent).
 /// Phase 3: `_ember_dev` system user via dscl (idempotent).
 /// Phase 4: `_ember_clients_dev` group via dscl + operator membership (idempotent).
-/// Phases 5-10: stubs (follow-up integration PR wires slice-C helpers).
 pub fn run() -> Result<(), String> {
+    let mut completion_issues = Vec::new();
+    let runtime = crate::dev_runtime::resolve_current_dev_runtime()?;
+
+    println!("worktree dev runtime:");
+    println!("  workspace root: {}", runtime.workspace_root.display());
+    println!("  worktree id:    {}", runtime.worktree_id);
+    println!("  install root:   {}", runtime.install_root.display());
+    println!("  plist label:    {}", runtime.plist_label);
+    println!("  socket:         {}", runtime.socket_path.display());
+    println!();
+
     // Phase 1: dev IdentityRoot key generation.
     eprintln!("[ember dev install] phase 1: dev IdentityRoot key generation");
     let handle = identity_root::ensure_dev_identity_root()?;
@@ -38,6 +47,7 @@ pub fn run() -> Result<(), String> {
             eprintln!(
                 "  Run 'ember dev install' again after setting EMBER_DEV_GH_APP_ID + EMBER_DEV_GH_APP_PEM"
             );
+            completion_issues.push(format!("GitHub App provisioning incomplete: {e}"));
         }
     }
 
@@ -54,7 +64,7 @@ pub fn run() -> Result<(), String> {
         uids::CLIENTS_DEV_GID
     );
 
-    // Phases 5-10: wire slice-C helpers (prior change).
+    // Phases 5-11: build/sign/install/bootstrap/verify via slice-C helpers.
     use crate::dev_install_slice_c::{
         RealCommandRunner, build_sign, install_binaries, launchctl, manifest, verify,
     };
@@ -73,7 +83,7 @@ pub fn run() -> Result<(), String> {
 
     // Phase 7: copy signed binaries to install root (idempotent via SHA-256 diff).
     eprintln!("[ember dev install] phase 7: install binaries");
-    let changed = install_binaries::install_binaries(&runner, &build)
+    let changed = install_binaries::install_binaries(&runner, &build, &runtime.install_root)
         .map_err(|e| format!("phase 7 failed: {e}"))?;
     println!("  binaries copied: {} changed", changed.len());
 
@@ -82,40 +92,35 @@ pub fn run() -> Result<(), String> {
     let entries =
         manifest::scan_tool_binaries(&runner).map_err(|e| format!("phase 8 (scan) failed: {e}"))?;
     let toml_str = manifest::render_manifest(&entries);
-    // Re-load dev IdentityRoot signing key from Keychain (cheap; same Entry as phase 1).
-    let signer_handle = identity_root::ensure_dev_identity_root()?;
-    // Note: ensure_dev_identity_root returns public-key handle; we need the signing key.
-    // The slice-C `sign_manifest` will load the private-key from Keychain internally.
-    // For the integration PR we delegate to manifest::sign_manifest which knows how.
-    match manifest::manifest_dest_dir() {
-        Some(dest_dir) => {
-            eprintln!(
-                "  manifest target dir: {}; signing with dev IdentityRoot {}",
-                dest_dir.display(),
-                signer_handle.fingerprint
-            );
-            // Sign + write (slice-C handles the Keychain-side key load internally;
-            // for now we just write the unsigned manifest as the wire-up. The
-            // signing-with-Keychain-loaded-key is a future tightening.)
-            let _ = (toml_str, dest_dir); // wire-up only; sign+write deferred
-            eprintln!(
-                "  manifest write deferred — see slice-C manifest.rs (Keychain-side key load needed)"
-            );
-        }
-        None => {
-            eprintln!("  manifest dest dir not resolvable (no $HOME?); skipping");
-        }
-    }
+    let signing_key = identity_root::ensure_dev_identity_root_signing_key()?;
+    let dest_dir = manifest::manifest_dest_dir(&runtime.manifest_path).ok_or_else(|| {
+        "phase 8 failed: manifest dest dir not resolvable (no $HOME?)".to_string()
+    })?;
+    eprintln!(
+        "  manifest target dir: {}; signing with dev IdentityRoot {}",
+        dest_dir.display(),
+        handle.fingerprint
+    );
+    let signature = manifest::sign_manifest(toml_str.as_bytes(), &signing_key)
+        .map_err(|e| format!("phase 8 (sign) failed: {e}"))?;
+    manifest::write_manifest(&toml_str, &signature, &dest_dir)
+        .map_err(|e| format!("phase 8 (write) failed: {e}"))?;
+    println!(
+        "  manifest written: {} entr{} -> {}",
+        entries.len(),
+        if entries.len() == 1 { "y" } else { "ies" },
+        dest_dir.join("manifest.toml").display()
+    );
 
     // Phase 9+10: render dev LaunchDaemon plist + launchctl bootstrap.
     eprintln!("[ember dev install] phase 9+10: plist install + launchctl bootstrap");
-    launchctl::install_and_bootstrap(&runner, &signer_handle.fingerprint)
+    launchctl::install_and_bootstrap(&runner, &handle.fingerprint, &runtime)
         .map_err(|e| format!("phase 9+10 failed: {e}"))?;
     println!("  dev daemon: bootstrapped");
 
     // Phase 11: post-install verify.
     eprintln!("[ember dev install] phase 11: verify");
-    match verify::verify_dev_install() {
+    match verify::verify_dev_install_for(&runtime) {
         Ok(report) => {
             println!(
                 "  verify: pid={:?} manifest_fp={:?} brokers={:?} trust_roots={:?}",
@@ -124,10 +129,24 @@ pub fn run() -> Result<(), String> {
                 report.registered_broker_count,
                 report.trust_roots,
             );
+            completion_issues.extend(verify::readiness_issues(&report));
         }
         Err(e) => {
             eprintln!("  verify: WARN — {e}");
+            completion_issues.push(format!("post-install verify failed: {e}"));
         }
+    }
+
+    if !completion_issues.is_empty() {
+        eprintln!();
+        eprintln!("ember dev install: incomplete");
+        for issue in &completion_issues {
+            eprintln!("  - {issue}");
+        }
+        eprintln!(
+            "  Inspect `ember dev status` and re-run `ember dev install` after fixing the gaps above."
+        );
+        return Err("install did not reach ready state".to_string());
     }
 
     println!();

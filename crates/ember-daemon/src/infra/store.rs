@@ -71,35 +71,25 @@ pub enum StoreError {
         "identity key at {path} has insecure mode {mode:#06o} (expected 0600 — chmod 0600 to fix)"
     )]
     KeyInsecureMode { path: String, mode: u32 },
+    /// `quarantine_serve_mode_audit_writes_refused` — the daemon is in
+    /// quarantine (audit-chain tamper detected at startup or mid-serve)
+    /// and the audit-log writers refuse to record this event. Returned
+    /// by `log_event`, `append_audit_event_with_chain`, and
+    /// `append_audit_event_with_chain_in_tx`. Closes the chain-write
+    /// entry points so the dispatcher quarantine gate's invariant holds
+    /// across ALL audit writers (dashboard, proxy, session_watcher,
+    /// startup runtime) — not just the JSON-RPC dispatch path. The
+    /// `action` field names the suppressed event so the operator log
+    /// can identify which writer was refused. Per design v2 §1 +
+    /// adversarial review CRIT-1/CRIT-2.
+    #[error("daemon quarantined; audit-log write for action `{action}` refused")]
+    Quarantined { action: String },
 }
 
 impl From<core_grants::scope::DelegationViolation> for StoreError {
     fn from(v: core_grants::scope::DelegationViolation) -> Self {
         StoreError::DelegationViolation { reason: v.reason }
     }
-}
-
-/// implementation-note-292 —
-/// outcome of [`DaemonStore::recover_audit_chain_tail`].
-///
-/// `NoOp` is the normal-path outcome — the tail row is well-formed (or
-/// the audit_log is empty). `Truncated` means a half-written tail row
-/// was detected and removed before the verifier ran; the carried fields
-/// are surfaced via a structured `tracing::warn!` so operators see the
-/// recovery in `audit show` / `daemon.log` rather than a silent fix.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AuditChainTailRecovery {
-    /// The tail row is well-formed (or no row exists).
-    NoOp,
-    /// A half-write was detected and truncated. Carries the deleted
-    /// row's SQLite `id` and `action` so the operator log can identify
-    /// what was removed without dumping the full row.
-    Truncated {
-        /// The deleted row's `audit_log.id`.
-        id: i64,
-        /// The deleted row's `action` column (e.g. `"grant.create"`).
-        action: String,
-    },
 }
 
 pub struct DaemonStore {
@@ -118,7 +108,7 @@ pub struct DaemonStore {
     /// reference through that chain. The `RefCell` is only touched on
     /// the single-threaded LocalSet, so runtime borrow panics cannot race.
     vault_slot: RefCell<LiveVaultSlot>,
-    /// implementation-note-253 Phase 2: in-memory rate-limit set for the
+    /// implementation-note-279 Phase 2: in-memory rate-limit set for the
     /// `sops_unwrap_dek` RPC. Each grant_id is consumed exactly once per
     /// daemon-process lifetime. The set is intentionally non-persistent —
     /// daemon restart clears it (acceptable: a restart-then-replay attack
@@ -128,7 +118,7 @@ pub struct DaemonStore {
     /// Single-threaded LocalSet semantics: same as `vault`. No cross-thread
     /// races possible.
     consumed_dek_grants: RefCell<HashSet<String>>,
-    /// implementation-note-60: cached
+    /// implementation-note-71: cached
     /// copy of the daemon's Bridge CA fingerprint (blake3-256 of the SPKI
     /// bytes). Wired in by `runtime.rs` after `load_or_mint_bridge_ca`
     /// succeeds but before the socket listener starts. Read by the
@@ -144,6 +134,35 @@ pub struct DaemonStore {
 
 impl DaemonStore {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
+        // cordon_phase1_recreate_table_landed — pre-cordon backup. If we
+        // detect a pre-v2 schema on a populated DB, copy the file out of
+        // the way before opening rusqlite (which would otherwise hold an
+        // exclusive write lock during the BEGIN IMMEDIATE recreate). The
+        // backup is the rollback substrate (locked decision #22 / R5).
+        //
+        // Best-effort: a backup failure does NOT abort startup — the
+        // recreate is atomic in the SQLite transaction, so loss of the
+        // backup file just means rollback would need to re-derive from
+        // event-log evidence. We log a WARN so the operator knows.
+        let backup_attempted = match Self::pre_cordon_backup_if_needed(path) {
+            Ok(Some(dest)) => {
+                tracing::warn!(
+                    backup = %dest.display(),
+                    "cordon_phase1_recreate_table_landed: pre-cordon DB backup written before migration"
+                );
+                true
+            }
+            Ok(None) => false,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "cordon_phase1_recreate_table_landed: pre-cordon backup attempt failed; \
+                     continuing with migration (recreate is atomic in BEGIN IMMEDIATE)"
+                );
+                false
+            }
+        };
+
         let conn = Connection::open(path)?;
         let store = Self {
             conn,
@@ -151,8 +170,75 @@ impl DaemonStore {
             consumed_dek_grants: RefCell::new(HashSet::new()),
             bridge_ca_fingerprint: RefCell::new(None),
         };
-        store.migrate()?;
+        let migrate_result = store.migrate();
+        if migrate_result.is_err() && backup_attempted {
+            tracing::error!(
+                "cordon_phase1_recreate_table_landed: migrate() failed; the pre-cordon backup \
+                 is the rollback substrate"
+            );
+        }
+        migrate_result?;
         Ok(store)
+    }
+
+    /// cordon_phase1_recreate_table_landed — copy the daemon DB to a
+    /// timestamped sibling file before opening rusqlite, if and only if
+    /// the file exists and is a pre-v2 schema with rows that would be
+    /// affected by the cordon. Returns Ok(Some(backup_path)) on a real
+    /// copy, Ok(None) when no backup is needed.
+    fn pre_cordon_backup_if_needed(path: &Path) -> Result<Option<std::path::PathBuf>, std::io::Error> {
+        // No existing file? Fresh install, nothing to back up.
+        if !path.exists() {
+            return Ok(None);
+        }
+        // Probe the DB without rusqlite (lightweight): open a read-only
+        // connection, check for segment_id column. If it already exists,
+        // the cordon won't run, so no backup is needed.
+        let probe = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        );
+        let pre_v2 = match probe {
+            Ok(conn) => {
+                let mut stmt = match conn.prepare("PRAGMA table_info(audit_log)") {
+                    Ok(s) => s,
+                    Err(_) => return Ok(None),
+                };
+                let mut rows = match stmt.query([]) {
+                    Ok(r) => r,
+                    Err(_) => return Ok(None),
+                };
+                let mut has_segment_id = false;
+                while let Ok(Some(row)) = rows.next() {
+                    let name: String = match row.get(1) {
+                        Ok(n) => n,
+                        Err(_) => continue,
+                    };
+                    if name == "segment_id" {
+                        has_segment_id = true;
+                        break;
+                    }
+                }
+                drop(rows);
+                drop(stmt);
+                !has_segment_id
+            }
+            Err(_) => return Ok(None),
+        };
+        if !pre_v2 {
+            return Ok(None);
+        }
+
+        let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        let mut dest = path.to_path_buf();
+        let stem = dest
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "daemon.db".to_string());
+        let dest_name = format!("{stem}.pre-cordon-{ts}");
+        dest.set_file_name(dest_name);
+        std::fs::copy(path, &dest)?;
+        Ok(Some(dest))
     }
 
     pub fn open_in_memory() -> Result<Self, StoreError> {
@@ -193,7 +279,7 @@ impl DaemonStore {
         Ok(store)
     }
 
-    /// implementation-note-253 Phase 2: claim a `grant_id` slot for a
+    /// implementation-note-279 Phase 2: claim a `grant_id` slot for a
     /// `sops_unwrap_dek` RPC call. Returns `true` on first claim,
     /// `false` if the grant has already been consumed for an unwrap.
     ///
@@ -253,7 +339,7 @@ impl DaemonStore {
         *self.vault_slot.borrow_mut() = slot;
     }
 
-    /// implementation-note-60: attach the
+    /// implementation-note-71: attach the
     /// daemon's Bridge CA fingerprint after `load_or_mint_bridge_ca`
     /// succeeds in `runtime.rs`. Mirrors [`Self::set_vault`] — the store is
     /// constructed before the CA exists, so the runtime stitches them
@@ -272,7 +358,7 @@ impl DaemonStore {
         *self.bridge_ca_fingerprint.borrow()
     }
 
-    /// implementation-note-27 C2: drop the attached `Rc<Vault>` so the
+    /// implementation-note-33 C2: drop the attached `Rc<Vault>` so the
     /// final outstanding reference is released — the MEK is wiped via
     /// `ZeroizeOnDrop` once every clone of the `Rc` has dropped. Called
     /// from `trust::presence::lock()` (explicit user-initiated lock) so
@@ -290,109 +376,425 @@ impl DaemonStore {
         &self.conn
     }
 
-    /// implementation-note-292 —
-    /// recovery pre-pass for the audit-chain tail.
+    /// mek_fingerprint_column_verified — read the plaintext
+    /// blake3(MEK) fingerprint from vault_meta. Returns `None` if not
+    /// yet written (first-run pre-MEK-provision or pre-slice-B-bis).
+    /// Per implementation-note-341.
+    pub fn read_mek_fingerprint(&self) -> Result<Option<String>, StoreError> {
+        use rusqlite::OptionalExtension as _;
+        let row: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT mek_fingerprint FROM vault_meta WHERE id = 1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(StoreError::Sqlite)?;
+        Ok(row.flatten())
+    }
+
+    /// mek_fingerprint_column_verified — write the plaintext
+    /// blake3(MEK) fingerprint to vault_meta. UPSERT semantics: if a
+    /// fingerprint is already present and differs from the supplied
+    /// value, returns an error (mismatch — caller must surface to the
+    /// startup-probe fail-loud path). Per
+    /// implementation-note-341.
+    pub fn write_mek_fingerprint(&self, fingerprint_hex: &str) -> Result<(), StoreError> {
+        let existing = self.read_mek_fingerprint()?;
+        if let Some(prev) = &existing
+            && prev != fingerprint_hex {
+                return Err(StoreError::InvalidInput(format!(
+                    "MEK fingerprint mismatch: recorded={prev} attempted={fingerprint_hex}"
+                )));
+            }
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO vault_meta (id, mek_fingerprint, provisioned_at) \
+                 VALUES (1, ?1, ?2) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                   mek_fingerprint = excluded.mek_fingerprint, \
+                   provisioned_at = excluded.provisioned_at",
+                rusqlite::params![fingerprint_hex, now],
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(())
+    }
+
+    /// mek_missing_with_state_refuses_start helper
+    /// (implementation-note-327).
     ///
-    /// Called from `runtime.rs::Daemon::start` BEFORE `run_audit_verify`.
-    /// Detects the half-write signature on the most-recently-inserted
-    /// `audit_log` row and truncates it so the verifier does not
-    /// false-positive a tamper. The signature is:
+    /// Returns true when any state-bearing row exists in the store:
+    /// personas, grants, receipts, credentials (vault). Used by the
+    /// runtime.rs MEK-missing-with-state detector to refuse the silent
+    /// re-provision path on startup. Sum-of-counts pattern keeps this
+    /// to a single connection round-trip; row contents are not loaded.
+    pub fn has_state_bearing_rows(&self) -> Result<bool, StoreError> {
+        let total: i64 = self
+            .conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM personas) +
+                    (SELECT COUNT(*) FROM grants) +
+                    (SELECT COUNT(*) FROM receipts) +
+                    (SELECT COUNT(*) FROM credentials)",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(StoreError::Sqlite)?;
+        Ok(total > 0)
+    }
+
+    /// cordon_phase1_recreate_table_landed — promote pre-v2 `audit_log`
+    /// (chain columns present but no `segment_id`) to v2 via recreate-table
+    /// per design v2 + design review 20260521-134520 R2/R5/R7. No-op on:
     ///
-    /// ```text
-    /// prev_hash IS NULL
-    ///   AND row_hash IS NOT NULL
-    ///   AND action != 'audit.chain_v1_genesis'
+    /// - Fresh DBs (CREATE TABLE already used v2 shape so `segment_id`
+    ///   column already exists).
+    /// - Already-migrated DBs (`MAX(segment_id) > 0`).
+    /// - Pre-v1 DBs without the genesis row (the cordon predicate's third
+    ///   clause demands at least one chained row past the legacy block).
+    ///
+    /// On the operator's host (1 genesis + 290 NULL legacy + 3 buggy
+    /// chained tail at ids 295/296/297), this:
+    ///   1. CREATEs `audit_log_new` with the v2 shape (CHECK + partial
+    ///      unique index).
+    ///   2. INSERTs rows 1..=294 into segment_id=0 (genesis +
+    ///      cordoned-legacy block), preserving id values.
+    ///   3. INSERTs a `audit.chain_v1_segment_bridge_unattested` row at
+    ///      `segment_id = 1, is_segment_genesis = 1` whose `prev_hash`
+    ///      chains to the v1 genesis's `row_hash`.
+    ///   4. DROPs the old `audit_log` (which destroys rows 295/296/297 by
+    ///      exclusion from the INSERT SELECT — they were not carried over).
+    ///   5. ALTER RENAMEs `audit_log_new` → `audit_log`.
+    ///
+    /// All five steps run inside a single `BEGIN IMMEDIATE` transaction
+    /// per locked decision #20. Idempotent via the `MAX(segment_id) > 0`
+    /// predicate: a second invocation post-migration no-ops.
+    ///
+    /// Cordon discrimination predicate (R2 / pass-2 finding #1, locked in
+    /// SQL not prose):
+    /// ```sql
+    /// MAX(segment_id) = 0
+    ///   AND COUNT(*) FROM audit_log WHERE row_hash IS NULL > 0
+    ///   AND EXISTS (SELECT 1 FROM audit_log WHERE row_hash IS NOT NULL AND id > 1)
     /// ```
     ///
-    /// A row that matches this shape can only arise from a
-    /// chain-write whose `prev_hash` lookup landed on a legacy
-    /// `log_event` row (whose `row_hash` is NULL by design) and
-    /// therefore stored `prev_hash = NULL`. The chain verifier walks
-    /// past the legacy row (via the `row_hash IS NULL → continue`
-    /// branch) and then expects the next chained row's `prev_hash` to
-    /// equal the prior chain row's `row_hash` — but the stored value
-    /// is `NULL`, so the verifier emits a false-positive
-    /// `VerifyOutcome::Break`.
-    ///
-    /// This is NOT actual tampering. Mutating an existing row's
-    /// `details` (the real tamper signature, asserted by
-    /// `audit_verify_chain_detects_tampered_row`) leaves both
-    /// `prev_hash` and `row_hash` non-NULL — only the `row_hash`
-    /// diverges from the recomputed value. The NULL-`prev_hash`
-    /// signature is structurally distinct and is the brief's
-    /// "missing chain-link write on shutdown" failure mode.
-    ///
-    /// Recovery is conservative — strictly latest-row-only. A
-    /// non-NULL but wrong `prev_hash` mid-chain (a real attacker
-    /// rewrite) remains a tamper. A NULL-prev_hash row that is NOT
-    /// the latest (i.e. there is at least one row inserted after it)
-    /// also remains a tamper, because the daemon's writes have
-    /// committed past that point and operator intervention is
-    /// required to choose a recovery strategy.
-    ///
-    /// Returns:
-    /// - `AuditChainTailRecovery::NoOp` if the tail row is
-    ///   well-formed or no audit_log row exists.
-    /// - `AuditChainTailRecovery::Truncated { id, action }` if a
-    ///   half-write was detected and the row was deleted.
-    ///
-    /// Runs inside `BEGIN IMMEDIATE` so the read-decide-delete is
-    /// atomic w.r.t. concurrent writers; in practice the recovery is
-    /// called BEFORE the socket listener binds, so no concurrent
-    /// writer exists, but the immediate-mode lock guards against a
-    /// future caller invoking this from a hot path.
-    pub fn recover_audit_chain_tail(&self) -> Result<AuditChainTailRecovery, StoreError> {
+    /// On a fresh-install DB the second clause is false (no legacy NULL
+    /// rows) so the predicate no-ops and the daemon writes happily into
+    /// segment 0.
+    fn cordon_migration_phase1_if_needed(&self) -> Result<(), StoreError> {
+        // 1. If `audit_log` doesn't have the segment_id column yet, this is
+        //    a pre-v2 DB. Detect via PRAGMA table_info. If the column is
+        //    already present, we're either fresh (v2 from CREATE TABLE) or
+        //    already-migrated. Either way, ensure the partial unique index
+        //    exists (idempotent via IF NOT EXISTS) and return.
+        let has_segment_id = self.audit_log_column_exists("segment_id")?;
+        if has_segment_id {
+            self.recreate_audit_log_indexes(&self.conn)?;
+            return Ok(());
+        }
+
+        // 2. Cordon discrimination predicate (R2 / pass-2 finding #1).
+        // First: any rows at all? Fresh DBs (no audit_log content) skip the
+        // recreate; the CREATE TABLE batch handled them.
+        let total_rows: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM audit_log", [], |row| row.get(0))
+            .unwrap_or(0);
+        if total_rows == 0 {
+            // Empty table — fall through to the v2-shape CREATE TABLE the
+            // migrate() body already executed via the IF NOT EXISTS, BUT
+            // since the table already exists at v1 shape with rows=0, we
+            // still need to recreate it to pick up the new columns +
+            // CHECK constraint. Handle this as a no-data recreate.
+            return self.recreate_audit_log_no_data();
+        }
+
+        // Legacy null block + chained-rows-past-genesis predicate.
+        let legacy_null_count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE row_hash IS NULL AND action != 'audit.chain_v1_genesis'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let chained_past_genesis: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE row_hash IS NOT NULL AND action != 'audit.chain_v1_genesis'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        let cordon_predicate_fires =
+            legacy_null_count > 0 && chained_past_genesis > 0;
+
+        if cordon_predicate_fires {
+            self.cordon_migration_phase1_destructive()?;
+            tracing::warn!(
+                legacy_rows = legacy_null_count,
+                chained_rows_destroyed = chained_past_genesis,
+                "cordon_phase1_recreate_table_landed: Phase 1 cordon migration fired \
+                 (recreate-table; pre-cordon backup written; bridge row inserted at segment_id=1)"
+            );
+        } else {
+            // Pre-v2 schema without a legacy block: recreate-table to add
+            // segment_id + is_segment_genesis + CHECK, carry all rows over
+            // into segment 0. Fresh chained writes will land in segment 0
+            // (per Theme A — segment_id is the operational segment, not
+            // strictly a migration concept).
+            self.recreate_audit_log_carry_all_segment_zero()?;
+            tracing::info!(
+                rows_carried = total_rows,
+                "cordon_phase1_recreate_table_landed: pre-v2 → v2 recreate-table no-cordon \
+                 (no legacy NULL block present; all rows carried into segment_id=0)"
+            );
+        }
+        Ok(())
+    }
+
+    /// PRAGMA-based column existence probe.
+    fn audit_log_column_exists(&self, column_name: &str) -> Result<bool, StoreError> {
+        let mut stmt = self.conn.prepare("PRAGMA table_info(audit_log)")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == column_name {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Recreate `audit_log` from a pre-v2 schema where no rows exist (or
+    /// the row count is genuinely zero). The CREATE TABLE in the migrate
+    /// batch's IF NOT EXISTS was a no-op because the table already
+    /// exists with the old shape; we drop and re-create to pick up the
+    /// new columns + CHECK constraint + partial unique index.
+    fn recreate_audit_log_no_data(&self) -> Result<(), StoreError> {
         let conn = &self.conn;
         conn.execute("BEGIN IMMEDIATE", [])?;
-        let result = (|| -> Result<AuditChainTailRecovery, StoreError> {
-            // Fetch (id, action, prev_hash, row_hash) of the latest row.
-            // QueryReturnedNoRows → empty audit_log (pre-migrate path),
-            // which is a NoOp.
-            let row = conn.query_row(
-                "SELECT id, action, prev_hash, row_hash \
-                 FROM audit_log ORDER BY id DESC LIMIT 1",
-                [],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                    ))
-                },
-            );
-            let (id, action, prev_hash, row_hash) = match row {
-                Ok(t) => t,
-                Err(rusqlite::Error::QueryReturnedNoRows) => {
-                    return Ok(AuditChainTailRecovery::NoOp);
-                }
-                Err(e) => return Err(StoreError::Sqlite(e)),
-            };
-
-            // The half-write signature: chained row (row_hash set)
-            // whose prev_hash is NULL, and which is not the genesis
-            // anchor (genesis legitimately has NULL prev_hash).
-            let is_half_write =
-                prev_hash.is_none() && row_hash.is_some() && action != "audit.chain_v1_genesis";
-
-            if !is_half_write {
-                return Ok(AuditChainTailRecovery::NoOp);
-            }
-
-            conn.execute("DELETE FROM audit_log WHERE id = ?1", rusqlite::params![id])?;
-            Ok(AuditChainTailRecovery::Truncated { id, action })
+        let result = (|| -> Result<(), StoreError> {
+            self.create_audit_log_new_v2(conn)?;
+            // No rows to carry; just swap.
+            conn.execute("DROP TABLE audit_log", [])?;
+            conn.execute("ALTER TABLE audit_log_new RENAME TO audit_log", [])?;
+            self.recreate_audit_log_indexes(conn)?;
+            Ok(())
         })();
-
         match result {
-            Ok(outcome) => {
+            Ok(()) => {
                 conn.execute("COMMIT", [])?;
-                Ok(outcome)
+                Ok(())
             }
             Err(e) => {
                 let _ = conn.execute("ROLLBACK", []);
                 Err(e)
             }
         }
+    }
+
+    /// Carry all rows over into `segment_id = 0` and recreate the table.
+    /// Used when a pre-v2 DB has no legacy NULL block (so no cordon-
+    /// bridge needed) — e.g. a DB that already had only chained rows
+    /// under v1 chain semantics.
+    fn recreate_audit_log_carry_all_segment_zero(&self) -> Result<(), StoreError> {
+        let conn = &self.conn;
+        conn.execute("BEGIN IMMEDIATE", [])?;
+        let result = (|| -> Result<(), StoreError> {
+            self.create_audit_log_new_v2(conn)?;
+            conn.execute(
+                "INSERT INTO audit_log_new \
+                 (id, timestamp, agent_id, action, credential, outcome, details, prev_hash, row_hash, segment_id, is_segment_genesis) \
+                 SELECT id, timestamp, agent_id, action, credential, outcome, details, prev_hash, row_hash, \
+                        0 AS segment_id, \
+                        CASE WHEN action = 'audit.chain_v1_genesis' THEN 1 ELSE 0 END AS is_segment_genesis \
+                 FROM audit_log",
+                [],
+            )?;
+            conn.execute("DROP TABLE audit_log", [])?;
+            conn.execute("ALTER TABLE audit_log_new RENAME TO audit_log", [])?;
+            self.recreate_audit_log_indexes(conn)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", [])?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", []);
+                Err(e)
+            }
+        }
+    }
+
+    /// cordon_phase1_recreate_table_landed — the destructive cordon
+    /// migration that fires on a DB matching the operator's host shape
+    /// (legacy NULL block + chained tail past the block). See
+    /// `cordon_migration_phase1_if_needed` doc-comment for the full
+    /// design rationale.
+    fn cordon_migration_phase1_destructive(&self) -> Result<(), StoreError> {
+        // Compute the first-non-null chained id past genesis BEFORE
+        // opening the transaction (this is a read).
+        let first_non_null_after_genesis: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT MIN(id) FROM audit_log WHERE row_hash IS NOT NULL AND action != 'audit.chain_v1_genesis'",
+                [],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten();
+
+        // The cordon boundary: every id < first_non_null_after_genesis
+        // is carried over (genesis + legacy NULL block). Every id >=
+        // first_non_null_after_genesis is destroyed (the buggy chained
+        // tail past the legacy block).
+        let boundary_id = first_non_null_after_genesis
+            .ok_or_else(|| StoreError::InvalidInput(
+                "cordon predicate fired but no non-NULL chained row past genesis exists".into()
+            ))?;
+
+        // Resolve the genesis row's row_hash — it's the bridge row's
+        // prev_hash.
+        let genesis_row_hash: String = self
+            .conn
+            .query_row(
+                "SELECT row_hash FROM audit_log WHERE action = 'audit.chain_v1_genesis' AND id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| StoreError::InvalidInput(
+                "cordon predicate fired but the chain-v1 genesis row at id=1 is missing or has NULL row_hash".into()
+            ))?;
+
+        let conn = &self.conn;
+        conn.execute("BEGIN IMMEDIATE", [])?;
+        let result = (|| -> Result<(), StoreError> {
+            // 1. CREATE audit_log_new with v2 schema.
+            self.create_audit_log_new_v2(conn)?;
+
+            // 2. INSERT cordoned-legacy rows (id < boundary_id) into
+            //    segment_id = 0. Preserves id values via INSERT ... id
+            //    column. The genesis row gets is_segment_genesis = 1; all
+            //    other carryovers get 0.
+            conn.execute(
+                "INSERT INTO audit_log_new \
+                 (id, timestamp, agent_id, action, credential, outcome, details, prev_hash, row_hash, segment_id, is_segment_genesis) \
+                 SELECT id, timestamp, agent_id, action, credential, outcome, details, prev_hash, row_hash, \
+                        0 AS segment_id, \
+                        CASE WHEN action = 'audit.chain_v1_genesis' THEN 1 ELSE 0 END AS is_segment_genesis \
+                 FROM audit_log \
+                 WHERE id < ?1",
+                rusqlite::params![boundary_id],
+            )?;
+
+            // 3. INSERT segment-1 bridge row.
+            // Action: `audit.chain_v1_segment_bridge_unattested` (Phase 1).
+            // Bridge row body is canonical-encoded with the same shape as
+            // a chained audit row; row_hash = blake3(genesis_row_hash ||
+            // canonical_body). Phase 2 will re-issue with `_attested` +
+            // operator signature; both receipts persist.
+            let bridge_timestamp = chrono::Utc::now().to_rfc3339();
+            let bridge_action = "audit.chain_v1_segment_bridge_unattested";
+            let bridge_outcome = "ok";
+            let canonical = crate::infra::audit::canonical_audit_row_bytes_pub(
+                &bridge_timestamp,
+                None,
+                bridge_action,
+                None,
+                bridge_outcome,
+                None,
+            );
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(genesis_row_hash.as_bytes());
+            hasher.update(&canonical);
+            let bridge_row_hash = hasher.finalize().to_hex().to_string();
+
+            conn.execute(
+                "INSERT INTO audit_log_new \
+                 (timestamp, agent_id, action, credential, outcome, details, prev_hash, row_hash, segment_id, is_segment_genesis) \
+                 VALUES (?1, NULL, ?2, NULL, ?3, NULL, ?4, ?5, 1, 1)",
+                rusqlite::params![
+                    bridge_timestamp,
+                    bridge_action,
+                    bridge_outcome,
+                    genesis_row_hash,
+                    bridge_row_hash,
+                ],
+            )?;
+
+            // 4. DROP the old table (destroys rows past boundary_id by
+            //    exclusion). 5. RENAME the new table into place.
+            conn.execute("DROP TABLE audit_log", [])?;
+            conn.execute("ALTER TABLE audit_log_new RENAME TO audit_log", [])?;
+            self.recreate_audit_log_indexes(conn)?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                conn.execute("COMMIT", [])?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = conn.execute("ROLLBACK", []);
+                Err(e)
+            }
+        }
+    }
+
+    /// audit_chain_v2_schema_landed — build the v2 `audit_log_new` table
+    /// (same shape as the migrate-batch CREATE TABLE on fresh DBs). Used
+    /// by all recreate paths so the schema definition lives in one place.
+    fn create_audit_log_new_v2(&self, conn: &rusqlite::Connection) -> Result<(), StoreError> {
+        conn.execute(
+            "CREATE TABLE audit_log_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                agent_id TEXT,
+                action TEXT NOT NULL,
+                credential TEXT,
+                outcome TEXT NOT NULL,
+                details TEXT,
+                prev_hash TEXT,
+                row_hash TEXT,
+                segment_id INTEGER NOT NULL,
+                is_segment_genesis INTEGER NOT NULL DEFAULT 0,
+                CHECK (
+                    (segment_id = 0)
+                    OR (action = 'audit.chain_v1_genesis')
+                    OR (row_hash IS NOT NULL AND prev_hash IS NOT NULL)
+                )
+            )",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// audit_chain_v2_schema_landed — re-create the audit_log indexes
+    /// after a recreate-table swap. The indexes don't carry over via
+    /// ALTER TABLE RENAME (they're attached to the original table name);
+    /// re-create them against the new table.
+    fn recreate_audit_log_indexes(&self, conn: &rusqlite::Connection) -> Result<(), StoreError> {
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_agent ON audit_log(agent_id)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_segment_genesis \
+             ON audit_log(segment_id) WHERE is_segment_genesis = 1",
+            [],
+        )?;
+        Ok(())
     }
 
     fn migrate(&self) -> Result<(), StoreError> {
@@ -419,6 +821,13 @@ impl DaemonStore {
                 metadata TEXT
             );
 
+            -- audit_chain_v2_schema_landed (implementation-note-342).
+            -- v2 audit_log shape from CREATE TABLE on fresh DBs. The CHECK
+            -- constraint encodes the chain invariant. segment_id is NOT NULL
+            -- with NO DEFAULT (per R5 / pass-2 finding #4) so an older binary
+            -- that does not name the column fails loudly instead of silently
+            -- downgrade-corrupting topology. Pre-v2 DBs are migrated by
+            -- cordon_migration_phase1 below.
             CREATE TABLE IF NOT EXISTS audit_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT NOT NULL,
@@ -428,10 +837,23 @@ impl DaemonStore {
                 outcome TEXT NOT NULL,
                 details TEXT,
                 prev_hash TEXT,
-                row_hash TEXT
+                row_hash TEXT,
+                segment_id INTEGER NOT NULL,
+                is_segment_genesis INTEGER NOT NULL DEFAULT 0,
+                CHECK (
+                    (segment_id = 0)
+                    OR (action = 'audit.chain_v1_genesis')
+                    OR (row_hash IS NOT NULL AND prev_hash IS NOT NULL)
+                )
             );
             CREATE INDEX IF NOT EXISTS idx_audit_agent ON audit_log(agent_id);
             CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp);
+            -- audit_chain_v2_schema_landed (R6 / pass-2 finding #6):
+            -- the partial unique index `idx_audit_segment_genesis` is NOT
+            -- created here because pre-v2 audit_log tables do not yet have
+            -- the `is_segment_genesis` column — the cordon migration below
+            -- (which runs before any chained writes) creates the index via
+            -- `recreate_audit_log_indexes` after the v2 schema lands.
 
             CREATE TABLE IF NOT EXISTS grants (
                 id TEXT PRIMARY KEY,
@@ -498,7 +920,7 @@ impl DaemonStore {
                 created_at TEXT NOT NULL,
                 composite_statements_json TEXT,
                 result_grant_id TEXT,
-                -- implementation-note-7:
+                -- implementation-note-10:
                 -- grant-shaping fields preserved through the approval queue so
                 -- the resolver can re-stamp them on the minted grant.
                 max_delegation_depth INTEGER,
@@ -545,7 +967,7 @@ impl DaemonStore {
             CREATE INDEX IF NOT EXISTS idx_receipts_persona ON receipts(persona_id);
             CREATE INDEX IF NOT EXISTS idx_receipts_created ON receipts(created_at);
 
-            -- implementation-note-91: server-persisted WebAuthn credentials.
+            -- implementation-note-105: server-persisted WebAuthn credentials.
             -- Each row is a passkey enrolled by a persona via
             -- /settings/passkeys; the `passkey_json` column is the
             -- webauthn-rs `Passkey` type (serde JSON serialization)
@@ -564,7 +986,7 @@ impl DaemonStore {
             CREATE INDEX IF NOT EXISTS idx_webauthn_credentials_persona
                 ON webauthn_credentials(persona_id);
 
-            -- implementation-note-91: in-flight WebAuthn ceremony state.
+            -- implementation-note-105: in-flight WebAuthn ceremony state.
             -- Registration ceremonies and authentication ceremonies
             -- both stash `state_json` here keyed by a freshly-minted
             -- challenge_id; the corresponding finish endpoint reads it
@@ -590,7 +1012,7 @@ impl DaemonStore {
             CREATE INDEX IF NOT EXISTS idx_webauthn_challenges_persona
                 ON webauthn_challenges(persona_id);
 
-            -- credential_bindings_table_schema — implementation-note-307
+            -- credential_bindings_table_schema — implementation-note-343
             -- Daemon-controlled credential-target allowlist: binds a
             -- principal (persona) + working-tree (canonical absolute
             -- repo-root path) + remote-name to a specific remote URL.
@@ -611,7 +1033,7 @@ impl DaemonStore {
                 ON credential_bindings(principal_id);",
         )?;
 
-        // implementation-note-49 — backfill `kind` column on legacy DBs so
+        // implementation-note-60 — backfill `kind` column on legacy DBs so
         // the kms_wrap / kms_unwrap rows can land alongside grant rows.
         // Errors swallowed when the column already exists.
         let _ = self.conn.execute(
@@ -619,7 +1041,7 @@ impl DaemonStore {
             [],
         );
 
-        // implementation-note-49 — per-key fast-path index for queries shaped
+        // implementation-note-60 — per-key fast-path index for queries shaped
         // `WHERE kind IN ('kms_wrap','kms_unwrap') AND key_name = ?`. Uses
         // SQLite JSON1 (`json_extract`) over the existing `receipt_json`
         // column so we don't have to project key_name into its own
@@ -631,7 +1053,7 @@ impl DaemonStore {
                  WHERE kind IN ('kms_wrap','kms_unwrap');",
         )?;
 
-        // EMBER-implementation-note-244 — per-actor and per-resource fast-path indexes
+        // EMBER-implementation-note-270 — per-actor and per-resource fast-path indexes
         // for the `ember audit` query CLI. The existing
         // `idx_receipts_persona` covers persona_id lookups; we keep the
         // `idx_receipts_actor` alias as a stable name the task spec can
@@ -644,7 +1066,7 @@ impl DaemonStore {
                  ON receipts(json_extract(receipt_json, '$.summary.resource'));",
         )?;
 
-        // implementation-note-201 — composite-grant approval columns. Existing v0 DBs
+        // implementation-note-226 — composite-grant approval columns. Existing v0 DBs
         // (e.g. the qember.sh demo seed) predate the columns above, so
         // additively backfill them with idempotent ALTER TABLE calls.
         // Errors here are swallowed when the column already exists; any
@@ -683,7 +1105,7 @@ impl DaemonStore {
             .conn
             .execute("ALTER TABLE sandboxes ADD COLUMN owner_persona_id TEXT", []);
 
-        // implementation-note-242 — per-statement revocation list.
+        // implementation-note-268 — per-statement revocation list.
         // Stores a JSON array of revoked Statement sids ("S0", "S1", ...) so
         // the demo can revoke a single Statement without taking down the
         // whole grant. Default `'[]'` keeps the column non-null on legacy
@@ -724,7 +1146,7 @@ impl DaemonStore {
             [],
         );
 
-        // implementation-note-7 — grant-
+        // implementation-note-10 — grant-
         // shaping fields the auto-approve `create_grant` path writes onto the
         // freshly-minted grant row. Before this fix the approval-required
         // path silently dropped them. Persisted on the approval_requests row
@@ -764,7 +1186,7 @@ impl DaemonStore {
             [],
         );
 
-        // implementation-note-53 (design §9 + §6) — bind a
+        // implementation-note-64 (design §9 + §6) — bind a
         // workload Persona to the container identity it was minted for so
         // the reconciler can refuse to spawn a second container into the
         // same enrollment slot if the daemon restarts mid-spawn (CRIT-4
@@ -784,7 +1206,7 @@ impl DaemonStore {
             .conn
             .execute("ALTER TABLE personas ADD COLUMN parent_grant_id TEXT", []);
 
-        // implementation-note-308 (M1 of design, Bridge
+        // implementation-note-344 (M1 of design, Bridge
         // Cert Refresh Protocol). Per-persona client-certificate state for
         // the (d) refresh-and-rotate path:
         //
@@ -795,6 +1217,15 @@ impl DaemonStore {
         // - `client_cert_not_after INTEGER NOT NULL DEFAULT 0` — Unix
         //   timestamp of the pinned cert's `notAfter`. Zero means "no
         //   cert" / "expiry not relevant" (same legacy class).
+        // - `client_cert_refresh_seq INTEGER NOT NULL DEFAULT 0` —
+        //   monotone refresh counter emitted by `refresh_cert` RPC into
+        //   the `bridge.cert_refreshed` Receipt body (design Extension
+        //   4/5). The `verify --strict` invariants depend on this value
+        //   being durable across daemon restarts; without persistence
+        //   M3's RPC handler cannot guarantee monotonicity. New persona
+        //   rows start at 0; the first `refresh_cert` call observes 1
+        //   via the atomic UPDATE ... RETURNING in
+        //   `DaemonStore::increment_refresh_seq`.
         //
         // Defaults preserve back-compat for any persona row that predates
         // the (d) chain. New persona rows minted by the spawn-time cert
@@ -810,8 +1241,12 @@ impl DaemonStore {
             "ALTER TABLE personas ADD COLUMN client_cert_not_after INTEGER NOT NULL DEFAULT 0",
             [],
         );
+        let _ = self.conn.execute(
+            "ALTER TABLE personas ADD COLUMN client_cert_refresh_seq INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
 
-        // implementation-note-238 (design §"In-container
+        // implementation-note-264 (design §"In-container
         // extension") — per-socket Persona enrollment table. At spawn
         // time the daemon records `(agent_socket_path, persona_id,
         // grant_id, brief_content_hash)` so subsequent RPCs on that
@@ -835,11 +1270,12 @@ impl DaemonStore {
                 state TEXT NOT NULL DEFAULT 'active',
                 cgroup_v2_id INTEGER,
                 userns_inode INTEGER,
-                mnt_ns_inode INTEGER
+                mnt_ns_inode INTEGER,
+                peer_uid INTEGER
             );",
         )?;
 
-        // implementation-note-309 Step A — namespace-inode columns on
+        // implementation-note-345 Step A — namespace-inode columns on
         // agent_socket_enrollments. Errors swallowed when columns already
         // exist (fresh DBs have them via the CREATE TABLE above; old DBs
         // need the ALTER).
@@ -856,23 +1292,52 @@ impl DaemonStore {
             [],
         );
 
-        // implementation-note-168 — tamper-evident chain columns on the
-        // audit_log table + split-brain migration checkpoint. Pre-chain rows
-        // carry NULL hashes; the genesis row marks the boundary between
-        // pre-chain audit history and the new chained-from-here regime.
-        // Errors swallowed when columns already exist (fresh DBs have them
-        // via the CREATE TABLE above; old DBs need the ALTER).
+        // implementation-note-289 — peer_uid
+        // column on agent_socket_enrollments. Carries the kernel-attested
+        // uid the per-agent UDS socket was bound to at spawn time so the
+        // broker's `check_principal_against_persona` gate can compare the
+        // live `PeerCredPrincipal.uid` against the enrollment row. The
+        // in-process `PERSONA_UID_REGISTRY` thread-local was retired in
+        // implementation-note-151; the
+        // enrollment table is now the sole source of truth.
+        //
+        // Nullable to preserve back-compat for legacy / pre-Step-B rows
+        // that were recorded before the writer was migrated; the
+        // `lookup_persona_uid_from_enrollments` helper maps `NULL` to
+        // `Ok(None)` so callers preserve the legacy fail-open posture
+        // for personas that pre-date the per-agent UDS enrollment
+        // surface. Error swallowed when the column already exists.
+        let _ = self.conn.execute(
+            "ALTER TABLE agent_socket_enrollments ADD COLUMN peer_uid INTEGER",
+            [],
+        );
+
+        // audit_chain_v2_schema_landed — pre-v2 DBs may exist without the
+        // chain columns at all (the very oldest schema). Best-effort ADD
+        // COLUMN to bring them up to v1 shape (prev_hash + row_hash); the
+        // cordon migration below promotes v1 → v2 (adds segment_id +
+        // is_segment_genesis + CHECK + partial unique index via recreate-
+        // table). Errors swallowed when the columns already exist.
         let _ = self
             .conn
             .execute("ALTER TABLE audit_log ADD COLUMN prev_hash TEXT", []);
         let _ = self
             .conn
             .execute("ALTER TABLE audit_log ADD COLUMN row_hash TEXT", []);
+
+        // cordon_phase1_recreate_table_landed (implementation-note-346-
+        // CORDON-PHASE1) — promote a v1 DB (chain columns but no segment_id)
+        // to v2 via recreate-table. No-op on v2 DBs (the column already
+        // exists) and on fresh DBs (CREATE TABLE already used v2 shape).
+        self.cordon_migration_phase1_if_needed()?;
+
         // Idempotent genesis: insert only if no genesis row exists yet.
         // chain_v1_genesis acts as the chain anchor — subsequent
         // append_audit_event_with_chain calls hash the prior row's
         // row_hash into the new row, with this genesis providing the
-        // initial non-NULL prev_hash for chain readers.
+        // initial non-NULL prev_hash for chain readers. The genesis is at
+        // `segment_id = 0, is_segment_genesis = 1` (the segment-0
+        // boundary marker).
         let has_genesis: i64 = self
             .conn
             .query_row(
@@ -885,17 +1350,42 @@ impl DaemonStore {
             let genesis_hash = blake3::hash(b"audit.chain_v1_genesis").to_hex().to_string();
             let _ = self.conn.execute(
                 "INSERT INTO audit_log \
-                 (timestamp, agent_id, action, credential, outcome, details, prev_hash, row_hash) \
-                 VALUES (?1, NULL, 'audit.chain_v1_genesis', NULL, 'ok', NULL, NULL, ?2)",
+                 (timestamp, agent_id, action, credential, outcome, details, prev_hash, row_hash, segment_id, is_segment_genesis) \
+                 VALUES (?1, NULL, 'audit.chain_v1_genesis', NULL, 'ok', NULL, NULL, ?2, 0, 1)",
                 rusqlite::params![chrono::Utc::now().to_rfc3339(), genesis_hash],
             );
         }
+
+        // mek_fingerprint_column_verified
+        // (implementation-note-341).
+        //
+        // `vault_meta` table carries plaintext-fingerprint columns that
+        // survive the keychain-ACL problem: the daemon can ALWAYS read
+        // vault_meta regardless of who signed the binary, so a plaintext
+        // blake3(MEK) hex string in SQLite is the cross-platform stable
+        // reference point for the slice A loud-fail check.
+        //
+        // Single-row table (id=1 checkpoint). Columns:
+        //   mek_fingerprint  — blake3(MEK_bytes).hex() as TEXT
+        //   provisioned_at   — ISO-8601 timestamp when fingerprint written
+        //
+        // Idempotent: CREATE IF NOT EXISTS. Slice F's diagnose CLI +
+        // future runtime.rs verify path read this column; slice B-bis
+        // wires the WRITE side at MEK-first-provision time.
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS vault_meta (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                mek_fingerprint TEXT,
+                provisioned_at TEXT
+            )",
+            [],
+        )?;
 
         Ok(())
     }
 }
 
-/// implementation-note-238 (design §"In-container
+/// implementation-note-264 (design §"In-container
 /// extension") — projection of an `agent_socket_enrollments` row.
 ///
 /// Returned by [`DaemonStore::lookup_agent_socket_enrollment`] when an
@@ -910,18 +1400,18 @@ pub struct AgentSocketEnrollment {
     pub brief_content_hash: String,
     pub enrolled_at: String,
     pub state: String,
-    /// implementation-note-309 Step A — cgroup v2 leaf inode for
+    /// implementation-note-345 Step A — cgroup v2 leaf inode for
     /// the worker container (Step B populates; Step C gates dispatch).
     /// NULL for legacy/host-resident enrollments.
     pub cgroup_v2_id: Option<i64>,
-    /// implementation-note-309 Step A — user-namespace inode.
+    /// implementation-note-345 Step A — user-namespace inode.
     pub userns_inode: Option<i64>,
-    /// implementation-note-309 Step A — mount-namespace inode.
+    /// implementation-note-345 Step A — mount-namespace inode.
     pub mnt_ns_inode: Option<i64>,
 }
 
 impl DaemonStore {
-    /// implementation-note-238 — record a fresh per-socket
+    /// implementation-note-264 — record a fresh per-socket
     /// Persona enrollment.
     ///
     /// Called at agent-spawn time by the scion spawn pipeline once a
@@ -936,6 +1426,7 @@ impl DaemonStore {
     /// re-enrollment of the same `socket_path` replaces the prior row
     /// (`INSERT OR REPLACE`) so a tombstoned slot can be reclaimed
     /// after the original agent exits.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_agent_socket_enrollment(
         &self,
         socket_path: &str,
@@ -946,7 +1437,7 @@ impl DaemonStore {
         userns_inode: Option<i64>,
         mnt_ns_inode: Option<i64>,
     ) -> Result<(), StoreError> {
-        // implementation-note-310 — the three Option<i64>
+        // implementation-note-347 — the three Option<i64>
         // columns carry the kernel-observable binding tuple captured
         // at spawn-completion via
         // `crate::spawn::scion::capture_container_ns_inodes`. NULL is
@@ -972,7 +1463,7 @@ impl DaemonStore {
         Ok(())
     }
 
-    /// implementation-note-238 — resolve the Persona
+    /// implementation-note-264 — resolve the Persona
     /// bound to a per-agent UDS socket.
     ///
     /// Returns `Ok(Some(...))` only when an `active` enrollment row is
@@ -1009,7 +1500,7 @@ impl DaemonStore {
         }
     }
 
-    /// implementation-note-238 — tombstone an enrollment.
+    /// implementation-note-264 — tombstone an enrollment.
     ///
     /// Flips the row's `state` column to `'revoked'`; the row itself
     /// stays so the slot is observable for post-mortem audit and so a
@@ -1028,8 +1519,61 @@ impl DaemonStore {
     }
 }
 
+/// implementation-note-289 — look up a
+/// persona's expected peer uid by consulting the
+/// `agent_socket_enrollments` table.
+///
+/// Single source of truth for the `check_principal_against_persona`
+/// gate: the per-agent UDS socket already populates this table at
+/// enrollment time, so the broker can compare the live kernel-attested
+/// `PeerCredPrincipal.uid` against the recorded `peer_uid`. The
+/// per-process `PERSONA_UID_REGISTRY` thread-local was retired in
+/// implementation-note-151; see
+/// `crates/ember-daemon/src/infra/handler.rs` for the tombstone.
+///
+/// Resolution order:
+///
+/// 1. No active enrollment row for `persona_id` → `Ok(None)`. Caller
+///    decides whether to refuse or downgrade — preserving the legacy
+///    fail-open posture from `check_principal_against_persona` so
+///    legacy daemon-internal smoke callers continue to function.
+/// 2. Active row exists but `peer_uid` is `NULL` (legacy row recorded
+///    before the writer was migrated) → `Ok(None)`. Same fail-open
+///    semantics as (1).
+/// 3. Active row exists with a non-NULL `peer_uid` → `Ok(Some(uid))`.
+///    Multi-row personas (re-enrollment after a tombstone, multiple
+///    sockets for the same persona) resolve to the most-recently
+///    enrolled active row — the `ORDER BY enrolled_at DESC LIMIT 1`
+///    deterministic tie-break.
+///
+/// Returns `Err(StoreError::Sqlite)` only on a real SQLite error
+/// (corrupt db, schema-mismatch, etc.); the no-row and NULL-uid cases
+/// are mapped to `Ok(None)` so the caller can apply policy uniformly.
+pub fn lookup_persona_uid_from_enrollments(
+    store: &DaemonStore,
+    persona_id: &str,
+) -> Result<Option<u32>, StoreError> {
+    let result = store.conn.query_row(
+        "SELECT peer_uid \
+         FROM agent_socket_enrollments \
+         WHERE persona_id = ?1 AND state = 'active' \
+         ORDER BY enrolled_at DESC \
+         LIMIT 1",
+        rusqlite::params![persona_id],
+        |row| row.get::<_, Option<i64>>(0),
+    );
+    match result {
+        Ok(Some(uid)) if uid >= 0 => Ok(Some(uid as u32)),
+        // NULL peer_uid or negative checkpoint — caller falls back to
+        // legacy fail-open posture.
+        Ok(_) => Ok(None),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(StoreError::Sqlite(e)),
+    }
+}
+
 impl DaemonStore {
-    /// EMBER-implementation-note-244 — query the receipts table with the full
+    /// EMBER-implementation-note-270 — query the receipts table with the full
     /// [`crate::infra::receipt::ReceiptFilter`] filter set (actor/kind/grant_id/
     /// since_iso/resource/limit). Returns flat [`crate::infra::receipt::ReceiptRow`]
     /// projections so callers get `materialized_at`, `terminal_reason`,
@@ -1055,7 +1599,7 @@ impl DaemonStore {
     /// Phase C callers replace the embedded `if current_status != "pending"`
     /// string-comparison guard with this fn, which also covers the
     /// scope-narrowing invariant checked by `core_approval::TransitionError::ScopeNotNarrowing`.
-    // implementation-note-311 wires this into resolve_approval_inner.
+    // implementation-note-348 wires this into resolve_approval_inner.
     #[allow(dead_code)]
     pub(crate) fn validate_approval_transition(
         state: core_grant_types::approval::ApprovalStatus,
@@ -1079,10 +1623,12 @@ mod tests {
         assert!(DaemonStore::open_in_memory().is_ok());
     }
 
-    /// implementation-note-308 (M1) — verify the M1
+    /// implementation-note-344 (M1) +
+    /// implementation-note-296 — verify the
     /// schema migration landed: the `personas` table has
-    /// `client_cert_fingerprint` (TEXT NOT NULL DEFAULT '') and
-    /// `client_cert_not_after` (INTEGER NOT NULL DEFAULT 0).
+    /// `client_cert_fingerprint` (TEXT NOT NULL DEFAULT ''),
+    /// `client_cert_not_after` (INTEGER NOT NULL DEFAULT 0), and
+    /// `client_cert_refresh_seq` (INTEGER NOT NULL DEFAULT 0).
     ///
     /// Also verifies idempotency by running `migrate()` a second time and
     /// re-querying — the second call must be a no-op (additive ALTER with
@@ -1118,6 +1664,25 @@ mod tests {
             not_after.default.as_deref(),
             Some("0"),
             "client_cert_not_after default must be 0"
+        );
+
+        // implementation-note-296 — third M-series
+        // column on the cert refresh chain. Default 0 so legacy rows
+        // observe their first refresh as seq=1 via the atomic
+        // `UPDATE ... RETURNING` in `DaemonStore::increment_refresh_seq`.
+        let refresh_seq = cols
+            .iter()
+            .find(|c| c.name == "client_cert_refresh_seq")
+            .expect("client_cert_refresh_seq column must exist");
+        assert_eq!(refresh_seq.col_type, "INTEGER");
+        assert_eq!(
+            refresh_seq.notnull, 1,
+            "client_cert_refresh_seq must be NOT NULL"
+        );
+        assert_eq!(
+            refresh_seq.default.as_deref(),
+            Some("0"),
+            "client_cert_refresh_seq default must be 0"
         );
 
         // Re-running migrate() is a no-op — the ALTER calls swallow errors
@@ -1169,7 +1734,7 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         let expected = [
-            // implementation-note-238: per-socket Persona
+            // implementation-note-264: per-socket Persona
             // enrollment table keyed by `socket_path`.
             "agent_socket_enrollments",
             "approval_requests",
@@ -1183,11 +1748,16 @@ mod tests {
             "receipts",
             "sandboxes",
             "standing_grants",
-            // implementation-note-91: server-persisted WebAuthn state.
+            // implementation-note-349-* (design / SE-sealed vault):
+            // single-row table holding the current MEK fingerprint + the
+            // ISO-8601 timestamp it was provisioned at. Slice B-bis writes
+            // it at first-provision; slice F's diagnose CLI reads it.
+            "vault_meta",
+            // implementation-note-105: server-persisted WebAuthn state.
             "webauthn_credentials",
             "webauthn_challenges",
         ];
-        assert_eq!(tables.len(), 14);
+        assert_eq!(tables.len(), 15);
         for name in &expected {
             assert!(tables.contains(&name.to_string()), "missing table: {name}");
         }
@@ -1300,213 +1870,260 @@ mod tests {
         assert!(grants.is_empty());
     }
 
-    // implementation-note-292 —
-    // recovery pre-pass tests.
+    // audit_chain_v2_schema_landed — v2 schema invariant tests.
+    // The pre-v2 `recover_audit_chain_tail` tests were deleted per R4 /
+    // pass-2 finding #3: the CHECK constraint structurally precludes the
+    // half-write input that primitive was designed to clean up, so the
+    // primitive is dead code and its tests now violate the CHECK
+    // constraint at raw-INSERT time.
 
-    /// On a fresh DB the migrate() call inserts the genesis anchor. The
-    /// anchor legitimately carries `prev_hash = NULL` because it's the
-    /// chain root — recovery MUST treat it as well-formed and not
-    /// truncate it.
+    /// audit_chain_v2_schema_landed — the CHECK constraint rejects a
+    /// row with `segment_id > 0` that has NULL prev_hash/row_hash and
+    /// is not the chain-v1 genesis checkpoint. This is the structural
+    /// enforcement that makes the buggy-half-write input (the case
+    /// `recover_audit_chain_tail` used to clean up) un-constructible.
     #[test]
-    fn recover_audit_chain_tail_noop_on_genesis_only() {
+    fn audit_log_check_constraint_rejects_unchained_segment_1() {
         let store = DaemonStore::open_in_memory().unwrap();
-        let outcome = store.recover_audit_chain_tail().unwrap();
-        assert_eq!(outcome, AuditChainTailRecovery::NoOp);
-        let count: i64 = store
+        let result = store.conn().execute(
+            "INSERT INTO audit_log \
+             (timestamp, agent_id, action, credential, outcome, details, prev_hash, row_hash, segment_id, is_segment_genesis) \
+             VALUES (?1, NULL, 'grant.create', NULL, 'ok', NULL, NULL, NULL, 1, 0)",
+            rusqlite::params!["2026-05-21T00:00:00Z"],
+        );
+        let err = result.expect_err("CHECK constraint must reject segment_id=1 with NULL hashes");
+        let msg = format!("{err}");
+        assert!(
+            msg.to_uppercase().contains("CHECK") || msg.to_uppercase().contains("CONSTRAINT"),
+            "expected CHECK constraint failure, got: {msg}"
+        );
+    }
+
+    /// audit_chain_v2_schema_landed (R6 / pass-2 finding #6) — the
+    /// partial unique index rejects a second `is_segment_genesis = 1`
+    /// row within the same segment_id. Composes with the cordon bridge
+    /// + repair-tombstone invariant "each segment-genesis opens a NEW
+    /// segment."
+    #[test]
+    fn audit_log_partial_unique_index_rejects_double_genesis() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        // First segment-1 genesis insert succeeds.
+        let h1 = blake3::hash(b"synthetic-bridge-1").to_hex().to_string();
+        let genesis_hash = blake3::hash(b"audit.chain_v1_genesis").to_hex().to_string();
+        store
+            .conn()
+            .execute(
+                "INSERT INTO audit_log \
+                 (timestamp, agent_id, action, credential, outcome, details, prev_hash, row_hash, segment_id, is_segment_genesis) \
+                 VALUES (?1, NULL, 'audit.chain_v1_segment_bridge_unattested', NULL, 'ok', NULL, ?2, ?3, 1, 1)",
+                rusqlite::params!["2026-05-21T00:00:01Z", genesis_hash, h1],
+            )
+            .expect("first segment-1 genesis insert");
+
+        // Second segment-1 genesis insert fails (partial unique index).
+        let h2 = blake3::hash(b"synthetic-bridge-2").to_hex().to_string();
+        let result = store.conn().execute(
+            "INSERT INTO audit_log \
+             (timestamp, agent_id, action, credential, outcome, details, prev_hash, row_hash, segment_id, is_segment_genesis) \
+             VALUES (?1, NULL, 'audit.chain_v1_segment_bridge_unattested', NULL, 'ok', NULL, ?2, ?3, 1, 1)",
+            rusqlite::params!["2026-05-21T00:00:02Z", genesis_hash, h2],
+        );
+        let err = result.expect_err("partial unique index must reject second segment-1 genesis");
+        let msg = format!("{err}");
+        assert!(
+            msg.to_uppercase().contains("UNIQUE") || msg.to_uppercase().contains("CONSTRAINT"),
+            "expected UNIQUE constraint failure, got: {msg}"
+        );
+    }
+
+    /// cordon_phase1_recreate_table_landed — synthesize a DB matching the
+    /// operator's host shape (1 genesis + N legacy NULL rows + 3 chained
+    /// rows past the legacy block). Run the cordon migration. Assert
+    /// the legacy block is preserved in segment 0, a bridge row sits at
+    /// segment 1, and the chained-tail rows past the legacy block were
+    /// destroyed.
+    ///
+    /// Built against a fresh in-memory store BUT bypasses the migrate()
+    /// auto-cordon by manipulating the table back to v1 shape, seeding
+    /// the operator's row pattern, then calling
+    /// cordon_migration_phase1_if_needed directly.
+    #[test]
+    fn cordon_migration_recreate_table_on_operators_db_shape() {
+        // Use a temp file so the open() backup path exercises against
+        // a real file (in-memory has no backup).
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("operator-shape.db");
+
+        // Build the pre-v2 (v1) shape manually so the cordon predicate
+        // fires. v1 had prev_hash + row_hash columns but NO segment_id.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    agent_id TEXT,
+                    action TEXT NOT NULL,
+                    credential TEXT,
+                    outcome TEXT NOT NULL,
+                    details TEXT,
+                    prev_hash TEXT,
+                    row_hash TEXT
+                );",
+            )
+            .unwrap();
+            // Genesis at id=1.
+            let genesis_hash = blake3::hash(b"audit.chain_v1_genesis").to_hex().to_string();
+            conn.execute(
+                "INSERT INTO audit_log \
+                 (timestamp, agent_id, action, credential, outcome, details, prev_hash, row_hash) \
+                 VALUES (?1, NULL, 'audit.chain_v1_genesis', NULL, 'ok', NULL, NULL, ?2)",
+                rusqlite::params!["2026-05-01T00:00:00Z", genesis_hash],
+            )
+            .unwrap();
+            // 5 legacy NULL-NULL rows.
+            for i in 0..5 {
+                conn.execute(
+                    "INSERT INTO audit_log \
+                     (timestamp, agent_id, action, credential, outcome, details, prev_hash, row_hash) \
+                     VALUES (?1, NULL, ?2, NULL, 'ok', NULL, NULL, NULL)",
+                    rusqlite::params![
+                        format!("2026-05-{:02}T00:00:00Z", 2 + i),
+                        format!("legacy.event-{}", i),
+                    ],
+                )
+                .unwrap();
+            }
+            // 3 buggy chained rows past the legacy block (operator's
+            // 295/296/297 equivalent).
+            for i in 0..3 {
+                let fake_hash = blake3::hash(format!("synthetic-tail-{i}").as_bytes())
+                    .to_hex()
+                    .to_string();
+                let prev_hash: Option<String> = if i == 0 { None } else { Some(fake_hash.clone()) };
+                conn.execute(
+                    "INSERT INTO audit_log \
+                     (timestamp, agent_id, action, credential, outcome, details, prev_hash, row_hash) \
+                     VALUES (?1, NULL, ?2, NULL, 'ok', NULL, ?3, ?4)",
+                    rusqlite::params![
+                        format!("2026-05-{:02}T00:00:00Z", 7 + i),
+                        format!("buggy.tail-{}", i),
+                        prev_hash,
+                        fake_hash,
+                    ],
+                )
+                .unwrap();
+            }
+        }
+
+        // Open via DaemonStore::open — fires the cordon migration.
+        let store = DaemonStore::open(&path).expect("open + cordon migration");
+
+        // Post-migration assertions.
+        let total: i64 = store
             .conn()
             .query_row("SELECT COUNT(*) FROM audit_log", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 1, "genesis row must remain after recovery");
-    }
+        // 1 genesis + 5 legacy + 1 bridge = 7. Buggy-tail rows were destroyed.
+        assert_eq!(
+            total, 7,
+            "post-migration row count must be genesis + legacy + bridge ({total} != 7)"
+        );
 
-    /// A legacy `log_event` row tail carries (NULL, NULL) — it is NOT a
-    /// half-write (the chain verifier skips it). Recovery must leave it
-    /// alone so non-chained audit history is preserved.
-    #[test]
-    fn recover_audit_chain_tail_noop_on_legacy_log_event_tail() {
-        let store = DaemonStore::open_in_memory().unwrap();
-        store
-            .log_event(Some("agent-x"), "legacy.action", None, "ok", None)
-            .unwrap();
-        let outcome = store.recover_audit_chain_tail().unwrap();
-        assert_eq!(outcome, AuditChainTailRecovery::NoOp);
-        // The legacy row stays.
-        let action: String = store
+        let segment_0_count: i64 = store
             .conn()
             .query_row(
-                "SELECT action FROM audit_log ORDER BY id DESC LIMIT 1",
+                "SELECT COUNT(*) FROM audit_log WHERE segment_id = 0",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(action, "legacy.action");
+        assert_eq!(segment_0_count, 6, "segment 0 must carry genesis + 5 legacy");
+
+        let segment_1_count: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE segment_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(segment_1_count, 1, "segment 1 must hold the bridge row");
+
+        let (bridge_action, is_genesis): (String, i64) = store
+            .conn()
+            .query_row(
+                "SELECT action, is_segment_genesis FROM audit_log WHERE segment_id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(bridge_action, "audit.chain_v1_segment_bridge_unattested");
+        assert_eq!(is_genesis, 1);
+
+        // Pre-cordon backup file was written.
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("operator-shape.db.pre-cordon-")
+            })
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "exactly one pre-cordon backup must exist"
+        );
+
+        // Idempotency: opening again no-ops the migration.
+        drop(store);
+        let _reopen = DaemonStore::open(&path).expect("reopen post-migration");
     }
 
-    /// A well-formed chained tail row (prev_hash + row_hash both set)
-    /// must not be truncated.
+    /// cordon_phase1_recreate_table_landed — on a fresh DB the cordon
+    /// predicate's "chained rows past legacy block" clause is false, so
+    /// Phase 1 no-ops. The daemon writes happily into segment_id = 0.
     #[test]
-    fn recover_audit_chain_tail_noop_on_well_formed_chain_tail() {
+    fn cordon_migration_noop_on_fresh_db() {
         let store = DaemonStore::open_in_memory().unwrap();
+        // Only the genesis row exists.
+        let total: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM audit_log", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(total, 1);
+        let segment_id: i64 = store
+            .conn()
+            .query_row(
+                "SELECT segment_id FROM audit_log WHERE action = 'audit.chain_v1_genesis'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(segment_id, 0);
+
+        // Write a chained event — lands in segment 0.
         crate::infra::audit::append_audit_event_with_chain(
             &store,
-            Some("agent-x"),
+            None,
             "grant.create",
             None,
             "ok",
             None,
         )
         .unwrap();
-        let outcome = store.recover_audit_chain_tail().unwrap();
-        assert_eq!(outcome, AuditChainTailRecovery::NoOp);
-        let action: String = store
+        let (sid, sg): (i64, i64) = store
             .conn()
             .query_row(
-                "SELECT action FROM audit_log ORDER BY id DESC LIMIT 1",
+                "SELECT segment_id, is_segment_genesis FROM audit_log WHERE action = 'grant.create'",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(action, "grant.create");
-    }
-
-    /// The half-write signature: tail row has a `row_hash` (so the
-    /// verifier will walk it) but a NULL `prev_hash` (the verifier
-    /// expects it to match the prior chain row's row_hash). Recovery
-    /// MUST truncate this row so the verifier does not false-positive.
-    ///
-    /// Reproduces the bootout-bootstrap repro by directly synthesizing
-    /// the row state — equivalent to what
-    /// `append_audit_event_with_chain` produced under the pre-fix bug
-    /// when the prior row was a legacy `log_event` (NULL row_hash).
-    #[test]
-    fn recover_audit_chain_tail_truncates_half_written_tail() {
-        let store = DaemonStore::open_in_memory().unwrap();
-        // Synthesize the half-write: chained row with row_hash set but
-        // prev_hash NULL. Bypass `append_audit_event_with_chain` so we
-        // control the row shape exactly.
-        let fake_hash = blake3::hash(b"synthetic-row").to_hex().to_string();
-        let inserted = store
-            .conn()
-            .execute(
-                "INSERT INTO audit_log \
-                 (timestamp, agent_id, action, credential, outcome, details, prev_hash, row_hash) \
-                 VALUES (?1, NULL, 'grant.create', NULL, 'ok', NULL, NULL, ?2)",
-                rusqlite::params!["2026-05-15T00:00:00Z", fake_hash],
-            )
-            .unwrap();
-        assert_eq!(inserted, 1);
-        let half_id: i64 = store.conn().last_insert_rowid();
-
-        let outcome = store.recover_audit_chain_tail().unwrap();
-        match outcome {
-            AuditChainTailRecovery::Truncated { id, action } => {
-                assert_eq!(id, half_id);
-                assert_eq!(action, "grant.create");
-            }
-            other => panic!("expected Truncated, got {other:?}"),
-        }
-
-        // The half-written row is gone; the genesis row remains.
-        let count: i64 = store
-            .conn()
-            .query_row("SELECT COUNT(*) FROM audit_log", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(count, 1);
-        let surviving_action: String = store
-            .conn()
-            .query_row(
-                "SELECT action FROM audit_log ORDER BY id DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(surviving_action, "audit.chain_v1_genesis");
-    }
-
-    /// After recovery, the chain verifier MUST report Ok on a previously
-    /// false-positive DB. End-to-end regression for the bootout repro.
-    #[test]
-    fn recover_then_verify_passes_on_bootout_repro() {
-        use crate::infra::audit::{VerifyOutcome, run_audit_verify};
-
-        let store = DaemonStore::open_in_memory().unwrap();
-        // Genesis (from migrate) + legacy log_event row + half-written
-        // chained tail row. Without recovery the verifier fails at the
-        // tail with `prev_hash` mismatch.
-        store
-            .log_event(None, "vault.auto_unseal_from_keyring", None, "ok", None)
-            .unwrap();
-        let fake_hash = blake3::hash(b"synthetic-row").to_hex().to_string();
-        store
-            .conn()
-            .execute(
-                "INSERT INTO audit_log \
-                 (timestamp, agent_id, action, credential, outcome, details, prev_hash, row_hash) \
-                 VALUES (?1, NULL, 'grant.create', NULL, 'ok', NULL, NULL, ?2)",
-                rusqlite::params!["2026-05-15T00:00:00Z", fake_hash],
-            )
-            .unwrap();
-
-        // Pre-recovery: the verifier sees the half-write and emits Break.
-        match run_audit_verify(store.conn(), None).unwrap() {
-            VerifyOutcome::Break { .. } => {}
-            other => panic!("expected pre-recovery Break, got {other:?}"),
-        }
-
-        // Recovery truncates the tail.
-        let outcome = store.recover_audit_chain_tail().unwrap();
-        assert!(matches!(outcome, AuditChainTailRecovery::Truncated { .. }));
-
-        // Post-recovery: verifier reports Ok.
-        match run_audit_verify(store.conn(), None).unwrap() {
-            VerifyOutcome::Ok { .. } => {}
-            other => panic!("expected post-recovery Ok, got {other:?}"),
-        }
-    }
-
-    /// Tamper on a mid-chain row (existing test
-    /// `audit_verify_chain_detects_tampered_row` in audit.rs) flips a
-    /// row's `details`, leaving `prev_hash` non-NULL but `row_hash`
-    /// diverging. Recovery on the latest-only tail MUST NOT mask that
-    /// case — the verifier still emits Break.
-    #[test]
-    fn recover_audit_chain_tail_preserves_mid_chain_tamper_detection() {
-        use crate::infra::audit::{VerifyOutcome, append_audit_event_with_chain, run_audit_verify};
-        let store = DaemonStore::open_in_memory().unwrap();
-        let id1 = append_audit_event_with_chain(
-            &store,
-            Some("a-1"),
-            "grant.create",
-            None,
-            "ok",
-            Some("orig"),
-        )
-        .unwrap();
-        append_audit_event_with_chain(&store, Some("a-2"), "grant.revoked", None, "ok", None)
-            .unwrap();
-        append_audit_event_with_chain(&store, None, "broker.materialization", None, "ok", None)
-            .unwrap();
-
-        // Real tamper — mutate row 1's `details` directly. prev_hash
-        // and row_hash stay non-NULL; only the recomputed hash
-        // diverges.
-        store
-            .conn()
-            .execute(
-                "UPDATE audit_log SET details = 'TAMPERED' WHERE id = ?1",
-                rusqlite::params![id1],
-            )
-            .unwrap();
-
-        // Recovery: NoOp — the latest row is well-formed.
-        let outcome = store.recover_audit_chain_tail().unwrap();
-        assert_eq!(outcome, AuditChainTailRecovery::NoOp);
-
-        // Verifier: still Break.
-        match run_audit_verify(store.conn(), None).unwrap() {
-            VerifyOutcome::Break { at_row_id, .. } => assert_eq!(at_row_id, id1),
-            other => panic!("expected Break, got {other:?}"),
-        }
+        assert_eq!(sid, 0, "fresh-DB chained writes go into segment 0");
+        assert_eq!(sg, 0, "chain extensions are NOT segment-genesis");
     }
 
     #[test]
@@ -1551,10 +2168,278 @@ mod tests {
             .lookup_agent_socket_enrollment("/run/emberd/agent-test-some.sock")
             .unwrap()
             .expect("inserted enrollment must resolve");
-        // implementation-note-310 — the binding tuple round-
+        // implementation-note-347 — the binding tuple round-
         // trips through SQLite intact.
         assert_eq!(row.cgroup_v2_id, Some(987654321));
         assert_eq!(row.userns_inode, Some(4026531840));
         assert_eq!(row.mnt_ns_inode, Some(4026531841));
+    }
+
+    // implementation-note-289 — T1 unit
+    // tests on `lookup_persona_uid_from_enrollments`. The helper is the
+    // seam between the broker's `check_principal_against_persona` gate
+    // and the per-agent UDS enrollment table; Step A only wires the
+    // reader path, so tests seed `peer_uid` directly via SQL until Step
+    // B migrates the writer signature.
+
+    /// Helper-side test seam: stamp `peer_uid` onto an existing
+    /// `agent_socket_enrollments` row by socket_path. Step B will
+    /// thread `peer_uid` through `record_agent_socket_enrollment`;
+    /// until then, tests use this to exercise the reader's new column
+    /// without touching the writer signature.
+    fn seed_peer_uid_for_test(store: &DaemonStore, socket_path: &str, peer_uid: u32) {
+        store
+            .conn()
+            .execute(
+                "UPDATE agent_socket_enrollments SET peer_uid = ?1 WHERE socket_path = ?2",
+                rusqlite::params![peer_uid as i64, socket_path],
+            )
+            .expect("seed peer_uid for test");
+    }
+
+    /// Row-exists-with-peer-uid → `Ok(Some(uid))`. The happy path: an
+    /// active enrollment with a populated `peer_uid` column resolves
+    /// to that uid.
+    #[test]
+    fn lookup_persona_uid_from_enrollments_returns_some_when_row_present() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let socket_path = "/run/emberd/agent-uid-some.sock";
+        let persona_id = "persona-uid-some";
+        store
+            .record_agent_socket_enrollment(
+                socket_path,
+                persona_id,
+                "grant-uid-some",
+                "hash-uid-some",
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        seed_peer_uid_for_test(&store, socket_path, 4242);
+
+        let resolved =
+            lookup_persona_uid_from_enrollments(&store, persona_id).expect("lookup must succeed");
+        assert_eq!(
+            resolved,
+            Some(4242),
+            "active enrollment with peer_uid must resolve to that uid"
+        );
+    }
+
+    /// No-row → `Ok(None)`. A persona with no enrollment surface
+    /// returns None; caller falls back to the legacy fail-open
+    /// posture (no refusal).
+    #[test]
+    fn lookup_persona_uid_from_enrollments_returns_none_when_row_absent() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let resolved = lookup_persona_uid_from_enrollments(&store, "persona-with-no-enrollment")
+            .expect("lookup must succeed");
+        assert_eq!(
+            resolved, None,
+            "no enrollment row → None (legacy fail-open posture)"
+        );
+    }
+
+    /// Row-exists-but-NULL-peer_uid → `Ok(None)`. Pre-Step-B legacy
+    /// rows recorded before the writer was migrated carry NULL in
+    /// the new column; the reader maps NULL to None so the caller's
+    /// fail-open posture is preserved during the transition.
+    #[test]
+    fn lookup_persona_uid_from_enrollments_returns_none_when_peer_uid_null() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let persona_id = "persona-null-peer-uid";
+        store
+            .record_agent_socket_enrollment(
+                "/run/emberd/agent-uid-null.sock",
+                persona_id,
+                "grant-uid-null",
+                "hash-uid-null",
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        // `record_agent_socket_enrollment` does not yet populate
+        // `peer_uid` (Step B). Row exists but column is NULL.
+
+        let resolved =
+            lookup_persona_uid_from_enrollments(&store, persona_id).expect("lookup must succeed");
+        assert_eq!(
+            resolved, None,
+            "row with NULL peer_uid must resolve to None"
+        );
+    }
+
+    /// Multi-row → returns the most-recent (`ORDER BY enrolled_at
+    /// DESC LIMIT 1`). A persona that's been re-enrolled across
+    /// multiple sockets resolves to the most-recent active row, so
+    /// the latest binding wins.
+    #[test]
+    fn lookup_persona_uid_from_enrollments_returns_most_recent_when_multi_row() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let persona_id = "persona-multi-enrollment";
+
+        // First enrollment — older.
+        store
+            .record_agent_socket_enrollment(
+                "/run/emberd/agent-multi-1.sock",
+                persona_id,
+                "grant-multi-1",
+                "hash-multi-1",
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        seed_peer_uid_for_test(&store, "/run/emberd/agent-multi-1.sock", 1001);
+        // Pin the older row's enrolled_at to an earlier timestamp so
+        // the DESC ordering is deterministic regardless of wall-clock
+        // resolution.
+        store
+            .conn()
+            .execute(
+                "UPDATE agent_socket_enrollments SET enrolled_at = ?1 WHERE socket_path = ?2",
+                rusqlite::params!["2026-01-01T00:00:00Z", "/run/emberd/agent-multi-1.sock"],
+            )
+            .expect("backdate older enrollment");
+
+        // Second enrollment — newer.
+        store
+            .record_agent_socket_enrollment(
+                "/run/emberd/agent-multi-2.sock",
+                persona_id,
+                "grant-multi-2",
+                "hash-multi-2",
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        seed_peer_uid_for_test(&store, "/run/emberd/agent-multi-2.sock", 2002);
+        store
+            .conn()
+            .execute(
+                "UPDATE agent_socket_enrollments SET enrolled_at = ?1 WHERE socket_path = ?2",
+                rusqlite::params!["2026-05-01T00:00:00Z", "/run/emberd/agent-multi-2.sock"],
+            )
+            .expect("forward-date newer enrollment");
+
+        let resolved =
+            lookup_persona_uid_from_enrollments(&store, persona_id).expect("lookup must succeed");
+        assert_eq!(
+            resolved,
+            Some(2002),
+            "multi-row persona must resolve to the most-recent enrolled_at"
+        );
+    }
+
+    /// Revoked rows are filtered out — only `state = 'active'`
+    /// enrollments resolve. A revoked row, even with a populated
+    /// peer_uid, must not produce a binding.
+    #[test]
+    fn lookup_persona_uid_from_enrollments_skips_revoked_rows() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let persona_id = "persona-revoked-enrollment";
+        let socket_path = "/run/emberd/agent-uid-revoked.sock";
+        store
+            .record_agent_socket_enrollment(
+                socket_path,
+                persona_id,
+                "grant-uid-revoked",
+                "hash-uid-revoked",
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        seed_peer_uid_for_test(&store, socket_path, 9999);
+        store
+            .revoke_agent_socket_enrollment(socket_path)
+            .expect("revoke");
+
+        let resolved =
+            lookup_persona_uid_from_enrollments(&store, persona_id).expect("lookup must succeed");
+        assert_eq!(
+            resolved, None,
+            "revoked enrollment must not produce a binding"
+        );
+    }
+
+    // mek_missing_with_state_refuses_start helper tests
+    // (implementation-note-327).
+
+    #[test]
+    fn has_state_bearing_rows_returns_false_for_empty_store() {
+        let store = DaemonStore::open_in_memory_without_vault().expect("open");
+        let has = store.has_state_bearing_rows().expect("probe");
+        assert!(!has, "fresh in-memory store must report empty");
+    }
+
+    // mek_fingerprint_column_verified tests
+    // (implementation-note-341).
+
+    #[test]
+    fn read_mek_fingerprint_returns_none_on_fresh_store() {
+        let store = DaemonStore::open_in_memory_without_vault().expect("open");
+        let fp = store.read_mek_fingerprint().expect("read");
+        assert!(fp.is_none(), "fresh store must have no fingerprint");
+    }
+
+    #[test]
+    fn write_mek_fingerprint_round_trips() {
+        let store = DaemonStore::open_in_memory_without_vault().expect("open");
+        let expected = "feedfaceabba0000feedfaceabba0001feedfaceabba0002feedfaceabba0003";
+        store.write_mek_fingerprint(expected).expect("write");
+        let got = store.read_mek_fingerprint().expect("read");
+        assert_eq!(got.as_deref(), Some(expected));
+    }
+
+    #[test]
+    fn write_mek_fingerprint_same_value_is_idempotent() {
+        let store = DaemonStore::open_in_memory_without_vault().expect("open");
+        let value = "deadbeef".repeat(8);
+        store.write_mek_fingerprint(&value).expect("first write");
+        // Second write with the same value is idempotent (UPSERT updates provisioned_at).
+        store.write_mek_fingerprint(&value).expect("second write");
+        let got = store.read_mek_fingerprint().expect("read");
+        assert_eq!(got.as_deref(), Some(value.as_str()));
+    }
+
+    #[test]
+    fn write_mek_fingerprint_mismatch_errors() {
+        let store = DaemonStore::open_in_memory_without_vault().expect("open");
+        let first = "cafebabe".repeat(8);
+        let second = "12345678".repeat(8);
+        store.write_mek_fingerprint(&first).expect("first write");
+        let result = store.write_mek_fingerprint(&second);
+        assert!(
+            matches!(result, Err(StoreError::InvalidInput(_))),
+            "mismatched fingerprint write must error; got: {result:?}"
+        );
+        // Original fingerprint preserved on disk.
+        let got = store.read_mek_fingerprint().expect("read");
+        assert_eq!(got.as_deref(), Some(first.as_str()));
+    }
+
+    #[test]
+    fn has_state_bearing_rows_returns_true_when_credentials_exist() {
+        let store = DaemonStore::open_in_memory_without_vault().expect("open");
+        // Insert a single credential row — the lowest-level state proxy.
+        store
+            .conn
+            .execute(
+                "INSERT INTO credentials (id, name, nonce, ciphertext, created_at) VALUES (?, ?, ?, ?, ?)",
+                rusqlite::params![
+                    "cred-test-1",
+                    "test-cred",
+                    b"nonce-bytes-24-chars-xyzab" as &[u8],
+                    b"opaque-ciphertext" as &[u8],
+                    "2026-05-20T00:00:00Z"
+                ],
+            )
+            .expect("insert credential");
+        let has = store.has_state_bearing_rows().expect("probe");
+        assert!(has, "store with one credential row must report has_state");
     }
 }

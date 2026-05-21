@@ -1,13 +1,13 @@
 //! Docker engine client connection helper + `DockerEngineRuntime`
 //! implementation of the daemon's `ContainerRuntime` contract.
 //!
-//! implementation-note-93 — daemon-side Docker
+//! implementation-note-107 — daemon-side Docker
 //! engine plumbing. `connect_docker_engine()` discovers the local engine
 //! via the standard precedence chain (`DOCKER_HOST` env var → platform
 //! default socket: `/var/run/docker.sock` on Unix, named pipe on
 //! Windows) and returns a ready `bollard::Docker` client.
 //!
-//! implementation-note-342 — adds
+//! implementation-note-384 — adds
 //! [`DockerEngineRuntime`] and the `docker_engine_spawn` entry point
 //! (the parent's checkpoint). `DockerEngineRuntime` implements the local
 //! [`ContainerRuntime`] trait by composing a bollard `Config` /
@@ -19,7 +19,7 @@
 //! by persona / agent / task / age without keeping daemon-side state.
 //!
 //! The `ContainerRuntime` trait declared here is a stop-gap local
-//! definition — implementation-note-343 will hoist it
+//! definition — implementation-note-385 will hoist it
 //! into `crates/ember-daemon/src/spawn/runtime.rs` as the canonical
 //! cross-backend contract (with `bind_mount_uds`, `drain`, and
 //! `state_report` methods alongside `spawn`). The local trait here
@@ -39,12 +39,16 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bollard::Docker;
-use bollard::container::{Config, CreateContainerOptions, StartContainerOptions};
-use bollard::models::{HostConfig, Mount, MountTypeEnum};
+use bollard::container::{
+    Config, CreateContainerOptions, InspectContainerOptions, StartContainerOptions,
+    StopContainerOptions,
+};
+use bollard::models::{ContainerStateStatusEnum, HostConfig, Mount, MountTypeEnum};
 use chrono::Utc;
 
 /// Connect to the local Docker engine using standard discovery.
@@ -110,6 +114,44 @@ pub enum RuntimeSpawnError {
     /// rather than a confusing engine-side rejection.
     #[error("invalid spawn spec: {0}")]
     InvalidSpec(String),
+    /// `Docker::stop_container` failed (container missing, engine
+    /// rejected the stop, or the grace window elapsed without the
+    /// container exiting). Surfaced by [`ContainerRuntime::drain`].
+    #[error("docker stop_container failed (container_id={container_id}): {source}")]
+    StopFailed {
+        /// The container id that was being drained.
+        container_id: String,
+        /// Underlying bollard error.
+        #[source]
+        source: bollard::errors::Error,
+    },
+    /// `Docker::inspect_container` failed (container missing, engine
+    /// rejected the inspect call). Surfaced by [`ContainerRuntime::drain`]
+    /// (during post-stop verification) and
+    /// [`ContainerRuntime::state_report`].
+    #[error("docker inspect_container failed (container_id={container_id}): {source}")]
+    InspectFailed {
+        /// The container id that was being inspected.
+        container_id: String,
+        /// Underlying bollard error.
+        #[source]
+        source: bollard::errors::Error,
+    },
+    /// [`ContainerRuntime::drain`] called `stop_container` successfully
+    /// and then re-inspected the container, but the engine reported a
+    /// state other than `exited` / `dead` within the grace window. This
+    /// indicates the container did not actually halt — e.g. the kernel
+    /// failed to deliver `SIGKILL` or a parent reaper retained it. The
+    /// caller should escalate (force-remove, alert).
+    #[error("docker drain did not produce exited state (container_id={container_id}, observed={observed})")]
+    DrainNotExited {
+        /// The container id that failed to exit.
+        container_id: String,
+        /// The state reported by `inspect_container` after `stop_container`.
+        /// Stored as the lowercased string form so downstream events
+        /// don't need to know the bollard enum.
+        observed: String,
+    },
 }
 
 /// Declarative spec consumed by [`ContainerRuntime::spawn`].
@@ -119,7 +161,7 @@ pub enum RuntimeSpawnError {
 /// fields requires a default so existing call sites keep compiling.
 ///
 /// **Stop-gap module location:** Slice A
-/// (implementation-note-343) will hoist this struct
+/// (implementation-note-385) will hoist this struct
 /// into a cross-backend module; the local definition here keeps Slice B
 /// compilable in isolation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -234,16 +276,67 @@ pub struct SpawnedContainer {
     pub name: Option<String>,
 }
 
+/// High-level lifecycle state observed by
+/// [`ContainerRuntime::state_report`]. Maps the engine's verbose
+/// status vocabulary into the three states the reconciler cares about.
+///
+/// The mapping is intentionally lossy — `Running` covers both
+/// `created` and `running` (the container exists and may serve work),
+/// `Draining` covers `restarting` / `removing` / `paused` (a lifecycle
+/// transition is in flight), and `Dead` covers `exited` / `dead` /
+/// missing-state (the container is no longer serving work). The
+/// reconciler does not need finer-grained vocabulary to decide whether
+/// to keep, drain, or replace a container.
+///
+/// implementation-note-96 — added alongside
+/// [`docker_engine_drain`] / [`docker_engine_state_report`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeState {
+    /// The container is alive: `created` (start scheduled) or `running`
+    /// (entrypoint executing).
+    Running,
+    /// A lifecycle transition is in flight: `restarting`, `removing`,
+    /// or `paused`. The container is not currently serving work but is
+    /// not terminal either; callers typically wait + re-inspect.
+    Draining,
+    /// The container is terminal: `exited` (process returned) or
+    /// `dead` (engine declared it unrecoverable). Also returned when
+    /// `inspect_container` reports no state at all — the engine has
+    /// effectively forgotten the container.
+    Dead,
+}
+
+impl RuntimeState {
+    /// Map a bollard [`ContainerStateStatusEnum`] into a
+    /// [`RuntimeState`]. The `EMPTY` variant maps to [`Dead`] —
+    /// reading "no state at all" as "terminal" is the safest posture
+    /// for the reconciler (treat as "needs replacement").
+    pub fn from_engine_status(status: ContainerStateStatusEnum) -> Self {
+        match status {
+            ContainerStateStatusEnum::CREATED | ContainerStateStatusEnum::RUNNING => {
+                Self::Running
+            }
+            ContainerStateStatusEnum::RESTARTING
+            | ContainerStateStatusEnum::REMOVING
+            | ContainerStateStatusEnum::PAUSED => Self::Draining,
+            ContainerStateStatusEnum::EXITED
+            | ContainerStateStatusEnum::DEAD
+            | ContainerStateStatusEnum::EMPTY => Self::Dead,
+        }
+    }
+}
+
 /// Local definition of the container-runtime contract.
 ///
 /// **Stop-gap:** the canonical cross-backend definition lands in
 /// `crates/ember-daemon/src/spawn/runtime.rs` under
-/// implementation-note-343 with the full four-bullet
+/// implementation-note-385 with the full four-bullet
 /// surface (`spawn`, `bind_mount_uds`, `drain`, `state_report`). The
-/// trait here exposes only `spawn` so Slice B can compile against a
-/// stable contract before Slice A merges; Slice A will absorb this
-/// trait into the canonical location and the `DockerEngineRuntime`
-/// `impl` here will re-target the canonical trait verbatim.
+/// trait here exposes `spawn`, `drain`, and `state_report` so Slice B
+/// + D can compile against a stable contract before Slice A merges;
+/// Slice A will absorb this trait into the canonical location and the
+/// `DockerEngineRuntime` `impl` here will re-target the canonical trait
+/// verbatim.
 #[async_trait]
 pub trait ContainerRuntime: Send + Sync {
     /// Spawn a container as described by `spec` and return a handle.
@@ -254,6 +347,40 @@ pub trait ContainerRuntime: Send + Sync {
     ///   - apply each [`UdsBindMount`] as a bind-mount in the
     ///     backend's native vocabulary.
     async fn spawn(&self, spec: SpawnSpec) -> Result<SpawnedContainer, RuntimeSpawnError>;
+
+    /// Stop the container identified by `container_id`, giving the
+    /// entrypoint up to `grace` to exit gracefully before the engine
+    /// escalates to `SIGKILL`. Verifies the container reached a
+    /// terminal state (`exited` / `dead`) before returning success.
+    ///
+    /// Implementations MUST:
+    ///   - call the engine's stop primitive with the grace timeout,
+    ///   - re-inspect the container after stop returns and reject
+    ///     anything other than [`RuntimeState::Dead`] with
+    ///     [`RuntimeSpawnError::DrainNotExited`].
+    ///
+    /// implementation-note-96.
+    async fn drain(
+        &self,
+        container_id: &str,
+        grace: Duration,
+    ) -> Result<(), RuntimeSpawnError>;
+
+    /// Inspect the container and return its lifecycle state in the
+    /// reconciler's three-state vocabulary.
+    ///
+    /// Implementations MUST call the engine's inspect primitive and
+    /// fold the resulting status string through
+    /// [`RuntimeState::from_engine_status`]. A container with no
+    /// state populated in the inspect response is reported as
+    /// [`RuntimeState::Dead`] — see [`RuntimeState::from_engine_status`]
+    /// for the rationale.
+    ///
+    /// implementation-note-96.
+    async fn state_report(
+        &self,
+        container_id: &str,
+    ) -> Result<RuntimeState, RuntimeSpawnError>;
 }
 
 /// `ContainerRuntime` implementation backed by the local Docker engine
@@ -295,7 +422,7 @@ impl DockerEngineRuntime {
     }
 }
 
-/// Parent checkpoint for implementation-note-342.
+/// Parent checkpoint for implementation-note-384.
 ///
 /// Free function form of [`DockerEngineRuntime::spawn`]. Composes the
 /// bollard `Config` from `spec`, calls `create_container` +
@@ -403,10 +530,140 @@ pub async fn docker_engine_spawn(
     })
 }
 
+/// Parent checkpoint for implementation-note-96.
+///
+/// Free function form of [`DockerEngineRuntime::drain`]. Stops the
+/// container with a grace window, then re-inspects it to confirm the
+/// state actually transitioned to terminal (`exited` / `dead`).
+///
+/// Kept as a free function (not just a trait impl) so the
+/// `target_state_anchor = "fn docker_engine_drain"` task-level marker in
+/// `release-checklist` matches a literal symbol in this module. The
+/// [`ContainerRuntime`] impl below delegates to this function so there
+/// is exactly one stop+verify code path to audit.
+///
+/// # Wire shape
+///
+/// 1. `Docker::stop_container` with `StopContainerOptions { t: grace_secs }`.
+///    The engine sends `SIGTERM`, waits up to `t` seconds, then
+///    escalates to `SIGKILL`. On `t=0` the engine kills immediately.
+/// 2. `Docker::inspect_container` (no options) to read the post-stop
+///    state. We fold the status through [`RuntimeState::from_engine_status`].
+/// 3. Reject any non-[`RuntimeState::Dead`] outcome with
+///    [`RuntimeSpawnError::DrainNotExited`] so callers learn the
+///    drain did not actually halt the workload.
+///
+/// # Grace conversion
+///
+/// `bollard::container::StopContainerOptions::t` is `i64` seconds.
+/// `Duration::as_secs()` is `u64`; we saturate to `i64::MAX` on
+/// overflow rather than silently truncating, but in practice any grace
+/// window larger than ~292 billion years is already a caller bug.
+///
+/// # Errors
+///
+/// - [`RuntimeSpawnError::StopFailed`] — `stop_container` returned an
+///   error (engine unreachable, container missing, grace exceeded).
+/// - [`RuntimeSpawnError::InspectFailed`] — the post-stop inspect call
+///   failed (container removed between calls, engine flaked).
+/// - [`RuntimeSpawnError::DrainNotExited`] — stop succeeded and
+///   inspect succeeded, but the observed state is not terminal.
+pub async fn docker_engine_drain(
+    docker: &Docker,
+    container_id: &str,
+    grace: Duration,
+) -> Result<(), RuntimeSpawnError> {
+    let grace_secs = i64::try_from(grace.as_secs()).unwrap_or(i64::MAX);
+
+    docker
+        .stop_container(container_id, Some(StopContainerOptions { t: grace_secs }))
+        .await
+        .map_err(|e| RuntimeSpawnError::StopFailed {
+            container_id: container_id.to_string(),
+            source: e,
+        })?;
+
+    let inspect = docker
+        .inspect_container(container_id, None::<InspectContainerOptions>)
+        .await
+        .map_err(|e| RuntimeSpawnError::InspectFailed {
+            container_id: container_id.to_string(),
+            source: e,
+        })?;
+
+    let observed_status = inspect
+        .state
+        .as_ref()
+        .and_then(|s| s.status)
+        .unwrap_or(ContainerStateStatusEnum::EMPTY);
+    let observed = RuntimeState::from_engine_status(observed_status);
+
+    if observed == RuntimeState::Dead {
+        Ok(())
+    } else {
+        Err(RuntimeSpawnError::DrainNotExited {
+            container_id: container_id.to_string(),
+            observed: observed_status.as_ref().to_string(),
+        })
+    }
+}
+
+/// Parent checkpoint for implementation-note-96.
+///
+/// Free function form of [`DockerEngineRuntime::state_report`].
+/// Inspects the container and maps the engine's `state.status` string
+/// onto the reconciler's three-state vocabulary via
+/// [`RuntimeState::from_engine_status`].
+///
+/// Kept as a free function so the trait impl has a single code path to
+/// audit; the call shape mirrors [`docker_engine_drain`].
+///
+/// # Errors
+///
+/// - [`RuntimeSpawnError::InspectFailed`] — the inspect call failed
+///   (container missing, engine unreachable). A container with no
+///   `state` populated in the response is NOT an error — it is folded
+///   into [`RuntimeState::Dead`] per [`RuntimeState::from_engine_status`].
+pub async fn docker_engine_state_report(
+    docker: &Docker,
+    container_id: &str,
+) -> Result<RuntimeState, RuntimeSpawnError> {
+    let inspect = docker
+        .inspect_container(container_id, None::<InspectContainerOptions>)
+        .await
+        .map_err(|e| RuntimeSpawnError::InspectFailed {
+            container_id: container_id.to_string(),
+            source: e,
+        })?;
+
+    let status = inspect
+        .state
+        .as_ref()
+        .and_then(|s| s.status)
+        .unwrap_or(ContainerStateStatusEnum::EMPTY);
+
+    Ok(RuntimeState::from_engine_status(status))
+}
+
 #[async_trait]
 impl ContainerRuntime for DockerEngineRuntime {
     async fn spawn(&self, spec: SpawnSpec) -> Result<SpawnedContainer, RuntimeSpawnError> {
         docker_engine_spawn(&self.docker, spec).await
+    }
+
+    async fn drain(
+        &self,
+        container_id: &str,
+        grace: Duration,
+    ) -> Result<(), RuntimeSpawnError> {
+        docker_engine_drain(&self.docker, container_id, grace).await
+    }
+
+    async fn state_report(
+        &self,
+        container_id: &str,
+    ) -> Result<RuntimeState, RuntimeSpawnError> {
+        docker_engine_state_report(&self.docker, container_id).await
     }
 }
 
@@ -465,5 +722,143 @@ mod tests {
             "client construction must succeed even with an unroutable DOCKER_HOST: {:?}",
             client.err()
         );
+    }
+
+    // -----------------------------------------------------------------
+    // implementation-note-96 — drain +
+    // state_report mapping tests.
+    //
+    // We exercise the pure mapping helpers
+    // ([`RuntimeState::from_engine_status`]) plus the error-variant
+    // surface added for the new methods. End-to-end roundtrips against
+    // a real engine are deferred to a `DOCKER_E2E=1`-gated integration
+    // test in the same posture as the existing `connect_docker_engine`
+    // tests above.
+    // -----------------------------------------------------------------
+
+    /// T2 fixture: `created` and `running` engine statuses fold into
+    /// [`RuntimeState::Running`]. The reconciler does not need to
+    /// distinguish "start scheduled" from "entrypoint executing" — both
+    /// are "alive, may serve work".
+    #[test]
+    fn runtime_state_running_covers_created_and_running() {
+        assert_eq!(
+            RuntimeState::from_engine_status(ContainerStateStatusEnum::CREATED),
+            RuntimeState::Running
+        );
+        assert_eq!(
+            RuntimeState::from_engine_status(ContainerStateStatusEnum::RUNNING),
+            RuntimeState::Running
+        );
+    }
+
+    /// T2 fixture: `restarting`, `removing`, and `paused` engine
+    /// statuses fold into [`RuntimeState::Draining`]. These are
+    /// transient states the reconciler waits on rather than acting on.
+    #[test]
+    fn runtime_state_draining_covers_transitional_states() {
+        for status in [
+            ContainerStateStatusEnum::RESTARTING,
+            ContainerStateStatusEnum::REMOVING,
+            ContainerStateStatusEnum::PAUSED,
+        ] {
+            assert_eq!(
+                RuntimeState::from_engine_status(status),
+                RuntimeState::Draining,
+                "{status:?} should fold to Draining"
+            );
+        }
+    }
+
+    /// T2 fixture: `exited`, `dead`, and the empty-string checkpoint
+    /// fold into [`RuntimeState::Dead`]. The empty case happens when
+    /// `inspect_container` returns a response with no `state` field
+    /// populated — folding that into `Dead` is the safest posture for
+    /// the reconciler (treat as "needs replacement").
+    #[test]
+    fn runtime_state_dead_covers_terminal_and_missing() {
+        for status in [
+            ContainerStateStatusEnum::EXITED,
+            ContainerStateStatusEnum::DEAD,
+            ContainerStateStatusEnum::EMPTY,
+        ] {
+            assert_eq!(
+                RuntimeState::from_engine_status(status),
+                RuntimeState::Dead,
+                "{status:?} should fold to Dead"
+            );
+        }
+    }
+
+    /// T2 fixture: `StopFailed` carries the container id verbatim so
+    /// downstream `spawn-failed`-style events can identify which
+    /// container actually failed to drain without re-parsing the
+    /// underlying bollard error.
+    #[test]
+    fn stop_failed_carries_container_id() {
+        let err = RuntimeSpawnError::StopFailed {
+            container_id: "abc123".to_string(),
+            source: bollard::errors::Error::APIVersionParseError {},
+        };
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("abc123"),
+            "StopFailed display must include container id; got: {rendered}"
+        );
+    }
+
+    /// T2 fixture: `InspectFailed` carries the container id verbatim
+    /// for the same reason as `StopFailed`.
+    #[test]
+    fn inspect_failed_carries_container_id() {
+        let err = RuntimeSpawnError::InspectFailed {
+            container_id: "def456".to_string(),
+            source: bollard::errors::Error::APIVersionParseError {},
+        };
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("def456"),
+            "InspectFailed display must include container id; got: {rendered}"
+        );
+    }
+
+    /// T2 fixture: `DrainNotExited` records both the container id and
+    /// the observed status string so an operator can tell whether the
+    /// container is stuck in `restarting`, `paused`, etc. without
+    /// re-inspecting.
+    #[test]
+    fn drain_not_exited_carries_observed_state() {
+        let err = RuntimeSpawnError::DrainNotExited {
+            container_id: "ghi789".to_string(),
+            observed: "restarting".to_string(),
+        };
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("ghi789"),
+            "DrainNotExited display must include container id; got: {rendered}"
+        );
+        assert!(
+            rendered.contains("restarting"),
+            "DrainNotExited display must include observed state; got: {rendered}"
+        );
+    }
+
+    /// T2 fixture: confirm [`DockerEngineRuntime`] can be coerced to
+    /// `&dyn ContainerRuntime`. If `drain` or `state_report` is missing
+    /// from either the trait or the impl, the coercion fails to compile.
+    /// Runtime never touches an engine — the function pointer is taken
+    /// but never invoked. End-to-end engine roundtrips are deferred to
+    /// the `DOCKER_E2E=1` lane.
+    #[test]
+    fn docker_engine_runtime_is_container_runtime_trait_object() {
+        fn assert_dyn_runtime(_r: &dyn ContainerRuntime) {}
+        fn _use_dyn(r: &DockerEngineRuntime) {
+            assert_dyn_runtime(r);
+        }
+        // The function above is enough to compile-check the impl
+        // surface. We do not call `_use_dyn` because constructing a
+        // `DockerEngineRuntime` requires bollard's
+        // `connect_with_local_defaults`, which fails in environments
+        // without `/var/run/docker.sock`.
     }
 }

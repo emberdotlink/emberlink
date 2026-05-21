@@ -11,7 +11,7 @@
 //! could constitute a timing or metadata leak to an agent that merely holds
 //! a cached handle. Agents can re-query `list_grants` if they need more.
 //!
-//! implementation-note-212: the `GrantEvent` type itself now lives in
+//! implementation-note-237: the `GrantEvent` type itself now lives in
 //! `core-proxy-forward` so the EventSink trait (also in that crate) can take
 //! it as its native event type. This module re-exports it for back-compat
 //! with existing call sites (`use crate::infra::events::GrantEvent;`) and

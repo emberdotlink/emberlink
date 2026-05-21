@@ -23,10 +23,10 @@
 //! - [`wizard_step_chown_data_dirs`] — chown `~/.ember/{vault,grants,…}`.
 //! - [`wizard_step_provision_mek`] — vault MEK in System.keychain (macOS) /
 //!   keyring (Linux). Without this the daemon refuses to start.
-//!   implementation-note-425.
+//!   implementation-note-474.
 //! - [`wizard_step_emit_launch_spec`] — launchd plist or systemd unit.
 //! - [`wizard_step_add_user_to_group`] — operator → `ember-clients`.
-//! - [`wizard_step_verify`] — daemon socket present + responsive.
+//! - [`wizard_step_verify`] — daemon status RPC reachable on the managed socket.
 //!
 //! Steps shell out to [`ember_daemon::install`] primitives via the
 //! [`InstallPrimitives`] trait so tests can stub the side effects and assert
@@ -260,7 +260,7 @@ pub trait InstallPrimitives {
     /// Provision the vault MEK in System.keychain (macOS) / keyring (Linux).
     /// The daemon refuses to start without this. Idempotent — re-running
     /// against an existing MEK item is a no-op (preserves access to existing
-    /// encrypted state). implementation-note-425.
+    /// encrypted state). implementation-note-474.
     fn provision_se_mek(&self, home: &Path) -> Result<(), daemon_install::InstallError>;
     fn install_launch_spec(
         &self,
@@ -343,10 +343,9 @@ pub trait InstallPrimitives {
 /// because both `dseditgroup -a` and `usermod -aG` tolerate "already a
 /// member".
 ///
-/// `socket_responsive` checks the socket file exists. A future slice can
-/// extend this to actually open + handshake; the current contract is "the
-/// daemon has bound its UDS", which is what the operator's manual smoke test
-/// looks at.
+/// `socket_responsive` performs a best-effort live status probe against the
+/// managed daemon socket. The contract is now "the daemon is actually serving
+/// read-class RPCs", not merely "a socket inode exists".
 pub struct RealPrimitives;
 
 impl InstallPrimitives for RealPrimitives {
@@ -438,13 +437,17 @@ impl InstallPrimitives for RealPrimitives {
     }
 
     fn socket_responsive(&self, socket: &Path) -> Result<(), String> {
-        if socket.exists() {
-            Ok(())
-        } else {
-            Err(format!(
-                "daemon socket not present at {} — daemon may still be starting",
+        let pid_file = socket
+            .parent()
+            .map(|dir| dir.join("emberd.pid"))
+            .unwrap_or_else(|| PathBuf::from("emberd.pid"));
+        match crate::probe_live_daemon_status(socket, &pid_file) {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(format!(
+                "daemon status RPC unavailable at {} — daemon may still be starting",
                 socket.display()
-            ))
+            )),
+            Err(e) => Err(e.to_string()),
         }
     }
 
@@ -743,7 +746,7 @@ pub fn run_install_wizard() -> Result<(), WizardError> {
                 println!("  verify: {reason}");
             } else {
                 println!(
-                    "  verify: daemon socket present at {}",
+                    "  verify: daemon status RPC reachable at {}",
                     ctx.socket_path.display()
                 );
             }
@@ -898,7 +901,7 @@ pub fn wizard_step_chown_data_dirs<P: InstallPrimitives>(
 /// already exists, preserving access to any existing encrypted state from
 /// a prior install. Re-running this step is safe.
 ///
-/// implementation-note-425. The older
+/// implementation-note-474. The older
 /// non-wizard install path (in `crates/emberlink-cli/src/bin/ember.rs`)
 /// called this between the chown step and the launchd-plist step; the
 /// wizard refactor dropped it, causing every fresh install to end with a
@@ -1007,13 +1010,12 @@ pub fn wizard_step_add_user_to_group<P: InstallPrimitives>(
     })
 }
 
-/// Step 6 — verify the daemon is responding under `uid=ember`.
+/// Step 6 — verify the daemon's live status RPC is reachable.
 ///
-/// Two checks: (a) the daemon socket exists at
-/// `~/.ember/run/daemon.sock`; (b) `ps -eo uid,pid,comm | grep emberd`
-/// finds an emberd process. The verification is best-effort — if the
-/// platform launcher is still starting the daemon we record a Skipped
-/// outcome rather than failing the wizard.
+/// This is stronger than "socket file exists": the install wizard should only
+/// report success once the managed daemon is actually serving read-class RPCs
+/// on the operator-visible socket seam. If launchd/systemd is still racing
+/// startup we record a Skipped outcome rather than failing the wizard.
 pub fn wizard_step_verify<P: InstallPrimitives>(
     ctx: &WizardContext,
     primitives: &P,
@@ -1022,7 +1024,10 @@ pub fn wizard_step_verify<P: InstallPrimitives>(
         return Ok(StepOutcome::Skipped { reason });
     }
     Ok(StepOutcome::Completed {
-        note: format!("daemon socket present at {}", ctx.socket_path.display()),
+        note: format!(
+            "daemon status RPC reachable at {}",
+            ctx.socket_path.display()
+        ),
     })
 }
 
@@ -1377,7 +1382,7 @@ pub fn run_rollback<P: InstallPrimitives>(
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// implementation-note-407 — new-machine daemon detection + prompt
+// implementation-note-455 — new-machine daemon detection + prompt
 // ───────────────────────────────────────────────────────────────────────────
 
 /// Three-state result of [`detect_daemon_installed`].
@@ -1392,7 +1397,8 @@ pub fn run_rollback<P: InstallPrimitives>(
 ///   path — `ember init` should offer to run `sudo ember daemon install`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DaemonInstallStatus {
-    /// Socket present — daemon is running.
+    /// Socket present — best-effort hint that the daemon may be running.
+    /// Callers that need live truth should probe the daemon's status RPC.
     Running,
     /// Service file found but socket absent — installed, not yet running.
     InstalledNotRunning,
@@ -1400,10 +1406,13 @@ pub enum DaemonInstallStatus {
     NotInstalled,
 }
 
-/// Detect whether the ember daemon is installed and/or running.
+/// Detect whether the ember daemon is installed and/or plausibly running.
 ///
 /// Detection order:
-/// 1. **Socket probe** — if `socket_path` exists, the daemon is `Running`.
+/// 1. **Socket probe** — if `socket_path` exists, treat the daemon as
+///    `Running` for coarse install-posture UX. This is explicitly not a
+///    live-RPC proof; higher-level callers should prefer `probe_live_daemon_status`
+///    when they need actual daemon truth.
 /// 2. **macOS LaunchAgent** — `~/Library/LaunchAgents/link.ember.daemon.plist`
 ///    present → `InstalledNotRunning`.
 /// 3. **macOS system LaunchDaemon** — `/Library/LaunchDaemons/sh.emberlink.daemon.plist`
@@ -1473,14 +1482,14 @@ impl std::fmt::Display for DaemonInstallPromptError {
             DaemonInstallPromptError::NonInteractive => {
                 write!(
                     f,
-                    "daemon is not installed; re-run without --non-interactive to be prompted, \
-                     or run `sudo ember daemon install` manually before `ember init`"
+                    "daemon is not installed; run `sudo ember daemon install`, then re-run \
+                     `ember init`"
                 )
             }
             DaemonInstallPromptError::Declined => {
                 write!(
                     f,
-                    "daemon install skipped — run `sudo ember daemon install` when ready, \
+                    "setup paused before daemon install — run `sudo ember daemon install`, \
                      then re-run `ember init`"
                 )
             }
@@ -1504,7 +1513,7 @@ impl std::fmt::Display for DaemonInstallPromptError {
     }
 }
 
-/// Production entry point: display the cohort-A-friendly explanation and
+/// Production entry point: display the friendly onboarding explanation and
 /// optionally run `sudo ember daemon install` via subprocess.
 ///
 /// Delegates to [`prompt_install_daemon_with`] with real stdin/stdout and the
@@ -1513,7 +1522,7 @@ impl std::fmt::Display for DaemonInstallPromptError {
 /// Returns `Ok(())` when the operator consented and the install succeeded.
 /// Returns `Err(DaemonInstallPromptError::Declined)` when the operator said no.
 /// Returns other `Err` variants for non-interactive mode or subprocess failures.
-// implementation-note-407 checkpoint
+// implementation-note-455 checkpoint
 pub fn prompt_install_daemon(non_interactive: bool) -> Result<(), DaemonInstallPromptError> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -1569,29 +1578,29 @@ where
         return Err(DaemonInstallPromptError::NonInteractive);
     }
 
-    // Cohort-A-friendly explanation.
+    // Friendly-preview explanation.
     writeln!(out).ok();
     writeln!(out, "The ember daemon is not installed on this machine.").ok();
     writeln!(out).ok();
     writeln!(
         out,
-        "  The daemon is the trust broker that holds the vault encryption key,\n\
-         enforces grant policy, and signs Receipts for every agent action.\n\
-         Without it, `ember init` cannot open the vault or create a persona."
+        "  `ember init` uses the daemon to set up the vault, create the\n\
+         default persona, manage grants, and wire launchers like Claude Code.\n\
+         Without it, onboarding cannot finish."
     )
     .ok();
     writeln!(out).ok();
     writeln!(
         out,
         "  Installing the daemon requires elevated privileges so it can create\n\
-         a dedicated `ember` service account and register a system service\n\
-         (LaunchDaemon on macOS, systemd unit on Linux). The command is:\n\
+         a dedicated `ember` service account and register the system service\n\
+         (LaunchDaemon on macOS, systemd on Linux). The command is:\n\
          \n\
              sudo ember daemon install"
     )
     .ok();
     writeln!(out).ok();
-    write!(out, "Run `sudo ember daemon install` now? [y/N] ").ok();
+    write!(out, "Run it now and continue setup? [y/N] ").ok();
     out.flush().ok();
 
     let mut buf = String::new();
@@ -1913,7 +1922,7 @@ mod tests {
     }
 
     /// `wizard_step_verify` returns Skipped (not an error) when the daemon
-    /// socket isn't yet present — the platform launcher may still be
+    /// status RPC isn't yet reachable — the platform launcher may still be
     /// starting the daemon when the wizard finishes its provisioning steps.
     #[test]
     fn wizard_step_verify_skips_when_socket_missing() {
@@ -2338,7 +2347,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // implementation-note-407 — T2 tests
+    // implementation-note-455 — T2 tests
     // ----------------------------------------------------------------
 
     /// detect_daemon_installed: socket present → Running.
@@ -2452,15 +2461,19 @@ mod tests {
             "runner must be called after operator consent"
         );
 
-        // Output must contain the cohort-A explanation and the command.
+        // Output must contain the onboarding explanation and the command.
         let printed = String::from_utf8(out).expect("utf8");
         assert!(
             printed.contains("sudo ember daemon install"),
             "explanation must name the command; got: {printed}"
         );
         assert!(
-            printed.contains("trust broker"),
-            "explanation must describe the daemon role; got: {printed}"
+            printed.contains("onboarding cannot finish"),
+            "explanation must describe the onboarding dependency; got: {printed}"
+        );
+        assert!(
+            printed.contains("Run it now and continue setup?"),
+            "prompt must read like a setup continuation; got: {printed}"
         );
     }
 

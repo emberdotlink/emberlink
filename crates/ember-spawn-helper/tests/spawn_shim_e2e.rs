@@ -1,7 +1,7 @@
 
 //! End-to-end tests for the MACOS-PRIMITIVES Decision 5 spawn chain.
 //!
-//! implementation-note-161
+//! implementation-note-184
 //!
 //! ## Test surfaces
 //!
@@ -117,6 +117,20 @@ async fn send_directive_and_read(
     socket: &std::path::Path,
     directive: SpawnDirective,
 ) -> HelperFrame {
+    // Self-documenting invariant: every test in this file runs with
+    // `target_uid == current_uid`, so the shim's `setuid()` call is
+    // intentionally a kernel no-op here. The actual privilege-drop
+    // observation lives in `tests/setuid_drop_root.rs` (Linux-only,
+    // root-gated). If a future test wants to send a directive with
+    // `target_uid != current_uid`, it MUST NOT go through this
+    // helper — add a dedicated path with proper root-gating.
+    assert_eq!(
+        directive.target_uid,
+        current_uid(),
+        "spawn_shim_e2e tests must run with target_uid==current_uid; \
+         setuid is intentionally a no-op here — see setuid_drop_root.rs \
+         for the actual privilege-drop test"
+    );
     let mut stream = UnixStream::connect(socket)
         .await
         .expect("connect helper socket");

@@ -1,4 +1,4 @@
-//! implementation-note-453 regression guard — MCP read path must see grants owned by
+//! implementation-note-506 regression guard — MCP read path must see grants owned by
 //! the caller's persona (and only those grants).
 //!
 //! The narrative being guarded is "agent asks -> human approves -> agent

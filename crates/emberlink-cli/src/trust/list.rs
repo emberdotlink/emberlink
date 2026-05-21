@@ -1,7 +1,7 @@
 //! `ember trust list` — call the daemon's `trust.list` JSON-RPC and
 //! render the operator-visible trust-set snapshot.
 //!
-//! Per design §Component 2 / implementation-note-295. Read-only
+//! Per design §Component 2 / implementation-note-325. Read-only
 //! query (`AuthorityClass::ConnectOnly` on the daemon side); the
 //! returned snapshot was assembled at startup so the CLI sees exactly
 //! the trust set the daemon would verify against if a manifest reached
@@ -54,7 +54,11 @@ pub enum TrustListError {
 /// Call `trust.list` against the daemon socket and parse the response.
 /// Pure I/O — no rendering. Tests use it via the parse helpers below.
 pub fn fetch_trust_list(socket_path: &Path) -> Result<TrustListResponse, TrustListError> {
-    let response = call_daemon(socket_path, "trust.list", &Value::Object(Default::default()))?;
+    let response = call_daemon(
+        socket_path,
+        "trust.list",
+        &Value::Object(Default::default()),
+    )?;
     parse_trust_list_response(&response)
 }
 
@@ -62,9 +66,8 @@ pub fn fetch_trust_list(socket_path: &Path) -> Result<TrustListResponse, TrustLi
 /// Separated from the socket I/O so tests can exercise the parsing
 /// path against a fixture without needing a live daemon.
 pub fn parse_trust_list_response(body: &Value) -> Result<TrustListResponse, TrustListError> {
-    serde_json::from_value(body.clone()).map_err(|e| {
-        TrustListError::Protocol(format!("decode trust.list response: {e}"))
-    })
+    serde_json::from_value(body.clone())
+        .map_err(|e| TrustListError::Protocol(format!("decode trust.list response: {e}")))
 }
 
 /// Render the response as a human-readable block (line-per-root, with
@@ -112,9 +115,8 @@ pub fn run(socket_path: &Path) -> i32 {
         }
         Err(TrustListError::DaemonUnavailable { socket, source }) => {
             eprintln!(
-                "ember trust list: daemon socket at {} unreachable ({source}). \
-                 Is emberd running? (ember daemon status)",
-                socket.display()
+                "ember trust list: {}",
+                crate::format_daemon_unavailable(&socket, &source)
             );
             2
         }
@@ -125,11 +127,7 @@ pub fn run(socket_path: &Path) -> i32 {
     }
 }
 
-fn call_daemon(
-    socket_path: &Path,
-    method: &str,
-    params: &Value,
-) -> Result<Value, TrustListError> {
+fn call_daemon(socket_path: &Path, method: &str, params: &Value) -> Result<Value, TrustListError> {
     let stream = std::os::unix::net::UnixStream::connect(socket_path).map_err(|e| {
         TrustListError::DaemonUnavailable {
             socket: socket_path.to_path_buf(),

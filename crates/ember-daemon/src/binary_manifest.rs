@@ -501,7 +501,7 @@ pub fn parse_trust_roots(raw: &str) -> Result<Vec<VerifyingKey>, VerifyError> {
 }
 
 // ---------------------------------------------------------------------------
-// implementation-note-106 — peer binary pinning
+// implementation-note-122 — peer binary pinning
 // ---------------------------------------------------------------------------
 
 /// Error variants surfaced by [`verify_peer_binary`]. Distinct from
@@ -1020,7 +1020,7 @@ publisher = "did:emberlink"
 
     #[test]
     fn cohort_a_constructs_covers_v030_friendly_drop_tools() {
-        // Per implementation-note-107 (Cluster A 3d, design review
+        // Per implementation-note-123 (Cluster A 3d, design review
         // 20260513-122447): v0.3.0 ships 3 tools (gh/git/kubectl) — the
         // 3 with daemon-side classifiers. npm/docker/wrangler/pulumi
         // defer to v0.3.1 (with proper classifiers per
@@ -1105,7 +1105,7 @@ publisher = "did:emberlink"
     }
 
     // -----------------------------------------------------------------
-    // implementation-note-106 — peer binary
+    // implementation-note-122 — peer binary
     // pinning gate. The broker handlers refuse a request whose peer
     // binary (resolved via /proc/<pid>/exe + blake3) is not in the
     // signed manifest, or whose process is being traced.

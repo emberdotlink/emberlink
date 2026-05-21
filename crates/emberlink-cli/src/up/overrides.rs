@@ -2,7 +2,8 @@
 //! Override pattern for agent-container bind-mount source paths.
 //!
 //! design Component 3 — container-resident agents bind-mount host Constructs
-//! + Claude binary into the worker container at well-known target paths. In
+//! plus the Claude binary into the worker container at well-known target
+//! paths. In
 //! production these sources are fixed paths on the host (`~/.ember/shadow/bin`
 //! for the Construct library and `/usr/local/bin/claude` for the Claude
 //! binary). During dev iteration, multi-version testing, or canary promotion
@@ -84,14 +85,14 @@ pub fn validate(p: &Path) -> Result<(), OverrideError> {
     }
 
     // Rule 3 + 4: symlink resolution.
-    if p.is_symlink() {
-        if let Ok(canonical) = p.canonicalize() {
-            if !canonical.starts_with(&home) {
-                return Err(OverrideError::SymlinkEscapes);
-            }
-            // Symlink target is inside $HOME — accept.
-            return Ok(());
+    if p.is_symlink()
+        && let Ok(canonical) = p.canonicalize()
+    {
+        if !canonical.starts_with(&home) {
+            return Err(OverrideError::SymlinkEscapes);
         }
+        // Symlink target is inside $HOME — accept.
+        return Ok(());
         // Canonicalization failed; fall through to the plain starts_with check.
     }
 

@@ -36,7 +36,7 @@ pub struct ClaimEvent {
 }
 
 /// Generic Receipt v2 body. Kind-specific extensions live in sibling modules
-/// (e.g. `receipt::cohort_a` will add `audit_gaps[]` per implementation-note-35).
+/// (e.g. `receipt::cohort_a` will add `audit_gaps[]` per implementation-note-45).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReceiptBody {
     pub claim_events: Vec<ClaimEvent>,

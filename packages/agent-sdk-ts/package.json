@@ -1,6 +1,6 @@
 {
   "name": "@emberlink/agent",
-  "description": "TypeScript SDK for the Emberlink agent authorization protocol",
+  "description": "Experimental TypeScript helper client for the Emberlink agent authorization protocol",
   "homepage": "https://github.com/emberdotlink/emberlink",
   "repository": {
     "type": "git",

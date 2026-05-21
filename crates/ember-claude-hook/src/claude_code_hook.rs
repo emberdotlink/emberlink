@@ -19,7 +19,7 @@
 //! }
 //! ```
 //!
-//! Wire shape (implementation-note-74, 2026-04-27):
+//! Wire shape (implementation-note-85, 2026-04-27):
 //! Claude Code's PreToolUse hook contract is documented in the Claude Code
 //! docs as a JSON object on stdin with at least `tool_name` (string) and
 //! `tool_input` / `params` (opaque object). Field names are best-effort
@@ -36,7 +36,7 @@
 //! intended path for first-run install before `emberd` is reachable.
 //! Production callers MUST leave the variable unset; in that mode the hook
 //! still permits today (full grant validation lands in
-//! `implementation-note-75`) but logs a structured WARN line so the
+//! `implementation-note-86`) but logs a structured WARN line so the
 //! operator can see the gating gap.
 
 use anyhow::Result;
@@ -82,7 +82,7 @@ pub struct HookResponse {
 /// not cheap so we don't want it on every hook invocation.
 ///
 /// Currently only consumed by [`evaluate_inproc`] (test-only since the
-/// implementation-note-76 daemon wiring landed). Retained for implementation-note-77 — the
+/// implementation-note-87 daemon wiring landed). Retained for implementation-note-88 — the
 /// daemon will fold the template into its own evaluator path and the
 /// proxy will keep this seam for offline / fallback decisions.
 #[allow(dead_code)]
@@ -94,15 +94,15 @@ fn default_template() -> &'static ScopeTemplate {
     })
 }
 
-/// implementation-note-76: route a hook evaluation through the daemon socket so the
+/// implementation-note-87: route a hook evaluation through the daemon socket so the
 /// daemon owns grant lookup + audit-event emission.
 ///
 /// 1. `EMBER_PROXY_DEV_PERMIT=1` short-circuits to permit (first-run install).
 /// 2. Otherwise open `~/.ember/run/daemon.sock`, send `evaluate_tool_call`
 ///    JSON-RPC, return [`HookResponse`] from the daemon decision.
-/// 3. Daemon-unreachable ⇒ deny with the canned "implementation-note-13 will add
+/// 3. Daemon-unreachable ⇒ deny with the canned "implementation-note-16 will add
 ///    fail-open" reason (this branch is the only path that bails today;
-///    implementation-note-13 wires the controlled fail-open + panic-catch surface).
+///    implementation-note-16 wires the controlled fail-open + panic-catch surface).
 ///
 /// The dev-permit short-circuit at step 1 is intentionally unconditional —
 /// without an emberd reachable on the local socket the install path
@@ -172,7 +172,7 @@ struct EvaluateToolCallParams<'a> {
 /// `crate::grant::ToolCallDecision` in `ember-daemon`. Decoupled type
 /// so we don't drag the daemon crate into the proxy build.
 ///
-/// implementation-note-42: `await_approval_request_id` is surfaced when the daemon's
+/// implementation-note-53: `await_approval_request_id` is surfaced when the daemon's
 /// evaluator routes a call into the approval queue. When present (and
 /// `permit == false`), the hook calls back into the daemon via
 /// `await_approval` to block until the operator resolves the request.
@@ -184,13 +184,13 @@ struct ToolCallDecisionWire {
     #[serde(default)]
     grant_id: Option<String>,
     #[serde(default)]
-    #[allow(dead_code)] // surfaced for implementation-note-35 receipt-termination work
+    #[allow(dead_code)] // surfaced for implementation-note-45 receipt-termination work
     emitted_event_id: Option<String>,
     #[serde(default)]
     await_approval_request_id: Option<String>,
 }
 
-/// implementation-note-42 — wire-shape mirror of `core_grant_types::approval::ApprovalDecision`.
+/// implementation-note-53 — wire-shape mirror of `core_grant_types::approval::ApprovalDecision`.
 ///
 /// Decoupled local type so the proxy build does not drag in `core-types`.
 /// Tag/case must match the daemon-side serialization (`#[serde(tag =
@@ -224,7 +224,7 @@ const AWAIT_APPROVAL_TIMEOUT_SECS: u64 = 300;
 /// Append a JSON audit-gap record to `~/.ember/sessions/<session_id>/audit-gaps.jsonl`.
 ///
 /// Best-effort — logs via `tracing::warn!` on failure, never propagates.
-/// One record per daemon-unreachable event per the implementation-note-13 spec.
+/// One record per daemon-unreachable event per the implementation-note-16 spec.
 fn append_audit_gap(session_id: &str, reason: &str) {
     let Ok(home) = std::env::var("HOME") else {
         eprintln!("ember-proxy: audit-gap: $HOME not set, skipping gap record");
@@ -262,7 +262,7 @@ fn append_audit_gap(session_id: &str, reason: &str) {
 /// Open the daemon socket, send `evaluate_tool_call`, return a
 /// [`HookResponse`].
 ///
-/// implementation-note-13: when the daemon is unreachable, consults
+/// implementation-note-16: when the daemon is unreachable, consults
 /// `EmberConfig::load_or_default().explicit_fail_open`. If true (default),
 /// returns `{allow: true}` with a structured reason and records an audit-gap.
 /// If false, returns `{allow: false}` (original fail-closed behaviour).
@@ -308,7 +308,7 @@ fn evaluate_via_daemon(req: &PreToolUseRequest, socket_path: &Path) -> HookRespo
         };
     }
 
-    // implementation-note-42: when the daemon routed the call into the approval queue
+    // implementation-note-53: when the daemon routed the call into the approval queue
     // (signaled by `await_approval_request_id`), block-and-poll the daemon
     // for the operator's resolution instead of denying outright. On
     // unreachable / decode error we fall back to the original deny reason
@@ -424,7 +424,7 @@ fn call_daemon_evaluate(
         .map_err(|e| format!("decode ToolCallDecision: {e}"))
 }
 
-/// implementation-note-42 — block-and-poll RPC helper for the approval round-trip.
+/// implementation-note-53 — block-and-poll RPC helper for the approval round-trip.
 ///
 /// Mirrors [`call_daemon_evaluate`] but invokes `await_approval` against
 /// an existing `request_id` minted by an earlier `evaluate_tool_call`
@@ -498,11 +498,11 @@ fn call_daemon_await_approval(
     Ok(resp.decision)
 }
 
-/// In-process scope evaluator. Unchanged from the pre-implementation-note-76 hook
+/// In-process scope evaluator. Unchanged from the pre-implementation-note-87 hook
 /// path; retained here so unit tests can exercise the embedded
 /// `claude-code-default-v1` template's deny / approval / permit rules
 /// without standing up a daemon. Production traffic flows through
-/// `evaluate_via_daemon` instead — this lives on as the implementation-note-77
+/// `evaluate_via_daemon` instead — this lives on as the implementation-note-88
 /// real-evaluator scaffold.
 #[allow(dead_code)]
 fn evaluate_inproc(req: &PreToolUseRequest) -> HookResponse {
@@ -526,7 +526,7 @@ fn evaluate_inproc(req: &PreToolUseRequest) -> HookResponse {
         ScopeDecision::RequireApproval { reason, rule } => HookResponse {
             allow: false,
             reason: format!(
-                "ember-proxy: approval-required ({rule}): {reason} — block-and-poll await-approval lands in implementation-note-42"
+                "ember-proxy: approval-required ({rule}): {reason} — block-and-poll await-approval lands in implementation-note-53"
             ),
         },
     }
@@ -631,7 +631,7 @@ mod tests {
     // Scope-rule tests below exercise the in-process evaluator
     // directly — production traffic now goes through
     // `evaluate_via_daemon`, but the embedded scope template is the
-    // single source of truth that implementation-note-77 will fold back into the
+    // single source of truth that implementation-note-88 will fold back into the
     // daemon. Pinning the rule semantics here keeps the rule table
     // honest as A-3 lands.
 
@@ -674,10 +674,10 @@ mod tests {
             transcript_path: None,
         };
         let resp = evaluate_inproc(&req);
-        // Until implementation-note-42 await-approval lands, RequireApproval ⇒ deny.
+        // Until implementation-note-53 await-approval lands, RequireApproval ⇒ deny.
         assert!(!resp.allow);
         assert!(resp.reason.contains("approval.git_push"));
-        assert!(resp.reason.contains("implementation-note-42"));
+        assert!(resp.reason.contains("implementation-note-53"));
     }
 
     #[test]
@@ -693,7 +693,7 @@ mod tests {
         assert!(resp.reason.contains("approval.novel_tool"));
     }
 
-    /// implementation-note-13: when the daemon socket is unreachable and
+    /// implementation-note-16: when the daemon socket is unreachable and
     /// `explicit_fail_open=true` (the default), the hook permits with a
     /// structured reason. The old fail-closed branch is replaced by a
     /// configurable fail-open + panic-catch surface.
@@ -733,7 +733,7 @@ mod tests {
         );
     }
 
-    /// implementation-note-76: `default_socket_path()` must honor `EMBER_SOCKET_PATH`
+    /// implementation-note-87: `default_socket_path()` must honor `EMBER_SOCKET_PATH`
     /// (used by `qember.sh` and the integration tests) and fall back
     /// to `~/.ember/run/daemon.sock` otherwise. This locks the
     /// resolution order so a future refactor cannot silently re-route
@@ -767,11 +767,11 @@ mod tests {
         }
     }
 
-    /// implementation-note-42: when the daemon is unreachable, the await_approval
+    /// implementation-note-53: when the daemon is unreachable, the await_approval
     /// helper surfaces a structured error that the caller maps to deny.
     /// We exercise the connect-failure path here; mid-poll resolution
     /// requires a real daemon and is covered by the T2 integration test
-    /// (TODO implementation-note-78).
+    /// (TODO implementation-note-89).
     #[test]
     fn call_daemon_await_approval_unreachable_returns_err() {
         let bogus = std::path::PathBuf::from(
@@ -789,7 +789,7 @@ mod tests {
         );
     }
 
-    /// implementation-note-42: ApprovalDecisionWire round-trips against the daemon's
+    /// implementation-note-53: ApprovalDecisionWire round-trips against the daemon's
     /// JSON tag/case convention. Locks the wire shape so a daemon-side
     /// rename of `core_types::ApprovalDecision` cannot silently break the
     /// proxy's decode without the test catching it.
@@ -812,7 +812,7 @@ mod tests {
         }
     }
 
-    /// implementation-note-42: the `await_approval_request_id` field on
+    /// implementation-note-53: the `await_approval_request_id` field on
     /// `ToolCallDecisionWire` is optional + backward-compatible — old
     /// daemons that don't surface it must still decode cleanly into a
     /// permit/deny decision.

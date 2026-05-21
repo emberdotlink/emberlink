@@ -18,6 +18,7 @@ name = "ember-kubectl"
 version = "0.1.0"
 publisher = "did:emberlink"
 description = "kubectl CLI Construct. Mediates `kubectl` invocations through ember's broker: apply/patch/edit/replace/create require biometric approval; delete is budget-capped at 3/session with biometric confirmation; exec/cp are biometric-gated (privileged pod access); rollout pause/resume/undo/restart, set image/env/resources, label, annotate, port-forward, proxy, cordon/drain/uncordon/taint, scale, run, and debug are gated. Read-only verbs (get, describe, logs, top, auth, cluster-info, version, api-resources, api-versions, explain, wait, events) and config context ops are passthrough — no broker mediation."
+headless_requirements = ["env_passthrough_authority"]
 
 # Default policy for unlisted action keys.
 default = "deny"

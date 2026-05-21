@@ -31,7 +31,7 @@
 //! - Not the SE-sealed CA load path. ember-rpc reads cert + key + CA
 //!   from operator-configured PEM paths. The emberd-side cert-minter
 //!   that writes those files is a separate task (the brief flags it as
-//!   `implementation-note-98`, M-size).
+//!   `implementation-note-112`, M-size).
 //!
 //! Security invariants enforced here:
 //! - `WebPkiClientVerifier::builder` REQUIRES a client cert; rustls refuses
@@ -148,10 +148,10 @@ pub enum ListenerError {
 ///
 /// - `server_cert_path` / `server_key_path` — ember-rpc's own server
 ///   identity, presented during the TLS handshake. Minted by emberd
-///   core (sibling task `implementation-note-98`).
+///   core (sibling task `implementation-note-112`).
 /// - `ca_cert_path` — the bridge CA cert used for client-auth
 ///   verification. emberd publishes this as `<data_dir>/bridge_ca.pub`
-///   per `implementation-note-290`.
+///   per `implementation-note-319`.
 #[derive(Debug, Clone)]
 pub struct ListenerConfig {
     pub listen_addr: std::net::SocketAddr,

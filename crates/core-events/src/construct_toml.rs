@@ -676,7 +676,7 @@ mode = "jit_approval""#,
     }
 
     // -----------------------------------------------------------------------
-    // needs_credentials + credential_types tests (implementation-note-32)
+    // needs_credentials + credential_types tests (implementation-note-41)
     // -----------------------------------------------------------------------
 
     #[test]

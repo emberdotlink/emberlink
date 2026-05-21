@@ -1,5 +1,5 @@
 //! Integration tests for `ember broker {issue, revoke, list}`
-//! (implementation-note-416).
+//! (implementation-note-465).
 //!
 //! Each test spawns a real `ember-daemon` socket listener on a temp
 //! `UnixStream` path with a `MockBroker`-backed registry installed (the
@@ -38,6 +38,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use ember_daemon::broker::handler::{BrokerRegistry, install_registry};
+use ember_daemon::infra::config::DaemonConfig;
 use ember_daemon::infra::rate_limit::RateLimiter;
 use ember_daemon::infra::socket::SocketListener;
 use ember_daemon::infra::store::DaemonStore;
@@ -45,7 +46,9 @@ use ember_daemon::infra::vault::Vault;
 use ember_daemon::trust::policy::{
     ApprovalRequirement, PolicyConfig, PolicyEngine, PolicyRule, RiskLevel,
 };
-use emberlink_cli::broker::{BrokerCliError, BrokerCmd, GlobalOpts, broker_command};
+use emberlink_cli::broker::{
+    BrokerCliError, BrokerCmd, GlobalOpts, RegisterProvider, broker_command,
+};
 use tempfile::TempDir;
 use tokio::sync::watch;
 
@@ -111,6 +114,10 @@ fn spawn_listener(tmp: &TempDir, name: &str) -> (PathBuf, watch::Sender<bool>) {
 
         let local = tokio::task::LocalSet::new();
         local.block_on(&rt, async move {
+            let id_dir = tempfile::tempdir().expect("tempdir for daemon identity");
+            let _ = ember_daemon::infra::receipt::init_identity(id_dir.path());
+            std::mem::forget(id_dir);
+
             let store = Rc::new(DaemonStore::open_in_memory().unwrap());
             let vault = Rc::new(Vault::new([42u8; 32]));
             store.set_vault(Rc::clone(&vault));
@@ -146,6 +153,104 @@ fn opts(socket_path: &std::path::Path) -> GlobalOpts {
     }
 }
 
+fn spawn_listener_with_real_unlock(tmp: &TempDir, name: &str) -> (PathBuf, watch::Sender<bool>) {
+    let socket_path = tmp.path().join(format!("{name}.sock"));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let path_for_thread = socket_path.clone();
+
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async move {
+            let id_dir = tempfile::tempdir().expect("tempdir for daemon identity");
+            let _ = ember_daemon::infra::receipt::init_identity(id_dir.path());
+            std::mem::forget(id_dir);
+
+            let config_root = tempfile::tempdir().expect("tempdir for daemon config");
+            let config = DaemonConfig::for_test(config_root.path());
+            let vault = Rc::new(
+                Vault::open_from_config(&config).expect("runtime vault open from config"),
+            );
+            let store = Rc::new(DaemonStore::open_in_memory().unwrap());
+            store.set_vault(Rc::clone(&vault));
+            ember_daemon::trust::presence::register_store(Rc::clone(&store));
+            ember_daemon::infra::interactive_unlock::register_config(config);
+
+            let policy = Rc::new(permissive_policy());
+            let rate_limiter = Rc::new(RefCell::new(RateLimiter::default()));
+            let _vault = vault;
+            let _config_root = config_root;
+            let listener =
+                SocketListener::new(path_for_thread, shutdown_rx, store, policy, rate_limiter);
+            let _ = listener.run().await;
+        });
+    });
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !socket_path.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        socket_path.exists(),
+        "socket {} never appeared",
+        socket_path.display()
+    );
+
+    (socket_path, shutdown_tx)
+}
+
+fn spawn_listener_without_presence(tmp: &TempDir, name: &str) -> (PathBuf, watch::Sender<bool>) {
+    ensure_registry_installed();
+    let id_dir = tempfile::tempdir().expect("tempdir for daemon identity");
+    let _ = ember_daemon::infra::receipt::init_identity(id_dir.path());
+    std::mem::forget(id_dir);
+
+    let socket_path = tmp.path().join(format!("{name}.sock"));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let path_for_thread = socket_path.clone();
+
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&rt, async move {
+            let store = Rc::new(DaemonStore::open_in_memory().unwrap());
+            let vault = Rc::new(Vault::new([42u8; 32]));
+            store.set_vault(Rc::clone(&vault));
+            let policy = Rc::new(permissive_policy());
+            let rate_limiter = Rc::new(RefCell::new(RateLimiter::default()));
+            let _vault = vault;
+            let listener = SocketListener::new(
+                path_for_thread,
+                shutdown_rx,
+                store,
+                policy,
+                rate_limiter,
+            );
+            let _ = listener.run().await;
+        });
+    });
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !socket_path.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        socket_path.exists(),
+        "socket {} never appeared",
+        socket_path.display()
+    );
+
+    (socket_path, shutdown_tx)
+}
+
 // ---------------------------------------------------------------------------
 // To capture stdout / stderr of `broker_command` we need a side-channel
 // because `println!` writes to the process stdout. The test asserts
@@ -165,7 +270,7 @@ fn broker_issue_valid_scope_returns_brokered_credential() {
         provider: "cloudflare".to_string(),
         scope_json: r#"{"zone":"emberlink.dev","permissions":["dns:edit"]}"#.to_string(),
         ttl: "15m".to_string(),
-        reason: "implementation-note-446issue-test".to_string(),
+        reason: "implementation-note-498issue-test".to_string(),
         json: true,
     };
     let res = broker_command(cmd, opts(&socket));
@@ -314,6 +419,40 @@ fn broker_list_active_only_excludes_expired() {
 }
 
 #[test]
+fn broker_list_without_presence_returns_guidance_not_raw_authority_error() {
+    let _guard = ember_daemon::PROCESS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    ember_daemon::trust::presence::reset_for_tests();
+
+    let tmp = TempDir::new().unwrap();
+    let (socket, shutdown) = spawn_listener_without_presence(&tmp, "list-guidance");
+
+    let err = broker_command(
+        BrokerCmd::List {
+            provider: None,
+            tier: None,
+            task_id: None,
+            active_only: true,
+            json: true,
+        },
+        opts(&socket),
+    )
+    .expect_err("missing operator presence should not succeed");
+
+    match err {
+        BrokerCliError::Guidance(message) => {
+            assert!(message.contains("advanced operator surface"));
+            assert!(message.contains("ember claude-code"));
+        }
+        other => panic!("expected Guidance, got {other:?}"),
+    }
+
+    let _ = shutdown.send(true);
+    ember_daemon::trust::presence::reset_for_tests();
+}
+
+#[test]
 fn broker_socket_unreachable_returns_clear_error() {
     let bad_socket = PathBuf::from("/tmp/ember-broker-cli-test-DOES-NOT-EXIST.sock");
     if bad_socket.exists() {
@@ -349,6 +488,110 @@ fn broker_socket_unreachable_returns_clear_error() {
         }
         other => panic!("expected DaemonUnavailable, got {other:?}"),
     }
+}
+
+#[test]
+fn broker_register_github_reuses_shared_presence_bootstrap() {
+    let tmp = TempDir::new().unwrap();
+    let (socket, shutdown) = spawn_listener(&tmp, "register-github");
+
+    let pem_path = tmp.path().join("app.pem");
+    std::fs::write(
+        &pem_path,
+        "\x2d----BEGIN PRIVATE KEY-----\nnot-a-real-key\n-----END PRIVATE KEY-----\n",
+    )
+    .unwrap();
+
+    let cmd = BrokerCmd::Register {
+        provider: RegisterProvider::Github {
+            pem_file: pem_path,
+            app_id: "3491890".into(),
+            installation_id: "126782716".into(),
+            slug: "ember-engine".into(),
+            allow_unverified_slug: true,
+            replace: false,
+            json: true,
+        },
+    };
+
+    let res = broker_command(cmd, opts(&socket));
+    assert!(
+        res.is_ok(),
+        "register github should succeed through auto-unlock/presence bootstrap, got {res:?}"
+    );
+
+    let result = emberlink_cli::call_daemon_method(
+        &socket,
+        "vault_get",
+        &serde_json::json!({
+            "name": "github/apps/ember-engine/install-126782716/app-id"
+        }),
+    )
+    .expect("registered app id should be readable from the vault");
+    assert_eq!(
+        result.get("value").and_then(|v| v.as_str()),
+        Some("3491890"),
+        "register github must persist the app-id through the same daemon lane"
+    );
+
+    let _ = shutdown.send(true);
+}
+
+#[test]
+fn broker_register_github_round_trips_against_real_socket_unlock_flow() {
+    let _guard = ember_daemon::PROCESS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    ember_daemon::trust::presence::reset_for_tests();
+    // SAFETY: serialized by PROCESS_TEST_LOCK for this test process.
+    unsafe { std::env::set_var("EMBER_VAULT_TEST_KEYRING_PRESENT", "1") };
+
+    let tmp = TempDir::new().unwrap();
+    let (socket, shutdown) = spawn_listener_with_real_unlock(&tmp, "register-github-real");
+
+    let pem_path = tmp.path().join("app.pem");
+    std::fs::write(
+        &pem_path,
+        "\x2d----BEGIN PRIVATE KEY-----\nnot-a-real-key\n-----END PRIVATE KEY-----\n",
+    )
+    .unwrap();
+
+    let cmd = BrokerCmd::Register {
+        provider: RegisterProvider::Github {
+            pem_file: pem_path,
+            app_id: "3491890".into(),
+            installation_id: "126782716".into(),
+            slug: "ember-engine".into(),
+            allow_unverified_slug: true,
+            replace: false,
+            json: true,
+        },
+    };
+
+    let res = broker_command(cmd, opts(&socket));
+    assert!(
+        res.is_ok(),
+        "register github should succeed against the real socket unlock flow, got {res:?}"
+    );
+
+    let result = emberlink_cli::call_daemon_method(
+        &socket,
+        "vault_get",
+        &serde_json::json!({
+            "name": "github/apps/ember-engine/install-126782716/app-id"
+        }),
+    )
+    .expect("registered app id should be readable from the vault");
+    assert_eq!(
+        result.get("value").and_then(|v| v.as_str()),
+        Some("3491890"),
+        "registered app id must survive the real socket unlock flow"
+    );
+
+    let _ = shutdown.send(true);
+    // SAFETY: serialized by PROCESS_TEST_LOCK for this test process.
+    unsafe { std::env::remove_var("EMBER_VAULT_TEST_KEYRING_PRESENT") };
+    ember_daemon::trust::presence::reset_for_tests();
 }
 
 // Helper to dodge moving the error variant on equality checks above.

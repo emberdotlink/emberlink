@@ -1,5 +1,5 @@
 //!
-//! implementation-note-140 — per-spawn ephemeral uid pool for
+//! implementation-note-162 — per-spawn ephemeral uid pool for
 //! credentialed `broker_exec` children. Closes Finding 14 (refuse to
 //! spawn a child as the daemon's own uid) and the
 //! `/proc/<pid>/environ` side-channel between two concurrent broker_exec
@@ -21,7 +21,7 @@
 //!
 //! ## Allocation strategy
 //!
-//! Strategy (b) from the implementation-note-140 brief —
+//! Strategy (b) from the implementation-note-162 brief —
 //! **per-spawn ephemeral uid checked out from a pre-provisioned pool**.
 //! The installer provisions the pool uids at `ember daemon install`
 //! time (`ember-spawn-0` … `ember-spawn-N`) and the daemon checks one
@@ -76,7 +76,7 @@ pub fn init_uid_pool(config: Option<SpawnPoolConfig>) {
     let pool = config.map(|cfg| {
         // design Component 2 — modern-Linux subuid path. When the
         // config carries `subuid_range_start` + `subuid_range_slots`
-        // (provisioned by implementation-note-163), populate
+        // (provisioned by implementation-note-186), populate
         // the pool from the range and mark it as subuid-shaped so
         // the broker_exec handler routes through the clone3 +
         // newuidmap path. Otherwise the legacy design system-user
@@ -109,7 +109,7 @@ pub fn init_uid_pool(config: Option<SpawnPoolConfig>) {
 /// (`target_uid == daemon_uid`) refusal so the test path can spawn
 /// children without provisioning real separate uids.
 ///
-/// implementation-note-140 — test seam. Production callers
+/// implementation-note-162 — test seam. Production callers
 /// MUST never invoke this; the test_mode flag inside the resulting
 /// pool is the only escape valve from the Finding-14 refusal and
 /// the production install path never sets it.

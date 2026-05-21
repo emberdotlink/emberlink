@@ -14,20 +14,12 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 /// All session-level preferences persisted between launcher invocations.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionPrefs {
     /// When `true`, the host-mode mediation disclaimer is skipped at launch.
     /// Default: `false`.
     #[serde(default)]
     pub host_mode_disclaimer_suppressed: bool,
-}
-
-impl Default for SessionPrefs {
-    fn default() -> Self {
-        Self {
-            host_mode_disclaimer_suppressed: false,
-        }
-    }
 }
 
 /// Return the path to `~/.ember/session-prefs.json`.

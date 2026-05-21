@@ -1,9 +1,8 @@
 //!
 //! ember dev install — phases 5-11 helper modules (design §Component 4).
 //!
-//! This crate-level module declares the five helper submodules produced by
-//! Slice C. The integration PR (after both Slice B and Slice C land) will
-//! wire these functions into `dev/install.rs`.
+//! This crate-level module declares the five helper submodules that now back
+//! phases 5-11 of `ember dev install`.
 //!
 //! Anchor: `dev_prod_parity_ember_dev_install_slice_c_landed`
 
@@ -33,6 +32,9 @@ impl CommandRunner for RealCommandRunner {
 
 #[path = "dev_install_slice_c/build_sign.rs"]
 pub mod build_sign;
+
+#[path = "dev_install_slice_c/config.rs"]
+pub mod config;
 
 #[path = "dev_install_slice_c/install_binaries.rs"]
 pub mod install_binaries;

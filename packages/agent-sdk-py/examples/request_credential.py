@@ -9,6 +9,7 @@ from emberlink_agent import AgentConfig, EmberAgent, EmberAgentError
 config = AgentConfig(
     db_path=os.environ.get("EMBERLINK_DB", "./emberlink.db"),
     persona_id=os.environ.get("EMBERLINK_PERSONA", "my-agent-persona"),
+    daemon_socket=os.environ.get("EMBERLINK_DAEMON_SOCKET"),
 )
 
 try:
@@ -16,7 +17,11 @@ try:
         me = agent.whoami()
         print("Connected as:", me.persona_id)
 
-        grant = agent.request_grant(scope="netflix-password", reason="streaming session")
+        grant = agent.request_grant(
+            scope="repo:read",
+            resource_id=os.environ.get("EMBERLINK_CREDENTIAL", "github-token"),
+            reason="streaming session",
+        )
         print("Grant request submitted:", grant.request_id, "— status:", grant.status)
 
         status = agent.grant_status(grant.request_id)

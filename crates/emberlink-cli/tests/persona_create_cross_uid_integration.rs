@@ -1,6 +1,6 @@
 //!
 //! T3 integration test: `ember persona create` + `ember init` against a real
-//! separate-uid daemon process (implementation-note-449).
+//! separate-uid daemon process (implementation-note-501).
 //!
 //! ## What this tests
 //!

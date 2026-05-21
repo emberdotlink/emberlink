@@ -59,8 +59,8 @@ const KEY_DEFAULT_TARGET: &str = "GCP_DEFAULT_TARGET_SERVICE_ACCOUNT";
 ///
 /// The receiving const is reserved here; load_from_dir() does not yet
 /// read it (full daemon-side wireup follows in
-/// implementation-note-113 — the broker accepts an
-/// already-resolved [`GcpAuthMethod`] per the implementation-note-114-
+/// implementation-note-129 — the broker accepts an
+/// already-resolved [`GcpAuthMethod`] per the implementation-note-130-
 /// IDENTITY brief, mirroring the AWS-STS WI groundwork).
 #[allow(dead_code)]
 const KEY_OIDC_TOKEN_PATH: &str = "GCP_OIDC_TOKEN_PATH";
@@ -190,7 +190,7 @@ pub async fn gcp_config_from_store(
             project_id,
             // Mirrors load_from_dir: SA-key path is the historical
             // default for backward compat. Full WIF wireup follows in
-            // implementation-note-113.
+            // implementation-note-129.
             auth_method: GcpAuthMethod::ServiceAccountKey,
         },
         default_target,

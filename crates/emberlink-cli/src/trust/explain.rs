@@ -6,11 +6,11 @@
 //!
 //! - `binary_manifest` (default) — reads sidecar from `<artifact>.sig` or
 //!   the explicit `--sidecar` path.
-//! - `receipt` (implementation-note-357) — Receipt envelope JSON; no
+//! - `receipt` (implementation-note-399) — Receipt envelope JSON; no
 //!   sidecar (the signature is inline). `--sidecar` is ignored on this
 //!   kind, and the wire sidecar bytes are sent empty.
 //!
-//! Workflow grant chain walk lands in implementation-note-358.
+//! Workflow grant chain walk lands in implementation-note-400.
 //!
 //! The CLI reads the artifact + (when applicable) sidecar from disk and
 //! base64-encodes both for the wire. The daemon never touches a
@@ -89,12 +89,11 @@ pub fn fetch_trust_explain(
     artifact_path: &Path,
     sidecar_path: Option<&Path>,
 ) -> Result<TrustExplainResponse, TrustExplainError> {
-    let artifact_bytes =
-        std::fs::read(artifact_path).map_err(|e| TrustExplainError::ReadFile {
-            what: "artifact",
-            path: artifact_path.to_path_buf(),
-            source: e,
-        })?;
+    let artifact_bytes = std::fs::read(artifact_path).map_err(|e| TrustExplainError::ReadFile {
+        what: "artifact",
+        path: artifact_path.to_path_buf(),
+        source: e,
+    })?;
     let sidecar_bytes = match sidecar_path {
         Some(p) => std::fs::read(p).map_err(|e| TrustExplainError::ReadFile {
             what: "sidecar",
@@ -116,10 +115,11 @@ pub fn fetch_trust_explain(
 }
 
 /// Parse the daemon's `trust.explain` response body into a typed struct.
-pub fn parse_trust_explain_response(body: &Value) -> Result<TrustExplainResponse, TrustExplainError> {
-    serde_json::from_value(body.clone()).map_err(|e| {
-        TrustExplainError::Protocol(format!("decode trust.explain response: {e}"))
-    })
+pub fn parse_trust_explain_response(
+    body: &Value,
+) -> Result<TrustExplainResponse, TrustExplainError> {
+    serde_json::from_value(body.clone())
+        .map_err(|e| TrustExplainError::Protocol(format!("decode trust.explain response: {e}")))
 }
 
 /// Default sidecar path convention: `<artifact_path>.sig`. Matches the
@@ -187,17 +187,12 @@ pub fn run(
     match fetch_trust_explain(socket_path, artifact_kind, artifact_path, sidecar) {
         Ok(resp) => {
             print!("{}", render_human(&resp));
-            if resp.verdict == "verified" {
-                0
-            } else {
-                1
-            }
+            if resp.verdict == "verified" { 0 } else { 1 }
         }
         Err(TrustExplainError::DaemonUnavailable { socket, source }) => {
             eprintln!(
-                "ember trust explain: daemon socket at {} unreachable ({source}). \
-                 Is emberd running? (ember daemon status)",
-                socket.display()
+                "ember trust explain: {}",
+                crate::format_daemon_unavailable(&socket, &source)
             );
             2
         }
@@ -365,7 +360,7 @@ mod tests {
         assert_eq!(p, PathBuf::from("/tmp/release.sig"));
     }
 
-    /// implementation-note-357: receipt + workflow_grant kinds carry
+    /// implementation-note-399: receipt + workflow_grant kinds carry
     /// the signature inline; the run path must NOT compute a default
     /// sidecar path (it would fail trying to read a `.sig` that doesn't
     /// exist) and must pass empty bytes for the wire sidecar.

@@ -1,6 +1,6 @@
 //!
 //! `ember kms` CLI verb implementations — edge CA init and peer enrollment
-//! lifecycle (design Amendment 1 v3, implementation-note-362).
+//! lifecycle (design Amendment 1 v3, implementation-note-405).
 //!
 //! ## Verb overview
 //!
@@ -20,7 +20,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// implementation-note-427 → E0133-root-cause-resolved.
+// implementation-note-476 → E0133-root-cause-resolved.
 // The 2026-05-13 E0133 (unsafe-outside-unsafe-block) emitted by
 // `cargo build --workspace --quiet` near `EdgeCa` no longer
 // reproduces on 2026-05-16 against current main (zero `E0133` /
@@ -29,7 +29,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // refactor; no targeted patch was needed. Checkpoint preserved here so
 // the ranker's auto-transition pre-pass closes the open investigation
 // task.
-// EdgeCa import removed — implementation-note-428resolved
+// EdgeCa import removed — implementation-note-477resolved
 use core_crypto::ca::{
     CaError, ClientCertSpec, Csr, SignedClientCert, ca_fingerprint, generate_csr_pem,
     generate_edge_ca, parse_csr_signed_by, parse_spiffe_uri, sign_client_cert,

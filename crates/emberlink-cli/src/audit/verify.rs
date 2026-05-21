@@ -33,12 +33,9 @@ pub enum VerifyError {
 impl std::fmt::Display for VerifyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::DaemonUnavailable { socket, source } => write!(
-                f,
-                "daemon socket unavailable at {}: {}",
-                socket.display(),
-                source
-            ),
+            Self::DaemonUnavailable { socket, source } => {
+                write!(f, "{}", crate::format_daemon_unavailable(socket, source))
+            }
             Self::Io(s) => write!(f, "{s}"),
             Self::Rpc { code, message } => write!(f, "daemon error {code}: {message}"),
             Self::Protocol(s) => write!(f, "protocol error: {s}"),
@@ -64,7 +61,7 @@ pub enum VerifyVerdict {
     },
 }
 
-/// implementation-note-230 (B): `ember audit verify` CLI entry
+/// implementation-note-255 (B): `ember audit verify` CLI entry
 /// point. Walks the daemon's audit chain via the `audit_verify` socket
 /// method. `tail = None` requests a full-chain walk; `Some(n)` requests
 /// the last N rows.
