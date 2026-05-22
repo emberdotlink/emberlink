@@ -1,4 +1,4 @@
-//! implementation-note-406 regression coverage.
+//! implementation-note-416 regression coverage.
 //!
 //! Reproduces the bug where the TTL-expiry sweep silently failed to emit
 //! a Grant Receipt: the sweep call site discarded the wrapper's return
@@ -21,6 +21,10 @@
 
 use std::rc::Rc;
 
+use ember_daemon::infra::claim_journal::{
+    AuditEvidenceInput, ClaimJournal, ClaimScopeKind, ScopeRef, SqliteClaimJournal,
+    SuccessfulClaimInput,
+};
 use ember_daemon::infra::receipt::{current_identity, init_identity, verify_receipt};
 use ember_daemon::infra::store::DaemonStore;
 use ember_daemon::infra::vault::Vault;
@@ -152,5 +156,82 @@ fn ttl_expiry_sweep_is_idempotent() {
         store.receipt_count().unwrap(),
         1,
         "rerunning the sweep must not double-emit"
+    );
+}
+
+#[test]
+fn ttl_expiry_sweep_emits_session_composite_grant_v2_when_claim_journal_present() {
+    let _id_dir = init_test_identity();
+    let _identity = current_identity().expect("identity must be loaded for v2 receipt emission");
+
+    let store = store_with_vault();
+    let persona = store
+        .create_persona("agent-receipt-v2")
+        .expect("create_persona");
+
+    let grant = store
+        .create_grant(&persona.id, "github-token", "repo:read", Some(1))
+        .expect("create_grant with TTL");
+
+    let journal = SqliteClaimJournal::new(&store, 64);
+    let scope = ScopeRef {
+        kind: ClaimScopeKind::Grant,
+        id: grant.id.clone(),
+    };
+    journal
+        .record_successful_claim(
+            &scope,
+            &SuccessfulClaimInput {
+                source_key: "ttl-claim-1".to_string(),
+                occurred_at: "2026-05-22T12:00:00Z".to_string(),
+                claim_kind: core_events::receipt::ClaimKind::CredentialVended,
+                tool: "gh.pr_create".to_string(),
+                input_hash: "ttl-claim-hash-1".to_string(),
+                input_redacted: serde_json::json!({"kind": "broker_resolve", "grant_id": grant.id}),
+                resolved: serde_json::json!({"allowed": true}),
+                audit: AuditEvidenceInput {
+                    agent_id: Some(persona.id.clone()),
+                    action: "broker.resolve.materialized".to_string(),
+                    credential: Some("github-token".to_string()),
+                    outcome: "allowed".to_string(),
+                    details: Some("{\"kind\":\"broker_resolve_materialized\"}".to_string()),
+                },
+                persona_id: Some(persona.id.clone()),
+                device_id: None,
+                workflow_id: None,
+                materialization_id: Some("mat-ttl-1".to_string()),
+                credential_name: Some("github-token".to_string()),
+            },
+        )
+        .unwrap();
+
+    store
+        .conn()
+        .execute(
+            "UPDATE grants SET expires_at = '2000-01-01T00:00:00Z' WHERE id = ?1",
+            rusqlite::params![grant.id],
+        )
+        .expect("backdate expires_at");
+
+    assert_eq!(store.expire_stale_grants().unwrap(), 1);
+
+    let v2 = store
+        .list_receipts_v2_envelopes(std::slice::from_ref(&grant.id))
+        .expect("list v2 envelopes");
+    let (_, kind, grant_id, envelope) = v2
+        .into_iter()
+        .find(|(_, kind, _, _)| kind == core_events::receipt::RECEIPT_KIND_COMPOSITE_GRANT)
+        .expect("session.composite_grant envelope must be stored");
+    assert_eq!(grant_id, grant.id);
+    assert_eq!(kind, core_events::receipt::RECEIPT_KIND_COMPOSITE_GRANT);
+
+    let body: core_events::receipt::ClaudeCodeBody =
+        serde_json::from_value(envelope.body).expect("receipt body parses");
+    assert_eq!(body.base.claim_count_total, Some(1));
+    assert_eq!(body.base.claim_events.len(), 1);
+    assert_eq!(body.base.claim_segment_summaries.len(), 1);
+    assert_eq!(
+        body.termination_reason,
+        Some(core_events::receipt::TerminationReason::TtlExpired)
     );
 }

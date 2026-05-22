@@ -1,6 +1,6 @@
 //! T2 — Compose V2 YAML fixture round-trip tests.
 //!
-//! implementation-note-91. Parses the YAML
+//! implementation-note-93. Parses the YAML
 //! fixtures under `tests/fixtures/compose/` and asserts the key
 //! fields land in the right bollard slots.
 //!

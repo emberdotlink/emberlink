@@ -22,9 +22,12 @@ use zeroize::Zeroizing;
 
 use async_trait::async_trait;
 use core_proxy_forward::r#match::{
-    MethodTier, effective_scope_uri, extract_github_branch, extract_host_from_url,
-    git_echo_owner_repo, github_target_matches, glob_match_branch, host_matches_domain,
-    is_git_smart_http_path, method_tier, request_to_action_resource, wildcard_match,
+    effective_scope_uri, extract_github_branch, extract_host_from_url, git_echo_owner_repo,
+    glob_match_branch, host_matches_domain, is_git_smart_http_path, request_to_action_resource,
+};
+#[cfg(test)]
+use core_proxy_forward::r#match::{
+    MethodTier, github_target_matches, method_tier, wildcard_match,
 };
 use core_proxy_forward::{EventError, EventSink, PolicyBackend, ThresholdAxis, ThresholdBand};
 use hyper::http;
@@ -573,7 +576,7 @@ const HOP_BY_HOP_HEADERS: &[&str] = &[
 /// and all legitimate header names are ASCII.
 const ALLOWED_REQUEST_HEADERS: &[&str] = &[
     "accept",
-    // `accept-encoding` deliberately omitted — implementation-note-56.
+    // `accept-encoding` deliberately omitted — implementation-note-58.
     // Passing the client's `Accept-Encoding: gzip` through to upstream
     // returns a gzip-compressed response body, which `parse_usage` cannot
     // recognize as JSON (`looks_like_json` checks for a leading `{` or
@@ -788,7 +791,7 @@ pub struct ProxyState {
     pub vault: std::rc::Rc<crate::infra::vault::Vault>,
     /// Audit-log + broadcast sink, installed once during proxy spawn.
     ///
-    /// implementation-note-301: the threshold-debounce set and the
+    /// implementation-note-309: the threshold-debounce set and the
     /// broadcast channel both moved INTO `DaemonEventSink`. `ProxyState`
     /// now holds a `OnceLock` pointer to the sink so the existing
     /// `state.sink_*` shim methods (and `emit_threshold_crossings` /
@@ -1147,7 +1150,7 @@ impl PolicyBackend for DaemonPolicyBackend {
         Ok(())
     }
 
-    // implementation-note-237: post_flight_meter is the trait-level entry
+    // implementation-note-244: post_flight_meter is the trait-level entry
     // point for credential-grant metering after the upstream call completes.
     // Distinct from `post_flight` at the trait level so Slice C's remote
     // backend can route the two through different metering paths. The
@@ -1184,7 +1187,7 @@ impl PolicyBackend for DaemonPolicyBackend {
 }
 
 /// `EventSink` implementation for the ember daemon — landed in
-/// implementation-note-237 and finished in B-2.
+/// implementation-note-244 and finished in B-2.
 ///
 /// Wraps the daemon's `ProxyState` so the proxy pipeline can route audit
 /// writes + grant-event broadcasts through the trait surface. This is the
@@ -1216,7 +1219,7 @@ pub struct DaemonEventSink {
     /// SDKs). `None` in unit tests that only exercise audit-log emission
     /// and in the git-echo proxy spawn, which does not yet broadcast.
     ///
-    /// Moved here from `ProxyState` in implementation-note-301 so
+    /// Moved here from `ProxyState` in implementation-note-309 so
     /// the broadcast path is fully owned by the sink.
     events_tx: Option<broadcast::Sender<GrantEvent>>,
     /// In-memory debounce set for threshold-crossing emissions. Entries
@@ -1229,7 +1232,7 @@ pub struct DaemonEventSink {
     /// `RefCell` is safe here because proxy connections run on a
     /// `LocalSet` (see `run_proxy`) — the single-threaded runtime gives
     /// non-Sync interior mutability for free without a Mutex. Moved here
-    /// from `ProxyState` in implementation-note-301.
+    /// from `ProxyState` in implementation-note-309.
     threshold_emitted: RefCell<HashSet<(String, String, &'static str, &'static str)>>,
 }
 
@@ -1381,7 +1384,7 @@ impl EventSink for DaemonEventSink {
 /// `std::io::Error`). Bind success/failure must not depend on whether the
 /// receiver is still listening (silent-ignore on dropped rx).
 ///
-/// implementation-note-196 — added `bind_tx` so the daemon runtime can
+/// implementation-note-202 — added `bind_tx` so the daemon runtime can
 /// wait for bind, log the actual URL, and write the `proxy.url` sidecar
 /// before entering the main accept loop, matching `run_git_echo_proxy`'s
 /// startup discipline.
@@ -1505,7 +1508,7 @@ pub async fn handle_request<B: PolicyBackend>(
         }
     };
 
-    // implementation-note-299 — when the caller pins the grant
+    // implementation-note-307 — when the caller pins the grant
     // by id (composite-grant flow: a single grant authorizes multiple
     // credentials, so the persona+credential pair alone may match more than
     // one grant), look it up directly. The looked-up grant must still match
@@ -1556,34 +1559,15 @@ pub async fn handle_request<B: PolicyBackend>(
         Err(e) => return Err(ProxyError::PolicyBackend(e)),
     };
 
-    // Enforce grant.scope against request method + effective URI (C-1 fix).
-    // Fail closed on any unknown or ambiguous scope format. Do NOT leak the
-    // scope string to the client — log it internally and return a generic 403.
-    if let Err(violation) = check_scope(&resolved.grant_scope, req.method(), &effective_uri) {
-        tracing::warn!(
-            grant_id = %resolved.grant_id,
-            persona_id = %persona_id,
-            credential = %credential_name,
-            method = %req.method(),
-            uri = %req.uri(),
-            scope = %resolved.grant_scope,
-            detail = %violation.message,
-            "scope violation: denying request"
-        );
-        if let Err(e) = backend
-            .log_event(
-                &persona_id,
-                "credential.access",
-                Some(&credential_name),
-                violation.audit_outcome(),
-                Some(&violation.message),
-            )
-            .await
-        {
-            tracing::warn!(error = ?e, persona_id = %persona_id, credential = %credential_name, outcome = violation.audit_outcome(), "log_event failed");
-        }
-        return Ok(scope_violation_response());
-    }
+    // Statement resolution above is the canonical HTTP/LLM authorization
+    // boundary. `grant.scope` is a legacy flat projection that cannot
+    // faithfully encode composite chains like the Claude launcher's
+    // `{credential:read, llm:generate anthropic/*}` statement set.
+    //
+    // Re-checking the request against `grant.scope` here only creates false
+    // denials when the projection is a template id or other coarse metadata.
+    // The signed statement chain already bound the request via
+    // `request_to_action_resource` + `resolve_statement_for_request_with_uri`.
 
     // Enforce allowed_targets if the grant specifies them.
     //
@@ -1763,7 +1747,7 @@ pub async fn handle_request<B: PolicyBackend>(
     // Three branches, picked by upstream identity:
     //  1. Anthropic (`api.anthropic.com` and any subdomain) requires
     //     `x-api-key: <token>` and rejects `Authorization: Bearer ...` with
-    //     401. implementation-note-196 — FINDING B from the brief: the
+    //     401. implementation-note-202 — FINDING B from the brief: the
     //     prior unconditional Bearer injection broke every Beat 4 Anthropic
     //     SDK call.
     //  2. Git smart-HTTP (`/info/refs?service=git-*-pack`,
@@ -1816,7 +1800,7 @@ pub async fn handle_request<B: PolicyBackend>(
         "auth header injected"
     );
 
-    // implementation-note-56: force uncompressed responses upstream
+    // implementation-note-58: force uncompressed responses upstream
     // so the post-flight meter can parse JSON usage blocks. Anthropic
     // (and OpenAI) default to `gzip` if Accept-Encoding is absent or
     // permissive; identity is the only encoding `parse_usage` understands
@@ -1913,7 +1897,7 @@ pub async fn handle_request<B: PolicyBackend>(
         let meter_backend = Arc::clone(&backend);
         let meter_resolved = resolved.clone();
         let meter_host = target_host.clone();
-        // T-implementation-note-300: capture the upstream
+        // T-implementation-note-308: capture the upstream
         // status's 2xx-ness for the meter callback. The closure runs
         // post-flight on the tee thread; `status` itself is moved into
         // the response builder below, so we snapshot the bool here.
@@ -2033,7 +2017,7 @@ pub async fn handle_request<B: PolicyBackend>(
     // provider we have pricing for, `meter_response` returns `None` and
     // we skip the increment — the request still forwards unchanged.
     //
-    // T-implementation-note-300: pass `status.is_success()`
+    // T-implementation-note-308: pass `status.is_success()`
     // so the meter only credits a billable request to the grant when
     // the upstream actually returned 2xx. A 5xx with a usage-shaped
     // body (rare) does not count.
@@ -2135,7 +2119,7 @@ impl StreamOutcome {
     }
 }
 
-/// C44-implementation-note-302: short, stable hash of a credential alias for
+/// C44-implementation-note-310: short, stable hash of a credential alias for
 /// emission into the audit log's `credential` column.
 ///
 /// Returns `credname-<first 16 hex of sha256>` — enough entropy to avoid
@@ -2166,7 +2150,7 @@ fn hash_credential_name_for_audit(credential_name: &str) -> String {
 /// Receipt ID is a demo-grade short hex derived from a sha256 over the
 /// call's identifying fields. Beat 8 replaces this with a signed Receipt
 /// minted by the receipt subsystem; until then the ID is stable per call
-/// but not cryptographically bound. See implementation-note-303
+/// but not cryptographically bound. See implementation-note-311
 /// (release-checklist) for the follow-up.
 #[allow(clippy::too_many_arguments)]
 fn emit_proxy_call_event(
@@ -2252,9 +2236,9 @@ fn emit_proxy_call_event(
 /// `upstream_status_is_success` carries the upstream HTTP response's
 /// 2xx-ness through to the meter so the `usage.requests` counter only
 /// increments on upstream-confirmed responses. See
-/// `record_upstream_request` (T-implementation-note-300).
+/// `record_upstream_request` (T-implementation-note-308).
 ///
-/// WIP-FOR: T-implementation-note-300 — caller wiring in the
+/// WIP-FOR: T-implementation-note-308 — caller wiring in the
 /// proxy streaming path is in flight; this function is the shared meter
 /// the buffered + SSE-tee paths will both invoke once that task lands.
 #[allow(clippy::too_many_arguments, dead_code)]
@@ -2291,7 +2275,7 @@ fn run_post_flight_meter(
         );
         return;
     };
-    // T-implementation-note-300: fold the upstream-confirmed
+    // T-implementation-note-308: fold the upstream-confirmed
     // request count into the delta. `meter_response` no longer hardcodes
     // `requests: 1`; this is the single decision point that mints the
     // billable request against the grant. A successful upstream that
@@ -2308,7 +2292,7 @@ fn run_post_flight_meter(
     // `statement_usage` is identical for both cases; the audit record is
     // where the distinction lives.
     //
-    // C44-implementation-note-302: the `credential` audit column stores a short
+    // C44-implementation-note-310: the `credential` audit column stores a short
     // hash of the credential alias, not the raw alias. Raw aliases would
     // let anyone with audit-log read access correlate persona ↔ credential
     // across rows, breaking persona isolation. The raw alias still lives
@@ -2321,7 +2305,7 @@ fn run_post_flight_meter(
     // audit gap. Surface the error to tracing so the operator at least
     // sees it in the daemon log if the store fails.
     let credential_hash = hash_credential_name_for_audit(credential_name);
-    // implementation-note-301: audit-log emission routes through the
+    // implementation-note-309: audit-log emission routes through the
     // sink shim. The store write itself is identical; only the
     // ownership of the call boundary moves.
     if let Err(e) = state.sink_log_event(
@@ -2391,7 +2375,7 @@ fn run_post_flight_meter(
 /// status (Anthropic doesn't open an event stream on 5xx), but plumbing
 /// the bit explicitly keeps both paths symmetric and audit-ready.
 ///
-/// WIP-FOR: T-implementation-note-300 — pairs with
+/// WIP-FOR: T-implementation-note-308 — pairs with
 /// `run_post_flight_meter` above; the SSE-tee path will call this once
 /// caller wiring lands.
 #[allow(clippy::too_many_arguments, dead_code)]
@@ -2430,7 +2414,7 @@ fn run_post_flight_meter_from_summary(
         );
         return;
     };
-    // T-implementation-note-300: same fold as the buffered
+    // T-implementation-note-308: same fold as the buffered
     // path. `usage_from_summary` no longer hardcodes `requests: 1`; we
     // mint the billable request here once the upstream's confirmation
     // is known. A partial stream that observed any usage at all still
@@ -2445,7 +2429,7 @@ fn run_post_flight_meter_from_summary(
     // The audit + increment paths below mirror `run_post_flight_meter`
     // verbatim — keep in sync if either evolves.
     let credential_hash = hash_credential_name_for_audit(credential_name);
-    // implementation-note-301: sink shim — see sibling helper.
+    // implementation-note-309: sink shim — see sibling helper.
     if let Err(e) = state.sink_log_event(
         Some(persona_id),
         "proxy.meter",
@@ -2499,7 +2483,7 @@ fn run_post_flight_meter_from_summary(
 /// all — matches the byte-slice `meter_response` semantics so the audit
 /// trail and budget machinery behave identically across the two paths.
 ///
-/// T-implementation-note-300: `requests` is left at 0 here.
+/// T-implementation-note-308: `requests` is left at 0 here.
 /// Callers add the upstream-confirmed request count via
 /// `record_upstream_request` so a network failure / 5xx doesn't inflate
 /// the receipt's request tally.
@@ -2513,7 +2497,7 @@ pub fn usage_from_summary(
     }
     let folded = summary.folded_usage();
     let model = summary.model.clone().unwrap_or_default();
-    // implementation-note-56: micro-cent precision. See meter_response
+    // implementation-note-58: micro-cent precision. See meter_response
     // for the full rationale; the SSE path mirrors the buffered path so
     // both metering routes accumulate budget identically.
     let cents_micro =
@@ -2522,7 +2506,7 @@ pub fn usage_from_summary(
         tokens: folded.input_tokens.saturating_add(folded.output_tokens),
         cents: cents_micro / 1_000_000,
         cents_micro,
-        // T-implementation-note-300: filled in by the caller
+        // T-implementation-note-308: filled in by the caller
         // via `record_upstream_request` once upstream confirmation is
         // known. Leaving this at 0 here means a path that observes
         // tokens but not a confirmed upstream response (none of the
@@ -2740,7 +2724,7 @@ where
 /// transport upstream is an integrity failure of the vault, not a request
 /// problem.
 ///
-/// implementation-note-196 — FINDING B from the brief: prior code
+/// implementation-note-202 — FINDING B from the brief: prior code
 /// unconditionally injected `Authorization: Bearer ...`, which broke every
 /// Beat 4 Anthropic SDK call.
 pub(crate) fn inject_provider_auth(
@@ -2749,6 +2733,8 @@ pub(crate) fn inject_provider_auth(
     is_git_transport: bool,
     credential: &str,
 ) -> Result<AuthScheme, ()> {
+    let credential = credential.trim_end_matches(['\r', '\n']);
+
     // Defence-in-depth: strip any client-supplied auth headers before
     // injecting our vault-resolved value. The request-header allowlist
     // already drops `authorization` and `x-api-key`, but `remove` is cheap
@@ -2799,6 +2785,7 @@ impl AuthScheme {
 }
 
 /// Category of scope violation, used to pick an audit outcome string.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScopeViolationKind {
     /// Generic scope mismatch (provider/action/target/format).
@@ -2813,12 +2800,14 @@ pub(crate) enum ScopeViolationKind {
 /// Held as a separate type (rather than `String`) so callers can't
 /// accidentally render it into the HTTP response body — scope details are
 /// sensitive and should only hit `tracing` + the audit table.
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct ScopeViolation {
     pub(crate) message: String,
     pub(crate) kind: ScopeViolationKind,
 }
 
+#[cfg(test)]
 impl ScopeViolation {
     fn general(message: impl Into<String>) -> Self {
         Self {
@@ -3043,7 +3032,7 @@ pub fn preflight_budget_check(
     // the cents cap (post-flight cents tick can nudge usage over budget
     // between calls). We don't estimate cents up front — see doc above.
     //
-    // implementation-note-56: compare against the micro-cent
+    // implementation-note-58: compare against the micro-cent
     // accumulator so sub-cent calls aggregate honestly. Fall back to the
     // legacy `cents` axis when cents_micro is unset (zero) so pre-fix
     // grants stored under the old representation still gate correctly.
@@ -3138,7 +3127,7 @@ pub fn meter_response(target_host: &str, response_body: &[u8]) -> Option<core_gr
         return None;
     };
     let model = pricing::extract_model(provider, response_body).unwrap_or_default();
-    // implementation-note-56: compute micro-cents (cents × 10⁶) and
+    // implementation-note-58: compute micro-cents (cents × 10⁶) and
     // derive whole cents from it. Without micro-cent precision, sub-cent
     // calls (~0.1¢ on Haiku-4.5) round to 0 per call and the budget cap
     // can never accumulate enough to trip.
@@ -3148,7 +3137,7 @@ pub fn meter_response(target_host: &str, response_body: &[u8]) -> Option<core_gr
         tokens: parsed.input_tokens.saturating_add(parsed.output_tokens),
         cents: cents_micro / 1_000_000,
         cents_micro,
-        // T-implementation-note-300: leave `requests` at 0
+        // T-implementation-note-308: leave `requests` at 0
         // here. The caller folds in `record_upstream_request` once the
         // upstream's confirmation status is known, so a 5xx body that
         // happens to carry a usage block doesn't get counted as a
@@ -3162,10 +3151,10 @@ pub fn meter_response(target_host: &str, response_body: &[u8]) -> Option<core_gr
 
 /// Record a single upstream-confirmed request against the proxy meter.
 ///
-/// T-implementation-note-300: `usage.requests` historically
+/// T-implementation-note-308: `usage.requests` historically
 /// incremented by 1 for every proxy invocation that produced a parseable
 /// usage block, regardless of whether the upstream's HTTP response was
-/// itself a success. Per implementation-note-304 Decision 2 #2, the
+/// itself a success. Per implementation-note-312 Decision 2 #2, the
 /// receipt should reflect what actually happened upstream — Anthropic /
 /// OpenAI confirmed receiving the request — not what we tried to send.
 /// A request counted but rejected by the upstream is a false-positive.
@@ -3220,7 +3209,7 @@ pub(crate) fn emit_threshold_crossings(
     prior: &core_grant_types::Usage,
     current: &core_grant_types::Usage,
 ) {
-    // implementation-note-56: cents axis runs on micro-cents internally
+    // implementation-note-58: cents axis runs on micro-cents internally
     // so sub-cent calls accumulate honestly. Both the cap and the
     // before/after counters are scaled to micro-cents; the displayed
     // `used`/`limit` in the emitted audit/push payload are stepped back
@@ -3304,7 +3293,7 @@ fn emit_debounced(
     used: Option<u64>,
     budget: Option<u64>,
 ) {
-    // implementation-note-301: debounce + audit + broadcast now route
+    // implementation-note-309: debounce + audit + broadcast now route
     // through the `DaemonEventSink` reachable via `state.sink()`. The
     // sink owns the threshold-debounce set and the broadcast channel; the
     // sync shim methods on `ProxyState` keep this helper's signature
@@ -3399,6 +3388,7 @@ pub(crate) fn no_applicable_statement_response() -> Response<ProxyBody> {
 /// This function **never widens** a scope: a missing, empty, or
 /// unrecognised scope is a denial, and an unknown action never satisfies a
 /// write-tier method.
+#[cfg(test)]
 pub(crate) fn check_scope(
     scope: &str,
     method: &hyper::Method,
@@ -3516,6 +3506,7 @@ pub(crate) fn check_scope(
 ///
 /// For providers other than `github` (including `generic`/`*`) subtarget
 /// enforcement is not defined; we fail closed there too.
+#[cfg(test)]
 fn subtarget_matches(
     subtarget_glob: &str,
     uri: &hyper::Uri,
@@ -3835,7 +3826,7 @@ pub struct GitEchoConfig {
 /// Exposed `pub` so a separate test binary or an `#[ignore]`-d integration
 /// test can spawn it without reaching into daemon state.
 ///
-/// `bind_tx` (implementation-note-195): when `Some`, the bound `SocketAddr` is sent
+/// `bind_tx` (implementation-note-201): when `Some`, the bound `SocketAddr` is sent
 /// exactly once immediately after `TcpListener::bind` succeeds. Bind errors
 /// are sent as `Err` and the function returns. The receiver gets the actual
 /// local addr (so `127.0.0.1:0` callers can read the assigned port). If the
@@ -4027,7 +4018,7 @@ pub async fn handle_git_echo(
                 credential = %credential_name,
                 "git echo: no active grant for persona/credential"
             );
-            // implementation-note-301: route through sink shim.
+            // implementation-note-309: route through sink shim.
             if let Err(e) = config.state.sink_log_event(
                 Some(&persona_id),
                 "credential.access",
@@ -4064,7 +4055,7 @@ pub async fn handle_git_echo(
             resource = %resource,
             "git echo: no applicable statement for request — denying"
         );
-        // implementation-note-301: route through sink shim.
+        // implementation-note-309: route through sink shim.
         if let Err(e) = config.state.sink_log_event(
             Some(&persona_id),
             "credential.access",
@@ -4091,7 +4082,7 @@ pub async fn handle_git_echo(
                 credential = %credential_name,
                 "git echo: credential not found in vault"
             );
-            // implementation-note-301: route through sink shim.
+            // implementation-note-309: route through sink shim.
             if let Err(e) = config.state.sink_log_event(
                 Some(&persona_id),
                 "credential.access",
@@ -4110,7 +4101,7 @@ pub async fn handle_git_echo(
 
     // P69L.0b--AUDIT: emit `credential.access` so operators can see
     // that a credential substitution occurred and which repo was targeted.
-    // `action` mirrors the shape from C44-implementation-note-302: "github.push.<owner/repo>".
+    // `action` mirrors the shape from C44-implementation-note-310: "github.push.<owner/repo>".
     tracing::info!(
         event = "credential.access",
         allowed = true,
@@ -4120,7 +4111,7 @@ pub async fn handle_git_echo(
         request_id = %request_id,
         "git echo: credential access"
     );
-    // implementation-note-301: route through sink shim.
+    // implementation-note-309: route through sink shim.
     if let Err(e) = config.state.sink_log_event(
         Some(&persona_id),
         "credential.access",

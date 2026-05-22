@@ -7,7 +7,7 @@
 //!
 //! This module is consumed by `ember-daemon::broker::handler::handle_broker_exec`
 //! (T-CONSTRUCT-EXEC-CRED-INJECT) — the daemon classifies argv via
-//! [`crate::classify_argv_daemon_side`] and then queries
+//! per-tool `classify_argv` modules and then queries
 //! [`credential_policy`] to decide whether (and how) to mint + inject.
 //!
 //! The policy lives here, not in each `construct.toml`, because the
@@ -15,8 +15,8 @@
 //! shim binary describes the SHIM's view of the action; the policy
 //! that determines credential issuance must be daemon-defined so a
 //! tampered shim cannot escalate its own credential needs. The shim's
-//! pinned binary (verified by [`crate::binary_manifest::verify_binary_pin`]
-//! in the daemon at exec time) carries argv classification only.
+//! pinned binary (verified by the daemon's binary-pin check at exec
+//! time) carries argv classification only.
 //!
 //! Adding a new action: extend the `match` in [`credential_policy`].
 //! Cohort A is closed by design §3 so the list is small and stable.

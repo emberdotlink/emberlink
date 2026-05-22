@@ -17,8 +17,38 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
-// Daemon socket resolution
+// Daemon transport resolution
 // ---------------------------------------------------------------------------
+//
+// Subtask A of implementation-note-25. The
+// construct shims (`ember-gh`, `ember-git`, etc.) historically only
+// dialed the daemon over a host-local Unix socket. design §Component 1
+// adds an in-container path that has to traverse the host boundary via
+// an mTLS-protected TCP listener (the ember-rpc Phase C surface). This
+// module's job is to *decide* which transport to use; the actual dial
+// implementation for the mTLS+TCP path lands in subtask B.
+//
+// Anchor: `construct_runtime_mtls_tcp_transport_decide`.
+
+/// Which transport a construct shim should use to reach the daemon.
+///
+/// Carries enough state for the dial to proceed without re-reading env
+/// vars. Subtask B's dial code matches on this enum to pick the right
+/// connect path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonTransport {
+    /// Host-local Unix socket. Used when the shim runs on the same host
+    /// as the daemon (no container boundary).
+    Uds(PathBuf),
+    /// In-container mTLS+TCP path. The URL typically points at
+    /// `https://host.docker.internal:4243` (the host's ember-rpc
+    /// listener). The cert dir defaults to `/run/ember/client-cert/`
+    /// per design §Component 1 — overridable via
+    /// `EMBER_CLIENT_CERT_DIR` for tests.
+    MtlsTcp { url: String, cert_dir: PathBuf },
+}
+
+const DEFAULT_CLIENT_CERT_DIR: &str = "/run/ember/client-cert";
 
 /// Resolve the daemon UDS path.
 ///
@@ -26,6 +56,11 @@ use serde_json::{Value, json};
 ///   1. `EMBER_SOCKET_PATH` env var (used by qember.sh + integration tests)
 ///   2. `~/.ember/run/daemon.sock` (matches DaemonConfig::default())
 ///   3. `/tmp/.ember/run/daemon.sock` if $HOME is unset
+///
+/// Retained as a stable public API — existing callers that always want
+/// the UDS path call this directly. New callers reach for
+/// [`decide_transport`] instead so they pick up the in-container
+/// fallback for free.
 pub fn daemon_socket_path() -> PathBuf {
     if let Ok(p) = std::env::var("EMBER_SOCKET_PATH") {
         return PathBuf::from(p);
@@ -34,6 +69,37 @@ pub fn daemon_socket_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"));
     base.join(".ember").join("run").join("daemon.sock")
+}
+
+/// Choose the transport for a construct shim's daemon RPC.
+///
+/// Selection rule (matches design §Component 1 + design §Component 3):
+///
+///   1. If `EMBER_BRIDGE_URL` is set and non-empty, the shim is running
+///      in-container and reaches the daemon via mTLS+TCP. The cert dir
+///      defaults to `/run/ember/client-cert/` (orchestrator-provisioned
+///      per `implementation-note-26`); override via
+///      `EMBER_CLIENT_CERT_DIR` for tests / non-standard layouts.
+///   2. Otherwise the shim is host-resident; dial the UDS resolved by
+///      [`daemon_socket_path`].
+///
+/// Pure — every input comes from `std::env::var_os`; no I/O. Callers
+/// (subtask B's mTLS dial code) match on the returned enum to pick the
+/// connect path. construct_runtime_mtls_tcp_transport_decide.
+pub fn decide_transport() -> DaemonTransport {
+    if let Some(url) = std::env::var_os("EMBER_BRIDGE_URL")
+        && let Some(s) = url.to_str()
+        && !s.is_empty()
+    {
+        let cert_dir = std::env::var_os("EMBER_CLIENT_CERT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_CLIENT_CERT_DIR));
+        return DaemonTransport::MtlsTcp {
+            url: s.to_string(),
+            cert_dir,
+        };
+    }
+    DaemonTransport::Uds(daemon_socket_path())
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +262,7 @@ pub fn broker_exec(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     /// The construct_toml_bytes field is base64-encoded so the JSON wire
     /// can carry arbitrary TOML bytes (including UTF-8 multi-byte
@@ -208,5 +275,118 @@ mod tests {
         let encoded = BASE64_STANDARD.encode(manifest);
         let decoded = BASE64_STANDARD.decode(&encoded).expect("base64 decode");
         assert_eq!(decoded, manifest);
+    }
+
+    /// Process-global env vars are shared state across the test runner's
+    /// thread pool. Serialize the env-mutating cases through this mutex
+    /// so they don't race each other; combine all set/unset operations
+    /// inside the locked region.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    fn with_env<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
+        let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let saved: Vec<(String, Option<String>)> = vars
+            .iter()
+            .map(|(k, _)| ((*k).to_string(), std::env::var(k).ok()))
+            .collect();
+        for (k, v) in vars {
+            match v {
+                Some(value) => unsafe { std::env::set_var(k, value) },
+                None => unsafe { std::env::remove_var(k) },
+            }
+        }
+        f();
+        for (k, original) in saved {
+            match original {
+                Some(value) => unsafe { std::env::set_var(&k, value) },
+                None => unsafe { std::env::remove_var(&k) },
+            }
+        }
+    }
+
+    #[test]
+    fn decide_transport_returns_uds_when_bridge_url_unset() {
+        with_env(
+            &[("EMBER_BRIDGE_URL", None), ("EMBER_SOCKET_PATH", None)],
+            || {
+                let t = decide_transport();
+                match t {
+                    DaemonTransport::Uds(path) => {
+                        assert!(path.ends_with(".ember/run/daemon.sock"));
+                    }
+                    other => panic!("expected Uds, got {other:?}"),
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn decide_transport_returns_uds_when_bridge_url_empty() {
+        with_env(
+            &[
+                ("EMBER_BRIDGE_URL", Some("")),
+                ("EMBER_SOCKET_PATH", None),
+            ],
+            || {
+                assert!(matches!(decide_transport(), DaemonTransport::Uds(_)));
+            },
+        );
+    }
+
+    #[test]
+    fn decide_transport_returns_mtls_tcp_when_bridge_url_set() {
+        with_env(
+            &[
+                (
+                    "EMBER_BRIDGE_URL",
+                    Some("https://host.docker.internal:4243"),
+                ),
+                ("EMBER_CLIENT_CERT_DIR", None),
+            ],
+            || {
+                // construct_runtime_mtls_tcp_transport_decide — checkpoint mirrored
+                // in the in-container test body for grep coverage.
+                let t = decide_transport();
+                match t {
+                    DaemonTransport::MtlsTcp { url, cert_dir } => {
+                        assert_eq!(url, "https://host.docker.internal:4243");
+                        assert_eq!(cert_dir, PathBuf::from("/run/ember/client-cert"));
+                    }
+                    other => panic!("expected MtlsTcp, got {other:?}"),
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn decide_transport_honors_cert_dir_override() {
+        with_env(
+            &[
+                (
+                    "EMBER_BRIDGE_URL",
+                    Some("https://host.docker.internal:4243"),
+                ),
+                ("EMBER_CLIENT_CERT_DIR", Some("/tmp/alt-certs")),
+            ],
+            || {
+                let t = decide_transport();
+                match t {
+                    DaemonTransport::MtlsTcp { cert_dir, .. } => {
+                        assert_eq!(cert_dir, PathBuf::from("/tmp/alt-certs"));
+                    }
+                    other => panic!("expected MtlsTcp, got {other:?}"),
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn daemon_socket_path_honors_ember_socket_path_override() {
+        with_env(
+            &[("EMBER_SOCKET_PATH", Some("/tmp/test-daemon.sock"))],
+            || {
+                assert_eq!(daemon_socket_path(), PathBuf::from("/tmp/test-daemon.sock"));
+            },
+        );
     }
 }

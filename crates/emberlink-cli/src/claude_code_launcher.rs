@@ -10,7 +10,7 @@
 use std::io;
 use std::path::PathBuf;
 
-use crate::dev_runtime::derive_dev_runtime_env;
+use crate::dev_runtime::compact_runtime_banner;
 use crate::install_paths::PROD_DAEMON_SOCKET_REL;
 
 /// Which daemon flavor to use.
@@ -26,6 +26,8 @@ pub struct LaunchEnv {
     pub ember_daemon_socket: PathBuf,
     pub shadow_root: PathBuf,
     pub ember_daemon_flavor: &'static str,
+    pub runtime_banner: Option<String>,
+    pub dev_runtime_id: Option<String>,
 }
 
 /// Build a [`LaunchEnv`] for the given flavor.
@@ -45,15 +47,20 @@ fn build_launch_env_for_home(flavor: Flavor, home: &std::path::Path) -> io::Resu
             ember_daemon_socket: home.join(PROD_DAEMON_SOCKET_REL),
             shadow_root: home.join(".ember/shadow"),
             ember_daemon_flavor: "prod",
+            runtime_banner: None,
+            dev_runtime_id: None,
         }),
         Flavor::Dev => {
-            let workspace_root = crate::dev_runtime::resolve_workspace_root()
+            let runtime = crate::dev_runtime::resolve_current_dev_runtime_for_home(home)
                 .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e))?;
-            let runtime = derive_dev_runtime_env(home, &workspace_root);
+            let runtime_banner = compact_runtime_banner(&runtime);
+            let dev_runtime_id = (!runtime.is_shared()).then(|| runtime.worktree_id.clone());
             Ok(LaunchEnv {
                 ember_daemon_socket: runtime.socket_path,
                 shadow_root: runtime.shadow_root,
                 ember_daemon_flavor: "dev",
+                runtime_banner: Some(runtime_banner),
+                dev_runtime_id,
             })
         }
     }
@@ -103,6 +110,9 @@ pub fn ping_daemon(env: &LaunchEnv, flavor: Flavor) -> io::Result<()> {
 pub fn launch(flavor: Flavor, extra_args: &[String]) -> io::Result<()> {
     let env = build_launch_env(flavor)?;
     ping_daemon(&env, flavor)?;
+    if let Some(runtime_banner) = env.runtime_banner.as_deref() {
+        eprintln!("ember --dev runtime: {runtime_banner}");
+    }
     let bin = crate::launcher::claude_code::resolve_claude_bin();
     let persona = crate::launcher::claude_code::resolve_persona_name();
     let construct_specs = match flavor {
@@ -110,20 +120,22 @@ pub fn launch(flavor: Flavor, extra_args: &[String]) -> io::Result<()> {
             let specs = crate::launcher::claude_code::managed_prod_construct_specs();
             if !crate::launcher::claude_code::prod_required_constructs_present(&specs) {
                 return Err(io::Error::other(
-                    "prod construct bundle is incomplete: expected managed `ember-gh` and `ember-git` from the installed product, not repo-built target artifacts. Repair or reinstall the managed product before running `ember claude-code --prod`.",
+                    "prod construct bundle is incomplete: expected managed `ember-gh` and `ember-git` from the installed product, not repo-built target artifacts. Repair or reinstall the managed product before running `ember claude --prod`.",
                 ));
             }
             specs
         }
         Flavor::Dev => crate::launcher::claude_code::cohort_a_construct_specs(),
     };
-    let code = crate::launcher::claude_code::launch_claude_code_with_shadow_dir_and_constructs(
+    let code =
+        crate::launcher::claude_code::launch_claude_code_with_shadow_dir_and_constructs_with_runtime_id(
         extra_args,
         &env.ember_daemon_socket,
         &env.shadow_root,
         &bin,
         &persona,
         &construct_specs,
+        env.dev_runtime_id.as_deref(),
     )?;
     std::process::exit(code);
 }
@@ -131,6 +143,7 @@ pub fn launch(flavor: Flavor, extra_args: &[String]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dev_runtime::derive_dev_runtime_env;
 
     // ── T1: env composition ──────────────────────────────────────────────────
 
@@ -155,6 +168,8 @@ mod tests {
             ember_daemon_socket: runtime.socket_path.clone(),
             shadow_root: runtime.shadow_root.clone(),
             ember_daemon_flavor: "dev",
+            runtime_banner: None,
+            dev_runtime_id: None,
         };
         let sock = env.ember_daemon_socket.to_string_lossy();
         assert!(
@@ -185,6 +200,8 @@ mod tests {
             ember_daemon_socket: runtime.socket_path,
             shadow_root: runtime.shadow_root,
             ember_daemon_flavor: "dev",
+            runtime_banner: None,
+            dev_runtime_id: None,
         };
         let prefix = env.shadow_root.to_string_lossy();
         assert!(
@@ -197,6 +214,8 @@ mod tests {
     fn prod_flavor_label_is_prod() {
         let env = build_launch_env(Flavor::Prod).expect("build_launch_env prod");
         assert_eq!(env.ember_daemon_flavor, "prod");
+        assert!(env.runtime_banner.is_none());
+        assert!(env.dev_runtime_id.is_none());
     }
 
     #[test]
@@ -209,8 +228,18 @@ mod tests {
             ember_daemon_socket: runtime.socket_path,
             shadow_root: runtime.shadow_root,
             ember_daemon_flavor: "dev",
+            runtime_banner: None,
+            dev_runtime_id: None,
         };
         assert_eq!(env.ember_daemon_flavor, "dev");
+    }
+
+    #[test]
+    fn prod_launch_env_does_not_set_dev_runtime_id() {
+        let env = build_launch_env_for_home(Flavor::Prod, std::path::Path::new("/home/test-operator"))
+            .expect("prod");
+        assert!(env.dev_runtime_id.is_none());
+        assert!(env.runtime_banner.is_none());
     }
 
     // ── T2: daemon-ping pipeline ─────────────────────────────────────────────
@@ -221,6 +250,8 @@ mod tests {
             ember_daemon_socket: PathBuf::from("/nonexistent/daemon.sock"),
             shadow_root: PathBuf::from("/tmp/.ember/shadow"),
             ember_daemon_flavor: "prod",
+            runtime_banner: None,
+            dev_runtime_id: None,
         };
         let err = ping_daemon(&env, Flavor::Prod).expect_err("should fail for missing socket");
         let msg = err.to_string();
@@ -240,6 +271,8 @@ mod tests {
             ember_daemon_socket: PathBuf::from("/nonexistent/worktree-dev/daemon.sock"),
             shadow_root: PathBuf::from("/tmp/.ember-dev/envs/worktree-a/shadow"),
             ember_daemon_flavor: "dev",
+            runtime_banner: None,
+            dev_runtime_id: None,
         };
         let err = ping_daemon(&env, Flavor::Dev).expect_err("should fail for missing socket");
         let msg = err.to_string();
@@ -259,6 +292,8 @@ mod tests {
             ember_daemon_socket: PathBuf::from("/tmp/.ember/run/daemon.sock"),
             shadow_root: PathBuf::from("/tmp/.ember/shadow"),
             ember_daemon_flavor: "prod",
+            runtime_banner: None,
+            dev_runtime_id: None,
         };
         let err = io::Error::from_raw_os_error(1);
         let msg = daemon_ping_error_message(&env, Flavor::Prod, &err);
@@ -273,6 +308,8 @@ mod tests {
             ember_daemon_socket: PathBuf::from("/tmp/.ember-dev/envs/worktree-a/run/daemon.sock"),
             shadow_root: PathBuf::from("/tmp/.ember-dev/envs/worktree-a/shadow"),
             ember_daemon_flavor: "dev",
+            runtime_banner: None,
+            dev_runtime_id: None,
         };
         let err = io::Error::from_raw_os_error(13);
         let msg = daemon_ping_error_message(&env, Flavor::Dev, &err);
@@ -293,6 +330,8 @@ mod tests {
             ember_daemon_socket: runtime.socket_path,
             shadow_root: runtime.shadow_root,
             ember_daemon_flavor: "dev",
+            runtime_banner: None,
+            dev_runtime_id: None,
         };
         assert_ne!(
             prod.ember_daemon_socket, dev.ember_daemon_socket,

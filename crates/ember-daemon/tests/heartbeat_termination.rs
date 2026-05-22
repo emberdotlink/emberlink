@@ -1,4 +1,4 @@
-//! implementation-note-46 T2 — heartbeat-lost dirty-exit.
+//! implementation-note-48 T2 — heartbeat-lost dirty-exit.
 //!
 //! H1 invariant (cohort-A test plan): every grant terminates in a signed
 //! Receipt across all four termination paths. This file pins the
@@ -353,7 +353,7 @@ fn heartbeat_timeout_boundary_is_90_seconds() {
 }
 
 #[test]
-#[ignore = "T3 — real launcher under qember.sh; out of scope for implementation-note-46 PR"]
+#[ignore = "T3 — real launcher under qember.sh; out of scope for implementation-note-48 PR"]
 fn t3_real_launcher_sigkill() {
     // T3 placeholder per the brief. Spawn a real launcher under
     // `qember.sh`, send SIGKILL, and verify the daemon emits the

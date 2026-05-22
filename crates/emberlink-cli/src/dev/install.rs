@@ -1,9 +1,9 @@
-//! `ember dev install` — dev daemon install flow (design Phase 4).
+//! `ember dev install` — worktree dev runtime install flow (design Phase 4).
 //!
 //! This file ships the full design Phase 4 dev-install path: dev
 //! IdentityRoot generation, GH App provisioning, uid/group provisioning,
-//! release build + signing, binary install, manifest signing, launchctl
-//! bootstrap, and post-install verify.
+//! release build + signing, runtime binary install, manifest signing,
+//! launchctl bootstrap, and post-install verify.
 //!
 
 use super::gh_app;
@@ -22,8 +22,10 @@ pub fn run() -> Result<(), String> {
     let runtime = crate::dev_runtime::resolve_current_dev_runtime()?;
 
     println!("worktree dev runtime:");
-    println!("  workspace root: {}", runtime.workspace_root.display());
-    println!("  worktree id:    {}", runtime.worktree_id);
+    println!(
+        "  runtime:        {}",
+        crate::dev_runtime::compact_runtime_banner(&runtime)
+    );
     println!("  install root:   {}", runtime.install_root.display());
     println!("  plist label:    {}", runtime.plist_label);
     println!("  socket:         {}", runtime.socket_path.display());
@@ -76,7 +78,8 @@ pub fn run() -> Result<(), String> {
     let build =
         build_sign::build_and_sign(&runner).map_err(|e| format!("phase 5+6 failed: {e}"))?;
     println!(
-        "  built + signed: {} (daemon) + {} construct binaries",
+        "  built + signed: {} (cli), {} (daemon), {} construct binaries",
+        build.cli_signed_path.display(),
         build.daemon_signed_path.display(),
         build.construct_signed_paths.len()
     );
@@ -123,11 +126,12 @@ pub fn run() -> Result<(), String> {
     match verify::verify_dev_install_for(&runtime) {
         Ok(report) => {
             println!(
-                "  verify: pid={:?} manifest_fp={:?} brokers={:?} trust_roots={:?}",
+                "  verify: pid={:?} manifest_fp={:?} brokers={:?} trust_roots={:?} runtime_missing={:?}",
                 report.daemon_pid,
                 report.manifest_fingerprint,
                 report.registered_broker_count,
                 report.trust_roots,
+                report.missing_runtime_artifacts,
             );
             completion_issues.extend(verify::readiness_issues(&report));
         }

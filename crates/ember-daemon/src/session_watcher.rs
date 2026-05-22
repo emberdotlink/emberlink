@@ -5,6 +5,10 @@ use chrono::{DateTime, Duration, Utc};
 use core_events::receipt::{TerminationAuthority, TerminationReason};
 use tracing::{info, warn};
 
+use crate::infra::claim_journal::{
+    close_session_scope_best_effort, close_summary_audit_fields,
+    summarize_session_scope_best_effort,
+};
 use crate::infra::receipt::{
     current_identity,
     issue::{TerminationMeta, issue_cohort_a_receipt},
@@ -195,7 +199,7 @@ pub fn close_session_ttl_expiry(
 /// with `TerminationReason::CleanExit` so test code does not need access to
 /// the private `close_session` signature.
 ///
-/// implementation-note-380: clean_exit MUST NOT revoke
+/// implementation-note-390: clean_exit MUST NOT revoke
 /// the grant — multiple sessions per 24h grant is the contract.
 pub fn close_session_clean_exit(
     session_store: &SessionStore,
@@ -225,7 +229,7 @@ pub fn close_session_clean_exit(
 ///
 /// # Grant revocation policy
 ///
-/// implementation-note-380: clean_exit MUST NOT revoke
+/// implementation-note-390: clean_exit MUST NOT revoke
 /// the grant — multiple sessions per 24h grant is the contract.
 ///
 /// Grant revocation is performed ONLY for:
@@ -254,28 +258,47 @@ fn close_session(
 ) {
     // Evaluate revocation policy before moving termination_reason into the Receipt.
     //
-    // implementation-note-380: clean_exit MUST NOT revoke
+    // implementation-note-390: clean_exit MUST NOT revoke
     // the grant — multiple sessions per 24h grant is the contract.
     let should_revoke = !matches!(termination_reason, TerminationReason::CleanExit);
 
     // 1. Emit a signed v2 cohort-A Receipt before mutating state so the
     //    audit trail is complete even on partial failure.
     //    v2_receipt_coverage_audit_v030_2026_05_09: extend Receipt to TTL/revoke per M3 follow-up
+    let claim_summary =
+        summarize_session_scope_best_effort(daemon_store, session_id, "session_watcher::close_session");
     if let Some(identity) = current_identity() {
         let signer = DaemonPersonaSigner::new(identity);
-        match issue_cohort_a_receipt(
-            session_id,
-            Vec::new(),
-            None,
-            TerminationAuthority::DaemonPersona,
-            &identity.pubkey_hex(),
-            Some(TerminationMeta {
-                reason: termination_reason,
-                last_heartbeat_at: None,
-                pid_alive_at_check: None,
-            }),
-            &signer,
-        ) {
+        let issue_result = if let Some(summary) = claim_summary.as_ref() {
+            crate::infra::receipt::issue::issue_cohort_a_receipt_from_closed_scope(
+                session_id,
+                summary,
+                None,
+                TerminationAuthority::DaemonPersona,
+                &identity.pubkey_hex(),
+                Some(TerminationMeta {
+                    reason: termination_reason,
+                    last_heartbeat_at: None,
+                    pid_alive_at_check: None,
+                }),
+                &signer,
+            )
+        } else {
+            issue_cohort_a_receipt(
+                session_id,
+                Vec::new(),
+                None,
+                TerminationAuthority::DaemonPersona,
+                &identity.pubkey_hex(),
+                Some(TerminationMeta {
+                    reason: termination_reason,
+                    last_heartbeat_at: None,
+                    pid_alive_at_check: None,
+                }),
+                &signer,
+            )
+        };
+        match issue_result {
             Ok(envelope) => {
                 let receipt_path = sessions_dir.join(session_id).join("receipt.json");
                 match serde_json::to_vec_pretty(&envelope) {
@@ -323,6 +346,12 @@ fn close_session(
         return;
     }
     let _ = crate::infra::interactive_unlock::release_session_pin(session_id);
+    let claim_summary = close_session_scope_best_effort(
+        daemon_store,
+        session_id,
+        "session_watcher::close_session",
+    )
+    .or(claim_summary);
 
     // 3. Revoke the broker grant — cascades to children.
     //
@@ -348,13 +377,19 @@ fn close_session(
         }
     }
 
+    let mut details = format!("session_id={session_id} grant_id={grant_id}");
+    if let Some(summary) = claim_summary.as_ref() {
+        details.push(' ');
+        details.push_str(&close_summary_audit_fields(summary));
+    }
+
     // 4. Audit-log the transition.
     if let Err(e) = daemon_store.log_event(
         None,
         "session.closed",
         None,
         reason,
-        Some(&format!("session_id={session_id} grant_id={grant_id}")),
+        Some(&details),
     ) {
         warn!(
             session_id = %session_id,
@@ -369,8 +404,14 @@ fn close_session(
 mod tests {
     use super::*;
     use chrono::Utc;
+    use core_events::receipt::{ClaudeCodeBody, ReceiptEnvelope};
     use core_state::sessions::SessionMeta;
     use tempfile::TempDir;
+    use crate::infra::claim_journal::{
+        AuditEvidenceInput, ClaimJournal, ClaimScopeKind, ScopeRef, SqliteClaimJournal,
+        SuccessfulClaimInput,
+    };
+    use core_events::receipt::ClaimKind;
 
     #[test]
     fn close_session_clean_exit_releases_interactive_unlock_pin() {
@@ -420,5 +461,94 @@ mod tests {
                 .exists(),
             "session meta must be renamed closed"
         );
+    }
+
+    #[test]
+    fn close_session_clean_exit_closes_claim_journal_scope() {
+        let sessions_root = TempDir::new().expect("temp sessions root");
+        let sessions_dir = sessions_root.path().to_path_buf();
+        let identity_dir = TempDir::new().expect("temp identity root");
+        let _ = crate::infra::receipt::init_identity(identity_dir.path());
+        let session_store = SessionStore::new(sessions_dir.clone());
+        let daemon_store = DaemonStore::open_in_memory().expect("in-memory daemon store");
+        let journal = SqliteClaimJournal::new(&daemon_store, 64);
+
+        let meta = SessionMeta {
+            session_id: "sess_claim_journal_close".to_string(),
+            persona: "persona_test".to_string(),
+            grant_id: "grant_test".to_string(),
+            started_at: Utc::now(),
+            launcher_pid: std::process::id(),
+            workflow_id: None,
+            workflow_template: None,
+        };
+        session_store.create(&meta).expect("create session meta");
+
+        let scope = ScopeRef {
+            kind: ClaimScopeKind::Session,
+            id: meta.session_id.clone(),
+        };
+        journal
+            .record_successful_claim(
+                &scope,
+                &SuccessfulClaimInput {
+                    source_key: "source-1".to_string(),
+                    occurred_at: "2026-05-22T12:00:00Z".to_string(),
+                    claim_kind: ClaimKind::CredentialVended,
+                    tool: "Claude".to_string(),
+                    input_hash: "h1".to_string(),
+                    input_redacted: serde_json::json!({"cmd": "deploy"}),
+                    resolved: serde_json::json!({"allowed": true}),
+                    audit: AuditEvidenceInput {
+                        agent_id: Some(meta.persona.clone()),
+                        action: "broker.resolve.materialized".to_string(),
+                        credential: Some("anthropic".to_string()),
+                        outcome: "ok".to_string(),
+                        details: Some("session-scoped".to_string()),
+                    },
+                    persona_id: Some(meta.persona.clone()),
+                    device_id: Some("device-test".to_string()),
+                    workflow_id: None,
+                    materialization_id: Some("materialization-1".to_string()),
+                    credential_name: Some("anthropic".to_string()),
+                },
+            )
+            .expect("append claim row");
+
+        close_session_clean_exit(
+            &session_store,
+            &daemon_store,
+            &meta.session_id,
+            &meta.grant_id,
+            &sessions_dir,
+        );
+
+        let status: String = daemon_store
+            .conn()
+            .query_row(
+                "SELECT status
+                   FROM claim_journal_scopes
+                  WHERE scope_kind = 'session' AND scope_id = ?1",
+                rusqlite::params![meta.session_id],
+                |row| row.get(0),
+            )
+            .expect("claim journal scope row");
+        assert_eq!(status, "closed");
+
+        let receipt_bytes = std::fs::read(
+            sessions_dir
+                .join(&meta.session_id)
+                .join("receipt.json"),
+        )
+        .expect("receipt written");
+        let receipt: ReceiptEnvelope =
+            serde_json::from_slice(&receipt_bytes).expect("receipt envelope parses");
+        let body: ClaudeCodeBody =
+            serde_json::from_value(receipt.body).expect("receipt body parses");
+        assert_eq!(body.base.claim_count_total, Some(1));
+        assert!(!body.base.claim_events_truncated);
+        assert_eq!(body.base.claim_segment_summaries.len(), 1);
+        assert!(!body.base.claim_history_merkle_root.is_empty());
+        assert!(!body.base.permits_merkle_root.is_empty());
     }
 }

@@ -18,9 +18,9 @@
 //! methods just call through to the underlying sync `Vault` API
 //! directly rather than dispatching through `spawn_blocking`.
 //!
-//! # Receipt emission (implementation-note-132)
+//! # Receipt emission (implementation-note-136)
 //!
-//! Per implementation-note-208 security-review Findings 5 and 17 (audit-completeness
+//! Per implementation-note-214 security-review Findings 5 and 17 (audit-completeness
 //! gap for vault reads), every successful `get` emits a v2
 //! [`ReceiptEnvelope`] with `kind = "vault.read"`. Emission is
 //! best-effort — failures to sign or persist log a warning but do not
@@ -42,7 +42,7 @@ use crate::infra::vault::{VaultError, VaultScope, logical_name_from_storage};
 use super::{CredentialStore, StoreError};
 
 /// v2 kind discriminator for `LocalEncryptedStore::get` success-path
-/// audit. Per implementation-note-132 (Findings 5, 17 — daemon
+/// audit. Per implementation-note-136 (Findings 5, 17 — daemon
 /// vault reads must leave a signed receipt so post-hoc audit can
 /// reconstruct which credentials were read by whom and when).
 pub(crate) const RECEIPT_KIND_VAULT_READ: &str = "vault.read";
@@ -56,7 +56,7 @@ enum VaultSource {
 
 /// `CredentialStore` impl backed by the local sealed-credential vault.
 ///
-/// implementation-note-209: the live vault is resolved from the shared
+/// implementation-note-215: the live vault is resolved from the shared
 /// store slot at point of use instead of being owned directly here. That lets
 /// explicit lock cut off credential-store reads without needing to tear down
 /// the helper itself.
@@ -283,7 +283,15 @@ fn current_headless_vault(
             "headless enrollment key unavailable for vault key {key}: {err}"
         ))
     })?;
-    let vault = Rc::new(crate::infra::vault::Vault::new(mek));
+    // implementation-note-193 (B1) + adversarial CRIT-1 fix
+    // (2026-05-22): construct a implementation-note-216 Vault. Pre-fix this used
+    // `Vault::new(mek)` which set BOTH lanes to the headless MEK; any
+    // accidental `seal()` / `Vault::add(Interactive, ...)` call on the
+    // returned Rc would silently route headless-MEK through the
+    // Interactive lane. The new constructor sets `interactive_key`
+    // to the all-zero checkpoint and the refusal logic on Interactive
+    // operations makes the lane structurally unreachable.
+    let vault = Rc::new(crate::infra::vault::Vault::new_headless_only(mek));
     mek.zeroize();
     Ok(vault)
 }
@@ -311,7 +319,7 @@ fn map_vault_error(e: VaultError, key: &str) -> StoreError {
             // human-readable rendering of the path-grammar violation.
             StoreError::Other(format!("invalid credential name: {}", name_err))
         }
-        // implementation-note-210 sealed-blob variants. These
+        // implementation-note-217 sealed-blob variants. These
         // errors only surface from `export_mek_sealed`/`import_mek_sealed`
         // (the vault-level sealed-export substrate), not from the
         // get/list/add/remove credential paths this mapper serves. Map
@@ -327,7 +335,7 @@ fn map_vault_error(e: VaultError, key: &str) -> StoreError {
         | VaultError::SealedBlobAeadFailure) => {
             StoreError::Other(format!("sealed-blob: {sealed}"))
         }
-        // implementation-note-211 — same shape: surfaces
+        // implementation-note-218 — same shape: surfaces
         // from the rotation-witness emit path
         // (`emit_identity_rotation_witness`) which the credential
         // store does not call today, but the variant must still be
@@ -335,6 +343,18 @@ fn map_vault_error(e: VaultError, key: &str) -> StoreError {
         emit @ VaultError::WitnessEmit(_) => {
             StoreError::Other(format!("identity-rotation-witness: {emit}"))
         }
+        // implementation-note-193 (B1) + adversarial CRIT-1
+        // fix: a headless-only Vault refusing an Interactive-lane op
+        // surfaces as `HeadlessOnly`. The local credential store only
+        // routes Headless-scope operations through `current_headless_vault`
+        // (which uses `Vault::new_headless_only`), so this branch fires
+        // only if a caller mis-uses a headless-only Vault for an
+        // Interactive op — a programmer error, not a runtime condition.
+        // Map to `Other` so the operator-facing error names the
+        // structural cause.
+        VaultError::HeadlessOnly => StoreError::Other(
+            "headless-only vault refused interactive-lane operation".to_string(),
+        ),
     }
 }
 
@@ -346,7 +366,7 @@ impl CredentialStore for LocalEncryptedStore {
             .get(scope, &self.store, key)
             .map_err(|e| map_vault_error(e, key))?;
 
-        // implementation-note-132: emit a v2 `vault.read` Receipt
+        // implementation-note-136: emit a v2 `vault.read` Receipt
         // on the success path so the audit trail includes every
         // daemon-side credential read. Best-effort — emission failures
         // log a warning but do NOT fail the read.
@@ -396,7 +416,7 @@ impl CredentialStore for LocalEncryptedStore {
 }
 
 // ---------------------------------------------------------------------------
-// Receipt emission (implementation-note-132)
+// Receipt emission (implementation-note-136)
 // ---------------------------------------------------------------------------
 
 /// Best-effort: build, sign, and persist a v2 `vault.read` Receipt for
@@ -934,7 +954,7 @@ mod tests {
         });
     }
 
-    /// implementation-note-132: with the daemon identity
+    /// implementation-note-136: with the daemon identity
     /// initialised, a successful `get` must leave a signed
     /// `vault.read` row in the audit log carrying the credential
     /// name + the signed envelope JSON.
@@ -1016,7 +1036,7 @@ mod tests {
         });
     }
 
-    /// implementation-note-132: a cache-miss `get` (NotFound)
+    /// implementation-note-136: a cache-miss `get` (NotFound)
     /// must NOT emit a vault.read audit row — emission is success-path
     /// only so the audit log reflects credentials actually exposed.
     #[test]

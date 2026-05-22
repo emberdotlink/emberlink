@@ -4,6 +4,11 @@
 //! `ClaudeCodeBody` (claim_events + audit_gaps + permits_merkle_root) at session
 //! termination. Signs the envelope in-place using the Daemon Persona key per
 //! design via `daemon_persona_sign_receipt`.
+//!
+//! Transitional note: this helper still takes a full `Vec<ClaimEvent>`.
+//! `ClaimJournal` is now the canonical session/composite working set, and the
+//! long-term receipt materializer must become segment-aware instead of
+//! requiring one unbounded in-memory close-time claim vector.
 
 use std::fs;
 use std::path::Path;
@@ -11,9 +16,12 @@ use std::path::Path;
 use core_crypto::Signer;
 use core_events::receipt::sign::{SignError, sign_receipt_v2};
 use core_events::receipt::{
-    AuditGap, ClaimEvent, ClaudeCodeBody, RECEIPT_KIND_CLAUDE_CODE, ReceiptBody, ReceiptEnvelope,
-    ReceiptVersion, TerminationAuthority, TerminationReason, merkle_leaf, merkle_root,
+    AuditGap, ClaimEvent, ClaimSegmentDigest, ClaudeCodeBody, RECEIPT_KIND_CLAUDE_CODE,
+    ReceiptBody, ReceiptEnvelope, ReceiptVersion, TerminationAuthority, TerminationReason,
+    claim_history_merkle_root, merkle_leaf, merkle_root,
 };
+
+use crate::infra::claim_journal::ClosedScopeSummary;
 
 /// Errors raised by [`issue_cohort_a_receipt`].
 #[derive(Debug, thiserror::Error)]
@@ -31,13 +39,29 @@ pub enum IssueError {
 }
 
 /// Optional termination metadata injected into the `ClaudeCodeBody` by the
-/// dirty-exit path (implementation-note-46). Pass `None` for
+/// dirty-exit path (implementation-note-48). Pass `None` for
 /// clean-exit / TTL-expiry / explicit-revoke issuance paths where the reason
 /// is not yet known at build time.
 pub struct TerminationMeta {
     pub reason: TerminationReason,
     pub last_heartbeat_at: Option<String>,
     pub pid_alive_at_check: Option<bool>,
+}
+
+fn claim_segment_digests_from_summary(summary: &ClosedScopeSummary) -> Vec<ClaimSegmentDigest> {
+    summary
+        .segments
+        .iter()
+        .map(|segment| ClaimSegmentDigest {
+            segment_no: segment.segment_no as u64,
+            first_scope_seq: segment.first_scope_seq as u64,
+            last_scope_seq: segment.last_scope_seq as u64,
+            claim_count: segment.claim_count as u64,
+            started_at: segment.started_at.clone(),
+            ended_at: segment.ended_at.clone(),
+            merkle_root: segment.merkle_root.clone(),
+        })
+        .collect()
 }
 
 /// Build and sign a cohort-A `session.claude_code` Receipt envelope.
@@ -62,6 +86,115 @@ pub struct TerminationMeta {
 pub fn issue_cohort_a_receipt(
     _session_id: &str,
     claim_events: Vec<ClaimEvent>,
+    audit_gaps_path: Option<&Path>,
+    termination_authority: TerminationAuthority,
+    daemon_root_id: &str,
+    termination_meta: Option<TerminationMeta>,
+    signer: &dyn Signer,
+) -> Result<ReceiptEnvelope, IssueError> {
+    issue_session_receipt(
+        RECEIPT_KIND_CLAUDE_CODE,
+        _session_id,
+        claim_events,
+        audit_gaps_path,
+        termination_authority,
+        daemon_root_id,
+        termination_meta,
+        signer,
+    )
+}
+
+pub fn issue_session_receipt(
+    kind: &str,
+    _session_id: &str,
+    claim_events: Vec<ClaimEvent>,
+    audit_gaps_path: Option<&Path>,
+    termination_authority: TerminationAuthority,
+    daemon_root_id: &str,
+    termination_meta: Option<TerminationMeta>,
+    signer: &dyn Signer,
+) -> Result<ReceiptEnvelope, IssueError> {
+    issue_session_receipt_with_body(
+        kind,
+        claim_events,
+        None,
+        audit_gaps_path,
+        termination_authority,
+        daemon_root_id,
+        termination_meta,
+        signer,
+    )
+}
+
+pub fn issue_cohort_a_receipt_from_closed_scope(
+    _session_id: &str,
+    scope_summary: &ClosedScopeSummary,
+    audit_gaps_path: Option<&Path>,
+    termination_authority: TerminationAuthority,
+    daemon_root_id: &str,
+    termination_meta: Option<TerminationMeta>,
+    signer: &dyn Signer,
+) -> Result<ReceiptEnvelope, IssueError> {
+    let segment_digests = claim_segment_digests_from_summary(scope_summary);
+    let claim_history_root = claim_history_merkle_root(&segment_digests);
+    let body = ReceiptBody {
+        claim_events: scope_summary.recent_claims.clone(),
+        claim_count_total: Some(scope_summary.total_claims as u64),
+        claim_events_truncated: scope_summary.recent_claims_truncated,
+        claim_segment_summaries: segment_digests,
+        claim_history_merkle_root: claim_history_root,
+        device_id: None,
+        ..Default::default()
+    };
+    issue_session_receipt_with_body(
+        RECEIPT_KIND_CLAUDE_CODE,
+        body.claim_events.clone(),
+        Some(body),
+        audit_gaps_path,
+        termination_authority,
+        daemon_root_id,
+        termination_meta,
+        signer,
+    )
+}
+
+pub fn issue_session_receipt_from_closed_scope(
+    kind: &str,
+    _session_id: &str,
+    scope_summary: &ClosedScopeSummary,
+    audit_gaps_path: Option<&Path>,
+    termination_authority: TerminationAuthority,
+    daemon_root_id: &str,
+    termination_meta: Option<TerminationMeta>,
+    signer: &dyn Signer,
+) -> Result<ReceiptEnvelope, IssueError> {
+    let segment_digests = claim_segment_digests_from_summary(scope_summary);
+    let claim_history_root = claim_history_merkle_root(&segment_digests);
+    let body = ReceiptBody {
+        claim_events: scope_summary.recent_claims.clone(),
+        claim_count_total: Some(scope_summary.total_claims as u64),
+        claim_events_truncated: scope_summary.recent_claims_truncated,
+        claim_segment_summaries: segment_digests,
+        claim_history_merkle_root: claim_history_root,
+        device_id: None,
+        ..Default::default()
+    };
+    issue_session_receipt_with_body(
+        kind,
+        body.claim_events.clone(),
+        Some(body),
+        audit_gaps_path,
+        termination_authority,
+        daemon_root_id,
+        termination_meta,
+        signer,
+    )
+}
+
+fn issue_session_receipt_with_body(
+    kind: &str,
+    claim_events: Vec<ClaimEvent>,
+    base_body_override: Option<ReceiptBody>,
     audit_gaps_path: Option<&Path>,
     termination_authority: TerminationAuthority,
     daemon_root_id: &str,
@@ -99,13 +232,11 @@ pub fn issue_cohort_a_receipt(
         Some(m) => (Some(m.reason), m.last_heartbeat_at, m.pid_alive_at_check),
         None => (None, None, None),
     };
+    let mut base = base_body_override.unwrap_or_default();
+    base.claim_events = claim_events;
+    base.permits_merkle_root = permits_merkle_root;
     let body = ClaudeCodeBody {
-        base: ReceiptBody {
-            claim_events,
-            permits_merkle_root,
-            device_id: None,
-            ..Default::default()
-        },
+        base,
         audit_gaps,
         termination_reason,
         last_heartbeat_at,
@@ -116,7 +247,7 @@ pub fn issue_cohort_a_receipt(
     let body_value = serde_json::to_value(&body).map_err(IssueError::Serialize)?;
     let mut envelope = ReceiptEnvelope {
         version: ReceiptVersion::default(),
-        kind: RECEIPT_KIND_CLAUDE_CODE.into(),
+        kind: kind.into(),
         receipt_id: String::new(),
         daemon_root_id: daemon_root_id.into(),
         traceparent: None,
@@ -181,6 +312,9 @@ fn hex_lower(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::infra::claim_journal::{
+        ClaimScopeKind, ClaimSegmentSummary, ClosedScopeSummary, ScopeRef,
+    };
     use core_crypto::{FixtureSigner, FixtureVerifier, Signer as _};
     use core_events::receipt::body::{ClaimEvent, ClaimKind};
     use core_events::receipt::sign::{compute_receipt_id, verify_receipt_v2};
@@ -200,6 +334,27 @@ mod tests {
 
     fn fixture_signer() -> FixtureSigner {
         FixtureSigner::new("issue-rs-fixture")
+    }
+
+    fn sample_closed_scope_summary() -> ClosedScopeSummary {
+        ClosedScopeSummary {
+            scope: ScopeRef {
+                kind: ClaimScopeKind::Session,
+                id: "sess-closed-summary".to_string(),
+            },
+            total_claims: 9,
+            segments: vec![ClaimSegmentSummary {
+                segment_no: 0,
+                first_scope_seq: 1,
+                last_scope_seq: 8,
+                claim_count: 8,
+                started_at: "2026-05-22T12:00:00Z".to_string(),
+                ended_at: "2026-05-22T12:05:00Z".to_string(),
+                merkle_root: "deadbeef".to_string(),
+            }],
+            recent_claims: vec![sample_claim_event("tail-hash")],
+            recent_claims_truncated: true,
+        }
     }
 
     #[test]
@@ -315,9 +470,31 @@ mod tests {
         assert!(body.audit_gaps.is_empty());
     }
 
+    #[test]
+    fn closed_scope_summary_populates_segmented_rollup_fields() {
+        let signer = fixture_signer();
+        let env = issue_cohort_a_receipt_from_closed_scope(
+            "sess-closed-summary",
+            &sample_closed_scope_summary(),
+            None,
+            TerminationAuthority::DaemonPersona,
+            "daemon-root-closed-summary",
+            None,
+            &signer,
+        )
+        .unwrap();
+        let body: ClaudeCodeBody = serde_json::from_value(env.body).unwrap();
+        assert_eq!(body.base.claim_count_total, Some(9));
+        assert!(body.base.claim_events_truncated);
+        assert_eq!(body.base.claim_segment_summaries.len(), 1);
+        assert!(!body.base.claim_history_merkle_root.is_empty());
+        assert!(!body.base.permits_merkle_root.is_empty());
+        assert_eq!(body.base.claim_events.len(), 1);
+    }
+
     /// T1 round-trip — `issue_cohort_a_receipt` now signs in-place.
     /// The returned envelope must verify against the signer's public key.
-    /// Pins implementation-note-305 + implementation-note-306.
+    /// Pins implementation-note-313 + implementation-note-314.
     #[test]
     fn receipt_id_matches_canonical_compute_and_verifies_after_signing() {
         let signer = FixtureSigner::new("issue-rs-roundtrip");

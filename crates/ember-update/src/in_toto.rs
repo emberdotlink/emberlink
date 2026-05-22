@@ -1,7 +1,7 @@
 //!
 //! in-toto Statement v1 envelope — JCS-canonicalized predicate, Ed25519 sign/verify.
 //!
-//! Implements the in-toto Statement v1 shape (https://in-toto.io/Statement/v1) as
+//! Implements the in-toto Statement v1 shape (<https://in-toto.io/Statement/v1>) as
 //! defined in update-policy D2. The envelope wraps a
 //! generic predicate `P` which is serialized to JCS-canonical JSON before signing.
 //!
@@ -46,7 +46,7 @@ pub struct Subject {
 /// in-toto Statement v1 envelope wrapping a JCS-canonicalized predicate `P`.
 ///
 /// The anchor type name `InTotoStatementV1` is the `target_state_anchor` anchor
-/// for this task (implementation-note-424).
+/// for this task (implementation-note-434).
 ///
 /// # Field semantics
 ///
@@ -317,7 +317,7 @@ mod tests {
     /// `_type` / `subject` / `predicate_type` / `predicate`) and pastes it onto
     /// statement B whose `subject` and `predicate_type` differ but whose
     /// `predicate` bytes are identical. Before the
-    /// implementation-note-425 fix the signed bytes only covered the
+    /// implementation-note-435 fix the signed bytes only covered the
     /// predicate, so this lift verified successfully — letting an attacker
     /// re-target a legitimately-signed provenance predicate at a malicious
     /// artifact name or claim it under a different predicate schema URI.

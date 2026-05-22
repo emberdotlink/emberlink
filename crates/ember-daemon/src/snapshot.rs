@@ -7,7 +7,7 @@
 //!      Ed25519 seed with info "ember-seal-v1") using XChaCha20-Poly1305.
 //!   3. Described by a signed [`SnapshotManifest`] chained via `prev_snapshot_id`.
 //!
-//! **Snapshot scope** (per implementation-note-59, design §Decision):
+//! **Snapshot scope** (per implementation-note-61, design §Decision):
 //!   - `credentials` table rows (vault-sealed blobs)
 //!   - `vault.salt` file bytes (critical: without it the MEK cannot be rebuilt)
 //!   - `personas` table rows
@@ -839,7 +839,7 @@ pub async fn pull_cluster_snapshot(
 ///
 /// Call [`SnapshotPuller::maybe_pull`] on a Tokio interval at daemon startup.
 /// Only active when `snapshot_pull_endpoint` is configured (per design
-/// implementation-note-197).
+/// implementation-note-203).
 pub struct SnapshotPuller {
     interval_secs: u64,
     last_pulled_at: Mutex<Option<Instant>>,
@@ -1228,8 +1228,6 @@ mod tests {
         use hyper::service::service_fn;
         use hyper::{Request, Response, StatusCode};
         use hyper_util::rt::TokioIo;
-        use std::rc::Rc;
-        use std::sync::Arc;
         use tempfile::TempDir;
         use tokio::net::TcpListener;
 

@@ -1,4 +1,4 @@
-//! implementation-note-230 — biometric (Touch ID / device passcode) gate for high-risk
+//! implementation-note-237 — biometric (Touch ID / device passcode) gate for high-risk
 //! CLI operations like `ember approval approve <id>`.
 //!
 //! ## Goal
@@ -43,6 +43,13 @@
 //! out-of-scope for the May 3 demo.
 
 /// Outcome of a biometric check.
+///
+/// On macOS the `Verified` variant is constructed by the macOS-only
+/// `mod macos` block; on Linux/Windows the platform-bind shim short-
+/// circuits to `Skipped`. Suppress the dead-code lint on non-macOS so
+/// the cross-platform API contract doesn't emit spurious warnings on
+/// the Linux build (which is the headless host).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BiometricOutcome {
     /// The user successfully authenticated. `credential_id` carries an
@@ -56,6 +63,12 @@ pub enum BiometricOutcome {
     Skipped,
 }
 
+/// Errors a biometric check can surface.
+///
+/// Both variants are returned only from the macOS LocalAuthentication
+/// path; on non-macOS the bind is `Skipped` (no error path). Same
+/// `cfg_attr(allow(dead_code))` rationale as `BiometricOutcome`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Debug, thiserror::Error)]
 pub enum BiometricError {
     /// User cancelled the prompt or biometric verification declined.

@@ -3,6 +3,7 @@ pub mod attested_device;
 pub mod audit;
 pub mod audit_explain;
 pub mod binary_pin;
+pub mod claim_journal;
 pub mod config;
 pub mod credential_store;
 pub mod dashboard;
@@ -35,6 +36,7 @@ pub mod template_snapshot;
 pub mod unlock_pin;
 pub mod vault;
 pub mod workflow_grant;
+pub mod workflow_template;
 
 #[cfg(target_os = "macos")]
 pub mod vault_macos;

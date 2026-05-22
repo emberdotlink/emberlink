@@ -1,6 +1,6 @@
 //!
 //! Pure URL / scope / glob matching primitives extracted from
-//! `ember-daemon/src/infra/proxy.rs` (implementation-note-69).
+//! `ember-daemon/src/infra/proxy.rs` (implementation-note-71).
 //!
 //! These functions have no daemon-state coupling — no `&self`, no DB, no
 //! Vault, no runtime config. They take plain strings (or byte slices) and

@@ -676,7 +676,7 @@ mode = "jit_approval""#,
     }
 
     // -----------------------------------------------------------------------
-    // needs_credentials + credential_types tests (implementation-note-41)
+    // needs_credentials + credential_types tests (implementation-note-43)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -814,7 +814,7 @@ mode = "jit_approval""#,
         let c = parse_and_validate(valid_template())
             .expect("back-compat: existing toml must still parse");
         assert!(c.credential_types.is_empty());
-        for (_id, block) in &c.actions {
+        for block in c.actions.values() {
             assert!(!block.needs_credentials);
         }
     }

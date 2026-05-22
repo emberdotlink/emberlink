@@ -9108,6 +9108,10 @@ mod tests {
 
     // --- Access Grant CRUD tests ---
 
+    // Test fixture builder kept as documentation of the canonical
+    // "store with one persona under one root" shape. No current caller
+    // in this test module (siblings build their own fixtures inline).
+    #[allow(dead_code)]
     fn store_with_persona() -> EventStore {
         let mut store = EventStore::default();
         append_typed(

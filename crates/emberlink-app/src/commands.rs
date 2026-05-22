@@ -143,7 +143,7 @@ pub enum UiAction {
     /// is provided (or an existing persona is found), that persona claims the
     /// offer (existing-user flow).
     ///
-    /// `link_url`: the grant link URL (emberlink:// or https://ember.link/...)
+    /// `link_url`: the grant link URL (`emberlink://` or `https://ember.link/...`)
     ///   or an EL1:... QR string from `grant offer qr`.
     /// `claiming_persona_id`: optional — if omitted, auto-select the first active
     ///   persona (or create a new identity if none exist).

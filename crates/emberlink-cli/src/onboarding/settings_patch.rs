@@ -1,7 +1,7 @@
 use serde_json::{Value, json};
 
 /// The exact `command` string we look for and write. Exposed for tests
-/// and for implementation-note-458's `--uninstall` path to remove only what we added.
+/// and for implementation-note-477's `--uninstall` path to remove only what we added.
 pub const EMBER_PROXY_HOOK_COMMAND: &str = "ember-proxy hook";
 
 /// Raw tool names that must NOT be invoked outside the shadow PATH shims.
@@ -144,32 +144,36 @@ pub enum PatchError {
     RootNotObject(&'static str),
 }
 
-/// Detect whether the settings JSON already contains our PreToolUse hook
-/// entry. The check is conservative: matches any hook block under
-/// `hooks.PreToolUse[*].hooks[*]` whose `command` exactly equals
-/// `EMBER_PROXY_HOOK_COMMAND` and whose `type` is `"command"`.
-pub fn has_pretooluse_hook(settings: &Value) -> bool {
-    let pretooluse = match settings
+/// Detect whether the JSON already contains a specific command hook under the
+/// requested event + matcher block.
+pub fn has_command_hook(settings: &Value, event: &str, matcher: &str, command: &str) -> bool {
+    let event_hooks = match settings
         .get("hooks")
-        .and_then(|h| h.get("PreToolUse"))
+        .and_then(|h| h.get(event))
         .and_then(|v| v.as_array())
     {
         Some(arr) => arr,
         None => return false,
     };
-    pretooluse.iter().any(|block| {
-        block
-            .get("hooks")
-            .and_then(|v| v.as_array())
-            .map(|inner| {
-                inner.iter().any(|h| {
-                    h.get("type").and_then(|v| v.as_str()) == Some("command")
-                        && h.get("command").and_then(|v| v.as_str())
-                            == Some(EMBER_PROXY_HOOK_COMMAND)
+    event_hooks.iter().any(|block| {
+        block.get("matcher").and_then(|v| v.as_str()) == Some(matcher)
+            && block
+                .get("hooks")
+                .and_then(|v| v.as_array())
+                .map(|inner| {
+                    inner.iter().any(|hook| {
+                        hook.get("type").and_then(|v| v.as_str()) == Some("command")
+                            && hook.get("command").and_then(|v| v.as_str()) == Some(command)
+                    })
                 })
-            })
-            .unwrap_or(false)
+                .unwrap_or(false)
     })
+}
+
+/// Detect whether the settings JSON already contains our PreToolUse hook
+/// entry.
+pub fn has_pretooluse_hook(settings: &Value) -> bool {
+    has_command_hook(settings, "PreToolUse", "*", EMBER_PROXY_HOOK_COMMAND)
 }
 
 /// Add our PreToolUse hook entry if missing. No-op if already present.
@@ -192,7 +196,12 @@ pub fn has_pretooluse_hook(settings: &Value) -> bool {
 ///   }
 /// }
 /// ```
-pub fn add_pretooluse_hook(settings: &mut Value) -> Result<bool, PatchError> {
+pub fn add_command_hook(
+    settings: &mut Value,
+    event: &str,
+    matcher: &str,
+    command: &str,
+) -> Result<bool, PatchError> {
     let root = settings
         .as_object_mut()
         .ok_or(PatchError::RootNotObject("non-object"))?;
@@ -203,21 +212,20 @@ pub fn add_pretooluse_hook(settings: &mut Value) -> Result<bool, PatchError> {
         .as_object_mut()
         .ok_or(PatchError::RootNotObject("hooks is not an object"))?;
 
-    let pretooluse = hooks
-        .entry("PreToolUse")
+    let event_hooks = hooks
+        .entry(event)
         .or_insert_with(|| json!([]))
         .as_array_mut()
-        .ok_or(PatchError::RootNotObject("PreToolUse is not an array"))?;
+        .ok_or(PatchError::RootNotObject("hook event is not an array"))?;
 
-    // Find or create the wildcard-matcher block
-    let block = match pretooluse
+    let block = match event_hooks
         .iter_mut()
-        .find(|b| b.get("matcher").and_then(|v| v.as_str()) == Some("*"))
+        .find(|b| b.get("matcher").and_then(|v| v.as_str()) == Some(matcher))
     {
         Some(b) => b,
         None => {
-            pretooluse.push(json!({"matcher": "*", "hooks": []}));
-            pretooluse.last_mut().unwrap()
+            event_hooks.push(json!({"matcher": matcher, "hooks": []}));
+            event_hooks.last_mut().unwrap()
         }
     };
 
@@ -231,13 +239,17 @@ pub fn add_pretooluse_hook(settings: &mut Value) -> Result<bool, PatchError> {
     // Idempotency: skip if our hook is already there
     if inner.iter().any(|h| {
         h.get("type").and_then(|v| v.as_str()) == Some("command")
-            && h.get("command").and_then(|v| v.as_str()) == Some(EMBER_PROXY_HOOK_COMMAND)
+            && h.get("command").and_then(|v| v.as_str()) == Some(command)
     }) {
         return Ok(false);
     }
 
-    inner.push(json!({"type": "command", "command": EMBER_PROXY_HOOK_COMMAND}));
+    inner.push(json!({"type": "command", "command": command}));
     Ok(true)
+}
+
+pub fn add_pretooluse_hook(settings: &mut Value) -> Result<bool, PatchError> {
+    add_command_hook(settings, "PreToolUse", "*", EMBER_PROXY_HOOK_COMMAND)
 }
 
 /// Remove our PreToolUse hook entry — and ONLY ours. Removes any
@@ -245,7 +257,11 @@ pub fn add_pretooluse_hook(settings: &mut Value) -> Result<bool, PatchError> {
 /// `hooks.PreToolUse[*].hooks[*]` array. Cleans up empty wrapper
 /// arrays/objects we created but leaves user-authored hooks alone.
 /// Returns true if a write was made; false if our hook wasn't present.
-pub fn remove_pretooluse_hook(settings: &mut Value) -> Result<bool, PatchError> {
+pub fn remove_command_hook(
+    settings: &mut Value,
+    event: &str,
+    command: &str,
+) -> Result<bool, PatchError> {
     let root = settings
         .as_object_mut()
         .ok_or(PatchError::RootNotObject("non-object"))?;
@@ -255,8 +271,8 @@ pub fn remove_pretooluse_hook(settings: &mut Value) -> Result<bool, PatchError> 
         None => return Ok(false),
     };
 
-    let pretooluse = match hooks_obj
-        .get_mut("PreToolUse")
+    let event_hooks = match hooks_obj
+        .get_mut(event)
         .and_then(|v| v.as_array_mut())
     {
         Some(arr) => arr,
@@ -266,12 +282,12 @@ pub fn remove_pretooluse_hook(settings: &mut Value) -> Result<bool, PatchError> 
     let mut made_change = false;
 
     // Remove our hook entry from any matching block's inner hooks array
-    for block in pretooluse.iter_mut() {
+    for block in event_hooks.iter_mut() {
         if let Some(inner) = block.get_mut("hooks").and_then(|v| v.as_array_mut()) {
             let before = inner.len();
             inner.retain(|h| {
                 !(h.get("type").and_then(|v| v.as_str()) == Some("command")
-                    && h.get("command").and_then(|v| v.as_str()) == Some(EMBER_PROXY_HOOK_COMMAND))
+                    && h.get("command").and_then(|v| v.as_str()) == Some(command))
             });
             if inner.len() < before {
                 made_change = true;
@@ -285,7 +301,7 @@ pub fn remove_pretooluse_hook(settings: &mut Value) -> Result<bool, PatchError> 
 
     // Clean up empty wildcard blocks that we created (only if inner hooks is
     // empty AND no other fields beyond "matcher" and "hooks")
-    pretooluse.retain(|block| {
+    event_hooks.retain(|block| {
         let inner_empty = block
             .get("hooks")
             .and_then(|v| v.as_array())
@@ -305,13 +321,13 @@ pub fn remove_pretooluse_hook(settings: &mut Value) -> Result<bool, PatchError> 
     });
 
     // If PreToolUse is now empty, remove the key
-    let pretooluse_empty = hooks_obj
-        .get("PreToolUse")
+    let event_hooks_empty = hooks_obj
+        .get(event)
         .and_then(|v| v.as_array())
         .map(|a| a.is_empty())
         .unwrap_or(false);
-    if pretooluse_empty {
-        hooks_obj.remove("PreToolUse");
+    if event_hooks_empty {
+        hooks_obj.remove(event);
     }
 
     // If hooks object is now empty, remove the key
@@ -323,8 +339,12 @@ pub fn remove_pretooluse_hook(settings: &mut Value) -> Result<bool, PatchError> 
     Ok(true)
 }
 
+pub fn remove_pretooluse_hook(settings: &mut Value) -> Result<bool, PatchError> {
+    remove_command_hook(settings, "PreToolUse", EMBER_PROXY_HOOK_COMMAND)
+}
+
 /// Top-level convenience: parse → patch (add) → re-serialize.
-/// Used by `ember init --for claude-code` (implementation-note-458).
+/// Used by `ember init --for claude-code` (implementation-note-477).
 pub fn patch_settings_json(input: &str) -> Result<String, PatchError> {
     let mut value = if input.trim().is_empty() {
         json!({})
@@ -502,7 +522,7 @@ mod tests {
         assert!(patch_settings_json("{not json").is_err());
     }
 
-    // --- implementation-note-492 tests ---
+    // --- implementation-note-514 tests ---
 
     #[test]
     fn add_deny_to_empty_settings() {

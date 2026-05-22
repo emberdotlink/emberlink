@@ -1,4 +1,4 @@
-//! implementation-note-43 — T2 tests for the emberd-side
+//! implementation-note-45 — T2 tests for the emberd-side
 //! `exec.completion` Receipt v2 emission path.
 //!
 //! Two tests:

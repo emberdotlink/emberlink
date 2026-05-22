@@ -1,4 +1,4 @@
-//! implementation-note-264 (design §"In-container
+//! implementation-note-272 (design §"In-container
 //! extension") — T2 integration tests for per-socket Persona
 //! enrollment.
 //!
@@ -72,7 +72,7 @@ fn ensure_test_identity() -> tempfile::TempDir {
 /// Build a `RequestContext` from a per-agent socket path so the
 /// dispatch layer takes the enrolled-principal branch.
 // container_persona_enrollment_tests_green_sentinel
-// (implementation-note-261):
+// (implementation-note-268):
 // Use `RequestContext::socket_for_test(peer)` to get a ctx with a
 // synthetic presence_token bound to `peer.uid`. The cfg(test)
 // synthesis in `RequestContext::socket` is unreachable from
@@ -410,7 +410,7 @@ async fn test_revoked_enrollment_refuses_rpcs() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. T3 — implementation-note-115 —
+// 5. T3 — implementation-note-118 —
 //    test_broker_resolve_refuses_namespace_inode_mismatch_refused_receipt
 // ---------------------------------------------------------------------------
 
@@ -420,7 +420,7 @@ async fn test_revoked_enrollment_refuses_rpcs() {
 /// pipeline. The live `/proc/<pid>/ns/{user,mnt}` capture for the test
 /// process pid produces real inodes which cannot match the synthetic
 /// `0xdead`-shaped recorded values, so the namespace-inode gate
-/// (implementation-note-156/D) fires:
+/// (implementation-note-160/D) fires:
 ///
 ///   1. dispatch returns `Err((-32401, _))`
 ///   2. the audit_log carries one row with action
@@ -477,9 +477,9 @@ async fn test_broker_resolve_refuses_namespace_inode_mismatch_refused_receipt() 
             &persona.id,
             &grant.id,
             "blake3:namespace-mismatch-brief",
-            Some(0x0dead_a000), // synthetic cgroup_v2_id (A)
-            Some(0x0dead_b000), // synthetic userns_inode (B)
-            Some(0x0dead_c000), // synthetic mnt_ns_inode (C)
+            Some(0x0000_dead_a000), // synthetic cgroup_v2_id (A)
+            Some(0x0000_dead_b000), // synthetic userns_inode (B)
+            Some(0x0000_dead_c000), // synthetic mnt_ns_inode (C)
         )
         .expect("record enrollment with bogus inodes");
 

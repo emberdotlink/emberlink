@@ -22,9 +22,12 @@ pub struct ResolvedGrant {
     pub credential_name: String,
     pub statement_sid: String,
     pub statement: core_grant_types::Statement,
-    /// The grant's scope string, used for scope enforcement in the proxy
-    /// pipeline. Implementations should set this from the stored grant's
-    /// `scope` field. Defaults to `"*"` in test fixtures (permissive).
+    /// Legacy flat grant-scope metadata from the stored grant row.
+    ///
+    /// Composite grants may carry richer signed statement chains than this
+    /// single string can faithfully encode, so proxy request authorization
+    /// must use `statement` rather than this field. Keep this for audit /
+    /// display / compatibility surfaces that still expose the stored row.
     pub grant_scope: String,
     /// Optional comma-separated list of allowed upstream hosts/patterns.
     /// `None` means any target is permitted. Set from the grant's
@@ -123,7 +126,7 @@ pub trait PolicyBackend: Send + Sync + 'static {
     /// Distinct from `post_flight` so the daemon-side implementation can
     /// route the two through different metering paths — Slice B will land
     /// the in-process implementation, Slice C the remote one.
-    /// (implementation-note-66.)
+    /// (implementation-note-68.)
     async fn post_flight_meter(
         &self,
         resolved: &ResolvedGrant,

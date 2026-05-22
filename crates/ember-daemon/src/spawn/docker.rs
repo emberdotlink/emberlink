@@ -1,13 +1,13 @@
 //! Docker engine client connection helper + `DockerEngineRuntime`
 //! implementation of the daemon's `ContainerRuntime` contract.
 //!
-//! implementation-note-107 — daemon-side Docker
+//! implementation-note-110 — daemon-side Docker
 //! engine plumbing. `connect_docker_engine()` discovers the local engine
 //! via the standard precedence chain (`DOCKER_HOST` env var → platform
 //! default socket: `/var/run/docker.sock` on Unix, named pipe on
 //! Windows) and returns a ready `bollard::Docker` client.
 //!
-//! implementation-note-384 — adds
+//! implementation-note-394 — adds
 //! [`DockerEngineRuntime`] and the `docker_engine_spawn` entry point
 //! (the parent's checkpoint). `DockerEngineRuntime` implements the local
 //! [`ContainerRuntime`] trait by composing a bollard `Config` /
@@ -19,7 +19,7 @@
 //! by persona / agent / task / age without keeping daemon-side state.
 //!
 //! The `ContainerRuntime` trait declared here is a stop-gap local
-//! definition — implementation-note-385 will hoist it
+//! definition — implementation-note-395 will hoist it
 //! into `crates/ember-daemon/src/spawn/runtime.rs` as the canonical
 //! cross-backend contract (with `bind_mount_uds`, `drain`, and
 //! `state_report` methods alongside `spawn`). The local trait here
@@ -161,7 +161,7 @@ pub enum RuntimeSpawnError {
 /// fields requires a default so existing call sites keep compiling.
 ///
 /// **Stop-gap module location:** Slice A
-/// (implementation-note-385) will hoist this struct
+/// (implementation-note-395) will hoist this struct
 /// into a cross-backend module; the local definition here keeps Slice B
 /// compilable in isolation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -288,7 +288,7 @@ pub struct SpawnedContainer {
 /// reconciler does not need finer-grained vocabulary to decide whether
 /// to keep, drain, or replace a container.
 ///
-/// implementation-note-96 — added alongside
+/// implementation-note-99 — added alongside
 /// [`docker_engine_drain`] / [`docker_engine_state_report`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeState {
@@ -330,7 +330,7 @@ impl RuntimeState {
 ///
 /// **Stop-gap:** the canonical cross-backend definition lands in
 /// `crates/ember-daemon/src/spawn/runtime.rs` under
-/// implementation-note-385 with the full four-bullet
+/// implementation-note-395 with the full four-bullet
 /// surface (`spawn`, `bind_mount_uds`, `drain`, `state_report`). The
 /// trait here exposes `spawn`, `drain`, and `state_report` so Slice B
 /// + D can compile against a stable contract before Slice A merges;
@@ -359,7 +359,7 @@ pub trait ContainerRuntime: Send + Sync {
     ///     anything other than [`RuntimeState::Dead`] with
     ///     [`RuntimeSpawnError::DrainNotExited`].
     ///
-    /// implementation-note-96.
+    /// implementation-note-99.
     async fn drain(
         &self,
         container_id: &str,
@@ -376,7 +376,7 @@ pub trait ContainerRuntime: Send + Sync {
     /// [`RuntimeState::Dead`] — see [`RuntimeState::from_engine_status`]
     /// for the rationale.
     ///
-    /// implementation-note-96.
+    /// implementation-note-99.
     async fn state_report(
         &self,
         container_id: &str,
@@ -422,7 +422,7 @@ impl DockerEngineRuntime {
     }
 }
 
-/// Parent checkpoint for implementation-note-384.
+/// Parent checkpoint for implementation-note-394.
 ///
 /// Free function form of [`DockerEngineRuntime::spawn`]. Composes the
 /// bollard `Config` from `spec`, calls `create_container` +
@@ -530,7 +530,7 @@ pub async fn docker_engine_spawn(
     })
 }
 
-/// Parent checkpoint for implementation-note-96.
+/// Parent checkpoint for implementation-note-99.
 ///
 /// Free function form of [`DockerEngineRuntime::drain`]. Stops the
 /// container with a grace window, then re-inspects it to confirm the
@@ -608,7 +608,7 @@ pub async fn docker_engine_drain(
     }
 }
 
-/// Parent checkpoint for implementation-note-96.
+/// Parent checkpoint for implementation-note-99.
 ///
 /// Free function form of [`DockerEngineRuntime::state_report`].
 /// Inspects the container and maps the engine's `state.status` string
@@ -671,6 +671,30 @@ impl ContainerRuntime for DockerEngineRuntime {
 mod tests {
     use super::*;
 
+    /// Skip-gate for the two `connect_docker_engine_*` tests below.
+    ///
+    /// Bollard's `connect_with_local_defaults` reads either
+    /// `DOCKER_HOST` or `/var/run/docker.sock`; if the socket is
+    /// absent (the headless host has no Docker installed), the
+    /// constructor returns an error and the tests fail. Per the
+    /// daemon-crate test discipline rule
+    /// (`.claude/rules/daemon.md`: "Sandbox/Docker tests gate on
+    /// availability"), skip rather than fail.
+    ///
+    /// Mirrors the pattern used by `infra::sandbox::docker_available`
+    /// — same `docker info` exit-code check — but lives here so this
+    /// module's tests don't reach across into the sibling module.
+    /// Anchor: `ember_daemon_broken_test_cluster_resolved`.
+    fn docker_available() -> bool {
+        std::process::Command::new("docker")
+            .arg("info")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
     /// T2 fixture: happy-path construction of the engine client.
     ///
     /// `connect_with_local_defaults` is non-network in its construction
@@ -684,6 +708,12 @@ mod tests {
     /// rather than enabling it by default.
     #[test]
     fn connect_docker_engine_constructs_client() {
+        if !docker_available() {
+            eprintln!(
+                "connect_docker_engine_constructs_client: Docker not available — skipping per daemon test-discipline rule"
+            );
+            return;
+        }
         let client = connect_docker_engine();
         assert!(
             client.is_ok(),
@@ -706,6 +736,12 @@ mod tests {
     /// risk here because no other test in this module touches DOCKER_HOST.
     #[test]
     fn connect_docker_engine_honors_docker_host_env() {
+        if !docker_available() {
+            eprintln!(
+                "connect_docker_engine_honors_docker_host_env: Docker not available — skipping per daemon test-discipline rule"
+            );
+            return;
+        }
         // SAFETY: single-purpose smoke test; no other test in this module
         // reads or writes `DOCKER_HOST`. The variable is intentionally
         // left set on exit to avoid a teardown race; cargo test isolates
@@ -725,7 +761,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // implementation-note-96 — drain +
+    // implementation-note-99 — drain +
     // state_report mapping tests.
     //
     // We exercise the pure mapping helpers
@@ -851,6 +887,15 @@ mod tests {
     /// the `DOCKER_E2E=1` lane.
     #[test]
     fn docker_engine_runtime_is_container_runtime_trait_object() {
+        // Both helper fns are dead at runtime by design — their
+        // existence (and the trait-object coercion the inner one
+        // performs) is the compile-time assertion that
+        // `DockerEngineRuntime: ContainerRuntime`. The `_use_dyn`
+        // path is never invoked because the comment below explains
+        // we can't safely construct a `DockerEngineRuntime` in this
+        // test (bollard's `connect_with_local_defaults` fails on
+        // hosts without `/var/run/docker.sock`).
+        #[allow(dead_code)]
         fn assert_dyn_runtime(_r: &dyn ContainerRuntime) {}
         fn _use_dyn(r: &DockerEngineRuntime) {
             assert_dyn_runtime(r);

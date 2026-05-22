@@ -275,8 +275,9 @@ impl DaemonTransport {
     }
 
     /// Call a daemon JSON-RPC method by name, bypassing the MCP tool→method
-    /// map. Used by the agent runtime adapter ([`crate::main::DaemonTransportClient`])
-    /// where the tool layer's renamings don't apply, and by the
+    /// map. Used by the agent runtime adapter (`DaemonTransportClient` in
+    /// the emberlink-mcp binary's main module) where the tool layer's
+    /// renamings don't apply, and by the
     /// `bridge.cert_expiring_soon` timer task to post the warning.
     pub fn call_raw(
         &self,
@@ -438,7 +439,7 @@ impl std::error::Error for BridgeCertError {}
 
 /// Default in-container path for the per-agent client cert bundle. The
 /// orchestrator's spawn flow mounts these into the container at this
-/// path (implementation-note-494). Overridable via
+/// path (implementation-note-26). Overridable via
 /// `EMBER_BRIDGE_CERT_DIR` for tests + alternate deployment shapes.
 pub const DEFAULT_BRIDGE_CERT_DIR: &str = "/run/ember/client-cert";
 

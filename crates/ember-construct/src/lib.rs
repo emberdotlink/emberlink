@@ -7,7 +7,7 @@
 
 pub mod aws;
 pub mod az;
-// implementation-note-91 — Compose V2 manifest
+// implementation-note-93 — Compose V2 manifest
 // types + translator substrate. The public checkpoint
 // `fn compose_manifest_to_docker_spec` lives in `docker.rs`; this
 // module owns `ComposeManifest`, `ComposeService`,
@@ -254,7 +254,7 @@ pub static VENDORS: &[VendorManifest] = &[
         binary_env_var: "EMBER_SCION_BINARY",
         classifier: scion::classify_scion_argv_key,
         // Scion overrides the default identity translator per design §4
-        // (implementation-note-100): emberlink-shaped argv
+        // (implementation-note-103): emberlink-shaped argv
         // (`--persona X --max-depth N --template emberlink-worker --brief ...`)
         // becomes scion-native (`--type emberlink-worker --non-interactive`).
         argv_translator: scion::translate_scion_argv,
@@ -345,7 +345,7 @@ impl ConstructConfig for ManifestConfig<'_> {
 
 /// Dispatch entry point called by each `[[bin]]` target's `main.rs`.
 ///
-/// Panics on unknown `vendor` — build-time invariant since [[bin]] main.rs
+/// Panics on unknown `vendor` — build-time invariant since `[[bin]]` main.rs
 /// files are checked-in code that passes a literal vendor name.
 pub fn run(vendor: &str) -> ExitCode {
     tracing_subscriber::fmt()
@@ -426,7 +426,7 @@ mod resolve_binary_tests {
 }
 
 // ---------------------------------------------------------------------------
-// translate_argv hook tests (implementation-note-29)
+// translate_argv hook tests (implementation-note-31)
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]

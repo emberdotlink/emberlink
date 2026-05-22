@@ -1,5 +1,5 @@
 //!
-//! implementation-note-138 — T2 integration tests for
+//! implementation-note-142 — T2 integration tests for
 //! design §Component 2. Asserts the load-bearing invariants:
 //!
 //! 1. The BrokerRegistry distinguishes real-broker vs Mock-registered

@@ -1,4 +1,4 @@
-//! implementation-note-506 regression guard — MCP read path must see grants owned by
+//! implementation-note-540 regression guard — MCP read path must see grants owned by
 //! the caller's persona (and only those grants).
 //!
 //! The narrative being guarded is "agent asks -> human approves -> agent
@@ -72,6 +72,11 @@ fn spawn_listener_thread(tmp: &TempDir) -> (std::path::PathBuf, watch::Sender<bo
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let path_for_thread = socket_path.clone();
 
+    let id_dir = tempfile::tempdir().expect("tempdir for daemon identity");
+    let _ = ember_daemon::infra::receipt::init_identity(id_dir.path());
+    std::mem::forget(id_dir);
+    ember_daemon::trust::presence::mark_unlocked();
+
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -88,7 +93,8 @@ fn spawn_listener_thread(tmp: &TempDir) -> (std::path::PathBuf, watch::Sender<bo
             let rate_limiter = Rc::new(RefCell::new(RateLimiter::default()));
             let _vault = vault; // hold until end of scope: set_vault is the wire now
             let listener =
-                SocketListener::new(path_for_thread, shutdown_rx, store, policy, rate_limiter);
+                SocketListener::new(path_for_thread, shutdown_rx, store, policy, rate_limiter)
+                    .with_test_mode_synthetic_presence_token(true);
             listener.run().await.unwrap();
         });
     });

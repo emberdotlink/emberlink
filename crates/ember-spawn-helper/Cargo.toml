@@ -2,9 +2,9 @@
 # design Components 2 + 3 — privileged sibling spawn-helper daemon +
 # the MACOS-PRIMITIVES Decision 5 `emberd-spawn-shim`.
 #
-# implementation-note-183
-# implementation-note-182
-# implementation-note-184
+# implementation-note-187
+# implementation-note-186
+# implementation-note-188
 #
 # Three binaries are conditionally compiled, sharing the lib's wire
 # protocol:

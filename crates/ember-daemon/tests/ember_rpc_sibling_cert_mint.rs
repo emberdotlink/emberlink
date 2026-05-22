@@ -1,5 +1,5 @@
 //!
-//! implementation-note-112 — T3 integration test.
+//! implementation-note-115 — T3 integration test.
 //!
 //! Anchor: `ember_rpc_sibling_server_cert_minted_at_startup`.
 //!

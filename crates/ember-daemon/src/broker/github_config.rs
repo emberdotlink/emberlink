@@ -172,7 +172,7 @@ const PURPOSE_INSTALLATION_ID: &str = "installation-id";
 /// finds. Single-installation deployments therefore behave identically
 /// to the legacy flat-key reader; multi-installation deployments will
 /// pin to a specific slug+install via a later config knob (out of
-/// scope here — see implementation-note-132).
+/// scope here — see implementation-note-136).
 ///
 /// Returns:
 /// - `Ok(Some(creds))` when a complete triple is present.

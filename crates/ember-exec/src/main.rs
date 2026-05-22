@@ -1,7 +1,7 @@
 //!
 //! `ember-exec` — privileged sidecar that verifies, privilege-drops, and execs
 //! a target binary on behalf of an in-container agent. Per design §8 and the
-//! implementation-note-44 decomposition.
+//! implementation-note-46 decomposition.
 //!
 //! This is subtask A (BIN-UDS): bin scaffold + UDS accept loop + the
 //! `SpawnDirective` wire shape. Hash verification (subtask B) and PtyBridge
@@ -12,7 +12,7 @@
 
 // container_side_checkpoint_emitters — scaffold stub (daemon-RPC pending).
 // `emit_checkpoint` writes one NDJSON line to stderr for each container-side
-// lifecycle checkpoint.  When implementation-note-413 ships,
+// lifecycle checkpoint.  When implementation-note-423 ships,
 // this helper will be replaced with a daemon UDS RPC so checkpoints land in
 // the daemon event log.
 //
@@ -33,7 +33,7 @@ use tokio::net::UnixListener;
 /// Field shape: `{"checkpoint":<name>,"agent_id":<id>,"ts":<iso8601>}`
 ///
 /// This is a scaffold stub. The real implementation will route through the
-/// daemon's cross-uid bridge socket (implementation-note-413)
+/// daemon's cross-uid bridge socket (implementation-note-423)
 /// so checkpoints land in the daemon event log with proper attribution.
 fn emit_checkpoint(name: &str, agent_id: &str) {
     use std::io::Write;
@@ -103,7 +103,7 @@ fn sanitize_json_string(s: &str) -> String {
 #[command(
     name = "ember-exec",
     version,
-    about = "Privileged exec sidecar (implementation-note-44)"
+    about = "Privileged exec sidecar (implementation-note-46)"
 )]
 struct Cli {
     /// Path to the Unix-domain socket to bind. Refuses paths under `/tmp/`
@@ -160,7 +160,7 @@ async fn main() -> ExitCode {
                     return;
                 }
             };
-            // implementation-note-414: the handler runs the
+            // implementation-note-424: the handler runs the
             // full verify → drop_priv (if root) → spawn → output → exit
             // flow against the in-flight connection. Wire-shape errors
             // (frame write fail mid-stream) close the connection; spawn

@@ -2,7 +2,7 @@
 //! operator-IR + dev-IR private seeds from a backup file produced by
 //! `ember trust backup`.
 //!
-//! Per design §Component 4 and implementation-note-30.
+//! Per design §Component 4 and implementation-note-32.
 //!
 //! ## Flow
 //!

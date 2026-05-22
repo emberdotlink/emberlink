@@ -24,7 +24,7 @@
 //!   binary blake3 against the manifest. Mismatch → fail-closed.
 //! - Missing manifest → fail-closed with directive to run generate.
 //!
-//! Path 2 (filed as `implementation-note-193`) replaces the
+//! Path 2 (filed as `implementation-note-199`) replaces the
 //! daemon-self-signing model with Ember Systems IdentityRoot pre-signing
 //! in the release pipeline. Until then, this module's TOFU is the
 //! strongest v0.3-shippable check.
@@ -343,7 +343,7 @@ pub fn verify_peer_against_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_crypto::{FixtureSigner, FixtureVerifier};
+    use core_crypto::FixtureSigner;
 
     fn fixture_signer() -> FixtureSigner {
         FixtureSigner::new("binary-pin-manifest-test")

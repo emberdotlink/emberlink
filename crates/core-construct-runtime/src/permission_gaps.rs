@@ -4,7 +4,7 @@
 //! When a worker exits with an empty diff and reports a reason that
 //! starts with `"harness denied"`, the orchestrator calls
 //! [`append_permission_gap`] to land a structured record in the gap log.
-//! The orchestrator's drain step ([`permission-gap-drain.sh`]) reads
+//! The orchestrator's drain step (`permission-gap-drain.sh`) reads
 //! those records, dedups by `command`, and surfaces them for triage.
 //!
 //! Shape of each appended line:

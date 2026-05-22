@@ -212,19 +212,19 @@ pub fn generate_secure_enclave_key_with_policy(
             // keychain lookup framework treats biometric-only items as
             // unenumerable from a non-GUI context (the daemon got
             // `errSecItemNotFound` even though the key existed; see
-            // implementation-note-80 shipped checkpoint
+            // implementation-note-82 shipped checkpoint
             // below).
             //
             // The user-presence property the original
             // `BIOMETRY_CURRENT_SET` was reaching for is recovered at a higher
-            // layer by `implementation-note-81` — the daemon-MEK
+            // layer by `implementation-note-83` — the daemon-MEK
             // unwrap is autonomous (no Touch ID per daemon-start, which would be
             // terrible UX anyway), but the FIRST per-session vault operation
             // prompts Touch ID via cross-uid SecurityAgent. The SE-blob is still
             // hardware-bound: the SE key cannot be exported off the device, so
             // root-on-this-device is required to use it.
             //
-            // Anchor: implementation-note-82
+            // Anchor: implementation-note-84
             SeAccessPolicy::Headless => AccessControlOptions::PRIVATE_KEY_USAGE.bits(),
             SeAccessPolicy::BiometricCurrentSet => (AccessControlOptions::PRIVATE_KEY_USAGE
                 | AccessControlOptions::BIOMETRY_CURRENT_SET)
@@ -275,11 +275,28 @@ pub fn generate_secure_enclave_key_with_policy(
 ///
 /// Returns the DER-encoded ECDSA signature (r || s in X9.62 encoding).
 pub fn se_sign_with_touch_id(key: &SeKeyHandle, data: &[u8]) -> Result<Vec<u8>, SeError> {
+    se_sign_with_touch_id_reason(
+        key,
+        data,
+        "Authenticate to continue the requested Ember operation",
+    )
+}
+
+/// Sign `data` with `key`, triggering a Touch ID prompt with a caller-supplied
+/// localized reason.
+pub fn se_sign_with_touch_id_reason(
+    key: &SeKeyHandle,
+    data: &[u8],
+    reason: &str,
+) -> Result<Vec<u8>, SeError> {
     match &key.inner {
         #[cfg(feature = "se-real")]
         SeKeyInner::Real(sec_key) => {
             use security_framework::key::Algorithm;
-            sec_key
+            let signing_key = find_se_key_by_label_with_reason(&key.label, reason).unwrap_or_else(
+                |_| sec_key.clone(),
+            );
+            signing_key
                 .create_signature(Algorithm::ECDSASignatureMessageX962SHA256, data)
                 .map_err(|e| SeError::SignFailed(e.to_string()))
         }
@@ -356,6 +373,14 @@ pub fn se_pubkey_bytes(key: &SeKeyHandle) -> Result<Vec<u8>, SeError> {
 /// the SE and triggers any SAC attached to the key).
 #[cfg(feature = "se-real")]
 fn find_se_key_by_label(label: &str) -> Result<security_framework::key::SecKey, String> {
+    find_se_key_by_label_with_reason(label, "Authenticate to continue")
+}
+
+#[cfg(feature = "se-real")]
+fn find_se_key_by_label_with_reason(
+    label: &str,
+    reason: &str,
+) -> Result<security_framework::key::SecKey, String> {
     use security_framework::item::{
         ItemClass, ItemSearchOptions, KeyClass, Reference, SearchResult,
     };
@@ -367,11 +392,17 @@ fn find_se_key_by_label(label: &str) -> Result<security_framework::key::SecKey, 
     // material lives in the SE); the public-key handle only supports
     // `encrypt_data` and fails decrypt with
     // `algid:encrypt:ECIES:…: algorithm not supported by the key`.
-    let results = ItemSearchOptions::new()
+    let mut query = ItemSearchOptions::new();
+    query
         .class(ItemClass::key())
         .key_class(KeyClass::private())
         .label(label)
-        .load_refs(true)
+        .load_refs(true);
+    #[allow(deprecated)]
+    unsafe {
+        query.authentication_context(create_la_context_with_reason(reason)?);
+    }
+    let results = query
         .search()
         .map_err(|e| format!("SE key lookup for label '{label}': {e}"))?;
 
@@ -385,6 +416,116 @@ fn find_se_key_by_label(label: &str) -> Result<security_framework::key::SecKey, 
     ))
 }
 
+#[cfg(feature = "se-real")]
+#[allow(clashing_extern_declarations)]
+fn create_la_context_with_reason(reason: &str) -> Result<*mut std::os::raw::c_void, String> {
+    use std::ffi::CString;
+    use std::os::raw::{c_char, c_void};
+
+    type Id = *mut c_void;
+    type Sel = *const c_void;
+
+    #[link(name = "LocalAuthentication", kind = "framework")]
+    unsafe extern "C" {}
+
+    #[link(name = "Foundation", kind = "framework")]
+    unsafe extern "C" {}
+
+    unsafe extern "C" {
+        fn objc_getClass(name: *const c_char) -> Id;
+        fn sel_registerName(name: *const c_char) -> Sel;
+    }
+    unsafe extern "C" {
+        #[link_name = "objc_msgSend"]
+        fn msg_send_id(receiver: Id, sel: Sel) -> Id;
+    }
+    unsafe extern "C" {
+        #[link_name = "objc_msgSend"]
+        fn msg_send_void_id(receiver: Id, sel: Sel, arg0: Id);
+    }
+    unsafe extern "C" {
+        #[link_name = "objc_msgSend"]
+        fn msg_send_id_cstr(receiver: Id, sel: Sel, arg0: *const c_char) -> Id;
+    }
+
+    unsafe fn nsstring_from_str(s: &str) -> Result<Id, String> {
+        let cls_name =
+            CString::new("NSString").map_err(|e| format!("NSString class CString: {e}"))?;
+        let cls = unsafe { objc_getClass(cls_name.as_ptr()) };
+        if cls.is_null() {
+            return Err("NSString class lookup returned nil".to_string());
+        }
+        let sel_name = CString::new("stringWithUTF8String:")
+            .map_err(|e| format!("NSString selector CString: {e}"))?;
+        let sel = unsafe { sel_registerName(sel_name.as_ptr()) };
+        let cstr = CString::new(s).map_err(|e| format!("localized reason CString: {e}"))?;
+        Ok(unsafe { msg_send_id_cstr(cls, sel, cstr.as_ptr()) })
+    }
+
+    unsafe {
+        let cls_name =
+            CString::new("LAContext").map_err(|e| format!("LAContext class CString: {e}"))?;
+        let cls = objc_getClass(cls_name.as_ptr());
+        if cls.is_null() {
+            return Err("LAContext class lookup returned nil".to_string());
+        }
+        let alloc_sel = sel_registerName(
+            CString::new("alloc")
+                .map_err(|e| format!("alloc selector CString: {e}"))?
+                .as_ptr(),
+        );
+        let init_sel = sel_registerName(
+            CString::new("init")
+                .map_err(|e| format!("init selector CString: {e}"))?
+                .as_ptr(),
+        );
+        let set_reason_sel = sel_registerName(
+            CString::new("setLocalizedReason:")
+                .map_err(|e| format!("setLocalizedReason selector CString: {e}"))?
+                .as_ptr(),
+        );
+        let allocated = msg_send_id(cls, alloc_sel);
+        if allocated.is_null() {
+            return Err("LAContext alloc returned nil".to_string());
+        }
+        let context = msg_send_id(allocated, init_sel);
+        if context.is_null() {
+            return Err("LAContext init returned nil".to_string());
+        }
+        let reason_ns = nsstring_from_str(reason)?;
+        msg_send_void_id(context, set_reason_sel, reason_ns);
+        Ok(context)
+    }
+}
+
+#[cfg(feature = "se-real")]
+fn find_se_public_key_by_label(label: &str) -> Result<security_framework::key::SecKey, SeError> {
+    use security_framework::item::{
+        ItemClass, ItemSearchOptions, KeyClass, Reference, SearchResult,
+    };
+
+    let results = ItemSearchOptions::new()
+        .class(ItemClass::key())
+        .key_class(KeyClass::public())
+        .label(label)
+        .load_refs(true)
+        .search()
+        .map_err(|e| {
+            SeError::PubkeyExportFailed(format!(
+                "public-key lookup for label '{label}': {e}"
+            ))
+        })?;
+
+    for result in results {
+        if let SearchResult::Ref(Reference::Key(key)) = result {
+            return Ok(key);
+        }
+    }
+
+    Err(SeError::PubkeyExportFailed(format!(
+        "no public-key item found for label '{label}'"
+    )))
+}
 /// Re-open a previously-created Secure Enclave key by label.
 pub fn find_secure_enclave_key(label: &str) -> Result<SeKeyHandle, SeError> {
     #[cfg(feature = "se-real")]
@@ -426,7 +567,7 @@ pub fn find_secure_enclave_key(label: &str) -> Result<SeKeyHandle, SeError> {
 /// On the stub path: derives a 32-byte key from `SHA-256(label || private_bytes)`,
 /// then produces `nonce(16) || auth_tag(32) || xor_stream(plaintext)` where the
 /// auth tag is `SHA-256(0xFF || nonce || key || ciphertext)` (encrypt-then-MAC,
-/// per implementation-note-74 -B) and the stream key is
+/// per implementation-note-76 -B) and the stream key is
 /// `SHA-256(counter || nonce || key)` per 32-byte block.
 ///
 /// # Errors
@@ -490,7 +631,7 @@ pub fn se_wrap(label: &str, plaintext: &[u8]) -> Result<Vec<u8>, SeError> {
 /// Inverse of [`se_wrap`]. On the stub path, **verifies the auth tag
 /// constant-time first, then XOR-decrypts** (encrypt-then-MAC + verify-
 /// then-decrypt; see [`stub_unwrap`] for the per-byte invariant and the
-/// implementation-note-74 -B rationale).
+/// implementation-note-76 -B rationale).
 ///
 /// # Errors
 ///
@@ -507,7 +648,7 @@ pub fn se_unwrap(label: &str, ciphertext: &[u8]) -> Result<Vec<u8>, SeError> {
             // BiometryCurrentSet protection set by `generate_secure_enclave_key`)
             // triggers a biometric prompt here. For the daemon's separate-uid
             // posture (design) the install-side followup
-            // (implementation-note-74) pins the key to
+            // (implementation-note-76) pins the key to
             // the SystemKeychain without biometric protection so the daemon
             // can decrypt at startup without operator presence.
             #[cfg(feature = "se-real")]
@@ -598,7 +739,7 @@ fn keystream_block(counter: u8, nonce: &[u8; 16], key: &[u8; 32]) -> [u8; 32] {
 
 /// Compute encrypt-then-MAC auth tag: `SHA-256(0xFF || nonce || key || ciphertext)`.
 ///
-/// implementation-note-74 -B — the tag MUST be
+/// implementation-note-76 -B — the tag MUST be
 /// computed over the CIPHERTEXT (encrypt-then-MAC), not the plaintext.
 /// Tag-over-plaintext requires decryption before verification, which
 /// turned `stub_unwrap` into a padding/timing oracle on a malformed
@@ -666,7 +807,7 @@ fn stub_wrap(private_bytes: &[u8], label: &str, plaintext: &[u8]) -> Result<Vec<
 /// Stub unwrap: verify tag (constant-time, against ciphertext) **then**
 /// XOR-decrypt.
 ///
-/// implementation-note-74 -B — the prior
+/// implementation-note-76 -B — the prior
 /// implementation decrypted before verifying, which:
 ///   1. Did work the attacker controlled (touched every ciphertext byte
 ///      before the tag check), and
@@ -826,7 +967,7 @@ mod tests {
         assert_eq!(pt, b"hello");
     }
 
-    /// T1 — implementation-note-74 -B: stub_unwrap
+    /// T1 — implementation-note-76 -B: stub_unwrap
     /// must reject tampered ciphertext via the auth tag before producing
     /// any plaintext. Exercises the encrypt-then-MAC + verify-then-decrypt
     /// invariant on the stub path (deterministic, no SE hardware needed).
@@ -862,7 +1003,7 @@ mod tests {
         }
     }
 
-    /// T1 — implementation-note-74 -B: tampering
+    /// T1 — implementation-note-76 -B: tampering
     /// with the stored auth-tag region (offset 16..48) must also be
     /// rejected. Complement to the body-tamper test — both attacker-
     /// reachable regions of the blob are covered.

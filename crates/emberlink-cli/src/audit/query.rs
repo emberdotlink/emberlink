@@ -31,6 +31,7 @@
 
 use std::path::Path;
 
+use core_events::receipt::envelope::ReceiptEnvelope;
 use rusqlite::{Connection, OpenFlags, params_from_iter};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -39,6 +40,8 @@ use serde_json::Value;
 ///
 /// All fields are optional; omitting them returns all receipts up to
 /// `limit`. Filters AND-combine.
+///
+/// Anchor: audit_query_kind_filter_landed
 #[derive(Debug, Default, Clone)]
 pub struct QueryFilter {
     /// ISO-8601 lower bound on `created_at`. Caller is responsible for
@@ -51,6 +54,15 @@ pub struct QueryFilter {
     pub workflow: Option<String>,
     /// Exact match on `persona_id`.
     pub persona: Option<String>,
+    /// Exact match on `receipts.kind`. Per design, the kind catalog
+    /// includes values like `grant`, `kms_wrap`, `kms_unwrap`,
+    /// `bridge.cert_refreshed`, `bridge.cert_refresh_failed`,
+    /// `binding.registered`. The validation surface (well-known catalog
+    /// check at parse time) lives in the CLI arg parser; this library
+    /// layer accepts any non-empty string so future kinds work without
+    /// a library change. Anchors `implementation-note-441-
+    /// KIND-FILTER` (design §C8 M12 dogfood-gate prerequisite).
+    pub kind: Option<String>,
     /// Maximum rows. Defaults to 100 when `None`.
     pub limit: Option<u64>,
 }
@@ -154,6 +166,16 @@ pub fn run_audit_query_direct(
     if let Some(since) = filter.since_iso.as_deref() {
         clauses.push(format!("created_at >= ?{}", params.len() + 1));
         params.push(since.to_string());
+    }
+    if let Some(kind) = filter.kind.as_deref() {
+        // Exact-match on `receipts.kind`. The column exists in the
+        // daemon's schema (per `core-personas` migration) and is used
+        // by the daemon's own `ReceiptFilter` path; this brings the
+        // direct-SQLite path to feature parity for downstream
+        // M12-dogfood-gate-style queries:
+        //   `--kind bridge.cert_refresh_failed --since 7d`.
+        clauses.push(format!("kind = ?{}", params.len() + 1));
+        params.push(kind.to_string());
     }
     if let Some(workflow) = filter.workflow.as_deref() {
         // JSON1 extraction — match either the ULID workflow_id or the
@@ -354,6 +376,76 @@ fn truncate(s: &str, n: usize) -> String {
     } else {
         s.chars().take(n.saturating_sub(1)).collect::<String>() + "…"
     }
+}
+
+/// Load every `identity.rotation_witness` Receipt v2 envelope from the
+/// local Receipt store, sorted ascending by the body's
+/// `rotated_at_epoch_secs` field.
+///
+/// This is the read-side primitive consumed by the future
+/// `ember receipt verify --offline` chain-walking path
+/// (implementation-note-442). The
+/// CLI's verify dispatch will materialize these envelopes into
+/// [`core_events::receipt::sign::RotationWitnessEntry`] values
+/// (filling in `prior_identity_pub` / `new_identity_pub` from the
+/// epoch-root-ID-to-pubkey resolver that Slice E2 owns) and pass them
+/// to [`core_events::receipt::sign::verify_receipt_v2_with_rotation_chain`].
+///
+/// Anchor: rotation_witness_envelope_loader_landed
+///
+/// Returns an empty vec when the receipts table has no
+/// `identity.rotation_witness` rows yet (the daemon hasn't emitted any
+/// rotations — the normal case for fresh installs).
+///
+/// Opens the store read-only so concurrent daemon writes don't
+/// contend and the CLI cannot accidentally mutate the audit trail.
+pub fn load_rotation_witness_envelopes(
+    db_path: &Path,
+) -> Result<Vec<ReceiptEnvelope>, QueryError> {
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| QueryError::OpenStore {
+        path: db_path.to_path_buf(),
+        source: e,
+    })?;
+
+    // Match the kind string from
+    // `core_events::receipt::RECEIPT_KIND_IDENTITY_ROTATION_WITNESS`.
+    // Hard-coded here so this module doesn't take an additional
+    // dependency on the const just to compare — drift is caught by
+    // the round-trip test that emits via the canonical constant and
+    // expects the loader to return that envelope.
+    let mut stmt =
+        conn.prepare("SELECT receipt_json FROM receipts WHERE kind = ?1")?;
+    let rows = stmt.query_map(["identity.rotation_witness"], |row| {
+        row.get::<_, String>(0)
+    })?;
+
+    let mut sortable: Vec<(u64, ReceiptEnvelope)> = Vec::new();
+    for r in rows {
+        let receipt_json = r?;
+        let envelope: ReceiptEnvelope =
+            serde_json::from_str(&receipt_json).map_err(|e| {
+                QueryError::InvalidReceiptJson {
+                    id: "<rotation_witness>".to_string(),
+                    source: e,
+                }
+            })?;
+        // Extract `rotated_at_epoch_secs` from the body JSON. Bodies
+        // that aren't shaped like an IdentityRotationWitnessBody (e.g.
+        // schema drift, corruption) sort to position 0 so the chain
+        // walker rejects them on monotonic-order check.
+        let rotated_at: u64 = envelope
+            .body
+            .get("rotated_at_epoch_secs")
+            .and_then(|n| n.as_u64())
+            .unwrap_or(0);
+        sortable.push((rotated_at, envelope));
+    }
+    sortable.sort_by_key(|(ts, _)| *ts);
+    Ok(sortable.into_iter().map(|(_, e)| e).collect())
 }
 
 #[cfg(test)]
@@ -635,6 +727,101 @@ mod tests {
     }
 
     #[test]
+    fn direct_query_filters_by_kind() {
+        // implementation-note-443:
+        // The library path filters on `receipts.kind` so an M12-style
+        // dogfood-gate query like
+        //   `--kind bridge.cert_refresh_failed --since 7d`
+        // returns the targeted subset against a real audit store.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let db = dir.path().join("daemon.db");
+        let conn = make_db(&db);
+        insert(
+            &conn,
+            "r-cert-fail",
+            "persona-a",
+            "bridge.cert_refresh_failed",
+            "2026-05-20T12:00:00Z",
+            r#"{"body":{}}"#,
+        );
+        insert(
+            &conn,
+            "r-cert-ok",
+            "persona-a",
+            "bridge.cert_refreshed",
+            "2026-05-20T12:30:00Z",
+            r#"{"body":{}}"#,
+        );
+        insert(
+            &conn,
+            "r-grant",
+            "persona-a",
+            "grant",
+            "2026-05-20T13:00:00Z",
+            r#"{"body":{}}"#,
+        );
+        drop(conn);
+        let rows = run_audit_query_direct(
+            &db,
+            &QueryFilter {
+                kind: Some("bridge.cert_refresh_failed".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("query");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "r-cert-fail");
+        assert_eq!(rows[0].kind, "bridge.cert_refresh_failed");
+    }
+
+    #[test]
+    fn direct_query_kind_composes_with_since_and_persona() {
+        // implementation-note-443:
+        // Verify the brief's "composes with --since DUR and --persona ID"
+        // AND-combine requirement at the library layer.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let db = dir.path().join("daemon.db");
+        let conn = make_db(&db);
+        insert(
+            &conn,
+            "r-old-fail",
+            "persona-a",
+            "bridge.cert_refresh_failed",
+            "2026-04-01T00:00:00Z",
+            r#"{"body":{}}"#,
+        );
+        insert(
+            &conn,
+            "r-recent-fail-a",
+            "persona-a",
+            "bridge.cert_refresh_failed",
+            "2026-05-20T12:00:00Z",
+            r#"{"body":{}}"#,
+        );
+        insert(
+            &conn,
+            "r-recent-fail-b",
+            "persona-b",
+            "bridge.cert_refresh_failed",
+            "2026-05-20T12:30:00Z",
+            r#"{"body":{}}"#,
+        );
+        drop(conn);
+        let rows = run_audit_query_direct(
+            &db,
+            &QueryFilter {
+                kind: Some("bridge.cert_refresh_failed".to_string()),
+                persona: Some("persona-a".to_string()),
+                since_iso: Some("2026-05-01T00:00:00Z".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("query");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "r-recent-fail-a");
+    }
+
+    #[test]
     fn direct_query_filters_and_combine() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let db = dir.path().join("daemon.db");
@@ -728,6 +915,157 @@ mod tests {
         assert!(s.contains("WORKFLOW"));
         assert!(s.contains("tmpl1"));
         assert!(s.contains("total: 1"));
+    }
+
+    /// implementation-note-442:
+    /// `load_rotation_witness_envelopes` returns an empty vec when no
+    /// witnesses are stored. This is the normal case for fresh installs
+    /// and must not error.
+    #[test]
+    fn load_rotation_witness_envelopes_returns_empty_on_no_rows() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let db = dir.path().join("daemon.db");
+        let conn = make_db(&db);
+        // Seed an unrelated grant Receipt so the table isn't truly
+        // empty — the loader must filter to `identity.rotation_witness`
+        // kind only.
+        insert(
+            &conn,
+            "r-grant",
+            "persona-a",
+            "grant",
+            "2026-05-19T12:00:00Z",
+            r#"{"body":{}}"#,
+        );
+        drop(conn);
+        let envelopes =
+            load_rotation_witness_envelopes(&db).expect("loader must not error");
+        assert!(envelopes.is_empty());
+    }
+
+    /// implementation-note-442:
+    /// Multiple witnesses are returned sorted ascending by
+    /// `rotated_at_epoch_secs` regardless of insertion order. The chain
+    /// walker (`verify_receipt_v2_with_rotation_chain`) requires
+    /// monotonic-ascending input and rejects out-of-order chains.
+    #[test]
+    fn load_rotation_witness_envelopes_sorts_ascending_by_rotated_at() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let db = dir.path().join("daemon.db");
+        let conn = make_db(&db);
+
+        // Build minimal valid v2 envelopes whose body carries
+        // `rotated_at_epoch_secs`. The loader only inspects that field
+        // for sorting — the envelope signature surface is exercised by
+        // the chain-walker in core-events, not here.
+        let envelope_at = |rotated: u64| {
+            serde_json::json!({
+                "version": "2",
+                "receipt_id": format!("rcpt-{rotated}"),
+                "kind": "identity.rotation_witness",
+                "termination_authority": "daemon_persona",
+                "body": {
+                    "prev_epoch_root_id": "epoch-prev",
+                    "next_epoch_root_id": "epoch-next",
+                    "rotated_at_epoch_secs": rotated,
+                    "signature_by_prev_root": "sig-prev",
+                    "signature_by_next_root": "sig-next",
+                },
+                "daemon_root_id": "root-test",
+            })
+            .to_string()
+        };
+
+        // Insert in NON-ascending order to prove the loader sorts.
+        insert(
+            &conn,
+            "w-300",
+            "persona-a",
+            "identity.rotation_witness",
+            "2026-05-20T12:00:00Z",
+            &envelope_at(300),
+        );
+        insert(
+            &conn,
+            "w-100",
+            "persona-a",
+            "identity.rotation_witness",
+            "2026-05-19T12:00:00Z",
+            &envelope_at(100),
+        );
+        insert(
+            &conn,
+            "w-200",
+            "persona-a",
+            "identity.rotation_witness",
+            "2026-05-19T18:00:00Z",
+            &envelope_at(200),
+        );
+        drop(conn);
+
+        let envelopes = load_rotation_witness_envelopes(&db).expect("loader");
+        assert_eq!(envelopes.len(), 3);
+        let rotated_ats: Vec<u64> = envelopes
+            .iter()
+            .map(|e| {
+                e.body
+                    .get("rotated_at_epoch_secs")
+                    .and_then(|v| v.as_u64())
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            rotated_ats,
+            vec![100, 200, 300],
+            "loader must return chain ascending by rotated_at"
+        );
+    }
+
+    /// implementation-note-442:
+    /// Non-`identity.rotation_witness` kinds are excluded — the chain
+    /// walker would reject a non-witness anyway, but filtering at the
+    /// loader keeps the chain shape clean.
+    #[test]
+    fn load_rotation_witness_envelopes_excludes_non_witness_kinds() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let db = dir.path().join("daemon.db");
+        let conn = make_db(&db);
+        insert(
+            &conn,
+            "r-grant",
+            "persona-a",
+            "grant",
+            "2026-05-19T12:00:00Z",
+            r#"{"body":{}}"#,
+        );
+        insert(
+            &conn,
+            "r-kms",
+            "persona-a",
+            "kms_wrap",
+            "2026-05-19T12:30:00Z",
+            r#"{"body":{}}"#,
+        );
+        insert(
+            &conn,
+            "w-1",
+            "persona-a",
+            "identity.rotation_witness",
+            "2026-05-19T13:00:00Z",
+            &serde_json::json!({
+                "version": "2",
+                "receipt_id": "w-1",
+                "kind": "identity.rotation_witness",
+                "termination_authority": "daemon_persona",
+                "body": { "rotated_at_epoch_secs": 42 },
+                "daemon_root_id": "root-test",
+            })
+            .to_string(),
+        );
+        drop(conn);
+        let envelopes = load_rotation_witness_envelopes(&db).expect("loader");
+        assert_eq!(envelopes.len(), 1, "non-witness kinds must be filtered out");
+        assert_eq!(envelopes[0].receipt_id, "w-1");
     }
 
     #[test]

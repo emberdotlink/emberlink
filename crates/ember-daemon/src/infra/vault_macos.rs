@@ -60,7 +60,7 @@ use crate::infra::vault::{
 ///
 /// Mutex (not RwLock) because the read path also writes on first hit and the
 /// contention is negligible (a handful of vault opens per daemon lifetime).
-/// Per implementation-note-362: cache values are wrapped in
+/// Per implementation-note-372: cache values are wrapped in
 /// `Zeroizing<String>` so the unwrapped passphrase is overwritten when the
 /// cache entry is dropped (test reset, daemon shutdown, lock-then-clear
 /// flows). The HashMap key is the (service, account) identity tuple — those
@@ -177,7 +177,7 @@ pub fn get_password_user_presence(service: &str, account: &str) -> Result<Option
 /// immediately-following auto-unseal read.
 ///
 /// Note: if an entry already exists with a different SAC (e.g. from a
-/// pre-implementation-note-114 daemon that used `USER_PRESENCE`), the
+/// pre-implementation-note-117 daemon that used `USER_PRESENCE`), the
 /// underlying API replaces it with the new SAC-wrapped version. This is the
 /// documented one-shot upgrade path. Existing entries that pre-date this
 /// branch are NOT migrated automatically — they continue to function under
@@ -207,7 +207,7 @@ pub fn set_password_user_presence(
 
     // Pre-populate the session cache so the immediate read-back doesn't
     // double-prompt the user. Wrap the passphrase in `Zeroizing` so the
-    // cached copy is overwritten on drop (implementation-note-33 C3).
+    // cached copy is overwritten on drop (implementation-note-35 C3).
     let mut cache = SESSION_CACHE
         .lock()
         .expect("vault_macos session cache poisoned");
@@ -240,7 +240,7 @@ pub fn delete_password(service: &str, account: &str) -> Result<(), String> {
 
 /// Test-only: clear the in-process session cache. Lets unit AND integration
 /// tests assert the "first read prompts, second read doesn't" cache behaviour
-/// without needing a fresh process. Per implementation-note-362 the
+/// without needing a fresh process. Per implementation-note-372 the
 /// `_for_tests` suffix has been dropped — production lock paths now also
 /// call this fn (hard-lock semantics drop both the in-memory MEK and the
 /// SE-wrapped session cache).

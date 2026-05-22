@@ -1,7 +1,7 @@
 //! core-proxy-forward — HTTP CONNECT / forward-proxy primitives.
 //!
-//! Skeleton substrate landed in implementation-note-67; the
-//! actual forward-proxy logic migrates in a follow-up slice (implementation-note-68-
+//! Skeleton substrate landed in implementation-note-69; the
+//! actual forward-proxy logic migrates in a follow-up slice (implementation-note-70-
 //! CRATE-RENAME-C-MIGRATE, filed separately when needed).
 
 pub mod policy_backend;

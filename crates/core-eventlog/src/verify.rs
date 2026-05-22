@@ -19,8 +19,8 @@
 //! substrate; checks 4 and 5 (materialization correlation, workflow
 //! grant scope at issuance) require additional context this primitive
 //! does not own and are covered by follow-up tasks
-//! (`implementation-note-38`,
-//! `implementation-note-39`).
+//! (`implementation-note-40`,
+//! `implementation-note-41`).
 //!
 //! 1. **Envelope signature** — Ed25519 verify of `envelope.signature`
 //!    over `envelope.signed_bytes()` under `envelope.signer`, gated by
@@ -52,7 +52,7 @@
 //!
 //! # Checkpoint
 //!
-//! The checkpoint `audit_verify_cli_landed` (used by implementation-note-40
+//! The checkpoint `audit_verify_cli_landed` (used by implementation-note-42
 //! to confirm the substrate shipped) is anchored below.
 
 // anchor: audit_verify_cli_landed

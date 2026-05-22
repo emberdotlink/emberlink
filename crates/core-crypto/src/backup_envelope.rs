@@ -2,7 +2,7 @@
 //! material for cross-workstation operator portability + F-AUTHORITY-3/4
 //! recovery.
 //!
-//! Per design §Component 4 and implementation-note-30. The substrate
+//! Per design §Component 4 and implementation-note-32. The substrate
 //! is intentionally pure: `seal_backup` / `open_backup` consume only the
 //! envelope payload + a passphrase and return the sealed-blob bytes (or
 //! a recovered envelope). All operator UX (Touch ID prompts, Keychain

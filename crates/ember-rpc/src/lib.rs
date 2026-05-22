@@ -34,10 +34,10 @@
 //!
 //! `ember_rpc_phase_b_mtls_lane_landed` (also stamped in `main.rs`) is
 //! the `target_state_anchor` checkpoint for
-//! implementation-note-420.
+//! implementation-note-430.
 //!
 //! `ember_rpc_phase_c_mtls_listener_wired` (stamped in `listener.rs`) is
-//! the checkpoint for implementation-note-421.
+//! the checkpoint for implementation-note-431.
 
 pub mod listener;
 

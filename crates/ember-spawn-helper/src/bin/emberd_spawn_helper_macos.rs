@@ -2,7 +2,7 @@
 //! `emberd-spawn-helper-macos` — root-privileged LaunchDaemon for ADR
 //! 155 Component 3.
 //!
-//! implementation-note-182
+//! implementation-note-186
 //!
 //! ## Architecture
 //!

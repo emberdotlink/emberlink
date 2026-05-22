@@ -104,7 +104,7 @@ impl WorkflowTemplate {
         Ok(template)
     }
 
-    /// Validate the template's own fields. Called by [`parse`] but also
+    /// Validate the template's own fields. Called by [`Self::parse`] but also
     /// useful when a `WorkflowTemplate` is constructed programmatically.
     pub fn validate(&self) -> Result<(), WorkflowTemplateError> {
         validate_name(&self.name)?;

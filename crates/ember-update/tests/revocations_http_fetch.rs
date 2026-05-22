@@ -1,4 +1,4 @@
-//! T2 integration test for implementation-note-333.
+//! T2 integration test for implementation-note-342.
 //!
 //! Spawns a single-shot HTTP server on `127.0.0.1:0`, returns a canned
 //! `revocations/current.json` body, and asserts the
@@ -58,7 +58,7 @@ async fn t2_fetch_and_poll_critical_revocation_round_trip() {
         "revocations": [{
             "digest": "sha256:fakecritical",
             "severity": "critical",
-            "reason": "implementation-note-333 T2 fixture"
+            "reason": "implementation-note-342 T2 fixture"
         }],
         "issued_at_unix_secs": now
     })

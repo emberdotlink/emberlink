@@ -259,7 +259,7 @@ fn canonical_signed_bytes(
 
 #[cfg(test)]
 mod tests {
-    use core_crypto::{FixtureSigner, Verifier};
+    use core_crypto::FixtureSigner;
     use core_event_types::{EventBody, PersonaCreatedEvent, RootCreatedEvent};
     use core_principals::{KeyAlgorithm, PublicKeyMaterial, SurvivalMode};
 

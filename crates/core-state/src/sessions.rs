@@ -35,9 +35,9 @@ pub struct SessionMeta {
 ///   <session_id>/
 ///     meta.json          # written by `create`, removed by `close`
 ///     audit-gaps.jsonl   # placeholder — implementation-note-16 writes this
-///     permits-archive.jsonl  # placeholder — implementation-note-45 sidecar
+///     permits-archive.jsonl  # placeholder — implementation-note-47 sidecar
 ///     hook-errors.jsonl  # placeholder — implementation-note-16 panic catch
-///     receipt.json       # placeholder — implementation-note-45 termination receipt
+///     receipt.json       # placeholder — implementation-note-47 termination receipt
 /// ```
 ///
 /// `close` moves `meta.json` to `meta.json.closed` so the session directory
@@ -69,7 +69,7 @@ impl SessionStore {
         fs::write(&tmp_path, &json)?;
         fs::rename(&tmp_path, session_dir.join("meta.json"))?;
 
-        // Touch placeholder sidecar files so downstream tasks (implementation-note-45,
+        // Touch placeholder sidecar files so downstream tasks (implementation-note-47,
         // implementation-note-16) can append without creating their own directories.
         for name in &[
             "audit-gaps.jsonl",
@@ -106,7 +106,7 @@ impl SessionStore {
 
     /// Close a session by renaming `meta.json` → `meta.json.closed`.
     ///
-    /// The session directory stays on disk so sidecar writers (implementation-note-45,
+    /// The session directory stays on disk so sidecar writers (implementation-note-47,
     /// implementation-note-16) can still append to their files after termination.
     /// A no-op (returns `Ok(())`) when the session is already closed or does
     /// not exist.

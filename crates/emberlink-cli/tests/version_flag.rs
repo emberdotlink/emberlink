@@ -29,9 +29,9 @@ fn ember_bin() -> &'static str {
 /// the whole point of the flag.
 fn run_ember(args: &[&str]) -> (String, String, i32) {
     // ember-cli eager-loads ~/.ember/config.toml before dispatching subcommands
-    // (implementation-note-445 loud-fail). `version` subcommand doesn't
+    // (implementation-note-462 loud-fail). `version` subcommand doesn't
     // need the config but the eager-load fires anyway — see
-    // implementation-note-502 for the
+    // implementation-note-535 for the
     // structural fix. Until that ships, point EMBER_CONFIG at a fixture so
     // tests pass on hosts without ~/.ember/config.toml.
     let tmp = tempfile::tempdir().expect("config tempdir");

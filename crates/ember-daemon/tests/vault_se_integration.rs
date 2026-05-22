@@ -1,15 +1,15 @@
 //! T2 integration: SE-rooted vault path used by the design separate-uid daemon.
 //!
 //! This suite pins the end-to-end round-trip across the three components that
-//! the implementation-note-407-* task chain assembled:
+//! the implementation-note-417-* task chain assembled:
 //!
-//!   1. **implementation-note-408** — `install::provision_se_mek` generates
+//!   1. **implementation-note-418** — `install::provision_se_mek` generates
 //!      and SE-wraps the MEK passphrase, writing the blob to
 //!      `<data_dir>/vault-mek.bin`.
-//!   2. **implementation-note-409** — `infra::vault_macos_se::get_mek_passphrase`
+//!   2. **implementation-note-419** — `infra::vault_macos_se::get_mek_passphrase`
 //!      reads the blob back, calls `se_unwrap`, and returns the plaintext
 //!      passphrase.
-//!   3. **implementation-note-356** — `Vault::open_from_config` selects the
+//!   3. **implementation-note-366** — `Vault::open_from_config` selects the
 //!      SE path when `is_separate_uid_posture()` is true (HOME=/var/empty).
 //!
 //! The test verifies that a passphrase provisioned by step 1 can be recovered
@@ -81,7 +81,7 @@ fn vault_se_round_trip_under_separate_uid() {
     let passphrase =
         vault_macos_se::get_mek_passphrase(&data_dir).expect("get_mek_passphrase round-trip");
 
-    // The passphrase must be non-empty. implementation-note-408 writes a
+    // The passphrase must be non-empty. implementation-note-418 writes a
     // hex-encoded 32-byte MEK (64 ASCII chars); validate the shape.
     assert!(
         !passphrase.is_empty(),

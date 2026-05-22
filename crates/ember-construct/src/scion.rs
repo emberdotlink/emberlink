@@ -35,7 +35,7 @@ pub fn classify_scion_argv(argv: &[String]) -> Option<&'static str> {
 /// consumes server-side, not flags scion understands. This translation runs
 /// after `broker.resolve` and before exec'ing the upstream scion binary.
 ///
-/// Translation rules (implementation-note-100):
+/// Translation rules (implementation-note-103):
 ///   - Strip `--persona <X>` (daemon-side context, not scion CLI)
 ///   - Strip `--max-depth <N>` (capability check, not scion CLI)
 ///   - Strip `--brief <text>` (worker brief, not scion CLI)
@@ -164,7 +164,7 @@ mod tests {
         );
     }
 
-    // translate_scion_argv tests (implementation-note-100) ---
+    // translate_scion_argv tests (implementation-note-103) ---
 
     #[test]
     fn test_translate_strips_persona() {
@@ -426,7 +426,7 @@ mod t2_tests {
     /// Also verifies that the transaction emits `CredentialProvisioned` (not
     /// `CredentialResolveAborted`) — the receipt is correct.
     ///
-    /// Anchor: implementation-note-102.
+    /// Anchor: implementation-note-105.
     #[test]
     fn scion_start_translated_argv_reaches_exec_and_emits_provisioned_receipt() {
         let _guard = ENV_LOCK.lock().unwrap();

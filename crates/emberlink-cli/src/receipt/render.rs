@@ -81,7 +81,7 @@ fn render_actions_observed(entries: &[AuditEntry]) -> String {
 /// Per design §7: output targets <80 lines for a typical receipt.
 ///
 /// The `raw` parameter is reserved for design v2 sidecar compatibility and is
-/// a no-op today. When the v2 schema lands (implementation-note-45), `raw = true` will
+/// a no-op today. When the v2 schema lands (implementation-note-47), `raw = true` will
 /// include the full sidecar tier-mapping and tool-aware redaction fields.
 pub fn render_receipt_markdown(receipt: &GrantReceipt, _raw: bool) -> String {
     let mut out = String::new();
@@ -256,7 +256,7 @@ mod tests {
 
     #[test]
     fn raw_flag_currently_noop() {
-        // design v2 sidecar lands in implementation-note-45; today the flag is parsed
+        // design v2 sidecar lands in implementation-note-47; today the flag is parsed
         // but the rendering is identical regardless of value.
         let md_default = render_receipt_markdown(&fixture(), false);
         let md_raw = render_receipt_markdown(&fixture(), true);

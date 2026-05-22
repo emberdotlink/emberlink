@@ -29,7 +29,7 @@ use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::secure_enclave::{SeKeyHandle, se_pubkey_bytes, se_sign_with_touch_id};
+use crate::secure_enclave::{SeKeyHandle, se_pubkey_bytes, se_sign_with_touch_id_reason};
 
 // ---------------------------------------------------------------------------
 // OpenSSH agent wire constants (duplicated from ssh_agent.rs to keep modules
@@ -313,7 +313,11 @@ async fn handle_se_agent_connection(mut stream: UnixStream, session_key: Arc<SeS
                 match decode_sign_request_p256(body, &session_key.pubkey_blob) {
                     Some((data, _flags)) => {
                         // This call triggers Touch ID on a signed binary.
-                        match se_sign_with_touch_id(&session_key.handle, data) {
+                        match se_sign_with_touch_id_reason(
+                            &session_key.handle,
+                            data,
+                            "approve Ember SSH signing",
+                        ) {
                             Ok(der_sig) => encode_sign_response_p256(&der_sig),
                             Err(e) => {
                                 tracing::warn!(error = %e, "SE ssh-agent: sign failed");

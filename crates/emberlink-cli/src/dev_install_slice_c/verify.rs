@@ -13,7 +13,9 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
+
 use crate::dev_runtime::DevRuntimeEnv;
+use crate::dev_runtime_artifacts::runtime_artifacts;
 
 /// Post-install verification report produced by `verify_dev_install`.
 #[derive(Debug, Default)]
@@ -26,6 +28,8 @@ pub struct DevInstallVerifyReport {
     pub registered_broker_count: Option<usize>,
     /// Ed25519 fingerprints of registered trust roots (hex-encoded).
     pub trust_roots: Option<Vec<String>>,
+    /// Runtime binaries expected under the dev install root but absent.
+    pub missing_runtime_artifacts: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,6 +85,11 @@ pub fn verify_dev_install_with(
         report.trust_roots = ops.query_trust_roots(&socket_path);
     }
 
+    report.missing_runtime_artifacts = runtime_artifact_paths(runtime)
+        .into_iter()
+        .filter_map(|(binary_name, path)| (!ops.path_exists(&path)).then_some(binary_name))
+        .collect();
+
     Ok(report)
 }
 
@@ -105,6 +114,12 @@ pub fn readiness_issues(report: &DevInstallVerifyReport) -> Vec<String> {
         Some(roots) if roots.is_empty() => issues.push("trust root set is empty".to_string()),
         Some(_) => {}
     }
+    if !report.missing_runtime_artifacts.is_empty() {
+        issues.push(format!(
+            "missing staged runtime artifacts: {}",
+            report.missing_runtime_artifacts.join(", ")
+        ));
+    }
 
     issues
 }
@@ -120,6 +135,8 @@ pub trait VerifyOps {
     fn query_broker_count(&self, socket: &Path) -> Option<usize>;
     /// Query the dev daemon socket for registered trust-root fingerprints.
     fn query_trust_roots(&self, socket: &Path) -> Option<Vec<String>>;
+    /// Check whether an expected staged runtime path exists.
+    fn path_exists(&self, path: &Path) -> bool;
 }
 
 /// Production implementation of `VerifyOps`.
@@ -157,6 +174,10 @@ impl VerifyOps for DefaultVerifyOps {
                     .map(|root| root.fingerprint_hex)
                     .collect()
             })
+    }
+
+    fn path_exists(&self, path: &Path) -> bool {
+        path.exists()
     }
 }
 
@@ -246,6 +267,17 @@ fn dev_socket_path(runtime: &DevRuntimeEnv) -> Option<PathBuf> {
     Some(runtime.socket_path.clone())
 }
 
+fn runtime_artifact_paths(runtime: &DevRuntimeEnv) -> Vec<(String, PathBuf)> {
+    runtime_artifacts()
+        .into_iter()
+        .map(|artifact| {
+            let binary_name = artifact.binary_name.clone();
+            let path = artifact.installed_path(runtime);
+            (binary_name, path)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,6 +326,7 @@ mod tests {
         fingerprint: Option<String>,
         broker_count: Option<usize>,
         trust_roots: Option<Vec<String>>,
+        runtime_artifacts_present: bool,
     }
 
     impl VerifyOps for StubVerifyOps {
@@ -309,6 +342,10 @@ mod tests {
         fn query_trust_roots(&self, _: &Path) -> Option<Vec<String>> {
             self.trust_roots.clone()
         }
+
+        fn path_exists(&self, _: &Path) -> bool {
+            self.runtime_artifacts_present
+        }
     }
 
     #[test]
@@ -322,6 +359,7 @@ mod tests {
             fingerprint: Some("abcdef1234".to_string()),
             broker_count: Some(3),
             trust_roots: Some(vec!["sha256:aabbcc".to_string()]),
+            runtime_artifacts_present: true,
         };
         let report = verify_dev_install_with(&ops, &runtime).expect("verify must succeed");
         assert_eq!(report.daemon_pid, Some(42));
@@ -330,6 +368,10 @@ mod tests {
         assert_eq!(
             report.trust_roots.as_deref(),
             Some(["sha256:aabbcc".to_string()].as_slice())
+        );
+        assert!(
+            report.missing_runtime_artifacts.is_empty(),
+            "happy path should not report missing staged runtime artifacts"
         );
     }
 
@@ -345,6 +387,7 @@ mod tests {
             fingerprint: Some("aabbcc112233".to_string()),
             broker_count: None,
             trust_roots: None,
+            runtime_artifacts_present: true,
         };
         let report = verify_dev_install_with(&ops, &runtime)
             .expect("verify must return Ok even when daemon unreachable");
@@ -362,6 +405,10 @@ mod tests {
         );
         // Manifest fingerprint still readable.
         assert_eq!(report.manifest_fingerprint.as_deref(), Some("aabbcc112233"));
+        assert!(
+            report.missing_runtime_artifacts.is_empty(),
+            "daemon reachability should not imply missing staged artifacts"
+        );
     }
 
     #[test]
@@ -371,6 +418,7 @@ mod tests {
             manifest_fingerprint: Some("abc".to_string()),
             registered_broker_count: None,
             trust_roots: Some(Vec::new()),
+            missing_runtime_artifacts: Vec::new(),
         };
         let issues = readiness_issues(&report);
         assert!(issues.iter().any(|item| item.contains("PID")));
@@ -393,10 +441,29 @@ mod tests {
             manifest_fingerprint: Some("abc".to_string()),
             registered_broker_count: Some(3),
             trust_roots: Some(vec!["root".to_string()]),
+            missing_runtime_artifacts: Vec::new(),
         };
         assert!(
             readiness_issues(&report).is_empty(),
             "fully-populated report must be ready"
+        );
+    }
+
+    #[test]
+    fn readiness_issues_flags_missing_runtime_artifacts() {
+        let report = DevInstallVerifyReport {
+            daemon_pid: Some(7),
+            manifest_fingerprint: Some("abc".to_string()),
+            registered_broker_count: Some(3),
+            trust_roots: Some(vec!["root".to_string()]),
+            missing_runtime_artifacts: vec!["ember".to_string(), "ember-gh".to_string()],
+        };
+        let issues = readiness_issues(&report);
+        assert!(
+            issues
+                .iter()
+                .any(|item| item.contains("missing staged runtime artifacts")),
+            "expected runtime artifact gap, got: {issues:?}"
         );
     }
 

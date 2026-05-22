@@ -200,7 +200,7 @@ impl PresenceManager {
 /// check is also a write (last_activity bump).
 static MANAGER: Lazy<Mutex<PresenceManager>> = Lazy::new(|| Mutex::new(PresenceManager::new()));
 
-/// implementation-note-33 C2: register the daemon's `DaemonStore` so
+/// implementation-note-35 C2: register the daemon's `DaemonStore` so
 /// `lock()` can clear the shared live-vault slot on explicit lock. Called
 /// once at daemon startup from `runtime.rs` after the store is opened.
 ///
@@ -286,7 +286,7 @@ pub fn mark_unlocked() {
 /// subcommand; also called from any `lock-on-shutdown` handlers in the
 /// daemon supervisor.
 ///
-/// implementation-note-33 C2 — **hard-lock semantics**:
+/// implementation-note-35 C2 — **hard-lock semantics**:
 ///
 /// - Flips `SessionState` to `Locked`.
 /// - Clears the macOS SE-keyring session cache so the next interactive
@@ -842,7 +842,7 @@ mod tests {
         assert!(idle.is_none());
     }
 
-    /// implementation-note-33 C2: explicit `lock()` is hard-lock —
+    /// implementation-note-35 C2: explicit `lock()` is hard-lock —
     /// the registered `DaemonStore` no longer carries a vault handle
     /// after the call, so the next vault op MUST re-derive the MEK
     /// from the keyring (forces a fresh biometric on macOS).
@@ -872,7 +872,7 @@ mod tests {
         assert!(!unlocked, "explicit lock() must also flip session state");
     }
 
-    /// implementation-note-33 C3: the session-cache value type is
+    /// implementation-note-35 C3: the session-cache value type is
     /// `Zeroizing<String>` so dropping a cache entry overwrites the
     /// passphrase bytes in place. We assert the contract by allocating
     /// a `Zeroizing<String>`, snapshotting the inner pointer, dropping
@@ -910,7 +910,7 @@ mod tests {
         drop(wrapped);
     }
 
-    /// implementation-note-33 C2 partner: idle auto-lock retains
+    /// implementation-note-35 C2 partner: idle auto-lock retains
     /// soft-lock semantics — the vault stays Rc'd so background
     /// headless doesn't have to re-prompt. Only the session presence
     /// state flips.

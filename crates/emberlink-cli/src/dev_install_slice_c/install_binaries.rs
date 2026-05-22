@@ -35,11 +35,7 @@ pub fn install_binaries(
 
     let mut changed = Vec::new();
 
-    let sources: Vec<&PathBuf> = std::iter::once(&build.daemon_signed_path)
-        .chain(build.construct_signed_paths.iter())
-        .collect();
-
-    for src in sources {
+    for src in build.signed_paths() {
         let file_name = src
             .file_name()
             .ok_or_else(|| format!("source path has no filename: {}", src.display()))?;
@@ -127,42 +123,34 @@ mod tests {
         let src_dir = tempfile::tempdir().unwrap();
         let dst_dir = tempfile::tempdir().unwrap();
 
+        let cli_src = src_dir.path().join("ember");
+        fs::write(&cli_src, b"ember cli bytes").unwrap();
         let daemon_src = src_dir.path().join("emberd");
         fs::write(&daemon_src, b"emberd binary bytes").unwrap();
-        let construct_src = src_dir.path().join("ember-construct");
+        let construct_src = src_dir.path().join("ember-gh");
         fs::write(&construct_src, b"construct binary bytes").unwrap();
 
         let build = BuildSignResult {
+            cli_signed_path: cli_src.clone(),
             daemon_signed_path: daemon_src.clone(),
             construct_signed_paths: vec![construct_src.clone()],
         };
+        let changed =
+            install_binaries(&NoopRunner, &build, dst_dir.path()).expect("install_binaries");
 
-        // Temporarily override install root by pointing at a known dir.
-        // install_binaries uses DEV_INSTALL_ROOT, so we test the sha256 path
-        // and idempotency logic using direct sha256_file calls here.
-        let h_daemon = sha256_file(&daemon_src).unwrap();
-        let _h_construct = sha256_file(&construct_src).unwrap();
-
-        // Verify that copying the same bytes again would be a no-op.
-        let dest_daemon = dst_dir.path().join("emberd");
-        fs::copy(&daemon_src, &dest_daemon).unwrap();
-        let h_dest = sha256_file(&dest_daemon).unwrap();
+        assert_eq!(changed.len(), 3, "all absent binaries must be copied");
         assert_eq!(
-            h_daemon, h_dest,
-            "copied file must have same SHA-256 as source"
+            fs::read(dst_dir.path().join("ember")).unwrap(),
+            b"ember cli bytes"
         );
-
-        // Modify dest — hashes should now differ.
-        fs::write(&dest_daemon, b"different content").unwrap();
-        let h_modified = sha256_file(&dest_daemon).unwrap();
-        assert_ne!(
-            h_daemon, h_modified,
-            "modified dest must have different SHA-256"
+        assert_eq!(
+            fs::read(dst_dir.path().join("emberd")).unwrap(),
+            b"emberd binary bytes"
         );
-
-        // Unused build result: suppress warning.
-        let _ = build;
-        let _ = NoopRunner;
+        assert_eq!(
+            fs::read(dst_dir.path().join("ember-gh")).unwrap(),
+            b"construct binary bytes"
+        );
     }
 
     #[test]

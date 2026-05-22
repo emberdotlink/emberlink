@@ -14,4 +14,5 @@
 
 pub mod query;
 pub mod summary;
+pub mod usage;
 pub mod verify;

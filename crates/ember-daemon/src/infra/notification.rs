@@ -61,7 +61,6 @@ impl DaemonStore {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::infra::store::DaemonStore;
     use serde_json::json;
 

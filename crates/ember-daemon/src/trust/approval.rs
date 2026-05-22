@@ -481,7 +481,7 @@ pub struct ApprovalRequestInfo {
     pub target_summary: Option<String>,
     pub target_url: Option<String>,
     pub agent_framework: Option<String>,
-    /// implementation-note-226 — composite envelope statements (3-statement
+    /// implementation-note-233 — composite envelope statements (3-statement
     /// credential+session+time bundle minted by `ember sandbox run`)
     /// serialized as JSON when set. Surfaces as a single approval entry
     /// (NOT three) so the dashboard can render all three statements as
@@ -588,7 +588,7 @@ impl DaemonStore {
         )
     }
 
-    /// implementation-note-226 — submit ONE approval entry that bundles a 3-statement
+    /// implementation-note-233 — submit ONE approval entry that bundles a 3-statement
     /// composite envelope (credential + session + time). On `Approved` the
     /// resolver mints a single composite grant whose `blocks_json` is
     /// overwritten with the supplied statement list (matching the shape
@@ -937,7 +937,7 @@ impl DaemonStore {
     }
 
     /// Resolve an approval request with optional biometric attestation
-    /// metadata (implementation-note-230).
+    /// metadata (implementation-note-237).
     ///
     /// `biometric` records whether the approval was gated by a hardware
     /// biometric on the operator's device (Touch ID via LocalAuthentication
@@ -995,7 +995,7 @@ impl DaemonStore {
             committed: false,
         };
 
-        // implementation-note-226 — composite approvals stash their 3-statement envelope
+        // implementation-note-233 — composite approvals stash their 3-statement envelope
         // alongside the legacy single-statement fields, so the SELECT row
         // shape grew. Aliased to keep clippy happy.
         // REVIEW2-F2 — also fetch composite_statements_hash for integrity
@@ -1137,7 +1137,7 @@ impl DaemonStore {
 
         match outcome {
             ApprovalOutcome::Approved => {
-                // implementation-note-226 — for composite approvals the row is created
+                // implementation-note-233 — for composite approvals the row is created
                 // with scope "*" because the typed child statements
                 // (Credential / Session / Time) overwrite `blocks_json`
                 // immediately below; the flat `scope` column is a
@@ -1180,7 +1180,7 @@ impl DaemonStore {
 
                 self.apply_grant_shape_to_grant(&grant.id, &grant_shape)?;
 
-                // implementation-note-226 — when the approval bundles a composite envelope,
+                // implementation-note-233 — when the approval bundles a composite envelope,
                 // overwrite the freshly-minted single-statement grant's
                 // blocks_json with the canonical 3-statement composite chain.
                 // Mirrors the path the CLI sandbox-run handler used to take
@@ -1207,7 +1207,7 @@ impl DaemonStore {
                             "ttl_secs": ttl_secs,
                             "source": "approval",
                             "composite": composite_statements.is_some(),
-                            // implementation-note-230 — `biometric=true` indicates the
+                            // implementation-note-237 — `biometric=true` indicates the
                             // approval was attested by a hardware biometric on
                             // the operator's device (Touch ID via
                             // LocalAuthentication on the macOS CLI, or
@@ -1221,7 +1221,7 @@ impl DaemonStore {
                         .to_string(),
                     ),
                 );
-                // implementation-note-230 — also emit a dedicated `approval.approved`
+                // implementation-note-237 — also emit a dedicated `approval.approved`
                 // event so downstream auditors can filter on the approval
                 // beat without parsing `grant.issued` semantics.
                 let _ = self.log_event(
@@ -1251,7 +1251,7 @@ impl DaemonStore {
                      reason = ?2 WHERE id = ?3",
                     rusqlite::params![resolved_at, reason, id],
                 )?;
-                // implementation-note-230 — record the biometric posture on denial too
+                // implementation-note-237 — record the biometric posture on denial too
                 // so an auditor can distinguish "human rejected with TouchID"
                 // from "untouched timeout".
                 let _ = self.log_event(
@@ -1489,7 +1489,7 @@ impl DaemonStore {
             .ok_or(StoreError::NotFound)
     }
 
-    /// implementation-note-226 — overwrite a freshly-minted single-statement grant's
+    /// implementation-note-233 — overwrite a freshly-minted single-statement grant's
     /// `blocks_json` with the canonical 3-statement composite chain.
     ///
     /// Mirrors the path `ember sandbox run` previously took inline (signing
@@ -1652,7 +1652,7 @@ impl DaemonStore {
         Ok(count)
     }
 
-    /// implementation-note-221 — operator-initiated dismiss of a pending
+    /// implementation-note-228 — operator-initiated dismiss of a pending
     /// approval card. Sets status to `dismissed`, records an `approval.dismissed`
     /// audit event, and returns. Does NOT fire a desktop notification (the operator
     /// is already looking at the dashboard). Only `pending` rows can be dismissed;
@@ -2233,7 +2233,7 @@ mod tests {
         assert_eq!(still_pending.status, "pending");
     }
 
-    // --- implementation-note-226 — composite-grant approval flow ---
+    // --- implementation-note-233 — composite-grant approval flow ---
 
     fn demo_three_statements(credential: &str) -> Vec<Statement> {
         use core_grant_types::{Budget, ResourceSelector, ResourceType, Usage};
@@ -3285,7 +3285,7 @@ mod tests {
         );
     }
 
-    // --- implementation-note-221: dismiss_approval ---
+    // --- implementation-note-228: dismiss_approval ---
 
     #[test]
     fn dismiss_pending_approval_sets_status_dismissed() {
@@ -3445,7 +3445,7 @@ mod tests {
         );
     }
 
-    // --- implementation-note-393: T1 unit tests ---
+    // --- implementation-note-403: T1 unit tests ---
 
     /// T1: submit_approval_inner persists tool_name, target_host, target_url,
     /// and agent_framework; get_approval reads them back (not None).
@@ -3569,7 +3569,7 @@ mod tests {
         );
     }
 
-    // --- implementation-note-393: T2 round-trip via ApprovalLifecycle ---
+    // --- implementation-note-403: T2 round-trip via ApprovalLifecycle ---
 
     /// T2: SubmitMetadata carries notify fields → DaemonApprovalStoreRef persists them →
     /// get_approval returns them. This is the seam that was broken before this task.
@@ -3766,7 +3766,7 @@ mod tests {
         assert_eq!(
             pending.max_delegation_depth,
             Some(3),
-            "max_delegation_depth must round-trip via the approval row (the load-bearing implementation-note-249 regression)"
+            "max_delegation_depth must round-trip via the approval row (the load-bearing implementation-note-256 regression)"
         );
         assert_eq!(pending.max_uses_per_hour, Some(50));
         assert_eq!(pending.allowed_hours_start, Some(9));

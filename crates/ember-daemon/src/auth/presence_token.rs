@@ -25,7 +25,7 @@
 //! A minimal local abstraction that supports both sign and verify in a single
 //! trait object.  `core_crypto::Signer` only exposes `sign` + `public_key`; a
 //! full consolidation (re-exporting from `core-crypto`) is tracked in
-//! `implementation-note-119`.
+//! `implementation-note-122`.
 
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -70,6 +70,11 @@ impl ScopeKey {
     /// Pin the scope to a single JSON-RPC method name.
     pub fn new(method: &str) -> Self {
         ScopeKey(method.to_string())
+    }
+
+    /// Return the raw scope string stored in the token.
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -163,7 +168,7 @@ pub enum AuthError {
 ///
 /// `core_crypto::Signer` only exposes `sign` and `public_key`; a full
 /// consolidation that makes this trait redundant is tracked in
-/// `implementation-note-119`.
+/// `implementation-note-122`.
 pub trait DaemonSigner {
     fn sign(&self, msg: &[u8]) -> Bytes;
     fn verify(&self, msg: &[u8], sig: &[u8]) -> bool;

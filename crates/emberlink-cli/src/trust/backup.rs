@@ -1,6 +1,6 @@
 //! `ember trust backup --to <path>` — encrypted IR export.
 //!
-//! Per design §Component 4 and implementation-note-30. Reads the
+//! Per design §Component 4 and implementation-note-32. Reads the
 //! operator-IR + dev-IR private seeds from the macOS Keychain, builds
 //! a [`BackupEnvelope`] (CBOR), and seals it with a passphrase
 //! supplied by the operator via no-echo TTY prompt. Touch ID confirms
@@ -38,7 +38,7 @@ use ed25519_dalek::SigningKey;
 
 use crate::biometric::{BiometricError, BiometricOutcome, require_biometric};
 
-// trust_backup_restore_landed — checkpoint anchoring this PR (implementation-note-30).
+// trust_backup_restore_landed — checkpoint anchoring this PR (implementation-note-32).
 // Used by the failing-test grep `grep -c trust_backup_restore_landed ...` in the brief.
 
 /// Canonical macOS Keychain label for the operator IdentityRoot
@@ -211,8 +211,7 @@ fn pubkey_hex_from_seed(seed: &[u8; 32]) -> String {
 /// `trust.restore` Receipt at the other end of the lifecycle.
 pub fn path_hash_hex(path: &Path) -> String {
     let bytes = path.to_string_lossy().as_bytes().to_vec();
-    let digest = core_crypto::sha256_digest_hex(&bytes);
-    digest
+    core_crypto::sha256_digest_hex(&bytes)
 }
 
 /// Result returned by [`run_backup`] when the seal completes. The

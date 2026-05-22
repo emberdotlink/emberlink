@@ -1,9 +1,9 @@
-// implementation-note-238
+// implementation-note-245
 
-// dispatch_method_revoke_coverage_audited (implementation-note-239)
+// dispatch_method_revoke_coverage_audited (implementation-note-246)
 //
 // Audit date: 2026-05-15. Auditor: headless worker
-// implementation-note-239. Reviewer: operator (CODEOWNERS
+// implementation-note-246. Reviewer: operator (CODEOWNERS
 // gate on this file).
 //
 // Why this exists: design's cross-uid bridge claims per-statement revoke
@@ -42,14 +42,14 @@
 // ---------------------------------------------------------------------
 //
 //   ping                                EXEMPT — health probe, no auth surface
-//   evaluate_tool_call                  HOLE   — stub evaluator (implementation-note-87);
+//   evaluate_tool_call                  HOLE   — stub evaluator (implementation-note-89);
 //                                                does NOT check
 //                                                get_revoked_sids before
 //                                                returning Permit. See
 //                                                store.evaluate_tool_call
 //                                                in trust/grant.rs:2894.
 //                                                Filed: pending META
-//                                                implementation-note-240-
+//                                                implementation-note-247-
 //                                                TOOL-CALL-REVOKE-CHECK
 //                                                (orchestrator to file).
 //   create_persona                      EXEMPT — issues new persona; no
@@ -62,7 +62,7 @@
 //                                                revoke-coverage but
 //                                                surfaced in the same
 //                                                bridge gate). Filed as
-//                                                implementation-note-241-
+//                                                implementation-note-248-
 //                                                PERSONA-AUTHORITY.
 //   create_grant                        EXEMPT — mints a NEW grant; no
 //                                                pre-existing grant_id to
@@ -82,8 +82,8 @@
 //                                                child grant and bypass
 //                                                the revoke. Filed:
 //                                                pending META
-//                                                implementation-note-242-
-//                                                implementation-note-243
+//                                                implementation-note-249-
+//                                                implementation-note-250
 //                                                (orchestrator to file).
 //   list_grants                         EXEMPT — read-only projection;
 //                                                revoke status is
@@ -113,14 +113,14 @@
 //                                                fully-statement-revoked
 //                                                grant. Filed: pending
 //                                                META
-//                                                implementation-note-240-
-//                                                implementation-note-244
+//                                                implementation-note-247-
+//                                                implementation-note-251
 //                                                (orchestrator to file).
 //   use_credential                      COVERED — line ~1960 explicitly
 //                                                calls get_revoked_sids
 //                                                and refuses on revoked
 //                                                Credential Statement
-//                                                match (implementation-note-245-
+//                                                match (implementation-note-252-
 //                                                COMPOSITE-PER-STMT-
 //                                                REVOKE). Canonical
 //                                                pattern.
@@ -200,8 +200,8 @@
 //                                                rather than a security
 //                                                hole but inconsistent.
 //                                                Filed: pending META
-//                                                implementation-note-246-
-//                                                implementation-note-247
+//                                                implementation-note-253-
+//                                                implementation-note-254
 //                                                (orchestrator to file).
 //   request_access                      EXEMPT — mints a NEW grant via
 //                                                standing-grant or
@@ -244,7 +244,7 @@
 //                                                been revoked, with no
 //                                                indicator. Filed:
 //                                                pending META
-//                                                implementation-note-248-
+//                                                implementation-note-255-
 //                                                BUDGET-STATUS-REVOKE-
 //                                                PROJECTION
 //                                                (orchestrator to file).
@@ -272,8 +272,8 @@
 //                                                (workflow grant eval
 //                                                via the sidecar) that
 //                                                must enter the next
-//                                                pass of implementation-note-249-
-//                                                DAEMON-implementation-note-250-
+//                                                pass of implementation-note-256-
+//                                                DAEMON-implementation-note-257-
 //                                                COVERAGE-AUDIT. The
 //                                                workflow-grant
 //                                                revocation primitive
@@ -323,7 +323,7 @@
 //                                                been revoked will
 //                                                still unwrap. Filed:
 //                                                pending META
-//                                                implementation-note-251-
+//                                                implementation-note-258-
 //                                                UNWRAP-DEK-REVOKE-
 //                                                CHECK (orchestrator
 //                                                to file).
@@ -377,14 +377,14 @@
 //                                    evaluate_grant, extend_grant,
 //                                    grant_budget_status, sops_unwrap_dek)
 //   plus 1 cross-axis hole:       1 (revoke_persona authority — already
-//                                    filed implementation-note-252-
+//                                    filed implementation-note-259-
 //                                    AUTHORITY)
 //
 // Bridge readiness: NOT GREEN. The 6 revoke-coverage HOLEs above must be
 // fixed (or explicitly accepted as known-issue) before
-// implementation-note-253 ships. The DELEGATED handlers in
+// implementation-note-260 ships. The DELEGATED handlers in
 // `crate::broker` need their own audit pass under the same protocol
-// (filed: pending implementation-note-254,
+// (filed: pending implementation-note-261,
 // orchestrator to file).
 //
 // Re-run protocol: bump the audit date above and re-walk every arm
@@ -408,11 +408,14 @@ use core_grant_types::grant_receipt::{
 use core_personas::MtlsPrincipal;
 
 use crate::infra::audit::AuditFilter;
+use crate::infra::claim_journal::summarize_grant_scope_best_effort;
 use crate::infra::events::GrantEvent;
 use crate::infra::rate_limit::RateLimiter;
 use crate::infra::receipt::{
     current_identity,
-    issue::{TerminationMeta, issue_cohort_a_receipt},
+    issue::{
+        TerminationMeta, issue_cohort_a_receipt, issue_session_receipt_from_closed_scope,
+    },
     sign_vault_receipt,
 };
 use crate::infra::store::DaemonStore;
@@ -420,10 +423,12 @@ use crate::infra::vault::{Vault, VaultScope};
 use crate::trust::approval::{ApprovalRequestInfo, DaemonApprovalStoreRef, GrantShapeFields};
 use crate::trust::policy::{ApprovalRequirement, PolicyEngine};
 use crate::trust::presence::{self, GateOutcome, HighRiskOp};
-use core_events::receipt::{TerminationAuthority, TerminationReason};
+use core_events::receipt::{
+    RECEIPT_KIND_COMPOSITE_GRANT, TerminationAuthority, TerminationReason,
+};
 use core_grants::GrantState as CoreGrantState;
 
-// implementation-note-255: quarantine state. Flipped by the daemon
+// implementation-note-262: quarantine state. Flipped by the daemon
 // runtime's startup sampling verify (or any later detected break) so the
 // dispatch layer can refuse write-class socket methods while still allowing
 // read-class probes (audit_verify, audit_query, audit_log_query,
@@ -485,7 +490,7 @@ pub enum QuarantineAuthority {
     /// `/var/log/ember-audit-witness.log` has the wrong owner (e.g. the
     /// daemon's `ember` uid owns it, undermining the cross-trust-domain
     /// anchor). Surfaced by the periodic witness-integrity check
-    /// (implementation-note-256 in Phase C).
+    /// (implementation-note-263 in Phase C).
     WitnessOwnerMismatch,
 }
 
@@ -559,6 +564,58 @@ pub fn quarantine_authority() -> Option<QuarantineAuthority> {
     QUARANTINE_AUTHORITY.get().copied()
 }
 
+/// audit_repair_chain_rpc_landed — clear the quarantine latch on a
+/// successful operator-co-signed `audit.repair_chain` call. Per the
+/// v0.3-RC B4 acceptance criterion: a successful truncate-after-row
+/// repair exits quarantine-serve mode in-process (no daemon restart
+/// required). This narrows design v2 §1 Synthesis-1's
+/// "no in-process leave_quarantine" contract to: operator-co-signed
+/// repair is the ONLY in-process exit; every other quarantine entry
+/// still requires the restart-after-repair flow.
+///
+/// The companion `QUARANTINE_REASON` + `QUARANTINE_AUTHORITY`
+/// `OnceLock`s are NOT cleared — those record the entry-episode for
+/// forensics and the operator can still inspect them post-repair via
+/// `quarantine_reason()` / `quarantine_authority()`. The latch
+/// (`QUARANTINED` AtomicBool) is the only thing the dispatcher gate
+/// reads; clearing it suffices to re-enable write-class methods.
+///
+/// Called from `audit::truncate_after_row` after the SQLite COMMIT +
+/// receipt mint both succeed. Idempotent — a double-call no-ops.
+pub fn clear_quarantine_after_repair() {
+    let was_quarantined = QUARANTINED.swap(false, Ordering::Release);
+    if was_quarantined {
+        tracing::warn!(
+            authority = quarantine_authority()
+                .map(|a| a.as_str())
+                .unwrap_or("unrecorded"),
+            "audit_repair_chain_rpc_landed: quarantine cleared after operator-co-signed repair"
+        );
+    }
+}
+
+/// audit_repair_chain_rpc_landed — quarantine-allowed method whitelist.
+/// Per design v2 §1 R1 D3: a tamper-detected daemon refuses every
+/// write-class method EXCEPT `audit_repair_chain` (the operator-co-
+/// signed unbrick path) and the read-class diagnostic methods. This
+/// function wraps [`is_read_class_method`] with the single repair
+/// exception. The dispatcher uses this in lieu of `is_read_class_method`
+/// for the quarantine gate.
+pub fn quarantine_allowed_method(method: &str) -> bool {
+    is_read_class_method(method) || method == "audit_repair_chain"
+}
+
+/// audit_repair_chain_rpc_landed — test-only setter for the global
+/// `QUARANTINED` AtomicBool. Used by the B4 test suite to flip the
+/// quarantine latch WITHOUT touching `QUARANTINE_AUTHORITY` /
+/// `QUARANTINE_REASON` (both `OnceLock`s that contaminate sibling tests
+/// once set). Production callers MUST use [`enter_quarantine`] which
+/// records the entry-authority for forensics.
+#[cfg(test)]
+pub(crate) fn force_quarantine_latch_for_test(value: bool) {
+    QUARANTINED.store(value, Ordering::Release);
+}
+
 /// Read-class socket methods that proceed even when the daemon is
 /// quarantined. The principle: a tamper-detected daemon should still let
 /// the operator query the audit log to diagnose the break, but must refuse
@@ -594,10 +651,16 @@ fn is_read_class_method(method: &str) -> bool {
             | "status"
             | "vault_status"
             | "version"
+            // design §C4 — workflow_list / workflow_show are read-only
+            // operator surfaces. workflow_revoke is intentionally NOT
+            // read-class (it's a state mutation, even though authority
+            // is only ever removed).
+            | "workflow_list"
+            | "workflow_show"
     )
 }
 
-/// implementation-note-255 — socket-method handler that wraps the
+/// implementation-note-262 — socket-method handler that wraps the
 /// audit chain verifier primitive (`infra::audit::run_audit_verify`) for
 /// `dispatch_method`. Returns a JSON shape callers can format directly.
 ///
@@ -693,7 +756,7 @@ pub fn handle_audit_verify(
             "ok": false,
             "incomplete_repair": {
                 "receipt_id_orphan": receipt_id_orphan,
-                "remediation_id": "audit.chain_repair_finalize",
+                "remediation_id": "audit_repair_chain",
             },
             "tail": tail,
         }),
@@ -701,14 +764,14 @@ pub fn handle_audit_verify(
             "ok": false,
             "incomplete_repair_receipt": {
                 "tombstone_row_id": tombstone_row_id,
-                "remediation_id": "audit.chain_repair_finalize",
+                "remediation_id": "audit_repair_chain",
             },
             "tail": tail,
         }),
     })
 }
 
-/// implementation-note-28 (Tier 1) — subprocess
+/// implementation-note-30 (Tier 1) — subprocess
 /// observability without a session. A Construct shim that finds
 /// `EMBER_SESSION_ID` unset (or its classifier returning `None`) still
 /// passthrough-execs the wrapped binary, but emits this best-effort RPC
@@ -888,7 +951,7 @@ impl From<crate::infra::socket::PeerIdentity> for PeerCred {
 }
 
 /// Authority class required to dispatch a JSON-RPC method, per design
-/// §"Destination". Phase B (implementation-note-257)
+/// §"Destination". Phase B (implementation-note-264)
 /// declares the type + table; Phase B-enforce will gate dispatch on
 /// the lookup. **No enforcement in this slice.**
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -911,7 +974,7 @@ pub enum AuthorityClass {
 /// tier matrix.
 ///
 /// Phase B-enforce
-/// (implementation-note-258) flips the table
+/// (implementation-note-265) flips the table
 /// from telemetry-only to enforcing and classifies every currently-
 /// shipping JSON-RPC method:
 ///
@@ -986,7 +1049,7 @@ pub fn authority_class_for_method(method: &str) -> Option<AuthorityClass> {
         | "trust_show"
         | "trust.explain"
         | "trust_explain"
-        // implementation-note-178: refresh_cert
+        // implementation-note-182: refresh_cert
         // is read-class authority (produces a new cert from an existing
         // valid one; never escalates). Per design §Component 4.
         // Anchor: refresh_cert_dispatch_landed
@@ -999,14 +1062,22 @@ pub fn authority_class_for_method(method: &str) -> Option<AuthorityClass> {
         // no credentials, mutates no state. ConnectOnly mirrors the
         // adjacent `list_*` / `grant_status` / `vault_status` arms.
         | "status"
-        // implementation-note-28 (Tier 1):
+        // implementation-note-30 (Tier 1):
         // subprocess_audit_log is intentionally ConnectOnly. The handler
         // builds the action string from the vendor field (whitelist-
         // gated) and refuses any caller-supplied action prefix, so a
         // ConnectOnly peer cannot impersonate broker / vault / grant
         // actions. The write goes through the chain extender, which is
         // gated by quarantine and serialized via BEGIN IMMEDIATE.
-        | "subprocess_audit_log" => Some(AuthorityClass::ConnectOnly),
+        | "subprocess_audit_log"
+        // design §C4 — `workflow_revoke` is the load-bearing operator
+        // authority-control surface: "revoke is always safe — operator only
+        // ever removes authority." Classified ConnectOnly so an operator can
+        // kill a runaway agent even when the vault is locked or a presence
+        // token is unavailable. `workflow_list` / `workflow_show` are read-only.
+        | "workflow_revoke"
+        | "workflow_list"
+        | "workflow_show" => Some(AuthorityClass::ConnectOnly),
 
         // ---------------- OperatorPresence: mutating / sensitive ---
         //
@@ -1077,7 +1148,18 @@ pub fn authority_class_for_method(method: &str) -> Option<AuthorityClass> {
         | "register_session"
         | "close_session"
         | "headless_enroll"
-        | "headless_revoke" => Some(AuthorityClass::OperatorPresence),
+        | "headless_revoke"
+        // audit_repair_chain_rpc_landed (B4 + adversarial CRIT-2 fix
+        // 2026-05-22): the operator-co-signed audit-chain repair RPC
+        // MUST classify as OperatorPresence so the gate at
+        // `dispatch_method_with_context:2556` fires. Pre-fix it fell
+        // through to `_ => None` and the gate short-circuited —
+        // unauthenticated UDS peers could submit a self-signed
+        // RepairIntent and wipe the audit tail. The signature check
+        // inside the dispatcher arm is a defense-in-depth layer; the
+        // OperatorPresence + enrollment gate (handler:audit_repair_chain
+        // arm) is the load-bearing one.
+        | "audit_repair_chain" => Some(AuthorityClass::OperatorPresence),
 
         // ---------------- OperatorPresenceWithReattest ----------------
         //
@@ -1120,6 +1202,52 @@ fn operator_presence_privilege_reduction_method(method: &str) -> bool {
 fn operator_presence_token_optional_method(method: &str) -> bool {
     operator_presence_bootstrap_method(method)
         || operator_presence_privilege_reduction_method(method)
+}
+
+const PRESENCE_SCOPE_CLASS_VAULT: &str = "class:vault";
+const PRESENCE_SCOPE_CLASS_SESSION_RUNTIME: &str = "class:session-runtime";
+
+fn presence_scope_for_unlock_target(method: &str) -> Option<crate::auth::presence_token::ScopeKey> {
+    use crate::auth::presence_token::ScopeKey;
+
+    Some(match method {
+        "vault_unlock" => ScopeKey::new(PRESENCE_SCOPE_CLASS_VAULT),
+        "register_session" => ScopeKey::new(PRESENCE_SCOPE_CLASS_SESSION_RUNTIME),
+        _ if matches!(
+            authority_class_for_method(method),
+            Some(AuthorityClass::OperatorPresence)
+        ) =>
+        {
+            ScopeKey::new(method)
+        }
+        _ => return None,
+    })
+}
+
+fn presence_scope_allows_method(
+    scope: &crate::auth::presence_token::ScopeKey,
+    method: &str,
+) -> bool {
+    match scope.as_str() {
+        "*" => true,
+        PRESENCE_SCOPE_CLASS_VAULT => matches!(
+            method,
+            "vault_add" | "vault_list" | "vault_remove" | "vault_get" | "vault_migrate_acl"
+        ),
+        PRESENCE_SCOPE_CLASS_SESSION_RUNTIME => matches!(
+            method,
+            "use_credential"
+                | "evaluate_tool_call"
+                | "broker_issue"
+                | "broker_revoke"
+                | "broker_list"
+                | "broker_resolve"
+                | "broker_exec"
+                | "broker.mint_gh_token"
+                | "broker_register_pid_watcher"
+        ),
+        exact => exact == method,
+    }
 }
 
 /// Errors returned by the principal-binding layer.
@@ -1198,18 +1326,18 @@ pub struct RequestContext {
     /// `SessionMeta` + `receipt.json`. `None` for internal callers and test
     /// contexts that don't exercise the session lifecycle.
     pub sessions_dir: Option<std::path::PathBuf>,
-    /// implementation-note-259: bound LLM proxy
+    /// implementation-note-266: bound LLM proxy
     /// URL plumbed from the runtime after the proxy listener binds. Populated
     /// by `SocketListener::with_llm_proxy_url` and consumed by
     /// `register_session` instead of reading `EMBER_PROXY_URL` from the
     /// environment, which is unreliable across tokio worker threads (Rust
     /// 2024 `set_var` cross-thread visibility hazard).
     pub llm_proxy_url: Option<String>,
-    /// implementation-note-259: bound git proxy
+    /// implementation-note-266: bound git proxy
     /// URL plumbed from the runtime after the git proxy listener binds.
     /// Matches the pattern of `llm_proxy_url` above.
     pub git_proxy_url: Option<String>,
-    /// implementation-note-149 — kernel-attested
+    /// implementation-note-153 — kernel-attested
     /// (uid, pid, socket_path) triple captured at connection accept
     /// time. Threaded through to broker_issue / broker_revoke /
     /// broker_list / broker_exec / session.lookup_or_open so per-call
@@ -1229,7 +1357,7 @@ pub struct RequestContext {
     /// listener is the only path that populates this field; UDS
     /// callers always carry `None` here.
     pub mtls_principal: Option<MtlsPrincipal>,
-    /// implementation-note-260 —
+    /// implementation-note-267 —
     /// Phase D presence-token, attached by the JSON-RPC parser slice
     /// (D-3) from the `_presence_token` request parameter. When the
     /// dispatched method's authority class is `OperatorPresence`, the
@@ -1238,7 +1366,7 @@ pub struct RequestContext {
     /// methods, internal callers, and pre-D callers that have not yet
     /// been retro-fitted with token minting.
     pub presence_token: Option<crate::auth::presence_token::PresenceToken>,
-    /// implementation-note-261 — when set,
+    /// implementation-note-268 — when set,
     /// `enforce_local_state_gate` short-circuits with a synthetic peer
     /// (mirroring the existing `#[cfg(test)]` bypass arm). Only set by
     /// [`RequestContext::socket_for_test`], which is reachable only from
@@ -1335,7 +1463,7 @@ impl RequestContext {
     /// [`RequestContext::socket`] is unreachable from integration tests
     /// in `tests/` by Rust language semantics — integration tests link
     /// against the lib as if external and don't see cfg(test) blocks.
-    /// implementation-note-261.
+    /// implementation-note-268.
     pub fn socket_for_test(peer: PeerCred) -> Self {
         use crate::auth::presence_token::{ScopeKey, mint};
         use std::time::Duration;
@@ -1367,7 +1495,7 @@ impl RequestContext {
     /// (`socket::handle_connection`) once it has extracted the
     /// `(uid, pid, socket_path)` triple from the accepted stream.
     ///
-    /// implementation-note-149 — builder helper so the
+    /// implementation-note-153 — builder helper so the
     /// socket layer can stamp the principal without touching every
     /// constructor variant.
     pub fn with_peer_cred_principal(
@@ -1397,7 +1525,7 @@ impl RequestContext {
     /// payload carries an `_presence_token` field.
     ///
     /// `request_context_presence_token_builder`
-    /// (implementation-note-260) —
+    /// (implementation-note-267) —
     /// additive builder so existing constructors don't need updating.
     ///
     /// `None` is treated as no-op so this method composes cleanly with
@@ -1407,7 +1535,7 @@ impl RequestContext {
     /// (after `take_presence_token` returned None because the CLI request
     /// didn't carry one) would clobber the synthetic token and re-introduce
     /// the cross-crate "OperatorPresence missing presence_token" failure
-    /// mode that implementation-note-261
+    /// mode that implementation-note-268
     /// was filed to close.
     pub fn with_presence_token(
         mut self,
@@ -1485,8 +1613,9 @@ fn runtime_socket_dir_from_context(
 
 pub(crate) fn mint_operator_presence_token(
     peer: Option<&PeerCred>,
+    requested_method: &str,
 ) -> Result<Option<crate::auth::presence_token::PresenceToken>, (i32, String)> {
-    use crate::auth::presence_token::{ScopeKey, mint};
+    use crate::auth::presence_token::mint;
 
     let Some(peer) = peer else {
         return Ok(None);
@@ -1502,9 +1631,29 @@ pub(crate) fn mint_operator_presence_token(
         crate::trust::presence::current_config().idle_timeout,
         std::time::Duration::from_secs(60),
     );
-    Ok(Some(mint(peer.uid, ScopeKey::all(), ttl, &signer)))
+    let scope = presence_scope_for_unlock_target(requested_method).ok_or((
+        -32602,
+        format!("unknown or unsupported operator-presence unlock target '{requested_method}'"),
+    ))?;
+    Ok(Some(mint(peer.uid, scope, ttl, &signer)))
 }
 
+/// Real Ed25519-backed presence-token signer.
+///
+/// Wraps a borrowed `DaemonPersona` (Ed25519 keypair, design) so the
+/// presence-token mint/verify path goes through the daemon's real
+/// signing identity instead of a stub. The `DaemonSigner` impl below
+/// delegates `sign` to `persona.sign(msg)` and `verify` to
+/// `ed25519_dalek::Verifier::verify` against `persona.verifying_key()`.
+///
+/// Anchor: presence_signer_ed25519_wired
+///
+/// Anchors implementation-note-269: the stub
+/// primitive is gone — every presence-token signature this daemon
+/// emits is the same Ed25519 key surface that signs Receipts. See
+/// `crate::infra::receipt::DaemonPersona` for the Ed25519 key
+/// lifecycle and `crate::auth::presence_token::DaemonSigner` for the
+/// trait this type satisfies.
 struct DaemonIdentityPresenceSigner<'a> {
     persona: &'a crate::infra::receipt::DaemonPersona,
 }
@@ -1514,6 +1663,14 @@ impl<'a> DaemonIdentityPresenceSigner<'a> {
         Self { persona }
     }
 
+    /// Construct a signer from the process-singleton daemon identity.
+    ///
+    /// Returns `None` before `init_identity` has run (pre-startup or
+    /// failed key load). This is the canonical accessor — every
+    /// presence-token mint site goes through `current()` rather than
+    /// caching its own `DaemonPersona` reference, so a future
+    /// rotation/reload of the singleton flows through without
+    /// per-callsite changes.
     fn current() -> Option<Self> {
         crate::infra::receipt::current_identity().map(Self::new)
     }
@@ -1620,11 +1777,11 @@ pub fn clear_pid_persona_registry() {
     PID_PERSONA_REGISTRY.with(|reg| reg.borrow_mut().clear());
 }
 
-// implementation-note-151 — checkpoint.
+// implementation-note-155 — checkpoint.
 //
 // PERSONA_UID_REGISTRY retired — consult agent_socket_enrollments via
 // lookup_persona_uid_from_enrollments. See
-// implementation-note-262 for context.
+// implementation-note-270 for context.
 
 /// Resolve the calling persona for a peer credential.
 ///
@@ -1642,11 +1799,11 @@ pub fn peercred_principal(peer: &PeerCred) -> Result<String, HandlerError> {
     })
 }
 
-// implementation-note-263 — checkpoint for
+// implementation-note-271 — checkpoint for
 // target_state_anchor. This block extends the per-socket Persona
 // enrollment doctrine of design to the in-container case: agents
 // inside containers connect via per-agent UDS sockets at
-// `/run/emberd/agent-<uuid>.sock` (per implementation-note-150).
+// `/run/emberd/agent-<uuid>.sock` (per implementation-note-154).
 // emberd records `(socket_path, persona_id, grant_id, brief_content_hash)`
 // at spawn time; every RPC on that socket has identity resolved from
 // the enrollment table, NOT from wire-claimed `caller_persona_id` /
@@ -1654,7 +1811,7 @@ pub fn peercred_principal(peer: &PeerCred) -> Result<String, HandlerError> {
 // impersonate the orchestrator just by sending the orchestrator's
 // grant_id over its own socket.
 
-/// implementation-note-264 (design §"In-container
+/// implementation-note-272 (design §"In-container
 /// extension") — the kernel-attested-equivalent identity surfaced by
 /// the per-socket enrollment table when an RPC arrives on a per-agent
 /// UDS socket.
@@ -1671,7 +1828,7 @@ pub struct EnrolledPrincipal {
     pub brief_content_hash: String,
 }
 
-/// implementation-note-264 — directory prefix for
+/// implementation-note-272 — directory prefix for
 /// per-agent UDS sockets.
 ///
 /// Mirrors `crate::infra::socket::PER_AGENT_SOCKET_PARENT`. Kept as a
@@ -1679,7 +1836,7 @@ pub struct EnrolledPrincipal {
 /// operation and does not pull in the socket module's full surface.
 const PER_AGENT_SOCKET_DIR: &str = "/run/emberd/";
 
-/// implementation-note-264 — true when the supplied
+/// implementation-note-272 — true when the supplied
 /// socket path matches the per-agent UDS shape
 /// (`/run/emberd/agent-*.sock`).
 ///
@@ -1715,7 +1872,7 @@ pub fn is_per_agent_socket_path(socket_path: &std::path::Path) -> bool {
     true
 }
 
-/// implementation-note-264 — resolve the
+/// implementation-note-272 — resolve the
 /// kernel-attested-equivalent principal for a per-agent UDS socket.
 ///
 /// Reads the `agent_socket_enrollments` row keyed by `socket_path`
@@ -1729,7 +1886,7 @@ pub fn is_per_agent_socket_path(socket_path: &std::path::Path) -> bool {
 /// Returns `HandlerError::PrincipalNotEnrolled` when no `active`
 /// row exists for the supplied path (revoked rows count as missing —
 /// the store helper filters them).
-// implementation-note-263 — checkpoint for target_state_anchor
+// implementation-note-271 — checkpoint for target_state_anchor
 pub fn enroll_container_persona(
     store: &DaemonStore,
     socket_path: &std::path::Path,
@@ -1820,7 +1977,7 @@ pub async fn dispatch_method(
     method: &str,
     params: &Value,
 ) -> Result<Value, (i32, String)> {
-    // implementation-note-258: the per-method
+    // implementation-note-265: the per-method
     // authority gate moved into `dispatch_method_with_context` (the
     // production choke point all socket-layer entry points converge
     // on). This test wrapper constructs a `DispatchSource::Internal`
@@ -2104,7 +2261,7 @@ pub async fn dispatch_method_with_source(
     method: &str,
     params: &Value,
 ) -> Result<Value, (i32, String)> {
-    // implementation-note-258: under `#[cfg(test)]`,
+    // implementation-note-265: under `#[cfg(test)]`,
     // Synthesize a kernel-attested peer when the caller specified a
     // `Socket` source. Pre-existing test fixtures call this shim with
     // `peer: None` because they predate per-method authority gating;
@@ -2126,7 +2283,7 @@ pub async fn dispatch_method_with_source(
     #[cfg(not(test))]
     let synthetic_peer: Option<PeerCred> = None;
 
-    // implementation-note-260: under
+    // implementation-note-267: under
     // `#[cfg(test)]`, also synthesize a valid presence_token bound to
     // the synthetic peer's uid so legacy tests that exercise
     // OperatorPresence-class methods through this shim continue to
@@ -2174,7 +2331,7 @@ pub async fn dispatch_method_with_source(
     .await
 }
 
-/// implementation-note-258 — set the cohort A
+/// implementation-note-265 — set the cohort A
 /// dev0 bridge env var process-wide for the duration of the test
 /// binary's run, exactly once.
 ///
@@ -2226,7 +2383,7 @@ pub async fn dispatch_method_with_context(
 ) -> Result<Value, (i32, String)> {
     let source = ctx.source;
 
-    // implementation-note-264 (design §"In-container
+    // implementation-note-272 (design §"In-container
     // extension"): when the RPC arrived on a per-agent UDS socket
     // (`/run/emberd/agent-<uuid>.sock`), the calling principal is
     // resolved from the `agent_socket_enrollments` table rather than
@@ -2328,7 +2485,7 @@ pub async fn dispatch_method_with_context(
         let mut p = params.clone();
         if let Value::Object(obj) = &mut p {
             // enrolled_principal_overlay_extends_persona_params:
-            // implementation-note-265 closes the
+            // implementation-note-273 closes the
             // cross-persona authz bypass where evaluate_tool_call(persona =
             // other) read the wire param instead of the kernel-attested
             // (per-agent UDS) or cert-attested (mTLS) identity. Insert ALL
@@ -2355,7 +2512,7 @@ pub async fn dispatch_method_with_context(
         None => params,
     };
 
-    // enrolled_principal_overlay_propagates_to_ctx (implementation-note-266-
+    // enrolled_principal_overlay_propagates_to_ctx (implementation-note-274-
     // TESTS-PRE-EXISTING-FAILURES): also stamp the resolved persona_id onto
     // `ctx.principal` so `resolve_caller_principal` (handlers/support.rs) sees
     // the pre-resolved identity at step 1 and does NOT short-circuit on the
@@ -2370,14 +2527,22 @@ pub async fn dispatch_method_with_context(
         ctx.principal = Some(persona_id.clone());
     }
 
-    // implementation-note-255: quarantine gate. When the daemon
+    // implementation-note-262: quarantine gate. When the daemon
     // has detected a tampered audit chain, refuse any non-read-class
     // socket method so the chain cannot be extended over the break and
     // state mutations cannot mask the tamper. Read-class methods (ping,
     // audit_verify, audit_query, …) still proceed so the operator can
     // diagnose. Internal callers (in-process test harness, recovery
     // CLIs) are NOT exempted — quarantine is a hard latch.
-    if is_quarantined() && !is_read_class_method(method) {
+    //
+    // audit_repair_chain_rpc_landed — `audit_repair_chain` is the
+    // ONE write-class method allowed through this gate per design v2
+    // §1 R1 D3. `quarantine_allowed_method` wraps
+    // `is_read_class_method` with that single exception so the gate
+    // logic remains "default-deny + named whitelist." The repair RPC
+    // re-runs the operator-co-signature check internally; this gate
+    // doesn't substitute for that authority check.
+    if is_quarantined() && !quarantine_allowed_method(method) {
         // design v2 §1 + adversarial review HIGH-4: do NOT include the
         // free-text quarantine reason in the wire response. The reason
         // string is sourced from local SQLite (`expected_hash`,
@@ -2402,7 +2567,7 @@ pub async fn dispatch_method_with_context(
         ));
     }
 
-    // implementation-note-258: per-method
+    // implementation-note-265: per-method
     // authority gate. Cohort A's current local path uses the socket
     // listener's peer-cred gate for ConnectOnly and a daemon-signed
     // presence-token bound to that peer uid for OperatorPresence.
@@ -2524,6 +2689,22 @@ pub async fn dispatch_method_with_context(
                 .to_string(),
             ));
         }
+        if !presence_scope_allows_method(&token.scope, method) {
+            tracing::warn!(
+                method = %method,
+                peer_uid = peer_uid,
+                scope = token.scope.as_str(),
+                "dispatch_method: presence_token scope mismatch"
+            );
+            return Err((
+                -32001,
+                json!({
+                    "error": "authority_class_not_met",
+                    "reason": "scope-mismatch"
+                })
+                .to_string(),
+            ));
+        }
         let (unlocked, _) = presence::snapshot();
         if !unlocked {
             return Err((
@@ -2547,11 +2728,11 @@ pub async fn dispatch_method_with_context(
             "presence_token_mint is not a shipped generic CLI authority surface".to_string(),
         )),
 
-        // implementation-note-87: Claude Code PreToolUse hook entry point.
+        // implementation-note-89: Claude Code PreToolUse hook entry point.
         // The proxy hook (`ember-proxy/src/claude_code_hook.rs`) calls
         // this with the parsed `tool_name` + `params` + `session_id`,
         // and the daemon performs grant lookup + audit emit + decision.
-        // Real evaluator integration lands in implementation-note-88; this path is
+        // Real evaluator integration lands in implementation-note-90; this path is
         // a Permit-stub on grant-hit, Deny on grant-miss.
         "evaluate_tool_call" => {
             let persona = params["persona"]
@@ -2998,7 +3179,7 @@ pub async fn dispatch_method_with_context(
             } else {
                 None
             };
-            // implementation-note-267: load via DaemonGrantStore to obtain
+            // implementation-note-275: load via DaemonGrantStore to obtain
             // core_grants::Grant at the state-machine boundary. Ownership
             // checks below use `parent_grant.issuer.0` (persona_id) directly.
             // TODO: delegate_grant log_event credential_name
@@ -3032,7 +3213,7 @@ pub async fn dispatch_method_with_context(
                     );
                     return Err(HandlerError::PrincipalMismatch.to_jsonrpc());
                 }
-                // implementation-note-267: compare against issuer.0 (core_grants::PrincipalId).
+                // implementation-note-275: compare against issuer.0 (core_grants::PrincipalId).
                 if principal != parent_grant.issuer.0 {
                     tracing::warn!(
                         caller_persona_id = %principal,
@@ -3384,7 +3565,7 @@ pub async fn dispatch_method_with_context(
             let id = params["id"]
                 .as_str()
                 .ok_or((-32602, "missing 'id'".to_string()))?;
-            // implementation-note-267: load via DaemonGrantStore for issuer.
+            // implementation-note-275: load via DaemonGrantStore for issuer.
             // credential_name lives on GrantInfo (the SQL row projection),
             // not on core_grants::Grant — fetch both so the audit row carries
             // the credential identity.
@@ -3402,21 +3583,38 @@ pub async fn dispatch_method_with_context(
             // session_id derived from the grant_id so the Receipt envelope is
             // well-formed (spec option (a)).
             let synthetic_session_id = format!("grant:{id}");
+            let grant_claim_summary =
+                summarize_grant_scope_best_effort(store, id, "dispatch_method_with_context::revoke_grant");
             if let Some(identity) = current_identity() {
                 let signer = crate::session::lifecycle::DaemonPersonaSigner::new(identity);
-                match issue_cohort_a_receipt(
-                    &synthetic_session_id,
-                    Vec::new(),
-                    None,
-                    TerminationAuthority::DaemonPersona,
-                    &identity.pubkey_hex(),
-                    Some(TerminationMeta {
-                        reason: TerminationReason::ExplicitRevoke,
-                        last_heartbeat_at: None,
-                        pid_alive_at_check: None,
-                    }),
-                    &signer,
-                ) {
+                let termination = Some(TerminationMeta {
+                    reason: TerminationReason::ExplicitRevoke,
+                    last_heartbeat_at: None,
+                    pid_alive_at_check: None,
+                });
+                let envelope_result = if let Some(summary) = grant_claim_summary.as_ref() {
+                    issue_session_receipt_from_closed_scope(
+                        RECEIPT_KIND_COMPOSITE_GRANT,
+                        &synthetic_session_id,
+                        summary,
+                        None,
+                        TerminationAuthority::DaemonPersona,
+                        &identity.pubkey_hex(),
+                        termination,
+                        &signer,
+                    )
+                } else {
+                    issue_cohort_a_receipt(
+                        &synthetic_session_id,
+                        Vec::new(),
+                        None,
+                        TerminationAuthority::DaemonPersona,
+                        &identity.pubkey_hex(),
+                        termination,
+                        &signer,
+                    )
+                };
+                match envelope_result {
                     Ok(envelope) => {
                         // Persist the Receipt sidecar if a sessions_dir is
                         // available. Best-effort: a write failure does not
@@ -3485,7 +3683,7 @@ pub async fn dispatch_method_with_context(
             Ok(json!({"revoked": true}))
         }
 
-        // implementation-note-268 — revoke a single Statement
+        // implementation-note-276 — revoke a single Statement
         // within a composite grant. The grant remains active; only requests
         // resolving to the named sid are denied at the proxy + use_credential
         // boundaries.
@@ -3548,7 +3746,7 @@ pub async fn dispatch_method_with_context(
                 String,
                 Option<crate::trust::grant::GrantInfo>,
             ) = if let Some(grant_id) = params["grant_id"].as_str() {
-                // Load core_grants::Grant for state-machine checks (implementation-note-267).
+                // Load core_grants::Grant for state-machine checks (implementation-note-275).
                 let core_grant = store
                     .grant_store()
                     .load_grant(grant_id)
@@ -3576,7 +3774,7 @@ pub async fn dispatch_method_with_context(
                     }
                     other => (-32000, other.to_string()),
                 })?;
-                // implementation-note-269: when the caller passes
+                // implementation-note-277: when the caller passes
                 // both grant_id AND credential_name, honor the caller's
                 // value if it's bound to a Credential Statement on the
                 // grant's chain. Composite grants carry multiple
@@ -3634,7 +3832,7 @@ pub async fn dispatch_method_with_context(
                     .map_err(|e| (-32000, format!("no active grant: {e}")))?
             };
 
-            // implementation-note-268 — block credential reads
+            // implementation-note-276 — block credential reads
             // when the Credential Statement that authorizes THIS specific
             // credential_name has been revoked. The previous shape blocked
             // ALL credential reads if ANY credential statement was revoked,
@@ -3768,7 +3966,7 @@ pub async fn dispatch_method_with_context(
             crate::infra::interactive_unlock::ensure_vault_for_explicit_unlock(store)
                 .map_err(|msg| (-32030, msg))?;
             crate::infra::interactive_unlock::arm_non_session_grace_window();
-            let token = mint_operator_presence_token(ctx.peer.as_ref())?;
+            let token = mint_operator_presence_token(ctx.peer.as_ref(), "vault_unlock")?;
             let mut response = json!({"unlocked": true});
             if let Some(token) = token {
                 response["presence_token"] = serde_json::to_value(token)
@@ -3790,9 +3988,17 @@ pub async fn dispatch_method_with_context(
                     -32030,
                     "vault_unlock_begin: interactive unlock config not registered".to_string(),
                 ))?;
+                let requested_method = params["requested_method"]
+                    .as_str()
+                    .unwrap_or("vault_unlock");
+                let scope = presence_scope_for_unlock_target(requested_method).ok_or((
+                    -32602,
+                    format!("vault_unlock_begin: unsupported requested_method '{requested_method}'"),
+                ))?;
                 let begin = crate::infra::native_biometric_unlock::begin(
                     &config.data_dir,
-                    "Unlock the daemon vault for operator commands",
+                    "unlock your Ember vault",
+                    scope.as_str(),
                 )
                 .map_err(|msg| (-32030, format!("vault_unlock_begin: {msg}")))?;
                 serde_json::to_value(begin)
@@ -3830,7 +4036,7 @@ pub async fn dispatch_method_with_context(
                     -32030,
                     "vault_unlock_complete: interactive unlock config not registered".to_string(),
                 ))?;
-                crate::infra::native_biometric_unlock::complete(
+                let completed = crate::infra::native_biometric_unlock::complete(
                     &config.data_dir,
                     request_id,
                     public_key_hex,
@@ -3840,7 +4046,29 @@ pub async fn dispatch_method_with_context(
                 crate::infra::interactive_unlock::ensure_vault_for_explicit_unlock(store)
                     .map_err(|msg| (-32030, msg))?;
                 crate::infra::interactive_unlock::arm_non_session_grace_window();
-                let token = mint_operator_presence_token(ctx.peer.as_ref())?;
+                let token = match ctx.peer {
+                    Some(peer) => {
+                        let identity = crate::infra::receipt::current_identity().ok_or((
+                            -32000,
+                            "daemon identity not initialised — cannot mint operator presence token"
+                                .to_string(),
+                        ))?;
+                        let signer = DaemonIdentityPresenceSigner::new(identity);
+                        let ttl = std::cmp::max(
+                            crate::trust::presence::current_config().idle_timeout,
+                            std::time::Duration::from_secs(60),
+                        );
+                        Some(crate::auth::presence_token::mint(
+                            peer.uid,
+                            crate::auth::presence_token::ScopeKey::new(
+                                &completed.presence_scope_key,
+                            ),
+                            ttl,
+                            &signer,
+                        ))
+                    }
+                    None => None,
+                };
                 let mut response = json!({"unlocked": true});
                 if let Some(token) = token {
                     response["presence_token"] = serde_json::to_value(token).map_err(|e| {
@@ -4026,13 +4254,200 @@ pub async fn dispatch_method_with_context(
             crate::infra::handlers::binary_pin::handle_generate(store, source, params)
         }
 
-        // implementation-note-255 (A): socket method that exposes
+        // implementation-note-262 (A): socket method that exposes
         // the audit-chain verifier primitive shipped in #2998. Walks the
         // last `tail` rows (or full chain when omitted) and returns a
         // shape callers (`ember audit verify` CLI) can render directly.
         "audit_verify" => {
             let tail = params["tail"].as_u64().map(|n| n as usize);
             handle_audit_verify(store, tail)
+        }
+
+        // audit_repair_chain_rpc_landed — design v2 §2 / B4 operator
+        // -co-signed audit-chain repair RPC. Allowed while quarantined
+        // (the ONLY write-class method on `quarantine_allowed_method`).
+        // Wire shape:
+        //   params: {
+        //     "from_row_id": i64,
+        //     "repair_kind": "truncate" | "tombstone_segment",
+        //     "operator_signature_hex": "<128-hex>",
+        //     "operator_pubkey":         "ed25519:<hex>",
+        //     "current_chain_tip_hash":  "<hex>",
+        //     "daemon_identity_root_fingerprint": "<hex>",
+        //   }
+        // returns: { "ok": true, "repair_id", "new_chain_tip_hash",
+        //            "tombstone_row_id", "truncated_row_count" }
+        "audit_repair_chain" => {
+            use crate::infra::audit::{
+                RepairError, RepairIntent, RepairKind, RepairOutcome, truncate_after_row,
+                verify_repair_intent_signature,
+            };
+
+            // audit_repair_chain_rpc_landed (B4 + adversarial CRIT-3
+            // fix 2026-05-22): refuse repair on a healthy chain.
+            // Pre-fix this RPC was callable on any daemon, letting a
+            // valid RepairIntent wipe legitimate audit history. The
+            // design v2 contract is "repair is the operator's unbrick
+            // path FROM quarantine"; gating on `is_quarantined()`
+            // structurally encodes that contract.
+            if !is_quarantined() {
+                tracing::warn!(
+                    method = "audit_repair_chain",
+                    peer_uid = ?ctx.peer.as_ref().map(|p| p.uid),
+                    "audit_repair_chain refused: daemon not in quarantine-serve mode"
+                );
+                return Err((
+                    -32602,
+                    "audit_repair_chain refused: daemon is not in quarantine-serve mode \
+                     (repair is only valid as the unbrick path FROM a detected chain \
+                     break — call `audit_verify` first)"
+                        .to_string(),
+                ));
+            }
+
+            // Parse params with explicit error mapping so the dispatcher
+            // returns -32602 (invalid params) for shape errors vs -32401
+            // (authority) for signature failures vs -32603 (internal).
+            let from_row_id = params["from_row_id"]
+                .as_i64()
+                .ok_or((-32602, "missing or non-integer 'from_row_id'".to_string()))?;
+            let repair_kind_str = params["repair_kind"].as_str().ok_or((
+                -32602,
+                "missing 'repair_kind' (must be 'truncate' or 'tombstone_segment')".to_string(),
+            ))?;
+            let repair_kind = match repair_kind_str {
+                "truncate" => RepairKind::Truncate,
+                "tombstone_segment" => RepairKind::TombstoneSegment,
+                other => {
+                    return Err((
+                        -32602,
+                        format!(
+                            "unknown repair_kind '{other}' (allowed: 'truncate', 'tombstone_segment')"
+                        ),
+                    ));
+                }
+            };
+            let operator_signature_hex = params["operator_signature_hex"]
+                .as_str()
+                .ok_or((-32602, "missing 'operator_signature_hex'".to_string()))?;
+            let operator_signature = hex::decode(operator_signature_hex).map_err(|e| {
+                (
+                    -32602,
+                    format!("operator_signature_hex is not valid hex: {e}"),
+                )
+            })?;
+            let operator_pubkey = params["operator_pubkey"]
+                .as_str()
+                .ok_or((-32602, "missing 'operator_pubkey'".to_string()))?
+                .to_string();
+            let current_chain_tip_hash = params["current_chain_tip_hash"]
+                .as_str()
+                .ok_or((-32602, "missing 'current_chain_tip_hash'".to_string()))?
+                .to_string();
+            let daemon_identity_root_fingerprint = params
+                ["daemon_identity_root_fingerprint"]
+                .as_str()
+                .ok_or((
+                    -32602,
+                    "missing 'daemon_identity_root_fingerprint'".to_string(),
+                ))?
+                .to_string();
+
+            let intent = RepairIntent {
+                from_row_id,
+                repair_kind,
+                operator_signature,
+                operator_pubkey: operator_pubkey.clone(),
+                current_chain_tip_hash,
+                daemon_identity_root_fingerprint,
+            };
+
+            // audit_repair_chain_rpc_landed (B4 + adversarial CRIT-1
+            // fix 2026-05-22): bind the RepairIntent's operator_pubkey
+            // to an enrolled persona's identity-root pubkey. Pre-fix,
+            // the dispatcher accepted ANY Ed25519 keypair — a UDS peer
+            // could mint a fresh key, self-sign, and wipe the chain.
+            // design v2 §4 contract is "Ed25519 by an enrolled
+            // operator persona's identity-root." Persona `public_key`
+            // shape is `ed25519:<hex>` (per `persona.rs:505`),
+            // matching `intent.operator_pubkey` directly.
+            let enrolled = store.list_personas().map_err(|e| {
+                (
+                    -32603,
+                    format!(
+                        "audit_repair_chain: enumerate enrolled personas failed: {e}"
+                    ),
+                )
+            })?;
+            let pubkey_enrolled = enrolled
+                .iter()
+                .any(|p| p.public_key == intent.operator_pubkey);
+            if !pubkey_enrolled {
+                tracing::warn!(
+                    method = "audit_repair_chain",
+                    peer_uid = ?ctx.peer.as_ref().map(|p| p.uid),
+                    "audit_repair_chain refused: operator_pubkey not enrolled"
+                );
+                return Err((
+                    -32401,
+                    "audit_repair_chain: operator_pubkey is not enrolled as a persona on \
+                     this daemon (signature-binding gate per design v2 §4)"
+                        .to_string(),
+                ));
+            }
+
+            // Authority gate: operator co-signature MUST verify before
+            // any state mutation. Refusal returns -32401 (authority class
+            // not met) — distinct from -32603 (internal) so the caller
+            // surfaces the right operator-facing message.
+            verify_repair_intent_signature(&intent).map_err(|e| match e {
+                RepairError::OperatorSignatureInvalid => (
+                    -32401,
+                    "audit_repair_chain: operator co-signature verification failed".to_string(),
+                ),
+                RepairError::OperatorPubkeyInvalid(msg) => (
+                    -32401,
+                    format!("audit_repair_chain: operator_pubkey malformed: {msg}"),
+                ),
+                other => (-32603, format!("audit_repair_chain: {other}")),
+            })?;
+
+            let outcome = truncate_after_row(store, &intent).map_err(|e| match e {
+                RepairError::OperatorSignatureInvalid => (-32401, e.to_string()),
+                RepairError::OperatorPubkeyInvalid(_) => (-32401, e.to_string()),
+                RepairError::DaemonFingerprintMismatch { .. } => (-32401, e.to_string()),
+                RepairError::ChainTipMismatch { .. } => (-32602, e.to_string()),
+                RepairError::FromRowIdMissing(_) => (-32602, e.to_string()),
+                RepairError::UnsupportedRepairKind(_) => (-32602, e.to_string()),
+                other => (-32603, format!("audit_repair_chain: {other}")),
+            })?;
+
+            match outcome {
+                RepairOutcome::Ok {
+                    repair_id,
+                    new_chain_tip_hash,
+                    tombstone_row_id,
+                    truncated_row_count,
+                } => Ok(json!({
+                    "ok": true,
+                    "repair_id": repair_id,
+                    "new_chain_tip_hash": new_chain_tip_hash,
+                    "tombstone_row_id": tombstone_row_id,
+                    "truncated_row_count": truncated_row_count,
+                })),
+                RepairOutcome::IncompleteRepair { receipt_id_orphan } => Ok(json!({
+                    "ok": false,
+                    "incomplete_repair": { "receipt_id_orphan": receipt_id_orphan },
+                })),
+                RepairOutcome::IncompleteRepairReceipt {
+                    tombstone_row_id_orphan,
+                } => Ok(json!({
+                    "ok": false,
+                    "incomplete_repair_receipt": {
+                        "tombstone_row_id_orphan": tombstone_row_id_orphan,
+                    },
+                })),
+            }
         }
 
         "audit_query" => {
@@ -4148,7 +4563,7 @@ pub async fn dispatch_method_with_context(
             Ok(serde_json::to_value(tree).unwrap_or(Value::Null))
         }
 
-        // EMBER-implementation-note-270: unified receipt query — supports the full
+        // EMBER-implementation-note-278: unified receipt query — supports the full
         // `ReceiptFilter` shape (actor/kind/grant_id/since/resource/limit).
         // The `ember audit query` CLI path calls this via JSON-RPC socket.
         "receipt_query" => {
@@ -4268,7 +4683,7 @@ pub async fn dispatch_method_with_context(
             Ok(json!({"id": request_id.0, "status": req.status}))
         }
 
-        // implementation-note-271 — submit a composite approval that bundles
+        // implementation-note-279 — submit a composite approval that bundles
         // an N-Statement envelope. On `Approved`, the resolver mints a single
         // composite grant whose `blocks_json` carries the full statement
         // chain. Wraps the already-shipped `DaemonStore::propose_grant`.
@@ -4457,7 +4872,7 @@ pub async fn dispatch_method_with_context(
                     false,
                 )?;
 
-            // implementation-note-272: if the caller is observing a
+            // implementation-note-280: if the caller is observing a
             // grant whose effective (wall-clock-projected) status is terminal
             // but whose stored status is still `active`, flip the row + emit
             // the signed receipt right now. Without this, the runner's
@@ -4516,7 +4931,7 @@ pub async fn dispatch_method_with_context(
                             .collect(),
                         Err(_) => Vec::new(),
                     };
-                    // implementation-note-268 — surface the
+                    // implementation-note-276 — surface the
                     // per-Statement revocation list so callers can render
                     // strikethrough on individual sids without polling a
                     // separate endpoint.
@@ -4737,7 +5152,7 @@ pub async fn dispatch_method_with_context(
             }
         }
 
-        // implementation-note-53: block-and-poll RPC for the proxy hook approval round-trip.
+        // implementation-note-55: block-and-poll RPC for the proxy hook approval round-trip.
         //
         // Polls `get_approval(request_id)` every 500ms up to `timeout_secs`. On
         // first non-pending state -> return the matching `ApprovalDecision`. On
@@ -4747,7 +5162,7 @@ pub async fn dispatch_method_with_context(
         //
         // Defaults: `timeout_secs = 300` (5 min) when omitted, matching the
         // proxy hook's `call_daemon_await_approval` default. A configurable
-        // EmberConfig surface is out of scope for implementation-note-53 — file as
+        // EmberConfig surface is out of scope for implementation-note-55 — file as
         // follow-up if operators need per-deployment tuning.
         //
         // TODO: T2 integration test with simulated dashboard
@@ -5129,7 +5544,7 @@ pub async fn dispatch_method_with_context(
                 Err(e) => return Err((-32000, e.to_string())),
             };
 
-            // Envelope status: load via DaemonGrantStore (implementation-note-267)
+            // Envelope status: load via DaemonGrantStore (implementation-note-275)
             // to get core_grants::Grant with a typed expires_at
             // (Option<DateTime<Utc>>) rather than an RFC3339 string from
             // GrantInfo. GrantStatus::derive is still used for the "Expired"
@@ -5165,7 +5580,7 @@ pub async fn dispatch_method_with_context(
             }))
         }
 
-        // implementation-note-133 (design Phase 2): broker socket RPC arms.
+        // implementation-note-137 (design Phase 2): broker socket RPC arms.
         //
         // These are intentionally additive — the registry, materialization
         // tracking, Receipt-event emission, and provider-routing logic live
@@ -5173,11 +5588,11 @@ pub async fn dispatch_method_with_context(
         // dispatch surface so concurrent worktrees touching unrelated
         // arms don't conflict on a structural refactor of this fn.
         //
-        // Marker (implementation-note-133): RPC method name "BrokerIssue" lives
+        // Marker (implementation-note-137): RPC method name "BrokerIssue" lives
         // alongside its sibling routes as the literal `broker_issue`. See
         // `broker_handler.rs` for handler bodies + tests.
         //
-        // implementation-note-149: the kernel-attested
+        // implementation-note-153: the kernel-attested
         // `PeerCredPrincipal` captured at connection accept time is
         // threaded into every broker handler so per-call authorization is
         // rooted in a kernel-supplied identity. `ctx.peer_cred_principal`
@@ -5212,7 +5627,7 @@ pub async fn dispatch_method_with_context(
         // opaque `SecretRef`; the trust boundary (ember-proxy /
         // ember-tools) calls `broker_resolve` to materialise the
         // plaintext credential. Stub today; full impl in
-        // implementation-note-273.
+        // implementation-note-281.
         "broker_resolve" => {
             crate::broker::handler::handle_broker_resolve(
                 ctx.peer_cred_principal.as_ref(),
@@ -5222,7 +5637,7 @@ pub async fn dispatch_method_with_context(
             )
             .await
         }
-        // implementation-note-178: refresh_cert
+        // implementation-note-182: refresh_cert
         // dispatch skeleton + RefreshDenied error type. Stub returns
         // NotImplemented variant until M3-B/C/D/E land the identity proof,
         // mint, rate-limit, and Receipt-emission slices. Per design §M3.
@@ -5247,7 +5662,7 @@ pub async fn dispatch_method_with_context(
             )
             .await
         }
-        // implementation-note-28 (Tier 1) —
+        // implementation-note-30 (Tier 1) —
         // unsessioned subprocess audit observability. Fires from a
         // Construct shim's passthrough-exec branch BEFORE the shim
         // execs the wrapped binary, so the daemon's tamper-evident
@@ -5258,7 +5673,7 @@ pub async fn dispatch_method_with_context(
         "subprocess_audit_log" => {
             handle_subprocess_audit_log(store, params, ctx.peer_cred_principal.as_ref())
         }
-        // implementation-note-149: session.lookup_or_open
+        // implementation-note-153: session.lookup_or_open
         // RPC — look up an existing session for the caller's persona or
         // open a fresh one. The persona identity is taken from the
         // kernel-attested `PeerCredPrincipal`, not from the request
@@ -5269,21 +5684,21 @@ pub async fn dispatch_method_with_context(
         "session.lookup_or_open" | "session_lookup_or_open" => {
             handle_session_lookup_or_open(ctx.peer_cred_principal.as_ref(), store, params).await
         }
-        // implementation-note-274: mint a 1-hour GitHub App installation
+        // implementation-note-282: mint a 1-hour GitHub App installation
         // token using a local-held RSA private key (design credential broker).
         // Credentials loaded from GH_APP_* env vars (placeholder until vault
         // path provisioning lands).
         "broker.mint_gh_token" => {
             crate::broker::handler::handle_broker_mint_gh_token(store, params).await
         }
-        // implementation-note-160: mint a child sub-persona scoped
+        // implementation-note-164: mint a child sub-persona scoped
         // under an existing parent persona. Params: { parent_persona_id, child_label,
         // scope }. Response: { persona_id }. Real two-phase commit + spawn wiring
         // is a stub; input validation runs before the unimplemented! fires.
         "broker.mint_sub_persona" => {
             crate::broker::handler::handle_broker_mint_sub_persona(store, params).await
         }
-        // implementation-note-171 §--inject: register a child shell PID for
+        // implementation-note-175 §--inject: register a child shell PID for
         // auto-revoke when the shell exits. Spawns a background poll task that
         // watches /proc/<pid> (Linux) or kill(pid, 0) (other Unix) and calls
         // broker_revoke on all listed materialization IDs on exit.
@@ -5291,7 +5706,7 @@ pub async fn dispatch_method_with_context(
             crate::broker::handler::handle_broker_register_pid_watcher(store, params).await
         }
 
-        // implementation-note-176
+        // implementation-note-180
         // (design note): daemon-side cold-path
         // presence-proof RPC. Forwards the challenge tuple to the dashboard
         // tab via the daemon→dashboard tab channel, awaits the WebAuthn
@@ -5312,7 +5727,7 @@ pub async fn dispatch_method_with_context(
             .await
         }
 
-        // implementation-note-175: first-run WebAuthn
+        // implementation-note-179: first-run WebAuthn
         // passkey enrollment. Called by the dashboard enrollment component
         // (`ember_dashboard::components::enrollment`) after the browser
         // completes `navigator.credentials.create()`. Guards against
@@ -5325,7 +5740,7 @@ pub async fn dispatch_method_with_context(
             )
         }
 
-        // implementation-note-172: credential-binding admin
+        // implementation-note-176: credential-binding admin
         // RPCs invoked by `ember bind {register, list, remove, move}`. The
         // admin path does NOT require biometric — the operator
         // authenticates to the daemon via PeerCred. Each handler enforces
@@ -5417,7 +5832,7 @@ pub async fn dispatch_method_with_context(
             .await
         }
 
-        // implementation-note-275 (design §"binding.delete"):
+        // implementation-note-283 (design §"binding.delete"):
         // graceful delete of a SA→Persona binding. Revokes the workload
         // Persona's grants (cascade via `revoke_persona`) so in-flight
         // broker requests holding active grant references drain to
@@ -5428,7 +5843,7 @@ pub async fn dispatch_method_with_context(
         // underscore alias mirrors the broker_* dispatch convention.
         "binding.delete" | "binding_delete" => binding_delete(store, params).await,
 
-        // implementation-note-276 (design
+        // implementation-note-284 (design
         // §"binding.revoke_urgent"): compromise-response revocation.
         // Cascades the same SQL flip as `binding.delete` but tags the
         // audit row with `binding.revoke_urgent` so the operator can
@@ -5443,7 +5858,7 @@ pub async fn dispatch_method_with_context(
             binding_revoke_urgent(store, params).await
         }
 
-        // implementation-note-277 (design §"binding.update"):
+        // implementation-note-285 (design §"binding.update"):
         // mutate metadata on an existing binding without revoking it.
         // Today the persona row only carries a mutable `name` column;
         // the broader binding-metadata fields the brief calls out
@@ -5456,7 +5871,7 @@ pub async fn dispatch_method_with_context(
         // mirrors the broker_* dispatch convention.
         "binding.update" | "binding_update" => binding_update(store, params).await,
 
-        // implementation-note-278 (design §"binding.upsert"):
+        // implementation-note-286 (design §"binding.upsert"):
         // idempotent insert-or-update for the SA→Persona binding
         // surface used by `ember-kernel`'s EmberServiceAccount
         // reconciler. Replaces the placeholder "method not found"
@@ -5477,7 +5892,7 @@ pub async fn dispatch_method_with_context(
         // underscore alias matches the broker_* dispatch convention.
         "binding.upsert" | "binding_upsert" => binding_upsert(store, params).await,
 
-        // implementation-note-64 (design §9 + §6):
+        // implementation-note-66 (design §9 + §6):
         // atomic create_agent_persona binding container identity →
         // Persona + attenuated child grant. Replaces the
         // create_persona + delegate_grant two-call sequence with a
@@ -5502,7 +5917,7 @@ pub async fn dispatch_method_with_context(
             create_agent_persona(store, params).await
         }
 
-        // implementation-note-279 Phase 2: SOPS DEK unwrap RPC.
+        // implementation-note-287 Phase 2: SOPS DEK unwrap RPC.
         //
         // Authorisation flow:
         //   1. Caller supplies `persona_id`, `grant_id`, and the
@@ -5533,7 +5948,7 @@ pub async fn dispatch_method_with_context(
         //      sent to the caller; whoever calls this RPC is implicitly
         //      trusted with the plaintext DEK by the grant flow.
         //
-        // Phase 3 (implementation-note-117, orchestrator-only) ships
+        // Phase 3 (implementation-note-120, orchestrator-only) ships
         // `.claude/scripts/sops-as-bot.sh` — the only blessed agent path
         // that calls this RPC. Direct callers from the agent harness are
         // out of scope for v0.
@@ -5563,7 +5978,7 @@ pub async fn dispatch_method_with_context(
                 .map_err(|e| (-32602, format!("invalid 'encrypted_dek_blob' hex: {e}")))?;
 
             // Grant gating: load via DaemonGrantStore to get core_grants::Grant
-            // at the state-machine boundary (implementation-note-267). State and
+            // at the state-machine boundary (implementation-note-275). State and
             // issuer checks use the core type directly.
             let grant = store
                 .grant_store()
@@ -5733,10 +6148,10 @@ pub async fn dispatch_method_with_context(
             "sops_unwrap_dek requires the 'age' feature; build with --features age".to_string(),
         )),
 
-        // SOPS-implementation-note-280 — implementation-note-281. Routes for the Path 2 native SOPS
-        // recipient surface. Until implementation-note-282 lands, the underlying stubs
+        // SOPS-implementation-note-288 — implementation-note-289. Routes for the Path 2 native SOPS
+        // recipient surface. Until implementation-note-290 lands, the underlying stubs
         // return NotImplementedError — wire is reserved so the SOPS Go-fork
-        // (implementation-note-283) can develop against a real RPC shape.
+        // (implementation-note-291) can develop against a real RPC shape.
         "sops.pubkey" => {
             let persona_id = params["persona_id"]
                 .as_str()
@@ -5780,7 +6195,7 @@ pub async fn dispatch_method_with_context(
             }))
         }
 
-        // implementation-note-284: register a new claude-code session.
+        // implementation-note-292: register a new claude-code session.
         //
         // Called by the launcher immediately before spawning the `claude` child.
         // Creates a `SessionMeta` file in `sessions_dir` and returns the
@@ -5794,14 +6209,14 @@ pub async fn dispatch_method_with_context(
             crate::infra::handlers::session::handle_register_session(store, &ctx, params)
         }
 
-        // implementation-note-284: close a claude-code session (clean exit).
+        // implementation-note-292: close a claude-code session (clean exit).
         //
         // Called by the launcher after the `claude` child exits naturally. Emits
         // a signed v2 `session.claude_code` Receipt with
         // `termination_reason: clean_exit` into `<session_dir>/receipt.json`,
         // closes the `SessionMeta`, and logs a `session.closed` audit event.
         //
-        // implementation-note-285: CleanExit MUST NOT
+        // implementation-note-293: CleanExit MUST NOT
         // revoke the grant. A 24h grant supports many sessions; the previous
         // unconditional revoke_grant call here was the second-half regression
         // (the launcher goes through this RPC arm, not session_watcher, so
@@ -5813,7 +6228,50 @@ pub async fn dispatch_method_with_context(
             crate::infra::handlers::session::handle_close_session(store, &ctx, params)
         }
 
-        // implementation-note-286 — first real local enrollment cut.
+        // design §C4 — operator authority-control surface. The
+        // `ember workflow {revoke, list, show}` CLI family routes through
+        // these arms. Revoke is the load-bearing trust property: operator
+        // only ever removes authority; subsequent broker.resolve calls
+        // return DENIED until a new workflow grant is issued at next
+        // session-open. Anchor: workflow_revoke_rpc_landed.
+        "workflow_revoke" => {
+            // workflow_revoke_rpc_landed + adversarial CRIT-1 fix
+            // (2026-05-22): resolve the caller principal here so the
+            // handler can refuse cross-persona revoke. ConnectOnly
+            // class admits the call; the persona match closes the
+            // confused-deputy attack the original `ConnectOnly +
+            // "revoke is always safe"` argument missed.
+            let caller =
+                crate::infra::handlers::support::resolve_caller_principal(&ctx, params).await?;
+            crate::infra::handlers::workflow::handle_workflow_revoke(
+                store, &ctx, params, &caller,
+            )
+        }
+        "workflow_list" => {
+            // workflow_list_rpc_landed + adversarial HIGH-1 fix
+            // (2026-05-22): resolve caller principal so the handler
+            // can scope results to the caller's own grants. `all=true`
+            // is now gated on OperatorPresence (the handler refuses
+            // when `all && !ctx.satisfies(OperatorPresence)`).
+            let caller =
+                crate::infra::handlers::support::resolve_caller_principal(&ctx, params).await?;
+            crate::infra::handlers::workflow::handle_workflow_list(
+                store, &ctx, params, &caller,
+            )
+        }
+        "workflow_show" => {
+            // workflow_show_rpc_landed + adversarial HIGH-1 fix
+            // (2026-05-22): caller principal lets the handler refuse
+            // cross-persona inspection on ConnectOnly. OperatorPresence
+            // callers can still inspect any workflow.
+            let caller =
+                crate::infra::handlers::support::resolve_caller_principal(&ctx, params).await?;
+            crate::infra::handlers::workflow::handle_workflow_show(
+                store, &ctx, params, &caller,
+            )
+        }
+
+        // implementation-note-294 — first real local enrollment cut.
         //
         // Per design §"Headless: attested device, variable enrollment".
         // This slice makes `headless_enroll` truthful for the local broker
@@ -5993,7 +6451,14 @@ pub async fn dispatch_method_with_context(
                     format!("headless_enroll: generate headless MEK: {err}"),
                 )
             })?;
-            let headless_vault = crate::infra::vault::Vault::new(mek);
+            // implementation-note-193 (B1) + adversarial CRIT-1
+            // fix (2026-05-22): use `Vault::new_headless_only`. The
+            // headless-runtime Vault MUST refuse Interactive-lane ops on
+            // an in-memory single-key shape; `new_headless_only` sets
+            // `interactive_key` to the all-zero checkpoint, and the
+            // refusal gate in `seal`/`open`/`add(Interactive)` etc.
+            // closes the API boundary.
+            let headless_vault = crate::infra::vault::Vault::new_headless_only(mek);
             crate::infra::headless_scope::replace_headless_subset(
                 &interactive_vault,
                 &headless_vault,
@@ -6122,12 +6587,12 @@ pub async fn dispatch_method_with_context(
                 .map_err(|e| (-32000, format!("serialize PermissionGap list: {e}")))
         }
 
-        // implementation-note-287 — Layer 1 predictive
+        // implementation-note-295 — Layer 1 predictive
         // pre-flight gate, wired over the daemon socket so the CLI can
         // surface manifest-declared Construct gaps before headless dispatches
         // a task that the enrolled persona's template cannot grant.
         //
-        // implementation-note-288
+        // implementation-note-296
         //
         // Per design §"Pre-flight scope check at enrollment" Layer 1: for
         // each queued task that declares `constructs = ["<construct>.<action>"]`,
@@ -6156,9 +6621,9 @@ pub async fn dispatch_method_with_context(
     }
 }
 
-/// implementation-note-287 — Layer 1 pre-flight handler.
+/// implementation-note-295 — Layer 1 pre-flight handler.
 ///
-/// implementation-note-288
+/// implementation-note-296
 ///
 /// Parses the caller-supplied `tasks` + optional `template`, resolves each
 /// task's declared constructs through the bundled cohort-A manifest registry
@@ -6302,7 +6767,7 @@ fn bundled_construct_registry()
 }
 
 /// `session.lookup_or_open` JSON-RPC verb — peercred-bound session
-/// lookup/creation per implementation-note-149.
+/// lookup/creation per implementation-note-153.
 ///
 /// Returns the (session_id, persona, parent_pid) triple for the
 /// caller's existing session, or opens a fresh session bound to the
@@ -6327,7 +6792,7 @@ fn bundled_construct_registry()
 /// Result: `{ "session_id": <string>, "persona_id"?: <string>,
 ///            "parent_pid": <i32>, "socket_path": <string> }`
 ///
-/// implementation-note-149.
+/// implementation-note-153.
 pub async fn handle_session_lookup_or_open(
     principal: Option<&crate::infra::runtime::PeerCredPrincipal>,
     store: &crate::infra::store::DaemonStore,
@@ -6340,7 +6805,7 @@ pub async fn handle_session_lookup_or_open(
             .to_string(),
     ))?;
 
-    // implementation-note-155 — refuse if the bound peer has been
+    // implementation-note-159 — refuse if the bound peer has been
     // reaped between connection-accept and this RPC dispatch. PID-reuse
     // could otherwise hand the freshly-recycled PID to a new process
     // that this session would then bind to.
@@ -6348,7 +6813,7 @@ pub async fn handle_session_lookup_or_open(
 
     // Persona-name → bound-uid check (when the caller asserts which
     // persona they're opening a session for, kernel attests it).
-    // implementation-note-289 — gate
+    // implementation-note-297 — gate
     // now consults `agent_socket_enrollments` (the new authority) via
     // the store, falling back to the legacy thread-local registry
     // during the transition.
@@ -6381,7 +6846,7 @@ pub async fn handle_session_lookup_or_open(
 
     // Mint a fresh session id. Production wiring (registry of open
     // sessions, persistence under `sessions_dir`, etc.) lives in the
-    // sibling implementation-note-290 task; this surface
+    // sibling implementation-note-298 task; this surface
     // establishes the peercred gate so the production wiring can
     // drop into a kernel-attested foundation.
     let nanos = std::time::SystemTime::now()
@@ -6426,7 +6891,7 @@ pub async fn handle_session_lookup_or_open(
 /// the locally-bound `core_grants::Grant` they captured at request entry.
 /// New requests fail because lookup runs after the SQL flip.
 ///
-/// `binding_revoke_urgent` (separate verb, T-EMBERD-BINDING-implementation-note-291)
+/// `binding_revoke_urgent` (separate verb, T-EMBERD-BINDING-implementation-note-299)
 /// will skip the in-flight drain by also poisoning the in-process
 /// grant cache — that path is intentionally NOT reused here because it
 /// inverts the contract callers rely on for the graceful path.
@@ -6857,7 +7322,7 @@ pub async fn binding_upsert(store: &DaemonStore, params: &Value) -> Result<Value
     }))
 }
 
-/// implementation-note-64 (design §9 + §6) — atomic
+/// implementation-note-66 (design §9 + §6) — atomic
 /// `create_agent_persona` RPC handler.
 ///
 /// Replaces the two-call sequence `create_persona` + `delegate_grant`
@@ -7153,6 +7618,7 @@ fn build_statement_budget_entry(s: &core_grant_types::Statement) -> Value {
 mod tests {
     use super::build_banner;
     use super::*;
+    use crate::infra::claim_journal::ClaimJournal;
     use crate::infra::interactive_unlock;
     use crate::infra::rate_limit::RateLimiter;
     use crate::infra::store::DaemonStore;
@@ -7176,7 +7642,7 @@ mod tests {
         RefCell::new(RateLimiter::default())
     }
 
-    // implementation-note-260: mint a
+    // implementation-note-267: mint a
     // daemon-identity-signed presence-token for `uid` so tests that
     // construct `RequestContext` directly for OperatorPresence-class
     // methods continue to pass the gate.
@@ -7189,7 +7655,19 @@ mod tests {
         mint(uid, ScopeKey::all(), Duration::from_secs(60), &signer)
     }
 
-    // implementation-note-258: Phase B's
+    fn test_presence_token_for_scope(
+        uid: u32,
+        scope: &str,
+    ) -> crate::auth::presence_token::PresenceToken {
+        use crate::auth::presence_token::{ScopeKey, mint};
+        use std::time::Duration;
+        ensure_test_presence_identity();
+        let signer =
+            DaemonIdentityPresenceSigner::current().expect("test presence signer initialised");
+        mint(uid, ScopeKey::new(scope), Duration::from_secs(60), &signer)
+    }
+
+    // implementation-note-265: Phase B's
     // "every method is ConnectOnly" placeholder is gone. Unknown
     // methods now fail-closed to `OperatorPresence` so a newly-
     // added dispatcher arm without a table entry cannot be invoked
@@ -7246,6 +7724,60 @@ mod tests {
         assert_eq!(
             authority_class_for_method("await_approval"),
             Some(AuthorityClass::ConnectOnly)
+        );
+    }
+
+    #[test]
+    fn vault_unlock_targets_mint_scoped_presence() {
+        assert_eq!(
+            presence_scope_for_unlock_target("vault_unlock")
+                .as_ref()
+                .map(|scope| scope.as_str()),
+            Some(PRESENCE_SCOPE_CLASS_VAULT)
+        );
+        assert_eq!(
+            presence_scope_for_unlock_target("register_session")
+                .as_ref()
+                .map(|scope| scope.as_str()),
+            Some(PRESENCE_SCOPE_CLASS_SESSION_RUNTIME)
+        );
+        assert_eq!(
+            presence_scope_for_unlock_target("create_persona")
+                .as_ref()
+                .map(|scope| scope.as_str()),
+            Some("create_persona")
+        );
+        assert!(
+            presence_scope_for_unlock_target("ping").is_none(),
+            "connect-only methods must not become unlock targets"
+        );
+    }
+
+    #[test]
+    fn class_scopes_cover_only_their_intended_operator_lanes() {
+        let vault_scope = crate::auth::presence_token::ScopeKey::new(PRESENCE_SCOPE_CLASS_VAULT);
+        assert!(presence_scope_allows_method(&vault_scope, "vault_list"));
+        assert!(presence_scope_allows_method(&vault_scope, "vault_add"));
+        assert!(
+            !presence_scope_allows_method(&vault_scope, "create_persona"),
+            "vault scope must not spill into general operator actions"
+        );
+        assert!(
+            !presence_scope_allows_method(&vault_scope, "broker_exec"),
+            "vault scope must not spill into session runtime actions"
+        );
+
+        let runtime_scope =
+            crate::auth::presence_token::ScopeKey::new(PRESENCE_SCOPE_CLASS_SESSION_RUNTIME);
+        assert!(presence_scope_allows_method(&runtime_scope, "broker_exec"));
+        assert!(presence_scope_allows_method(&runtime_scope, "broker_list"));
+        assert!(
+            !presence_scope_allows_method(&runtime_scope, "vault_list"),
+            "session runtime scope must not reopen the vault lane"
+        );
+        assert!(
+            !presence_scope_allows_method(&runtime_scope, "create_persona"),
+            "session runtime scope must not spill into grant or persona admin"
         );
     }
 
@@ -7541,8 +8073,18 @@ mod tests {
             "sops.unwrap",
             "register_session",
             "close_session",
+            // design §C4 — workflow CLI family.
+            "workflow_revoke",
+            "workflow_list",
+            "workflow_show",
             "headless_enroll",
             "headless_revoke",
+            // audit_repair_chain_rpc_landed (B4 + adversarial CRIT-2
+            // fix 2026-05-22): omitted from this list pre-fix, so the
+            // exhaustivity test below did not catch the unclassified
+            // dispatcher arm. Added per the maintenance hint at the
+            // top of this constant.
+            "audit_repair_chain",
         ];
 
         let mut unclassified = Vec::new();
@@ -7564,7 +8106,7 @@ mod tests {
         // `^\s+"[a-z_.]+"\s+=>` in dispatch_method_with_context excluding
         // the AuthorityClass match. If this drifts, the maintenance hint
         // above tells the developer to add the new method.
-        const DISPATCHER_ARM_COUNT_BASELINE: usize = 70;
+        const DISPATCHER_ARM_COUNT_BASELINE: usize = 73;
         assert!(
             DISPATCHED_METHODS.len() >= DISPATCHER_ARM_COUNT_BASELINE,
             "DISPATCHED_METHODS has {} entries; dispatcher had {} as of 2026-05-17 — \
@@ -7726,7 +8268,7 @@ mod tests {
         assert_eq!(result["grant"], json!("NotRequested"));
     }
 
-    // implementation-note-258: `RequestContext::
+    // implementation-note-265: `RequestContext::
     // satisfies` table.
     //
     // The bridge env var is process-global so we set it before the
@@ -7770,7 +8312,7 @@ mod tests {
         );
     }
 
-    // implementation-note-258: dispatch gate
+    // implementation-note-265: dispatch gate
     // round-trip. Internal dispatch bypasses the gate — `ping`
     // succeeds even without a synthesized peer or bridge env var,
     // because Internal callers are the pre-existing in-process trust
@@ -7801,7 +8343,7 @@ mod tests {
         );
     }
 
-    // implementation-note-258: Socket source
+    // implementation-note-265: Socket source
     // without a kernel-attested peer is rejected for ConnectOnly. We
     // construct the context directly (bypassing the test shim's
     // synthetic-peer injection) so we see the production gate.
@@ -7845,7 +8387,7 @@ mod tests {
         assert_eq!(err.1, "authority_class_not_met");
     }
 
-    // implementation-note-258: positive path —
+    // implementation-note-265: positive path —
     // Socket source with a peer + bridge env on (set by the test
     // shim) passes the gate for an OperatorPresence-class method.
     // Downstream errors (param validation etc.) are NOT -32001 —
@@ -8084,7 +8626,7 @@ mod tests {
         assert!(err.1.contains("session is locked"));
     }
 
-    // implementation-note-260:
+    // implementation-note-267:
     // dispatch_accepts_connect_only_without_token — ConnectOnly-class
     // methods skip the Phase D-4 gate entirely. With peer + no token,
     // dispatch proceeds normally (the response shape depends on the
@@ -8373,7 +8915,7 @@ mod tests {
         assert_eq!(err.0, -32602);
     }
 
-    // ---- implementation-note-87: evaluate_tool_call dispatch arm -----------------
+    // ---- implementation-note-89: evaluate_tool_call dispatch arm -----------------
 
     #[tokio::test]
     async fn evaluate_tool_call_dispatch_returns_decision_for_active_grant() {
@@ -8800,7 +9342,7 @@ mod tests {
 
     #[tokio::test]
     async fn revoke_statement_blocks_use_credential() {
-        // implementation-note-268 — per-statement revoke MVP.
+        // implementation-note-276 — per-statement revoke MVP.
         // Revoking the Credential Statement's sid blocks use_credential
         // while the grant is otherwise still active.
         let store = DaemonStore::open_in_memory().unwrap();
@@ -8907,7 +9449,7 @@ mod tests {
 
     #[tokio::test]
     async fn propose_grant_rpc_persists_n_statements() {
-        // implementation-note-271 — N-statement persistence + retrieval.
+        // implementation-note-279 — N-statement persistence + retrieval.
         let store = DaemonStore::open_in_memory().unwrap();
         let vault = test_vault();
         let policy = test_policy();
@@ -12727,7 +13269,7 @@ mod tests {
     }
 
     // delegate_grant_socket_principal_not_enrolled — checkpoint for
-    // implementation-note-292.
+    // implementation-note-300.
     //
     // Original contract (pre-prior change): a Socket-source dispatch
     // with missing `caller_persona_id` returned -32602 (invalid params).
@@ -12898,7 +13440,7 @@ mod tests {
             git_proxy_url: None,
             peer_cred_principal: None,
             mtls_principal: None,
-            // implementation-note-260
+            // implementation-note-267
             // — attach a valid presence_token so the Phase D-4 gate
             // passes; the test asserts a deeper authorization check.
             presence_token: Some(test_presence_token(1000)),
@@ -12951,6 +13493,18 @@ mod tests {
         // daemon enrolls (peer.pid -> persona_id).  A subsequent
         // `delegate_grant` from the same PID is bound to that persona
         // without the caller having to assert `caller_persona_id`.
+        //
+        // Partial of implementation-note-128 (#4372):
+        // `dispatch_method_with_context` enforces a presence-unlocked
+        // gate at the entry of every method dispatch (line ~2618).
+        // Tests that exercise the dispatch path must hold a
+        // `test_state_guard()` and call `mark_unlocked()` first or the
+        // gate fires before the test reaches its assertions. The
+        // surrounding tests in this module (see e.g. handler.rs:7785,
+        // 7837, 9793) follow the same pattern.
+        // Anchor: `ember_daemon_broken_test_cluster_resolved`.
+        let _presence_test_guard = crate::trust::presence::test_state_guard();
+        crate::trust::presence::mark_unlocked();
         clear_pid_persona_registry();
         let store = DaemonStore::open_in_memory().unwrap();
         let vault = test_vault();
@@ -12977,7 +13531,7 @@ mod tests {
             git_proxy_url: None,
             peer_cred_principal: None,
             mtls_principal: None,
-            // implementation-note-260
+            // implementation-note-267
             // — attach a valid presence_token so the Phase D-4 gate
             // passes; the test exercises the enrollment/peercred
             // resolution path, not the auth gate.
@@ -13050,7 +13604,7 @@ mod tests {
             git_proxy_url: None,
             peer_cred_principal: None,
             mtls_principal: None,
-            // implementation-note-260
+            // implementation-note-267
             // — attach a valid presence_token so the Phase D-4 gate
             // passes; the test asserts the delegation succeeds via the
             // enrolled persona, not the auth gate.
@@ -13125,7 +13679,7 @@ mod tests {
             git_proxy_url: None,
             peer_cred_principal: None,
             mtls_principal: None,
-            // implementation-note-260
+            // implementation-note-267
             // — attach a valid presence_token so the Phase D-4 gate
             // passes; the test asserts the PrincipalUnavailable path
             // for pid=None, not the auth gate.
@@ -13604,8 +14158,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn team0_vault_scope_token_allows_vault_list_but_not_create_persona() {
+        let _presence_test_guard = crate::trust::presence::test_state_guard();
+        crate::trust::presence::mark_unlocked();
+
+        let _tier = DeploymentTierGuard::set(crate::infra::config::DeploymentTier::Team0);
+        let store = DaemonStore::open_in_memory().unwrap();
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        dispatch_method(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            "vault_add",
+            &json!({"name": "team0/scoped-target", "value": "secret"}),
+        )
+        .await
+        .unwrap();
+
+        let scoped_ctx = RequestContext {
+            source: DispatchSource::Socket,
+            peer: Some(PeerCred {
+                uid: 501,
+                pid: Some(1234),
+            }),
+            principal: None,
+            sessions_dir: None,
+            llm_proxy_url: None,
+            git_proxy_url: None,
+            peer_cred_principal: None,
+            mtls_principal: None,
+            presence_token: Some(test_presence_token_for_scope(501, PRESENCE_SCOPE_CLASS_VAULT)),
+            bypass_binary_pin_gate_for_test: false,
+        };
+        let rows = dispatch_method_with_context(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            None,
+            scoped_ctx.clone(),
+            "vault_list",
+            &json!(null),
+        )
+        .await
+        .unwrap();
+        let arr = rows.as_array().expect("vault_list returns array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["name"], json!("team0/scoped-target"));
+
+        let err = dispatch_method_with_context(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            None,
+            scoped_ctx,
+            "create_persona",
+            &json!({"name": "scope-should-fail"}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, -32001);
+        assert!(
+            err.1.contains("\"scope-mismatch\""),
+            "non-vault operator methods must fail with scope-mismatch, got: {}",
+            err.1
+        );
+    }
+
+    #[tokio::test]
     async fn vault_get_round_trip_returns_plaintext_value_and_bytes() {
-        // implementation-note-293: pulumi-render.sh + similar headless
+        // implementation-note-301: pulumi-render.sh + similar headless
         // integrations call `ember vault get` -> daemon RPC `vault_get`.
         // This proves the RPC arm is wired and returns the decrypted
         // value under the canonical {"value": ..., "value_bytes": ...}
@@ -14047,7 +14674,7 @@ mod tests {
         assert_eq!(err.0, -32602);
     }
 
-    /// EMBER-implementation-note-270 integration test: emit synthetic kms_wrap receipts
+    /// EMBER-implementation-note-278 integration test: emit synthetic kms_wrap receipts
     /// for two actors, then verify `receipt_query` filters by actor and kind.
     #[tokio::test]
     async fn receipt_query_filters_by_actor_and_kind() {
@@ -14314,7 +14941,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // implementation-note-279 Phase 2: sops_unwrap_dek RPC tests
+    // implementation-note-287 Phase 2: sops_unwrap_dek RPC tests
     // -----------------------------------------------------------------
 
     /// Build an age-encrypted DEK ciphertext for the given recipient
@@ -14800,7 +15427,7 @@ mod tests {
         assert_eq!(err.0, -32602);
     }
 
-    // ---- implementation-note-53: await_approval block-and-poll RPC -----------------
+    // ---- implementation-note-55: await_approval block-and-poll RPC -----------------
 
     #[tokio::test]
     async fn await_approval_returns_approved_when_resolved_mid_poll() {
@@ -14993,7 +15620,7 @@ mod tests {
         assert_eq!(err.0, -32602, "got: {err:?}");
     }
 
-    // implementation-note-275 — graceful binding delete (design).
+    // implementation-note-283 — graceful binding delete (design).
     #[tokio::test]
     async fn binding_delete_revokes_persona_and_cascades_grants() {
         let store = DaemonStore::open_in_memory().unwrap();
@@ -15161,7 +15788,7 @@ mod tests {
         assert_eq!(resp["deleted"], json!(true));
     }
 
-    // implementation-note-276 — compromise-response revocation
+    // implementation-note-284 — compromise-response revocation
     // (design §"binding.revoke_urgent").
     #[tokio::test]
     async fn binding_revoke_urgent_cascades_grants_and_emits_urgent_audit() {
@@ -15329,7 +15956,7 @@ mod tests {
         assert_eq!(resp["revoked_urgent"], json!(true));
     }
 
-    // implementation-note-277 — mutate binding metadata
+    // implementation-note-285 — mutate binding metadata
     // (design §"binding.update").
     #[tokio::test]
     async fn binding_update_mutates_name_and_emits_before_after_audit() {
@@ -15587,7 +16214,7 @@ mod tests {
         );
     }
 
-    // implementation-note-278 — idempotent insert-or-update
+    // implementation-note-286 — idempotent insert-or-update
     // (design §"binding.upsert").
 
     #[tokio::test]
@@ -15870,7 +16497,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // implementation-note-284: register_session + close_session T2
+    // implementation-note-292: register_session + close_session T2
     // -------------------------------------------------------------------------
 
     #[tokio::test]
@@ -16010,7 +16637,7 @@ mod tests {
             "meta.json.closed must exist after close"
         );
 
-        // implementation-note-285: grant must remain
+        // implementation-note-293: grant must remain
         // Active after CleanExit — the handler no longer calls revoke_grant.
         let grant_after = store.get_grant(grant_id).expect("grant still queryable");
         assert_eq!(
@@ -16018,6 +16645,119 @@ mod tests {
             "CleanExit MUST NOT revoke the grant — multi-session per 24h grant invariant"
         );
         interactive_unlock::reset_for_tests();
+    }
+
+    #[tokio::test]
+    async fn revoke_grant_emits_receipt_with_grant_scope_claim_rollup_when_present() {
+        let _guard = crate::PROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _id_dir = setup_receipt_identity();
+
+        let store = DaemonStore::open_in_memory().unwrap();
+        store.set_vault(std::rc::Rc::new(test_vault()));
+        let vault = test_vault();
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        let sessions_root = tempfile::TempDir::new().unwrap();
+        let sessions_dir = sessions_root.path().to_path_buf();
+
+        let persona = dispatch_method(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            "create_persona",
+            &json!({"name": "revoke-rollup-persona"}),
+        )
+        .await
+        .unwrap();
+        let persona_id = persona["id"].as_str().unwrap();
+
+        let grant = dispatch_method(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            "create_grant",
+            &json!({
+                "persona_id": persona_id,
+                "credential_name": "cloudflare",
+                "scope": "dns:edit",
+                "force": true,
+            }),
+        )
+        .await
+        .unwrap();
+        let grant_id = grant["id"].as_str().unwrap().to_string();
+
+        let journal = crate::infra::claim_journal::SqliteClaimJournal::new(&store, 64);
+        let grant_scope = crate::infra::claim_journal::ScopeRef {
+            kind: crate::infra::claim_journal::ClaimScopeKind::Grant,
+            id: grant_id.clone(),
+        };
+        journal
+            .record_successful_claim(
+                &grant_scope,
+                &crate::infra::claim_journal::SuccessfulClaimInput {
+                    source_key: "grant-resolve-1".to_string(),
+                    occurred_at: "2026-05-22T12:00:00Z".to_string(),
+                    claim_kind: core_events::receipt::ClaimKind::CredentialVended,
+                    tool: "git.push".to_string(),
+                    input_hash: "grant-hash-1".to_string(),
+                    input_redacted: json!({"kind": "broker_resolve", "grant_id": grant_id}),
+                    resolved: json!({"allowed": true}),
+                    audit: crate::infra::claim_journal::AuditEvidenceInput {
+                        agent_id: Some(persona_id.to_string()),
+                        action: "broker.resolve.materialized".to_string(),
+                        credential: Some("cloudflare".to_string()),
+                        outcome: "allowed".to_string(),
+                        details: Some("{\"kind\":\"broker_resolve_materialized\"}".to_string()),
+                    },
+                    persona_id: Some(persona_id.to_string()),
+                    device_id: None,
+                    workflow_id: None,
+                    materialization_id: Some("mat-grant-rollup-1".to_string()),
+                    credential_name: Some("cloudflare".to_string()),
+                },
+            )
+            .unwrap();
+
+        let mut ctx = RequestContext::internal("test harness");
+        ctx.sessions_dir = Some(sessions_dir.clone());
+
+        dispatch_method_with_context(
+            &store,
+            &vault,
+            &policy,
+            &rl,
+            None,
+            ctx,
+            "revoke_grant",
+            &json!({ "id": grant_id }),
+        )
+        .await
+        .unwrap();
+
+        let receipt_path = sessions_dir
+            .join(format!("grant:{grant_id}"))
+            .join("receipt.json");
+        let receipt_bytes =
+            std::fs::read(&receipt_path).expect("revoke_grant must persist receipt.json sidecar");
+        let envelope: core_events::receipt::ReceiptEnvelope =
+            serde_json::from_slice(&receipt_bytes).expect("receipt.json parses as v2 envelope");
+        assert_eq!(envelope.kind, core_events::receipt::RECEIPT_KIND_COMPOSITE_GRANT);
+        let body: core_events::receipt::ClaudeCodeBody =
+            serde_json::from_value(envelope.body).expect("receipt body parses");
+        assert_eq!(body.base.claim_count_total, Some(1));
+        assert_eq!(body.base.claim_events.len(), 1);
+        assert_eq!(body.base.claim_segment_summaries.len(), 1);
+        assert!(!body.base.claim_history_merkle_root.is_empty());
+        assert_eq!(
+            body.termination_reason,
+            Some(core_events::receipt::TerminationReason::ExplicitRevoke)
+        );
     }
 
     #[tokio::test]
@@ -16401,8 +17141,8 @@ mod tests {
         );
     }
 
-    // implementation-note-294: daemon-side T2 (updated for
-    // implementation-note-259) — register_session
+    // implementation-note-302: daemon-side T2 (updated for
+    // implementation-note-266) — register_session
     // response must include the real LLM proxy URL from RequestContext.
     #[tokio::test]
     async fn register_session_response_includes_real_proxy_url() {
@@ -16450,7 +17190,7 @@ mod tests {
         let mut ctx = RequestContext::internal("test harness");
         ctx.sessions_dir = Some(sessions_dir.clone());
         // Wire the URL via RequestContext — the correct path after
-        // implementation-note-259.
+        // implementation-note-266.
         ctx.llm_proxy_url = Some(expected_proxy_url.to_string());
 
         let reg = dispatch_method_with_context(
@@ -16482,7 +17222,7 @@ mod tests {
         );
     }
 
-    // implementation-note-259: T2 test —
+    // implementation-note-266: T2 test —
     // register_session must read the LLM proxy URL from RequestContext,
     // NOT from std::env::var. The env var may be absent or stale due to
     // Rust 2024 std::env::set_var cross-thread visibility hazard (tokio
@@ -16543,7 +17283,7 @@ mod tests {
         // SocketListener.with_llm_proxy_url wires in production.
         let mut ctx = RequestContext::internal("test harness");
         ctx.sessions_dir = Some(sessions_dir.clone());
-        // implementation-note-259: this URL must
+        // implementation-note-266: this URL must
         // appear in the response; the env var ("8484") must be ignored.
         ctx.llm_proxy_url = Some("http://127.0.0.1:55555".to_string());
 
@@ -17675,7 +18415,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // implementation-note-64 end-to-end tests.
+    // implementation-note-66 end-to-end tests.
     // ------------------------------------------------------------------
 
     /// Helper: mint a parent grant suitable for delegation tests.
@@ -17883,7 +18623,7 @@ mod tests {
         );
     }
 
-    /// implementation-note-64 acceptance criterion:
+    /// implementation-note-66 acceptance criterion:
     /// "emberd restart mid-spawn → reconciler refuses to spawn into
     /// enrolling slot."
     ///
@@ -17961,7 +18701,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // implementation-note-149 — session.lookup_or_open
+    // implementation-note-153 — session.lookup_or_open
     // ---------------------------------------------------------------
 
     /// `session.lookup_or_open` refuses when no kernel-attested
@@ -18068,9 +18808,9 @@ mod tests {
         );
     }
 
-    // ─── implementation-note-287 ────────────────────
+    // ─── implementation-note-295 ────────────────────
     //
-    // implementation-note-288
+    // implementation-note-296
     //
     // Coverage for the `headless_preflight_layer1` dispatch arm. The
     // resolver itself is exhaustively unit-tested in
@@ -18252,7 +18992,7 @@ mod tests {
         );
     }
 
-    /// implementation-note-265 — shape check that
+    /// implementation-note-273 — shape check that
     /// the overlay block at the dispatch site overwrites the wire-claimed
     /// `persona` (and the `persona_id` / `id` aliases the various dispatch
     /// arms read) with the kernel-attested or cert-attested identity. The
@@ -18308,7 +19048,7 @@ mod tests {
         assert_eq!(wire["tool_name"], json!("Bash"));
     }
 
-    // --- implementation-note-295 tests --------------------
+    // --- implementation-note-303 tests --------------------
 
     #[tokio::test]
     async fn revoke_persona_rejects_non_operator_non_self() {
@@ -18572,7 +19312,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // implementation-note-28 (Tier 1) —
+    // implementation-note-30 (Tier 1) —
     // subprocess_audit_log tests. Anchor:
     // subprocess_audit_log_routes_through_chain
     // -----------------------------------------------------------------------

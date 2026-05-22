@@ -37,7 +37,7 @@
 //!
 //! Spawn witnesses are emitted at parent→child grant edge creation time by
 //! `crate::trust::grant::delegate_grant_full_sql` and persisted via
-//! `DaemonStore::store_spawn_witness_receipt` (implementation-note-108,
+//! `DaemonStore::store_spawn_witness_receipt` (implementation-note-111,
 //! shipped 2026-05-15). `build_tree` reads them back via
 //! `DaemonStore::list_spawn_witnesses_for_grants`; the demo-seam synthesis
 //! path that previously fabricated witnesses at export time was removed in
@@ -175,7 +175,7 @@ pub struct TreeSpawnWitness {
     pub spawn_grant_id: String,
     /// `ed25519:<hex>` trust anchor used to verify the inner
     /// `parent_signature` field on the body. Sourced from the parent
-    /// persona's row at tree-build time (implementation-note-108);
+    /// persona's row at tree-build time (implementation-note-111);
     /// `verify_spawn_witness_parent_signature` succeeds iff the parent
     /// persona authorised the spawn at delegation time.
     pub parent_pubkey_hex: String,
@@ -296,15 +296,31 @@ pub fn build_tree(
     }
 
     // ---- Daemon pubkey for trust anchor (load BEFORE daemon stop). ----
-    // `DaemonPersona::load_or_create` reads `<data_dir>/daemon_persona.key`
-    // from disk — works whether the daemon is running or not.
-    let persona =
-        DaemonPersona::load_or_create(data_dir).map_err(|e| TreeError::Store(e.to_string()))?;
-    let daemon_pubkey_hex = persona.pubkey_hex();
+    // Anchor: receipt_tree_pubkey_cross_uid_safe
+    //
+    // Prefer the 0644 pubkey sidecar (`daemon_persona.pub`) per
+    // implementation-note-316 Option A — cross-uid
+    // callers (CLI run as operator against an ember-uid daemon under
+    // design) can read it without permission errors on the 0600
+    // private key file. Fall back to `DaemonPersona::load_or_create`
+    // when the sidecar is missing (pre-sidecar daemon runs, or
+    // recovery scenarios where the daemon has never started) — that
+    // path still works for same-uid callers and produces the same
+    // 64-char hex shape.
+    let daemon_pubkey_hex = match ember_daemon::infra::receipt::read_pubkey_sidecar_hex(
+        data_dir,
+    ) {
+        Ok(hex) => hex,
+        Err(_) => {
+            let persona = DaemonPersona::load_or_create(data_dir)
+                .map_err(|e| TreeError::Store(e.to_string()))?;
+            persona.pubkey_hex()
+        }
+    };
 
     // ---- Load spawn witnesses persisted at parent→child delegation time. ----
     //
-    // implementation-note-108 (2026-05-15): the daemon
+    // implementation-note-111 (2026-05-15): the daemon
     // emits + persists a spawn.witness Receipt v2 envelope for every
     // parent→child grant edge inside `delegate_grant_full_sql`, signed by
     // the parent persona (body) and the daemon persona (envelope). We
@@ -696,7 +712,7 @@ mod tests {
         assert!(matches!(err, TreeError::Io(_)));
     }
 
-    // --- v2 envelope inclusion (implementation-note-317) ---
+    // --- v2 envelope inclusion (implementation-note-326) ---
 
     fn fixture_tree_with_v2_receipt() -> TreeExport {
         let mut t = fixture_tree();

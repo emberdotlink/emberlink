@@ -2,7 +2,7 @@
 //!
 //! H1 invariant (cohort-A test plan): every grant terminates in a signed
 //! Receipt across all four termination paths. Coverage post-M3 follow-up
-//! (implementation-note-379, v2_receipt_coverage_audit_v030_2026_05_09):
+//! (implementation-note-389, v2_receipt_coverage_audit_v030_2026_05_09):
 //!
 //! | Path               | Location                                | TerminationReason |
 //! |--------------------|----------------------------------------|-------------------|
@@ -59,6 +59,10 @@ use crate::infra::receipt::{
     issue::{TerminationMeta, issue_cohort_a_receipt},
 };
 use crate::infra::store::{DaemonStore, StoreError};
+use crate::infra::claim_journal::{
+    close_session_scope_best_effort, close_summary_audit_fields,
+    summarize_session_scope_best_effort,
+};
 
 #[derive(Debug, Error)]
 pub enum LifecycleError {
@@ -133,23 +137,44 @@ pub fn transition_to_terminated_dirty_at(
 ) -> Result<ReceiptEnvelope, LifecycleError> {
     let identity = current_identity().ok_or(LifecycleError::IdentityMissing)?;
     let signer = DaemonPersonaSigner::new(identity);
+    let claim_summary = summarize_session_scope_best_effort(
+        daemon_store,
+        &session.session_id,
+        "transition_to_terminated_dirty_at",
+    );
 
     // 1. Build + sign envelope atomically (design — signing inside issue).
     //    Termination metadata is passed via TerminationMeta so the signed
     //    body is complete at issuance time — no post-signing body mutation.
-    let envelope = issue_cohort_a_receipt(
-        &session.session_id,
-        Vec::new(),
-        None,
-        TerminationAuthority::DaemonPersona,
-        &identity.pubkey_hex(),
-        Some(TerminationMeta {
-            reason: TerminationReason::HeartbeatLost,
-            last_heartbeat_at: Some(last_heartbeat_at.to_rfc3339()),
-            pid_alive_at_check: Some(pid_alive_at_check),
-        }),
-        &signer,
-    )?;
+    let envelope = if let Some(summary) = claim_summary.as_ref() {
+        crate::infra::receipt::issue::issue_cohort_a_receipt_from_closed_scope(
+            &session.session_id,
+            summary,
+            None,
+            TerminationAuthority::DaemonPersona,
+            &identity.pubkey_hex(),
+            Some(TerminationMeta {
+                reason: TerminationReason::HeartbeatLost,
+                last_heartbeat_at: Some(last_heartbeat_at.to_rfc3339()),
+                pid_alive_at_check: Some(pid_alive_at_check),
+            }),
+            &signer,
+        )
+    } else {
+        issue_cohort_a_receipt(
+            &session.session_id,
+            Vec::new(),
+            None,
+            TerminationAuthority::DaemonPersona,
+            &identity.pubkey_hex(),
+            Some(TerminationMeta {
+                reason: TerminationReason::HeartbeatLost,
+                last_heartbeat_at: Some(last_heartbeat_at.to_rfc3339()),
+                pid_alive_at_check: Some(pid_alive_at_check),
+            }),
+            &signer,
+        )
+    }?;
 
     // 2. Persist Receipt sidecar.
     let session_dir = sessions_dir.join(&session.session_id);
@@ -165,6 +190,12 @@ pub fn transition_to_terminated_dirty_at(
         .close(&session.session_id)
         .map_err(LifecycleError::Close)?;
     let _ = crate::infra::interactive_unlock::release_session_pin(&session.session_id);
+    let claim_summary = close_session_scope_best_effort(
+        daemon_store,
+        &session.session_id,
+        "transition_to_terminated_dirty_at",
+    )
+    .or(claim_summary);
 
     // 4. Revoke broker grant — reuses clean-exit path, which emits the v1
     //    grant Receipt + cascades to children.
@@ -182,19 +213,24 @@ pub fn transition_to_terminated_dirty_at(
     }
 
     // 5. Audit-log the dirty-exit event.
+    let mut details = format!(
+        "session_id={} grant_id={} last_heartbeat_at={} pid_alive_at_check={}",
+        session.session_id,
+        session.grant_id,
+        last_heartbeat_at.to_rfc3339(),
+        pid_alive_at_check
+    );
+    if let Some(summary) = claim_summary.as_ref() {
+        details.push(' ');
+        details.push_str(&close_summary_audit_fields(summary));
+    }
     daemon_store
         .log_event(
             None,
             "session.terminated_dirty",
             None,
             "heartbeat_lost",
-            Some(&format!(
-                "session_id={} grant_id={} last_heartbeat_at={} pid_alive_at_check={}",
-                session.session_id,
-                session.grant_id,
-                last_heartbeat_at.to_rfc3339(),
-                pid_alive_at_check
-            )),
+            Some(&details),
         )
         .map_err(LifecycleError::Audit)?;
 

@@ -50,7 +50,7 @@ impl LogLevel {
 /// is the auth boundary. Team0+ deployments have multiple operators
 /// sharing the same daemon and require additional authorization controls
 /// that are NOT yet wired (see the startup `team0_connect_only_per_uid_filter_pending`
-/// WARN in `runtime.rs::run` for the gap and implementation-note-194
+/// WARN in `runtime.rs::run` for the gap and implementation-note-200
 /// for the destination work).
 ///
 /// The tier is declared explicitly in `config.toml` (`[daemon].tier`)
@@ -119,31 +119,31 @@ struct RawDaemonSection {
     stale_approval_threshold_secs: Option<u64>,
     /// Bind address for the git-echo credential-injection proxy. `None` (key
     /// absent) ⇒ default `127.0.0.1:0` (random port). Empty string ⇒ disabled.
-    /// (implementation-note-195)
+    /// (implementation-note-201)
     git_proxy_addr: Option<String>,
     /// Bind address for the general LLM/HTTP credential-injection proxy
     /// (`run_proxy` / `handle_request` — provider-aware auth, X-Ember-* header
     /// protocol). `None` (key absent) ⇒ default `127.0.0.1:0`. Empty string ⇒
     /// disabled. The Anthropic SDK demo path posts to this listener.
-    /// (implementation-note-196)
+    /// (implementation-note-202)
     llm_proxy_addr: Option<String>,
     /// design: vault snapshot interval. Defaults to 3600 (1 hour). `0` disables.
     snapshot_interval_secs: Option<u64>,
-    /// implementation-note-197: interval in seconds between snapshot pull
+    /// implementation-note-203: interval in seconds between snapshot pull
     /// attempts. Defaults to 600 (10 minutes). `0` disables pulling.
     snapshot_pull_interval_secs: Option<u64>,
-    /// implementation-note-197: base URL of the remote EIC snapshot endpoint.
+    /// implementation-note-203: base URL of the remote EIC snapshot endpoint.
     /// `None` disables pulling. Example: `http://eic.tz-net.ts.net:3141`.
     snapshot_pull_endpoint: Option<String>,
-    /// implementation-note-197: cluster id for keying pulled snapshots in the
+    /// implementation-note-203: cluster id for keying pulled snapshots in the
     /// local vault. Required when `snapshot_pull_endpoint` is set.
     snapshot_pull_cluster_id: Option<String>,
-    /// implementation-note-198: absolute path to the pre-built SCION
+    /// implementation-note-204: absolute path to the pre-built SCION
     /// fork binary the daemon shells out to at agent-spawn time. `None`
     /// (key absent) ⇒ pin verification is disabled (development /
     /// non-SCION installs).
     scion_binary_path: Option<String>,
-    /// implementation-note-198: operator-pinned SHA-256 of the SCION
+    /// implementation-note-204: operator-pinned SHA-256 of the SCION
     /// fork binary (lower-hex, 64 chars). `None` (key absent) ⇒ pin
     /// verification is disabled. When `Some`, the daemon refuses to
     /// fork-exec the binary unless its on-disk bytes hash to this value
@@ -176,7 +176,7 @@ struct RawConfig {
     keyring: Option<KeyringConfig>,
     presence: Option<PresenceConfigSection>,
     credential_store: Option<CredentialStoreConfig>,
-    /// implementation-note-162 — top-level `[spawn_pool]`
+    /// implementation-note-166 — top-level `[spawn_pool]`
     /// table. Holds the pre-provisioned uid pool that
     /// `handle_broker_exec` checks out a uid from before fork+execve
     /// to drop privileges into. Absent ⇒ pool is disabled and
@@ -205,7 +205,7 @@ struct RawConfig {
 /// cache_ttl_secs = 60
 /// ```
 ///
-/// For the AWS IAM auth method (implementation-note-106) the wire shape is:
+/// For the AWS IAM auth method (implementation-note-109) the wire shape is:
 ///
 /// ```toml
 /// [credential_store]
@@ -222,7 +222,7 @@ struct RawConfig {
 /// / IRSA / ECS task role / Fargate). Vault re-plays a SigV4-signed
 /// `sts:GetCallerIdentity` request server-side as the proof.
 ///
-/// For HashiCorp Cloud Platform (HCP) Vault — implementation-note-199 —
+/// For HashiCorp Cloud Platform (HCP) Vault — implementation-note-205 —
 /// the wire shape is:
 ///
 /// ```toml
@@ -262,14 +262,14 @@ pub struct CredentialStoreConfig {
     /// or `"hcp-service-principal"`. The `"aws"` variant uses the
     /// daemon's surrounding AWS IAM identity (env vars / instance
     /// metadata) to sign a `sts:GetCallerIdentity` request that Vault
-    /// re-plays as the proof (implementation-note-106). The
+    /// re-plays as the proof (implementation-note-109). The
     /// `"hcp-service-principal"` variant exchanges
     /// `(client_id, client_secret)` at HashiCorp Cloud Platform's
     /// OAuth2 IdP for an access_token, then uses that as
     /// `Authorization: Bearer` against the HCP-hosted Vault cluster
-    /// (implementation-note-199). Other methods (Kubernetes SA, JWT/OIDC,
+    /// (implementation-note-205). Other methods (Kubernetes SA, JWT/OIDC,
     /// cert) are out of scope — file follow-ups as
-    /// `implementation-note-200-<METHOD>`.
+    /// `implementation-note-206-<METHOD>`.
     #[serde(default)]
     pub auth: Option<String>,
 
@@ -291,19 +291,19 @@ pub struct CredentialStoreConfig {
     /// `vault auth/aws/role/<role>`). Only consulted when
     /// `auth = "aws"`. AWS credentials themselves come from the
     /// daemon's surrounding identity (env / IMDS / IRSA / etc.), not
-    /// from this config (implementation-note-106).
+    /// from this config (implementation-note-109).
     #[serde(default)]
     pub role: Option<String>,
 
     /// HCP service-principal auth: client id (always inline —
     /// non-secret). Only consulted when
-    /// `auth = "hcp-service-principal"` (implementation-note-199).
+    /// `auth = "hcp-service-principal"` (implementation-note-205).
     #[serde(default)]
     pub client_id: Option<String>,
 
     /// HCP service-principal auth: client secret. Supports `@<path>`
     /// to read from a file. Only consulted when
-    /// `auth = "hcp-service-principal"` (implementation-note-199).
+    /// `auth = "hcp-service-principal"` (implementation-note-205).
     #[serde(default)]
     pub client_secret: Option<String>,
 
@@ -406,7 +406,7 @@ pub struct PresenceConfigSection {
 /// Daemon-level configuration loaded from `~/.ember/config.toml` (or the path
 /// resolved from `--config` / `EMBER_CONFIG`).
 ///
-/// **No `impl Default`** — per implementation-note-201, every
+/// **No `impl Default`** — per implementation-note-207, every
 /// constructor must be explicit so that test partial-overrides can't silently
 /// pull user-home paths. The type system pins the rule:
 ///
@@ -430,14 +430,14 @@ pub struct DaemonConfig {
     pub dashboard_addr: Option<SocketAddr>,
     /// Bind address for the git-echo credential-injection proxy used by
     /// sandboxed agents (`EMBER_GIT_PROXY_URL`). `None` disables the proxy.
-    /// Defaults to `127.0.0.1:0` (loopback, ephemeral port). implementation-note-195.
+    /// Defaults to `127.0.0.1:0` (loopback, ephemeral port). implementation-note-201.
     pub git_proxy_addr: Option<SocketAddr>,
     /// Bind address for the general LLM/HTTP credential-injection proxy
     /// (`run_proxy` / `handle_request`). Surfaced to clients as
     /// `EMBER_PROXY_URL` and `<data_dir>/run/proxy.url`. Provider-aware auth
     /// (Anthropic `x-api-key`, generic Bearer). `None` disables the listener.
     /// Defaults to `127.0.0.1:0` (loopback, ephemeral port).
-    /// implementation-note-196.
+    /// implementation-note-202.
     pub llm_proxy_addr: Option<SocketAddr>,
     /// Keyring service/account override. `None` fields fall back to env var, then compile-time default.
     pub keyring: KeyringConfig,
@@ -447,13 +447,13 @@ pub struct DaemonConfig {
     /// design — vault snapshot interval in seconds. Default 3600 (1 hour).
     /// Set to 0 to disable periodic snapshots.
     pub snapshot_interval_secs: u64,
-    /// implementation-note-197 — periodic pull interval in seconds. Default
+    /// implementation-note-203 — periodic pull interval in seconds. Default
     /// 600 (10 min). Set to 0 to disable pulling.
     pub snapshot_pull_interval_secs: u64,
-    /// implementation-note-197 — base URL of the remote EIC snapshot endpoint.
+    /// implementation-note-203 — base URL of the remote EIC snapshot endpoint.
     /// `None` means pulling is not configured.
     pub snapshot_pull_endpoint: Option<String>,
-    /// implementation-note-197 — cluster id used to key pulled snapshots in
+    /// implementation-note-203 — cluster id used to key pulled snapshots in
     /// the local vault. Required when `snapshot_pull_endpoint` is `Some`.
     pub snapshot_pull_cluster_id: Option<String>,
     /// Per-op user-presence gate. Loaded from `[presence]`
@@ -463,12 +463,12 @@ pub struct DaemonConfig {
     /// means no `[credential_store]` section was present, which the
     /// daemon treats as `backend = "local"` (the existing vault path).
     pub credential_store: Option<CredentialStoreConfig>,
-    /// implementation-note-198 — absolute path to the pre-built
+    /// implementation-note-204 — absolute path to the pre-built
     /// SCION fork binary the daemon shells out to at agent-spawn time.
     /// `PathBuf::new()` (empty) means pin verification is disabled
     /// (development / non-SCION installs).
     pub scion_binary_path: PathBuf,
-    /// implementation-note-198 — operator-pinned SHA-256 of the
+    /// implementation-note-204 — operator-pinned SHA-256 of the
     /// SCION fork binary (lower-hex, 64 chars). Empty string means
     /// pin verification is disabled. When non-empty, the spawn path
     /// calls [`crate::spawn::scion::verify_scion_binary_hash`] before
@@ -497,7 +497,7 @@ pub struct DaemonConfig {
     ///   2. `[daemon].trust_roots` config field.
     ///   3. Empty (release-only).
     pub trust_roots: String,
-    /// implementation-note-162 — pre-provisioned uid pool the
+    /// implementation-note-166 — pre-provisioned uid pool the
     /// broker_exec spawn paths drop into before execve. `None` ⇒ the
     /// pool is not configured and `handle_broker_exec` refuses with
     /// `-32011` ("spawn pool not configured — `ember daemon install`
@@ -532,7 +532,7 @@ fn expand_tilde(path: &str) -> Result<PathBuf, ConfigError> {
     }
 }
 
-// implementation-note-202: `impl Default for DaemonConfig`
+// implementation-note-208: `impl Default for DaemonConfig`
 // is REMOVED. The May-12 25-hour leaked-daemon incident was rooted in
 // `DaemonConfig { data_dir: tmpdir.path()..., ..Default::default() }`
 // partial-overrides silently inheriting user-home paths. The type
@@ -542,24 +542,24 @@ fn expand_tilde(path: &str) -> Result<PathBuf, ConfigError> {
 // from `Self::load_defaults()` (private; see below). See doc-test on
 // the struct above for the compile_fail pin.
 //
-// implementation-note-203
+// implementation-note-209
 
 impl DaemonConfig {
-    /// implementation-note-204 (Phase 1 substrate) — tempdir-scoped
+    /// implementation-note-210 (Phase 1 substrate) — tempdir-scoped
     /// test constructor. Sets every path-bearing field under `tmpdir` so a
     /// T3 test cannot accidentally bind the operator's real
     /// `~/.ember/run/daemon.sock` (the May-12 25-hour leaked-daemon
     /// incident root cause).
     ///
     /// Tests MUST use this instead of `..Default::default()` partial-overrides.
-    /// Subtask B (implementation-note-205) migrates existing
+    /// Subtask B (implementation-note-211) migrates existing
     /// callers off `Default` so the type system enforces the rule by
     /// removing `impl Default` entirely.
     ///
     /// # target_state_anchor
     ///
     /// `DaemonConfig::for_test`
-    /// implementation-note-202: private fallback ctor used by
+    /// implementation-note-208: private fallback ctor used by
     /// `load` when the on-disk TOML omits a field. Replaces the prior
     /// `impl Default` role. Tests that previously asserted on
     /// `DaemonConfig::default()`'s shape now call this method directly via
@@ -586,7 +586,7 @@ impl DaemonConfig {
             snapshot_pull_cluster_id: None,
             presence: PresenceConfigSection::default(),
             credential_store: None,
-            // implementation-note-198: empty defaults mean verification
+            // implementation-note-204: empty defaults mean verification
             // is opt-in — production configs MUST set both.
             scion_binary_path: PathBuf::new(),
             scion_binary_sha256: String::new(),
@@ -596,7 +596,7 @@ impl DaemonConfig {
             // set"; operators add dev / org roots via `EMBER_TRUST_ROOTS`
             // or `[daemon].trust_roots` without re-shipping the binary.
             trust_roots: String::new(),
-            // implementation-note-162 — default is `None`
+            // implementation-note-166 — default is `None`
             // ("pool not configured"). The installer writes
             // `[spawn_pool]` into the operator's config.toml when
             // `ember daemon install` runs; daemons running pre-
@@ -645,7 +645,7 @@ impl DaemonConfig {
             // compiled-in IdentityRoot). Tests that exercise dev-mode
             // trust-root semantics override explicitly.
             trust_roots: String::new(),
-            // implementation-note-162 — tests default to
+            // implementation-note-166 — tests default to
             // `None`. Broker-exec tests that need a working spawn
             // path call `uid_alloc::init_uid_pool_for_test()` directly
             // to install a process-global pool keyed on the current
@@ -749,7 +749,7 @@ impl DaemonConfig {
 
         let credential_store = raw.credential_store;
 
-        // implementation-note-198: expand `~` so operators can write
+        // implementation-note-204: expand `~` so operators can write
         // the path naturally; empty/absent fields fall back to defaults
         // (empty path, empty hash) which disable verification — same
         // semantics as not setting the keys at all.
@@ -798,7 +798,7 @@ impl DaemonConfig {
             None => section.trust_roots.unwrap_or_default(),
         };
 
-        // implementation-note-162 — top-level `[spawn_pool]`
+        // implementation-note-166 — top-level `[spawn_pool]`
         // table is consumed verbatim. `None` (absent) ⇒ broker_exec
         // refuses with `-32011`; `Some` ⇒ the pool is installed via
         // `uid_alloc::init_uid_pool` during runtime startup.
@@ -1294,7 +1294,7 @@ mod tests {
 
     #[test]
     fn scion_binary_pin_absent_gives_empty_defaults() {
-        // implementation-note-198: when neither key is set the
+        // implementation-note-204: when neither key is set the
         // daemon treats verification as disabled (dev installs).
         let toml_str = "[daemon]\nlog_level = \"info\"\n";
         let mut f = NamedTempFile::new().unwrap();
@@ -1306,7 +1306,7 @@ mod tests {
 
     #[test]
     fn scion_binary_pin_loaded_from_toml() {
-        // implementation-note-198: both fields round-trip through
+        // implementation-note-204: both fields round-trip through
         // TOML so operators can pin the binary in `config.toml`.
         let toml_str = "[daemon]\nlog_level = \"info\"\nscion_binary_path = \"/opt/scion/scion\"\nscion_binary_sha256 = \"abc123\"\n";
         let mut f = NamedTempFile::new().unwrap();
@@ -1317,7 +1317,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // implementation-note-162 — `[spawn_pool]` TOML deserializer.
+    // implementation-note-166 — `[spawn_pool]` TOML deserializer.
     // -----------------------------------------------------------------
 
     #[test]
@@ -1361,7 +1361,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // implementation-note-186 — design Component 2 subuid range
+    // implementation-note-190 — design Component 2 subuid range
     // round-trips through the DaemonConfig parser. The installer writes
     // this shape on modern-Linux hosts where unprivileged_userns_clone=1.
     // -----------------------------------------------------------------

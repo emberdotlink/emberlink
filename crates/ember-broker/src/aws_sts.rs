@@ -1313,7 +1313,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // AssumeRoleWithWebIdentity — implementation-note-75 tests
+    // AssumeRoleWithWebIdentity — implementation-note-77 tests
     // -----------------------------------------------------------------
 
     fn assume_role_with_web_identity_ok_xml() -> String {
@@ -1433,13 +1433,17 @@ mod tests {
         );
     }
 
+    /// Shape captured by [`CapturingStsClient`]: the (headers, body)
+    /// tuple the broker handed to the STS HTTP client.
+    type CapturedStsRequest = (Vec<(String, String)>, String);
+
     /// Captures the headers/body the broker hands to the HTTP client
     /// so the test can assert "no Authorization header" for
     /// AssumeRoleWithWebIdentity.
     struct CapturingStsClient {
         status: u16,
         body: String,
-        captured: Mutex<Option<(Vec<(String, String)>, String)>>,
+        captured: Mutex<Option<CapturedStsRequest>>,
     }
 
     #[async_trait::async_trait]

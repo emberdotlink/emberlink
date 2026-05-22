@@ -1,6 +1,6 @@
 //! TOFU (Trust-On-First-Use) credential binding confirmation.
 //!
-//! implementation-note-185 — replaces the DCC-3A stub with real
+//! implementation-note-189 — replaces the DCC-3A stub with real
 //! design biometric prompt integration. The flow:
 //!
 //! 1. `submit_approval` writes a pending row into the approvals table
@@ -43,16 +43,27 @@ pub enum TofuError {
     Internal(String),
 }
 
+// Three constants used by the production `tofu_confirm_binding` polling
+// loop. Under `cargo build --tests`, that fn's `#[cfg(test)] { return
+// mock::... }` short-circuit at function entry skips the polling loop
+// entirely, so the constants look unused at the test-build target.
+// `#[allow(dead_code)]` keeps the documented constants in place under
+// both builds — the dead-code warning would otherwise mislead future
+// readers into thinking these have been retired.
+
 /// Biometric-prompt timeout. 120s matches the credgate poll loop's
 /// timeout in `handler.rs::handle_broker_issue`.
+#[allow(dead_code)]
 const BIOMETRIC_PROMPT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Poll interval — mirrors the credgate loop's 50ms but a touch slower
 /// since TOFU prompts are out-of-band rather than mid-flight.
+#[allow(dead_code)]
 const BIOMETRIC_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Approval-row TTL hint for the row's `ttl_secs` field. Soft hint —
 /// the load-bearing limit is `BIOMETRIC_PROMPT_TIMEOUT` enforced here.
+#[allow(dead_code)]
 const APPROVAL_ROW_TTL_SECS: u64 = 300;
 
 /// Confirm a new credential binding via TOFU.
@@ -107,7 +118,7 @@ pub async fn tofu_confirm_binding(
 /// outcome mapping. Lives under `cfg(not(test))` so unit tests bypass
 /// it through the mock-outcome short-circuit above.
 ///
-/// implementation-note-185: biometric_prompt_for_binding checkpoint.
+/// implementation-note-189: biometric_prompt_for_binding checkpoint.
 #[cfg(not(test))]
 async fn biometric_prompt_for_binding(
     store: &DaemonStore,

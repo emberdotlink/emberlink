@@ -1,7 +1,7 @@
 //!
 //! Launcher pidfd watch — fast-path detector for launcher-process exit.
 //!
-//! implementation-note-335 (Phase 1).
+//! implementation-note-344 (Phase 1).
 //!
 //! Per design note §D3: when a launcher process
 //! (e.g. `ember up` or the bridge launcher) exits, all in-flight workflow
@@ -197,7 +197,7 @@ pub async fn run(_daemon_store: Rc<DaemonStore>, sessions_dir: PathBuf) {
 
     info!(
         tick_secs = TICK.as_secs(),
-        "launcher_watch: starting (implementation-note-335 Phase 1)"
+        "launcher_watch: starting (implementation-note-344 Phase 1)"
     );
 
     loop {
@@ -336,31 +336,48 @@ fn launcher_is_dead(tracked: &TrackedLauncher) -> bool {
     }
 }
 
-/// Structured event + revocation-cascade placeholder.
+/// Structured event + workflow-grant cascade revoke.
 ///
-/// Phase 1 emits a structured `info` event so the operator can see the exit
-/// land in real time. The revocation cascade is deferred — when
-/// `implementation-note-297` lands, replace the TODO with the call
-/// into `infra::workflow_grant::revoke` (and any sibling cascade the
-/// parent-walk decides on).
+/// Phase 1 emits a structured `info` event. Phase 2 (this slice — design
+/// §Component 3 + design F-AUTHORITY-1) wires the workflow-grant revoke
+/// cascade so the operator's authority does not survive a crashed launcher.
+/// The atomic rename in `workflow_grant::revoke` is the durable revocation
+/// signal — subsequent `broker.resolve` calls return DENIED until a fresh
+/// session opens.
+///
+/// Child-grant cascade (parent-walk) is still deferred to
+/// implementation-note-305.
 fn on_launcher_exit(sessions_dir: &std::path::Path, session_id: &str, launcher_pid: u32) {
     info!(
         event = "launcher.exit_detected",
         session_id = %session_id,
         launcher_pid,
-        "launcher_watch: launcher process exit detected — revocation cascade pending"
+        "launcher_watch: launcher process exit detected — revoking workflow grant cascade"
     );
 
-    // TODO: wire revocation cascade here.
-    // The intended Phase 2 shape (subject to the parent-walk ADR):
-    //   1. `crate::infra::workflow_grant::revoke(sessions_dir, session_id)` —
-    //      atomically renames `workflow-grant.json` → `.revoked`.
-    //   2. Walk child grants (parent_grant_id chain) and revoke each.
-    //   3. Emit a signed v2 Receipt with `TerminationReason::HeartbeatLost`
-    //      (or a new reason `LauncherExited` once it's added upstream).
-    //   4. Hand off to `session_watcher::close_session` for the audit log
-    //      write so we don't fork the close path.
-    let _ = sessions_dir; // suppress dead-code when no cascade is wired.
+    match crate::infra::workflow_grant::revoke(sessions_dir, session_id) {
+        Ok(true) => {
+            info!(
+                event = "workflow.revoked",
+                session_id = %session_id,
+                reason = "launcher_exited",
+                "launcher_watch: workflow grant cascade-revoked on launcher exit"
+            );
+        }
+        Ok(false) => {
+            // No workflow grant on file for this session — either the
+            // session never had one (legacy path) or close_session already
+            // revoked it. Both are healthy.
+        }
+        Err(e) => {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "launcher_watch: workflow-grant cascade revoke failed; \
+                 grant may leak beyond launcher exit"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -382,7 +399,7 @@ mod tests {
         }
     }
 
-    /// Checkpoint anchor — implementation-note-335 Phase 1.
+    /// Checkpoint anchor — implementation-note-344 Phase 1.
     /// Presence of this test proves the launcher_watch module ships with the
     /// load-bearing surface: tick_once reconciles against SessionStore, and
     /// the platform-specific pidfd/kqueue path lives behind cfg gates.

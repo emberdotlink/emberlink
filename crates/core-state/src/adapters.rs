@@ -570,9 +570,9 @@ fn build_attestation_object(auth_data: &[u8]) -> Result<Vec<u8>, ValidationError
 pub struct OAuthBindingMeta {
     /// OAuth2 client identifier registered with the provider.
     pub client_id: String,
-    /// Authorization endpoint URL (e.g., "https://accounts.google.com/o/oauth2/v2/auth").
+    /// Authorization endpoint URL (e.g., `<https://accounts.google.com/o/oauth2/v2/auth>`).
     pub authorization_endpoint: String,
-    /// Token endpoint URL (e.g., "https://oauth2.googleapis.com/token").
+    /// Token endpoint URL (e.g., `<https://oauth2.googleapis.com/token>`).
     pub token_endpoint: String,
     /// Redirect URI registered with the provider.
     pub redirect_uri: String,

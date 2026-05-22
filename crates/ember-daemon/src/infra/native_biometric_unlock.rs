@@ -25,12 +25,22 @@ pub struct UnlockBeginResponse {
 struct PendingRequest {
     challenge: [u8; 32],
     expires_at_unix_ms: u64,
+    presence_scope_key: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompletedUnlock {
+    pub presence_scope_key: String,
 }
 
 static PENDING_REQUESTS: Lazy<Mutex<HashMap<String, PendingRequest>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-pub fn begin(data_dir: &Path, reason: &str) -> Result<UnlockBeginResponse, String> {
+pub fn begin(
+    data_dir: &Path,
+    reason: &str,
+    presence_scope_key: &str,
+) -> Result<UnlockBeginResponse, String> {
     let request_id = Uuid::new_v4().to_string();
     let mut nonce = [0u8; 16];
     getrandom::fill(&mut nonce).map_err(|e| format!("OS RNG failure: {e}"))?;
@@ -51,6 +61,7 @@ pub fn begin(data_dir: &Path, reason: &str) -> Result<UnlockBeginResponse, Strin
             PendingRequest {
                 challenge,
                 expires_at_unix_ms,
+                presence_scope_key: presence_scope_key.to_string(),
             },
         );
 
@@ -69,7 +80,7 @@ pub fn complete(
     request_id: &str,
     public_key_hex: &str,
     signature_der_hex: &str,
-) -> Result<(), String> {
+) -> Result<CompletedUnlock, String> {
     let now = now_unix_ms();
     let pending = take_pending_request(request_id)?
         .ok_or_else(|| "native biometric unlock request missing or already consumed".to_string())?;
@@ -102,7 +113,9 @@ pub fn complete(
     if stored_pubkey.is_none() {
         store_trusted_pubkey(data_dir, public_key_hex)?;
     }
-    Ok(())
+    Ok(CompletedUnlock {
+        presence_scope_key: pending.presence_scope_key,
+    })
 }
 
 fn take_pending_request(request_id: &str) -> Result<Option<PendingRequest>, String> {
@@ -177,6 +190,10 @@ pub fn clear_for_tests() {
 
 #[cfg(test)]
 mod tests {
+    // Parent-mod re-export is consumed only by the macOS-gated test
+    // below; suppress the unused-import lint on non-macOS so the Linux
+    // build (headless host) doesn't warn on every build.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
     use super::*;
 
     #[cfg(target_os = "macos")]
@@ -201,18 +218,19 @@ mod tests {
         se_register_stub_key(label, &handle);
         let reopened = find_secure_enclave_key(label).unwrap_or(handle);
 
-        let first_begin = begin(dir.path(), "Unlock the daemon vault").unwrap();
+        let first_begin = begin(dir.path(), "Unlock the daemon vault", "class:vault").unwrap();
         let pubkey_hex = hex::encode(se_pubkey_bytes(&reopened).unwrap());
         let challenge = hex::decode(&first_begin.challenge_hex).unwrap();
         let signature_hex = hex::encode(se_sign_with_touch_id(&reopened, &challenge).unwrap());
 
-        complete(
+        let completed = complete(
             dir.path(),
             &first_begin.request_id,
             &pubkey_hex,
             &signature_hex,
         )
         .unwrap();
+        assert_eq!(completed.presence_scope_key, "class:vault");
         assert!(trusted_pubkey_path(dir.path()).exists());
     }
 
@@ -227,17 +245,17 @@ mod tests {
 
         let first = new_stub_key("stub-one");
         se_register_stub_key("stub-one", &first);
-        let first_begin = begin(dir.path(), "Unlock the daemon vault").unwrap();
+        let first_begin = begin(dir.path(), "Unlock the daemon vault", "class:vault").unwrap();
         let challenge = hex::decode(&first_begin.challenge_hex).unwrap();
         let first_sig = hex::encode(
             ember_broker::secure_enclave::se_sign_with_touch_id(&first, &challenge).unwrap(),
         );
         let first_pub = hex::encode(se_pubkey_bytes(&first).unwrap());
-        complete(dir.path(), &first_begin.request_id, &first_pub, &first_sig).unwrap();
+        let _ = complete(dir.path(), &first_begin.request_id, &first_pub, &first_sig).unwrap();
 
         let second = new_stub_key("stub-two");
         se_register_stub_key("stub-two", &second);
-        let begin2 = begin(dir.path(), "Unlock the daemon vault").unwrap();
+        let begin2 = begin(dir.path(), "Unlock the daemon vault", "class:vault").unwrap();
         let challenge2 = hex::decode(&begin2.challenge_hex).unwrap();
         let second_sig = hex::encode(
             ember_broker::secure_enclave::se_sign_with_touch_id(&second, &challenge2).unwrap(),
@@ -245,5 +263,32 @@ mod tests {
         let second_pub = hex::encode(se_pubkey_bytes(&second).unwrap());
         let err = complete(dir.path(), &begin2.request_id, &second_pub, &second_sig).unwrap_err();
         assert!(err.contains("key mismatch"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn complete_returns_bound_non_vault_scope() {
+        use ember_broker::secure_enclave::{new_stub_key, se_pubkey_bytes, se_register_stub_key};
+        use tempfile::tempdir;
+
+        clear_for_tests();
+        let dir = tempdir().unwrap();
+        let handle = new_stub_key("stub-session-runtime");
+        se_register_stub_key("stub-session-runtime", &handle);
+
+        let begin = begin(
+            dir.path(),
+            "Start a new Ember session",
+            "class:session-runtime",
+        )
+        .unwrap();
+        let challenge = hex::decode(&begin.challenge_hex).unwrap();
+        let signature = hex::encode(
+            ember_broker::secure_enclave::se_sign_with_touch_id(&handle, &challenge).unwrap(),
+        );
+        let pubkey = hex::encode(se_pubkey_bytes(&handle).unwrap());
+
+        let completed = complete(dir.path(), &begin.request_id, &pubkey, &signature).unwrap();
+        assert_eq!(completed.presence_scope_key, "class:session-runtime");
     }
 }

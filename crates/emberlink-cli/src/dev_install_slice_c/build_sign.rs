@@ -1,7 +1,8 @@
 //!
 //! design Phase 4 steps 5 + 6: cargo release build + code-sign.
 //!
-//! Build is `cargo build --release -p ember-daemon -p ember-construct`.
+//! Build is `cargo build --release -p emberlink-cli -p ember-daemon -p
+//! ember-construct`.
 //! Sign uses the operator's Developer ID Application cert (resolved via
 //! `security find-identity -p codesigning`). No notarization (dev only).
 //!
@@ -10,18 +11,30 @@
 use std::path::PathBuf;
 
 use super::CommandRunner;
+use crate::dev_runtime_artifacts::{DevRuntimeArtifactKind, build_packages, runtime_artifacts};
 
 /// Output of a successful build + sign cycle.
 #[derive(Debug)]
 pub struct BuildSignResult {
+    /// Path to the signed ember CLI (`target/release/ember`).
+    pub cli_signed_path: PathBuf,
     /// Path to the signed emberd binary (`target/release/emberd`).
     pub daemon_signed_path: PathBuf,
     /// Paths to any additional signed construct binaries.
     pub construct_signed_paths: Vec<PathBuf>,
 }
 
-/// Build both `ember-daemon` and `ember-construct` in release mode, then
-/// code-sign each binary with the operator's Developer ID Application cert.
+impl BuildSignResult {
+    pub fn signed_paths(&self) -> impl Iterator<Item = &PathBuf> + '_ {
+        std::iter::once(&self.cli_signed_path)
+            .chain(std::iter::once(&self.daemon_signed_path))
+            .chain(self.construct_signed_paths.iter())
+    }
+}
+
+/// Build the worktree dev runtime (`ember`, `emberd`, and the construct
+/// bundle) in release mode, then code-sign each binary with the operator's
+/// Developer ID Application cert.
 ///
 /// # Errors
 ///
@@ -32,30 +45,32 @@ pub fn build_and_sign(
     runner: &dyn CommandRunner,
 ) -> Result<BuildSignResult, Box<dyn std::error::Error>> {
     // Phase 5: cargo build --release
-    runner.run(
-        "cargo",
-        &[
-            "build",
-            "--release",
-            "-p",
-            "ember-daemon",
-            "-p",
-            "ember-construct",
-        ],
-    )?;
+    let mut cargo_args = vec!["build", "--release"];
+    for package in build_packages() {
+        cargo_args.push("-p");
+        cargo_args.push(package);
+    }
+    runner.run("cargo", &cargo_args)?;
 
+    let cli_path = PathBuf::from("target/release/ember");
     let daemon_path = PathBuf::from("target/release/emberd");
-    let construct_paths: Vec<PathBuf> = vec![PathBuf::from("target/release/ember-construct")];
+    let construct_paths: Vec<PathBuf> = runtime_artifacts()
+        .into_iter()
+        .filter(|artifact| artifact.kind == DevRuntimeArtifactKind::Construct)
+        .map(|artifact| PathBuf::from("target/release").join(artifact.binary_name))
+        .collect();
 
     // Phase 6: resolve signing identity + codesign each binary.
     let identity = resolve_signing_identity(runner)?;
 
+    codesign_binary(runner, &cli_path, &identity)?;
     codesign_binary(runner, &daemon_path, &identity)?;
     for p in &construct_paths {
         codesign_binary(runner, p, &identity)?;
     }
 
     Ok(BuildSignResult {
+        cli_signed_path: cli_path,
         daemon_signed_path: daemon_path,
         construct_signed_paths: construct_paths,
     })
@@ -146,10 +161,10 @@ mod tests {
 
     impl CommandRunner for RecordingRunner {
         fn run(&self, program: &str, args: &[&str]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-            if let Some(ref fail) = self.fail_on {
-                if program == fail.as_str() {
-                    return Err(format!("simulated failure in {program}").into());
-                }
+            if let Some(ref fail) = self.fail_on
+                && program == fail.as_str()
+            {
+                return Err(format!("simulated failure in {program}").into());
             }
             self.calls.borrow_mut().push((
                 program.to_string(),
@@ -184,8 +199,16 @@ mod tests {
         );
         assert!(args.contains(&"-p".to_string()), "must pass '-p'");
         assert!(
+            args.contains(&"emberlink-cli".to_string()),
+            "must target emberlink-cli"
+        );
+        assert!(
             args.contains(&"ember-daemon".to_string()),
             "must target ember-daemon"
+        );
+        assert!(
+            args.contains(&"ember-construct".to_string()),
+            "must target ember-construct"
         );
     }
 
@@ -204,6 +227,15 @@ mod tests {
         assert!(
             !codesign_calls.is_empty(),
             "codesign must be invoked at least once"
+        );
+        let expected_codesign_calls = 2 + runtime_artifacts()
+            .iter()
+            .filter(|artifact| artifact.kind == DevRuntimeArtifactKind::Construct)
+            .count();
+        assert_eq!(
+            codesign_calls.len(),
+            expected_codesign_calls,
+            "codesign count must match staged dev-runtime binaries"
         );
 
         // Every codesign call must pass --sign and --force.

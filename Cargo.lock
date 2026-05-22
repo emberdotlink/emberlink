@@ -2230,6 +2230,7 @@ dependencies = [
  "ed25519-dalek",
  "ember-broker",
  "ember-claude-hook",
+ "ember-construct",
  "ember-daemon",
  "ember-update",
  "emberlink-app",

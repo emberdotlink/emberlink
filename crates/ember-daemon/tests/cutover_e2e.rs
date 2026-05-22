@@ -1,4 +1,4 @@
-//! implementation-note-404 — T3 cutover end-to-end test.
+//! implementation-note-414 — T3 cutover end-to-end test.
 //!
 //! Pins the vault-first credential-discovery contract added by PR4A
 //! (`github_config_from_store` design reader) + PR4B (the

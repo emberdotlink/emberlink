@@ -728,7 +728,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Receipt emission (implementation-note-60)
+    // Receipt emission (implementation-note-62)
     // -----------------------------------------------------------------------
 
     /// Test-double sink that records every call into a Mutex<Vec<_>>.

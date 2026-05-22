@@ -241,12 +241,12 @@ pub enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         rest: Vec<String>,
     },
-    /// Grants manifest workflows (validate <file>).
+    /// Grants manifest workflows (`validate <file>`).
     Grants {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         rest: Vec<String>,
     },
-    /// Approve or deny a pending approval (implementation-note-230).
+    /// Approve or deny a pending approval (implementation-note-237).
     Approval {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         rest: Vec<String>,
@@ -340,12 +340,12 @@ pub enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         rest: Vec<String>,
     },
-    /// Query the receipts audit log (EMBER-implementation-note-270).
+    /// Query the receipts audit log (EMBER-implementation-note-278).
     ///
     /// Subcommand::Audit — dispatches to the receipt-query handler.
-    /// Filters: --since <duration|ISO>, --actor <persona-id>,
-    /// --kind <grant|kms_wrap|kms_unwrap>, --grant-id <id>,
-    /// --resource <pattern>, --limit <N>, --format <table|json|jsonl>.
+    /// Filters: `--since <duration|ISO>`, `--actor <persona-id>`,
+    /// `--kind <grant|kms_wrap|kms_unwrap>`, `--grant-id <id>`,
+    /// `--resource <pattern>`, `--limit <N>`, `--format <table|json|jsonl>`.
     Audit {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         rest: Vec<String>,

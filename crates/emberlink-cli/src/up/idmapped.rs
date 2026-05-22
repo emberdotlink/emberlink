@@ -14,7 +14,7 @@
 //!   OrbStack any 2024+ version (Docker-compat layer, handles transparently)
 //!
 //! Older runtimes fall back to `safe.directory` + chown-on-flush per
-//! `implementation-note-497`.
+//! `implementation-note-525`.
 
 use std::path::Path;
 

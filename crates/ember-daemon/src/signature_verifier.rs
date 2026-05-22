@@ -243,8 +243,6 @@ mod tests {
         cache: &VerifierCache,
         trust_graph_version: u64,
     ) -> Result<(), VerifyError> {
-        use ed25519_dalek::Verifier as _;
-
         if sidecar.schema_version != 1 {
             return Err(VerifyError::SchemaUnsupported(sidecar.schema_version));
         }

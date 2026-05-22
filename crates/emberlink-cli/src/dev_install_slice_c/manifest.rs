@@ -1,7 +1,7 @@
 //!
 //! design Phase 4 step 8: scan tool binaries, generate signed manifest.
 //!
-//! Manifest is TOML with one [[binary]] block per gated tool (gh, git,
+//! Manifest is TOML with one `[[binary]]` block per gated tool (gh, git,
 //! kubectl, npm, docker, pulumi, wrangler, etc.). Each entry: path,
 //! content_hash (SHA-256), version (best-effort from `--version`),
 //! signed_at (RFC3339).

@@ -2,7 +2,7 @@
 //! Root-required Linux e2e test that **actually observes the
 //! `setuid` privilege drop** in the spawn-helper.
 //!
-//! implementation-note-422 anchor:
+//! implementation-note-432 anchor:
 //! `setuid_drops_to_target_uid_observed_via_id_u`
 //!
 //! ## Why this file exists

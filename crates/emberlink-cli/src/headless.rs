@@ -12,7 +12,7 @@
 //! [`PreflightDecision`] enum — without wiring it into an actual
 //! `ember headless enroll` command (that command does not yet exist;
 //! see the blocked-by dependency on implementation-note-21 in
-//! `release-checklist`). Phase 2 (implementation-note-469) will:
+//! `release-checklist`). Phase 2 (implementation-note-489) will:
 //!   - wire this helper into the enrollment flow,
 //!   - apply per-enrollment template amendments that revert at expiry,
 //!   - amend the enrollment Receipt with the widen-template evidence
@@ -264,11 +264,11 @@ fn headless_guidance_for_rpc(method: &str, code: i32, message: &str) -> Option<S
     None
 }
 
-// ─── implementation-note-439 — enroll / revoke / status commands ──
+// ─── implementation-note-490 — enroll / revoke / status commands ──
 //
 // CLI surface for the daemon-side `headless_enroll` / `headless_revoke` /
 // `headless_status` socket methods that shipped in prior change
-// (implementation-note-286 Phase 1). Per design §"Headless:
+// (implementation-note-294 Phase 1). Per design §"Headless:
 // attested device, variable enrollment". The daemon-side handlers
 // now ship a first real local enroll/revoke/status workflow. `headless_enroll`
 // installs a fresh headless MEK plus the currently configured local
@@ -544,9 +544,9 @@ pub fn cmd_status(socket_path: &Path) -> Result<(), HeadlessCommandError> {
     Ok(())
 }
 
-// ─── implementation-note-287 — CLI surface ─────────
+// ─── implementation-note-295 — CLI surface ─────────
 //
-// implementation-note-288
+// implementation-note-296
 //
 // `ember headless preflight` shells the daemon's
 // `headless_preflight_layer1` RPC, then renders the gap list as a
@@ -773,7 +773,7 @@ mod tests {
         requires_copy(PreflightDecision::Skip);
     }
 
-    // ─── implementation-note-439 helper tests ───────────────────
+    // ─── implementation-note-490 helper tests ───────────────────
 
     #[test]
     fn parse_duration_spec_recognizes_canonical_units() {
@@ -809,7 +809,7 @@ mod tests {
     #[test]
     fn render_enroll_cta_includes_locked_copy() {
         let cta = render_enroll_cta("4h");
-        // Spot-check the load-bearing lines from the implementation-note-470 lock.
+        // Spot-check the load-bearing lines from the implementation-note-491 lock.
         assert!(cta.contains("Enable headless — for how long?"));
         assert!(cta.contains("Default: 4 hours."));
         assert!(cta.contains("anything up to 7 days"));
@@ -874,7 +874,7 @@ mod tests {
         assert!(guidance.contains("ember vault unlock"));
     }
 
-    // ─── implementation-note-287 — CLI table tests ─
+    // ─── implementation-note-295 — CLI table tests ─
 
     #[test]
     fn preflight_table_renders_no_gaps_message_for_empty_input() {

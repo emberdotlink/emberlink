@@ -44,6 +44,12 @@ fn top_level_help_centers_friendly_surface() {
     assert_eq!(code, 0, "exit non-zero. stderr: {stderr}");
     let names = help_command_names(&stdout);
 
+    // emberlink_cli_tests_unbroken_on_main: `session` moved from visible to
+    // hidden in prior change (`fix(cli): hide top-level Session subcommand from
+    // help`); the test wasn't updated at that time, which left it asserting
+    // a state that contradicted the new intent. The canonical friendly
+    // surface is now `claude` / `codex` / `headless` etc.; `session` is the
+    // dev-internal substrate.
     for visible in [
         "init",
         "daemon",
@@ -55,7 +61,8 @@ fn top_level_help_centers_friendly_surface() {
         "trust",
         "status",
         "github",
-        "claude-code",
+        "claude",
+        "codex",
         "headless",
     ] {
         assert!(
@@ -75,13 +82,13 @@ fn top_level_help_centers_friendly_surface() {
         "cluster",
         "demo",
         "grants",
-        "session",
         "construct",
         "binary",
         "kms",
         "orchestrator",
         "dev",
         "bridge",
+        "session",
     ] {
         assert!(
             !names.contains(&hidden),
@@ -123,12 +130,20 @@ fn init_help_centers_canonical_onboarding() {
     assert_eq!(code, 0, "exit non-zero. stderr: {stderr}");
 
     assert!(
-        stdout.contains("Canonical onboarding for Claude Code"),
+        stdout.contains("Canonical onboarding for Claude or Codex"),
         "expected init help to describe the friendly onboarding path; stdout:\n{stdout}"
     );
     assert!(
         stdout.contains("`~/.claude/settings.json`"),
         "expected init help to mention Claude Code wiring; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("`~/.codex/hooks.json`"),
+        "expected init help to mention Codex hook wiring; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("codex login status"),
+        "expected init help to mention Codex's native auth lane; stdout:\n{stdout}"
     );
     assert!(
         !stdout.contains("--touch-id"),
@@ -142,6 +157,36 @@ fn init_help_centers_canonical_onboarding() {
         !stdout.contains("design"),
         "expected init help to avoid ADR references; stdout:\n{stdout}"
     );
+}
+
+#[test]
+fn claude_launcher_help_accepts_new_name_and_compat_alias() {
+    for name in ["claude", "claude-code"] {
+        let (stdout, stderr, code) = run_ember(&[name, "--help"]);
+        assert_eq!(
+            code, 0,
+            "exit non-zero for `{name} --help`. stderr: {stderr}"
+        );
+        assert!(
+            stdout.contains("Launch Claude with ember-managed env + PATH wiring."),
+            "expected `{name} --help` to describe the Claude launcher; stdout:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn session_open_help_accepts_claude_target_and_compat_alias() {
+    for target in ["claude", "claude-code"] {
+        let (stdout, stderr, code) = run_ember(&["session", "open", target, "--help"]);
+        assert_eq!(
+            code, 0,
+            "exit non-zero for `session open {target} --help`. stderr: {stderr}"
+        );
+        assert!(
+            stdout.contains("Trailing arguments forwarded to the target surface"),
+            "expected `session open {target} --help` to parse and show target help; stdout:\n{stdout}"
+        );
+    }
 }
 
 #[test]

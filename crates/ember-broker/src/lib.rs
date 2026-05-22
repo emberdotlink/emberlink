@@ -3,8 +3,8 @@
 //! Locks the SHAPE of the approval-channel surface so policy can route
 //! `persona → channels[]` and the kernel knows which adapter to call.
 //! Real wire (Slack webhook, AppleScript iMessage, SMTP) lands in
-//! per-channel follow-up tasks (`implementation-note-78`,
-//! `implementation-note-77`, `implementation-note-76`).
+//! per-channel follow-up tasks (`implementation-note-80`,
+//! `implementation-note-79`, `implementation-note-78`).
 pub mod aws_sts;
 pub mod azure;
 pub mod channels;

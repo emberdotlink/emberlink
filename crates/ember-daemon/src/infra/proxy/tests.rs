@@ -164,7 +164,7 @@ async fn handle_request_boxed(
         Err(msg) => return Ok(bad_request(&msg)),
     };
 
-    // implementation-note-299 test parity — pin grant by id
+    // implementation-note-307 test parity — pin grant by id
     // when the header is present (mirrors production handle_request).
     let pinned_grant_id = headers
         .get("x-ember-grant-id")
@@ -267,30 +267,6 @@ async fn handle_request_boxed(
         return Ok(no_applicable_statement_response());
     }
 
-    // Mirror the production scope check so tests exercise it end-to-end.
-    if let Err(violation) = check_scope(&grant.scope, req.method(), &effective_uri) {
-        tracing::warn!(
-            grant_id = %grant.id,
-            persona_id = %persona_id,
-            credential = %credential_name,
-            method = %req.method(),
-            uri = %req.uri(),
-            scope = %grant.scope,
-            detail = %violation.message,
-            "scope violation: denying request"
-        );
-        if let Err(e) = state.store.log_event(
-            Some(&persona_id),
-            "credential.access",
-            Some(&credential_name),
-            violation.audit_outcome(),
-            Some(&violation.message),
-        ) {
-            tracing::warn!(error = ?e, persona_id = %persona_id, credential = %credential_name, outcome = violation.audit_outcome(), "log_event failed");
-        }
-        return Ok(scope_violation_response());
-    }
-
     // Enforce allowed_targets if the grant specifies them.
     // FINDING-1 fix (cycle 41): use effective_uri.host() + host_matches_domain
     // — see the production handler's equivalent block for the rationale.
@@ -384,7 +360,7 @@ async fn handle_request_boxed(
 
     // P69L.0a (test harness): mirror the production auth-injection
     // branching so the test wrapper routes the same way as
-    // `handle_request`. implementation-note-196 — this now also
+    // `handle_request`. implementation-note-202 — this now also
     // detects Anthropic and emits `auth_mode = "anthropic"` so tests
     // can assert the FINDING B routing without a real upstream socket.
     let effective_path_and_query_test = effective_uri
@@ -433,7 +409,7 @@ async fn handle_request_boxed(
     // Post-flight meter (test parity with production).
     let target_host: String = extract_host_from_url(&target_url).unwrap_or_default();
     if let Some(mut delta) = meter_response(&target_host, response_body_bytes.as_ref()) {
-        // T-implementation-note-300: production
+        // T-implementation-note-308: production
         // metering folds in `record_upstream_request` to mint the
         // billable request count. The test harness always returns
         // 200, so success is unconditional — match the production
@@ -673,14 +649,10 @@ async fn scope_read_denies_post() {
     // Per design a POST to a github endpoint under a read-only
     // statement has zero applicable statements (the statement's
     // action is "read", the request's action is "github:push"),
-    // so this denies at the composite layer, not the legacy scope
-    // layer. Either denial shape is acceptable as long as the body
-    // never leaks the selector string.
+    // so this denies at the statement-resolution layer. The body
+    // must not leak the selector string.
     let err = json["error"].as_str().unwrap_or("");
-    assert!(
-        err == "no_applicable_statement" || err == "scope violation",
-        "unexpected error shape: {err}"
-    );
+    assert_eq!(err, "no_applicable_statement", "unexpected error shape: {err}");
     // The response must NOT leak the scope string.
     let body_str = std::str::from_utf8(&body).unwrap();
     assert!(
@@ -786,7 +758,8 @@ async fn scope_unknown_format_denies() {
 
 #[tokio::test]
 async fn scope_read_denies_post_e2e_logs_denial() {
-    // End-to-end: denial also writes an audit entry with outcome=denied_scope.
+    // End-to-end: denial also writes an audit entry when no statement
+    // covers the request.
     let state = make_state();
     let persona = state.store.create_persona("scope-audit").unwrap();
     state
@@ -813,10 +786,8 @@ async fn scope_read_denies_post_e2e_logs_denial() {
         .store
         .query_audit(&crate::infra::audit::AuditFilter::default())
         .unwrap();
-    // Either the legacy scope-violation denial or the composite
-    // no-applicable-statement denial satisfies the audit requirement.
     assert!(entries.iter().any(|e| e.action == "credential.access"
-        && (e.outcome == "denied_scope" || e.outcome == "denied_no_applicable_statement")));
+        && e.outcome == "denied_no_applicable_statement"));
 }
 
 #[tokio::test]
@@ -1129,7 +1100,7 @@ async fn subtarget_contents_no_ref_query_denies() {
 
 // ------------------------------------------------------------------
 // Glob semantics — unit tests now live in
-// `core-proxy-forward::r#match::tests` (implementation-note-69).
+// `core-proxy-forward::r#match::tests` (implementation-note-71).
 // The two end-to-end scope tests below stay here because they exercise
 // `check_scope` against a full `hyper::Uri`, not the matcher alone.
 // ------------------------------------------------------------------
@@ -1403,9 +1374,9 @@ fn seed_composite_grant(
     credential_name: &str,
     statements: Vec<Statement>,
 ) -> String {
-    // Issue a stub so the row exists with sensible scope. Scope of
-    // `*` means the grant-level `check_scope` is a no-op; the
-    // per-Statement resolution carries the real shape.
+    // Issue a stub so the row exists with sensible scope. The row-level
+    // `scope` is metadata here; the signed statement set carries the
+    // real request authorization shape.
     let grant = state
         .store
         .create_grant(persona_id, credential_name, "*", None)
@@ -1421,7 +1392,10 @@ fn seed_composite_grant(
         &root,
     )
     .unwrap();
-    state.store.overwrite_grant_blocks(&grant.id, &ag).unwrap();
+    state
+        .store
+        .overwrite_grant_blocks_with_parent_bound(&grant.id, &ag, &ag)
+        .unwrap();
     grant.id
 }
 
@@ -2080,7 +2054,7 @@ fn threshold_warning_broadcasts_to_subscribers() {
         [0x42u8; 32],
     )));
     let state = Arc::new(ProxyState::new(store));
-    // implementation-note-301: the broadcast channel + threshold
+    // implementation-note-309: the broadcast channel + threshold
     // debounce set now live on the sink, not on `ProxyState`. Install
     // the sink immediately after construction. `OnceLock::set` returns
     // `Result<(), Arc<DaemonEventSink>>` whose Err variant does not
@@ -2171,7 +2145,7 @@ fn threshold_exhausted_broadcasts_budget_exhausted_event() {
         [0x42u8; 32],
     )));
     let state = Arc::new(ProxyState::new(store));
-    // implementation-note-301: see sibling test — sink ownership of
+    // implementation-note-309: see sibling test — sink ownership of
     // events_tx + threshold_emitted moved out of ProxyState.
     let sink = Arc::new(DaemonEventSink::new(state.clone(), Some(events_tx.clone())));
     let _ = state.event_sink.set(sink.clone());
@@ -2222,7 +2196,7 @@ fn threshold_exhausted_broadcasts_budget_exhausted_event() {
 }
 
 // P69L spike Day-1 pure-function tests for git echo helpers moved to
-// `core-proxy-forward::r#match::tests` (implementation-note-69).
+// `core-proxy-forward::r#match::tests` (implementation-note-71).
 
 #[test]
 fn base64_std_encode_matches_rfc_vectors() {
@@ -3216,10 +3190,10 @@ fn filter_drops_proxy_authorization_forwarded_via_te_trailer_connection() {
 }
 
 // development milestone: strict host-suffix matching unit tests moved to
-// `core-proxy-forward::r#match::tests` (implementation-note-69).
+// `core-proxy-forward::r#match::tests` (implementation-note-71).
 
 // ------------------------------------------------------------------
-// implementation-note-196 — FINDING B: provider-aware auth
+// implementation-note-202 — FINDING B: provider-aware auth
 // injection. Mirrors `git_echo_grant_backed_lookup_injects_correct_auth`
 // for the LLM proxy path, but tests the helper directly because
 // `handle_request` consults the target URL for the live TCP connection
@@ -3335,6 +3309,23 @@ fn inject_provider_auth_default_is_bearer() {
     assert_eq!(
         headers.get("authorization").and_then(|v| v.to_str().ok()),
         Some("Bearer sk-openai-test"),
+    );
+}
+
+#[test]
+fn inject_provider_auth_trims_trailing_line_endings() {
+    let mut headers = hyper::HeaderMap::new();
+    let scheme = inject_provider_auth(
+        &mut headers,
+        "api.anthropic.com",
+        false,
+        "sk-ant-test-token\r\n",
+    )
+    .expect("valid credential after newline trim");
+    assert_eq!(scheme, AuthScheme::Anthropic);
+    assert_eq!(
+        headers.get("x-api-key").and_then(|v| v.to_str().ok()),
+        Some("sk-ant-test-token"),
     );
 }
 
@@ -3488,12 +3479,9 @@ async fn c1_scope_split_attack_denies_exfiltration_to_attacker_host() {
     let body = resp.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let err = json["error"].as_str().unwrap_or("");
-    // Either the scope layer or the composite layer may fire first;
-    // both are acceptable denials so long as the credential never
-    // leaves the daemon for `evil.attacker.example`.
-    assert!(
-        err == "scope violation" || err == "no_applicable_statement",
-        "expected a denial error code, got: {err}"
+    assert_eq!(
+        err, "no_applicable_statement",
+        "expected statement-resolution denial, got: {err}"
     );
 }
 
@@ -4026,6 +4014,70 @@ async fn tee_body_meter_matches_buffered_path() {
     assert!(summary.saw_message_stop, "complete SSE stream is Complete");
 }
 
+#[tokio::test]
+async fn composite_template_scope_does_not_block_anthropic_proxy_flow() {
+    let state = make_state();
+    let persona = state.store.create_persona("llm-template-scope").unwrap();
+    state
+        .vault
+        .add(
+            VaultScope::Interactive,
+            &state.store,
+            "anthropic-key",
+            b"sk-test",
+            None,
+        )
+        .unwrap();
+
+    let grant = state
+        .store
+        .create_grant(
+            &persona.id,
+            "anthropic-key",
+            "claude-code-default-v1",
+            None,
+        )
+        .unwrap();
+    let root = state.store.persona_root_keypair(&persona.id).unwrap();
+    let ag = crate::trust::grant::access_grant_from_statements(
+        &grant.id,
+        &persona.id,
+        "anthropic-key",
+        vec![
+            Statement {
+                sid: "S0".into(),
+                resource_type: ResourceType::Credential,
+                actions: vec!["credential:read".into()],
+                resource: ResourceSelector::Exact {
+                    value: "anthropic-key".into(),
+                },
+                budget: None,
+                usage: Usage::default(),
+                conditions: Vec::new(),
+            },
+            stmt_session("S1", 10_000),
+        ],
+        0,
+        None,
+        &root,
+    )
+    .unwrap();
+    state
+        .store
+        .overwrite_grant_blocks_with_parent_bound(&grant.id, &ag, &ag)
+        .unwrap();
+
+    let body = anthropic_body(128, 32);
+    let req = proxy_llm_request(
+        &persona.id,
+        "anthropic-key",
+        "https://api.anthropic.com",
+        &body,
+    );
+    let resp = call_full(Arc::clone(&state), req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
 /// Build a single SSE frame: `event:\n data:\n\n`. Panics on malformed
 /// JSON so a typo in the test fixture fails loud.
 fn sse_frame(event: &str, payload: serde_json::Value) -> String {
@@ -4390,7 +4442,7 @@ fn test_non_streaming_unchanged() {
     );
 }
 
-/// C44-implementation-note-302 regression guard — the proxy.meter audit event
+/// C44-implementation-note-310 regression guard — the proxy.meter audit event
 /// must NOT emit the raw credential alias in any field. Readers of the
 /// audit log must not be able to correlate persona → credential by
 /// scanning rows. The raw alias stays in `statement_usage`/grant rows;
@@ -4998,14 +5050,12 @@ async fn git_echo_grant_backed_lookup_injects_correct_auth() {
 /// Missing persona header → 401 (fail closed before touching upstream).
 #[tokio::test(flavor = "current_thread")]
 async fn git_echo_missing_persona_header_returns_401() {
-    let (echo_state, _persona_id, cred_name) =
+    let (_echo_state, _persona_id, cred_name) =
         make_git_echo_state("test-persona-401", "test-cred-401", "tok");
-    let config = Arc::new(GitEchoConfig {
-        bind_addr: "127.0.0.1:0".parse().unwrap(),
-        upstream_host: "github.com".to_string(),
-        state: echo_state,
-        upstream_scheme: Scheme::Https,
-    });
+    // The 401 path returns before ever touching a GitEchoConfig, so the
+    // earlier `let config = Arc::new(GitEchoConfig { .. })` here was dead
+    // code — drop it. Persona-check + unauthorized() call below are the
+    // exact code path under test.
     let req = Request::builder()
         .method("POST")
         .uri("/github.com/owner/repo.git/git-receive-pack")
@@ -5531,7 +5581,7 @@ async fn body_over_limit_returns_413() {
 // -------------------------------------------------------------------------
 
 // -------------------------------------------------------------------------
-// implementation-note-299 — X-Ember-Grant-Id header support
+// implementation-note-307 — X-Ember-Grant-Id header support
 // -------------------------------------------------------------------------
 
 /// Build a request with an explicit X-Ember-Grant-Id header so the test
@@ -5755,7 +5805,7 @@ fn credential_bytes_zeroized_on_drop() {
     unsafe { ManuallyDrop::drop(&mut md) };
 }
 
-/// T-implementation-note-300 regression guard.
+/// T-implementation-note-308 regression guard.
 ///
 /// `usage.requests` must reflect upstream-confirmed responses, not a
 /// pre-flight tally. Driving the post-flight meter once with an
@@ -5854,7 +5904,7 @@ fn record_upstream_request_only_credits_on_success() {
     assert_eq!(record_upstream_request("api.github.com", true, true), 0,);
 }
 
-/// BEAT-7-implementation-note-217 — `statement_revoked_response` emits a
+/// BEAT-7-implementation-note-224 — `statement_revoked_response` emits a
 /// structured JSON 403 naming the persona + statement so clients can
 /// distinguish revoke from a generic scope/audit denial. Locks the
 /// public shape `{"error":"statement_revoked","persona_id":..,
@@ -5876,7 +5926,7 @@ async fn statement_revoked_response_emits_structured_json_403() {
     assert_eq!(json["statement_id"], "S1");
 }
 
-// implementation-note-237: DaemonEventSink::record_threshold_crossing
+// implementation-note-244: DaemonEventSink::record_threshold_crossing
 // dedupes repeated calls on the same (grant_id, statement_sid, axis, band)
 // tuple. Mirrors the existing in-place `ProxyState.threshold_emitted`
 // semantics so the trait-routed code path is independently correct before

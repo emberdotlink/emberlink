@@ -5,17 +5,34 @@
 //! entry so headless can mint short-lived credentials without re-prompting
 //! Touch ID between sessions, until the enrollment expiry elapses.
 //!
-//! The keychain entry uses the `keyring` crate's default macOS ACL —
-//! "this binary can read it when the system is unlocked" — which is the
-//! AfterFirstUnlock-equivalent access posture the ADR calls for. Touch ID
-//! happens once at enrollment time (slice B's socket handler runs the
-//! biometric prompt before calling `enroll()`); after that, headless rides
-//! the keychain entry until `is_expired()` returns true.
+//! ## ATTESTED-DEVICE-MEK-WRAP (B2, 2026-05-22)
 //!
-//! On revoke or expiry, the keychain entry is deleted and the in-memory
-//! MEK copy is zeroized.
+//! The headless MEK is **AEAD-wrapped under a per-enrollment wrap-key**
+//! before storage. design §"Headless: attested device, variable
+//! enrollment" steps 1-3 require the wrap, not plaintext-in-keychain.
 //!
-//! ## Scope (implementation-note-188)
+//! Storage layout (two keychain entries per persona enrollment):
+//! - `<account>` — base64(`24-byte nonce` || `ciphertext-with-tag` of the
+//!   32-byte MEK), AEAD-encrypted under the wrap-key, AAD
+//!   `b"attested-device.mek-wrap.v1"`. Total wire size: 72 bytes raw → 96
+//!   bytes base64.
+//! - `<WRAP_KEY_PREFIX><account>` — base64(32-byte wrap-key). Stored
+//!   under the keychain entry's default `kSecAttrAccessibleAfterFirstUnlock`
+//!   ACL posture, so a same-uid process can read it after the device is
+//!   first unlocked post-boot — matching design §"variable enrollment"
+//!   step 3.
+//!
+//! Both entries are required to recover the MEK. An attacker who lifts
+//! only one cannot recover the headless MEK; an attacker who lifts both
+//! has effectively the same access the daemon does (matching the
+//! same-uid threat model documented in design §"Headless invariants").
+//!
+//! Legacy v1 entries (pre-B2) stored the raw MEK as base64 (44 bytes
+//! base64 = 32 raw bytes). `unwrap_mek` detects this shape and refuses
+//! with `Error::LegacyUnwrappedFormat` so the operator re-enrolls under
+//! the wrapped scheme rather than silently consuming an insecure entry.
+//!
+//! ## Scope (implementation-note-192)
 //!
 //! - Generate keychain-backed storage for one MEK per persona-enrollment.
 //! - Persist the single active-enrollment metadata slot under the daemon
@@ -31,6 +48,7 @@
 //! - CLI commands (slice C).
 //! - MEK-source selection from the vault.
 //!
+//! CLASSIFICATION: INTERNAL
 
 use std::collections::HashMap;
 use std::fs;
@@ -40,6 +58,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
+use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce, aead::Aead, aead::Payload};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
@@ -55,6 +74,22 @@ pub const KEYCHAIN_SERVICE: &str = "ember-daemon-headless";
 pub const ACTIVE_ENROLLMENT_FILE: &str = "headless/active-enrollment.json";
 
 const ACTIVE_ENROLLMENT_VERSION: u8 = 1;
+
+/// Prefix on the keychain account name for the per-enrollment wrap-key
+/// companion entry. Per ATTESTED-DEVICE-MEK-WRAP (B2): the wrap-key
+/// lives at `<WRAP_KEY_PREFIX><account>` while the wrapped MEK lives
+/// at `<account>` for backward compatibility with the entry name the
+/// legacy v1 schema used.
+const WRAP_KEY_PREFIX: &str = "wrap-key.";
+
+/// AEAD AAD bound into every wrapped headless MEK. Version-prefixed
+/// per design conventions; bump the suffix on any format rotation.
+const HEADLESS_MEK_WRAP_AAD: &[u8] = b"attested-device.mek-wrap.v1";
+
+/// Legacy raw-MEK entries (pre-B2) stored 32 bytes base64-encoded — 44
+/// characters. Wrapped entries store 24 + 32 + 16 = 72 bytes base64-encoded
+/// — 96 characters. The length test discriminates cleanly.
+const LEGACY_RAW_MEK_BASE64_LEN: usize = 44;
 type MockKeychain = HashMap<(String, String), String>;
 
 static MOCK_KEYCHAIN: OnceLock<Mutex<MockKeychain>> = OnceLock::new();
@@ -68,6 +103,15 @@ pub enum Error {
     Io(String),
     EnrollmentIdMismatch { requested: String, active: String },
     UnsupportedSize,
+    /// Encountered a pre-B2 raw-MEK entry that must be re-enrolled under
+    /// the AEAD-wrapped scheme before it can be read. The operator
+    /// remediation is `ember headless enroll --persona <id>` (which
+    /// generates a fresh wrap-key + wrapped MEK pair).
+    LegacyUnwrappedFormat,
+    /// AEAD verification failed — the wrap-key and wrapped MEK don't
+    /// agree, or the AAD didn't match. Suggests tampering or schema
+    /// drift; safe response is to revoke + re-enroll.
+    UnwrapFailed(String),
 }
 
 impl std::fmt::Display for Error {
@@ -85,6 +129,13 @@ impl std::fmt::Display for Error {
             Error::UnsupportedSize => {
                 write!(f, "stored headless MEK has unexpected size (not 32 bytes)")
             }
+            Error::LegacyUnwrappedFormat => write!(
+                f,
+                "headless MEK is in the pre-B2 raw-plaintext keychain format; \
+                 re-enroll the persona with `ember headless enroll` to upgrade \
+                 to the AEAD-wrapped scheme"
+            ),
+            Error::UnwrapFailed(msg) => write!(f, "headless MEK unwrap failed: {msg}"),
         }
     }
 }
@@ -193,15 +244,77 @@ pub struct AttestedDevice {
 }
 
 impl AttestedDevice {
-    /// Store `mek` under the headless keychain entry for `persona` and return
-    /// the enrollment record.
+    /// AEAD-wrap `mek` and store the wrap-key + wrapped MEK in the
+    /// keychain. Returns the enrollment record.
+    ///
+    /// Per ATTESTED-DEVICE-MEK-WRAP (B2, design §"Headless: attested
+    /// device, variable enrollment"): the MEK is encrypted under a
+    /// freshly-generated 32-byte wrap-key with a 24-byte XChaCha20 nonce
+    /// and AAD `b"attested-device.mek-wrap.v1"`. Two keychain entries
+    /// land:
+    /// - `<persona>` — base64(nonce || ciphertext-with-tag) of the
+    ///   wrapped MEK
+    /// - `<WRAP_KEY_PREFIX><persona>` — base64(wrap-key)
+    ///
+    /// Both entries are required to recover the MEK; either alone is
+    /// insufficient. This matches the device-binding posture design
+    /// calls for — the wrap-key entry's keychain ACL is what makes
+    /// recovery require the daemon's identity context.
     ///
     /// Caller is responsible for running any biometric / Touch ID prompt
     /// BEFORE calling this function — `enroll` itself does not prompt.
     pub fn enroll(persona: &str, duration: Duration, mek: &[u8; 32]) -> Result<Self, Error> {
         let account = persona.to_string();
-        let encoded = base64::engine::general_purpose::STANDARD.encode(mek);
-        keychain_set(&account, &encoded)?;
+        // Generate a fresh per-enrollment wrap-key. The wrap-key NEVER
+        // leaves this function in unwrapped form — it lands in keychain
+        // base64-encoded and is zeroized from this stack frame on the
+        // explicit drop below.
+        let mut wrap_key = [0u8; 32];
+        getrandom::fill(&mut wrap_key)
+            .map_err(|e| Error::Keychain(format!("wrap-key entropy: {e}")))?;
+        // Fresh nonce per wrap.
+        let mut nonce_bytes = [0u8; 24];
+        getrandom::fill(&mut nonce_bytes)
+            .map_err(|e| Error::Keychain(format!("wrap nonce entropy: {e}")))?;
+        let cipher = XChaCha20Poly1305::new_from_slice(&wrap_key)
+            .map_err(|e| Error::Encode(format!("wrap cipher init: {e}")))?;
+        let nonce = XNonce::from_slice(&nonce_bytes);
+        let ciphertext = cipher
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: mek.as_slice(),
+                    aad: HEADLESS_MEK_WRAP_AAD,
+                },
+            )
+            .map_err(|e| Error::Encode(format!("wrap aead: {e}")))?;
+        // Wire shape: [24-byte nonce] || [ciphertext-with-tag]. Base64
+        // for keychain storage.
+        let mut wire = Vec::with_capacity(24 + ciphertext.len());
+        wire.extend_from_slice(&nonce_bytes);
+        wire.extend_from_slice(&ciphertext);
+        let wrapped_b64 = base64::engine::general_purpose::STANDARD.encode(&wire);
+        let wrap_key_b64 = base64::engine::general_purpose::STANDARD.encode(wrap_key);
+
+        // Store wrap-key first; if that fails, the wrapped MEK never lands
+        // and the operator sees a clean failure rather than a half-written
+        // pair. On rollback, an existing wrap-key entry (from a prior
+        // failed enroll) gets overwritten — keychain set is idempotent.
+        let wrap_key_account = format!("{WRAP_KEY_PREFIX}{account}");
+        keychain_set(&wrap_key_account, &wrap_key_b64)?;
+        // Then store the wrapped MEK at the persona's account slot.
+        if let Err(e) = keychain_set(&account, &wrapped_b64) {
+            // Best-effort rollback: try to remove the wrap-key entry so
+            // the keychain doesn't hold an orphaned wrap-key. Ignore
+            // delete errors — the wrap-key alone is useless.
+            let _ = keychain_delete(&wrap_key_account);
+            return Err(e);
+        }
+
+        // Zeroize the per-stack copy of the wrap-key now that both
+        // keychain entries are landed.
+        wrap_key.zeroize();
+
         let now = SystemTime::now();
         Ok(Self {
             enrollment_id: uuid::Uuid::new_v4().to_string(),
@@ -226,33 +339,116 @@ impl AttestedDevice {
         Ok(device)
     }
 
-    /// Read the stored MEK back from the keychain.
+    /// Read + AEAD-unwrap the stored MEK from the keychain.
     ///
-    /// Returns `Err(Error::NotFound)` if the entry has been deleted (revoked
-    /// or never enrolled). Returns `Err(Error::UnsupportedSize)` if the
-    /// stored value decodes to anything other than 32 bytes — should never
-    /// happen for entries written by `enroll`, but the invariant is asserted
-    /// so a future migration / hand-edit can't silently widen the MEK type.
+    /// Per ATTESTED-DEVICE-MEK-WRAP (B2): loads both keychain entries
+    /// (wrap-key + wrapped MEK), AEAD-decrypts with the bound
+    /// `HEADLESS_MEK_WRAP_AAD`, and returns the 32-byte plaintext MEK.
     ///
-    /// **Zeroize discipline:** the returned `[u8; 32]` must be `zeroize`d by
-    /// the caller once consumed. This function does not retain a copy.
+    /// Migration: legacy v1 entries (pre-B2) stored the raw MEK as a
+    /// 44-character base64 string. If we see that shape, refuse with
+    /// `Error::LegacyUnwrappedFormat` — the operator-facing remediation
+    /// is to re-enroll under the wrapped scheme. The legacy entry stays
+    /// in keychain until explicitly revoked; we do NOT silently delete
+    /// it here.
+    ///
+    /// Returns `Err(Error::NotFound)` if either entry has been deleted
+    /// (revoked or never enrolled). Returns `Err(Error::UnwrapFailed)`
+    /// if AEAD verification fails (tampering, schema drift, wrap-key
+    /// rotated out from under the wrapped MEK).
+    ///
+    /// **Zeroize discipline:** the returned `[u8; 32]` must be `zeroize`d
+    /// by the caller once consumed. This function does not retain a
+    /// copy of either the MEK or the wrap-key after return.
     pub fn unwrap_mek(&self) -> Result<[u8; 32], Error> {
-        let encoded = keychain_get(&self.account)?;
-        let mut bytes = base64::engine::general_purpose::STANDARD
-            .decode(&encoded)
-            .map_err(|e| Error::Decode(format!("base64: {e}")))?;
-        if bytes.len() != 32 {
-            bytes.zeroize();
+        let wrapped_b64 = keychain_get(&self.account)?;
+
+        // Legacy v1 detection: raw 32 bytes base64-encoded → 44 chars.
+        // Refuse with a re-enrollment hint rather than silently
+        // consuming an insecure entry.
+        if wrapped_b64.len() == LEGACY_RAW_MEK_BASE64_LEN {
+            return Err(Error::LegacyUnwrappedFormat);
+        }
+
+        // Wrap-key entry MUST exist for v2 entries — if it doesn't, the
+        // pair is half-installed and the safe response is `NotFound`.
+        let wrap_key_account = format!("{WRAP_KEY_PREFIX}{}", self.account);
+        let wrap_key_b64 = match keychain_get(&wrap_key_account) {
+            Ok(v) => v,
+            Err(Error::NotFound) => return Err(Error::NotFound),
+            Err(e) => return Err(e),
+        };
+
+        let mut wrap_key_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&wrap_key_b64)
+            .map_err(|e| Error::Decode(format!("wrap-key base64: {e}")))?;
+        if wrap_key_bytes.len() != 32 {
+            wrap_key_bytes.zeroize();
+            return Err(Error::UnsupportedSize);
+        }
+        let mut wrap_key = [0u8; 32];
+        wrap_key.copy_from_slice(&wrap_key_bytes);
+        wrap_key_bytes.zeroize();
+
+        let mut wire = base64::engine::general_purpose::STANDARD
+            .decode(&wrapped_b64)
+            .map_err(|e| Error::Decode(format!("wrapped-mek base64: {e}")))?;
+        if wire.len() < 24 + 16 {
+            wire.zeroize();
+            wrap_key.zeroize();
+            return Err(Error::UnwrapFailed(format!(
+                "wrapped MEK wire too short ({} bytes; minimum 40)",
+                wire.len()
+            )));
+        }
+        let (nonce_bytes, ciphertext) = wire.split_at(24);
+        let cipher = XChaCha20Poly1305::new_from_slice(&wrap_key).map_err(|e| {
+            // Zeroize before bailing.
+            wrap_key.zeroize();
+            Error::UnwrapFailed(format!("cipher init: {e}"))
+        })?;
+        let nonce = XNonce::from_slice(nonce_bytes);
+        let plaintext = cipher
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: ciphertext,
+                    aad: HEADLESS_MEK_WRAP_AAD,
+                },
+            )
+            .map_err(|e| {
+                wrap_key.zeroize();
+                Error::UnwrapFailed(format!("aead: {e}"))
+            })?;
+
+        // Zeroize the wrap-key as soon as decrypt succeeds; the MEK is
+        // the only sensitive value that should leave this function.
+        wrap_key.zeroize();
+
+        if plaintext.len() != 32 {
+            let mut pt = plaintext;
+            pt.zeroize();
             return Err(Error::UnsupportedSize);
         }
         let mut out = [0u8; 32];
-        out.copy_from_slice(&bytes);
-        bytes.zeroize();
+        out.copy_from_slice(&plaintext);
+        // Zeroize the plaintext Vec.
+        let mut pt = plaintext;
+        pt.zeroize();
         Ok(out)
     }
 
-    /// Delete the keychain entry. Idempotent: a missing entry returns Ok.
+    /// Delete both the wrapped-MEK and wrap-key keychain entries.
+    /// Idempotent: a missing entry returns Ok. Per
+    /// ATTESTED-DEVICE-MEK-WRAP (B2) we revoke the wrap-key first so a
+    /// concurrent reader cannot win a TOCTOU race where the wrap-key is
+    /// still readable but the wrapped MEK is already gone (which would
+    /// trigger `NotFound` on the wrapped side — safe, but noisy).
     pub fn revoke(&self) -> Result<(), Error> {
+        let wrap_key_account = format!("{WRAP_KEY_PREFIX}{}", self.account);
+        // Delete wrap-key first; if a reader observes the missing
+        // wrap-key, they correctly report `NotFound`.
+        let _ = keychain_delete(&wrap_key_account);
         keychain_delete(&self.account)
     }
 
@@ -644,4 +840,113 @@ mod tests {
         AttestedDevice::revoke_active(tmp.path(), Some(&device.enrollment_id))
             .expect("cleanup revoke succeeds");
     }
+
+    // ATTESTED-DEVICE-MEK-WRAP (B2) anchor: enroll writes BOTH the
+    // wrap-key and wrapped-MEK entries, and removing either alone makes
+    // unwrap fail safely without leaking plaintext.
+    #[test]
+    fn enroll_lands_both_wrap_key_and_wrapped_mek_entries() {
+        let persona = "test-wrap-pair-landed";
+        cleanup(persona);
+        let _ = keychain_delete(&format!("{WRAP_KEY_PREFIX}{persona}"));
+        let mek: [u8; 32] = [0xCD; 32];
+        let device =
+            AttestedDevice::enroll(persona, Duration::from_secs(3600), &mek).expect("enroll");
+
+        let wrapped_b64 = keychain_get(persona).expect("wrapped-mek entry present");
+        let wrap_key_b64 =
+            keychain_get(&format!("{WRAP_KEY_PREFIX}{persona}")).expect("wrap-key entry present");
+
+        // Wire shapes: wrapped MEK is 24 nonce + 32 ciphertext + 16 tag
+        // = 72 raw bytes → 96 base64 chars. Wrap-key is 32 raw → 44 b64.
+        assert_eq!(
+            wrap_key_b64.len(),
+            44,
+            "wrap-key should base64-encode 32 raw bytes"
+        );
+        assert!(
+            wrapped_b64.len() > 80,
+            "wrapped MEK should be larger than the legacy 44-char raw shape; got {}",
+            wrapped_b64.len()
+        );
+        assert_ne!(
+            wrapped_b64.len(),
+            44,
+            "wrapped MEK must not look like a raw-MEK entry (collision with legacy detection)"
+        );
+
+        // Round-trip: unwrap recovers the original MEK.
+        let recovered = device.unwrap_mek().expect("unwrap_mek succeeds");
+        assert_eq!(recovered, mek);
+
+        // Lose the wrap-key entry → unwrap reports NotFound (safe).
+        let _ = keychain_delete(&format!("{WRAP_KEY_PREFIX}{persona}"));
+        match device.unwrap_mek() {
+            Err(Error::NotFound) => {}
+            other => panic!("expected NotFound without wrap-key, got {other:?}"),
+        }
+
+        device.revoke().expect("cleanup revoke");
+    }
+
+    // B2 migration: legacy raw-MEK base64 entries are refused with a
+    // re-enrollment hint rather than silently consumed.
+    #[test]
+    fn unwrap_refuses_legacy_raw_mek_entry() {
+        let persona = "test-legacy-refuse";
+        cleanup(persona);
+        let _ = keychain_delete(&format!("{WRAP_KEY_PREFIX}{persona}"));
+        let mek: [u8; 32] = [0x99; 32];
+        // Hand-roll a legacy v1 entry — raw MEK base64-encoded under the
+        // persona's account slot, no wrap-key companion.
+        let raw_b64 = base64::engine::general_purpose::STANDARD.encode(mek);
+        assert_eq!(raw_b64.len(), 44, "legacy detection assumption");
+        keychain_set(persona, &raw_b64).expect("hand-rolled legacy entry");
+
+        let device = AttestedDevice {
+            enrollment_id: "legacy-fixture".into(),
+            persona: persona.to_string(),
+            account: persona.to_string(),
+            enrolled_at: SystemTime::now(),
+            expiry: SystemTime::now() + Duration::from_secs(3600),
+        };
+        match device.unwrap_mek() {
+            Err(Error::LegacyUnwrappedFormat) => {}
+            other => panic!("expected LegacyUnwrappedFormat, got {other:?}"),
+        }
+
+        cleanup(persona);
+    }
+
+    // ATTESTED-DEVICE-MEK-WRAP anchor: revoke clears BOTH keychain
+    // entries so a subsequent enroll under the same persona doesn't
+    // inherit a stale wrap-key.
+    #[test]
+    fn revoke_clears_both_wrap_key_and_wrapped_mek_entries() {
+        let persona = "test-wrap-revoke-both";
+        cleanup(persona);
+        let _ = keychain_delete(&format!("{WRAP_KEY_PREFIX}{persona}"));
+        let mek: [u8; 32] = [0xEE; 32];
+        let device =
+            AttestedDevice::enroll(persona, Duration::from_secs(3600), &mek).expect("enroll");
+        device.revoke().expect("revoke");
+
+        match keychain_get(persona) {
+            Err(Error::NotFound) => {}
+            other => panic!("wrapped-mek entry should be deleted, got {other:?}"),
+        }
+        match keychain_get(&format!("{WRAP_KEY_PREFIX}{persona}")) {
+            Err(Error::NotFound) => {}
+            other => panic!("wrap-key entry should be deleted, got {other:?}"),
+        }
+    }
 }
+
+// implementation-note-193 anchor: this constant marks
+// the crate-level B1+B2 landing for grep-time auditability.
+#[doc(hidden)]
+pub const VAULT_SCOPE_MEK_SPLIT_CRYPTOGRAPHIC_LANDED: &str =
+    "vault_scope_mek_split_cryptographic_landed";
+
+#[doc(hidden)]
+pub const ATTESTED_DEVICE_MEK_WRAP_LANDED: &str = "attested_device_mek_wrap_landed";

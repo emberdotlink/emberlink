@@ -42,12 +42,16 @@ pub enum TerminationReason {
     /// Launcher sent `session.close` cleanly.
     CleanExit,
     /// Daemon detected the launcher's heartbeat lost (>90s without a fresh
-    /// heartbeat AND PID no longer alive). implementation-note-46.
+    /// heartbeat AND PID no longer alive). implementation-note-48.
     HeartbeatLost,
     /// Grant TTL elapsed before the launcher closed the session.
     TtlExpired,
     /// Operator explicitly revoked via `ember grant revoke`.
     ExplicitRevoke,
+    /// Grant exhausted one of its budget axes before the session ended.
+    ExhaustedByBudget,
+    /// Grant terminated because an ancestor grant was revoked.
+    ParentCascadeRevoked,
 }
 
 /// Cohort A `session.claude_code` Receipt body. Wraps the generic
@@ -55,7 +59,7 @@ pub enum TerminationReason {
 /// — flow through unchanged) and adds the cohort-A-specific extensions
 /// permitted by design: `audit_gaps[]` for daemon-unreachable windows, and
 /// the termination-reason triple (`termination_reason`, `last_heartbeat_at`,
-/// `pid_alive_at_check`) for implementation-note-46's H1 invariant.
+/// `pid_alive_at_check`) for implementation-note-48's H1 invariant.
 ///
 /// `#[serde(flatten)]` on `base` ensures the wire shape is one flat object
 /// (matching design §"Body" and design §7), not a nested `{ base: { ... } }`.
@@ -69,7 +73,7 @@ pub struct ClaudeCodeBody {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub audit_gaps: Vec<AuditGap>,
     /// Termination reason. `None` for receipts predating
-    /// implementation-note-46; required for receipts emitted by
+    /// implementation-note-48; required for receipts emitted by
     /// the daemon-driven dirty-exit path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub termination_reason: Option<TerminationReason>,
@@ -90,6 +94,9 @@ pub struct ClaudeCodeBody {
 /// Locked `kind` discriminator for the cohort-A `session.claude_code` Receipt.
 /// Used as `ReceiptEnvelope.kind` per design §"Envelope".
 pub const RECEIPT_KIND_CLAUDE_CODE: &str = "session.claude_code";
+
+/// Locked `kind` discriminator for composite-grant terminal session receipts.
+pub const RECEIPT_KIND_COMPOSITE_GRANT: &str = "session.composite_grant";
 
 #[cfg(test)]
 mod tests {
@@ -229,7 +236,7 @@ mod tests {
     fn termination_reason_fields_omit_when_none() {
         // Backward-compat: a body without termination metadata must not
         // emit the new fields onto the wire — receipts predating
-        // implementation-note-46 still parse and round-trip.
+        // implementation-note-48 still parse and round-trip.
         let body = ClaudeCodeBody::default();
         let json = serde_json::to_string(&body).unwrap();
         assert!(!json.contains("termination_reason"));

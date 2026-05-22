@@ -1,5 +1,5 @@
 //! `ember init --for claude-code` and `ember uninstall --for claude-code`
-//! orchestration (implementation-note-451).
+//! orchestration (implementation-note-468).
 //!
 //! Per design §2 / §3: a one-command first-run setup that wires Claude Code
 //! to the local ember daemon. This module is the orchestration layer — the
@@ -99,16 +99,46 @@ pub fn default_settings_json_path() -> Result<PathBuf, InitError> {
 /// users who relied on per-host persona separation must now set
 /// `EMBER_PERSONA` explicitly or pass `-w <name>` to the launcher.
 ///
-/// implementation-note-483 anchor: routes
+/// implementation-note-505 anchor: routes
 /// through `default_persona_id_for_runtime` so launcher + init agree on
 /// the same persona-id shape.
 pub fn claude_code_persona_name() -> String {
     crate::launcher::default_persona_id_for_runtime("claude-code", None)
 }
 
+/// Install or repair the managed production shadow toolchain under
+/// `~/.ember/shadow/bin/`.
+///
+/// This is the init-time repair seam for operator/friendly hosts:
+/// the launcher and host-proof both expect `gh` / `git` shims to resolve
+/// through the installed product construct bundle rather than repo-local
+/// `target/...` artifacts.
+pub fn install_managed_prod_shadow_path() -> Result<PathBuf, String> {
+    let shadow_root = home_dir()
+        .map_err(|e| e.to_string())?
+        .join(".ember")
+        .join("shadow");
+    let specs = crate::launcher::claude_code::managed_prod_construct_specs();
+    if !crate::launcher::claude_code::prod_required_constructs_present(&specs) {
+        return Err(
+            "managed product construct bundle is incomplete: expected installed `ember-gh` and `ember-git`, not repo-built target artifacts".to_string(),
+        );
+    }
+    crate::launcher::path_shadow::install_path_shadow(&shadow_root, &specs)
+        .map_err(|e| format!("io error on {}: {e}", shadow_root.display()))?;
+    Ok(shadow_root)
+}
+
 /// Resolve the user's home directory. Wraps `dirs_next::home_dir`.
 fn home_dir() -> Result<PathBuf, InitError> {
     dirs_next::home_dir().ok_or(InitError::NoHomeDir)
+}
+
+/// Public surface of [`home_dir`] used by the `cmd_migrate_path_shadow_layout`
+/// CLI handler so the binary doesn't have to depend on `dirs_next` directly.
+/// implementation-note-453.
+pub fn home_dir_for_migrate() -> Result<PathBuf, String> {
+    home_dir().map_err(|e| e.to_string())
 }
 
 /// Best-effort hostname resolution. Returns `None` if the platform call
@@ -224,13 +254,13 @@ fn next_commands_text(posture: GitHubOnboardingPosture) -> String {
     match posture {
         GitHubOnboardingPosture::AppConfiguredReal => {
             lines.extend_from_slice(&[
-                "  ember claude-code        # launch Claude Code with this grant (recommended)",
+                "  ember claude             # launch Claude with this grant (recommended)",
                 "  ember receipt show       # see the audit trail of the grant",
             ]);
         }
         GitHubOnboardingPosture::PatConfigured => {
             lines.extend_from_slice(&[
-                "  ember claude-code        # launch now on the degraded PAT lane",
+                "  ember claude             # launch now on the degraded PAT lane",
                 "  ember github setup       # upgrade to the real App lane when ready",
                 "  ember receipt show       # see the audit trail of the grant",
             ]);
@@ -239,14 +269,14 @@ fn next_commands_text(posture: GitHubOnboardingPosture) -> String {
             lines.extend_from_slice(&[
                 "  ember github setup       # repair or replace the local App credential triple",
                 "  ember github status      # confirm the App lane is healthy",
-                "  ember claude-code        # launch once GitHub is repaired",
+                "  ember claude             # launch once GitHub is repaired",
             ]);
         }
         GitHubOnboardingPosture::AppConfiguredMock | GitHubOnboardingPosture::AppNotConfigured => {
             lines.extend_from_slice(&[
                 "  ember github setup       # register PEM + App ID + installation URL/ID + slug",
                 "  ember github status      # confirm the App lane is ready",
-                "  ember claude-code        # launch once GitHub is configured",
+                "  ember claude             # launch once GitHub is configured",
             ]);
         }
     }
@@ -254,7 +284,7 @@ fn next_commands_text(posture: GitHubOnboardingPosture) -> String {
         "",
         "About the launcher",
         "------------------",
-        "`ember claude-code` is the canonical v0.3.0 launcher. It opens a fresh session,",
+        "`ember claude` is the canonical v0.3.0 launcher. It opens a fresh session,",
         "attaches a scoped grant, and keeps audit plus revocation on the supported path.",
         "",
         "Use that path first. Bare `claude` and headless automation remain advanced",
@@ -277,7 +307,7 @@ pub fn render_github_onboarding_guidance(posture: GitHubOnboardingPosture) -> St
     match posture {
         GitHubOnboardingPosture::AppConfiguredReal => {
             out.push_str("  Ready: GitHub App broker configured for the HTTPS/API lane.\n");
-            out.push_str("  `ember claude-code` will use short-lived installation tokens there.\n");
+            out.push_str("  `ember claude` will use short-lived installation tokens there.\n");
         }
         GitHubOnboardingPosture::PatConfigured => {
             out.push_str("  Degraded PAT fallback is configured today.\n");
@@ -320,7 +350,7 @@ pub fn print_github_onboarding_guidance(posture: GitHubOnboardingPosture) -> io:
 /// Decide whether the autostart path should install a LaunchAgent / systemd
 /// user unit, or fall back to a raw `--background` daemon spawn.
 ///
-/// implementation-note-486: the LaunchAgent / systemd-user
+/// implementation-note-508: the LaunchAgent / systemd-user
 /// path is correct for the canonical "production user" install (single
 /// always-up daemon per login session) — but it baked an absolute `~/.ember/`
 /// path resolved against the operator's *real* HOME at install time, so an
@@ -360,7 +390,7 @@ pub fn supports_managed_daemon_install(
 
 /// Resolve the autostart liveness-wait timeout in seconds. Honors the
 /// `EMBER_DAEMON_AUTOSTART_TIMEOUT_SECS` env override; falls back to a
-/// 10s default (raised from 5s in implementation-note-486
+/// 10s default (raised from 5s in implementation-note-508
 /// because first-time provisioning — vault.salt + daemon.db schema — can
 /// exceed 5s on slow disks).
 pub fn autostart_liveness_timeout_secs() -> u64 {
@@ -395,7 +425,7 @@ mod tests {
 
     #[test]
     fn persona_name_uses_2_slot_default_shape() {
-        // implementation-note-483: the default
+        // implementation-note-505: the default
         // persona now follows the locked 2-slot Persona schema
         // (CONTEXT.md "Identity surface" §Persona ID schema) —
         // `claude-code-<context>` where `<context>` is `default` until
@@ -584,7 +614,7 @@ mod tests {
         let text = next_commands_text(GitHubOnboardingPosture::AppConfiguredReal);
         assert!(
             text.contains(
-                "`ember claude-code` is the canonical v0.3.0 launcher. It opens a fresh session,"
+                "`ember claude` is the canonical v0.3.0 launcher. It opens a fresh session,"
             ),
             "launcher guidance should still recommend the session-scoped path"
         );
@@ -633,7 +663,7 @@ mod tests {
         assert!(text.contains("launch once GitHub is repaired"));
     }
 
-    // ── implementation-note-487 tests ───────────────────────
+    // ── implementation-note-509 tests ───────────────────────
 
     /// Integration-level: init_for_claude_code_autostarts_daemon_when_not_running
     ///
@@ -655,7 +685,7 @@ mod tests {
         unimplemented!("run manually: ember daemon stop && ember init --for claude-code")
     }
 
-    // ── implementation-note-486 tests ───────────────────────
+    // ── implementation-note-508 tests ───────────────────────
 
     /// LaunchAgent/systemd path is appropriate for a default user HOME with
     /// no --config override.

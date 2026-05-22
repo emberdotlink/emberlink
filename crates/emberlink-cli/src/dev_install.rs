@@ -74,7 +74,7 @@ pub fn render_plist(vars: &DevInstallVars) -> String {
 ///
 /// The production implementation ([`RealInstallOps`]) shells out to
 /// `launchctl bootout` / `launchctl bootstrap`. Tests supply a
-/// [`StubInstallOps`] that records calls and returns controlled outcomes.
+/// `StubInstallOps` that records calls and returns controlled outcomes.
 pub trait InstallOps {
     /// Write `content` to `dest`, creating or truncating the file.
     fn write_plist(&self, dest: &str, content: &str) -> io::Result<()>;
@@ -166,9 +166,9 @@ impl InstallOps for RealInstallOps {
 /// # Algorithm
 ///
 /// 1. Render the plist from `vars`.
-/// 2. Acquire the advisory lock at [`LOCK_PATH`] to serialize concurrent
+/// 2. Acquire the advisory lock at `LOCK_PATH` to serialize concurrent
 ///    `launchctl` operations.
-/// 3. Read the currently-installed plist at [`PLIST_DEST`] (if any).
+/// 3. Read the currently-installed plist at `PLIST_DEST` (if any).
 /// 4. If content is identical → return `Ok(false)` (no-op).
 /// 5. If content differs (or the file is absent) → write the new content,
 ///    then `bootout` the old service (idempotent), then `bootstrap` the new
@@ -185,7 +185,7 @@ pub fn install_plist(vars: &DevInstallVars) -> io::Result<bool> {
 
 /// Testable variant of [`install_plist`] — caller supplies the operations
 /// adapter, destination path, lock path, and label. Tests inject a
-/// [`StubInstallOps`] and direct writes to a temp directory.
+/// `StubInstallOps` and direct writes to a temp directory.
 pub fn install_plist_with(
     vars: &DevInstallVars,
     ops: &dyn InstallOps,
@@ -392,7 +392,7 @@ mod tests {
 
         fn launchctl_bootout(&self, label: &str) -> io::Result<()> {
             if self.bootout_fails {
-                return Err(io::Error::new(io::ErrorKind::Other, "bootout failed"));
+                return Err(io::Error::other("bootout failed"));
             }
             self.calls
                 .borrow_mut()
@@ -402,7 +402,7 @@ mod tests {
 
         fn launchctl_bootstrap(&self, plist_path: &str) -> io::Result<()> {
             if self.bootstrap_fails {
-                return Err(io::Error::new(io::ErrorKind::Other, "bootstrap failed"));
+                return Err(io::Error::other("bootstrap failed"));
             }
             self.calls
                 .borrow_mut()

@@ -864,7 +864,7 @@ mod tests {
     // contract slice this Construct depends on: the broker registry can
     // hold a `MockBroker::new(BrokerProvider::Vercel)`, and a request that
     // declares `provider = Vercel` round-trips through issue → revoke
-    // without panicking. Real Vercel impl is implementation-note-103 (separate task).
+    // without panicking. Real Vercel impl is implementation-note-106 (separate task).
 
     use core_broker::{Broker, BrokerError, BrokerProvider, BrokerRequest, MockBroker};
     use std::time::Duration;

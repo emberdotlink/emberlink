@@ -1,7 +1,7 @@
 
 //! End-to-end tests for the MACOS-PRIMITIVES Decision 5 spawn chain.
 //!
-//! implementation-note-184
+//! implementation-note-188
 //!
 //! ## Test surfaces
 //!

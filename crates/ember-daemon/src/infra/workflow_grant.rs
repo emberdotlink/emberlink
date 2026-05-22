@@ -4,7 +4,7 @@
 //! Per-session sidecar file at `<sessions_dir>/<session_id>/workflow-grant.json`
 //! carrying the active `core_grants::workflow::WorkflowGrant` if the launcher
 //! attached one at session-open via the workflow-template prompt UX
-//! (implementation-note-159).
+//! (implementation-note-163).
 //!
 //! Sidecar pattern matches the existing audit-gaps.jsonl / permits-archive.jsonl
 //! / receipt.json convention in `core_state::SessionStore` — see that module's

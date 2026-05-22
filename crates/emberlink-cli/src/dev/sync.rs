@@ -1,16 +1,19 @@
-//! `ember dev sync` — incremental rebuild + diff + kickstart of the dev daemon.
+//! `ember dev sync` — incremental rebuild + diff + kickstart of the current
+//! worktree dev runtime.
 //!
-//! design §Component 4. After editing daemon or construct code, the operator
-//! runs `ember dev sync` to rebuild, detect changed binaries (content-hash
-//! diff), copy them to the dev install root, and restart the dev daemon.
-//! Target wall-clock: ~30 seconds (dominated by `cargo build --release`).
+//! design §Component 4. After editing CLI, daemon, or construct code, the
+//! operator runs `ember dev sync` to rebuild, detect changed binaries
+//! (content-hash diff), copy them to the dev install root, and restart the
+//! dev daemon. Target wall-clock: ~30 seconds (dominated by
+//! `cargo build --release`).
 //!
 //! # Phase-1 scope (this slice)
 //!
-//! - Step 1: incremental cargo build (`--release -p ember-daemon -p ember-construct`).
+//! - Step 1: incremental cargo build (`--release -p emberlink-cli -p
+//!   ember-daemon -p ember-construct`).
 //! - Step 2: content-hash diff (SHA-256) — detect which built binaries changed.
 //! - Step 3: copy changed binaries to the dev install root (code-signing is a
-//!   TODO stub; signing pipeline lands in implementation-note-468).
+//!   TODO stub; signing pipeline lands in implementation-note-488).
 //! - Step 4: re-generate and re-sign the dev manifest when synced binaries
 //!   changed.
 //! - Step 5: `launchctl kickstart -k system/sh.emberlink.daemon.dev` (skipped
@@ -32,16 +35,17 @@ use ed25519_dalek::SigningKey;
 use sha2::{Digest, Sha256};
 
 use crate::dev::identity_root;
-use crate::dev_runtime::{DevRuntimeEnv, resolve_dev_runtime_for_workspace_root, resolve_workspace_root};
 use crate::dev_install_slice_c::{CommandRunner, RealCommandRunner, manifest, verify};
+use crate::dev_runtime::{
+    DevRuntimeEnv, resolve_dev_runtime_for_workspace_root, resolve_workspace_root,
+};
+use crate::dev_runtime_artifacts::{build_packages, runtime_artifacts};
 
 /// Checkpoint — `dev_prod_parity_ember_dev_sync_landed`.
 #[doc(hidden)]
 pub const SENTINEL_DEV_PROD_PARITY_EMBER_DEV_SYNC_LANDED: &str =
     "dev_prod_parity_ember_dev_sync_landed";
 
-/// Binary targets built and synced by `ember dev sync`.
-const SYNC_TARGETS: &[&str] = &["ember-daemon", "ember-construct"];
 const SYNC_VERIFY_TIMEOUT_SECS: u64 = 10;
 
 /// Arguments for `ember dev sync`.
@@ -111,27 +115,25 @@ fn io_other(message: impl Into<String>) -> io::Error {
     io::Error::other(message.into())
 }
 
-/// Run `cargo build --release` for the sync targets.
+/// Run `cargo build --release` for the dev-runtime packages.
 ///
 /// Returns an error if `cargo` exits non-zero. Output (stdout + stderr) is
 /// forwarded to the terminal so the operator sees compile errors inline.
 fn cargo_build(workspace_root: &Path) -> io::Result<()> {
     let mut args = vec!["build", "--release"];
-    for target in SYNC_TARGETS {
+    for package in build_packages() {
         args.push("-p");
-        args.push(target);
+        args.push(package);
     }
     let status = Command::new("cargo")
         .args(&args)
         .current_dir(workspace_root)
         .status()?;
     if !status.success() {
-        return Err(io::Error::other(
-            format!(
-                "cargo build --release exited {}",
-                status.code().unwrap_or(-1)
-            ),
-        ));
+        return Err(io::Error::other(format!(
+            "cargo build --release exited {}",
+            status.code().unwrap_or(-1)
+        )));
     }
     Ok(())
 }
@@ -147,12 +149,10 @@ fn launchctl_kickstart(label: &str) -> io::Result<()> {
         .args(["kickstart", "-k", &target])
         .status()?;
     if !status.success() {
-        return Err(io::Error::other(
-            format!(
-                "launchctl kickstart -k {target} exited {}",
-                status.code().unwrap_or(-1)
-            ),
-        ));
+        return Err(io::Error::other(format!(
+            "launchctl kickstart -k {target} exited {}",
+            status.code().unwrap_or(-1)
+        )));
     }
     Ok(())
 }
@@ -237,19 +237,27 @@ fn resolve_workspace_root_arg(args: &SyncArgs) -> io::Result<PathBuf> {
 /// progress is printed to stderr before returning.
 pub fn run(args: &SyncArgs) -> io::Result<()> {
     let workspace_root = resolve_workspace_root_arg(args)?;
-    let runtime =
-        resolve_dev_runtime_for_workspace_root(&workspace_root).map_err(io_other)?;
+    let runtime = resolve_dev_runtime_for_workspace_root(&workspace_root).map_err(io_other)?;
+    let artifacts = runtime_artifacts();
+
+    eprintln!(
+        "[dev sync] runtime {}",
+        crate::dev_runtime::compact_runtime_banner(&runtime)
+    );
 
     // --- Step 1: incremental cargo build ---
-    eprintln!("[dev sync] building {} …", SYNC_TARGETS.join(", "));
+    eprintln!(
+        "[dev sync] building {} …",
+        build_packages().join(", ")
+    );
     cargo_build(&workspace_root)?;
     eprintln!("[dev sync] build OK");
 
     // --- Step 2+3: content-hash diff + copy changed binaries ---
     let mut changed_count = 0usize;
-    for &target in SYNC_TARGETS {
-        let built = built_path(&workspace_root, target);
-        let installed = installed_path(&runtime, target);
+    for artifact in &artifacts {
+        let built = built_path(&workspace_root, &artifact.binary_name);
+        let installed = installed_path(&runtime, &artifact.binary_name);
 
         if !built.exists() {
             eprintln!(
@@ -262,16 +270,16 @@ pub fn run(args: &SyncArgs) -> io::Result<()> {
         let changed = binary_changed(&built, &installed)?;
         if changed {
             // TODO(phase-2): run the dev IdentityRoot sign pipeline here
-            // (implementation-note-468 phase 6) before copying.
+            // (implementation-note-488 phase 6) before copying.
             eprintln!(
                 "[dev sync] {} changed — copying to {}",
-                target,
+                artifact.binary_name,
                 installed.display()
             );
             copy_binary(&built, &installed)?;
             changed_count += 1;
         } else {
-            eprintln!("[dev sync] {} unchanged — skipping", target);
+            eprintln!("[dev sync] {} unchanged — skipping", artifact.binary_name);
         }
     }
 
@@ -419,7 +427,7 @@ mod tests {
             Path::new("/home/test-operator"),
             Path::new("/tmp/emberlink-dev/worktree-a"),
         );
-        let p = installed_path(&runtime, "ember-daemon");
+        let p = installed_path(&runtime, "ember");
         assert!(
             p.starts_with(&runtime.install_root),
             "installed_path must be under worktree install root: {}",
@@ -430,7 +438,7 @@ mod tests {
     #[test]
     fn built_path_is_under_target_release() {
         let workspace = PathBuf::from("/tmp/workspace");
-        let p = built_path(&workspace, "ember-daemon");
+        let p = built_path(&workspace, "ember");
         assert!(
             p.starts_with("/tmp/workspace/target/release"),
             "built_path must be under target/release: {}",
@@ -444,12 +452,17 @@ mod tests {
             Path::new("/home/test-operator"),
             Path::new("/tmp/emberlink-dev/worktree-a"),
         );
-        let p1 = installed_path(&runtime, "ember-daemon");
-        let p2 = installed_path(&runtime, "ember-construct");
+        let p1 = installed_path(&runtime, "ember");
+        let p2 = installed_path(&runtime, "ember-gh");
         assert_ne!(
             p1, p2,
             "different targets must have different install paths"
         );
+    }
+
+    #[test]
+    fn dev_sync_build_packages_include_cli_daemon_and_construct_package() {
+        assert_eq!(build_packages(), vec!["ember-construct", "ember-daemon", "emberlink-cli"]);
     }
 
     #[test]
@@ -459,6 +472,7 @@ mod tests {
             manifest_fingerprint: Some("abc".to_string()),
             registered_broker_count: Some(0),
             trust_roots: Some(vec![]),
+            missing_runtime_artifacts: Vec::new(),
         };
         let err = verify_report_ready(&report).expect_err("missing readiness must fail");
         assert!(
@@ -474,6 +488,7 @@ mod tests {
             manifest_fingerprint: Some("abc".to_string()),
             registered_broker_count: Some(3),
             trust_roots: Some(vec!["root".to_string()]),
+            missing_runtime_artifacts: Vec::new(),
         };
         verify_report_ready(&report).expect("populated report must be ready");
     }

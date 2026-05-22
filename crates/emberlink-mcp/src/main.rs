@@ -5,7 +5,7 @@
 //! The `main()` flow picks one of two daemon transports:
 //!
 //! - When `EMBER_DAEMON_ENDPOINT` is set (in-container mode, design
-//!   component 1 — implementation-note-504): load the per-agent
+//!   component 1 — implementation-note-537): load the per-agent
 //!   cert bundle from `EMBER_BRIDGE_CERT_DIR` (default
 //!   `/run/ember/client-cert/`) and build an mTLS+TCP transport to the
 //!   host's ember-rpc listener. Fails closed (exit non-zero) on missing
@@ -34,7 +34,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 /// Env var the orchestrator sets at container spawn time to point this
 /// MCP server at the host's ember-rpc listener. Format: `host:port`.
 /// Presence selects the mTLS bridge transport; absence selects the
-/// legacy UDS path. Per implementation-note-505 the
+/// legacy UDS path. Per implementation-note-538 the
 /// orchestrator also wires the corresponding `extra_hosts` entry.
 const EMBER_DAEMON_ENDPOINT_ENV: &str = "EMBER_DAEMON_ENDPOINT";
 
@@ -44,7 +44,7 @@ const EMBER_DAEMON_ENDPOINT_ENV: &str = "EMBER_DAEMON_ENDPOINT";
 const DEFAULT_BRIDGE_SERVER_NAME: &str = "localhost";
 
 /// `emberlink_mcp_mtls_client_handshake` — checkpoint for the
-/// implementation-note-504 target-state grep. Don't remove or
+/// implementation-note-537 target-state grep. Don't remove or
 /// rename without also updating `release-checklist` for the task.
 #[allow(dead_code)]
 const SENTINEL_EMBERLINK_MCP_MTLS_CLIENT_HANDSHAKE: &str = "emberlink_mcp_mtls_client_handshake";
@@ -172,7 +172,7 @@ fn build_uds_server(
 }
 
 /// Build the in-container mTLS bridge MCP server. Per design component 1
-/// (implementation-note-504): load per-agent cert bundle, build
+/// (implementation-note-537): load per-agent cert bundle, build
 /// `rustls::ClientConfig` with the bridge CA as the SOLE trust anchor,
 /// arm the 90% TTL expiry timer, and route every `DaemonTransport` call
 /// through the mTLS+TCP bridge. Fails closed (`std::process::exit(1)`) on
@@ -247,6 +247,19 @@ fn build_bridge_server(
 
     // 90% TTL expiry timer. Failure to parse the cert isn't fatal — the
     // bridge still works; we just lose the proactive warning.
+    //
+    // bridge_cert_expiring_soon_event: this is the MCP-server-side arm
+    // of the `bridge.cert_expiring_soon` warning flow per design
+    // §Component 3 + implementation-note-539. The
+    // module that actually computes the 90%-TTL fire time, emits the
+    // event over the daemon's `bridge_cert_expiring_soon` JSON-RPC
+    // tool, and carries the persona_id / container_id / cert expiry
+    // timestamp on the payload lives at
+    // `crates/emberlink-mcp/src/cert_expiry.rs`. This call-site is the
+    // contract that the timer is armed at MCP-server boot — the
+    // checkpoint anchors it here so a grep verifies the wiring as a
+    // single unit instead of asking the reader to chase the module
+    // back to the consumer.
     match parse_cert_validity(&leaf_cert_der) {
         Ok(validity) => {
             let timer_transport = Arc::new(DaemonTransport::new_mtls(

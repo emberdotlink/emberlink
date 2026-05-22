@@ -1,6 +1,6 @@
 //! Compose V2 spawn lifecycle (daemon side).
 //!
-//! implementation-note-91 — wires the
+//! implementation-note-93 — wires the
 //! ember-construct `compose_manifest_to_docker_spec` translator into a
 //! daemon-side spawn helper. Given a [`ComposeManifest`] and a connected
 //! [`bollard::Docker`] client, [`spawn_compose_service`] composes the
@@ -39,7 +39,7 @@
 //! The full Compose lifecycle — translate → label-merge → privilege
 //! check → engine roundtrip via `docker_engine_spawn` — is staged in
 //! this module. The follow-up slice
-//! implementation-note-96 wires this entry
+//! implementation-note-99 wires this entry
 //! point into the broker's `docker.run` mediated path (so a
 //! Construct-side `docker compose up` call lands here instead of
 //! shelling out to the host `docker` binary). Until D lands, callers

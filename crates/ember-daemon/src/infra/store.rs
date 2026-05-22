@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use rusqlite::Connection;
@@ -108,7 +108,7 @@ pub struct DaemonStore {
     /// reference through that chain. The `RefCell` is only touched on
     /// the single-threaded LocalSet, so runtime borrow panics cannot race.
     vault_slot: RefCell<LiveVaultSlot>,
-    /// implementation-note-279 Phase 2: in-memory rate-limit set for the
+    /// implementation-note-287 Phase 2: in-memory rate-limit set for the
     /// `sops_unwrap_dek` RPC. Each grant_id is consumed exactly once per
     /// daemon-process lifetime. The set is intentionally non-persistent —
     /// daemon restart clears it (acceptable: a restart-then-replay attack
@@ -118,7 +118,7 @@ pub struct DaemonStore {
     /// Single-threaded LocalSet semantics: same as `vault`. No cross-thread
     /// races possible.
     consumed_dek_grants: RefCell<HashSet<String>>,
-    /// implementation-note-71: cached
+    /// implementation-note-73: cached
     /// copy of the daemon's Bridge CA fingerprint (blake3-256 of the SPKI
     /// bytes). Wired in by `runtime.rs` after `load_or_mint_bridge_ca`
     /// succeeds but before the socket listener starts. Read by the
@@ -130,6 +130,13 @@ pub struct DaemonStore {
     /// the same reason as `vault` (store constructed before runtime opens
     /// the CA).
     bridge_ca_fingerprint: RefCell<Option<[u8; 32]>>,
+    /// cordon_phase1_receipt_mint_retrofitted — data directory for the
+    /// daemon, used to locate `receipts.log` when minting the Phase 1
+    /// cordon bridge receipt + the `audit.chain_repair_finalize` receipt
+    /// emitted by `audit.repair_chain`. `None` on in-memory stores (the
+    /// receipt mint is then a logged no-op). Set at construction from the
+    /// daemon.db path's parent for production callers.
+    data_dir: Option<PathBuf>,
 }
 
 impl DaemonStore {
@@ -164,11 +171,17 @@ impl DaemonStore {
         };
 
         let conn = Connection::open(path)?;
+        // cordon_phase1_receipt_mint_retrofitted — derive data_dir from
+        // the daemon.db path so the cordon path can locate receipts.log
+        // (Phase 1 bridge receipt) without threading another parameter
+        // through migrate().
+        let data_dir = path.parent().map(|p| p.to_path_buf());
         let store = Self {
             conn,
             vault_slot: RefCell::new(LiveVaultSlot::default()),
             consumed_dek_grants: RefCell::new(HashSet::new()),
             bridge_ca_fingerprint: RefCell::new(None),
+            data_dir,
         };
         let migrate_result = store.migrate();
         if migrate_result.is_err() && backup_attempted {
@@ -248,6 +261,11 @@ impl DaemonStore {
             vault_slot: RefCell::new(LiveVaultSlot::default()),
             consumed_dek_grants: RefCell::new(HashSet::new()),
             bridge_ca_fingerprint: RefCell::new(None),
+            // In-memory stores have no on-disk receipts.log; the cordon
+            // path logs a warning and skips the receipt mint when this
+            // is None. Tests that need to assert on the mint use the
+            // file-backed `open(&path)` constructor.
+            data_dir: None,
         };
         store.migrate()?;
         // V0 schema: every persona secret is vault-sealed, so an
@@ -274,12 +292,21 @@ impl DaemonStore {
             vault_slot: RefCell::new(LiveVaultSlot::default()),
             consumed_dek_grants: RefCell::new(HashSet::new()),
             bridge_ca_fingerprint: RefCell::new(None),
+            data_dir: None,
         };
         store.migrate()?;
         Ok(store)
     }
 
-    /// implementation-note-279 Phase 2: claim a `grant_id` slot for a
+    /// cordon_phase1_receipt_mint_retrofitted — return the configured
+    /// data_dir, if any. Used by the cordon migration to locate
+    /// `receipts.log` and by `audit.repair_chain` to emit its
+    /// `audit.chain_repair_finalize` receipt. `None` on in-memory stores.
+    pub(crate) fn data_dir(&self) -> Option<&Path> {
+        self.data_dir.as_deref()
+    }
+
+    /// implementation-note-287 Phase 2: claim a `grant_id` slot for a
     /// `sops_unwrap_dek` RPC call. Returns `true` on first claim,
     /// `false` if the grant has already been consumed for an unwrap.
     ///
@@ -339,7 +366,7 @@ impl DaemonStore {
         *self.vault_slot.borrow_mut() = slot;
     }
 
-    /// implementation-note-71: attach the
+    /// implementation-note-73: attach the
     /// daemon's Bridge CA fingerprint after `load_or_mint_bridge_ca`
     /// succeeds in `runtime.rs`. Mirrors [`Self::set_vault`] — the store is
     /// constructed before the CA exists, so the runtime stitches them
@@ -358,7 +385,7 @@ impl DaemonStore {
         *self.bridge_ca_fingerprint.borrow()
     }
 
-    /// implementation-note-33 C2: drop the attached `Rc<Vault>` so the
+    /// implementation-note-35 C2: drop the attached `Rc<Vault>` so the
     /// final outstanding reference is released — the MEK is wiped via
     /// `ZeroizeOnDrop` once every clone of the `Rc` has dropped. Called
     /// from `trust::presence::lock()` (explicit user-initiated lock) so
@@ -379,7 +406,7 @@ impl DaemonStore {
     /// mek_fingerprint_column_verified — read the plaintext
     /// blake3(MEK) fingerprint from vault_meta. Returns `None` if not
     /// yet written (first-run pre-MEK-provision or pre-slice-B-bis).
-    /// Per implementation-note-341.
+    /// Per implementation-note-350.
     pub fn read_mek_fingerprint(&self) -> Result<Option<String>, StoreError> {
         use rusqlite::OptionalExtension as _;
         let row: Option<Option<String>> = self
@@ -399,7 +426,7 @@ impl DaemonStore {
     /// fingerprint is already present and differs from the supplied
     /// value, returns an error (mismatch — caller must surface to the
     /// startup-probe fail-loud path). Per
-    /// implementation-note-341.
+    /// implementation-note-350.
     pub fn write_mek_fingerprint(&self, fingerprint_hex: &str) -> Result<(), StoreError> {
         let existing = self.read_mek_fingerprint()?;
         if let Some(prev) = &existing
@@ -423,7 +450,7 @@ impl DaemonStore {
     }
 
     /// mek_missing_with_state_refuses_start helper
-    /// (implementation-note-327).
+    /// (implementation-note-336).
     ///
     /// Returns true when any state-bearing row exists in the store:
     /// personas, grants, receipts, credentials (vault). Used by the
@@ -638,6 +665,18 @@ impl DaemonStore {
     /// (legacy NULL block + chained tail past the block). See
     /// `cordon_migration_phase1_if_needed` doc-comment for the full
     /// design rationale.
+    ///
+    /// cordon_phase1_receipt_mint_retrofitted — the deferred-receipt
+    /// obligation per design v2 §5 + design §4 is honored inside the
+    /// `BEGIN IMMEDIATE` transaction below. The bridge row INSERT and
+    /// the `audit.chain_v1_segment_bridge_unattested` Receipt v2 append
+    /// to `receipts.log` are atomic: if the file write fails, the
+    /// SQLite transaction rolls back and neither lands. On in-memory
+    /// stores (`data_dir == None`) or pre-identity-init paths, the
+    /// receipt mint logs a warning and skips — production callers
+    /// (`runtime.rs`) initialise the daemon identity BEFORE
+    /// `DaemonStore::open` so the singleton is set when the cordon
+    /// runs.
     fn cordon_migration_phase1_destructive(&self) -> Result<(), StoreError> {
         // Compute the first-non-null chained id past genesis BEFORE
         // opening the transaction (this is a read).
@@ -660,6 +699,18 @@ impl DaemonStore {
                 "cordon predicate fired but no non-NULL chained row past genesis exists".into()
             ))?;
 
+        // cordon_phase1_receipt_mint_retrofitted — pre-compute the list
+        // of destroyed-row ids so the bridge receipt body can record
+        // them. Pre-transaction read; ordering by id is informational
+        // for forensics.
+        let destroyed_row_ids: Vec<i64> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id FROM audit_log WHERE id >= ?1 ORDER BY id ASC",
+            )?;
+            stmt.query_map(rusqlite::params![boundary_id], |r| r.get::<_, i64>(0))?
+                .collect::<Result<Vec<i64>, _>>()?
+        };
+
         // Resolve the genesis row's row_hash — it's the bridge row's
         // prev_hash.
         let genesis_row_hash: String = self
@@ -675,6 +726,7 @@ impl DaemonStore {
 
         let conn = &self.conn;
         conn.execute("BEGIN IMMEDIATE", [])?;
+        let data_dir = self.data_dir.clone();
         let result = (|| -> Result<(), StoreError> {
             // 1. CREATE audit_log_new with v2 schema.
             self.create_audit_log_new_v2(conn)?;
@@ -734,6 +786,35 @@ impl DaemonStore {
             conn.execute("DROP TABLE audit_log", [])?;
             conn.execute("ALTER TABLE audit_log_new RENAME TO audit_log", [])?;
             self.recreate_audit_log_indexes(conn)?;
+
+            // cordon_phase1_receipt_mint_retrofitted — mint the Phase 1
+            // bridge receipt INSIDE the BEGIN IMMEDIATE block. If the
+            // receipts.log append fails, propagate the error so SQLite
+            // ROLLBACK fires and the bridge row is undone — neither
+            // lands. The body carries the pre-migration BLAKE3 anchor
+            // (the v1 genesis row_hash, since the operator's tail is
+            // destroyed by exclusion) + the destroyed-row ids + the
+            // bridge row's anchor data so a verifier can re-bind the
+            // receipt to the in-DB row by anchors.
+            //
+            // Idempotency: the cordon path itself is idempotent via
+            // `cordon_migration_phase1_if_needed`'s `segment_id`-column
+            // probe — the cordon does not re-run on already-migrated
+            // DBs, so the receipt is minted exactly once per host. A
+            // crash AFTER the SQLite COMMIT but BEFORE the runtime's
+            // post-cordon receipt-presence check (Phase 2 attestation
+            // surface, pending `implementation-note-351`) would
+            // leave a row without a receipt; this is the symmetric
+            // `IncompleteRepairReceipt` surface and is currently
+            // out-of-band recovered.
+            mint_cordon_phase1_bridge_receipt(
+                data_dir.as_deref(),
+                &genesis_row_hash,
+                &destroyed_row_ids,
+                &bridge_timestamp,
+                &bridge_row_hash,
+            )?;
+
             Ok(())
         })();
         match result {
@@ -821,7 +902,7 @@ impl DaemonStore {
                 metadata TEXT
             );
 
-            -- audit_chain_v2_schema_landed (implementation-note-342).
+            -- audit_chain_v2_schema_landed (implementation-note-352).
             -- v2 audit_log shape from CREATE TABLE on fresh DBs. The CHECK
             -- constraint encodes the chain invariant. segment_id is NOT NULL
             -- with NO DEFAULT (per R5 / pass-2 finding #4) so an older binary
@@ -967,7 +1048,7 @@ impl DaemonStore {
             CREATE INDEX IF NOT EXISTS idx_receipts_persona ON receipts(persona_id);
             CREATE INDEX IF NOT EXISTS idx_receipts_created ON receipts(created_at);
 
-            -- implementation-note-105: server-persisted WebAuthn credentials.
+            -- implementation-note-108: server-persisted WebAuthn credentials.
             -- Each row is a passkey enrolled by a persona via
             -- /settings/passkeys; the `passkey_json` column is the
             -- webauthn-rs `Passkey` type (serde JSON serialization)
@@ -986,7 +1067,64 @@ impl DaemonStore {
             CREATE INDEX IF NOT EXISTS idx_webauthn_credentials_persona
                 ON webauthn_credentials(persona_id);
 
-            -- implementation-note-105: in-flight WebAuthn ceremony state.
+            -- Claim Journal working set for successful Claim accumulation.
+            -- This is distinct from `audit_log` (immutable evidence) and
+            -- from `receipts` (durable signed artifacts). The journal is a
+            -- segmented working set for session/composite rollups.
+            CREATE TABLE IF NOT EXISTS claim_journal_scopes (
+                scope_kind TEXT NOT NULL,
+                scope_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                next_scope_seq INTEGER NOT NULL,
+                open_segment_no INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                closed_at TEXT,
+                PRIMARY KEY (scope_kind, scope_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_claim_journal_scopes_status
+                ON claim_journal_scopes(status);
+
+            CREATE TABLE IF NOT EXISTS claim_journal_segments (
+                scope_kind TEXT NOT NULL,
+                scope_id TEXT NOT NULL,
+                segment_no INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                first_scope_seq INTEGER NOT NULL,
+                last_scope_seq INTEGER NOT NULL,
+                claim_count INTEGER NOT NULL,
+                started_at TEXT NOT NULL,
+                ended_at TEXT NOT NULL,
+                merkle_root TEXT NOT NULL,
+                PRIMARY KEY (scope_kind, scope_id, segment_no)
+            );
+
+            CREATE TABLE IF NOT EXISTS claim_journal_claims (
+                scope_kind TEXT NOT NULL,
+                scope_id TEXT NOT NULL,
+                scope_seq INTEGER NOT NULL,
+                segment_no INTEGER NOT NULL,
+                segment_seq INTEGER NOT NULL,
+                source_key TEXT NOT NULL,
+                audit_event_id INTEGER NOT NULL,
+                ts TEXT NOT NULL,
+                claim_kind TEXT NOT NULL,
+                tool TEXT NOT NULL,
+                input_hash TEXT NOT NULL,
+                input_redacted_json TEXT NOT NULL,
+                resolved_json TEXT NOT NULL,
+                persona_id TEXT,
+                device_id TEXT,
+                workflow_id TEXT,
+                materialization_id TEXT,
+                credential_name TEXT,
+                PRIMARY KEY (scope_kind, scope_id, scope_seq),
+                UNIQUE (scope_kind, scope_id, source_key),
+                UNIQUE (audit_event_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_claim_journal_claims_scope_segment
+                ON claim_journal_claims(scope_kind, scope_id, segment_no, segment_seq);
+
+            -- implementation-note-108: in-flight WebAuthn ceremony state.
             -- Registration ceremonies and authentication ceremonies
             -- both stash `state_json` here keyed by a freshly-minted
             -- challenge_id; the corresponding finish endpoint reads it
@@ -1012,7 +1150,7 @@ impl DaemonStore {
             CREATE INDEX IF NOT EXISTS idx_webauthn_challenges_persona
                 ON webauthn_challenges(persona_id);
 
-            -- credential_bindings_table_schema — implementation-note-343
+            -- credential_bindings_table_schema — implementation-note-353
             -- Daemon-controlled credential-target allowlist: binds a
             -- principal (persona) + working-tree (canonical absolute
             -- repo-root path) + remote-name to a specific remote URL.
@@ -1033,7 +1171,76 @@ impl DaemonStore {
                 ON credential_bindings(principal_id);",
         )?;
 
-        // implementation-note-60 — backfill `kind` column on legacy DBs so
+        // CLAIM-JOURNAL-MULTI-SCOPE-PROJECTION — pre-release schema reset.
+        //
+        // The first cut enforced `UNIQUE(audit_event_id)` on
+        // `claim_journal_claims`, which prevents one successful authority use
+        // from being projected into both session and grant scopes while
+        // sharing a single immutable audit evidence row. The real idempotency
+        // key is `(scope_kind, scope_id, source_key)`. Rebuild the table once
+        // so multi-scope rollups can back-reference one audit row without
+        // duplicating evidence.
+        let rebuild_claim_journal_for_multi_scope = {
+            let mut stmt = self.conn.prepare("PRAGMA index_list(claim_journal_claims)")?;
+            let indexes: Vec<(String, i64)> = stmt
+                .query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, i64>(2)?)))?
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut found_unique_audit_only = false;
+            for (index_name, is_unique) in indexes {
+                if is_unique == 0 {
+                    continue;
+                }
+                let pragma = format!("PRAGMA index_info({index_name})");
+                let mut info_stmt = self.conn.prepare(&pragma)?;
+                let cols: Vec<String> = info_stmt
+                    .query_map([], |row| row.get::<_, String>(2))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                if cols == ["audit_event_id"] {
+                    found_unique_audit_only = true;
+                    break;
+                }
+            }
+            found_unique_audit_only
+        };
+        if rebuild_claim_journal_for_multi_scope {
+            self.conn.execute_batch(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE claim_journal_claims
+                     RENAME TO claim_journal_claims_legacy_unique_audit;
+                 CREATE TABLE claim_journal_claims (
+                     scope_kind TEXT NOT NULL,
+                     scope_id TEXT NOT NULL,
+                     scope_seq INTEGER NOT NULL,
+                     segment_no INTEGER NOT NULL,
+                     segment_seq INTEGER NOT NULL,
+                     source_key TEXT NOT NULL,
+                     audit_event_id INTEGER NOT NULL,
+                     ts TEXT NOT NULL,
+                     claim_kind TEXT NOT NULL,
+                     tool TEXT NOT NULL,
+                     input_hash TEXT NOT NULL,
+                     input_redacted_json TEXT NOT NULL,
+                     resolved_json TEXT NOT NULL,
+                     persona_id TEXT,
+                     device_id TEXT,
+                     workflow_id TEXT,
+                     materialization_id TEXT,
+                     credential_name TEXT,
+                     PRIMARY KEY (scope_kind, scope_id, scope_seq),
+                     UNIQUE (scope_kind, scope_id, source_key)
+                 );
+                 INSERT INTO claim_journal_claims
+                     (scope_kind, scope_id, scope_seq, segment_no, segment_seq, source_key, audit_event_id, ts, claim_kind, tool, input_hash, input_redacted_json, resolved_json, persona_id, device_id, workflow_id, materialization_id, credential_name)
+                 SELECT scope_kind, scope_id, scope_seq, segment_no, segment_seq, source_key, audit_event_id, ts, claim_kind, tool, input_hash, input_redacted_json, resolved_json, persona_id, device_id, workflow_id, materialization_id, credential_name
+                   FROM claim_journal_claims_legacy_unique_audit;
+                 DROP TABLE claim_journal_claims_legacy_unique_audit;
+                 CREATE INDEX IF NOT EXISTS idx_claim_journal_claims_scope_segment
+                     ON claim_journal_claims(scope_kind, scope_id, segment_no, segment_seq);
+                 COMMIT;",
+            )?;
+        }
+
+        // implementation-note-62 — backfill `kind` column on legacy DBs so
         // the kms_wrap / kms_unwrap rows can land alongside grant rows.
         // Errors swallowed when the column already exists.
         let _ = self.conn.execute(
@@ -1041,7 +1248,7 @@ impl DaemonStore {
             [],
         );
 
-        // implementation-note-60 — per-key fast-path index for queries shaped
+        // implementation-note-62 — per-key fast-path index for queries shaped
         // `WHERE kind IN ('kms_wrap','kms_unwrap') AND key_name = ?`. Uses
         // SQLite JSON1 (`json_extract`) over the existing `receipt_json`
         // column so we don't have to project key_name into its own
@@ -1053,7 +1260,7 @@ impl DaemonStore {
                  WHERE kind IN ('kms_wrap','kms_unwrap');",
         )?;
 
-        // EMBER-implementation-note-270 — per-actor and per-resource fast-path indexes
+        // EMBER-implementation-note-278 — per-actor and per-resource fast-path indexes
         // for the `ember audit` query CLI. The existing
         // `idx_receipts_persona` covers persona_id lookups; we keep the
         // `idx_receipts_actor` alias as a stable name the task spec can
@@ -1066,7 +1273,7 @@ impl DaemonStore {
                  ON receipts(json_extract(receipt_json, '$.summary.resource'));",
         )?;
 
-        // implementation-note-226 — composite-grant approval columns. Existing v0 DBs
+        // implementation-note-233 — composite-grant approval columns. Existing v0 DBs
         // (e.g. the qember.sh demo seed) predate the columns above, so
         // additively backfill them with idempotent ALTER TABLE calls.
         // Errors here are swallowed when the column already exists; any
@@ -1105,7 +1312,7 @@ impl DaemonStore {
             .conn
             .execute("ALTER TABLE sandboxes ADD COLUMN owner_persona_id TEXT", []);
 
-        // implementation-note-268 — per-statement revocation list.
+        // implementation-note-276 — per-statement revocation list.
         // Stores a JSON array of revoked Statement sids ("S0", "S1", ...) so
         // the demo can revoke a single Statement without taking down the
         // whole grant. Default `'[]'` keeps the column non-null on legacy
@@ -1186,7 +1393,7 @@ impl DaemonStore {
             [],
         );
 
-        // implementation-note-64 (design §9 + §6) — bind a
+        // implementation-note-66 (design §9 + §6) — bind a
         // workload Persona to the container identity it was minted for so
         // the reconciler can refuse to spawn a second container into the
         // same enrollment slot if the daemon restarts mid-spawn (CRIT-4
@@ -1206,7 +1413,7 @@ impl DaemonStore {
             .conn
             .execute("ALTER TABLE personas ADD COLUMN parent_grant_id TEXT", []);
 
-        // implementation-note-344 (M1 of design, Bridge
+        // implementation-note-354 (M1 of design, Bridge
         // Cert Refresh Protocol). Per-persona client-certificate state for
         // the (d) refresh-and-rotate path:
         //
@@ -1246,7 +1453,7 @@ impl DaemonStore {
             [],
         );
 
-        // implementation-note-264 (design §"In-container
+        // implementation-note-272 (design §"In-container
         // extension") — per-socket Persona enrollment table. At spawn
         // time the daemon records `(agent_socket_path, persona_id,
         // grant_id, brief_content_hash)` so subsequent RPCs on that
@@ -1275,7 +1482,7 @@ impl DaemonStore {
             );",
         )?;
 
-        // implementation-note-345 Step A — namespace-inode columns on
+        // implementation-note-355 Step A — namespace-inode columns on
         // agent_socket_enrollments. Errors swallowed when columns already
         // exist (fresh DBs have them via the CREATE TABLE above; old DBs
         // need the ALTER).
@@ -1292,13 +1499,13 @@ impl DaemonStore {
             [],
         );
 
-        // implementation-note-289 — peer_uid
+        // implementation-note-297 — peer_uid
         // column on agent_socket_enrollments. Carries the kernel-attested
         // uid the per-agent UDS socket was bound to at spawn time so the
         // broker's `check_principal_against_persona` gate can compare the
         // live `PeerCredPrincipal.uid` against the enrollment row. The
         // in-process `PERSONA_UID_REGISTRY` thread-local was retired in
-        // implementation-note-151; the
+        // implementation-note-155; the
         // enrollment table is now the sole source of truth.
         //
         // Nullable to preserve back-compat for legacy / pre-Step-B rows
@@ -1325,7 +1532,7 @@ impl DaemonStore {
             .conn
             .execute("ALTER TABLE audit_log ADD COLUMN row_hash TEXT", []);
 
-        // cordon_phase1_recreate_table_landed (implementation-note-346-
+        // cordon_phase1_recreate_table_landed (implementation-note-356-
         // CORDON-PHASE1) — promote a v1 DB (chain columns but no segment_id)
         // to v2 via recreate-table. No-op on v2 DBs (the column already
         // exists) and on fresh DBs (CREATE TABLE already used v2 shape).
@@ -1357,7 +1564,7 @@ impl DaemonStore {
         }
 
         // mek_fingerprint_column_verified
-        // (implementation-note-341).
+        // (implementation-note-350).
         //
         // `vault_meta` table carries plaintext-fingerprint columns that
         // survive the keychain-ACL problem: the daemon can ALWAYS read
@@ -1385,7 +1592,123 @@ impl DaemonStore {
     }
 }
 
-/// implementation-note-264 (design §"In-container
+/// cordon_phase1_receipt_mint_retrofitted — mint and append the Phase 1
+/// `audit.chain_v1_segment_bridge_unattested` Receipt v2 to
+/// `<data_dir>/receipts.log` per design v2 §5 + design §4. Called from
+/// inside the cordon migration's `BEGIN IMMEDIATE` block AFTER the
+/// bridge row INSERT and BEFORE the SQLite COMMIT — a failure here
+/// propagates upward and the outer transaction rolls back, so the
+/// receipt mint and the audit_log INSERT are byte-for-byte atomic
+/// across the boundary.
+///
+/// `data_dir == None`: in-memory store or pre-identity-init test path.
+/// Logs a warning and returns Ok (the bridge row still lands; the
+/// receipt obligation surfaces as `IncompleteRepairReceipt` on the
+/// next verifier walk and is out-of-band recovered).
+///
+/// `current_identity() == None`: the daemon's signing key hasn't been
+/// loaded yet. Same posture as above — log + skip.
+///
+/// Returns `StoreError::InvalidInput` on a real journal-write failure
+/// (mode-drift refusal, I/O error). The caller's `BEGIN IMMEDIATE`
+/// then rolls back.
+fn mint_cordon_phase1_bridge_receipt(
+    data_dir: Option<&Path>,
+    pre_migration_chain_tip_hash: &str,
+    destroyed_row_ids: &[i64],
+    bridge_timestamp: &str,
+    bridge_row_hash: &str,
+) -> Result<(), StoreError> {
+    use core_events::receipt::{
+        AuditChainV1SegmentBridgeUnattestedBody, BridgeSegmentGenesis,
+        RECEIPT_KIND_AUDIT_CHAIN_V1_SEGMENT_BRIDGE_UNATTESTED, ReceiptEnvelope, ReceiptVersion,
+        TerminationAuthority, sign_receipt_v2,
+    };
+
+    let Some(data_dir) = data_dir else {
+        tracing::warn!(
+            "cordon_phase1_receipt_mint_retrofitted: data_dir not configured (likely \
+             in-memory store); skipping Phase 1 bridge receipt mint. The bridge row \
+             still lands; recovery is via Phase 2 attestation or the symmetric \
+             IncompleteRepairReceipt path."
+        );
+        return Ok(());
+    };
+
+    let Some(identity) = crate::infra::receipt::current_identity() else {
+        tracing::warn!(
+            "cordon_phase1_receipt_mint_retrofitted: daemon identity not yet \
+             initialised at cordon time; skipping Phase 1 bridge receipt mint. \
+             Production callers (runtime.rs) initialise identity BEFORE opening the \
+             store so the singleton is set when the cordon fires."
+        );
+        return Ok(());
+    };
+
+    let pubkey_hex = identity.pubkey_hex();
+    let fingerprint_hex = blake3::hash(pubkey_hex.as_bytes()).to_hex().to_string();
+
+    let body = AuditChainV1SegmentBridgeUnattestedBody {
+        pre_migration_chain_tip_hash: pre_migration_chain_tip_hash.to_string(),
+        destroyed_row_ids: destroyed_row_ids.to_vec(),
+        bridge_segment_genesis: BridgeSegmentGenesis {
+            segment_id: 1,
+            prev_hash: pre_migration_chain_tip_hash.to_string(),
+            row_hash: bridge_row_hash.to_string(),
+        },
+        migration_timestamp: bridge_timestamp.to_string(),
+        daemon_identity_root_fingerprint: fingerprint_hex,
+    };
+
+    let body_value = serde_json::to_value(&body).map_err(|e| {
+        StoreError::InvalidInput(format!(
+            "cordon_phase1_receipt_mint_retrofitted: serialize bridge body: {e}"
+        ))
+    })?;
+
+    let mut envelope = ReceiptEnvelope {
+        version: ReceiptVersion::default(),
+        kind: RECEIPT_KIND_AUDIT_CHAIN_V1_SEGMENT_BRIDGE_UNATTESTED.to_string(),
+        receipt_id: String::new(),
+        daemon_root_id: pubkey_hex,
+        traceparent: None,
+        // Daemon-administrative receipt — daemon persona is the termination
+        // authority. Mirrors the pattern from `emit_vault_read_receipt`.
+        termination_authority: TerminationAuthority::DaemonPersona,
+        presence_kind: None,
+        body: body_value,
+        signature: None,
+        calling_principal: None,
+        presence_reason: None,
+        handle_id: None,
+        challenge_hash: None,
+        verifier_aaguid: None,
+    };
+
+    let signer = crate::session::lifecycle::DaemonPersonaSigner::new(identity);
+    sign_receipt_v2(&mut envelope, &signer).map_err(|e| {
+        StoreError::InvalidInput(format!(
+            "cordon_phase1_receipt_mint_retrofitted: sign bridge receipt: {e}"
+        ))
+    })?;
+
+    crate::infra::receipt::append_receipts_journal(data_dir, &envelope).map_err(|e| {
+        StoreError::InvalidInput(format!(
+            "cordon_phase1_receipt_mint_retrofitted: append bridge receipt to receipts.log: {e}"
+        ))
+    })?;
+
+    tracing::info!(
+        receipt_id = %envelope.receipt_id,
+        destroyed_count = destroyed_row_ids.len(),
+        "cordon_phase1_receipt_mint_retrofitted: Phase 1 bridge receipt minted and \
+         appended to receipts.log (atomic with cordon BEGIN IMMEDIATE)"
+    );
+
+    Ok(())
+}
+
+/// implementation-note-272 (design §"In-container
 /// extension") — projection of an `agent_socket_enrollments` row.
 ///
 /// Returned by [`DaemonStore::lookup_agent_socket_enrollment`] when an
@@ -1400,18 +1723,18 @@ pub struct AgentSocketEnrollment {
     pub brief_content_hash: String,
     pub enrolled_at: String,
     pub state: String,
-    /// implementation-note-345 Step A — cgroup v2 leaf inode for
+    /// implementation-note-355 Step A — cgroup v2 leaf inode for
     /// the worker container (Step B populates; Step C gates dispatch).
     /// NULL for legacy/host-resident enrollments.
     pub cgroup_v2_id: Option<i64>,
-    /// implementation-note-345 Step A — user-namespace inode.
+    /// implementation-note-355 Step A — user-namespace inode.
     pub userns_inode: Option<i64>,
-    /// implementation-note-345 Step A — mount-namespace inode.
+    /// implementation-note-355 Step A — mount-namespace inode.
     pub mnt_ns_inode: Option<i64>,
 }
 
 impl DaemonStore {
-    /// implementation-note-264 — record a fresh per-socket
+    /// implementation-note-272 — record a fresh per-socket
     /// Persona enrollment.
     ///
     /// Called at agent-spawn time by the scion spawn pipeline once a
@@ -1437,7 +1760,7 @@ impl DaemonStore {
         userns_inode: Option<i64>,
         mnt_ns_inode: Option<i64>,
     ) -> Result<(), StoreError> {
-        // implementation-note-347 — the three Option<i64>
+        // implementation-note-357 — the three Option<i64>
         // columns carry the kernel-observable binding tuple captured
         // at spawn-completion via
         // `crate::spawn::scion::capture_container_ns_inodes`. NULL is
@@ -1463,7 +1786,7 @@ impl DaemonStore {
         Ok(())
     }
 
-    /// implementation-note-264 — resolve the Persona
+    /// implementation-note-272 — resolve the Persona
     /// bound to a per-agent UDS socket.
     ///
     /// Returns `Ok(Some(...))` only when an `active` enrollment row is
@@ -1500,7 +1823,7 @@ impl DaemonStore {
         }
     }
 
-    /// implementation-note-264 — tombstone an enrollment.
+    /// implementation-note-272 — tombstone an enrollment.
     ///
     /// Flips the row's `state` column to `'revoked'`; the row itself
     /// stays so the slot is observable for post-mortem audit and so a
@@ -1519,7 +1842,7 @@ impl DaemonStore {
     }
 }
 
-/// implementation-note-289 — look up a
+/// implementation-note-297 — look up a
 /// persona's expected peer uid by consulting the
 /// `agent_socket_enrollments` table.
 ///
@@ -1528,7 +1851,7 @@ impl DaemonStore {
 /// enrollment time, so the broker can compare the live kernel-attested
 /// `PeerCredPrincipal.uid` against the recorded `peer_uid`. The
 /// per-process `PERSONA_UID_REGISTRY` thread-local was retired in
-/// implementation-note-151; see
+/// implementation-note-155; see
 /// `crates/ember-daemon/src/infra/handler.rs` for the tombstone.
 ///
 /// Resolution order:
@@ -1573,7 +1896,7 @@ pub fn lookup_persona_uid_from_enrollments(
 }
 
 impl DaemonStore {
-    /// EMBER-implementation-note-270 — query the receipts table with the full
+    /// EMBER-implementation-note-278 — query the receipts table with the full
     /// [`crate::infra::receipt::ReceiptFilter`] filter set (actor/kind/grant_id/
     /// since_iso/resource/limit). Returns flat [`crate::infra::receipt::ReceiptRow`]
     /// projections so callers get `materialized_at`, `terminal_reason`,
@@ -1599,7 +1922,7 @@ impl DaemonStore {
     /// Phase C callers replace the embedded `if current_status != "pending"`
     /// string-comparison guard with this fn, which also covers the
     /// scope-narrowing invariant checked by `core_approval::TransitionError::ScopeNotNarrowing`.
-    // implementation-note-348 wires this into resolve_approval_inner.
+    // implementation-note-358 wires this into resolve_approval_inner.
     #[allow(dead_code)]
     pub(crate) fn validate_approval_transition(
         state: core_grant_types::approval::ApprovalStatus,
@@ -1623,8 +1946,8 @@ mod tests {
         assert!(DaemonStore::open_in_memory().is_ok());
     }
 
-    /// implementation-note-344 (M1) +
-    /// implementation-note-296 — verify the
+    /// implementation-note-354 (M1) +
+    /// implementation-note-304 — verify the
     /// schema migration landed: the `personas` table has
     /// `client_cert_fingerprint` (TEXT NOT NULL DEFAULT ''),
     /// `client_cert_not_after` (INTEGER NOT NULL DEFAULT 0), and
@@ -1666,7 +1989,7 @@ mod tests {
             "client_cert_not_after default must be 0"
         );
 
-        // implementation-note-296 — third M-series
+        // implementation-note-304 — third M-series
         // column on the cert refresh chain. Default 0 so legacy rows
         // observe their first refresh as seq=1 via the atomic
         // `UPDATE ... RETURNING` in `DaemonStore::increment_refresh_seq`.
@@ -1705,7 +2028,20 @@ mod tests {
     }
 
     fn collect_persona_columns(store: &DaemonStore) -> Vec<PersonaColumn> {
-        let mut stmt = store.conn().prepare("PRAGMA table_info(personas)").unwrap();
+        collect_columns(store, "personas")
+    }
+
+    fn collect_webauthn_credential_columns(store: &DaemonStore) -> Vec<PersonaColumn> {
+        collect_columns(store, "webauthn_credentials")
+    }
+
+    fn collect_claim_journal_claim_columns(store: &DaemonStore) -> Vec<PersonaColumn> {
+        collect_columns(store, "claim_journal_claims")
+    }
+
+    fn collect_columns(store: &DaemonStore, table: &str) -> Vec<PersonaColumn> {
+        let pragma = format!("PRAGMA table_info({table})");
+        let mut stmt = store.conn().prepare(&pragma).unwrap();
         stmt.query_map([], |row| {
             Ok(PersonaColumn {
                 name: row.get(1)?,
@@ -1734,11 +2070,14 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         let expected = [
-            // implementation-note-264: per-socket Persona
+            // implementation-note-272: per-socket Persona
             // enrollment table keyed by `socket_path`.
             "agent_socket_enrollments",
             "approval_requests",
             "audit_log",
+            "claim_journal_claims",
+            "claim_journal_scopes",
+            "claim_journal_segments",
             "credential_bindings",
             "credentials",
             "grant_usage",
@@ -1748,16 +2087,16 @@ mod tests {
             "receipts",
             "sandboxes",
             "standing_grants",
-            // implementation-note-349-* (design / SE-sealed vault):
+            // implementation-note-359-* (design / SE-sealed vault):
             // single-row table holding the current MEK fingerprint + the
             // ISO-8601 timestamp it was provisioned at. Slice B-bis writes
             // it at first-provision; slice F's diagnose CLI reads it.
             "vault_meta",
-            // implementation-note-105: server-persisted WebAuthn state.
+            // implementation-note-108: server-persisted WebAuthn state.
             "webauthn_credentials",
             "webauthn_challenges",
         ];
-        assert_eq!(tables.len(), 15);
+        assert_eq!(tables.len(), 20);
         for name in &expected {
             assert!(tables.contains(&name.to_string()), "missing table: {name}");
         }
@@ -1771,6 +2110,79 @@ mod tests {
             .query_row("SELECT 1", [], |row| row.get(0))
             .unwrap();
         assert_eq!(result, 1);
+    }
+
+    #[test]
+    fn webauthn_credentials_table_has_daemon_operator_binding_scope_column() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let cols = collect_webauthn_credential_columns(&store);
+        let names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
+        assert!(
+            names.contains(&"binding_scope"),
+            "webauthn_credentials must carry binding_scope so operator attesters are not keyed only by persona_id"
+        );
+        assert!(
+            names.contains(&"binding_ref"),
+            "webauthn_credentials must carry binding_ref so daemon_operator attesters have an explicit anchor independent of persona_id"
+        );
+    }
+
+    #[test]
+    fn claim_journal_claims_table_has_segmented_rollup_columns() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let cols = collect_claim_journal_claim_columns(&store);
+        let names: Vec<&str> = cols.iter().map(|c| c.name.as_str()).collect();
+        for expected in [
+            "scope_kind",
+            "scope_id",
+            "scope_seq",
+            "segment_no",
+            "segment_seq",
+            "source_key",
+            "audit_event_id",
+            "claim_kind",
+            "tool",
+            "input_hash",
+            "input_redacted_json",
+            "resolved_json",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "claim_journal_claims missing required column: {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn claim_journal_claims_table_allows_shared_audit_event_backpointers() {
+        let store = DaemonStore::open_in_memory().unwrap();
+        let mut stmt = store
+            .conn()
+            .prepare("PRAGMA index_list(claim_journal_claims)")
+            .unwrap();
+        let indexes: Vec<(String, i64)> = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, i64>(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        for (index_name, is_unique) in indexes {
+            if is_unique == 0 {
+                continue;
+            }
+            let pragma = format!("PRAGMA index_info({index_name})");
+            let mut info_stmt = store.conn().prepare(&pragma).unwrap();
+            let cols: Vec<String> = info_stmt
+                .query_map([], |row| row.get::<_, String>(2))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_ne!(
+                cols,
+                vec!["audit_event_id".to_string()],
+                "claim_journal_claims must not globally unique-lock audit_event_id"
+            );
+        }
     }
 
     #[test]
@@ -2082,6 +2494,160 @@ mod tests {
         let _reopen = DaemonStore::open(&path).expect("reopen post-migration");
     }
 
+    /// cordon_phase1_receipt_mint_retrofitted — bridge row INSERT and
+    /// `audit.chain_v1_segment_bridge_unattested` Receipt v2 append to
+    /// `receipts.log` must be atomic across the cordon's BEGIN IMMEDIATE
+    /// boundary. With the daemon identity initialised before the cordon
+    /// fires, opening a operator-shape DB lands BOTH the bridge row AND a
+    /// matching receipt; reopening is a no-op (idempotent — does not
+    /// double-mint).
+    #[test]
+    fn cordon_phase1_mints_receipt_atomically_with_bridge_row() {
+        // Set up an isolated data_dir for the daemon identity sidecar
+        // so the OnceCell singleton is populated against a fresh key
+        // (subsequent #[test] in the suite may have already loaded it).
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("operator.db");
+
+        // Initialise the daemon identity in this data_dir BEFORE the
+        // store is opened — mirrors runtime.rs's reordered boot.
+        crate::infra::receipt::init_identity(dir.path())
+            .expect("init daemon identity for cordon receipt mint test");
+
+        // Build the pre-v2 (v1) operator-shape DB.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    agent_id TEXT,
+                    action TEXT NOT NULL,
+                    credential TEXT,
+                    outcome TEXT NOT NULL,
+                    details TEXT,
+                    prev_hash TEXT,
+                    row_hash TEXT
+                );",
+            )
+            .unwrap();
+            let genesis_hash = blake3::hash(b"audit.chain_v1_genesis").to_hex().to_string();
+            conn.execute(
+                "INSERT INTO audit_log \
+                 (timestamp, agent_id, action, credential, outcome, details, prev_hash, row_hash) \
+                 VALUES (?1, NULL, 'audit.chain_v1_genesis', NULL, 'ok', NULL, NULL, ?2)",
+                rusqlite::params!["2026-05-01T00:00:00Z", genesis_hash],
+            )
+            .unwrap();
+            for i in 0..3 {
+                conn.execute(
+                    "INSERT INTO audit_log \
+                     (timestamp, agent_id, action, credential, outcome, details, prev_hash, row_hash) \
+                     VALUES (?1, NULL, ?2, NULL, 'ok', NULL, NULL, NULL)",
+                    rusqlite::params![
+                        format!("2026-05-{:02}T00:00:00Z", 2 + i),
+                        format!("legacy.event-{}", i),
+                    ],
+                )
+                .unwrap();
+            }
+            // Buggy chained tail past the legacy block to trip the
+            // cordon predicate.
+            for i in 0..2 {
+                let fake = blake3::hash(format!("tail-{i}").as_bytes())
+                    .to_hex()
+                    .to_string();
+                let prev: Option<String> = if i == 0 { None } else { Some(fake.clone()) };
+                conn.execute(
+                    "INSERT INTO audit_log \
+                     (timestamp, agent_id, action, credential, outcome, details, prev_hash, row_hash) \
+                     VALUES (?1, NULL, ?2, NULL, 'ok', NULL, ?3, ?4)",
+                    rusqlite::params![
+                        format!("2026-05-{:02}T00:00:00Z", 6 + i),
+                        format!("buggy.tail-{i}"),
+                        prev,
+                        fake,
+                    ],
+                )
+                .unwrap();
+            }
+        }
+
+        // Open via DaemonStore::open — fires the cordon + mints receipt.
+        let store = DaemonStore::open(&path).expect("open + cordon + receipt mint");
+
+        // Bridge row landed.
+        let (segment_1_count, bridge_action): (i64, String) = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*), MAX(action) FROM audit_log WHERE segment_id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get::<_, Option<String>>(1)?.unwrap_or_default())),
+            )
+            .unwrap();
+        assert_eq!(segment_1_count, 1, "exactly one bridge row at segment_id=1");
+        assert_eq!(bridge_action, "audit.chain_v1_segment_bridge_unattested");
+
+        // Receipt landed in receipts.log with the right kind + body.
+        let receipts_path = dir.path().join("receipts.log");
+        assert!(
+            receipts_path.exists(),
+            "receipts.log must exist post-cordon"
+        );
+        let contents = std::fs::read_to_string(&receipts_path).unwrap();
+        let bridge_receipt_lines: Vec<&str> = contents
+            .lines()
+            .filter(|line| line.contains("audit.chain_v1_segment_bridge_unattested"))
+            .collect();
+        assert_eq!(
+            bridge_receipt_lines.len(),
+            1,
+            "exactly one Phase 1 bridge receipt in receipts.log"
+        );
+        // Parse and assert envelope shape.
+        let envelope: serde_json::Value =
+            serde_json::from_str(bridge_receipt_lines[0]).expect("parse bridge receipt envelope");
+        assert_eq!(
+            envelope["kind"].as_str().unwrap(),
+            "audit.chain_v1_segment_bridge_unattested"
+        );
+        assert!(
+            envelope["signature"].is_string(),
+            "Phase 1 bridge receipt must be signed by the daemon persona"
+        );
+        let body = &envelope["body"];
+        assert_eq!(
+            body["bridge_segment_genesis"]["segment_id"]
+                .as_u64()
+                .unwrap(),
+            1
+        );
+        let destroyed = body["destroyed_row_ids"]
+            .as_array()
+            .expect("destroyed_row_ids array");
+        assert_eq!(
+            destroyed.len(),
+            2,
+            "destroyed_row_ids must record the 2 buggy-tail rows excluded by the cordon"
+        );
+
+        // Idempotency: reopening the same path does NOT re-mint the
+        // receipt (cordon migration is gated on segment_id-column
+        // existence per `cordon_migration_phase1_if_needed`).
+        drop(store);
+        let _reopen = DaemonStore::open(&path).expect("reopen post-migration");
+        let contents2 = std::fs::read_to_string(&receipts_path).unwrap();
+        let bridge_receipt_lines2: Vec<&str> = contents2
+            .lines()
+            .filter(|line| line.contains("audit.chain_v1_segment_bridge_unattested"))
+            .collect();
+        assert_eq!(
+            bridge_receipt_lines2.len(),
+            1,
+            "reopening must NOT double-mint the bridge receipt (idempotency)"
+        );
+    }
+
     /// cordon_phase1_recreate_table_landed — on a fresh DB the cordon
     /// predicate's "chained rows past legacy block" clause is false, so
     /// Phase 1 no-ops. The daemon writes happily into segment_id = 0.
@@ -2168,14 +2734,14 @@ mod tests {
             .lookup_agent_socket_enrollment("/run/emberd/agent-test-some.sock")
             .unwrap()
             .expect("inserted enrollment must resolve");
-        // implementation-note-347 — the binding tuple round-
+        // implementation-note-357 — the binding tuple round-
         // trips through SQLite intact.
         assert_eq!(row.cgroup_v2_id, Some(987654321));
         assert_eq!(row.userns_inode, Some(4026531840));
         assert_eq!(row.mnt_ns_inode, Some(4026531841));
     }
 
-    // implementation-note-289 — T1 unit
+    // implementation-note-297 — T1 unit
     // tests on `lookup_persona_uid_from_enrollments`. The helper is the
     // seam between the broker's `check_principal_against_persona` gate
     // and the per-agent UDS enrollment table; Step A only wires the
@@ -2367,7 +2933,7 @@ mod tests {
     }
 
     // mek_missing_with_state_refuses_start helper tests
-    // (implementation-note-327).
+    // (implementation-note-336).
 
     #[test]
     fn has_state_bearing_rows_returns_false_for_empty_store() {
@@ -2377,7 +2943,7 @@ mod tests {
     }
 
     // mek_fingerprint_column_verified tests
-    // (implementation-note-341).
+    // (implementation-note-350).
 
     #[test]
     fn read_mek_fingerprint_returns_none_on_fresh_store() {

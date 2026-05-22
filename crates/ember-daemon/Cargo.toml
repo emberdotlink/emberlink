@@ -11,12 +11,12 @@ categories = ["authentication", "command-line-utilities"]
 publish = false
 
 [features]
-# implementation-note-104: age keypair generation for SOPS+emberd integration.
-# On by default — implementation-note-104 ships persona age keys as a first-class
+# implementation-note-107: age keypair generation for SOPS+emberd integration.
+# On by default — implementation-note-107 ships persona age keys as a first-class
 # daemon capability. Build with `--no-default-features` to opt out for
 # environments that explicitly don't want the age dep linked.
 #
-# implementation-note-105: webauthn enables server-side passkey ceremony
+# implementation-note-108: webauthn enables server-side passkey ceremony
 # (registration + authentication) so dashboard approvals are gated by
 # a verified WebAuthn assertion against a stored credential pubkey.
 # Default-on: the gate fails closed by default. Build with
@@ -25,7 +25,7 @@ default = ["age", "webauthn", "se-real"]
 age = ["dep:age"]
 webauthn = ["dep:webauthn-rs"]
 
-# implementation-note-73-: gates the real Secure-Enclave wrap/unwrap
+# implementation-note-75-: gates the real Secure-Enclave wrap/unwrap
 # path in `install::provision_se_mek` (write side) and
 # `infra::vault_macos_se::get_mek_passphrase` (read side, transitively via
 # `ember_broker::secure_enclave::se_unwrap`). On by default so the daemon
@@ -48,7 +48,7 @@ age = { version = "0.11", optional = true, features = ["armor"] }
 anyhow = "1"
 async-trait = "0.1"
 argon2 = "0.5"
-# AWS SigV4 signing for Vault AWS IAM auth (implementation-note-106).
+# AWS SigV4 signing for Vault AWS IAM auth (implementation-note-109).
 # Used by `infra::credential_store::hashicorp_vault::vault_aws_login`
 # to sign a `sts:GetCallerIdentity` request that Vault re-plays
 # server-side as proof of the daemon's AWS IAM identity. Already
@@ -58,7 +58,7 @@ aws-credential-types = "1"
 aws-sigv4 = "1"
 base64 = "0.22"
 blake3 = "1"
-# implementation-note-107 — Bollard Docker engine
+# implementation-note-110 — Bollard Docker engine
 # client. The daemon-side `spawn::docker::connect_docker_engine` helper
 # uses bollard's `Docker::connect_with_*_defaults` constructors to talk
 # to a Docker engine (Docker Desktop on macOS, or any compatible engine)
@@ -76,9 +76,9 @@ core-state = { path = "../core-state" }
 core-crypto = { path = "../core-crypto" }
 core-construct-runtime = { path = "../core-construct-runtime" }
 core-events = { path = "../core-events" }
-# implementation-note-50 — SCM_RIGHTS + sealed-memfd
+# implementation-note-52 — SCM_RIGHTS + sealed-memfd
 # cross-process fd-passing primitive. Daemon-side consumer wire-up lands
-# in a follow-up task (META-design-AMEND-EXTEND-TO-implementation-note-51 Phase D);
+# in a follow-up task (META-design-AMEND-EXTEND-TO-implementation-note-53 Phase D);
 # the dep is declared here so the crate is in the daemon's build graph
 # for compile-time discovery as the RPC frontend evolves.
 core-fd-pass = { path = "../core-fd-pass" }
@@ -86,7 +86,7 @@ core-grants = { path = "../core-grants" }
 core-kms = { path = "../core-kms" }
 core-personas = { path = "../core-personas" }
 core-proxy-forward = { path = "../core-proxy-forward" }
-# implementation-note-108 — emit `spawn.witness` Receipt v2
+# implementation-note-111 — emit `spawn.witness` Receipt v2
 # envelopes (kind constant + `SpawnWitness` body shape) at every parent→child
 # grant edge in `crate::trust::grant::delegate_grant_full_sql`. Acyclic: the
 # core-receipts crate depends only on `core-events::receipt::sign` for kind
@@ -97,7 +97,7 @@ core-principals = { path = "../core-principals" }
 core-event-types = { path = "../core-event-types" }
 core-grant-types = { path = "../core-grant-types" }
 ember-construct = { path = "../ember-construct" }
-# implementation-note-109 — emberd-side SpawnDirective
+# implementation-note-112 — emberd-side SpawnDirective
 # sender shares the `ExecFrame` / `SpawnDirective` wire types with the
 # in-container `ember-exec` receiver. The dep is acyclic: ember-exec
 # (a leaf binary + thin lib) does not depend back on ember-daemon.
@@ -113,7 +113,7 @@ ember-spawn-helper = { path = "../ember-spawn-helper" }
 # method delegates to headless-runtime's `recent_gaps_for_persona` reader,
 # which owns the `.ember/runtime/permission-gaps.jsonl` log. The dep
 # is acyclic — headless-runtime does not depend on ember-daemon.
-# implementation-note-110 — 60-second revocations poller; severity-driven
+# implementation-note-113 — 60-second revocations poller; severity-driven
 # daemon response (critical=isolate+drain+kill, high=drain, medium/low=log).
 ember-update = { path = "../ember-update" }
 dirs-next = "2"
@@ -127,7 +127,7 @@ sha2.workspace = true
 keyring-core = "1"
 apple-native-keyring-store = { version = "1", features = ["keychain"] }
 libc = "0.2"
-# implementation-note-52 Phase 1 — memfd_create + F_ADD_SEALS
+# implementation-note-54 Phase 1 — memfd_create + F_ADD_SEALS
 # via nix for the Linux-only credential-seal path in `broker/exec_env.rs`.
 # `fs` feature enables `SealFlag` / `F_ADD_SEALS` (Linux + FreeBSD-gated).
 # Pinned to 0.29 to match the workspace's existing nix transitive (via
@@ -145,7 +145,7 @@ hyper-util = { version = "0.1", features = ["full"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 rustls-pki-types = "1"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
-# implementation-note-111: `FutureExt::catch_unwind`
+# implementation-note-114: `FutureExt::catch_unwind`
 # is the canonical async panic-recovery primitive (std::panic::catch_unwind
 # only handles sync closures). futures-util is already pulled in
 # transitively via tokio/hyper; this declares it as a direct dep for
@@ -168,7 +168,7 @@ secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
-# implementation-note-112 — `OffsetDateTime` conversion for
+# implementation-note-115 — `OffsetDateTime` conversion for
 # the leaf cert's `not_before`/`not_after` window. Arrives transitively via
 # rcgen; declared here so the direct `time::OffsetDateTime::from(SystemTime)`
 # call in `trust::bridge_ca::sign_server_cert` is explicit.
@@ -186,7 +186,7 @@ aho-corasick = "1"
 once_cell = "1"
 regex = "1"
 zeroize = { version = "1", features = ["derive"] }
-# implementation-note-105: WebAuthn relying-party. Verifies passkey
+# implementation-note-108: WebAuthn relying-party. Verifies passkey
 # registration + authentication ceremonies against stored credential
 # pubkeys. Sync API (no Send/async surprises in our LocalSet model).
 # `resident-key-support` feature so the dashboard can authenticate
@@ -203,12 +203,12 @@ zeroize = { version = "1", features = ["derive"] }
 webauthn-rs = { version = "0.5", features = ["resident-key-support", "danger-allow-state-serialisation"], optional = true }
 
 # Ephemeral per-spawn HOME tempdir for broker_exec children
-# (implementation-note-113). The TempDir guard auto-cleans on Drop;
+# (implementation-note-116). The TempDir guard auto-cleans on Drop;
 # `handle_broker_exec` holds the binding across the child spawn so the
 # directory exists for the lifetime of the child process.
 tempfile = "3"
 
-# implementation-note-114: macOS biometric+passcode gate. The
+# implementation-note-117: macOS biometric+passcode gate. The
 # `keyring` crate (already a dep above) does not expose
 # `kSecAttrAccessControl`, so we drop down to `security-framework` directly
 # on macOS to wrap the vault MEK with
@@ -222,12 +222,12 @@ security-framework = "3.7"
 [dev-dependencies]
 emberlink-agent = { path = "../emberlink-agent" }
 hex = "0.4"
-# implementation-note-115 — T1 property test on the namespace-inode
+# implementation-note-118 — T1 property test on the namespace-inode
 # comparator. The brief mandates proptest for permutation coverage over the
 # (cgroup_v2_id, userns_inode, mnt_ns_inode) tuple per `.claude/rules/library-crates.md`
 # (property tests are the default for state machines / pure comparators).
 proptest = "1"
-# implementation-note-112 — T3 integration test parses
+# implementation-note-115 — T3 integration test parses
 # the minted PEM pair through the same rustls_pemfile path the ember-rpc
 # listener uses, so a format mismatch (PEM-vs-DER, BEGIN-block name,
 # wrong key encoding) surfaces here as a real load error rather than at

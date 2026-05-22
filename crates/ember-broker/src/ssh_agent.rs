@@ -1,4 +1,4 @@
-//! Tier-0 daemon-managed ssh-agent (implementation-note-83).
+//! Tier-0 daemon-managed ssh-agent (implementation-note-85).
 //!
 //! Per the 2026-05-05 grill (Angle A1): the daemon IS the ssh-agent for a
 //! session. A fresh ed25519 keypair is minted in the daemon's address space,
@@ -305,7 +305,7 @@ pub enum SshAgentError {
 /// Separate from [`crate::github_app::HttpClient`] (which is scoped to
 /// installation-token minting) so the two concerns stay independent.
 ///
-/// Tests inject [`MockDeployKeyClient`] (defined in the test module).
+/// Tests inject `MockDeployKeyClient` (defined in the test module).
 /// Production code uses [`ReqwestDeployKeyClient`].
 #[async_trait::async_trait]
 pub trait DeployKeyHttpClient: Send + Sync {
@@ -1222,7 +1222,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Deploy-key T1 tests (implementation-note-84)
+    // Deploy-key T1 tests (implementation-note-86)
     // -----------------------------------------------------------------------
 
     use std::sync::atomic::{AtomicU64, Ordering};

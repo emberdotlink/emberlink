@@ -2,7 +2,7 @@
 //! awaits a reply that matches the `approve`/`deny` keyword.
 //!
 //! Stub: logs at info and returns `TimedOut`. Real wire ships in
-//! `implementation-note-77` (AppleScript bridge + Messages.app
+//! `implementation-note-79` (AppleScript bridge + Messages.app
 //! reply polling).
 
 use anyhow::Result;

@@ -1,5 +1,5 @@
 //! Integration tests for `ember broker {issue, revoke, list}`
-//! (implementation-note-465).
+//! (implementation-note-485).
 //!
 //! Each test spawns a real `ember-daemon` socket listener on a temp
 //! `UnixStream` path with a `MockBroker`-backed registry installed (the
@@ -270,7 +270,7 @@ fn broker_issue_valid_scope_returns_brokered_credential() {
         provider: "cloudflare".to_string(),
         scope_json: r#"{"zone":"emberlink.dev","permissions":["dns:edit"]}"#.to_string(),
         ttl: "15m".to_string(),
-        reason: "implementation-note-498issue-test".to_string(),
+        reason: "implementation-note-530issue-test".to_string(),
         json: true,
     };
     let res = broker_command(cmd, opts(&socket));
@@ -443,7 +443,7 @@ fn broker_list_without_presence_returns_guidance_not_raw_authority_error() {
     match err {
         BrokerCliError::Guidance(message) => {
             assert!(message.contains("advanced operator surface"));
-            assert!(message.contains("ember claude-code"));
+            assert!(message.contains("ember claude"));
         }
         other => panic!("expected Guidance, got {other:?}"),
     }

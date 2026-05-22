@@ -690,8 +690,16 @@ async fn github_store_configured_from_metadata(
         }
     }
 
+    // Empty triples set is NOT a "configured = false" signal on its
+    // own — the operator may have provisioned a `github-pat` entry
+    // without any App-style triple. Fall through to the PAT-fallback
+    // probe below so PAT-only deployments resolve as configured.
+    // Partial of implementation-note-128: the
+    // `startup_metadata_probe_accepts_github_pat_without_app` T1
+    // unit asserts this exact contract.
+    // Anchor: `ember_daemon_broken_test_cluster_resolved`.
     if triples.is_empty() {
-        return Ok(false);
+        return github_pat_store_configured_from_metadata(store).await;
     }
 
     for (triple_key, slots) in &triples {

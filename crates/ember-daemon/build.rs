@@ -2,7 +2,7 @@
 //! consumption in `runtime.rs`.
 //!
 //! CLI-VERSION-FLAG: the daemon startup log line records both so a stale
-//! binary running against a newer codebase (the implementation-note-116
+//! binary running against a newer codebase (the implementation-note-119
 //! root cause) is identifiable in seconds.
 //!
 //! See `crates/emberlink-cli/build.rs` for the same algorithm — duplicated

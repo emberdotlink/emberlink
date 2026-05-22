@@ -120,8 +120,9 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let dir = tmp_ember_home();
         unsafe { std::env::set_var("EMBER_HOME", dir.path()) };
-        let mut prefs = SessionPrefs::default();
-        prefs.host_mode_disclaimer_suppressed = true;
+        let prefs = SessionPrefs {
+            host_mode_disclaimer_suppressed: true,
+        };
         save(&prefs).expect("save prefs");
         let loaded = load();
         unsafe { std::env::remove_var("EMBER_HOME") };

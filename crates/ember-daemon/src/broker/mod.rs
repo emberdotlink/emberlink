@@ -2,12 +2,12 @@ pub mod anthropic_config;
 pub mod authority;
 pub mod aws_sts_config;
 pub mod azure_config;
-// implementation-note-126 — daemon-controlled credential-target
+// implementation-note-130 — daemon-controlled credential-target
 // allowlist. CRUD over `credential_bindings` is consumed by the
 // admin verb (`ember bind …`) and (in a follow-up) by the broker's
 // per-request authorization gate.
 pub mod bindings;
-// implementation-note-52 Phase 1 — Linux memfd-sealed
+// implementation-note-54 Phase 1 — Linux memfd-sealed
 // credential surface that callers can swap for raw env-var injection.
 // Non-Linux targets compile a stub that returns `NotImplemented`.
 pub mod exec_env;
@@ -16,13 +16,13 @@ pub mod gcp_config;
 pub mod github_config;
 pub mod handler;
 pub mod hashivault_config;
-// implementation-note-138 (design §Component 2) —
+// implementation-note-142 (design §Component 2) —
 // parser for `EMBER_ALLOW_MOCK_BROKERS`. MockBroker registration is now
 // an explicit opt-in: missing creds fail-loud unless the operator named
 // the provider in this env. Anchor: `dev_prod_parity_mock_broker_explicit_landed`.
 pub mod mock_allowlist;
 pub mod okta_config;
-// implementation-note-162 — per-spawn ephemeral uid pool that
+// implementation-note-166 — per-spawn ephemeral uid pool that
 // fork+execve drops into before running the child. Closes Finding 14
 // (refuse spawning child as daemon uid) and the cross-spawn
 // `/proc/<pid>/environ` side-channel. See uid_alloc.rs for the pool;

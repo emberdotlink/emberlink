@@ -14,6 +14,10 @@
 use core_event_types::PregrantPath;
 use serde::{Deserialize, Serialize};
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Per design §F6. The vocabulary is locked: `claim_events`, not `decisions`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -35,11 +39,48 @@ pub struct ClaimEvent {
     pub resolved: serde_json::Value,
 }
 
+/// Segment digest for scalable session/composite receipt materialization.
+///
+/// This is additive receipt-wire state for long-lived scopes whose full claim
+/// history should not be forced into one terminal in-memory blob. Atomic
+/// receipts leave this empty.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimSegmentDigest {
+    pub segment_no: u64,
+    pub first_scope_seq: u64,
+    pub last_scope_seq: u64,
+    pub claim_count: u64,
+    pub started_at: String,
+    pub ended_at: String,
+    pub merkle_root: String,
+}
+
 /// Generic Receipt v2 body. Kind-specific extensions live in sibling modules
-/// (e.g. `receipt::cohort_a` will add `audit_gaps[]` per implementation-note-45).
+/// (e.g. `receipt::cohort_a` will add `audit_gaps[]` per implementation-note-47).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReceiptBody {
     pub claim_events: Vec<ClaimEvent>,
+    /// Total claims represented by this receipt scope. When this exceeds
+    /// `claim_events.len()`, the receipt is carrying a bounded recent tail plus
+    /// segment summaries rather than the full claim history inline.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub claim_count_total: Option<u64>,
+    /// Whether `claim_events` is a bounded tail rather than the complete set of
+    /// claims for this scope.
+    #[serde(skip_serializing_if = "is_false", default)]
+    pub claim_events_truncated: bool,
+    /// Segment digests for scalable session/composite rollups. Empty for
+    /// atomic receipts and small session receipts that still inline every
+    /// claim event.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub claim_segment_summaries: Vec<ClaimSegmentDigest>,
+    /// Full-scope history root over `claim_segment_summaries[]`.
+    ///
+    /// This is distinct from `permits_merkle_root`, which continues to cover
+    /// the inline `claim_events[]` field only. When `claim_events_truncated` is
+    /// true, this field anchors the complete scope history.
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub claim_history_merkle_root: String,
     /// `blake3` Merkle root over `claim_events[].input_hash` per design §"Merkle leaf format".
     /// Empty until populated by signing helper.
     #[serde(skip_serializing_if = "String::is_empty", default)]
@@ -91,13 +132,19 @@ mod tests {
     fn body_default_empty() {
         let body = ReceiptBody::default();
         assert!(body.claim_events.is_empty());
+        assert_eq!(body.claim_count_total, None);
+        assert!(!body.claim_events_truncated);
+        assert!(body.claim_segment_summaries.is_empty());
+        assert!(body.claim_history_merkle_root.is_empty());
         assert!(body.permits_merkle_root.is_empty());
     }
 
     #[test]
     fn body_with_device_id_round_trip() {
-        let mut body = ReceiptBody::default();
-        body.device_id = Some("device-example-laptop".to_string());
+        let body = ReceiptBody {
+            device_id: Some("device-example-laptop".to_string()),
+            ..ReceiptBody::default()
+        };
         let json = serde_json::to_string(&body).unwrap();
         assert!(json.contains("\"device_id\":\"device-example-laptop\""));
         let back: ReceiptBody = serde_json::from_str(&json).unwrap();
@@ -112,6 +159,52 @@ mod tests {
     }
 
     #[test]
+    fn body_omits_segmented_rollup_fields_when_empty() {
+        let body = ReceiptBody::default();
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(!json.contains("claim_count_total"));
+        assert!(!json.contains("claim_events_truncated"));
+        assert!(!json.contains("claim_segment_summaries"));
+        assert!(!json.contains("claim_history_merkle_root"));
+    }
+
+    #[test]
+    fn body_round_trips_segmented_rollup_fields() {
+        let mut body = ReceiptBody::default();
+        body.claim_events = vec![ClaimEvent {
+            ts: "2026-05-22T12:00:00Z".to_string(),
+            kind: ClaimKind::CredentialVended,
+            tool: "Claude".to_string(),
+            input_hash: "h1".to_string(),
+            input_redacted: serde_json::json!({"cmd": "deploy"}),
+            resolved: serde_json::json!({"allowed": true}),
+        }];
+        body.claim_count_total = Some(9);
+        body.claim_events_truncated = true;
+        body.claim_segment_summaries = vec![ClaimSegmentDigest {
+            segment_no: 0,
+            first_scope_seq: 1,
+            last_scope_seq: 8,
+            claim_count: 8,
+            started_at: "2026-05-22T12:00:00Z".to_string(),
+            ended_at: "2026-05-22T12:05:00Z".to_string(),
+            merkle_root: "deadbeef".to_string(),
+        }];
+        body.claim_history_merkle_root = "cafebabe".to_string();
+        let json = serde_json::to_string(&body).unwrap();
+        assert!(json.contains("claim_count_total"));
+        assert!(json.contains("claim_events_truncated"));
+        assert!(json.contains("claim_segment_summaries"));
+        assert!(json.contains("claim_history_merkle_root"));
+        let back: ReceiptBody = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.claim_count_total, Some(9));
+        assert!(back.claim_events_truncated);
+        assert_eq!(back.claim_segment_summaries.len(), 1);
+        assert_eq!(back.claim_segment_summaries[0].claim_count, 8);
+        assert_eq!(back.claim_history_merkle_root, "cafebabe");
+    }
+
+    #[test]
     fn body_omits_workflow_fields_when_none() {
         let body = ReceiptBody::default();
         let json = serde_json::to_string(&body).unwrap();
@@ -122,10 +215,12 @@ mod tests {
 
     #[test]
     fn body_round_trips_workflow_fields() {
-        let mut body = ReceiptBody::default();
-        body.workflow_id = Some("wfg_01HQ0EXAMPLE".to_string());
-        body.workflow_template = Some("emberd-development".to_string());
-        body.pregrant_path = Some(PregrantPath::Workflow);
+        let body = ReceiptBody {
+            workflow_id: Some("wfg_01HQ0EXAMPLE".to_string()),
+            workflow_template: Some("emberd-development".to_string()),
+            pregrant_path: Some(PregrantPath::Workflow),
+            ..ReceiptBody::default()
+        };
         let json = serde_json::to_string(&body).unwrap();
         assert!(json.contains("\"workflow_id\":\"wfg_01HQ0EXAMPLE\""));
         assert!(json.contains("\"workflow_template\":\"emberd-development\""));
@@ -144,8 +239,10 @@ mod tests {
             PregrantPath::Jit,
             PregrantPath::Deny,
         ] {
-            let mut body = ReceiptBody::default();
-            body.pregrant_path = Some(variant);
+            let body = ReceiptBody {
+                pregrant_path: Some(variant),
+                ..ReceiptBody::default()
+            };
             let json = serde_json::to_string(&body).unwrap();
             let back: ReceiptBody = serde_json::from_str(&json).unwrap();
             assert_eq!(back.pregrant_path, Some(variant));

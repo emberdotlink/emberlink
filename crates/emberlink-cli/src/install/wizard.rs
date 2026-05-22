@@ -3,7 +3,7 @@
 //! `run_install_wizard` is the entry point operators will reach via the
 //! `ember install` CLI verb. The wizard:
 //!
-//! 1. [`batch_sudo_v`] — primes the sudo timestamp once at wizard start so
+//! 1. `batch_sudo_v` — primes the sudo timestamp once at wizard start so
 //!    later steps can shell out without re-prompting.
 //! 2. [`detect_platform`] — returns a [`Platform`] discriminant the wizard
 //!    branches on (macOS / Linux+distro / WSL+distro / Unsupported).
@@ -23,7 +23,7 @@
 //! - [`wizard_step_chown_data_dirs`] — chown `~/.ember/{vault,grants,…}`.
 //! - [`wizard_step_provision_mek`] — vault MEK in System.keychain (macOS) /
 //!   keyring (Linux). Without this the daemon refuses to start.
-//!   implementation-note-474.
+//!   implementation-note-495.
 //! - [`wizard_step_emit_launch_spec`] — launchd plist or systemd unit.
 //! - [`wizard_step_add_user_to_group`] — operator → `ember-clients`.
 //! - [`wizard_step_verify`] — daemon status RPC reachable on the managed socket.
@@ -223,7 +223,7 @@ impl WizardContext {
     /// Build a `WizardContext` from the live process environment.
     ///
     /// `home` defaults to `dirs_next::home_dir()`, falling back to `.` for
-    /// the same edge case [`transcript_path`] handles (no `$HOME` in a
+    /// the same edge case `transcript_path` handles (no `$HOME` in a
     /// stripped container). `invoking_user` reads `$USER`; `$SUDO_USER`
     /// takes precedence when present so a step run via `sudo ember install`
     /// still records the unprivileged operator.
@@ -260,7 +260,7 @@ pub trait InstallPrimitives {
     /// Provision the vault MEK in System.keychain (macOS) / keyring (Linux).
     /// The daemon refuses to start without this. Idempotent — re-running
     /// against an existing MEK item is a no-op (preserves access to existing
-    /// encrypted state). implementation-note-474.
+    /// encrypted state). implementation-note-495.
     fn provision_se_mek(&self, home: &Path) -> Result<(), daemon_install::InstallError>;
     fn install_launch_spec(
         &self,
@@ -279,13 +279,13 @@ pub trait InstallPrimitives {
     /// re-run on an already-loaded profile.
     fn load_apparmor_profile(&self) -> Result<(), daemon_install::InstallError>;
 
-    /// Reverse of [`provision_ember_user`] — delete the `ember` system user
+    /// Reverse of `provision_ember_user` — delete the `ember` system user
     /// and the `ember`/`ember-clients` groups. Best-effort; tolerates "no
     /// such user" stderr signatures.
     fn unwind_provision_ember_user(&self) -> Result<(), daemon_install::InstallError> {
         Ok(())
     }
-    /// Reverse of [`chown_ember_data_dirs`] — chown the data dirs back to
+    /// Reverse of `chown_ember_data_dirs` — chown the data dirs back to
     /// the operator's uid/gid. Best-effort.
     fn unwind_chown_ember_data_dirs(
         &self,
@@ -293,7 +293,7 @@ pub trait InstallPrimitives {
     ) -> Result<(), daemon_install::InstallError> {
         Ok(())
     }
-    /// Reverse of [`provision_se_mek`]. Default is no-op — unwinding a
+    /// Reverse of `provision_se_mek`. Default is no-op — unwinding a
     /// keychain item risks data loss (encrypted state under that key becomes
     /// unrecoverable), so rollback intentionally leaves the MEK in place.
     /// An operator who wants to wipe it can do so manually via `security
@@ -301,7 +301,7 @@ pub trait InstallPrimitives {
     fn unwind_provision_se_mek(&self, _home: &Path) -> Result<(), daemon_install::InstallError> {
         Ok(())
     }
-    /// Reverse of [`install_launch_spec`] — remove the launchd plist (macOS)
+    /// Reverse of `install_launch_spec` — remove the launchd plist (macOS)
     /// or systemd unit (Linux/WSL). Best-effort.
     fn unwind_install_launch_spec(
         &self,
@@ -309,7 +309,7 @@ pub trait InstallPrimitives {
     ) -> Result<(), daemon_install::InstallError> {
         Ok(())
     }
-    /// Reverse of [`load_apparmor_profile`] — removing a loaded AppArmor
+    /// Reverse of `load_apparmor_profile` — removing a loaded AppArmor
     /// profile from the kernel risks stranding running containers that were
     /// granted confinement under it, so rollback is intentionally a no-op.
     /// An operator who wants to unload the profile can run
@@ -317,7 +317,7 @@ pub trait InstallPrimitives {
     fn unwind_load_apparmor_profile(&self) -> Result<(), daemon_install::InstallError> {
         Ok(())
     }
-    /// Reverse of [`add_operator_to_group`] — remove the operator from the
+    /// Reverse of `add_operator_to_group` — remove the operator from the
     /// `ember-clients` group. Best-effort.
     fn unwind_add_operator_to_group(
         &self,
@@ -326,7 +326,7 @@ pub trait InstallPrimitives {
     ) -> Result<(), daemon_install::InstallError> {
         Ok(())
     }
-    /// Reverse of [`socket_responsive`] / `wizard_step_verify` — verify is
+    /// Reverse of `socket_responsive` / `wizard_step_verify` — verify is
     /// a read-only check, so unwind is a no-op. Provided for symmetry.
     fn unwind_verify(&self, _socket: &Path) -> Result<(), String> {
         Ok(())
@@ -901,7 +901,7 @@ pub fn wizard_step_chown_data_dirs<P: InstallPrimitives>(
 /// already exists, preserving access to any existing encrypted state from
 /// a prior install. Re-running this step is safe.
 ///
-/// implementation-note-474. The older
+/// implementation-note-495. The older
 /// non-wizard install path (in `crates/emberlink-cli/src/bin/ember.rs`)
 /// called this between the chown step and the launchd-plist step; the
 /// wizard refactor dropped it, causing every fresh install to end with a
@@ -1182,7 +1182,7 @@ fn state_path() -> PathBuf {
 /// Persist [`WizardState`] to `~/.ember/install-wizard.state.json` as a
 /// pretty-printed JSON document. Overwrites the prior file. Failures bubble
 /// up as [`WizardError::TranscriptIo`] for the same reason
-/// [`append_transcript`] does — the wizard cannot continue if it can't
+/// `append_transcript` does — the wizard cannot continue if it can't
 /// persist its own resume breadcrumb.
 pub fn save_wizard_state(state: &WizardState) -> Result<(), WizardError> {
     save_wizard_state_at(state, &state_path())
@@ -1232,7 +1232,7 @@ pub fn clear_wizard_state() -> Result<(), WizardError> {
 ///
 /// Reads `prior_state` and returns the appropriate [`ResumeAction`]. The
 /// prompt-driven branches (`Resume` / `Rollback` / `Cancel`) call
-/// [`prompt_resume_choice`] under the hood; tests bypass the prompt by
+/// `prompt_resume_choice` under the hood; tests bypass the prompt by
 /// using [`wizard_resume_or_rollback_with_choice`] directly.
 ///
 /// Decision matrix:
@@ -1256,7 +1256,7 @@ pub fn wizard_resume_or_rollback(prior_state: &WizardState) -> ResumeAction {
 
 /// Test-friendly variant of [`wizard_resume_or_rollback`] — caller supplies
 /// the prompt choice instead of the function reading stdin. The character
-/// argument matches what [`prompt_resume_choice`] returns: `'r'` for resume,
+/// argument matches what `prompt_resume_choice` returns: `'r'` for resume,
 /// `'b'` for rollback, `'c'` for cancel.
 pub fn wizard_resume_or_rollback_with_choice(
     prior_state: &WizardState,
@@ -1382,7 +1382,7 @@ pub fn run_rollback<P: InstallPrimitives>(
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// implementation-note-455 — new-machine daemon detection + prompt
+// implementation-note-474 — new-machine daemon detection + prompt
 // ───────────────────────────────────────────────────────────────────────────
 
 /// Three-state result of [`detect_daemon_installed`].
@@ -1522,7 +1522,7 @@ impl std::fmt::Display for DaemonInstallPromptError {
 /// Returns `Ok(())` when the operator consented and the install succeeded.
 /// Returns `Err(DaemonInstallPromptError::Declined)` when the operator said no.
 /// Returns other `Err` variants for non-interactive mode or subprocess failures.
-// implementation-note-455 checkpoint
+// implementation-note-474 checkpoint
 pub fn prompt_install_daemon(non_interactive: bool) -> Result<(), DaemonInstallPromptError> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -2347,7 +2347,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // implementation-note-455 — T2 tests
+    // implementation-note-474 — T2 tests
     // ----------------------------------------------------------------
 
     /// detect_daemon_installed: socket present → Running.
@@ -2410,12 +2410,11 @@ mod tests {
             // Build a real ExitStatus from a known exit code via a trivial
             // child process.  We can't construct ExitStatus directly (it's
             // opaque), so we spawn `true` (succeeds) or `false` (fails).
-            let status = if self.succeed {
+            if self.succeed {
                 std::process::Command::new("true").status()
             } else {
                 std::process::Command::new("false").status()
-            };
-            status
+            }
         }
     }
 

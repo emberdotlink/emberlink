@@ -105,7 +105,7 @@ impl Drop for PidFile {
     }
 }
 
-/// `daemon_status_pid_liveness_check` — implementation-note-298.
+/// `daemon_status_pid_liveness_check` — implementation-note-306.
 ///
 /// Discriminate `kill(0)` errno states so cross-uid daemons aren't
 /// misclassified as gone under design separate-uid posture:
@@ -255,7 +255,7 @@ mod tests {
         assert_eq!(writer.read().unwrap(), Some(std::process::id()));
     }
 
-    /// implementation-note-298 — regression test
+    /// implementation-note-306 — regression test
     /// for the cross-uid case under design separate-uid posture.
     ///
     /// PID 1 (init/launchd) always exists and is owned by root. When the

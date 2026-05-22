@@ -1,10 +1,10 @@
 //! In-memory Vault Transit keyring — AES-256-GCM encrypt/decrypt.
 //!
 //! Implements the minimal Transit subset used by SOPS and Pulumi:
-//! - key creation (POST /v1/transit/keys/<key>)
-//! - key metadata (GET /v1/transit/keys/<key>)
-//! - encrypt (POST /v1/transit/encrypt/<key>)
-//! - decrypt (POST /v1/transit/decrypt/<key>)
+//! - key creation (`POST /v1/transit/keys/<key>`)
+//! - key metadata (`GET /v1/transit/keys/<key>`)
+//! - encrypt (`POST /v1/transit/encrypt/<key>`)
+//! - decrypt (`POST /v1/transit/decrypt/<key>`)
 //!
 //! Keys are memory-only for now; envelope wrapping (storing the KEK in the
 //! `ember vault` row at `kms/<name>`) is a follow-up per design.
@@ -105,7 +105,7 @@ impl TransitKey {
     }
 }
 
-/// Key metadata returned by GET /v1/transit/keys/<key>.
+/// Key metadata returned by `GET /v1/transit/keys/<key>`.
 #[derive(Debug, Clone, Serialize)]
 pub struct KeyInfo {
     pub name: String,
@@ -203,13 +203,13 @@ fn key_to_info(key: &TransitKey) -> KeyInfo {
 // Request / response shapes (Vault Transit wire format)
 // ---------------------------------------------------------------------------
 
-/// POST /v1/transit/encrypt/<key> request body.
+/// `POST /v1/transit/encrypt/<key>` request body.
 #[derive(Debug, Deserialize)]
 pub struct EncryptRequest {
     pub plaintext: String,
 }
 
-/// POST /v1/transit/decrypt/<key> request body.
+/// `POST /v1/transit/decrypt/<key>` request body.
 #[derive(Debug, Deserialize)]
 pub struct DecryptRequest {
     pub ciphertext: String,

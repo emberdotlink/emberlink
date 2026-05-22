@@ -1,5 +1,5 @@
 //!
-//! implementation-note-162 — per-spawn ephemeral uid pool for
+//! implementation-note-166 — per-spawn ephemeral uid pool for
 //! credentialed `broker_exec` children. Closes Finding 14 (refuse to
 //! spawn a child as the daemon's own uid) and the
 //! `/proc/<pid>/environ` side-channel between two concurrent broker_exec
@@ -21,7 +21,7 @@
 //!
 //! ## Allocation strategy
 //!
-//! Strategy (b) from the implementation-note-162 brief —
+//! Strategy (b) from the implementation-note-166 brief —
 //! **per-spawn ephemeral uid checked out from a pre-provisioned pool**.
 //! The installer provisions the pool uids at `ember daemon install`
 //! time (`ember-spawn-0` … `ember-spawn-N`) and the daemon checks one
@@ -76,7 +76,7 @@ pub fn init_uid_pool(config: Option<SpawnPoolConfig>) {
     let pool = config.map(|cfg| {
         // design Component 2 — modern-Linux subuid path. When the
         // config carries `subuid_range_start` + `subuid_range_slots`
-        // (provisioned by implementation-note-186), populate
+        // (provisioned by implementation-note-190), populate
         // the pool from the range and mark it as subuid-shaped so
         // the broker_exec handler routes through the clone3 +
         // newuidmap path. Otherwise the legacy design system-user
@@ -109,7 +109,7 @@ pub fn init_uid_pool(config: Option<SpawnPoolConfig>) {
 /// (`target_uid == daemon_uid`) refusal so the test path can spawn
 /// children without provisioning real separate uids.
 ///
-/// implementation-note-162 — test seam. Production callers
+/// implementation-note-166 — test seam. Production callers
 /// MUST never invoke this; the test_mode flag inside the resulting
 /// pool is the only escape valve from the Finding-14 refusal and
 /// the production install path never sets it.
@@ -173,8 +173,11 @@ pub fn init_subuid_pool_for_test() {
 }
 
 /// Reset the global pool — test-only, used by tests that need to
-/// simulate the "pool not configured" path.
+/// simulate the "pool not configured" path. No current caller in
+/// the test suite; the helper is intentionally preserved as
+/// documentation of the OnceLock-can't-be-reset limitation.
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn reset_uid_pool_for_test() {
     // OnceLock::set fails once initialized, but tests run serially per
     // crate so we can't actually undo it. Tests that need a different

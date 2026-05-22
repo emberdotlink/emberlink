@@ -418,6 +418,9 @@ mod tests {
             let (stream, _) = listener.accept().expect("accept");
             let mut writer = stream.try_clone().expect("clone");
             let reader = BufReader::new(stream);
+            // Intentionally single-shot: the loop body breaks after the
+            // first request (see `break // one request only` below).
+            #[allow(clippy::never_loop)]
             for line in reader.lines() {
                 let line = line.expect("read line");
                 let req: serde_json::Value = serde_json::from_str(&line).expect("parse request");

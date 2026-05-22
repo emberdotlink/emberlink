@@ -2,7 +2,7 @@
 //!
 //! Exposes [`run_main`] so the `ember-proxy` binary (in this crate) and the
 //! workspace bin alias in `emberlink-cli` can both call the same entry point.
-//! Per implementation-note-90 / design §2: `cargo install emberlink` should produce
+//! Per implementation-note-92 / design §2: `cargo install emberlink` should produce
 //! both `ember` and `ember-proxy` on `$PATH` in one step.
 
 pub mod claude_code_hook;

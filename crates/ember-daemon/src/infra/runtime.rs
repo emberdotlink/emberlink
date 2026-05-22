@@ -57,12 +57,12 @@ pub enum DaemonError {
     NotRunning,
     #[error("signal error: {0}")]
     Signal(std::io::Error),
-    /// implementation-note-255 (D): startup sampling verify
+    /// implementation-note-262 (D): startup sampling verify
     /// detected a chain break. The daemon refused normal-serve and
     /// entered quarantine. Recovery requires operator intervention.
     #[error("audit chain break detected at startup: {0}")]
     AuditChainBreak(String),
-    /// implementation-note-255 (E) / F-S5-013 HIGH: the
+    /// implementation-note-262 (E) / F-S5-013 HIGH: the
     /// daemon's long-lived identity key could not be initialised, so
     /// the daemon refuses startup (fail-closed). Receipts are
     /// load-bearing for the audit chain and the broker; running
@@ -70,7 +70,7 @@ pub enum DaemonError {
     /// state.
     #[error("identity init failed: {0}")]
     IdentityInitFailed(String),
-    /// implementation-note-138 (design §Component 2):
+    /// implementation-note-142 (design §Component 2):
     /// broker credentials are missing for a provider AND the provider is
     /// not in `EMBER_ALLOW_MOCK_BROKERS`. Silent fallback to `MockBroker`
     /// is the credential-isolation invariant violation this gates against
@@ -87,7 +87,7 @@ pub enum DaemonError {
          per project design notes)"
     )]
     BrokerCredsMissing { provider: &'static str },
-    /// implementation-note-319: the explicit bridge
+    /// implementation-note-328: the explicit bridge
     /// bootstrap path (design component 3) could not load or mint the
     /// Bridge CA. When the bridge lane is enabled, fail closed rather than
     /// starting with a missing CA or unreadable sibling cert.
@@ -153,7 +153,7 @@ pub enum DashboardBind {
     Timeout,
 }
 
-/// implementation-note-195: outcome of the git-echo credential-injection proxy bind.
+/// implementation-note-201: outcome of the git-echo credential-injection proxy bind.
 /// Mirrors `DashboardBind` semantics. Sent to `run()`'s `start_notify`
 /// callback so the CLI can print `EMBER_PROXY_URL=…` for qember.sh +
 /// ember-git.sh consumers.
@@ -169,7 +169,7 @@ pub enum GitProxyBind {
     Timeout,
 }
 
-/// implementation-note-196: outcome of the general LLM/HTTP credential-
+/// implementation-note-202: outcome of the general LLM/HTTP credential-
 /// injection proxy bind. Mirrors `GitProxyBind` semantics. The LLM proxy
 /// (`run_proxy` / `handle_request`) is what the Anthropic SDK demo path
 /// posts to; its bound URL is exposed via `EMBER_PROXY_URL` and the
@@ -189,12 +189,12 @@ pub enum LlmProxyBind {
 /// Aggregate bind report passed to `run()`'s `start_notify` callback. Carries
 /// every listener that may have raced to bind during startup so the CLI can
 /// render a consolidated banner. New listeners get a new field here rather
-/// than a parallel callback. implementation-note-195.
+/// than a parallel callback. implementation-note-201.
 #[derive(Debug, Clone)]
 pub struct StartupBinds {
     pub dashboard: DashboardBind,
     pub git_proxy: GitProxyBind,
-    /// implementation-note-196: bind outcome for the LLM proxy.
+    /// implementation-note-202: bind outcome for the LLM proxy.
     pub llm_proxy: LlmProxyBind,
     /// Daemon's Ed25519 signing-identity pubkey (64-hex). Empty string if
     /// identity initialisation failed at startup. Used by the CLI to render
@@ -202,7 +202,7 @@ pub struct StartupBinds {
     pub identity_pubkey: String,
 }
 
-/// emberd_sandbox_startup_probe (implementation-note-121).
+/// emberd_sandbox_startup_probe (implementation-note-124).
 ///
 /// Verifies the daemon is actually running under a kernel-level sandbox
 /// (seccomp on Linux, sandbox-exec on macOS) at startup. Designed to
@@ -243,7 +243,7 @@ pub fn check_sandbox_at_startup() -> Result<SandboxState, SandboxProbeFailure> {
             "daemon is NOT running under a kernel sandbox; ensure systemd \
              SystemCallFilter= (Linux) or LaunchDaemon sandbox-exec (macOS) \
              is wired. Set EMBER_REQUIRE_SANDBOX=1 to refuse-on-detect. \
-             Per implementation-note-320."
+             Per implementation-note-329."
         );
         if std::env::var("EMBER_REQUIRE_SANDBOX").is_ok_and(|v| v == "1") {
             return Err(SandboxProbeFailure::StrictModeUnsandboxed);
@@ -326,7 +326,7 @@ fn probe_sandbox_state() -> SandboxState {
     SandboxState::Unsandboxed
 }
 
-/// implementation-note-216 — render a 64-hex Ed25519 pubkey as a
+/// implementation-note-223 — render a 64-hex Ed25519 pubkey as a
 /// short SSH-style fingerprint (`4a5d:a587:dd36:53b2`) using the first
 /// 8 bytes / 16 hex chars. The dashboard, the receipt detail page, and
 /// the demo teardown printout all use the same shape so a viewer can
@@ -395,7 +395,7 @@ pub fn authenticate_peer_creds(
 
 // ---------------------------------------------------------------------------
 // PeerCredPrincipal — kernel-attested per-call identity
-// (implementation-note-149, design + design §"Decision §2")
+// (implementation-note-153, design + design §"Decision §2")
 // ---------------------------------------------------------------------------
 
 /// Kernel-attested identity of the caller on the other end of a Unix
@@ -411,10 +411,10 @@ pub fn authenticate_peer_creds(
 ///   broker handlers: a caller whose kernel uid does not match the
 ///   persona's bound uid is refused with `-32004`.
 /// - `pid`         — pid-namespace-scoped peer pid. Diagnostics only:
-///   the bare PID is reuse-prone (see sibling implementation-note-155
+///   the bare PID is reuse-prone (see sibling implementation-note-159
 ///   for the pidfd-based reuse-immune surface).
 /// - `socket_path` — per-agent UDS path the connection accepted on.
-///   Per implementation-note-150 each agent gets its own socket;
+///   Per implementation-note-154 each agent gets its own socket;
 ///   the path is the cohesive identity binding the OS uid to a
 ///   specific persona. For Phase 1 (this task) the daemon's single
 ///   socket path is used uniformly.
@@ -427,7 +427,7 @@ pub fn authenticate_peer_creds(
 /// drop. Using `Arc` rather than `dup(2)`-on-clone keeps the fd count
 /// constant and avoids leaking fds across the per-RPC clone path.
 ///
-/// implementation-note-155.
+/// implementation-note-159.
 #[cfg(target_os = "linux")]
 #[derive(Debug)]
 pub struct PidFdOwner {
@@ -492,11 +492,11 @@ pub struct PeerCredPrincipal {
     /// consults the bound pidfd) over inspecting this field directly — the
     /// bare PID is reuse-prone, and the pidfd is the reuse-immune anchor.
     pub pid: i32,
-    /// Per-agent UDS socket path. Per implementation-note-150 each
+    /// Per-agent UDS socket path. Per implementation-note-154 each
     /// agent gets its own socket; for Phase 1 the daemon's single
     /// socket path is used uniformly.
     pub socket_path: PathBuf,
-    /// implementation-note-155 — pidfd opened at accept time against the
+    /// implementation-note-159 — pidfd opened at accept time against the
     /// peer's PID. `Some(_)` when `pidfd_open(2)` succeeded; `None` when
     /// the syscall is unavailable (pre-5.3 kernel) or the process exited
     /// between `accept()` and `pidfd_open()`. `Arc`-wrapped so the
@@ -527,12 +527,12 @@ impl PeerCredPrincipal {
     /// the per-agent socket path the connection landed on.
     ///
     /// `socket_path` is the listener path the connection accepted on
-    /// (per implementation-note-150) — passed in so the constructor
+    /// (per implementation-note-154) — passed in so the constructor
     /// is independent of the listener's address API which is not always
     /// usable on a connected stream.
     ///
     /// On Linux this also issues `pidfd_open(pid, 0)` to bind a
-    /// reuse-immune handle to the peer process (implementation-note-321-
+    /// reuse-immune handle to the peer process (implementation-note-330-
     /// BINDING). The pidfd is `None` on legacy kernels — broker handlers
     /// fall back to the bare-PID surface in that case.
     ///
@@ -621,7 +621,7 @@ impl PeerCredPrincipal {
     /// etc.). Tests that depend on pidfd behaviour should skip on a
     /// `None` return rather than panic.
     ///
-    /// implementation-note-155 — test seam so the dead-pid rejection
+    /// implementation-note-159 — test seam so the dead-pid rejection
     /// test can build a principal with a real pidfd against an already-
     /// exited child.
     #[cfg(target_os = "linux")]
@@ -819,7 +819,7 @@ pub struct DaemonRuntime {
     /// Path the config was loaded from — used for the vault identity warning in `run()`.
     /// `None` when config came from defaults (no file on disk).
     config_path: Option<std::path::PathBuf>,
-    /// implementation-note-213: actual address the dashboard
+    /// implementation-note-220: actual address the dashboard
     /// listener bound to (`Some(addr)`) or absent when the dashboard is
     /// disabled / failed to bind / timed out (`None`). Populated from inside
     /// `run()` after the bind result arrives. `Mutex` (not `RefCell`)
@@ -827,7 +827,7 @@ pub struct DaemonRuntime {
     /// the test harness reads it from a different thread than the one
     /// driving the daemon.
     pub dashboard_actual_addr: Mutex<Option<SocketAddr>>,
-    /// implementation-note-319: the SE-sealed Bridge
+    /// implementation-note-328: the SE-sealed Bridge
     /// CA (design component 3). `None` until an explicit bridge bootstrap
     /// path opens the vault and loads-or-mints the CA via
     /// [`load_or_mint_bridge_ca`]. Startup on the default local path now
@@ -896,7 +896,7 @@ impl DaemonRuntime {
         self.config.ensure_dirs()?;
         self.pid_file.write()?;
 
-        // implementation-note-196 fix: install the rustls process-wide
+        // implementation-note-202 fix: install the rustls process-wide
         // CryptoProvider once at daemon startup. Both the LLM proxy
         // (`run_proxy`) and the git-echo proxy (`run_git_echo_proxy`) call
         // `HttpsConnectorBuilder::with_webpki_roots()` which panics on the
@@ -912,7 +912,7 @@ impl DaemonRuntime {
         info!(pid = std::process::id(), socket = %socket_path.display(), "ember daemon starting");
         // CLI-VERSION-FLAG: log the binary's compile-time version + git SHA +
         // build timestamp at INFO so a stale binary running against a newer
-        // codebase (the implementation-note-116 root cause) is
+        // codebase (the implementation-note-119 root cause) is
         // identifiable in seconds via `tail daemon.log`. Also surfaces the
         // `(no-git)` fallback if the build script ran without a working repo.
         info!(
@@ -949,7 +949,7 @@ impl DaemonRuntime {
                  filtering is still partial; some persona-keyed reads now principal-scope or \
                  fail closed and OperatorPresence methods now fail closed without a \
                  presence-token, but the broader ConnectOnly surface is not yet uniformly \
-                 filtered by peer.uid. See implementation-note-194; the \
+                 filtered by peer.uid. See implementation-note-200; the \
                  historical-revision file-ACL accept path is dev0-correct and team0-incomplete."
             );
         }
@@ -976,6 +976,51 @@ impl DaemonRuntime {
             self.config.tier.interactive_grace_window(),
         );
 
+        // cordon_phase1_receipt_mint_retrofitted — load the daemon
+        // identity BEFORE opening the store so the cordon migration
+        // (which runs inside `DaemonStore::open` → `migrate` →
+        // `cordon_migration_phase1_if_needed`) has access to
+        // `current_identity()` for signing the Phase 1 bridge receipt.
+        // Per design v2 §5 + design §4: the bridge row INSERT and the
+        // `audit.chain_v1_segment_bridge_unattested` Receipt v2 append
+        // are atomic across the cordon's BEGIN IMMEDIATE boundary; the
+        // identity must already exist at that point. The identity init
+        // is itself idempotent (process-singleton `OnceCell`), so the
+        // reorder is benign for non-cordon paths.
+        //
+        // Failure is fail-closed (was already the case at the
+        // previously-later call site): receipts are load-bearing for
+        // the audit chain (signed evidence) and the broker (credential
+        // -access proof); refuse normal-serve rather than silently
+        // produce state nothing downstream can verify.
+        #[allow(unused_assignments)]
+        let mut identity_pubkey_hex = String::new();
+        match crate::infra::receipt::init_identity(&self.config.data_dir) {
+            Ok(pubkey) => {
+                let fingerprint = daemon_identity_fingerprint(&pubkey);
+                identity_pubkey_hex = pubkey.clone();
+                info!(
+                    signer_pubkey = %pubkey,
+                    fingerprint = %fingerprint,
+                    "daemon identity key loaded (pre-store-open for cordon receipt mint)"
+                );
+                info!(
+                    signer_pubkey = %pubkey,
+                    fingerprint = %fingerprint,
+                    canonical_version = %crate::infra::receipt::CANONICAL_VERSION,
+                    "daemon-identity-anchor: pass --pubkey to `ember receipt verify` to verify offline"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "implementation-note-262 (F-S5-013): daemon identity key \
+                     unavailable; refusing startup (fail-closed)"
+                );
+                return Err(DaemonError::IdentityInitFailed(e.to_string()));
+            }
+        }
+
         // Open the store and vault. DaemonStore holds a rusqlite Connection which
         // is !Send + !Sync, so we wrap in Rc and run everything on a LocalSet.
         let db_path = self.config.data_dir.join("daemon.db");
@@ -989,9 +1034,9 @@ impl DaemonRuntime {
         // designed to clean up. Keeping it around shipped dead-code-with-
         // live-tests; the v2 redesign removes it cleanly.
 
-        // implementation-note-255 + audit_verifier_outcome_v2:
+        // implementation-note-262 + audit_verifier_outcome_v2:
         // startup verify. Walk the last 1000 rows of the audit chain (the
-        // verifier-startup-cadence task implementation-note-322-
+        // verifier-startup-cadence task implementation-note-331-
         // CADENCE will upgrade this to full-walk-if-N<100k in Phase B).
         // On Break / TopologyViolation / IncompleteRepair*, flip the
         // process-global quarantine latch under a distinct authority
@@ -1007,7 +1052,7 @@ impl DaemonRuntime {
                 tracing::info!(
                     rows_walked,
                     segments_walked,
-                    "implementation-note-255: audit chain startup sample verify ok"
+                    "implementation-note-262: audit chain startup sample verify ok"
                 );
             }
             Ok(crate::infra::audit::VerifyOutcome::LegacyRowsPresent {
@@ -1024,7 +1069,7 @@ impl DaemonRuntime {
                     legacy_rows = count,
                     max_legacy_id,
                     chain_resumes_at_id,
-                    "implementation-note-255: legacy NULL-hash block present \
+                    "implementation-note-262: legacy NULL-hash block present \
                      in segment 0 (post-cordon expected state); Phase 2 attestation pending"
                 );
             }
@@ -1053,7 +1098,7 @@ impl DaemonRuntime {
                 };
                 tracing::error!(
                     reason = %reason,
-                    "implementation-note-255: audit-chain TAMPER DETECTED at startup; \
+                    "implementation-note-262: audit-chain TAMPER DETECTED at startup; \
                      entering quarantine, binding socket, and refusing non-read-class methods"
                 );
                 crate::infra::handler::enter_quarantine(
@@ -1074,7 +1119,7 @@ impl DaemonRuntime {
                     ?kind,
                     at_row_id,
                     rows_walked_before,
-                    "implementation-note-255: audit-chain TOPOLOGY VIOLATION at startup"
+                    "implementation-note-262: audit-chain TOPOLOGY VIOLATION at startup"
                 );
                 crate::infra::handler::enter_quarantine(
                     crate::infra::handler::QuarantineAuthority::TopologyViolation,
@@ -1088,7 +1133,7 @@ impl DaemonRuntime {
                 );
                 tracing::error!(
                     %receipt_id_orphan,
-                    "implementation-note-255: audit-chain INCOMPLETE REPAIR at startup"
+                    "implementation-note-262: audit-chain INCOMPLETE REPAIR at startup"
                 );
                 crate::infra::handler::enter_quarantine(
                     crate::infra::handler::QuarantineAuthority::IncompleteRepair,
@@ -1102,7 +1147,7 @@ impl DaemonRuntime {
                 );
                 tracing::error!(
                     tombstone_row_id,
-                    "implementation-note-255: audit-chain INCOMPLETE REPAIR RECEIPT at startup"
+                    "implementation-note-262: audit-chain INCOMPLETE REPAIR RECEIPT at startup"
                 );
                 crate::infra::handler::enter_quarantine(
                     crate::infra::handler::QuarantineAuthority::IncompleteRepairReceipt,
@@ -1112,14 +1157,14 @@ impl DaemonRuntime {
             Err(e) => {
                 tracing::warn!(
                     error = %e,
-                    "implementation-note-255: audit chain startup verify could not \
+                    "implementation-note-262: audit chain startup verify could not \
                      run (pre-migration DB or SQL failure); skipping (NOT entering quarantine)"
                 );
             }
         }
 
         // PATH-PINNING-STARTUP-VERIFY: daemon refuses startup on manifest sig mismatch.
-        // implementation-note-122: the loaded
+        // implementation-note-125: the loaded
         // manifest is also installed into the process-global
         // `broker::handler::MANIFEST` so every per-connection broker
         // handler can verify the peer binary against it without
@@ -1135,7 +1180,7 @@ impl DaemonRuntime {
                 // design §Component 1 — trust-root SET verification.
                 //
                 // Replaces the previous `dev_mode_enabled()` bypass branch
-                // (implementation-note-323, commit historical_revision).
+                // (implementation-note-332, commit historical_revision).
                 // The verifier ALWAYS runs; what differs between dev and
                 // prod daemons is the SET of acceptable signers,
                 // parameterized via `EMBER_TRUST_ROOTS` (parsed in
@@ -1228,11 +1273,11 @@ impl DaemonRuntime {
                 // non-release root is in the trust set (i.e. the
                 // operator added an additional signer via
                 // `EMBER_TRUST_ROOTS`). The Receipt-body wiring lives in
-                // implementation-note-324; this call site
+                // implementation-note-333; this call site
                 // is the canonical input.
                 crate::binary_manifest::set_dev_mode_active(n_user_roots > 0);
 
-                // design §Component 2 / implementation-note-325.
+                // design §Component 2 / implementation-note-334.
                 // Capture the trust-root set as a structured snapshot
                 // so `trust.list` (and future `trust.show` /
                 // `trust.explain`) can answer "what is this daemon
@@ -1304,7 +1349,7 @@ impl DaemonRuntime {
         // consumer of a direct bootstrap handle.
         let live_vault_slot = store.vault_slot();
 
-        // implementation-note-33 C2: register the store with the
+        // implementation-note-35 C2: register the store with the
         // presence module so an explicit `vault_lock` RPC clears the
         // shared live-vault slot (hard-lock semantics — main local
         // helper lanes lose live vault access). Idle auto-lock keeps the
@@ -1312,52 +1357,13 @@ impl DaemonRuntime {
         crate::trust::presence::register_store(Rc::clone(&store));
         crate::infra::interactive_unlock::register_config(self.config.clone());
 
-        // Initialise the daemon's long-lived Ed25519 identity key used to
-        // sign Grant Receipts (Stream D, design §Evidence). First-run
-        // generates the key; subsequent runs re-load it. Failure here is
-        // non-fatal — receipt emission will silently no-op if the key
-        // can't be loaded, but the daemon keeps running.
-        #[allow(unused_assignments)]
-        let mut identity_pubkey_hex = String::new();
-        match crate::infra::receipt::init_identity(&self.config.data_dir) {
-            Ok(pubkey) => {
-                let fingerprint = daemon_identity_fingerprint(&pubkey);
-                identity_pubkey_hex = pubkey.clone();
-                info!(
-                    signer_pubkey = %pubkey,
-                    fingerprint = %fingerprint,
-                    "daemon identity key loaded"
-                );
-                // implementation-note-216 — emit a structured
-                // operator-facing log line that the demo teardown
-                // script (and any future tooling) can grep without
-                // re-deriving the fingerprint or hitting an HTTP
-                // endpoint that may already be torn down. The daemon
-                // is the authoritative source for its own identity;
-                // surfacing it on every startup means the value is
-                // available before, during, and after any shutdown.
-                info!(
-                    signer_pubkey = %pubkey,
-                    fingerprint = %fingerprint,
-                    canonical_version = %crate::infra::receipt::CANONICAL_VERSION,
-                    "daemon-identity-anchor: pass --pubkey to `ember receipt verify` to verify offline"
-                );
-            }
-            Err(e) => {
-                // implementation-note-255 (E) / F-S5-013 HIGH:
-                // fail-closed at startup. Receipts are load-bearing for
-                // the audit chain (signed evidence) and the broker
-                // (credential-access proof); a daemon that boots without
-                // a signing identity silently produces state nothing
-                // downstream can verify. Refuse to enter normal-serve.
-                tracing::error!(
-                    error = %e,
-                    "implementation-note-255 (F-S5-013): daemon identity key \
-                     unavailable; refusing startup (fail-closed)"
-                );
-                return Err(DaemonError::IdentityInitFailed(e.to_string()));
-            }
-        }
+        // cordon_phase1_receipt_mint_retrofitted — daemon identity is now
+        // initialised BEFORE `DaemonStore::open` (search the earlier call
+        // site in this function) so the cordon migration's Phase 1 bridge
+        // receipt can be signed by the singleton. The variable below was
+        // populated by that earlier call; it is consumed downstream
+        // (snapshot watcher, dashboard, etc.) without re-initialising the
+        // OnceCell.
 
         // Bridge CA public-key cache: if a previous explicit bridge bootstrap
         // published `bridge_ca.pub`, startup can keep embedding the same
@@ -1386,7 +1392,7 @@ impl DaemonRuntime {
         }
 
         if let Some(bridge_bind) = self.config.bridge_bind {
-            // implementation-note-326: auto-unseal the vault from the system keyring. The
+            // implementation-note-335: auto-unseal the vault from the system keyring. The
             // helper's contract: it succeeds only if a keyring entry already
             // exists (or `EMBER_VAULT_PASSPHRASE` is set) — never
             // auto-provisions on daemon start so a wiped keyring can't
@@ -1397,7 +1403,7 @@ impl DaemonRuntime {
                 AutoUnsealOutcome::Unsealed(v) => (Rc::new(v), VaultUnsealStatus::FromKeyring),
                 AutoUnsealOutcome::NoKeyringEntry => {
                     // mek_missing_with_state_refuses_start
-                    // (implementation-note-327).
+                    // (implementation-note-336).
                     //
                     // Without this guard, the daemon would silently
                     // re-provision a FRESH MEK on top of pre-existing
@@ -1417,14 +1423,14 @@ impl DaemonRuntime {
                             tracing::error!(
                                 "vault: MEK absent from keychain but daemon.db has state-bearing rows; \
                                  REFUSING TO START to prevent silent re-provision (would destroy vault data). \
-                                 Run `ember daemon recover-fresh --archive-to <path>` (implementation-note-328) \
+                                 Run `ember daemon recover-fresh --archive-to <path>` (implementation-note-337) \
                                  OR `ember vault import --sealed --recovery-passphrase` \
-                                 (implementation-note-329) when those CLIs ship. \
+                                 (implementation-note-338) when those CLIs ship. \
                                  Today, archive ~/.ember/data/ manually and re-init."
                             );
                             return Err(DaemonError::Vault(
                                 "MEK-missing-with-state refusal: daemon.db has rows but keychain has no MEK; \
-                                 refusing silent re-provision per implementation-note-330".to_string(),
+                                 refusing silent re-provision per implementation-note-339".to_string(),
                             ));
                         }
                         Ok(false) => {
@@ -1464,7 +1470,7 @@ impl DaemonRuntime {
             };
             log_vault_identity(&self.config, self.config_path.as_deref());
 
-            // implementation-note-326: emit an audit event for the explicit bridge bootstrap
+            // implementation-note-335: emit an audit event for the explicit bridge bootstrap
             // open so operators running `audit show` see exactly when (and
             // how) the vault came online before serve. Failures here are
             // non-fatal — the audit log is for observability, not correctness.
@@ -1488,7 +1494,7 @@ impl DaemonRuntime {
                 );
             }
 
-            // bridge_ca_startup_wired — implementation-note-319.
+            // bridge_ca_startup_wired — implementation-note-328.
             // Explicit bridge bootstrap still load-or-mints the SE-sealed
             // Bridge CA (design component 3). Stores the sealed signing key +
             // a sealed module wrapping key (vault-wrapped) under `<data_dir>`;
@@ -1514,7 +1520,7 @@ impl DaemonRuntime {
             }
             store.set_bridge_ca_fingerprint(bridge_ca.fingerprint());
 
-            // implementation-note-112 — mint the ember-rpc
+            // implementation-note-115 — mint the ember-rpc
             // sibling's TLS server cert + key at startup, but only when the
             // operator has explicitly enabled the bridge lane.
             if let Err(e) = mint_or_rotate_ember_rpc_server_cert(
@@ -1532,7 +1538,7 @@ impl DaemonRuntime {
             );
         }
 
-        // implementation-note-331 (design sub-piece D): construct the
+        // implementation-note-340 (design sub-piece D): construct the
         // pluggable `CredentialStore` trait object from the
         // `[credential_store]` config section. Defaults to the
         // `LocalEncryptedStore` (which adapts the existing Vault) when
@@ -1609,7 +1615,7 @@ impl DaemonRuntime {
                         }
                     }
                     "aws" => {
-                        // implementation-note-106: AWS IAM auth.
+                        // implementation-note-109: AWS IAM auth.
                         // Daemon proves its surrounding AWS IAM
                         // identity (env vars / instance metadata
                         // / IRSA / ECS task role / Fargate) via a
@@ -1625,7 +1631,7 @@ impl DaemonRuntime {
                         HashiVaultAuth::Aws { role }
                     }
                     "hcp-service-principal" => {
-                        // implementation-note-199: HashiCorp Cloud
+                        // implementation-note-205: HashiCorp Cloud
                         // Platform service-principal auth. Exchange
                         // (client_id, client_secret) at HCP IdP's
                         // OAuth2 client_credentials endpoint for an
@@ -1727,14 +1733,14 @@ impl DaemonRuntime {
         let runtime_cred_store: Arc<dyn crate::infra::credential_store::CredentialStore> =
             Arc::clone(&cred_store);
 
-        // implementation-note-133 (design Phase 2): install the credential
+        // implementation-note-137 (design Phase 2): install the credential
         // broker registry. Real provider implementations replace
         // `MockBroker` as their downstream tasks ship — currently the
-        // GitHub App broker is wired (T-CONSTRUCT-DAEMON-GH-implementation-note-332);
+        // GitHub App broker is wired (T-CONSTRUCT-DAEMON-GH-implementation-note-341);
         // Anthropic and Cloudflare follow. Calling `install_registry`
         // multiple times is a no-op after the first call (`OnceCell`).
         //
-        // implementation-note-138 (design §Component 2):
+        // implementation-note-142 (design §Component 2):
         // MockBroker registration is now an explicit opt-in via
         // `EMBER_ALLOW_MOCK_BROKERS`.
         //
@@ -1755,7 +1761,7 @@ impl DaemonRuntime {
             use core_broker::{BrokerProvider, MockBroker};
             let mut registry = crate::broker::handler::BrokerRegistry::new();
 
-            // implementation-note-138: read the
+            // implementation-note-142: read the
             // opt-in allowlist once at the top of the registration
             // block so every per-provider gate uses the same parsed
             // set. Unknown tokens get surfaced as a structured WARN
@@ -1781,7 +1787,7 @@ impl DaemonRuntime {
                 );
             }
 
-            // implementation-note-132: precedence-flag for the
+            // implementation-note-136: precedence-flag for the
             // file/vault lookup order in each provider block below.
             //
             // - `EMBER_VAULT_FIRST=1` → vault-first (try the
@@ -1825,7 +1831,7 @@ impl DaemonRuntime {
             // exist; MockBroker fallback otherwise so dev hosts without
             // GH App config still answer broker_issue without a panic.
             //
-            // implementation-note-331 + implementation-note-132:
+            // implementation-note-340 + implementation-note-136:
             // try the higher-priority lane first (per `vault_first`),
             // fall back to the other lane so operators who haven't
             // migrated keep working.
@@ -1843,7 +1849,7 @@ impl DaemonRuntime {
                         "broker registered: ReloadingBroker (GH App config detected at startup; reloads from runtime seam)"
                     );
                 }
-                // implementation-note-138: missing or
+                // implementation-note-142: missing or
                 // malformed creds — Mock only if explicitly allow-listed,
                 // else fail-loud.
                 creds_outcome => {
@@ -1880,7 +1886,7 @@ impl DaemonRuntime {
             // MockBroker fallback otherwise so dev hosts without AWS
             // config still answer broker_issue without a panic.
             //
-            // implementation-note-331 + implementation-note-132:
+            // implementation-note-340 + implementation-note-136:
             // honor `vault_first` precedence.
             let aws_sts_probe = runtime_resolver
                 .startup_configured(BrokerProvider::AwsSts, startup_probe_mode)
@@ -1934,7 +1940,7 @@ impl DaemonRuntime {
             // MockBroker fallback otherwise so dev hosts without GCP
             // config still answer broker_issue without a panic.
             //
-            // implementation-note-331 + implementation-note-132:
+            // implementation-note-340 + implementation-note-136:
             // honor `vault_first` precedence.
             let gcp_probe = runtime_resolver
                 .startup_configured(BrokerProvider::Gcp, startup_probe_mode)
@@ -1989,7 +1995,7 @@ impl DaemonRuntime {
             // so dev hosts without Azure config still answer
             // broker_issue without a panic.
             //
-            // implementation-note-331 + implementation-note-132:
+            // implementation-note-340 + implementation-note-136:
             // honor `vault_first` precedence.
             let azure_probe = runtime_resolver
                 .startup_configured(BrokerProvider::AzureCli, startup_probe_mode)
@@ -2043,7 +2049,7 @@ impl DaemonRuntime {
             // dev hosts without Fly config still answer broker_issue
             // without a panic.
             //
-            // implementation-note-331 + implementation-note-132:
+            // implementation-note-340 + implementation-note-136:
             // honor `vault_first` precedence.
             let fly_probe = runtime_resolver
                 .startup_configured(BrokerProvider::FlyIo, startup_probe_mode)
@@ -2098,7 +2104,7 @@ impl DaemonRuntime {
             // without Vault config still answer broker_issue without a
             // panic.
             //
-            // implementation-note-331 + implementation-note-132:
+            // implementation-note-340 + implementation-note-136:
             // honor `vault_first` precedence.
             let hashi_probe = runtime_resolver
                 .startup_configured(BrokerProvider::HashiVault, startup_probe_mode)
@@ -2155,7 +2161,7 @@ impl DaemonRuntime {
             // dev hosts without Okta config still answer broker_issue
             // without a panic.
             //
-            // implementation-note-331 + implementation-note-132:
+            // implementation-note-340 + implementation-note-136:
             // honor `vault_first` precedence.
             let okta_probe = runtime_resolver
                 .startup_configured(BrokerProvider::Okta, startup_probe_mode)
@@ -2209,7 +2215,7 @@ impl DaemonRuntime {
             // dev hosts without Vercel config still answer broker_issue
             // without a panic.
             //
-            // implementation-note-331 + implementation-note-132:
+            // implementation-note-340 + implementation-note-136:
             // honor `vault_first` precedence.
             let vercel_probe = runtime_resolver
                 .startup_configured(BrokerProvider::Vercel, startup_probe_mode)
@@ -2298,7 +2304,7 @@ impl DaemonRuntime {
         drop(cred_store);
         drop(runtime_cred_store);
 
-        // implementation-note-162 — install the process-global
+        // implementation-note-166 — install the process-global
         // uid pool from `[spawn_pool]` in config.toml. Absent ⇒ pool
         // stays uninstalled and `handle_broker_exec` refuses with
         // `-32021` until the operator runs `ember daemon install`.
@@ -2319,7 +2325,7 @@ impl DaemonRuntime {
                     tracing::warn!(
                         "spawn_pool: no [spawn_pool] section in config.toml — \
                          broker_exec will refuse with -32021 until operator runs \
-                         `ember daemon install` (implementation-note-162)"
+                         `ember daemon install` (implementation-note-166)"
                     );
                 }
             }
@@ -2397,7 +2403,7 @@ impl DaemonRuntime {
             }
         });
 
-        // implementation-note-221 — background sweep marks pending
+        // implementation-note-228 — background sweep marks pending
         // approvals older than `stale_approval_threshold_secs` as `timed_out`.
         // Runs every 60 seconds. Complements the startup sweep (line ~261) which
         // only catches requests left pending from prior sessions. This sweep
@@ -2421,8 +2427,8 @@ impl DaemonRuntime {
             }
         });
 
-        // implementation-note-110 — 60-second revocation document poller.
-        // implementation-note-333: fetch path now wired.
+        // implementation-note-113 — 60-second revocation document poller.
+        // implementation-note-342: fetch path now wired.
         // Fetches `revocations/current.json` on each tick and applies a
         // severity-driven response (critical=IsolateDrainKill, high=DrainToTtl,
         // medium/low=Log). Stale documents (>30 min) fail-closed regardless of
@@ -2501,7 +2507,7 @@ impl DaemonRuntime {
         });
         tracing::info!("image revocations poller started (60s interval)");
 
-        // implementation-note-334 — session heartbeat + TTL watcher.
+        // implementation-note-343 — session heartbeat + TTL watcher.
         // Runs every 60 s. Closes orphaned sessions (launcher PID dead > 5 min)
         // and sessions whose grant is past the 24-hour TTL backstop.
         let session_store_clone = Rc::clone(&store);
@@ -2511,7 +2517,7 @@ impl DaemonRuntime {
         });
         tracing::info!("session heartbeat watcher started");
 
-        // implementation-note-335 (Phase 1) —
+        // implementation-note-344 (Phase 1) —
         // fast-path launcher exit detector. Polls per-session pidfds every
         // 1 s on Linux (kqueue stub on macOS) so launcher exit fires the
         // revocation-cascade placeholder within ~1 s, complementing the
@@ -2566,7 +2572,7 @@ impl DaemonRuntime {
             }
         }
 
-        // implementation-note-197 — periodic cluster snapshot pull task.
+        // implementation-note-203 — periodic cluster snapshot pull task.
         // Runs every `snapshot_pull_interval_secs` (default 600, i.e. 10 min).
         // Only active when both `snapshot_pull_endpoint` and
         // `snapshot_pull_cluster_id` are configured. On each tick it calls
@@ -2678,7 +2684,7 @@ impl DaemonRuntime {
             None
         };
 
-        // implementation-note-195: spawn the git-echo credential-injection proxy if
+        // implementation-note-201: spawn the git-echo credential-injection proxy if
         // configured. Bind result is captured via a oneshot channel and
         // driven below alongside the dashboard's. Each proxy task gets its
         // own DaemonStore (rusqlite Connection is !Send) but shares the
@@ -2692,7 +2698,7 @@ impl DaemonRuntime {
             let proxy_shutdown = shutdown_tx.subscribe();
             let (bind_tx, bind_rx) = oneshot::channel::<Result<SocketAddr, std::io::Error>>();
             let proxy_vault_slot = live_vault_slot.clone();
-            // implementation-note-195 marker: spawn_local run_git_echo_proxy via this LocalSet.
+            // implementation-note-201 marker: spawn_local run_git_echo_proxy via this LocalSet.
             local.spawn_local(async move {
                     let store = match crate::infra::store::DaemonStore::open(&proxy_db_path) {
                         Ok(s) => s,
@@ -2711,7 +2717,7 @@ impl DaemonRuntime {
                     // the Arc is used only within this LocalSet (single-threaded runtime),
                     // mirroring run_proxy / run_git_echo_proxy themselves.
                     //
-                    // implementation-note-56: attach the vault to this fresh
+                    // implementation-note-58: attach the vault to this fresh
                     // store. Without this, increment_statement_usage's re-sign of
                     // block 0 calls persona_root_keypair → self.vault() → None →
                     // "no vault is attached", silently dropping every meter delta
@@ -2719,7 +2725,7 @@ impl DaemonRuntime {
                     store.replace_vault_slot(proxy_vault_slot.clone());
                     #[allow(clippy::arc_with_non_send_sync)]
                     let state = std::sync::Arc::new(crate::infra::proxy::ProxyState::new(store));
-                    // implementation-note-301: install the
+                    // implementation-note-309: install the
                     // `DaemonEventSink` immediately after construction.
                     // The git-echo proxy does not broadcast grant events
                     // (no SDK subscribers reach this listener), so the
@@ -2752,7 +2758,7 @@ impl DaemonRuntime {
             None
         };
 
-        // implementation-note-196: spawn the general LLM/HTTP credential-
+        // implementation-note-202: spawn the general LLM/HTTP credential-
         // injection proxy (`run_proxy` — provider-aware auth, X-Ember-* header
         // protocol). This is the listener the Anthropic SDK demo posts to via
         // `base_url=$EMBER_PROXY_URL`; previously `run_proxy` was defined but
@@ -2779,14 +2785,14 @@ impl DaemonRuntime {
                             return;
                         }
                     };
-                    // implementation-note-56: attach vault to the fresh store
+                    // implementation-note-58: attach vault to the fresh store
                     // so increment_statement_usage's block-0 re-sign can read the
                     // issuing persona's root keypair (vault-sealed). Same fix as
                     // the git-echo proxy spawn block above.
                     store.replace_vault_slot(proxy_vault_slot.clone());
                     #[allow(clippy::arc_with_non_send_sync)]
                     let state = std::sync::Arc::new(crate::infra::proxy::ProxyState::new(store));
-                    // implementation-note-301: install the
+                    // implementation-note-309: install the
                     // `DaemonEventSink` immediately after construction.
                     // The LLM proxy currently runs without a broadcast
                     // channel here (the SocketListener owns the
@@ -2842,7 +2848,7 @@ impl DaemonRuntime {
             });
         }
 
-        // implementation-note-336: spawn the mTLS edge listener when the edge CA
+        // implementation-note-345: spawn the mTLS edge listener when the edge CA
         // has been provisioned by `kms init-edge`. The CA is stored at
         // `<data_dir>/kms/edge-ca/ca.seed` (32-byte raw Ed25519 seed).
         // When absent, log and degrade gracefully — the loopback path remains
@@ -2977,7 +2983,7 @@ impl DaemonRuntime {
                 // launchers (qember.sh demo up) can pick the URL up after
                 // forking the daemon and exiting the parent.
                 //
-                // implementation-note-196: this URL now lives at
+                // implementation-note-202: this URL now lives at
                 // `EMBER_GIT_PROXY_URL` + `<data_dir>/run/git-proxy.url`. The
                 // bare `EMBER_PROXY_URL` and `proxy.url` names are claimed by
                 // the LLM proxy below — that is the listener the Anthropic
@@ -3057,7 +3063,7 @@ impl DaemonRuntime {
             (Some(_), None) => LlmProxyBind::Disabled,
         };
 
-        // implementation-note-259: extract the
+        // implementation-note-266: extract the
         // bound proxy URLs from the bind results and wire them into the
         // SocketListener. This makes the URLs available in RequestContext for
         // every inbound RPC without relying on std::env::var across tokio
@@ -3077,7 +3083,7 @@ impl DaemonRuntime {
             .with_llm_proxy_url(resolved_llm_proxy_url)
             .with_git_proxy_url(resolved_git_proxy_url);
 
-        // implementation-note-213: persist the resolved bind
+        // implementation-note-220: persist the resolved bind
         // address on the runtime so out-of-band readers (tests, future
         // introspection helpers) see the same truth as `/api/status`. Only
         // the `Bound` variant maps to `Some`; `Failed`/`Disabled`/`Timeout`
@@ -3187,7 +3193,7 @@ pub struct DaemonStatus {
     pub running: bool,
 }
 
-// ─── Bridge CA load-or-mint (implementation-note-319) ───
+// ─── Bridge CA load-or-mint (implementation-note-328) ───
 //
 // On-disk layout under `<data_dir>`:
 //
@@ -3381,7 +3387,7 @@ pub fn load_or_mint_bridge_ca(
     Ok(Arc::new(bridge_ca))
 }
 
-// ─── ember-rpc sibling server-cert mint (implementation-note-112) ───
+// ─── ember-rpc sibling server-cert mint (implementation-note-115) ───
 //
 // Checkpoint mirror: `ember_rpc_sibling_server_cert_minted_at_startup` (also
 // stamped on `crates/ember-daemon/src/trust/bridge_ca.rs`).
@@ -4213,7 +4219,7 @@ mod tests {
         }
     }
 
-    // emberd_sandbox_startup_probe (implementation-note-121).
+    // emberd_sandbox_startup_probe (implementation-note-124).
     //
     // The probe is best-effort by design (WARN-on-unsandboxed unless
     // EMBER_REQUIRE_SANDBOX=1). These tests verify the probe runs without

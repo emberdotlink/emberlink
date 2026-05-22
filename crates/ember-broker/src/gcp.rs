@@ -1477,7 +1477,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // Workload Identity Federation tests — implementation-note-79
+    // Workload Identity Federation tests — implementation-note-81
     // ---------------------------------------------------------------
 
     #[test]

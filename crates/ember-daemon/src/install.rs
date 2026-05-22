@@ -64,7 +64,7 @@ pub enum InstallError {
 /// row to the table above, widen the substring set below, and extend the
 /// unit tests.
 ///
-/// Anchor: `implementation-note-364`
+/// Anchor: `implementation-note-374`
 fn already_exists(stderr: &str) -> bool {
     let s = stderr.to_lowercase();
     s.contains("already exists")
@@ -163,7 +163,7 @@ pub fn is_separate_uid_posture() -> bool {
 ///
 /// ## Checkpoint
 ///
-/// implementation-note-365
+/// implementation-note-375
 #[cfg(target_os = "macos")]
 fn dseditgroup_tolerant_inner<R, C>(
     cmd_string: &str,
@@ -304,7 +304,7 @@ enum EmberUserInspectAction {
 /// Closure injection means unit tests can simulate any shape (canonical,
 /// missing-shell, wrong-uid, absent) without touching real Open Directory.
 ///
-/// Anchor: `implementation-note-366`
+/// Anchor: `implementation-note-376`
 #[cfg(target_os = "macos")]
 fn read_ember_user_shape_inner<R>(mut reader: R) -> Result<Option<EmberUserShape>, InstallError>
 where
@@ -356,7 +356,7 @@ where
 /// real dscl mutation. `changer(prop, current, desired)` is invoked
 /// once per divergent property.
 ///
-/// Anchor: `implementation-note-366`
+/// Anchor: `implementation-note-376`
 #[cfg(target_os = "macos")]
 fn inspect_and_heal_ember_user_inner<R, C>(
     reader: R,
@@ -432,7 +432,7 @@ where
 /// the explicit `dscl` create path (user absent) or skip the create step
 /// (user present + canonical, possibly after healing).
 ///
-/// Anchor: `implementation-note-366`
+/// Anchor: `implementation-note-376`
 #[cfg(target_os = "macos")]
 fn inspect_and_heal_ember_user() -> Result<EmberUserInspectAction, InstallError> {
     inspect_and_heal_ember_user_inner(
@@ -662,7 +662,7 @@ fn dseditgroup_add_operator_to_group(user: &str, group: &str) -> Result<(), Inst
 ///   outside the system range) surface a hard `InstallError` with the
 ///   manual remediation command. Replaces the naive `if !id ember` check
 ///   that silently kept divergent records around — see
-///   `implementation-note-366`.
+///   `implementation-note-376`.
 /// - `dseditgroup -o create ember-clients` — connect-group create.
 /// - `dseditgroup -o edit -a "$USER" -t user ember-clients` — add the
 ///   invoking operator to the connect group.
@@ -685,7 +685,7 @@ pub fn provision_ember_user() -> Result<(), InstallError> {
 
     // 2) ember user — inspect-and-heal before any create.
     //
-    // implementation-note-366: a previous
+    // implementation-note-376: a previous
     // partial install (or a different package that also created an `ember`
     // record) can leave the user present with wrong shape (e.g. shell !=
     // /usr/bin/false). The naive `if !user_exists` check skipped user creation
@@ -710,7 +710,7 @@ pub fn provision_ember_user() -> Result<(), InstallError> {
 
     // 4) add the ember user to ember-clients
     //
-    // implementation-note-367: the
+    // implementation-note-377: the
     // launchd plist's `GroupName=ember-clients` (formerly `ember` — a group
     // that was never created on macOS, falling back silently to `staff`)
     // requires the ember user to be a member of `ember-clients` so launchd's
@@ -786,7 +786,7 @@ pub fn provision_ember_user() -> Result<(), InstallError> {
     })
 }
 
-// implementation-note-162 — per-spawn uid pool provisioning.
+// implementation-note-166 — per-spawn uid pool provisioning.
 // The installer creates N `ember-spawn-<i>` system users with
 // pre-assigned uids in the 10010-10099 range. The daemon's
 // `[spawn_pool]` config references this set. See design (amendment
@@ -890,7 +890,7 @@ pub enum SpawnPoolProvisioning {
 /// dscl commands as `manual_commands` when the installer is not
 /// running as root.
 ///
-/// implementation-note-162 — checkpoint for callers that grep
+/// implementation-note-166 — checkpoint for callers that grep
 /// for the install integration point.
 pub fn provision_spawn_pool(pool_size: usize) -> Result<SpawnPoolProvisioning, InstallError> {
     if pool_size == 0 {
@@ -1093,7 +1093,7 @@ pub fn render_spawn_pool_toml(provisioning: &SpawnPoolProvisioning) -> String {
             range_start,
             slot_count,
         } => format!(
-            "\n[spawn_pool]\n# implementation-note-186 — design Component 2\n# modern-Linux subuid range. The daemon calls `clone3(CLONE_NEWUSER \\\n# | ...)` at spawn time, becomes namespace-owner (kernel grants all\n# caps inside the new namespace), then setresuid's to a uid mapped\n# from this range. No system users to provision — the kernel-side\n# `/etc/subuid` entry IS the pool.\nsubuid_range_start = {range_start}\nsubuid_range_slots = {slot_count}\n"
+            "\n[spawn_pool]\n# implementation-note-190 — design Component 2\n# modern-Linux subuid range. The daemon calls `clone3(CLONE_NEWUSER \\\n# | ...)` at spawn time, becomes namespace-owner (kernel grants all\n# caps inside the new namespace), then setresuid's to a uid mapped\n# from this range. No system users to provision — the kernel-side\n# `/etc/subuid` entry IS the pool.\nsubuid_range_start = {range_start}\nsubuid_range_slots = {slot_count}\n"
         ),
         SpawnPoolProvisioning::SystemUsers { uids, gid }
         | SpawnPoolProvisioning::ManualCommands { uids, gid, .. } => {
@@ -1103,17 +1103,17 @@ pub fn render_spawn_pool_toml(provisioning: &SpawnPoolProvisioning) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(
-                "\n[spawn_pool]\n# implementation-note-162 — per-spawn uid pool. The daemon\n# leases a uid from this set before fork+execve in `broker_exec`.\nuids = [{uids_str}]\ngid = {gid}\n"
+                "\n[spawn_pool]\n# implementation-note-166 — per-spawn uid pool. The daemon\n# leases a uid from this set before fork+execve in `broker_exec`.\nuids = [{uids_str}]\ngid = {gid}\n"
             )
         }
     }
 }
 
-// implementation-note-186 — checkpoint for callers that grep
+// implementation-note-190 — checkpoint for callers that grep
 // for the modern-Linux subuid install integration point. design
 // Component 2.
 //
-// implementation-note-368
+// implementation-note-378
 
 /// Detect whether the running kernel supports unprivileged user
 /// namespace clone (design Component 2 modern-Linux gate). Reads
@@ -1370,7 +1370,7 @@ fn ensure_subuid_entry(
 /// this into the daemon's `[spawn_pool]` config via
 /// [`render_spawn_pool_toml`].
 ///
-/// implementation-note-186 — checkpoint for callers that
+/// implementation-note-190 — checkpoint for callers that
 /// grep for the modern-Linux subuid install integration point.
 #[cfg(target_os = "linux")]
 pub fn provision_subuid_range() -> Result<SpawnPoolProvisioning, InstallError> {
@@ -1635,7 +1635,7 @@ pub fn install_pem_to_etc(operator_home: &Path) -> Result<(), InstallError> {
         })?;
 
         run("chmod", &["0440", dst_path], false)?;
-        // implementation-note-367:
+        // implementation-note-377:
         // `root:ember-clients` (formerly `root:ember`) so the daemon — running
         // with `ember-clients` as primary group per the matching plist change
         // in `render_launchd_plist_body` — can read the credential.
@@ -1849,14 +1849,14 @@ fn chown_emberd_binary(dst_str: &str) -> Result<(), InstallError> {
 ///
 /// ## Checkpoint
 ///
-/// implementation-note-369
+/// implementation-note-379
 pub fn chown_ember_data_dirs(home: &Path) -> Result<(), InstallError> {
     chown_ember_data_dirs_inner(home, &mut |path, is_dir| {
         let path_str = path.to_string_lossy().into_owned();
         run("chown", &["ember:ember-clients", &path_str], false)?;
         // Signing-key material (daemon_identity.key, daemon_persona.key)
         // must be 0600 (owner-only) per the daemon's fail-closed check
-        // in `infra::runtime` (implementation-note-255 F-S5-013).
+        // in `infra::runtime` (implementation-note-262 F-S5-013).
         // The default 0640 lets the ember-clients group read non-secret
         // state (SQLite, snapshots, vault.salt, etc.) but is too
         // permissive for private keys.
@@ -2008,13 +2008,13 @@ const VAULT_MEK_FILENAME: &str = "vault-mek.bin";
 ///
 /// ## Known follow-up
 ///
-/// `implementation-note-370`: the shell-out to
+/// `implementation-note-380`: the shell-out to
 /// `/usr/bin/security` passes the passphrase in `argv` for the duration
 /// of the subprocess (~50ms on a single-user dev box). Long-term fix is
 /// raw FFI to `SecKeychainAddGenericPassword` + `SecAccessCreate` with
 /// an explicit permissive ACL, which avoids the argv leak entirely.
 ///
-/// Anchor: `implementation-note-371`
+/// Anchor: `implementation-note-381`
 pub fn provision_se_mek(home: &Path) -> Result<(), InstallError> {
     let data_dir = home.join(".ember").join("data");
 
@@ -2101,7 +2101,7 @@ pub fn provision_se_mek(home: &Path) -> Result<(), InstallError> {
 /// root, the audience is "processes I'm already trusting." Acceptable
 /// for the dev0 wedge. Long-term: raw FFI to
 /// `SecKeychainAddGenericPassword` + `SecAccessCreate` with an explicit
-/// permissive ACL. Filed as `implementation-note-370`.
+/// permissive ACL. Filed as `implementation-note-380`.
 #[cfg(target_os = "macos")]
 fn provision_vault_mek_in_system_keychain() -> Result<(), InstallError> {
     use crate::infra::vault_macos_se::{
@@ -2236,7 +2236,7 @@ const SYSTEMD_UNIT_PATH: &str = "/etc/systemd/system/emberd.service";
 #[allow(dead_code)]
 pub(crate) fn render_launchd_plist_body(operator_home: &Path) -> String {
     let home = operator_home.display();
-    // emberd_launchd_sandbox_wired (implementation-note-372).
+    // emberd_launchd_sandbox_wired (implementation-note-382).
     //
     // ProgramArguments wrap `emberd` invocation in `sandbox-exec -f
     // <profile>` so the daemon process runs under the macOS TrustedBSD
@@ -2267,7 +2267,7 @@ pub(crate) fn render_launchd_plist_body(operator_home: &Path) -> String {
              <key>EMBER_APP_PEM_PATH</key><string>/etc/emberlink/ember-engine-app.pem</string>\n    \
              <key>EMBER_APP_ENV_PATH</key><string>/etc/emberlink/ember-engine.env</string>\n  \
            </dict>\n  \
-           <!-- emberd_launchd_sandbox_wired — sandbox-exec wrap per implementation-note-320. -->\n  \
+           <!-- emberd_launchd_sandbox_wired — sandbox-exec wrap per implementation-note-329. -->\n  \
            <key>ProgramArguments</key>\n  \
            <array>\n    \
              <string>/usr/bin/sandbox-exec</string>\n    \
@@ -2294,7 +2294,7 @@ pub(crate) fn render_launchd_plist_body(operator_home: &Path) -> String {
 #[allow(dead_code)]
 pub(crate) fn render_systemd_unit_body(operator_home: &Path) -> String {
     let home = operator_home.display();
-    // emberd_systemd_seccomp_wired (implementation-note-373).
+    // emberd_systemd_seccomp_wired (implementation-note-383).
     //
     // `SystemCallFilter=` directives below apply systemd's seccomp wrapper
     // around the daemon process. The allowlist mirrors the JSON profile
@@ -2331,7 +2331,7 @@ pub(crate) fn render_systemd_unit_body(operator_home: &Path) -> String {
          Restart=on-failure\n\
          RestartSec=5\n\
          \n\
-         # emberd_systemd_seccomp_wired — kernel sandbox per implementation-note-320.\n\
+         # emberd_systemd_seccomp_wired — kernel sandbox per implementation-note-329.\n\
          # Allowlist: systemd-curated baseline + explicit fork/exec/mlock.\n\
          SystemCallFilter=@system-service @ipc @memlock\n\
          SystemCallFilter=~@raw-io ~@reboot ~@swap ~@cpu-emulation ~@debug ~@mount ~@module ~@obsolete ~@privileged ~@resources\n\
@@ -2700,7 +2700,7 @@ fn launchd_service_has_active_process(print_output: &str) -> bool {
 ///
 /// ## Checkpoint
 ///
-/// implementation-note-374
+/// implementation-note-384
 #[cfg(target_os = "macos")]
 fn bootout_tolerant() -> Result<(), InstallError> {
     let cmd_string = format!("launchctl bootout system {LAUNCHD_PLIST_PATH}");
@@ -2794,7 +2794,7 @@ const EMBERD_LOG_OUT: &str = "/var/log/emberd.out";
 ///
 /// ## Checkpoint
 ///
-/// implementation-note-375
+/// implementation-note-385
 #[cfg(target_os = "macos")]
 pub fn ensure_emberd_log_paths() -> Result<bool, InstallError> {
     ensure_emberd_log_paths_inner(
@@ -3005,9 +3005,9 @@ pub fn install_systemd_unit(_operator_home: &Path) -> Result<(), InstallError> {
 // spawn-helper + spawn-shim install integration.
 // ============================================================================
 //
-// implementation-note-183
-// implementation-note-182
-// implementation-note-184
+// implementation-note-187
+// implementation-note-186
+// implementation-note-188
 //
 // The spawn-helper is a root-privileged sibling daemon (LaunchDaemon
 // on macOS, systemd unit on hardened Linux) that accepts
@@ -3094,7 +3094,7 @@ pub fn detect_hardened_linux() -> Result<bool, InstallError> {
 /// size` with no defaults; this renderer is the single producer of
 /// those values for production systemd.
 ///
-/// implementation-note-183
+/// implementation-note-187
 #[allow(dead_code)]
 pub(crate) fn render_spawn_helper_unit_body(
     ember_uid: u32,
@@ -3152,7 +3152,7 @@ pub(crate) fn render_spawn_helper_unit_body(
 /// installed rewrites only when the body differs; `daemon-reload` +
 /// `enable --now` are always issued so the active state converges.
 ///
-/// implementation-note-183
+/// implementation-note-187
 #[cfg(target_os = "linux")]
 pub fn install_spawn_helper_unit(
     ember_uid: u32,
@@ -3238,7 +3238,7 @@ fn ember_clients_group_exists() -> bool {
 /// - `{{POOL_SIZE}}` → number of slots in the pool
 /// - `{{EXPECTED_SHIM_HASH}}` → blake3 hex of the shipped shim
 ///
-/// implementation-note-182
+/// implementation-note-186
 #[cfg(target_os = "macos")]
 #[allow(dead_code)]
 pub(crate) fn render_spawn_helper_plist_body(
@@ -3305,8 +3305,8 @@ pub(crate) fn render_spawn_helper_plist_body(
 /// 6. Write the plist (mode 0644), `launchctl bootout`-tolerant,
 ///    `launchctl bootstrap system`.
 ///
-/// implementation-note-182
-/// implementation-note-184
+/// implementation-note-186
+/// implementation-note-188
 #[cfg(target_os = "macos")]
 pub fn install_spawn_helper_plist(pool_uid_base: u32, pool_size: u32) -> Result<(), InstallError> {
     // 1) Probe ember-clients group. Refuse install if missing — the
@@ -3443,7 +3443,7 @@ fn install_spawn_helper_binary() -> Result<(), InstallError> {
 /// Returns the install destination so the caller can hash it for
 /// `EXPECTED_SHIM_HASH`.
 ///
-/// implementation-note-184
+/// implementation-note-188
 #[cfg(target_os = "macos")]
 fn install_spawn_shim_binary() -> Result<PathBuf, InstallError> {
     install_libexec_binary(SPAWN_SHIM_BINARY_NAME)
@@ -3949,7 +3949,7 @@ mod tests {
         std::fs::create_dir_all(&data_dir).expect("mkdir data");
         let mek_path = data_dir.join("vault-mek.bin");
         let checkpoint = [0xABu8; 32];
-        std::fs::write(&mek_path, &checkpoint).expect("write checkpoint");
+        std::fs::write(&mek_path, checkpoint).expect("write checkpoint");
 
         let result = provision_se_mek(tmp.path());
         match result {
@@ -3995,8 +3995,8 @@ mod tests {
             "    <key>EMBER_APP_PEM_PATH</key><string>/etc/emberlink/ember-engine-app.pem</string>",
             "    <key>EMBER_APP_ENV_PATH</key><string>/etc/emberlink/ember-engine.env</string>",
             "  </dict>",
-            // emberd_launchd_sandbox_wired (implementation-note-372).
-            "  <!-- emberd_launchd_sandbox_wired — sandbox-exec wrap per implementation-note-320. -->",
+            // emberd_launchd_sandbox_wired (implementation-note-382).
+            "  <!-- emberd_launchd_sandbox_wired — sandbox-exec wrap per implementation-note-329. -->",
             "  <key>ProgramArguments</key>",
             "  <array>",
             "    <string>/usr/bin/sandbox-exec</string>",
@@ -4045,8 +4045,8 @@ mod tests {
             "Restart=on-failure",
             "RestartSec=5",
             "",
-            // emberd_systemd_seccomp_wired (implementation-note-373).
-            "# emberd_systemd_seccomp_wired — kernel sandbox per implementation-note-320.",
+            // emberd_systemd_seccomp_wired (implementation-note-383).
+            "# emberd_systemd_seccomp_wired — kernel sandbox per implementation-note-329.",
             "# Allowlist: systemd-curated baseline + explicit fork/exec/mlock.",
             "SystemCallFilter=@system-service @ipc @memlock",
             "SystemCallFilter=~@raw-io ~@reboot ~@swap ~@cpu-emulation ~@debug ~@mount ~@module ~@obsolete ~@privileged ~@resources",
@@ -4459,7 +4459,7 @@ system/sh.emberlink.daemon = {\n\
     }
 
     // emberd_systemd_seccomp_wired tests
-    // (implementation-note-373).
+    // (implementation-note-383).
 
     #[test]
     fn systemd_unit_body_contains_seccomp_filter() {
@@ -4508,7 +4508,7 @@ system/sh.emberlink.daemon = {\n\
         );
     }
 
-    // ── implementation-note-376 — resolve_emberd_source + install_emberd_binary_at ────
+    // ── implementation-note-386 — resolve_emberd_source + install_emberd_binary_at ────
 
     /// Serialize tests that mutate process env. `EMBER_EMBERD_BIN_PATH`
     /// is process-global; two override tests racing under cargo's
@@ -4527,6 +4527,11 @@ system/sh.emberlink.daemon = {\n\
             unsafe { std::env::set_var(ENV_EMBERD_BIN_PATH, value) };
             Self { previous }
         }
+        // Symmetric `unset` constructor to `set`. No caller in src/
+        // today; preserve the test-helper API surface so future tests
+        // that need the "ensure ENV is absent before this scope" shape
+        // can use it without re-inventing the Drop-restore guard.
+        #[allow(dead_code)]
         fn unset() -> Self {
             let previous = std::env::var(ENV_EMBERD_BIN_PATH).ok();
             unsafe { std::env::remove_var(ENV_EMBERD_BIN_PATH) };
@@ -4890,7 +4895,7 @@ system/sh.emberlink.daemon = {\n\
         );
     }
 
-    // ── implementation-note-186 — T2 tests ───────────────────────
+    // ── implementation-note-190 — T2 tests ───────────────────────
     //
     // design Component 2 modern-Linux subuid install path. Tests use
     // `provision_subuid_range_at` against tempdir-scoped `subuid` /
@@ -5556,7 +5561,7 @@ system/sh.emberlink.daemon = {\n\
 
     // ── T3: inspect_and_heal_ember_user_inner — partial-state collision ──────
     //
-    // implementation-note-366.
+    // implementation-note-376.
     //
     // These tests exercise the inspect-and-heal step that gates the
     // sysadminctl -addUser call. They use injected closures (mirroring

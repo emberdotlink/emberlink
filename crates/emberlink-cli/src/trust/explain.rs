@@ -6,11 +6,11 @@
 //!
 //! - `binary_manifest` (default) — reads sidecar from `<artifact>.sig` or
 //!   the explicit `--sidecar` path.
-//! - `receipt` (implementation-note-399) — Receipt envelope JSON; no
+//! - `receipt` (implementation-note-409) — Receipt envelope JSON; no
 //!   sidecar (the signature is inline). `--sidecar` is ignored on this
 //!   kind, and the wire sidecar bytes are sent empty.
 //!
-//! Workflow grant chain walk lands in implementation-note-400.
+//! Workflow grant chain walk lands in implementation-note-410.
 //!
 //! The CLI reads the artifact + (when applicable) sidecar from disk and
 //! base64-encodes both for the wire. The daemon never touches a
@@ -360,7 +360,7 @@ mod tests {
         assert_eq!(p, PathBuf::from("/tmp/release.sig"));
     }
 
-    /// implementation-note-399: receipt + workflow_grant kinds carry
+    /// implementation-note-409: receipt + workflow_grant kinds carry
     /// the signature inline; the run path must NOT compute a default
     /// sidecar path (it would fail trying to read a `.sig` that doesn't
     /// exist) and must pass empty bytes for the wire sidecar.

@@ -1,7 +1,7 @@
 //! T2 integration tests for `ember claude-code` launcher wiring.
 //!
 //!
-//! Verifies implementation-note-500 acceptance criteria:
+//! Verifies implementation-note-532 acceptance criteria:
 //! - `EMBER_SESSION_ID` is injected into the child env from the daemon RPC response.
 //! - Child `PATH` starts with the shadow directory.
 //! - `close_session` is called with the same session_id on child exit.
@@ -45,7 +45,7 @@ fn spawn_mock_daemon(socket_path: PathBuf) -> Arc<AtomicBool> {
 
     std::thread::spawn(move || {
         let listener = UnixListener::bind(&socket_path).expect("bind mock socket");
-        // implementation-note-461: nonblocking
+        // implementation-note-480: nonblocking
         // + per-iteration deadline so the for-loop exits cleanly when a test
         // path makes fewer than the maximum 4 connections, instead of hanging
         // the test-runner indefinitely on the unused-accept.
@@ -259,6 +259,8 @@ fn run_with_registration_injects_session_id_and_shadow_path() {
         anthropic_custom_headers: None,
         git_proxy_url: None,
         ssh_auth_sock: None,
+        workflow_id: None,
+        workflow_template: None,
     };
 
     // Use a shell snippet as the child binary: write $PATH to a temp file
@@ -366,6 +368,8 @@ fn child_env_contains_ember_session_id() {
         anthropic_custom_headers: None,
         git_proxy_url: None,
         ssh_auth_sock: None,
+        workflow_id: None,
+        workflow_template: None,
     };
 
     let capture_path_str = env_capture_file.display().to_string();
@@ -504,20 +508,53 @@ fn launch_claude_code_registers_and_closes_session() {
     );
 }
 
+// implementation-note-533: the `--dev` flow
+// gate-checks `~/.ember-dev/envs/<worktree-id>/binaries/ember` exists
+// and would re-exec into it via `maybe_reexec_via_dev_cli` if the
+// current binary doesn't canonicalize to that path. The fixture below
+// stands up the dev-install artifact tree in the tempdir + symlinks
+// the test binary into the expected install_root so:
+//   (1) the dev_cli existence check passes,
+//   (2) `current_exe.canonicalize() == dev_cli.canonicalize()` so no
+//       re-exec happens (the symlink resolves to the same
+//       CARGO_BIN_EXE_ember the test invokes),
+//   (3) the dev socket path the launcher computes matches the
+//       mock daemon's bind location.
+// Anchor: ember_cli_binary_claude_code_registers_grant_proxy_and_socket_path_passes
 #[test]
 fn ember_cli_binary_claude_code_registers_grant_proxy_and_socket_path() {
     let _g = LAUNCHER_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let tmp = TempDir::new().unwrap();
     let home_dir = tmp.path().join("home");
-    let socket_path = home_dir.join(".ember/run/daemon.sock");
-    let shadow_dir = home_dir.join(".ember/shadow");
+    let workspace_root = tmp.path().join("dev-workspace");
     let fake_bin_dir = tmp.path().join("bins");
     let env_capture_file = tmp.path().join("ember-cli-launcher-env.txt");
-    std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+
+    // workspace_root needs a Cargo.toml checkpoint — resolve_workspace_root_from
+    // walks parents looking for it.
+    std::fs::create_dir_all(&workspace_root).unwrap();
+    std::fs::write(workspace_root.join("Cargo.toml"), "[workspace]\n").unwrap();
     std::fs::create_dir_all(&fake_bin_dir).unwrap();
     write_default_home_config(&home_dir);
     make_fake_ember_binary(&fake_bin_dir, "gh");
+
+    // Compute the dev runtime layout the production code will use.
+    // Same function the launcher calls — guarantees path agreement.
+    let dev_runtime =
+        emberlink_cli::dev_runtime::derive_dev_runtime_env(&home_dir, &workspace_root);
+
+    // Dev-install fixture: create binaries dir + symlink the test binary
+    // so dev_cli.exists() = true AND
+    // dev_cli.canonicalize() == current_exe.canonicalize() (no re-exec).
+    std::fs::create_dir_all(&dev_runtime.install_root).unwrap();
+    let dev_cli = dev_runtime.install_root.join("ember");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_ember"), &dev_cli)
+        .expect("symlink test binary into dev install_root");
+
+    // Dev socket lives under <home>/.ember-dev/envs/<id>/run, not ~/.ember/run.
+    let socket_path = dev_runtime.socket_path.clone();
+    std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
 
     let close_called = spawn_mock_daemon(socket_path.clone());
     wait_for_socket(&socket_path);
@@ -528,11 +565,13 @@ fn ember_cli_binary_claude_code_registers_grant_proxy_and_socket_path() {
     );
 
     let status = std::process::Command::new(env!("CARGO_BIN_EXE_ember"))
-        .arg("claude-code")
+        .arg("claude")
+        .arg("--dev")
         .arg("--")
         .arg("-c")
         .arg(&child_script)
         .env("HOME", &home_dir)
+        .env("EMBER_DEV_WORKTREE_ROOT", &workspace_root)
         .env("EMBER_CLAUDE_BIN", "/bin/sh")
         .env("EMBER_PERSONA", "claude-code-binary-test")
         .env("PATH", fake_bin_dir.display().to_string())
@@ -549,7 +588,8 @@ fn ember_cli_binary_claude_code_registers_grant_proxy_and_socket_path() {
         "binary launcher must call close_session after child exit"
     );
 
-    assert_shadow_dir_created(&shadow_dir);
+    // Dev flavor's shadow dir is worktree-scoped, not ~/.ember/shadow.
+    assert_shadow_dir_created(&dev_runtime.shadow_root);
     let observed = std::fs::read_to_string(&env_capture_file)
         .expect("binary launcher child must have written env capture file");
     let mut lines = observed.lines();
@@ -559,8 +599,8 @@ fn ember_cli_binary_claude_code_registers_grant_proxy_and_socket_path() {
     assert_eq!(lines.next(), Some(socket_path.to_string_lossy().as_ref()));
     let path_line = lines.next().unwrap_or_default();
     assert!(
-        path_line.starts_with(&shadow_dir.join("bin").display().to_string()),
-        "binary launcher PATH must start with shadow/bin: {path_line}"
+        path_line.starts_with(&dev_runtime.shadow_root.join("bin").display().to_string()),
+        "binary launcher PATH must start with dev shadow/bin: {path_line}"
     );
 }
 
@@ -592,6 +632,8 @@ fn child_env_contains_anthropic_gateway_bundle_when_present() {
         ),
         git_proxy_url: None,
         ssh_auth_sock: None,
+        workflow_id: None,
+        workflow_template: None,
     };
 
     let capture_path_str = env_capture_file.display().to_string();
@@ -660,6 +702,8 @@ fn child_env_contains_ssh_auth_sock_when_present() {
         anthropic_custom_headers: None,
         git_proxy_url: None,
         ssh_auth_sock: Some("/tmp/ember-ssh-agent.sock".to_string()),
+        workflow_id: None,
+        workflow_template: None,
     };
 
     let capture_path_str = env_capture_file.display().to_string();

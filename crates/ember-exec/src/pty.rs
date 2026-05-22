@@ -112,7 +112,7 @@ impl PtyBridge {
 /// then run the fork+pty+pump body via [`pump_connection`] until the child
 /// exits.
 ///
-/// Refactored in implementation-note-415: the per-connection body now
+/// Refactored in implementation-note-425: the per-connection body now
 /// lives in [`pump_connection`] so `handle_spawn_directive` in `spawn.rs`
 /// can reuse it over an in-flight stream without re-binding a socket.
 /// `serve_inner` keeps its original shape (open listener, accept one client,
@@ -159,7 +159,7 @@ pub async fn serve_inner(
 // pump_connection — fork+pty+pump over a pre-bound async stream
 // ---------------------------------------------------------------------------
 
-/// implementation-note-415: fork a child with a controlling pty, exec
+/// implementation-note-425: fork a child with a controlling pty, exec
 /// `prog argv` in the child, and pump bytes between the pty master and the
 /// pre-bound `stream` until the child exits.
 ///

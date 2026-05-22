@@ -126,7 +126,7 @@ mod tests {
     /// not run, or `sudo security delete-generic-password -a vault-mek
     /// -s sh.emberlink.daemon /Library/Keychains/System.keychain` to
     /// clear state first (DESTRUCTIVE — breaks the live daemon's vault).
-    /// Filed as `implementation-note-363` to
+    /// Filed as `implementation-note-373` to
     /// refactor `get_mek_passphrase` to accept service/account args so
     /// the test can use unique strings that are guaranteed absent.
     #[test]

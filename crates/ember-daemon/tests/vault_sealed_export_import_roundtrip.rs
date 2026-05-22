@@ -15,7 +15,7 @@
 //! 6. Re-instantiate the vault via `Vault::new(recovered)` and
 //!    successfully decrypt the credential written in step 2.
 //!
-//! This is Slice C4 of implementation-note-410-
+//! This is Slice C4 of implementation-note-420-
 //! IMPORT-SEALED. C1 (the sealed-blob format + `export_mek_sealed` /
 //! `import_mek_sealed` substrate) shipped as prior change. C2/C3 (the RPC +
 //! `ember vault export --sealed` / `--import --sealed` CLI surfaces)

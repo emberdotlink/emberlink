@@ -18,7 +18,7 @@ pub const RECEIPT_KIND_BINDING_DELETED: &str = "binding.deleted";
 pub const RECEIPT_KIND_SEAL_UNSEALED: &str = "seal.unsealed";
 pub const RECEIPT_KIND_SNAPSHOT_EMITTED: &str = "snapshot.emitted";
 pub const RECEIPT_KIND_IDENTITY_ROTATED: &str = "identity.rotated";
-/// implementation-note-42 —
+/// implementation-note-44 —
 /// co-signed attestation that bridges between identity-key epochs at
 /// MEK rotation time. Per design Receipt v2 chain-continuity rule +
 /// design catalog discipline. Anchor:
@@ -26,13 +26,41 @@ pub const RECEIPT_KIND_IDENTITY_ROTATED: &str = "identity.rotated";
 pub const RECEIPT_KIND_IDENTITY_ROTATION_WITNESS: &str = "identity.rotation_witness";
 pub const RECEIPT_KIND_LOCAL_STATE_KEY_RESOLVE: &str = "local_state.key_resolve";
 pub const RECEIPT_KIND_LOCAL_STATE_KEY_ROTATION: &str = "local_state.key_rotation";
-/// implementation-note-43 — emberd emits this kind on every
+/// implementation-note-45 — emberd emits this kind on every
 /// `ExecFrame::Exit` arriving from the in-container `ember-exec`
 /// sidecar. The body shape ([`ExecCompletionBody`]) carries the seven
 /// fields design §"Body shape per kind" pins for the in-container
 /// exec audit trail: `persona_id`, `grant_id`, `binary_path`,
 /// `binary_blake3`, `target_uid`, `exit_code`, `materialized_at`.
 pub const RECEIPT_KIND_EXEC_COMPLETION: &str = "exec.completion";
+
+/// cordon_phase1_receipt_mint_retrofitted — Phase 1 cordon migration deferred
+/// receipt obligation per design v2 §5 + design §4. Minted by
+/// `cordon_migration_phase1_destructive` atomically with the
+/// `audit.chain_v1_segment_bridge_unattested` row insert; Phase 2 will
+/// re-issue this kind with `_attested` + operator signature.
+/// Catalog cross-reference: `project design notes` extension
+/// pending (filed as a follow-up).
+pub const RECEIPT_KIND_AUDIT_CHAIN_V1_SEGMENT_BRIDGE_UNATTESTED: &str =
+    "audit.chain_v1_segment_bridge_unattested";
+
+/// audit_repair_chain_rpc_landed — repair tombstone row kind emitted by
+/// `audit.repair_chain` on a successful truncate-after-row, per design v2
+/// §2 (the "tombstone row whose `prev_hash = audit_log[break-1].row_hash`
+/// and whose body carries the repair payload + receipt_id"). The
+/// tombstone row uses this action name; the receipt minted alongside
+/// the truncate is `RECEIPT_KIND_AUDIT_CHAIN_REPAIR_FINALIZE` (below).
+/// Catalog cross-reference: `project design notes` extension
+/// pending.
+pub const RECEIPT_KIND_AUDIT_CHAIN_REPAIR_TOMBSTONE: &str = "audit.chain_repair_tombstone";
+
+/// audit_repair_chain_rpc_landed — repair-finalize Receipt kind emitted on a
+/// successful `audit.repair_chain` truncate-after-row per design v2 §6.
+/// The body carries the operator co-signature, the new chain tip, the
+/// truncated-row count, and the tombstone row id so a downstream verifier
+/// can re-bind the repair to the audit chain. Catalog cross-reference:
+/// `project design notes` extension pending.
+pub const RECEIPT_KIND_AUDIT_CHAIN_REPAIR_FINALIZE: &str = "audit.chain_repair_finalize";
 
 // ===== Body structs =====
 
@@ -185,8 +213,8 @@ pub struct LocalStateKeyRotationBody {
 /// Body for `exec.completion` — emberd-side Receipt v2 emission on every
 /// `ExecFrame::Exit` arriving from the in-container `ember-exec` sidecar.
 ///
-/// Per implementation-note-43 and the parent
-/// implementation-note-44 acceptance — emberd (not ember-exec) is
+/// Per implementation-note-45 and the parent
+/// implementation-note-46 acceptance — emberd (not ember-exec) is
 /// the receipt signer; the in-container sidecar reports the child's
 /// exit code over the UDS frame protocol, and emberd composes the
 /// signed v2 envelope.
@@ -221,6 +249,85 @@ pub struct ExecCompletionBody {
     pub materialized_at: String,
 }
 
+/// cordon_phase1_receipt_mint_retrofitted — body for
+/// `audit.chain_v1_segment_bridge_unattested`. Carries the pre-migration
+/// BLAKE3 anchor + the destroyed-row ids + the bridge row's chain anchors
+/// per design v2 §5 + design §4. Daemon-signed only at Phase 1; Phase 2
+/// re-mints the kind suffixed `_attested` with an operator signature.
+///
+/// Field provenance:
+/// - `pre_migration_chain_tip_hash` — BLAKE3 of the last chained
+///   `audit_log` row before the cordon ran (the v1 genesis row's
+///   `row_hash` on the operator's host, since the operator's tail was the
+///   buggy half-write block that gets destroyed).
+/// - `destroyed_row_ids` — the ids of the audit_log rows the cordon
+///   excluded by id-boundary from the INSERT-SELECT carryover. Empty on
+///   the no-cordon recreate paths (`carry_all_segment_zero` and
+///   `no_data`); populated on the operator's-host destructive path.
+/// - `bridge_segment_genesis` — the bridge row's own anchor data
+///   (segment_id, prev_hash, row_hash) so a verifier walking from the
+///   receipt can re-bind it to the in-DB bridge row by primary key.
+/// - `migration_timestamp` — RFC3339 wall-clock at which the cordon
+///   executed (matches the bridge row's `timestamp` column).
+/// - `daemon_identity_root_fingerprint` — blake3 fingerprint of the
+///   daemon's signing pubkey, so a post-rotation forensic walk can
+///   resolve the signer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditChainV1SegmentBridgeUnattestedBody {
+    pub pre_migration_chain_tip_hash: String,
+    pub destroyed_row_ids: Vec<i64>,
+    pub bridge_segment_genesis: BridgeSegmentGenesis,
+    pub migration_timestamp: String,
+    pub daemon_identity_root_fingerprint: String,
+}
+
+/// cordon_phase1_receipt_mint_retrofitted — bridge row's chain anchors
+/// embedded in the bridge receipt's body. Mirrors the on-disk row at
+/// `(segment_id = 1, is_segment_genesis = 1)`. Per design §3 + §4.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BridgeSegmentGenesis {
+    pub segment_id: u64,
+    pub prev_hash: String,
+    pub row_hash: String,
+}
+
+/// audit_repair_chain_rpc_landed — body for `audit.chain_repair_finalize`
+/// minted on a successful `audit.repair_chain` truncate-after-row. Carries
+/// the operator co-signature + repair-anchors so a verifier can re-bind
+/// the repair to the audit chain post-restart. Per design v2 §6.
+///
+/// Field provenance:
+/// - `repair_id` — opaque id identifying this repair episode (UUID).
+/// - `from_row_id` — the id passed as `RepairIntent.from_row_id`; rows
+///   with `id > from_row_id` were destroyed.
+/// - `truncated_row_count` — count of rows DELETE'd in the truncate
+///   step.
+/// - `tombstone_row_id` — id of the `audit.chain_repair_tombstone` row
+///   inserted at `from_row_id + 1` (the new chain tip).
+/// - `new_chain_tip_hash` — `row_hash` of the tombstone row.
+/// - `pre_repair_chain_tip_hash` — `row_hash` of the row at
+///   `from_row_id` BEFORE the truncate (the new chain tip's
+///   `prev_hash`); the bytes the operator co-signed.
+/// - `operator_signature` — Ed25519 signature by an enrolled operator
+///   persona's identity-root over the canonical
+///   `(from_row_id, pre_repair_chain_tip_hash,
+///   daemon_identity_root_fingerprint)` tuple.
+/// - `daemon_identity_root_fingerprint` — blake3 fingerprint of the
+///   daemon's signing pubkey at repair time.
+/// - `repair_timestamp` — RFC3339 wall-clock when the repair ran.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditChainRepairFinalizeBody {
+    pub repair_id: String,
+    pub from_row_id: i64,
+    pub truncated_row_count: u64,
+    pub tombstone_row_id: i64,
+    pub new_chain_tip_hash: String,
+    pub pre_repair_chain_tip_hash: String,
+    pub operator_signature: String,
+    pub daemon_identity_root_fingerprint: String,
+    pub repair_timestamp: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,6 +360,64 @@ mod tests {
             RECEIPT_KIND_IDENTITY_ROTATION_WITNESS,
             "identity.rotation_witness"
         );
+        // cordon_phase1_receipt_mint_retrofitted +
+        // audit_repair_chain_rpc_landed — locked kind names per ADR
+        // 174 v2 §§5/6 + design §4.
+        assert_eq!(
+            RECEIPT_KIND_AUDIT_CHAIN_V1_SEGMENT_BRIDGE_UNATTESTED,
+            "audit.chain_v1_segment_bridge_unattested"
+        );
+        assert_eq!(
+            RECEIPT_KIND_AUDIT_CHAIN_REPAIR_TOMBSTONE,
+            "audit.chain_repair_tombstone"
+        );
+        assert_eq!(
+            RECEIPT_KIND_AUDIT_CHAIN_REPAIR_FINALIZE,
+            "audit.chain_repair_finalize"
+        );
+    }
+
+    #[test]
+    fn audit_chain_v1_segment_bridge_body_round_trips() {
+        let body = AuditChainV1SegmentBridgeUnattestedBody {
+            pre_migration_chain_tip_hash:
+                "1111111111111111111111111111111111111111111111111111111111111111".into(),
+            destroyed_row_ids: vec![295, 296, 297],
+            bridge_segment_genesis: BridgeSegmentGenesis {
+                segment_id: 1,
+                prev_hash: "2222222222222222222222222222222222222222222222222222222222222222"
+                    .into(),
+                row_hash: "3333333333333333333333333333333333333333333333333333333333333333"
+                    .into(),
+            },
+            migration_timestamp: "2026-05-22T12:00:00Z".into(),
+            daemon_identity_root_fingerprint:
+                "4444444444444444444444444444444444444444444444444444444444444444".into(),
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        let back: AuditChainV1SegmentBridgeUnattestedBody = serde_json::from_value(v).unwrap();
+        assert_eq!(body, back);
+    }
+
+    #[test]
+    fn audit_chain_repair_finalize_body_round_trips() {
+        let body = AuditChainRepairFinalizeBody {
+            repair_id: "repair-aaaa-bbbb-cccc".into(),
+            from_row_id: 290,
+            truncated_row_count: 3,
+            tombstone_row_id: 291,
+            new_chain_tip_hash:
+                "5555555555555555555555555555555555555555555555555555555555555555".into(),
+            pre_repair_chain_tip_hash:
+                "6666666666666666666666666666666666666666666666666666666666666666".into(),
+            operator_signature: "ed25519sig:deadbeef".into(),
+            daemon_identity_root_fingerprint:
+                "7777777777777777777777777777777777777777777777777777777777777777".into(),
+            repair_timestamp: "2026-05-22T13:00:00Z".into(),
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        let back: AuditChainRepairFinalizeBody = serde_json::from_value(v).unwrap();
+        assert_eq!(body, back);
     }
 
     #[test]

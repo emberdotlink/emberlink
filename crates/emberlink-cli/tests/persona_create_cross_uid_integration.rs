@@ -1,6 +1,6 @@
 //!
 //! T3 integration test: `ember persona create` + `ember init` against a real
-//! separate-uid daemon process (implementation-note-501).
+//! separate-uid daemon process (implementation-note-534).
 //!
 //! ## What this tests
 //!
@@ -29,7 +29,7 @@
 //! `persona_create_cross_uid_t3_coverage` grep checkpoint.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -115,7 +115,7 @@ fn sudo_nobody_available() -> bool {
 
 /// Wait until the daemon socket appears at `socket_path`, up to `timeout`.
 /// Returns true if the socket appeared in time, false on timeout.
-fn wait_for_socket(socket_path: &PathBuf, timeout: Duration) -> bool {
+fn wait_for_socket(socket_path: &Path, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if socket_path.exists() {

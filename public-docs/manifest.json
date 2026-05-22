@@ -167,6 +167,16 @@
       ]
     },
     {
+      "page": "reference/mcp-tools.md",
+      "title": "MCP Tool Reference",
+      "support_level": "Preview",
+      "source_truth": [
+        "crates/emberlink-mcp/README.md",
+        "crates/emberlink-mcp/src/lib.rs",
+        "crates/emberlink-mcp/src/main.rs"
+      ]
+    },
+    {
       "page": "use/cli-and-troubleshooting.md",
       "title": "CLI and Troubleshooting",
       "support_level": "Supported",

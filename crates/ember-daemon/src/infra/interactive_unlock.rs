@@ -79,6 +79,12 @@ pub fn register_config(config: DaemonConfig) {
     MANAGER.with(|manager| manager.borrow_mut().config = Some(config));
 }
 
+/// Read the daemon runtime config from the same-process interactive
+/// reopen slot. Consumed only by the macOS-gated `vault_unlock_begin`
+/// / `vault_unlock_complete` handler arms in
+/// `infra/handler.rs`; suppress the dead-code lint on non-macOS so the
+/// Linux build (the headless host) doesn't emit a spurious warning.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn current_config() -> Option<DaemonConfig> {
     MANAGER.with(|manager| manager.borrow().config.clone())
 }

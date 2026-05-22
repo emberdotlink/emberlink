@@ -18,7 +18,7 @@
 //!
 //! No Vault coupling, no Receipt-body wiring, no handler.rs dispatch.
 //!
-//! **Phase 2** (follow-up `implementation-note-350`) wires
+//! **Phase 2** (follow-up `implementation-note-360`) wires
 //! `store(scope, canonical_bytes)` and `fetch(scope, hash)` through the
 //! `VaultScope`-aware vault, extends the `headless_enrollment` Receipt body
 //! with `template_snapshot_hash`, and lands the Receipt-kind catalog entry.

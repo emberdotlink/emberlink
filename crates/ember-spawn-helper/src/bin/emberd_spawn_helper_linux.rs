@@ -2,7 +2,7 @@
 //! `emberd-spawn-helper-linux` — design Component 2 hardened-Linux
 //! helper.
 //!
-//! implementation-note-183
+//! implementation-note-187
 //!
 //! Privileged sibling daemon (systemd unit, `User=root`) that performs
 //! the `setuid → chroot → seccomp → execve` chain on behalf of the
@@ -204,7 +204,12 @@ mod linux_impl {
         // static Arc is safe).
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = handler as usize;
+            // Two-step cast (fn pointer → thin raw pointer → usize)
+            // silences the rustc `fn_ptr_cast_to_int` lint that
+            // fires on the bare `handler as usize`. The kernel
+            // struct stores the same bit pattern either way —
+            // `libc::sigaction::sa_sigaction` is `usize`-typed.
+            sa.sa_sigaction = handler as *const () as usize;
             sa.sa_flags = 0;
             if libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut()) != 0 {
                 return Err(format!(
@@ -748,7 +753,7 @@ mod linux_impl {
     /// instruction). The daemon owns the compilation; the helper is
     /// a pure carrier.
     fn install_seccomp_in_child(filter: &[u8]) -> Result<(), i32> {
-        if filter.is_empty() || filter.len() % 8 != 0 {
+        if filter.is_empty() || !filter.len().is_multiple_of(8) {
             return Err(libc::EINVAL);
         }
         let count = (filter.len() / 8) as u16;

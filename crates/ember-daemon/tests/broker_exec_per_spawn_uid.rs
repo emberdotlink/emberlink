@@ -1,5 +1,5 @@
 //!
-//! implementation-note-162 — T2 integration tests for the
+//! implementation-note-166 — T2 integration tests for the
 //! per-spawn uid pool that `handle_broker_exec` drops privileges
 //! into before fork+execve.
 //!
@@ -27,7 +27,7 @@ use ember_daemon::broker::uid_alloc::{self, UidPool};
 use ember_daemon::infra::store::DaemonStore;
 use std::sync::Arc;
 
-/// implementation-note-162 — verify the pool's basic
+/// implementation-note-166 — verify the pool's basic
 /// invariants in an integration context (separate test binary, so the
 /// process-global pool is independent from the lib's unit tests).
 #[test]
@@ -38,7 +38,7 @@ fn uid_pool_capacity_matches_configured_uids() {
     assert_eq!(pool.in_use_count(), 0);
 }
 
-/// implementation-note-162 — checking out a uid moves it
+/// implementation-note-166 — checking out a uid moves it
 /// from `available` to `in_use`. The Drop returns it.
 #[test]
 fn uid_pool_lease_roundtrip_returns_uid_on_drop() {
@@ -52,7 +52,7 @@ fn uid_pool_lease_roundtrip_returns_uid_on_drop() {
     assert_eq!(pool.in_use_count(), 0);
 }
 
-/// implementation-note-162 — pool exhaustion surfaces a
+/// implementation-note-166 — pool exhaustion surfaces a
 /// `PoolExhausted` error variant after all uids are checked out.
 #[test]
 fn uid_pool_exhausted_after_capacity_reached() {
@@ -67,7 +67,7 @@ fn uid_pool_exhausted_after_capacity_reached() {
     ));
 }
 
-/// implementation-note-162 — empty pool surfaces `PoolEmpty`,
+/// implementation-note-166 — empty pool surfaces `PoolEmpty`,
 /// distinct from `PoolExhausted` (so the handler can render the
 /// "configure pool first" vs "wait for in-flight" diagnostics
 /// distinctly).
@@ -78,7 +78,7 @@ fn uid_pool_empty_distinct_from_exhausted() {
     assert!(matches!(err, uid_alloc::UidAllocError::PoolEmpty));
 }
 
-/// implementation-note-162 — production pools never set the
+/// implementation-note-166 — production pools never set the
 /// test_mode flag. The flag is the only escape valve from the
 /// Finding 14 refusal, and the production install path must not flip
 /// it. (The pool struct does not even expose a public setter — the
@@ -89,7 +89,7 @@ fn production_pool_test_mode_flag_is_false() {
     assert!(!pool.is_test_mode());
 }
 
-/// implementation-note-162 — `init_uid_pool_for_test()`
+/// implementation-note-166 — `init_uid_pool_for_test()`
 /// installs a process-global test pool. After init, `global_pool()`
 /// returns Some(test_pool); the pool carries `test_mode = true` so
 /// the Finding-14 refusal is skipped (existing broker_exec unit
@@ -116,7 +116,7 @@ fn init_uid_pool_for_test_installs_global_pool() {
     );
 }
 
-/// implementation-note-162 — uid_pool can be opened against
+/// implementation-note-166 — uid_pool can be opened against
 /// a real `DaemonStore` in the same process. Regression guard against
 /// the pool primitives accidentally pulling in store state via a
 /// global handle.
@@ -131,7 +131,7 @@ fn uid_pool_is_independent_of_daemon_store() {
     assert_eq!(pool.in_use_count(), 1);
 }
 
-/// implementation-note-162 — concurrent checkouts from
+/// implementation-note-166 — concurrent checkouts from
 /// multiple threads each get a distinct uid (the Mutex serializes
 /// the available-to-in-use transition).
 #[test]
@@ -167,7 +167,7 @@ fn concurrent_checkouts_serialized_by_mutex() {
     );
 }
 
-/// implementation-note-162 — lease drops via early return
+/// implementation-note-166 — lease drops via early return
 /// (e.g. handler error after checkout) return the uid to the pool.
 /// This regression-guards against the lease being forgotten in an
 /// error path.
@@ -189,7 +189,7 @@ fn lease_returns_uid_on_function_error_return() {
     );
 }
 
-/// implementation-note-162 — render_spawn_pool_toml writes
+/// implementation-note-166 — render_spawn_pool_toml writes
 /// a valid TOML section the daemon's RawConfig deserializer can
 /// round-trip. Regression guard against the install path emitting
 /// TOML the daemon config parser refuses to load.

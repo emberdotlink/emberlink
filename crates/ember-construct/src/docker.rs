@@ -3,20 +3,20 @@
 //! server-side (untrusts the shim).
 //!
 //! Coverage:
-//!   - push <host/repo:tag>  → docker.push.<registry-host>
-//!   - login [host]          → docker.login.<host-or-default>
-//!   - logout [host]         → docker.logout.<host-or-default>
+//!   - `push <host/repo:tag>`  → `docker.push.<registry-host>`
+//!   - `login [host]`          → `docker.login.<host-or-default>`
+//!   - `logout [host]`         → `docker.logout.<host-or-default>`
 //!   - run [...]             → docker.run, OR docker.run.privileged when
 //!     --privileged / --pid=host / --network=host / --volume /:... is
 //!     present (default = deny in construct.toml so the broker refuses).
-//!   - build / exec / cp     → docker.<verb>
-//!   - stop / start / kill / rm / rmi / pull / tag → docker.<verb>
+//!   - build / exec / cp     → `docker.<verb>`
+//!   - stop / start / kill / rm / rmi / pull / tag → `docker.<verb>`
 //!   - ps / images / inspect / logs / stats → None (passthrough — read-only)
 //!   - anything else         → None (passthrough)
 //!
 //! ## Compose V2 → Docker engine spec translator
 //!
-//! implementation-note-91 (per /design review
+//! implementation-note-93 (per /design review
 //! 20260517-201622 orbstack-trust Decision 4) lives partly in this
 //! file: the public entry point [`compose_manifest_to_docker_spec`]
 //! and its type bundle. The substrate ([`ComposeManifest`],
@@ -29,7 +29,7 @@
 //!
 //! ## Drain + state_report (cross-crate checkpoint)
 //!
-//! implementation-note-96 adds two new methods
+//! implementation-note-99 adds two new methods
 //! to the daemon's `ContainerRuntime` trait — `drain` (stop a
 //! container with a grace window + verify it actually exited) and
 //! `state_report` (inspect a container, fold the engine status into
@@ -68,7 +68,7 @@ pub use crate::compose::{
 /// # Checkpoint
 ///
 /// `fn compose_manifest_to_docker_spec` — the task-level grep marker
-/// for implementation-note-91.
+/// for implementation-note-93.
 ///
 /// # Errors
 ///
@@ -378,7 +378,7 @@ mod tests {
         assert!(classify_docker_argv(&[]).is_none());
     }
 
-    // T1: container lifecycle verbs (implementation-note-97)
+    // T1: container lifecycle verbs (implementation-note-100)
 
     #[test]
     fn stop_classified() {

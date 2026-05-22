@@ -315,7 +315,7 @@ mod tests {
     #[test]
     fn existing_gh_app_record_returns_none_when_files_absent() {
         let tmp = TempDir::new().unwrap();
-        let record = existing_gh_app_record(&tmp.path().to_path_buf()).unwrap();
+        let record = existing_gh_app_record(tmp.path()).unwrap();
         assert!(record.is_none(), "missing config must return None");
     }
 

@@ -11,7 +11,7 @@
 //!   broker_exec RPC → PTY bridge → exit). Takes a [`ConstructConfig`] impl.
 //!   This is the entry point used by production Construct shims (ember-gh etc.).
 //!
-//! ## Resolve → exec two-phase invariant (implementation-note-25)
+//! ## Resolve → exec two-phase invariant (implementation-note-27)
 //!
 //! Per design §9, the construct shim MUST call `broker.resolve` BEFORE
 //! `broker.exec`. Resolve returns a [`SpawnHandle`] binding the four
@@ -57,7 +57,7 @@ fn parent_has_tty() -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Unsessioned subprocess audit log (implementation-note-26-
+// Unsessioned subprocess audit log (implementation-note-28-
 // WARNING, Tier 1) — best-effort logging from the passthrough branches.
 // ---------------------------------------------------------------------------
 
@@ -192,7 +192,7 @@ fn build_broker_exec_params(
 }
 
 // ---------------------------------------------------------------------------
-// Two-phase resolve → exec (implementation-note-25)
+// Two-phase resolve → exec (implementation-note-27)
 // ---------------------------------------------------------------------------
 
 /// Opaque spawn handle returned by [`resolve_via_broker`].
@@ -351,7 +351,7 @@ pub trait BrokerTransport {
 /// construct_toml_bytes) and receives a [`SpawnHandle`] binding
 /// (binary, env_allowlist, materialization_id, target_uid). The
 /// `materialization_id` carries the daemon's credential reference;
-/// plaintext is NEVER returned over this RPC (per implementation-note-27-
+/// plaintext is NEVER returned over this RPC (per implementation-note-29-
 /// SECRETREF-CONTRACT — only `handle_broker_resolve`'s legacy
 /// secret-ref → plaintext path returns raw credentials, and that path
 /// is gated to trust-boundary callers).
@@ -734,7 +734,7 @@ pub fn run_construct_full<C: ConstructConfig>(argv: &[String], config: &C) -> Ex
                 argv = ?argv,
                 "ember-construct: classify=None; passthrough exec (no broker mediation)"
             );
-            // implementation-note-28 (Tier 1): log
+            // implementation-note-30 (Tier 1): log
             // the classify=None passthrough so read-only / safe-write verbs
             // still appear in the chain (verb name from argv[0]).
             log_unsessioned_subprocess(config, argv, UnsessionedOutcome::PassthroughNoClassify);
@@ -826,7 +826,7 @@ pub fn run_construct_full<C: ConstructConfig>(argv: &[String], config: &C) -> Ex
     };
 
     // 6. Translate emberlink-shaped argv to wrapped-tool-native argv
-    //    (implementation-note-29 / Q5 grill-pair LOCK):
+    //    (implementation-note-31 / Q5 grill-pair LOCK):
     //    `ConstructConfig::translate_argv` strips/renames emberlink-specific
     //    flags the upstream binary doesn't understand. Default is identity;
     //    scion strips `--persona`/`--max-depth`/`--brief`, renames
@@ -1109,7 +1109,7 @@ mod tests {
         }
     }
 
-    /// implementation-note-25 acceptance 1+2:
+    /// implementation-note-27 acceptance 1+2:
     /// run_construct calls resolve_via_broker before exec_via_broker.
     /// The mock transport records the call order and the spawn handle
     /// must bind binary + env + credential + target_uid.
@@ -1172,7 +1172,7 @@ mod tests {
         );
     }
 
-    /// implementation-note-25 acceptance 3:
+    /// implementation-note-27 acceptance 3:
     /// Receipt emitted only on resolve+exec succeeding as a transaction.
     /// When exec fails after a successful resolve, the audit kind is
     /// `credential_resolve_aborted`, never `credential_provisioned`.
@@ -1230,7 +1230,7 @@ mod tests {
         assert_eq!(kind.map(|k| k.as_str()), Some("credential_resolve_aborted"));
     }
 
-    /// implementation-note-25 acceptance 2:
+    /// implementation-note-27 acceptance 2:
     /// spawn_handle binds binary + env + credential + target_uid.
     /// Constructs a handle directly and asserts the four fields exist
     /// with the expected types — guards against accidental field drops
@@ -1251,7 +1251,7 @@ mod tests {
         assert_eq!(handle.target_uid, 1500);
     }
 
-    /// implementation-note-25: resolve failure short-
+    /// implementation-note-27: resolve failure short-
     /// circuits before exec is reached. No audit kind is emitted
     /// because resolve never produced a credential to begin with.
     #[test]
@@ -1645,7 +1645,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // implementation-note-28 (Tier 1) tests for
+    // implementation-note-30 (Tier 1) tests for
     // log_unsessioned_subprocess. The daemon-up happy-path is exercised by
     // ember-daemon's handle_subprocess_audit_log tests; here we pin the
     // best-effort failure modes — vendor=="unknown" short-circuit, and

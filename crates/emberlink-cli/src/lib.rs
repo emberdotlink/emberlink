@@ -2,7 +2,7 @@ mod activity_support;
 pub mod audit;
 pub mod binary;
 mod biometric;
-// implementation-note-172 — `ember bind …` admin path
+// implementation-note-176 — `ember bind …` admin path
 // for credential bindings. See `bind.rs` doc-comment.
 pub mod bind;
 pub mod broker;
@@ -18,12 +18,14 @@ pub mod grants;
 //
 // implementation-note-20
 pub mod claude_code_launcher;
+pub mod codex_launcher;
 mod commands;
 pub mod demo;
 pub mod dev;
-pub mod dev_runtime;
 pub mod dev_install;
 pub mod dev_install_slice_c;
+pub mod dev_runtime;
+pub mod dev_runtime_artifacts;
 pub mod headless;
 pub mod install;
 pub mod install_paths;
@@ -33,6 +35,7 @@ pub mod onboarding;
 pub mod orchestrator;
 pub mod output;
 pub mod receipt;
+pub mod recover;
 mod recovery;
 mod screens;
 pub mod session;
@@ -40,6 +43,8 @@ mod sync_support;
 pub mod trust;
 pub mod up;
 pub mod vault_io;
+pub mod workflow;
+pub mod workflow_prompt;
 mod vault_support;
 
 pub use cli::{Args, Cmd};
@@ -87,7 +92,7 @@ use ember_broker::secure_enclave::{
 };
 #[cfg(target_os = "macos")]
 use ember_broker::secure_enclave::{
-    SeKeyHandle, find_secure_enclave_key, se_pubkey_bytes, se_sign_with_touch_id,
+    SeKeyHandle, find_secure_enclave_key, se_pubkey_bytes, se_sign_with_touch_id_reason,
 };
 #[cfg(all(test, target_os = "macos"))]
 use ember_broker::secure_enclave::{new_stub_key, se_register_stub_key};
@@ -1599,12 +1604,25 @@ pub fn local_state_content_key() -> Result<String, ValidationError> {
 const ENCRYPTED_MAGIC: &[u8] = b"EMBER_ENC\x01";
 
 #[derive(Debug)]
-pub(crate) enum DaemonRpcError {
+pub enum DaemonRpcError {
     Unavailable(std::io::Error),
     Io(std::io::Error),
     Protocol(String),
     Rpc { code: i32, message: String },
 }
+
+impl std::fmt::Display for DaemonRpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DaemonRpcError::Unavailable(e) => write!(f, "daemon unavailable: {e}"),
+            DaemonRpcError::Io(e) => write!(f, "io error: {e}"),
+            DaemonRpcError::Protocol(m) => write!(f, "protocol error: {m}"),
+            DaemonRpcError::Rpc { code, message } => write!(f, "daemon error (code {code}): {message}"),
+        }
+    }
+}
+
+impl std::error::Error for DaemonRpcError {}
 
 fn operator_presence_token_slot()
 -> &'static std::sync::Mutex<Option<ember_daemon::auth::presence_token::PresenceToken>> {
@@ -1680,7 +1698,7 @@ pub(crate) fn format_daemon_socket_io_error(err: &std::io::Error) -> String {
     format!("daemon socket error: {err}")
 }
 
-pub(crate) fn format_daemon_unavailable(
+pub fn format_daemon_unavailable(
     socket_path: &std::path::Path,
     source: &std::io::Error,
 ) -> String {
@@ -1792,9 +1810,13 @@ fn load_or_create_native_vault_unlock_key() -> Result<SeKeyHandle, DaemonRpcErro
 #[cfg(target_os = "macos")]
 fn perform_vault_unlock_ceremony(
     socket_path: &std::path::Path,
+    requested_method: &str,
+    requested_params: &serde_json::Value,
 ) -> Result<serde_json::Value, DaemonRpcError> {
-    let begin =
-        match call_daemon_rpc_once(socket_path, "vault_unlock_begin", &serde_json::Value::Null) {
+    let begin_params = serde_json::json!({
+        "requested_method": requested_method,
+    });
+    let begin = match call_daemon_rpc_once(socket_path, "vault_unlock_begin", &begin_params) {
             Ok(value) => value,
             Err(DaemonRpcError::Rpc { code, message })
                 if code == -32601
@@ -1824,7 +1846,12 @@ fn perform_vault_unlock_ceremony(
     })?;
 
     let handle = load_or_create_native_vault_unlock_key()?;
-    let signature_der = se_sign_with_touch_id(&handle, &challenge)
+    let prompt_reason = vault_unlock_prompt_reason(
+        requested_method,
+        requested_params,
+        begin.get("reason").and_then(|v| v.as_str()),
+    );
+    let signature_der = se_sign_with_touch_id_reason(&handle, &challenge, &prompt_reason)
         .map_err(|e| DaemonRpcError::Protocol(format!("native biometric unlock failed: {e}")))?;
     let public_key = se_pubkey_bytes(&handle).map_err(|e| {
         DaemonRpcError::Protocol(format!("native biometric pubkey export failed: {e}"))
@@ -1838,14 +1865,192 @@ fn perform_vault_unlock_ceremony(
     call_daemon_rpc_once(socket_path, "vault_unlock_complete", &complete_params)
 }
 
-pub(crate) fn call_daemon_rpc(
+#[cfg(target_os = "macos")]
+fn vault_unlock_prompt_reason(
+    requested_method: &str,
+    requested_params: &serde_json::Value,
+    daemon_reason: Option<&str>,
+) -> String {
+    if let Some(reason) = specific_vault_unlock_reason(requested_method, requested_params) {
+        return reason;
+    }
+
+    match daemon_reason {
+        Some("Unlock the daemon vault for operator commands") => {
+            "unlock your Ember vault for this command".to_string()
+        }
+        Some("Unlock Ember's secure vault to continue.") => {
+            "unlock your Ember vault for this command".to_string()
+        }
+        Some(reason) => reason.to_string(),
+        None => "unlock your Ember vault for this command".to_string(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn specific_vault_unlock_reason(
+    requested_method: &str,
+    requested_params: &serde_json::Value,
+) -> Option<String> {
+    fn shorten_id(raw: &str) -> String {
+        if let Some(stripped) = raw.strip_prefix("persona-") {
+            let short = stripped.chars().take(8).collect::<String>();
+            return format!("persona-{short}");
+        }
+        if raw.len() > 20 {
+            return raw.chars().take(20).collect::<String>();
+        }
+        raw.to_string()
+    }
+
+    fn quoted_param(
+        requested_params: &serde_json::Value,
+        key: &str,
+        noun: &str,
+        verb: &str,
+    ) -> Option<String> {
+        requested_params
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| format!("{verb} the Ember {noun} \"{value}\""))
+    }
+
+    fn first_present_string<'a>(
+        requested_params: &'a serde_json::Value,
+        keys: &[&str],
+    ) -> Option<&'a str> {
+        keys.iter()
+            .find_map(|key| requested_params.get(*key).and_then(|v| v.as_str()))
+            .filter(|value| !value.trim().is_empty())
+    }
+
+    fn persona_target_label(requested_params: &serde_json::Value) -> Option<String> {
+        let id = requested_params.get("id").and_then(|v| v.as_str());
+        let name = requested_params.get("name").and_then(|v| v.as_str());
+        match (name, id) {
+            (Some(name), Some(id)) if !name.trim().is_empty() && !id.trim().is_empty() => {
+                Some(format!("{name} ({})", shorten_id(id)))
+            }
+            (Some(name), _) if !name.trim().is_empty() => Some(name.to_string()),
+            (_, Some(id)) if !id.trim().is_empty() => Some(shorten_id(id)),
+            _ => None,
+        }
+    }
+
+    fn sandbox_target_label(requested_params: &serde_json::Value) -> Option<String> {
+        first_present_string(requested_params, &["name", "id_or_name"]).map(|value| value.to_string())
+    }
+
+    fn grant_target_label(requested_params: &serde_json::Value) -> Option<String> {
+        first_present_string(
+            requested_params,
+            &["grant_id", "id", "parent_grant_id"],
+        )
+        .map(shorten_id)
+    }
+
+    fn create_grant_reason(
+        requested_params: &serde_json::Value,
+        composite: bool,
+    ) -> String {
+        let persona = first_present_string(requested_params, &["persona_id", "persona"]);
+        let credential = first_present_string(requested_params, &["credential_name"]);
+        let scope = first_present_string(requested_params, &["scope"]);
+        let kind = if composite { "composite grant" } else { "grant" };
+        match (persona, credential, scope) {
+            (Some(persona), Some(credential), Some(scope)) => format!(
+                "create an Ember {kind} for persona \"{persona}\" to access \"{credential}\" ({scope})"
+            ),
+            (Some(persona), Some(credential), _) => format!(
+                "create an Ember {kind} for persona \"{persona}\" to access \"{credential}\""
+            ),
+            (Some(persona), _, _) => {
+                format!("create an Ember {kind} for persona \"{persona}\"")
+            }
+            _ => format!("create an Ember {kind}"),
+        }
+    }
+
+    Some(match requested_method {
+        "vault_unlock" => "unlock your Ember vault".to_string(),
+        "register_session" => quoted_param(requested_params, "persona", "session", "start")
+            .map(|reason| reason.replace("the Ember session", "an Ember session for persona"))
+            .unwrap_or_else(|| "start a new Ember session".to_string()),
+        "create_grant" => create_grant_reason(requested_params, false),
+        "create_composite_grant" => create_grant_reason(requested_params, true),
+        "resolve_grant_approval" => quoted_param(requested_params, "id", "approval", "approve")
+            .unwrap_or_else(|| "approve this pending Ember approval".to_string()),
+        "delegate_grant" => first_present_string(requested_params, &["child_persona_id"])
+            .map(|persona| format!("delegate an Ember grant to persona \"{persona}\""))
+            .unwrap_or_else(|| "delegate this Ember grant".to_string()),
+        "revoke_grant" => grant_target_label(requested_params)
+            .map(|label| format!("revoke the Ember grant \"{label}\""))
+            .unwrap_or_else(|| "revoke this Ember grant".to_string()),
+        "extend_grant" => grant_target_label(requested_params)
+            .map(|label| format!("extend the Ember grant \"{label}\""))
+            .unwrap_or_else(|| "extend this Ember grant".to_string()),
+        "expire_grants" => "expire stale Ember grants".to_string(),
+        "create_persona" => quoted_param(requested_params, "name", "persona", "create")
+            .unwrap_or_else(|| "create an Ember persona".to_string()),
+        "revoke_persona" => persona_target_label(requested_params)
+            .map(|label| format!("revoke the Ember persona \"{label}\""))
+            .unwrap_or_else(|| "revoke this Ember persona".to_string()),
+        "launcher_prepare_claude_code" => {
+            "start Claude Code with Ember".to_string()
+        }
+        "spawn_scoped_tool" => quoted_param(requested_params, "tool", "tool", "launch")
+            .unwrap_or_else(|| "launch this mediated Ember tool".to_string()),
+        "vault_add" | "vault_put" => quoted_param(requested_params, "name", "vault entry", "store")
+            .unwrap_or_else(|| "store this Ember vault entry".to_string()),
+        "vault_get" => quoted_param(requested_params, "name", "vault entry", "read")
+            .unwrap_or_else(|| "read this Ember vault entry".to_string()),
+        "vault_remove" => quoted_param(requested_params, "name", "vault entry", "remove")
+            .unwrap_or_else(|| "remove this Ember vault entry".to_string()),
+        "vault_migrate_acl" => "update Ember vault access control".to_string(),
+        "resolve_approval" => first_present_string(requested_params, &["id"])
+            .map(|id| {
+                let decision = first_present_string(requested_params, &["decision"])
+                    .unwrap_or("resolve");
+                format!("{decision} the Ember approval \"{}\"", shorten_id(id))
+            })
+            .unwrap_or_else(|| "resolve this Ember approval".to_string()),
+        "submit_approval" => first_present_string(requested_params, &["action"])
+            .map(|action| format!("submit an Ember approval for \"{action}\""))
+            .unwrap_or_else(|| "submit an Ember approval".to_string()),
+        "sandbox_create" => sandbox_target_label(requested_params)
+            .map(|label| format!("create the Ember sandbox \"{label}\""))
+            .unwrap_or_else(|| "create an Ember sandbox".to_string()),
+        "sandbox_stop" => sandbox_target_label(requested_params)
+            .map(|label| format!("stop the Ember sandbox \"{label}\""))
+            .unwrap_or_else(|| "stop an Ember sandbox".to_string()),
+        "sandbox_delete" => sandbox_target_label(requested_params)
+            .map(|label| format!("delete the Ember sandbox \"{label}\""))
+            .unwrap_or_else(|| "delete an Ember sandbox".to_string()),
+        "sandbox_exec" => sandbox_target_label(requested_params)
+            .map(|label| format!("run a command in the Ember sandbox \"{label}\""))
+            .unwrap_or_else(|| "run a command in an Ember sandbox".to_string()),
+        "sandbox_run" => sandbox_target_label(requested_params)
+            .map(|label| format!("start the Ember sandbox workflow \"{label}\""))
+            .unwrap_or_else(|| "start an Ember sandbox workflow".to_string()),
+        "headless_enroll" => "enable Ember headless access".to_string(),
+        "headless_revoke" => "revoke Ember headless access".to_string(),
+        "close_session" => first_present_string(requested_params, &["session_id"])
+            .map(|id| format!("close the Ember session \"{}\"", shorten_id(id)))
+            .unwrap_or_else(|| "close an Ember session".to_string()),
+        "binary_pin_generate" => "refresh Ember's binary trust pins".to_string(),
+        _ => return None,
+    })
+}
+
+pub fn call_daemon_rpc(
     socket_path: &std::path::Path,
     method: &str,
     params: &serde_json::Value,
 ) -> Result<serde_json::Value, DaemonRpcError> {
     #[cfg(target_os = "macos")]
     if method == "vault_unlock" {
-        let value = perform_vault_unlock_ceremony(socket_path)?;
+        let value = perform_vault_unlock_ceremony(socket_path, method, params)?;
         maybe_cache_presence_token_from_result(&value)?;
         return Ok(value);
     }
@@ -1863,7 +2068,7 @@ pub(crate) fn call_daemon_rpc(
         {
             set_cached_operator_presence_token(None);
             #[cfg(target_os = "macos")]
-            let unlock = perform_vault_unlock_ceremony(socket_path)?;
+            let unlock = perform_vault_unlock_ceremony(socket_path, method, params)?;
             #[cfg(not(target_os = "macos"))]
             let unlock =
                 call_daemon_rpc_once(socket_path, "vault_unlock", &serde_json::Value::Null)?;
@@ -2085,10 +2290,10 @@ fn resolve_encryption_key() -> Result<String, ValidationError> {
     // Step 2 — deterministic fixture key in test builds.
     #[cfg(test)]
     {
-        return Ok(core_crypto::derive_content_key(
+        Ok(core_crypto::derive_content_key(
             b"emberlink-test-key",
             b"test",
-        ));
+        ))
     }
 
     // Production path with adversarial-review CRIT-2 race-free migration.
@@ -2340,6 +2545,93 @@ mod tests {
         .expect("presence token value")
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn vault_unlock_prompt_reason_prefers_specific_user_copy() {
+        assert_eq!(
+            vault_unlock_prompt_reason(
+                "launcher_prepare_claude_code",
+                &serde_json::Value::Null,
+                Some("Unlock Ember's secure vault to continue.")
+            ),
+            "start Claude Code with Ember"
+        );
+        assert_eq!(
+            vault_unlock_prompt_reason(
+                "vault_unlock",
+                &serde_json::Value::Null,
+                Some("Unlock Ember's secure vault to continue.")
+            ),
+            "unlock your Ember vault"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn vault_unlock_prompt_reason_normalizes_internal_fallback_copy() {
+        assert_eq!(
+            vault_unlock_prompt_reason(
+                "unknown_method",
+                &serde_json::Value::Null,
+                Some("Unlock the daemon vault for operator commands")
+            ),
+            "unlock your Ember vault for this command"
+        );
+        assert_eq!(
+            vault_unlock_prompt_reason("unknown_method", &serde_json::Value::Null, None),
+            "unlock your Ember vault for this command"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn vault_unlock_prompt_reason_includes_specific_human_targets() {
+        assert_eq!(
+            vault_unlock_prompt_reason(
+                "create_persona",
+                &serde_json::json!({"name": "dogfood-reviewer"}),
+                None,
+            ),
+            "create the Ember persona \"dogfood-reviewer\""
+        );
+        assert_eq!(
+            vault_unlock_prompt_reason(
+                "revoke_persona",
+                &serde_json::json!({"id": "persona-7567f7d2-d120-4d6d-879e-b770e674e4fb", "name": "scope-proof-temp-20260521-1"}),
+                None,
+            ),
+            "revoke the Ember persona \"scope-proof-temp-20260521-1 (persona-7567f7d2)\""
+        );
+        assert_eq!(
+            vault_unlock_prompt_reason(
+                "vault_get",
+                &serde_json::json!({"name": "github/apps/ember-engine/app-id"}),
+                None,
+            ),
+            "read the Ember vault entry \"github/apps/ember-engine/app-id\""
+        );
+        assert_eq!(
+            vault_unlock_prompt_reason(
+                "create_grant",
+                &serde_json::json!({
+                    "persona_id": "claude-code-default",
+                    "credential_name": "anthropic-key",
+                    "scope": "credential:read"
+                }),
+                None,
+            ),
+            "create an Ember grant for persona \"claude-code-default\" to access \"anthropic-key\" (credential:read)"
+        );
+        assert_eq!(
+            vault_unlock_prompt_reason(
+                "sandbox_exec",
+                &serde_json::json!({"id_or_name": "debug-box"}),
+                None,
+            ),
+            "run a command in the Ember sandbox \"debug-box\""
+        );
+    }
+
     /// Accept a Unix-socket connection with a wall-clock timeout, ensuring
     /// tests never hang indefinitely on `__skb_wait_for_more_packets` when
     /// a client thread crashes before connecting. Replaces bare
@@ -2366,7 +2658,7 @@ mod tests {
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     if std::time::Instant::now() >= deadline {
                         panic!(
-                            "listener.accept() timed out after {:?} — implementation-note-485 guard fired",
+                            "listener.accept() timed out after {:?} — implementation-note-507 guard fired",
                             timeout
                         );
                     }
@@ -2444,15 +2736,22 @@ mod tests {
                                 })
                             }
                         }
-                        "vault_unlock_begin" => serde_json::json!({
-                            "id": request["id"],
-                            "result": {
-                                "request_id": "req-123",
-                                "challenge_hex": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
-                                "expires_at_unix_ms": 9999999999999u64,
-                                "reason": "Unlock the daemon vault for operator commands"
-                            }
-                        }),
+                        "vault_unlock_begin" => {
+                            assert_eq!(
+                                request["params"]["requested_method"],
+                                serde_json::json!("create_persona"),
+                                "unlock bootstrap must bind the requested operator method"
+                            );
+                            serde_json::json!({
+                                "id": request["id"],
+                                "result": {
+                                    "request_id": "req-123",
+                                    "challenge_hex": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+                                    "expires_at_unix_ms": 9999999999999u64,
+                                    "reason": "unlock your Ember vault"
+                                }
+                            })
+                        }
                         "vault_unlock_complete" | "vault_unlock" => serde_json::json!({
                             "id": request["id"],
                             "result": {
@@ -2547,15 +2846,22 @@ mod tests {
                                 }
                             })
                         }
-                        "vault_unlock_begin" => serde_json::json!({
-                            "id": request["id"],
-                            "result": {
-                                "request_id": "req-locked",
-                                "challenge_hex": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
-                                "expires_at_unix_ms": 9999999999999u64,
-                                "reason": "Unlock the daemon vault for operator commands"
-                            }
-                        }),
+                        "vault_unlock_begin" => {
+                            assert_eq!(
+                                request["params"]["requested_method"],
+                                serde_json::json!("create_persona"),
+                                "locked-session retry must bind the requested operator method"
+                            );
+                            serde_json::json!({
+                                "id": request["id"],
+                                "result": {
+                                    "request_id": "req-locked",
+                                    "challenge_hex": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+                                    "expires_at_unix_ms": 9999999999999u64,
+                                    "reason": "unlock your Ember vault"
+                                }
+                            })
+                        }
                         "vault_unlock_complete" | "vault_unlock" => serde_json::json!({
                             "id": request["id"],
                             "result": {
@@ -2741,7 +3047,7 @@ mod tests {
                                 "request_id": "req-boot",
                                 "challenge_hex": "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
                                 "expires_at_unix_ms": 9999999999999u64,
-                                "reason": "Unlock the daemon vault for operator commands"
+                                "reason": "unlock your Ember vault"
                             }
                         }),
                         "vault_unlock_complete" | "vault_unlock" => serde_json::json!({

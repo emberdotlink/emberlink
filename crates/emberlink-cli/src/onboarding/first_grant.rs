@@ -1,11 +1,11 @@
 //! First-grant walkthrough — the closing step of `ember init` that converts
 //! every install into a witness of the wedge artifact (Grant Receipt).
 //!
-//! EMBER-INIT-FIRST-implementation-note-488 (v1, tips-only):
+//! EMBER-INIT-FIRST-implementation-note-510 (v1, tips-only):
 //! Prints an educational three-step tutorial pointing the user at daemon
 //! startup, grant issuance, and Receipt inspection.
 //!
-//! EMBER-INIT-FIRST-implementation-note-450 (v2, real signed Receipt):
+//! EMBER-INIT-FIRST-implementation-note-467 (v2, real signed Receipt):
 //! Issues a 60-second illustrative grant from the root persona to a fake
 //! local agent persona ("first-grant-tutorial"), immediately revokes it,
 //! signs the resulting Grant Receipt v2 envelope with the root persona's
@@ -14,7 +14,7 @@
 //!
 //! The checkpoint `init_first_grant_receipt_emit` is embedded as a constant
 //! so the headless ranker can grep for it as the shipped-state indicator
-//! of EMBER-INIT-FIRST-implementation-note-450.
+//! of EMBER-INIT-FIRST-implementation-note-467.
 //!
 //! Idempotency: presence of `<data_dir>/receipts/first.json` suppresses
 //! re-emission on subsequent `ember init` calls — the file-exists check
@@ -39,13 +39,13 @@ pub const TIPS_SHOWN_SENTINEL: &str = ".first-grant-tips-shown";
 
 /// `init_first_grant_walkthrough` — the literal checkpoint string the
 /// headless ranker greps for to detect the shipped state of
-/// EMBER-INIT-FIRST-implementation-note-488. Embedded as a constant so a code
+/// EMBER-INIT-FIRST-implementation-note-510. Embedded as a constant so a code
 /// reader sees it explicitly and the `target_state_anchor` value in
 /// `release-checklist` matches against the binary's strings.
 pub const INIT_FIRST_GRANT_WALKTHROUGH_SENTINEL: &str = "init_first_grant_walkthrough";
 
 /// `init_first_grant_receipt_emit` — headless ranker checkpoint for
-/// EMBER-INIT-FIRST-implementation-note-450. Presence in this source file
+/// EMBER-INIT-FIRST-implementation-note-467. Presence in this source file
 /// marks the v2 receipt-emit path as shipped.
 pub const INIT_FIRST_GRANT_RECEIPT_EMIT_SENTINEL: &str = "init_first_grant_receipt_emit";
 

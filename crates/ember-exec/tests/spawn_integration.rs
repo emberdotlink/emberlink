@@ -1,5 +1,5 @@
 //!
-//! implementation-note-417: integration coverage for two
+//! implementation-note-427: integration coverage for two
 //! parent-task acceptance criteria that subtasks B/C/D shipped behavior for
 //! but did not test end-to-end via `handle_spawn_directive`:
 //!
@@ -42,7 +42,7 @@ fn blake3_of_file(path: &std::path::Path) -> String {
     hasher.finalize().to_hex().to_string()
 }
 
-/// implementation-note-417: dispatch a `SpawnDirective` for
+/// implementation-note-427: dispatch a `SpawnDirective` for
 /// `/usr/bin/id` and assert the child's output reports the expected uid.
 /// Because the test runs as the current user with `target_uid = current
 /// uid`, the privilege-drop codepath (when running as root) reduces to a
@@ -96,7 +96,7 @@ async fn test_setuid_drop_before_execve() {
     );
 }
 
-/// implementation-note-417: dispatch a `SpawnDirective` with a
+/// implementation-note-427: dispatch a `SpawnDirective` with a
 /// wrong `content_hash_expected`. The hash gate must close the connection
 /// with a `HashMismatch` frame before any privilege drop or spawn. The
 /// stricter assertion is that NO `OutputBytes` and NO `Exit` precede
@@ -126,8 +126,11 @@ async fn test_hash_mismatch_refuses_exec() {
 
     // The first (and only) frame must be HashMismatch. Reaching an
     // OutputBytes or Exit frame before that would prove the child spawned,
-    // which is the failure mode this test guards against.
+    // which is the failure mode this test guards against. The loop is
+    // intentionally single-shot — every non-mismatch arm panics or breaks,
+    // so allowing clippy::never_loop here preserves the assertion shape.
     let mut saw_mismatch = false;
+    #[allow(clippy::never_loop)]
     while let Ok(Some(frame)) = read_frame(&mut peer).await {
         match frame {
             ExecFrame::HashMismatch { .. } => {

@@ -60,11 +60,12 @@ toml.workspace = true
 clap_complete = "4"
 dirs-next = "2"
 # minijinja: Jinja2-compatible template engine for rendering
-# crates/headless-runtime/templates/compose.yml.j2 from cmd_up (implementation-note-428).
+# crates/headless-runtime/templates/compose.yml.j2 from cmd_up (implementation-note-438).
 minijinja = "2"
 ember-update = { path = "../ember-update" }
 ember-daemon = { path = "../ember-daemon" }
 ember-broker = { path = "../ember-broker", features = ["se-stub"] }
+ember-construct = { path = "../ember-construct" }
 core-construct-runtime = { path = "../core-construct-runtime" }
 # keyring-core 1.0 + apple-native-keyring-store split (post-keyring-v3 upstream
 # rewrite). The CLI registers the default store in main() before any vault op.
@@ -91,7 +92,7 @@ pem = "3"
 # the on-wire bytes into a `SimpleSigning` struct and checks that
 # `critical.image.docker_manifest_digest` matches `sha256(blob)`. Fulcio cert
 # chain + Rekor inclusion proof verification are deferred to follow-up slices
-# (implementation-note-429/-C). The `cosign` feature drags in
+# (implementation-note-439/-C). The `cosign` feature drags in
 # `oci-client`, which needs a TLS backend on `reqwest` to build at all; we
 # enable `rustls-tls` (already present in this crate via the `rustls` dep)
 # to satisfy that transitive requirement without adding a second TLS stack.
@@ -103,7 +104,7 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 webpki-roots = "1.0"
 # `ureq` is used by `ember broker register github` to call `GET /apps/<slug>`
-# for slug canonicalization (Finding 12 / implementation-note-430).
+# for slug canonicalization (Finding 12 / implementation-note-440).
 # Blocking client — no async runtime required for a one-shot CLI call.
 ureq = { version = "3", default-features = false, features = ["json", "rustls"] }
 # `jsonwebtoken` is used to build the GitHub App RS256 JWT for the slug

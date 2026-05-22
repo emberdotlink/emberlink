@@ -1,5 +1,5 @@
 //! `bridge.cert_expiring_soon` 90%-TTL timer for the in-container mTLS
-//! bridge transport (design component 1, implementation-note-504).
+//! bridge transport (design component 1, implementation-note-537).
 //!
 //! The brief locks in the timing: fire ONCE at ≥90% of the cert's TTL
 //! elapsed (i.e. 10% lifetime remaining), so the cert is still valid

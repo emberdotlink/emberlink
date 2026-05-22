@@ -25,7 +25,8 @@ If you are choosing between surfaces, start with
 ## Current truth
 
 - MCP is a real surface
-- it talks to the local daemon socket
+- it talks to the local daemon socket by default
+- `--no-daemon` is an explicit fail-closed compatibility mode, not the primary path
 - it is part of the build/integration story, not the primary friendly
   onboarding lane
 
@@ -51,7 +52,10 @@ The current MCP shape looks like:
   "mcpServers": {
     "ember": {
       "command": "emberlink-mcp",
-      "args": ["--daemon-socket", "${HOME}/.ember/run/daemon.sock"]
+      "args": [
+        "--persona", "my-agent-persona",
+        "--daemon-socket", "${HOME}/.ember/run/daemon.sock"
+      ]
     }
   }
 }
@@ -83,6 +87,20 @@ MCP is the right fit when:
 If you want the most polished current operator journey, prefer the launcher
 path first.
 
+## Tool shape notes
+
+- `request_grant` currently requires `scope`, `resource_id`, and `duration_secs`
+- `resource_id` is how the daemon policy path knows which credential-bearing
+  action is being requested
+- `grant_status` can be polled with either a pending approval/request id or an
+  active grant id
+- receipt and budget tools are also daemon-backed; they do not fall back to
+  local in-process state
+
 Treat MCP as a power-user or integration surface today, not the lead
 onboarding path for the pre-release operator story.
+
+## Next page
+
+- [MCP tool reference](../reference/mcp-tools/)
 

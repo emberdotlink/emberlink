@@ -52,7 +52,7 @@ pub struct ConstructManifest {
     pub name: String,
     /// Manifest-wide default authority families this Construct consumes when
     /// an action does not override them explicitly. Values use
-    /// [`core_broker::BrokerProvider::as_str`] naming (e.g. `"github"`,
+    /// `core_broker::BrokerProvider::as_str` naming (e.g. `"github"`,
     /// `"aws_sts"`). Empty means the manifest intentionally makes no claim
     /// yet; callers must treat that as unresolved rather than guessing.
     pub authority_refs: Vec<String>,

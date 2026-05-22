@@ -40,7 +40,7 @@ pub enum GhAppError {
 ///
 /// All three fields are required. `private_key_pem` is the RSA private key
 /// exactly as exported from GitHub (PEM-encoded PKCS#8 or PKCS#1). Load from
-/// the daemon vault path configured in [`crate::config::github_app::GitHubAppConfig`]
+/// the daemon vault path configured in the host's `GitHubAppConfig`
 /// or fall back to the `GH_APP_PRIVATE_KEY_PEM` environment variable; the daemon
 /// supplies a clear error when neither is set.
 #[derive(Clone)]

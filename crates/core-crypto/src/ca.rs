@@ -105,7 +105,7 @@ pub struct SpiffeIdentity {
 ///   `20260516-222000-container-identity` grill matrix) and is preserved
 ///   verbatim into [`SpiffeUri::Container::container_ref`].
 ///
-/// Anchor: `parse_spiffe_uri_container` — implementation-note-31.
+/// Anchor: `parse_spiffe_uri_container` — implementation-note-33.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpiffeUri {
     /// `spiffe://emberd/persona/<persona>/peer/<peer-hostname>` shape.
@@ -498,7 +498,7 @@ pub fn parse_spiffe_uri(uri: &str) -> Result<SpiffeIdentity, CaError> {
 /// or `/container/...`. Leaves room for future shapes (e.g. `/spawn/...` per
 /// design's spawn-uuid rename) — adding a variant here is purely additive.
 ///
-/// Anchor: `parse_spiffe_uri_container` — implementation-note-31.
+/// Anchor: `parse_spiffe_uri_container` — implementation-note-33.
 pub fn parse_spiffe_uri_container(uri: &str) -> Result<SpiffeUri, CaError> {
     // Reject URL-encoding up front, matching parse_spiffe_uri's invariant.
     if uri.contains('%') {
@@ -535,7 +535,7 @@ pub fn parse_spiffe_uri_container(uri: &str) -> Result<SpiffeUri, CaError> {
 
 // ─── Consolidated bridge-identity SAN parser ────────────────────────────────
 //
-// san_parser_consolidated_core_crypto_ca — implementation-note-32
+// san_parser_consolidated_core_crypto_ca — implementation-note-34
 //
 // Single entry point for extracting an agent/persona identity from a parsed
 // X.509 client cert's Subject Alternative Name extension. Replaces the

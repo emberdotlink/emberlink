@@ -1,4 +1,4 @@
-//! Stable working-tree identifier derived from a cwd path (implementation-note-187).
+//! Stable working-tree identifier derived from a cwd path (implementation-note-191).
 //!
 //! Walks up from a canonicalized `cwd` until finding an ancestor directory
 //! that contains a `.git/` subdirectory. Returns that ancestor's absolute

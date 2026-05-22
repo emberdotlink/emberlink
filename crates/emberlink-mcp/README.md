@@ -1,11 +1,16 @@
 # emberlink-mcp
 
-MCP server that exposes Emberlink agent authorization as tools — grant requests, credential use, and identity checks over JSON-RPC 2.0 on stdio.
+MCP server for Emberlink's daemon-backed authority surface. It speaks
+JSON-RPC 2.0 over stdio and is an MCP-shaped client of the local daemon, not a
+second trust root.
 
-## Prerequisites
+## Current truth
 
-- Rust toolchain (stable, via `rustup`)
-- An Emberlink event store (SQLite file) — omit `--db` to use an in-memory store for testing
+- daemon-backed by default
+- talks to the local daemon socket unless `--no-daemon` is passed
+- exposes both grant tools and daemon observability tools
+- intended as a preview integration surface, not the primary friendly-drop
+  onboarding lane
 
 ## Build
 
@@ -14,85 +19,105 @@ cargo build -p emberlink-mcp --release
 # binary at: target/release/emberlink-mcp
 ```
 
-## Claude Desktop config
+## Usage
 
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
+```text
+emberlink-mcp [OPTIONS]
+```
+
+### Flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--persona <ID>` | `default` | Persona ID to operate as |
+| `--label <LABEL>` | `emberlink-mcp` | Human-readable label for this MCP server |
+| `--daemon-socket <PATH>` | `$HOME/.ember/run/daemon.sock` | Path to the local daemon Unix socket |
+| `--db <PATH>` | in-memory | Optional local EventStore path retained for compatibility/tests; daemon-backed grant flows do not require it |
+| `--no-daemon` | off | Disable daemon transport and run fail-closed for daemon-backed tools |
+
+## Minimal Claude / MCP client wiring
 
 ```json
 {
   "mcpServers": {
-    "emberlink": {
-      "command": "/path/to/target/release/emberlink-mcp",
+    "ember": {
+      "command": "emberlink-mcp",
       "args": [
-        "--db", "/path/to/emberlink.db",
-        "--persona", "default",
-        "--label", "claude-desktop"
+        "--persona", "my-agent-persona",
+        "--daemon-socket", "${HOME}/.ember/run/daemon.sock"
       ]
     }
   }
 }
 ```
 
-Replace `/path/to/target/release/emberlink-mcp` with the absolute path to the built binary. The `--db` path should point to your Emberlink event store.
-
 ## Tools
 
-| Tool | Description | Required params | Optional params |
-|------|-------------|-----------------|-----------------|
-| `whoami` | Get the agent's current identity (persona ID and label) | — | — |
-| `list_grants` | List all active grants for this agent | — | — |
-| `request_grant` | Request a new scoped, time-bound grant | `scope` (string), `duration_secs` (integer) | `resource_id` (string), `reason` (string) |
-| `grant_status` | Check the status of a specific grant request | `grant_id` (string) | — |
-| `use_credential` | Use a credential through an active grant | `grant_id` (string), `credential_id` (string) | — |
+| Tool | Description | Required params |
+|---|---|---|
+| `whoami` | Get the agent identity (`persona_id`, label) | none |
+| `list_grants` | List active grants for the caller persona | none |
+| `request_grant` | Request daemon-mediated access to a credential-bearing action | `scope`, `resource_id`, `duration_secs` |
+| `grant_status` | Check status of a grant or approval id | `grant_id` |
+| `use_credential` | Redeem an active grant | `grant_id`, `credential_id` |
+| `list_receipts` | List emitted Grant Receipts | none |
+| `get_receipt` | Fetch a single receipt by id | `id` |
+| `grant_budget_status` | Read budget/lifecycle status for a grant | `grant_id` |
 
-### Example invocations
+## Request shape notes
 
-**whoami** — identify the agent:
+### `request_grant`
+
+For daemon-backed flows, `resource_id` is required so the request can be routed
+through the daemon policy engine with the correct synthesized action. A minimal
+request looks like:
+
 ```json
-{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"whoami","arguments":{}}}
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "request_grant",
+    "arguments": {
+      "scope": "repo:read",
+      "resource_id": "github-token",
+      "duration_secs": 3600,
+      "reason": "CI run"
+    }
+  }
+}
 ```
 
-**list_grants** — see what the agent can currently do:
-```json
-{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_grants","arguments":{}}}
-```
+When policy auto-approves, the tool can return an already-approved result. When
+approval is required, it returns a pending request id that can be polled via
+`grant_status`.
 
-**request_grant** — ask for access to a scope:
-```json
-{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"request_grant","arguments":{
-  "scope": "read:passwords",
-  "duration_secs": 3600,
-  "reason": "filling login form"
-}}}
-```
-Returns `{"status":"pending","request_id":"req-..."}`. The human approves or denies out-of-band.
+### `grant_status`
 
-**grant_status** — poll approval state:
-```json
-{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"grant_status","arguments":{
-  "grant_id": "req-abc123"
-}}}
-```
+`grant_status` accepts either:
 
-**use_credential** — redeem an approved grant:
-```json
-{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"use_credential","arguments":{
-  "grant_id": "grant-abc123",
-  "credential_id": "cred-xyz789"
-}}}
-```
+- a pending approval/request id from `request_grant`
+- an active grant id
 
-## CLI flags
+The returned JSON shape reflects which one the daemon resolved.
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--db <path>` | in-memory | Path to the SQLite event store |
-| `--persona <id>` | `default` | Persona ID for the agent session |
-| `--label <label>` | `emberlink-mcp` | Human-readable label for this server instance |
+## Fail-closed behavior
+
+Without a daemon link, daemon-backed tools do not fall back to local state.
+
+- `request_grant`
+- `list_grants`
+- `grant_status`
+- `use_credential`
+- receipt/budget tools
+
+all return tool errors when the daemon is unavailable or when `--no-daemon` is
+used.
 
 ## Protocol
 
-- Transport: JSON-RPC 2.0 over stdio (newline-delimited)
+- transport: JSON-RPC 2.0 over stdio (newline-delimited)
 - MCP protocol version: `2024-11-05`
-- Request size limit: 1 MB per line
-- Tool errors are returned as `isError: true` content, not JSON-RPC errors
+- maximum line length: 1 MB
+- tool failures are surfaced as MCP tool results with `isError: true`

@@ -4,7 +4,7 @@
 //! ships `ember trust show <root-id>` drill-down. Phase 3 ships
 //! `ember trust explain <artifact-path>` chain walk (binary_manifest +
 //! receipt artifact kinds at minimum; workflow_grant lands in
-//! implementation-note-400).
+//! implementation-note-410).
 //!
 //! All three surfaces are wired in `crates/emberlink-cli/src/bin/ember.rs`
 //! via `TrustAction::{List,Show,Explain}` dispatch arms. Daemon-side
@@ -19,7 +19,7 @@
 //! Component 4 (`ember trust backup` / `ember trust restore`) lives in
 //! the `backup` + `restore` submodules — encrypted IR export for
 //! cross-workstation portability + F-AUTHORITY-3/4 recovery.
-//! Anchor: `trust_backup_restore_landed` (implementation-note-30).
+//! Anchor: `trust_backup_restore_landed` (implementation-note-32).
 
 pub mod backup;
 pub mod explain;

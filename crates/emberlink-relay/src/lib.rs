@@ -738,35 +738,35 @@ pub enum Command {
     ShutdownNotice(ShutdownNotice),
     Drain(String),
     Submission,
-    /// Deposit a grant offer envelope: DEPOSIT_OFFER <offer-id> <expires-at-epoch> <hex-payload>
+    /// Deposit a grant offer envelope: `DEPOSIT_OFFER <offer-id> <expires-at-epoch> <hex-payload>`
     DepositOffer {
         offer_id: String,
         expires_at: u64,
         payload: Vec<u8>,
     },
-    /// Fetch a grant offer envelope by ID: FETCH_OFFER <offer-id>
+    /// Fetch a grant offer envelope by ID: `FETCH_OFFER <offer-id>`
     FetchOffer(String),
-    /// Claim (consume) a grant offer: CLAIM_OFFER <offer-id>
+    /// Claim (consume) a grant offer: `CLAIM_OFFER <offer-id>`
     ClaimOffer(String),
-    /// Atomically fetch and claim a grant offer: FETCH_AND_CLAIM <offer-id>
+    /// Atomically fetch and claim a grant offer: `FETCH_AND_CLAIM <offer-id>`
     FetchAndClaimOffer(String),
-    /// Deposit an encrypted credential: DEPOSIT_CREDENTIAL <grant-id> <hex-payload>
+    /// Deposit an encrypted credential: `DEPOSIT_CREDENTIAL <grant-id> <hex-payload>`
     DepositCredential {
         grant_id: String,
         payload: Vec<u8>,
     },
-    /// Fetch a stored credential: FETCH_CREDENTIAL <grant-id>
+    /// Fetch a stored credential: `FETCH_CREDENTIAL <grant-id>`
     FetchCredential(String),
-    /// Request a grant from a human identity: REQUEST_GRANT <target-id> <requester-id> <scope> <justification>
+    /// Request a grant from a human identity: `REQUEST_GRANT <target-id> <requester-id> <scope> <justification>`
     RequestGrant {
         target_id: String,
         requester_id: String,
         scope: String,
         justification: String,
     },
-    /// Fetch pending grant requests for a target identity: FETCH_GRANT_REQUESTS <target-id>
+    /// Fetch pending grant requests for a target identity: `FETCH_GRANT_REQUESTS <target-id>`
     FetchGrantRequests(String),
-    /// Respond to a grant request: RESPOND_GRANT_REQUEST <request-id> <approved|denied>
+    /// Respond to a grant request: `RESPOND_GRANT_REQUEST <request-id> <approved|denied>`
     RespondGrantRequest {
         request_id: String,
         approved: bool,

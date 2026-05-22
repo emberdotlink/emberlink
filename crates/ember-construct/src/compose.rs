@@ -1,6 +1,6 @@
 //! Compose V2 manifest → bollard Docker engine spec translator.
 //!
-//! implementation-note-91 (per /design review
+//! implementation-note-93 (per /design review
 //! 20260517-201622 orbstack-trust Decision 4: Compose V2 as the
 //! declarative spec). This module takes a parsed [`ComposeManifest`]
 //! and produces a [`DockerContainerSpec`] — a bundle of
@@ -14,7 +14,7 @@
 //! fields a Construct spawn actually needs: `image`, `command`,
 //! `entrypoint`, `environment` (map or list form), `volumes`,
 //! `network_mode`, and `labels`. The sibling slice
-//! implementation-note-95 is meant to provide a richer
+//! implementation-note-98 is meant to provide a richer
 //! [`ComposeManifest`] type — when it lands, this module re-exports
 //! the canonical one and deletes the local fallback. Until then, the
 //! local definition is the substrate; downstream callers should import
@@ -77,7 +77,7 @@ use serde::{Deserialize, Serialize};
 /// structure so a callable can keep a single canonical document.
 ///
 /// **Stop-gap module location:** the sibling slice
-/// implementation-note-95 lands the canonical
+/// implementation-note-98 lands the canonical
 /// `ComposeManifest` type used cross-crate. This local definition keeps
 /// Slice C compilable in isolation; when the canonical type lands we
 /// `pub use` it here and delete the local struct.
@@ -249,7 +249,7 @@ pub enum ComposeTranslationError {
     },
 
     /// The manifest had `services: {}` (or didn't pick a single
-    /// service via [`compose_manifest_to_docker_spec`]).
+    /// service via [`crate::docker::compose_manifest_to_docker_spec`]).
     #[error("compose manifest has no services to translate")]
     NoServices,
 

@@ -1,5 +1,5 @@
 //! Integration tests for `ember vault list/get/put/export/import`
-//! (implementation-note-442).
+//! (implementation-note-458).
 //!
 //! The argv-parsing surface lives in `bin/ember.rs`; the round-trip
 //! semantics live in `emberlink_cli::vault_io`. These tests exercise:

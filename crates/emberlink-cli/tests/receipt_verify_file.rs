@@ -14,9 +14,9 @@ fn ember_bin() -> &'static str {
 
 fn run(args: &[&str]) -> (String, String, i32) {
     // ember-cli eager-loads `~/.ember/config.toml` before dispatching subcommands
-    // (implementation-note-445 loud-fail). receipt verify --file/--tree/
+    // (implementation-note-462 loud-fail). receipt verify --file/--tree/
     // --materialization don't actually need the config, but the eager-load runs
-    // anyway — see implementation-note-502.
+    // anyway — see implementation-note-535.
     // Until the structural fix ships, point EMBER_CONFIG at a writable tempdir
     // for these tests so they pass on hosts without a host-level ~/.ember/config.toml.
     let tmp = tempfile::tempdir().expect("config tempdir");
@@ -73,7 +73,7 @@ fn verify_file_with_nonexistent_path_errors() {
 #[test]
 fn verify_file_with_garbage_json_errors() {
     // EMBER_CONFIG env-pin per the run() helper's rationale (see top of file +
-    // implementation-note-502).
+    // implementation-note-535).
     let tmp = tempfile::tempdir().expect("config tempdir");
     let config_path = tmp.path().join("config.toml");
     std::fs::write(
@@ -111,7 +111,7 @@ fn verify_file_with_garbage_json_errors() {
 }
 
 // ---------------------------------------------------------------------------
-// v2 dispatch tests (implementation-note-503)
+// v2 dispatch tests (implementation-note-536)
 // ---------------------------------------------------------------------------
 
 /// Build a signed v2 ReceiptEnvelope using the deterministic FixtureSigner,

@@ -3,15 +3,15 @@
 //! server-side (untrusts the shim).
 //!
 //! Coverage (cohort-A scope catalog):
-//!   - publish [tarball|dir]      → npm.publish.<registry-host>
-//!   - version <newversion>       → npm.version
-//!   - install / i / add          → npm.install.<registry-host>
-//!   - ci                         → npm.ci.<registry-host>
-//!   - run-script / run / start
-//!     / test / restart / stop    → npm.run-script
-//!   - audit fix                  → npm.audit-fix
-//!   - deprecate <pkg> <msg>      → npm.deprecate.<registry-host>
-//!   - dist-tag <add|rm|set> ...  → npm.dist-tag.<registry-host>
+//!   - `publish [tarball|dir]`      → `npm.publish.<registry-host>`
+//!   - `version <newversion>`       → `npm.version`
+//!   - `install / i / add`          → `npm.install.<registry-host>`
+//!   - `ci`                         → `npm.ci.<registry-host>`
+//!   - `run-script / run / start /
+//!     test / restart / stop`       → `npm.run-script`
+//!   - `audit fix`                  → `npm.audit-fix`
+//!   - `deprecate <pkg> <msg>`      → `npm.deprecate.<registry-host>`
+//!   - `dist-tag <add|rm|set> ...`  → `npm.dist-tag.<registry-host>`
 //!   - reads (ls / list / view / info / show / outdated / audit /
 //!     config get / search / ping / whoami) → None (passthrough)
 //!   - anything else              → None (passthrough)

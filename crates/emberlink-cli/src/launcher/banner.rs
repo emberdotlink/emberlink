@@ -68,7 +68,7 @@ impl BannerControl {
 /// JSON file — v0.1 uses JSON to avoid the toml-crate dep; storage format may
 /// upgrade to TOML in v0.2 with no behaviour change).
 ///
-/// Key shape: `<binary-name>@<version>` (e.g. `ember-claude-code@v0.3.0`).
+/// Key shape: `<binary-name>@<version>` (e.g. `ember-claude@v0.3.0`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LauncherState {
     #[serde(default)]
@@ -307,7 +307,7 @@ fn detect_posture_via_ps() -> Option<InstallPosture> {
 /// Render the banner (or skip it) per the design doc's gating rules.
 ///
 /// **Inputs:**
-/// - `binary_name` — e.g. `"ember-claude-code"` (for the state-file key).
+/// - `binary_name` — e.g. `"ember-claude"` (for the state-file key).
 /// - `binary_version` — e.g. `"v0.3.0"`.
 /// - `posture` — output of [`detect_install_posture`].
 /// - `control` — [`BannerControl`] from CLI flags + env.
@@ -370,7 +370,7 @@ pub const BANNER_TEMPLATE: &str = r#"
 │  Ember Construct gate — v0.3.0 posture notice                       │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
-│  ember-claude-code is starting under the SINGLE-UID install         │
+│  ember-claude is starting under the SINGLE-UID install              │
 │  default. This is the dev0 friction-survival posture; it ships      │
 │  before the production-grade SEPARATE-UID posture (design) is      │
 │  default.                                                           │
@@ -434,7 +434,7 @@ pub const BANNER_SINGLE_UID: &str = r#"
 │                                                                     │
 │  Daemon under your uid (dev-mode; relaxed threat model)             │
 │                                                                     │
-│  ember-claude-code is starting under the SINGLE-UID install         │
+│  ember-claude is starting under the SINGLE-UID install              │
 │  default. This is the dev0 friction-survival posture; it ships      │
 │  before the production-grade SEPARATE-UID posture (design) is      │
 │  default.                                                           │
@@ -492,7 +492,7 @@ mod tests {
         let mut out = Vec::new();
         let mut input = Cursor::new(b"\n" as &[u8]);
         let rendered = maybe_render(
-            "ember-claude-code",
+            "ember-claude",
             "v0.3.0",
             InstallPosture::SeparateUid,
             &BannerControl::default(),
@@ -512,7 +512,7 @@ mod tests {
             "SeparateUid banner must reference design"
         );
         let loaded = LauncherState::load(&state_path);
-        assert!(loaded.is_acknowledged("ember-claude-code", "v0.3.0"));
+        assert!(loaded.is_acknowledged("ember-claude", "v0.3.0"));
     }
 
     #[test]
@@ -521,7 +521,7 @@ mod tests {
         let mut out = Vec::new();
         let mut input = Cursor::new(b"\n" as &[u8]);
         let rendered = maybe_render(
-            "ember-claude-code",
+            "ember-claude",
             "v0.3.0",
             InstallPosture::SingleUid,
             &BannerControl::default(),
@@ -540,7 +540,7 @@ mod tests {
         assert!(s.contains("design"));
         // State written + key marked.
         let loaded = LauncherState::load(&state_path);
-        assert!(loaded.is_acknowledged("ember-claude-code", "v0.3.0"));
+        assert!(loaded.is_acknowledged("ember-claude", "v0.3.0"));
     }
 
     #[test]
@@ -549,7 +549,7 @@ mod tests {
         // Pre-seed acknowledgment.
         let mut s = LauncherState::default();
         s.acknowledgments.insert(
-            LauncherState::key("ember-claude-code", "v0.3.0"),
+            LauncherState::key("ember-claude", "v0.3.0"),
             "2026-05-05T12:00:00+00:00".into(),
         );
         s.save(&state_path).unwrap();
@@ -557,7 +557,7 @@ mod tests {
         let mut out = Vec::new();
         let mut input = Cursor::new(b"\n" as &[u8]);
         let rendered = maybe_render(
-            "ember-claude-code",
+            "ember-claude",
             "v0.3.0",
             InstallPosture::SingleUid,
             &BannerControl::default(),
@@ -576,7 +576,7 @@ mod tests {
         let mut out = Vec::new();
         let mut input = Cursor::new(b"\n" as &[u8]);
         let rendered = maybe_render(
-            "ember-claude-code",
+            "ember-claude",
             "v0.3.0",
             InstallPosture::SingleUid,
             &BannerControl {
@@ -593,7 +593,7 @@ mod tests {
         // Crucially: NOT acknowledged — next run without --no-banner shows it.
         assert!(
             !state_path.exists()
-                || !LauncherState::load(&state_path).is_acknowledged("ember-claude-code", "v0.3.0")
+                || !LauncherState::load(&state_path).is_acknowledged("ember-claude", "v0.3.0")
         );
     }
 
@@ -604,7 +604,7 @@ mod tests {
         // Empty input — verify we don't block on read_line.
         let mut input = Cursor::new(b"" as &[u8]);
         let rendered = maybe_render(
-            "ember-claude-code",
+            "ember-claude",
             "v0.3.0",
             InstallPosture::SingleUid,
             &BannerControl {
@@ -618,7 +618,7 @@ mod tests {
         .unwrap();
         assert!(rendered);
         let loaded = LauncherState::load(&state_path);
-        assert!(loaded.is_acknowledged("ember-claude-code", "v0.3.0"));
+        assert!(loaded.is_acknowledged("ember-claude", "v0.3.0"));
     }
 
     #[test]
@@ -627,7 +627,7 @@ mod tests {
         // Acknowledge v0.3.0.
         let mut s = LauncherState::default();
         s.acknowledgments.insert(
-            LauncherState::key("ember-claude-code", "v0.3.0"),
+            LauncherState::key("ember-claude", "v0.3.0"),
             "2026-05-05T12:00:00+00:00".into(),
         );
         s.save(&state_path).unwrap();
@@ -636,7 +636,7 @@ mod tests {
         let mut out = Vec::new();
         let mut input = Cursor::new(b"\n" as &[u8]);
         let rendered = maybe_render(
-            "ember-claude-code",
+            "ember-claude",
             "v0.3.1",
             InstallPosture::SingleUid,
             &BannerControl::default(),
@@ -647,8 +647,8 @@ mod tests {
         .unwrap();
         assert!(rendered);
         let loaded = LauncherState::load(&state_path);
-        assert!(loaded.is_acknowledged("ember-claude-code", "v0.3.0"));
-        assert!(loaded.is_acknowledged("ember-claude-code", "v0.3.1"));
+        assert!(loaded.is_acknowledged("ember-claude", "v0.3.0"));
+        assert!(loaded.is_acknowledged("ember-claude", "v0.3.1"));
     }
 
     #[test]

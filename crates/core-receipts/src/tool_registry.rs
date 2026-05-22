@@ -1,4 +1,4 @@
-//! Registry of known ember-X tools (implementation-note-70).
+//! Registry of known ember-X tools (implementation-note-72).
 //!
 //! Receipts reference tools by id (e.g. `ember-aws`); the registry tells
 //! the verifier whether a tool is recognized and what credential provider
