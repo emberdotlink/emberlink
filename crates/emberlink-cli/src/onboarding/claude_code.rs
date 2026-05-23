@@ -1,4 +1,4 @@
-//! `ember init --for claude-code` and `ember uninstall --for claude-code`
+//! `ember init --for claude` and `ember uninstall --for claude`
 //! orchestration (implementation-note-468).
 //!
 //! Per design §2 / §3: a one-command first-run setup that wires Claude Code
@@ -19,7 +19,7 @@
 //!      `ember vault add --name github-pat`, but init no longer captures
 //!      PATs interactively.
 //!   6. Print the next two commands per design §2:
-//!      `ember claude-code` and `ember receipt show`.
+//!      `ember claude` and `ember receipt show`.
 //!
 //! The uninstall flow reverses (4) by removing only the lines we added; the
 //! other artifacts (persona, grant, vault entry) are intentionally left in
@@ -249,6 +249,22 @@ pub fn print_next_commands(posture: GitHubOnboardingPosture) {
     print!("{}", next_commands_text(posture));
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LauncherBoundaryNote {
+    pub detail: String,
+    pub repair_guidance: String,
+}
+
+pub fn print_next_commands_with_launcher_boundary(
+    posture: GitHubOnboardingPosture,
+    launcher_boundary: Option<&LauncherBoundaryNote>,
+) {
+    print!(
+        "{}",
+        next_commands_with_launcher_boundary_text(posture, launcher_boundary)
+    );
+}
+
 fn next_commands_text(posture: GitHubOnboardingPosture) -> String {
     let mut lines = vec!["", "Next steps:"];
     match posture {
@@ -291,6 +307,21 @@ fn next_commands_text(posture: GitHubOnboardingPosture) -> String {
         "surfaces, but they are intentionally outside the friendly default.",
     ]);
     lines.join("\n") + "\n"
+}
+
+fn next_commands_with_launcher_boundary_text(
+    posture: GitHubOnboardingPosture,
+    launcher_boundary: Option<&LauncherBoundaryNote>,
+) -> String {
+    let mut out = next_commands_text(posture);
+    if let Some(note) = launcher_boundary {
+        out.push('\n');
+        out.push_str("Host launcher boundary\n");
+        out.push_str("----------------------\n");
+        let _ = writeln!(out, "Installed host launcher: {}", note.detail);
+        let _ = writeln!(out, "Repair first: {}", note.repair_guidance);
+    }
+    out
 }
 
 /// Render GitHub onboarding guidance for the current posture.
@@ -354,7 +385,7 @@ pub fn print_github_onboarding_guidance(posture: GitHubOnboardingPosture) -> io:
 /// path is correct for the canonical "production user" install (single
 /// always-up daemon per login session) — but it baked an absolute `~/.ember/`
 /// path resolved against the operator's *real* HOME at install time, so an
-/// `init --for claude-code` invocation under an isolated `HOME=/tmp/...`
+/// `init --for claude` invocation under an isolated `HOME=/tmp/...`
 /// would write a service file pointing at the production socket while the
 /// Returns `true` only when the invocation is running in the canonical
 /// friendly-install topology:
@@ -362,7 +393,7 @@ pub fn print_github_onboarding_guidance(posture: GitHubOnboardingPosture) -> io:
 ///     `/private/var/`), AND
 ///   - `config` is `None` (no `--config` / `EMBER_CONFIG` override).
 ///
-/// `ember init` and `ember init --for claude-code` may only offer to run the
+/// `ember init` and `ember init --for claude` may only offer to run the
 /// managed separate-uid installer in this topology. In isolated HOME / custom
 /// config environments, running `sudo ember daemon install` would provision
 /// the operator's real installed daemon instead of the isolated test target,
@@ -655,12 +686,28 @@ mod tests {
 
     #[test]
     fn next_commands_text_names_broken_app_lane_as_repair_path() {
-        let text = next_commands_text(GitHubOnboardingPosture::AppBroken(
-            "github/apps/ember/install-123: partial credential triple".to_string(),
-        ));
+        let text = next_commands_text(
+            GitHubOnboardingPosture::AppBroken(
+                "github/apps/ember/install-123: partial credential triple".to_string(),
+            ),
+        );
         assert!(text.contains("repair or replace the local App credential triple"));
         assert!(text.contains("confirm the App lane is healthy"));
         assert!(text.contains("launch once GitHub is repaired"));
+    }
+
+    #[test]
+    fn next_commands_text_surfaces_launcher_boundary_when_present() {
+        let text = next_commands_with_launcher_boundary_text(
+            GitHubOnboardingPosture::AppConfiguredReal,
+            Some(&LauncherBoundaryNote {
+                detail: "/usr/local/bin/ember -> /usr/local/lib/ember.app/Contents/MacOS/ember (older than managed runtime surface: /usr/local/bin/emberd)".to_string(),
+                repair_guidance: "Repair the installed `ember` launcher path first: /usr/local/bin/ember is older than the managed daemon/construct binaries on this host. Reinstall the managed CLI artifact or release package so `/usr/local/bin/ember` matches the runtime surface. `sudo ember daemon install` refreshes daemon/runtime sidecars, but it does not rebuild `/usr/local/lib/ember.app`.".to_string(),
+            }),
+        );
+        assert!(text.contains("Host launcher boundary"));
+        assert!(text.contains("Installed host launcher: /usr/local/bin/ember ->"));
+        assert!(text.contains("does not rebuild `/usr/local/lib/ember.app`"));
     }
 
     // ── implementation-note-509 tests ───────────────────────
@@ -672,17 +719,17 @@ mod tests {
     /// #[ignore] for the real process-spawn variant (which the operator runs
     /// manually per T4 protocol).
     #[test]
-    #[ignore = "T4 manual: requires real ember binary + keychain; run `ember daemon stop && ember init --for claude-code`"]
+    #[ignore = "T4 manual: requires real ember binary + keychain; run `ember daemon stop && ember init --for claude`"]
     fn init_for_claude_code_autostarts_daemon_when_not_running() {
         // Manual T4 invariant: with the daemon stopped, `ember init --for
-        // claude-code` should:
+        // claude` should:
         //   1. Detect live daemon absence.
         //   2. Call `install_agent` (or background spawn on unsupported platform).
         //   3. Print "started managed daemon service".
         //   4. Wait for the daemon's socket/RPC seam to become live (up to 5s).
         //   5. Proceed with persona + grant + settings.json patch.
         // Outcome: daemon is alive AND init completed successfully.
-        unimplemented!("run manually: ember daemon stop && ember init --for claude-code")
+        unimplemented!("run manually: ember daemon stop && ember init --for claude")
     }
 
     // ── implementation-note-508 tests ───────────────────────
@@ -774,10 +821,10 @@ mod tests {
     /// managed daemon into the wrong topology. Marked #[ignore] so it doesn't
     /// run in CI — invoked manually by the operator per T3 protocol.
     #[test]
-    #[ignore = "T3 manual: HOME=/tmp/t3-... target/release/ember init --for claude-code"]
+    #[ignore = "T3 manual: HOME=/tmp/t3-... target/release/ember init --for claude"]
     fn init_for_claude_code_refuses_managed_install_in_isolated_home() {
         // Manual T3 invariant: with an isolated HOME=/tmp/t3-..., `ember
-        // init --for claude-code` should:
+        // init --for claude` should:
         //   1. Detect socket absence under $HOME/.ember/.
         //   2. Refuse the automatic managed-daemon install
         //      (supports_managed_daemon_install → false).
@@ -786,7 +833,7 @@ mod tests {
         // Outcome: no same-uid daemon is spawned under the isolated HOME.
         unimplemented!(
             "run manually: HOME=/tmp/t3-XXX EMBER_KEYRING_SERVICE=... \
-             target/release/ember init --for claude-code"
+             target/release/ember init --for claude"
         )
     }
 
@@ -798,12 +845,12 @@ mod tests {
     #[ignore = "T4 manual: requires real ember binary + keychain; run with daemon already started"]
     fn init_for_claude_code_uses_existing_daemon_when_running() {
         // Manual T4 invariant: with the daemon running, `ember init --for
-        // claude-code` should:
+        // claude` should:
         //   1. Detect socket presence.
         //   2. Print "daemon already running (socket ...)".
         //   3. NOT attempt daemon-service autostart (no double-start).
         //   4. Proceed with persona + grant + settings.json patch.
         // Outcome: daemon still alive (same PID) AND init completed successfully.
-        unimplemented!("run manually with daemon pre-started: ember init --for claude-code")
+        unimplemented!("run manually with daemon pre-started: ember init --for claude")
     }
 }

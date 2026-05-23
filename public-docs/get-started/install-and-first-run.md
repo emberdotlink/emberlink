@@ -8,10 +8,10 @@
 The current canonical onboarding flow is:
 
 1. Install `ember`
-2. Run `ember init --for claude-code`
+2. Run `ember init --for claude`
 3. Let the installer repair or provision the daemon if needed
 4. Confirm health with `ember status`
-5. Launch a managed session with `ember claude-code`
+5. Launch a managed session with `ember claude`
 
 ## Install
 
@@ -29,7 +29,7 @@ cargo install --locked --path crates/emberlink-cli --bin ember
 ## Run the canonical onboarding flow
 
 ```bash
-ember init --for claude-code
+ember init --for claude
 ```
 
 This is the load-bearing first-run path. It wires the Claude Code shadow shims
@@ -48,11 +48,10 @@ Use it before you start chasing lower-level commands.
 ## Launch a managed session
 
 ```bash
-ember claude-code
+ember claude
 ```
 
-If `ANTHROPIC_API_KEY` was present during `ember init --for claude-code`,
+If `ANTHROPIC_API_KEY` was present during `ember init --for claude`,
 Ember can reuse a brokered Claude runtime grant. Otherwise Claude's own
 upstream auth remains ambient while Ember still brokers the Git/GitHub/tool
 lane.
-

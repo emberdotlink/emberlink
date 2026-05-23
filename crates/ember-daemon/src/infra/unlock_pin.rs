@@ -46,6 +46,15 @@ pub type SessionId = String;
 /// `UnlockPinTracker::with_grace_window` constructor.
 pub const DEFAULT_GRACE_WINDOW: Duration = Duration::from_secs(300);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnlockPinSnapshot {
+    pub session_pin_count: usize,
+    pub grace_window_secs: u64,
+    pub grace_remaining_secs: u64,
+    pub grace_lock_pending: bool,
+    pub grace_zero_due: bool,
+}
+
 /// A live pin held by an open session against the interactive vault MEK.
 ///
 /// Two pins are equal iff their `session_id` matches — `acquired_at` is
@@ -221,6 +230,37 @@ impl UnlockPinTracker {
             None => false,
         }
     }
+
+    pub fn snapshot(&self) -> UnlockPinSnapshot {
+        self.snapshot_at(Instant::now())
+    }
+
+    pub fn snapshot_at(&self, now: Instant) -> UnlockPinSnapshot {
+        let state = self.inner.borrow();
+        let session_pin_count = state.pins.len();
+        let grace_remaining_secs = if session_pin_count == 0 {
+            match state.last_released_at {
+                Some(released_at) => self
+                    .grace_window
+                    .saturating_sub(now.saturating_duration_since(released_at))
+                    .as_secs(),
+                None => 0,
+            }
+        } else {
+            0
+        };
+        let grace_zero_due =
+            session_pin_count == 0 && state.last_released_at.is_some() && grace_remaining_secs == 0;
+        let grace_lock_pending =
+            session_pin_count == 0 && state.last_released_at.is_some() && !grace_zero_due;
+        UnlockPinSnapshot {
+            session_pin_count,
+            grace_window_secs: self.grace_window.as_secs(),
+            grace_remaining_secs,
+            grace_lock_pending,
+            grace_zero_due,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -305,6 +345,24 @@ mod tests {
         assert!(!tracker.should_zero_at(last_release + Duration::from_millis(500)));
         // Past grace from the LAST release: zero.
         assert!(tracker.should_zero_at(last_release + Duration::from_millis(1_100)));
+    }
+
+    #[test]
+    fn snapshot_reports_remaining_grace_time_not_just_configured_window() {
+        let tracker = UnlockPinTracker::with_grace_window(Duration::from_secs(5));
+        let t0 = Instant::now();
+        tracker.acquire_pin_at("sess_A".into(), t0);
+
+        let release_at = t0 + Duration::from_millis(100);
+        tracker.release_pin_at("sess_A", release_at);
+
+        let mid_grace = release_at + Duration::from_millis(500);
+        let snapshot = tracker.snapshot_at(mid_grace);
+        assert_eq!(snapshot.session_pin_count, 0);
+        assert_eq!(snapshot.grace_window_secs, 5);
+        assert_eq!(snapshot.grace_remaining_secs, 4);
+        assert!(snapshot.grace_lock_pending);
+        assert!(!snapshot.grace_zero_due);
     }
 
     #[test]

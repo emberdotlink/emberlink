@@ -55,7 +55,7 @@ use core_event_types::PregrantPath;
 use core_events::receipt::sign::sign_receipt_v2;
 use ed25519_dalek::SigningKey;
 
-use crate::binary_manifest::{BinaryManifest, ManifestVerifyError};
+use crate::binary_manifest::BinaryManifest;
 use crate::infra::claim_journal::{
     AuditEvidenceInput, ClaimJournal, ClaimScopeKind, ScopeRef, SqliteClaimJournal,
     SuccessfulClaimInput,
@@ -308,6 +308,56 @@ pub fn classify_argv_daemon_side(tool_name: &str, argv: &[String]) -> Option<Str
     Some(key.0)
 }
 
+fn known_wrapped_tool_name_from_binary_path(binary_path: &str) -> Option<String> {
+    let basename = std::path::Path::new(binary_path)
+        .file_name()?
+        .to_string_lossy();
+    let normalized = basename.strip_prefix("ember-").unwrap_or(&basename);
+    match normalized {
+        "gh" | "git" | "kubectl" => Some(normalized.to_string()),
+        _ => None,
+    }
+}
+
+fn daemon_classification_tool_name(
+    binary_path: &str,
+    manifest_lookup: Option<&(String, String)>,
+) -> Option<String> {
+    manifest_lookup
+        .map(|(tool_name, _publisher)| tool_name.clone())
+        .or_else(|| known_wrapped_tool_name_from_binary_path(binary_path))
+}
+
+fn append_ephemeral_git_config_entry(
+    env: &mut std::collections::HashMap<String, String>,
+    key: &str,
+    value: &str,
+) {
+    let index = env
+        .get("GIT_CONFIG_COUNT")
+        .and_then(|count| count.parse::<usize>().ok())
+        .unwrap_or(0);
+    env.insert("GIT_CONFIG_COUNT".to_string(), (index + 1).to_string());
+    env.insert(format!("GIT_CONFIG_KEY_{index}"), key.to_string());
+    env.insert(format!("GIT_CONFIG_VALUE_{index}"), value.to_string());
+}
+
+fn inject_ephemeral_git_safe_directory(
+    env: &mut std::collections::HashMap<String, String>,
+    binary_path: &str,
+) {
+    // Host broker_exec runs git-family tools under a pool uid distinct from
+    // the operator's uid. Git therefore treats ordinary operator-owned repos
+    // as dubious unless we provide an ephemeral safe.directory override. Keep
+    // the override process-local to this child; do not mutate host gitconfig.
+    if matches!(
+        known_wrapped_tool_name_from_binary_path(binary_path).as_deref(),
+        Some("gh" | "git")
+    ) {
+        append_ephemeral_git_config_entry(env, "safe.directory", "*");
+    }
+}
+
 /// Extract the remote-name positional from a daemon-side tool invocation.
 ///
 /// Sibling to [`classify_argv_daemon_side`]. Calls
@@ -517,9 +567,27 @@ pub struct BrokerExecResponse {
     pub exit_code: i32,
     /// True iff exit_code == 0.
     pub success: bool,
+    /// Truncated stdout (last 64 KiB) for headless brokered commands.
+    /// Empty on PTY and spawn-helper paths where output is streamed or
+    /// otherwise unavailable to the RPC reply.
+    pub stdout_tail: String,
     /// Truncated stderr (last 4 KiB) for diagnostics. Stdout is NOT
-    /// captured — Constructs should write durable output to files.
+    /// interleaved with stderr — the non-PTY path returns the two streams
+    /// separately and the construct runtime replays them to the caller.
     pub stderr_tail: String,
+}
+
+fn capture_text_tail(bytes: &[u8], cap: usize) -> String {
+    let full = String::from_utf8_lossy(bytes);
+    if full.len() > cap {
+        format!(
+            "...[{} bytes truncated]...{}",
+            full.len() - cap,
+            &full[full.len() - cap..]
+        )
+    } else {
+        full.into_owned()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2394,7 +2462,9 @@ pub fn check_principal_against_persona(
     // enrollment table is now the sole source of truth. No-binding
     // preserves the legacy fail-open posture for legacy personas that
     // pre-date the per-agent UDS enrollment surface.
-    let bound_uid = match crate::infra::store::lookup_persona_uid_from_enrollments(store, persona_id) {
+    let bound_uid = match crate::infra::store::lookup_persona_uid_from_enrollments(
+        store, persona_id,
+    ) {
         Ok(Some(uid)) => uid,
         Ok(None) | Err(_) => return Ok(()),
     };
@@ -3806,7 +3876,7 @@ pub async fn handle_broker_mint_sub_persona(
 /// Refusal contracts:
 /// - `-32021 (pool not configured)` — the global pool was not
 ///   installed at startup (no `[spawn_pool]` in config.toml).
-///   Operator action: run `ember daemon install` (or rerun with
+///   Operator action: run `sudo ember daemon install` (or rerun with
 ///   `--upgrade`) to provision the pool, then restart the daemon.
 /// - `-32021 (pool exhausted)` — every uid is currently in use.
 ///   Operator action: raise `[spawn_pool] uids = [...]` count and
@@ -3881,6 +3951,291 @@ fn resolve_broker_exec_uid_lease(
     }
 
     Ok(lease)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostDirectNonPtySpawnRoute {
+    SpawnHelper,
+    ExecDomainSubuid,
+    DirectSetuid,
+}
+
+fn select_host_direct_non_pty_spawn_route(
+    spawn_lease: Option<&crate::broker::uid_alloc::UidLease>,
+) -> HostDirectNonPtySpawnRoute {
+    #[cfg(unix)]
+    if let Some(lease) = spawn_lease {
+        let current_uid = nix::unistd::geteuid().as_raw();
+        let current_gid = nix::unistd::getegid().as_raw();
+        if lease.uid() == current_uid && lease.gid() == current_gid {
+            return HostDirectNonPtySpawnRoute::DirectSetuid;
+        }
+    }
+
+    if cfg!(target_os = "linux") && spawn_lease.is_some_and(|lease| lease.is_subuid()) {
+        HostDirectNonPtySpawnRoute::ExecDomainSubuid
+    } else if spawn_lease.is_some() && crate::broker::spawn_helper_client::should_use_spawn_helper()
+    {
+        HostDirectNonPtySpawnRoute::SpawnHelper
+    } else {
+        HostDirectNonPtySpawnRoute::DirectSetuid
+    }
+}
+
+fn build_spawn_helper_directive(
+    req: &BrokerExecRequest,
+    env: &HashMap<String, String>,
+    cwd: &str,
+    spawn_lease: &crate::broker::uid_alloc::UidLease,
+) -> Result<ember_spawn_helper::SpawnDirective, (i32, String)> {
+    let binary_path = PathBuf::from(&req.binary);
+    let content_hash_blake3 =
+        ember_spawn_helper::hash::blake3_hex_of_file(&binary_path).map_err(|e| {
+            (
+                -32000,
+                format!(
+                    "spawn-helper hash read failed for {}: {e}",
+                    binary_path.display()
+                ),
+            )
+        })?;
+
+    let mut argv = Vec::with_capacity(req.argv.len() + 1);
+    argv.push(req.binary.clone());
+    argv.extend(req.argv.iter().cloned());
+
+    let mut env_pairs: Vec<(String, String)> =
+        env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    env_pairs.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+    Ok(ember_spawn_helper::SpawnDirective {
+        protocol_version: ember_spawn_helper::WIRE_VERSION,
+        binary_path,
+        argv,
+        env: env_pairs,
+        cwd: PathBuf::from(cwd),
+        target_uid: spawn_lease.uid(),
+        target_gid: spawn_lease.gid(),
+        content_hash_blake3,
+        chroot_dir: None,
+        sandbox_profile: None,
+        seccomp_filter: None,
+        invocation_id: None,
+    })
+}
+
+fn map_spawn_helper_error(
+    err: crate::broker::spawn_helper_client::SpawnHelperError,
+) -> (i32, String) {
+    use crate::broker::spawn_helper_client::SpawnHelperError;
+
+    match err {
+        SpawnHelperError::Connect { .. }
+        | SpawnHelperError::NoReply
+        | SpawnHelperError::Timeout { .. } => (
+            -32021,
+            format!(
+                "spawn-helper unavailable: {err}; re-run `sudo ember daemon install` and restart the daemon"
+            ),
+        ),
+        SpawnHelperError::HashMismatch { .. } => {
+            (-32030, format!("construct_hash_mismatch: {err}"))
+        }
+        SpawnHelperError::ShimHashMismatch { detail } => (
+            -32032,
+            detail
+                .map(|d| format!("spawn-helper shim hash mismatch: {d}"))
+                .unwrap_or_else(|| "spawn-helper shim hash mismatch".to_string()),
+        ),
+        SpawnHelperError::Refused { reason, detail } => (
+            -32000,
+            match detail {
+                Some(detail) if !detail.is_empty() => {
+                    format!("spawn-helper refused {reason}: {detail}")
+                }
+                _ => format!("spawn-helper refused {reason}"),
+            },
+        ),
+        SpawnHelperError::Frame(_)
+        | SpawnHelperError::UnexpectedFrame(_)
+        | SpawnHelperError::UnsupportedPlatform => {
+            (-32000, format!("spawn-helper protocol error: {err}"))
+        }
+    }
+}
+
+async fn spawn_host_direct_via_spawn_helper(
+    req: &BrokerExecRequest,
+    env: &HashMap<String, String>,
+    cwd: &str,
+    spawn_lease: &crate::broker::uid_alloc::UidLease,
+) -> Result<(i32, String), (i32, String)> {
+    let directive = build_spawn_helper_directive(req, env, cwd, spawn_lease)?;
+    let socket_path = crate::broker::spawn_helper_client::default_socket_path();
+    let exit_code =
+        crate::broker::spawn_helper_client::send_spawn_directive(&socket_path, directive, None)
+            .await
+            .map_err(map_spawn_helper_error)?;
+    Ok((exit_code, String::new()))
+}
+
+#[cfg(test)]
+mod host_direct_non_pty_route_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn sample_broker_exec_request(binary: String) -> BrokerExecRequest {
+        BrokerExecRequest {
+            binary,
+            argv: vec![
+                "pr".to_string(),
+                "list".to_string(),
+                "--limit".to_string(),
+                "1".to_string(),
+            ],
+            cwd: Some("/tmp/emberlink-worktree".to_string()),
+            env_passthrough: vec![],
+            pty_socket_path: None,
+            ssh_agent: false,
+            on_shim_eof: None,
+            claimed_action: None,
+            action_env_allowlist: None,
+            action_key: None,
+            construct_toml_bytes: None,
+            scion_exec_socket: None,
+            scion_target_uid: 0,
+            scion_target_gid: 0,
+            secret_ref: None,
+        }
+    }
+
+    #[test]
+    fn build_spawn_helper_directive_preserves_cwd_and_binary_argv0() {
+        let binary = std::env::current_exe()
+            .expect("current_exe")
+            .to_string_lossy()
+            .into_owned();
+        let req = sample_broker_exec_request(binary.clone());
+        let pool = Arc::new(crate::broker::uid_alloc::UidPool::new(vec![10010], 10010));
+        let lease = pool
+            .checkout("spawn-helper-directive-test")
+            .expect("checkout");
+        let env = HashMap::from([
+            ("HOME".to_string(), "/tmp/emberd-home".to_string()),
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+        ]);
+
+        let directive = build_spawn_helper_directive(&req, &env, "/tmp/emberlink-worktree", &lease)
+            .expect("directive");
+
+        assert_eq!(directive.cwd, PathBuf::from("/tmp/emberlink-worktree"));
+        assert_eq!(directive.argv[0], binary);
+        assert_eq!(directive.argv[1], "pr");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_system_user_leases_route_via_spawn_helper() {
+        let pool = Arc::new(crate::broker::uid_alloc::UidPool::new(vec![10010], 10010));
+        let lease = pool.checkout("macos-helper-route").expect("checkout");
+
+        assert_eq!(
+            select_host_direct_non_pty_spawn_route(Some(&lease)),
+            HostDirectNonPtySpawnRoute::SpawnHelper
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_subuid_leases_route_via_execution_domain() {
+        let pool = Arc::new(crate::broker::uid_alloc::UidPool::new_subuid(
+            vec![100000],
+            100000,
+        ));
+        let lease = pool.checkout("linux-subuid-route").expect("checkout");
+
+        assert_eq!(
+            select_host_direct_non_pty_spawn_route(Some(&lease)),
+            HostDirectNonPtySpawnRoute::ExecDomainSubuid
+        );
+    }
+
+    #[test]
+    fn daemon_classification_tool_name_falls_back_to_known_binary_basename() {
+        let tool = daemon_classification_tool_name("/opt/homebrew/bin/gh", None);
+        assert_eq!(tool.as_deref(), Some("gh"));
+
+        let action = tool
+            .as_deref()
+            .and_then(|tool_name| classify_argv_daemon_side(tool_name, &sample_broker_exec_request("/opt/homebrew/bin/gh".to_string()).argv));
+        assert_eq!(action.as_deref(), Some("gh.pr_list"));
+    }
+
+    #[test]
+    fn daemon_classification_tool_name_prefers_manifest_lookup_when_present() {
+        let manifest_lookup = Some(("ember-gh".to_string(), "did:emberlink".to_string()));
+        let tool = daemon_classification_tool_name("/opt/homebrew/bin/gh", manifest_lookup.as_ref());
+        assert_eq!(tool.as_deref(), Some("ember-gh"));
+    }
+
+    #[test]
+    fn current_identity_leases_stay_on_direct_route() {
+        let current_uid = nix::unistd::geteuid().as_raw();
+        let current_gid = nix::unistd::getegid().as_raw();
+        let pool = Arc::new(crate::broker::uid_alloc::UidPool::new(
+            vec![current_uid],
+            current_gid,
+        ));
+        let lease = pool.checkout("current-identity-route").expect("checkout");
+
+        assert_eq!(
+            select_host_direct_non_pty_spawn_route(Some(&lease)),
+            HostDirectNonPtySpawnRoute::DirectSetuid
+        );
+    }
+
+    #[test]
+    fn append_ephemeral_git_config_entry_initializes_count_and_pair() {
+        let mut env = HashMap::new();
+        append_ephemeral_git_config_entry(&mut env, "safe.directory", "*");
+        assert_eq!(env.get("GIT_CONFIG_COUNT").map(|v| v.as_str()), Some("1"));
+        assert_eq!(
+            env.get("GIT_CONFIG_KEY_0").map(|v| v.as_str()),
+            Some("safe.directory")
+        );
+        assert_eq!(
+            env.get("GIT_CONFIG_VALUE_0").map(|v| v.as_str()),
+            Some("*")
+        );
+    }
+
+    #[test]
+    fn inject_ephemeral_git_safe_directory_appends_after_git_rewrite_entries() {
+        let mut env = HashMap::new();
+        let injection = ember_construct::CredentialInjection::GitHttpRewrite {
+            hosts: &["github.com"],
+        };
+        apply_credential_to_env("{plaintext}", &injection, &mut env);
+
+        inject_ephemeral_git_safe_directory(&mut env, "/opt/homebrew/bin/git");
+
+        assert_eq!(env.get("GIT_CONFIG_COUNT").map(|v| v.as_str()), Some("2"));
+        assert_eq!(
+            env.get("GIT_CONFIG_KEY_1").map(|v| v.as_str()),
+            Some("safe.directory")
+        );
+        assert_eq!(
+            env.get("GIT_CONFIG_VALUE_1").map(|v| v.as_str()),
+            Some("*")
+        );
+    }
+
+    #[test]
+    fn inject_ephemeral_git_safe_directory_skips_non_git_binaries() {
+        let mut env = HashMap::new();
+        inject_ephemeral_git_safe_directory(&mut env, "/usr/local/bin/kubectl");
+        assert!(env.is_empty(), "non git-family tools must not get safe.directory");
+    }
 }
 
 /// Handle the `broker_exec` socket RPC.
@@ -4057,9 +4412,10 @@ pub async fn handle_broker_exec(
     // refuse on mismatch with a structured Receipt + JSON-RPC error. Grant
     // evaluation downstream uses `daemon_action`, NEVER `req.claimed_action`.
     let manifest_lookup = lookup_binary_in_manifest(&req.binary);
-    let daemon_action: Option<String> = manifest_lookup
-        .as_ref()
-        .and_then(|(tool_name, _publisher)| classify_argv_daemon_side(tool_name, &req.argv));
+    let daemon_action: Option<String> =
+        daemon_classification_tool_name(&req.binary, manifest_lookup.as_ref())
+            .as_deref()
+            .and_then(|tool_name| classify_argv_daemon_side(tool_name, &req.argv));
     // DCC-5: extract remote-name positional alongside the action key so DCC-6
     // can use it in the remote-binding allowlist check.
     let _daemon_remote_name: Option<String> = manifest_lookup
@@ -4131,15 +4487,12 @@ pub async fn handle_broker_exec(
     // Drop unlinks the directory and reclaims the inode. Daemon uid owns the
     // dir, so the spawned child (running as the daemon uid in the host-direct
     // path) can read+write inside it without inheriting operator-owned state.
-    let exec_home = tempfile::Builder::new()
-        .prefix("emberd-exec-home-")
-        .tempdir()
-        .map_err(|e| {
-            (
-                -32000,
-                format!("failed to allocate broker_exec HOME tempdir: {e}"),
-            )
-        })?;
+    let exec_home = allocate_broker_exec_home().map_err(|e| {
+        (
+            -32000,
+            format!("failed to allocate broker_exec HOME tempdir: {e}"),
+        )
+    })?;
     env.insert(
         "HOME".to_string(),
         exec_home.path().to_string_lossy().into_owned(),
@@ -4396,6 +4749,7 @@ pub async fn handle_broker_exec(
         .filter(|k| !env_keys_pre_mint.contains(*k))
         .cloned()
         .collect();
+    inject_ephemeral_git_safe_directory(&mut env, &req.binary);
 
     // Spawn a daemon-managed ssh-agent for this session when requested
     // (implementation-note-85). The handle lives for the duration of
@@ -4480,7 +4834,7 @@ pub async fn handle_broker_exec(
         ));
     }
 
-    let (exit_code, stderr_tail) = if let Some(ref scion_sock) = req.scion_exec_socket {
+    let (exit_code, stdout_tail, stderr_tail) = if let Some(ref scion_sock) = req.scion_exec_socket {
         // implementation-note-112: in-container exec path.
         // emberd dispatches the binary via the in-container `ember-exec`
         // listener — UDS connect, write `SpawnDirective`, drive frames
@@ -4607,7 +4961,7 @@ pub async fn handle_broker_exec(
                 );
             }
 
-            (exit_code, String::new())
+            (exit_code, String::new(), String::new())
         }
         #[cfg(not(unix))]
         {
@@ -4658,7 +5012,7 @@ pub async fn handle_broker_exec(
                 tracing::warn!(error = %e, "broker_exec pty: bridge returned error (child exit still reported)");
             }
             shim_outcome = outcome;
-            (exit_code, String::new())
+            (exit_code, String::new(), String::new())
         }
         #[cfg(not(unix))]
         {
@@ -4668,6 +5022,15 @@ pub async fn handle_broker_exec(
                 "pty_socket_path is not supported on this platform".to_string(),
             ));
         }
+    } else if select_host_direct_non_pty_spawn_route(spawn_lease.as_ref())
+        == HostDirectNonPtySpawnRoute::SpawnHelper
+    {
+        let lease = spawn_lease
+            .as_ref()
+            .expect("spawn-helper route requires a host-direct uid lease");
+        let (exit_code, stderr_tail) =
+            spawn_host_direct_via_spawn_helper(&req, &env, &cwd, lease).await?;
+        (exit_code, String::new(), stderr_tail)
     } else if cfg!(target_os = "linux") && spawn_lease.as_ref().is_some_and(|l| l.is_subuid()) {
         // design Component 2 — modern-Linux execution-domain path.
         // The lease was minted from a subuid-range pool (the install
@@ -4751,9 +5114,9 @@ pub async fn handle_broker_exec(
             .exit_code
             .or_else(|| exit_status.signal.map(|s| 128 + s))
             .unwrap_or(-1);
-        (exit_code, exit_status.stderr_tail)
+        (exit_code, String::new(), exit_status.stderr_tail)
     } else {
-        // Non-PTY path: tokio::process::Command with piped stderr.
+        // Non-PTY path: tokio::process::Command with piped stdout/stderr.
         //
         // implementation-note-54 Phase 1 (Linux only): when
         // `EMBER_BROKER_SEAL_CREDS=1` is set on the daemon, replace any
@@ -4797,83 +5160,123 @@ pub async fn handle_broker_exec(
         // kernel snapshots envp at execve, so standard tools (gh, git,
         // aws) see plaintext under the expected name once the binary
         // starts.
-        let mut command = tokio::process::Command::new(&req.binary);
-        command
-            .args(&req.argv)
-            .current_dir(&cwd)
-            .env_clear()
-            .envs(&env_for_spawn)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null()) // NOT captured; Constructs use files
-            .stderr(std::process::Stdio::piped());
+        #[cfg(target_os = "macos")]
+        let output = {
+            let binary = req.binary.clone();
+            let argv = req.argv.clone();
+            let cwd_clone = cwd.clone();
+            let env_pairs: Vec<(String, String)> = env_for_spawn.into_iter().collect();
+            let target_uid = spawn_lease.as_ref().map(|l| l.uid());
+            let target_gid = spawn_lease.as_ref().map(|l| l.gid());
 
-        #[cfg(unix)]
-        if let Some(ref lease) = spawn_lease {
-            use std::os::unix::process::CommandExt;
-            // CommandExt::uid/gid are on std::process::Command;
-            // tokio's Command::as_std_mut surfaces the underlying
-            // builder so we can attach the privilege drop without
-            // bypassing tokio's wait/output machinery.
-            command.as_std_mut().uid(lease.uid()).gid(lease.gid());
-        }
-
-        #[cfg(target_os = "linux")]
-        if let Some(sealed) = _sealed_env.as_ref() {
-            let key_fd_map = sealed.key_fd_map();
-            // SAFETY: pre_exec runs post-fork pre-execve, single-threaded.
-            // The closure only performs async-signal-safe operations
-            // (libc::read via read_sealed_fd, std::env::set_var/remove_var,
-            // libc::close). The plaintext String drops at end of the closure
-            // body; the child's address space is fully replaced at execve so
-            // a kernel-level scrub isn't required — the kernel snapshot at
-            // execve sees the rewritten env (plaintext under <KEY>, no
-            // <KEY>_FD remainder).
-            unsafe {
+            // The installed macOS daemon runs inside the launchd SBPL sandbox
+            // with per-spawn uid drop enabled. In that posture, the Tokio
+            // async pipe wrapper can return empty stdout/stderr tails even
+            // when the child executed and wrote output successfully. Keep the
+            // fork/exec privilege-drop contract, but use std's synchronous
+            // capture path on a blocking worker so the daemon still surfaces
+            // headless construct output on macOS.
+            tokio::task::spawn_blocking(move || -> Result<std::process::Output, std::io::Error> {
                 use std::os::unix::process::CommandExt;
-                command.pre_exec(move || {
-                    for (key, fd) in &key_fd_map {
-                        let plaintext =
-                            crate::broker::exec_env::read_sealed_fd(*fd).map_err(|e| {
-                                std::io::Error::new(
-                                    std::io::ErrorKind::Other,
-                                    format!("read_sealed_fd({key}_FD={fd}) failed: {e}"),
-                                )
-                            })?;
-                        // Set <KEY>=<plaintext> in the child's env, remove
-                        // <KEY>_FD=<n>, close the inherited fd.
-                        std::env::set_var(key, &plaintext);
-                        std::env::remove_var(format!("{key}_FD"));
-                        libc::close(*fd);
-                        // plaintext drops here; the Rust allocator may
-                        // reuse the buffer post-execve but the child's
-                        // address space is fully replaced at execve so
-                        // a kernel-level scrub isn't required.
-                    }
-                    Ok(())
-                });
-            }
-        }
 
-        let output = command
-            .output()
+                let mut command = std::process::Command::new(&binary);
+                command
+                    .args(&argv)
+                    .current_dir(&cwd_clone)
+                    .env_clear()
+                    .envs(env_pairs)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
+
+                if let Some(uid) = target_uid {
+                    command.uid(uid);
+                }
+                if let Some(gid) = target_gid {
+                    command.gid(gid);
+                }
+
+                command.output()
+            })
             .await
-            .map_err(|e| (-32000, format!("spawn failed: {e}")))?;
+            .map_err(|e| (-32000, format!("spawn capture task panicked: {e}")))?
+            .map_err(|e| (-32000, format!("spawn failed: {e}")))?
+        };
+
+        #[cfg(not(target_os = "macos"))]
+        let output = {
+            let mut command = tokio::process::Command::new(&req.binary);
+            command
+                .args(&req.argv)
+                .current_dir(&cwd)
+                .env_clear()
+                .envs(&env_for_spawn)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+
+            #[cfg(unix)]
+            if let Some(ref lease) = spawn_lease {
+                use std::os::unix::process::CommandExt;
+                // CommandExt::uid/gid are on std::process::Command;
+                // tokio's Command::as_std_mut surfaces the underlying
+                // builder so we can attach the privilege drop without
+                // bypassing tokio's wait/output machinery.
+                command.as_std_mut().uid(lease.uid()).gid(lease.gid());
+            }
+
+            #[cfg(target_os = "linux")]
+            if let Some(sealed) = _sealed_env.as_ref() {
+                let key_fd_map = sealed.key_fd_map();
+                // SAFETY: pre_exec runs post-fork pre-execve, single-threaded.
+                // The closure only performs async-signal-safe operations
+                // (libc::read via read_sealed_fd, std::env::set_var/remove_var,
+                // libc::close). The plaintext String drops at end of the closure
+                // body; the child's address space is fully replaced at execve so
+                // a kernel-level scrub isn't required — the kernel snapshot at
+                // execve sees the rewritten env (plaintext under <KEY>, no
+                // <KEY>_FD remainder).
+                unsafe {
+                    use std::os::unix::process::CommandExt;
+                    command.pre_exec(move || {
+                        for (key, fd) in &key_fd_map {
+                            let plaintext =
+                                crate::broker::exec_env::read_sealed_fd(*fd).map_err(|e| {
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::Other,
+                                        format!("read_sealed_fd({key}_FD={fd}) failed: {e}"),
+                                    )
+                                })?;
+                            // Set <KEY>=<plaintext> in the child's env, remove
+                            // <KEY>_FD=<n>, close the inherited fd.
+                            std::env::set_var(key, &plaintext);
+                            std::env::remove_var(format!("{key}_FD"));
+                            libc::close(*fd);
+                            // plaintext drops here; the Rust allocator may
+                            // reuse the buffer post-execve but the child's
+                            // address space is fully replaced at execve so
+                            // a kernel-level scrub isn't required.
+                        }
+                        Ok(())
+                    });
+                }
+            }
+
+            command
+                .output()
+                .await
+                .map_err(|e| (-32000, format!("spawn failed: {e}")))?
+        };
 
         let exit_code = output.status.code().unwrap_or(-1);
-
-        // Tail stderr — keep last 4 KiB for diagnostics.
+        // Tail stdout/stderr for the JSON-RPC reply. stdout is preserved so
+        // headless brokered commands (Claude/Codex/bash tool lanes) can still
+        // surface useful command output when no PTY bridge is active.
+        const STDOUT_TAIL_CAP: usize = 64 * 1024;
         const STDERR_TAIL_CAP: usize = 4096;
-        let stderr_full = String::from_utf8_lossy(&output.stderr);
-        let stderr_tail = if stderr_full.len() > STDERR_TAIL_CAP {
-            format!(
-                "...[{} bytes truncated]...{}",
-                stderr_full.len() - STDERR_TAIL_CAP,
-                &stderr_full[stderr_full.len() - STDERR_TAIL_CAP..]
-            )
-        } else {
-            stderr_full.into_owned()
-        };
-        (exit_code, stderr_tail)
+        let stdout_tail = capture_text_tail(&output.stdout, STDOUT_TAIL_CAP);
+        let stderr_tail = capture_text_tail(&output.stderr, STDERR_TAIL_CAP);
+        (exit_code, stdout_tail, stderr_tail)
     };
 
     let elapsed_ms = started_at.elapsed().as_millis() as u64;
@@ -4986,6 +5389,7 @@ pub async fn handle_broker_exec(
     let resp = BrokerExecResponse {
         exit_code,
         success,
+        stdout_tail,
         stderr_tail,
     };
     serde_json::to_value(resp).map_err(|e| (-32000, format!("serialize BrokerExecResponse: {e}")))
@@ -5292,6 +5696,25 @@ fn maybe_seal_credentials_in_env(
             );
             (None, env.clone())
         }
+    }
+}
+
+fn allocate_broker_exec_home() -> std::io::Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("emberd-exec-home-");
+
+    #[cfg(target_os = "macos")]
+    {
+        // The installed launchd sandbox only allows writes under
+        // `/tmp/emberd-*` and `/private/tmp/emberd-*`. Using the ambient
+        // `std::env::temp_dir()` resolves to `/var/folders/.../T` under
+        // launchd, which causes broker_exec to fail before the child runs.
+        return builder.tempdir_in("/tmp");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        builder.tempdir()
     }
 }
 
@@ -7847,6 +8270,18 @@ mod tests {
 
     use crate::infra::credential_store::CredentialStore;
 
+    fn broker_exec_home_is_sandbox_safe(path: &str) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            path.starts_with("/tmp/emberd-") || path.starts_with("/private/tmp/emberd-")
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            std::path::Path::new(path).starts_with(std::env::temp_dir())
+        }
+    }
+
     // -----------------------------------------------------------------------
     // implementation-note-181 tests
     // -----------------------------------------------------------------------
@@ -8788,6 +9223,8 @@ mod tests {
         let resp: BrokerExecResponse = serde_json::from_value(resp_value).expect("deserialize");
         assert_eq!(resp.exit_code, 0);
         assert!(resp.success);
+        assert_eq!(resp.stdout_tail, "hello world\n");
+        assert!(resp.stderr_tail.is_empty());
     }
 
     #[tokio::test]
@@ -8803,6 +9240,38 @@ mod tests {
         let resp: BrokerExecResponse = serde_json::from_value(resp_value).expect("deserialize");
         assert_ne!(resp.exit_code, 0);
         assert!(!resp.success);
+    }
+
+    #[tokio::test]
+    async fn broker_exec_surfaces_stdout_tail_on_non_pty_path() {
+        let store = DaemonStore::open_in_memory().expect("in-memory store");
+        let req = serde_json::json!({
+            "binary": "/bin/sh",
+            "argv": ["-c", "printf 'stdout-visible'; exit 1"],
+            "cwd": null,
+            "env_passthrough": [],
+        });
+        let resp_value = handle_broker_exec(None, &store, &req).await.expect("ok");
+        assert_eq!(
+            resp_value.get("exit_code").and_then(|v| v.as_i64()),
+            Some(1),
+            "probe command should fail so the output path is observable"
+        );
+        assert_eq!(
+            resp_value.get("stdout_tail").and_then(|v| v.as_str()),
+            Some("stdout-visible"),
+            "non-PTY broker_exec must preserve child stdout for headless launcher shims"
+        );
+    }
+
+    #[test]
+    fn allocate_broker_exec_home_uses_sandbox_safe_root() {
+        let dir = allocate_broker_exec_home().expect("broker_exec HOME tempdir");
+        let observed = dir.path().to_string_lossy();
+        assert!(
+            broker_exec_home_is_sandbox_safe(&observed),
+            "broker_exec HOME tempdir must stay under the sandbox-safe temp roots: {observed}"
+        );
     }
 
     #[tokio::test]
@@ -9270,9 +9739,8 @@ mod tests {
             "broker_exec child HOME must be set (got empty string)"
         );
         assert!(
-            std::path::Path::new(&observed_home).starts_with(std::env::temp_dir()),
-            "broker_exec child HOME ({observed_home}) should live under the system tempdir ({:?})",
-            std::env::temp_dir()
+            broker_exec_home_is_sandbox_safe(&observed_home),
+            "broker_exec child HOME ({observed_home}) should live under the sandbox-safe temp roots"
         );
     }
 
@@ -12091,6 +12559,8 @@ classify_argv = "pr merge *"
             spiffe_uri: "spiffe://emberlink.dev/agent/presence-test".to_string(),
             nonce_hex: hex::encode([0x11u8, 0x22, 0x33, 0x44]),
             persona_id: persona_id.to_string(),
+            prompt_id: None,
+            reason: None,
             caller_persona: None,
             ttl_ms: None,
         }

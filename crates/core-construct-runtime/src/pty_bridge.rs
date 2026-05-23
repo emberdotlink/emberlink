@@ -190,6 +190,13 @@ pub fn pty_bridge_client(listener: UnixListener, done: Arc<Mutex<bool>>) {
         if let Ok(d) = done.lock()
             && *d
         {
+            // The daemon only replies after the child has exited, but the UDS
+            // can still have unread child output buffered locally. Drain once
+            // before teardown so fast-failing tools don't lose their final
+            // auth/error text when the main thread flips `done = true`.
+            if let Err(e) = drain_daemon_output(&mut read_stream, &mut stdout, &mut buf) {
+                tracing::debug!(error = %e, "pty bridge: drain on done");
+            }
             break;
         }
 
@@ -262,15 +269,9 @@ pub fn pty_bridge_client(listener: UnixListener, done: Arc<Mutex<bool>>) {
         }
 
         // Read from daemon (child pty output) → our stdout.
-        match read_stream.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                if stdout.write_all(&buf[..n]).is_err() {
-                    break;
-                }
-                stdout.flush().ok();
-            }
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+        match drain_daemon_output(&mut read_stream, &mut stdout, &mut buf) {
+            Ok(DaemonOutputDrain::Eof) => break,
+            Ok(DaemonOutputDrain::WouldBlock) => {}
             Err(e) => {
                 tracing::debug!(error = %e, "pty bridge: read from daemon");
                 break;
@@ -286,6 +287,40 @@ pub fn pty_bridge_client(listener: UnixListener, done: Arc<Mutex<bool>>) {
                 PumpStdin::Eof => stdin_eof = true,
                 PumpStdin::WriteError => break,
             }
+        }
+    }
+}
+
+enum DaemonOutputDrain {
+    WouldBlock,
+    Eof,
+}
+
+fn drain_daemon_output<R: Read, W: Write>(
+    read_stream: &mut R,
+    stdout: &mut W,
+    buf: &mut [u8],
+) -> io::Result<DaemonOutputDrain> {
+    let mut wrote_any = false;
+    loop {
+        match read_stream.read(buf) {
+            Ok(0) => {
+                if wrote_any {
+                    stdout.flush()?;
+                }
+                return Ok(DaemonOutputDrain::Eof);
+            }
+            Ok(n) => {
+                stdout.write_all(&buf[..n])?;
+                wrote_any = true;
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                if wrote_any {
+                    stdout.flush()?;
+                }
+                return Ok(DaemonOutputDrain::WouldBlock);
+            }
+            Err(e) => return Err(e),
         }
     }
 }
@@ -332,6 +367,7 @@ fn pump_stdin_once<R: Read, W: Write>(
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::{collections::VecDeque, io};
 
     /// Regression for implementation-note-24.
     ///
@@ -408,5 +444,62 @@ mod tests {
         let outcome = pump_stdin_once(&mut stdin, &mut buf, &mut sink);
         assert!(matches!(outcome, PumpStdin::Continue));
         assert!(sink.is_empty());
+    }
+
+    enum ScriptedRead {
+        Data(&'static [u8]),
+        WouldBlock,
+        Eof,
+    }
+
+    struct ScriptedReader {
+        reads: VecDeque<ScriptedRead>,
+    }
+
+    impl Read for ScriptedReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.reads.pop_front().expect("scripted read step") {
+                ScriptedRead::Data(bytes) => {
+                    buf[..bytes.len()].copy_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+                ScriptedRead::WouldBlock => {
+                    Err(io::Error::new(io::ErrorKind::WouldBlock, "scripted"))
+                }
+                ScriptedRead::Eof => Ok(0),
+            }
+        }
+    }
+
+    #[test]
+    fn drain_daemon_output_flushes_all_pending_chunks_before_wouldblock() {
+        let mut reader = ScriptedReader {
+            reads: VecDeque::from(vec![
+                ScriptedRead::Data(b"gh auth "),
+                ScriptedRead::Data(b"failed"),
+                ScriptedRead::WouldBlock,
+            ]),
+        };
+        let mut stdout = Vec::<u8>::new();
+        let mut buf = [0u8; 32];
+
+        let outcome = drain_daemon_output(&mut reader, &mut stdout, &mut buf).expect("drain ok");
+
+        assert!(matches!(outcome, DaemonOutputDrain::WouldBlock));
+        assert_eq!(stdout, b"gh auth failed");
+    }
+
+    #[test]
+    fn drain_daemon_output_preserves_bytes_before_eof() {
+        let mut reader = ScriptedReader {
+            reads: VecDeque::from(vec![ScriptedRead::Data(b"final stderr"), ScriptedRead::Eof]),
+        };
+        let mut stdout = Vec::<u8>::new();
+        let mut buf = [0u8; 32];
+
+        let outcome = drain_daemon_output(&mut reader, &mut stdout, &mut buf).expect("drain ok");
+
+        assert!(matches!(outcome, DaemonOutputDrain::Eof));
+        assert_eq!(stdout, b"final stderr");
     }
 }

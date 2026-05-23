@@ -7,9 +7,9 @@
 
 For the current pre-release surface, the top-level operator journey is:
 
-1. `ember init --for claude-code`
+1. `ember init --for claude`
 2. `ember status`
-3. `ember claude-code`
+3. `ember claude`
 
 Everything else should support that journey, not compete with it.
 
@@ -17,7 +17,7 @@ Everything else should support that journey, not compete with it.
 
 - `ember init`
 - `ember status`
-- `ember claude-code`
+- `ember claude`
 - `ember vault ...`
 - `ember grant ...`
 - `ember approval ...`
@@ -61,4 +61,3 @@ The current public-friendly docs should not center:
 The right public rule is: solve user jobs, not subsystem archaeology.
 
 For the wider command contract, see the [CLI reference](../reference/cli-reference/).
-

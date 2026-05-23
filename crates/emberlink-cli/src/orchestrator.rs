@@ -854,8 +854,9 @@ fn orchestrator_guidance_for_rpc(code: i32, message: &str) -> Option<String> {
     if code == -32001 && message.contains("authority_class_not_met") {
         return Some(
             "this orchestrator action needs operator presence on the daemon-managed vault lane. \
-             Re-run it from an interactive operator shell, approve the unlock flow if prompted, \
-             or run `ember vault unlock` first and retry."
+             Re-run it from an interactive operator shell and use the managed separate-uid \
+             biometric unlock flow when available, or restart the daemon with \
+             `EMBER_VAULT_PASSPHRASE` for a fresh dev-probe bootstrap."
                 .to_string(),
         );
     }
@@ -867,7 +868,9 @@ fn orchestrator_guidance_for_rpc(code: i32, message: &str) -> Option<String> {
     {
         return Some(
             "this orchestrator action needs operator presence on the daemon-managed vault lane. \
-             Approve the unlock flow if prompted, or run `ember vault unlock` and retry."
+             Use the managed separate-uid biometric unlock flow when available, or restart the \
+             daemon with `EMBER_VAULT_PASSPHRASE` for a fresh dev-probe bootstrap; same-daemon \
+             operator-uid reopen is intentionally disabled."
                 .to_string(),
         );
     }
@@ -1765,18 +1768,20 @@ mod tests {
         )
         .expect("expected guidance");
         assert!(guidance.contains("operator presence"));
-        assert!(guidance.contains("ember vault unlock"));
+        assert!(guidance.contains("managed separate-uid biometric unlock"));
+        assert!(guidance.contains("EMBER_VAULT_PASSPHRASE"));
     }
 
     #[test]
     fn orchestrator_guidance_maps_locked_session() {
         let guidance = orchestrator_guidance_for_rpc(
             -32030,
-            "orchestrator_root denied: session is locked; reopen with `ember vault unlock`",
+            "orchestrator_root denied: session is locked; same-daemon operator-uid reopen is disabled to avoid legacy login-keychain prompts",
         )
         .expect("expected guidance");
         assert!(guidance.contains("operator presence"));
-        assert!(guidance.contains("ember vault unlock"));
+        assert!(guidance.contains("managed separate-uid biometric unlock"));
+        assert!(guidance.contains("EMBER_VAULT_PASSPHRASE"));
     }
 
     /// Beat 4 — proxy_call events render as the demo's display line.

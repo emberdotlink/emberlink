@@ -89,6 +89,10 @@ fn print_version() -> String {
     )
 }
 
+fn daemon_install_launcher_boundary_note() -> &'static str {
+    "`sudo ember daemon install` refreshes daemon/runtime sidecars, but it does not rebuild `/usr/local/lib/ember.app` or refresh `/usr/local/bin/ember`. Reinstall the managed CLI artifact or release package if the host launcher changed."
+}
+
 /// Resolve the credential value for `ember vault add` / `ember vault put`
 /// from the safe input flags (`--stdin`, `--file <path>`, terminal prompt).
 ///
@@ -235,12 +239,212 @@ enum StatusActionDispatch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct VaultStatusView {
+    posture: String,
+    unlocked: bool,
+    live_vault_attached: bool,
+    session_pin_count: usize,
+    grace_window_secs: u64,
+    grace_remaining_secs: u64,
+    grace_lock_pending: bool,
+    grace_zero_due: bool,
+    idle_secs: Option<u64>,
+    idle_timeout_secs: u64,
+    quiet_hours_start: Option<u8>,
+    quiet_hours_end: Option<u8>,
+}
+
+impl VaultStatusView {
+    fn from_json(value: &serde_json::Value) -> Result<Self, core_types::ValidationError> {
+        let posture = value["posture"]
+            .as_str()
+            .ok_or_else(|| core_types::ValidationError::new("vault_status: missing posture"))?
+            .to_string();
+        let unlocked = value["unlocked"]
+            .as_bool()
+            .ok_or_else(|| core_types::ValidationError::new("vault_status: missing unlocked"))?;
+        let live_vault_attached = value["live_vault_attached"].as_bool().ok_or_else(|| {
+            core_types::ValidationError::new("vault_status: missing live_vault_attached")
+        })?;
+        let session_pin_count = value["session_pin_count"].as_u64().ok_or_else(|| {
+            core_types::ValidationError::new("vault_status: missing session_pin_count")
+        })? as usize;
+        let grace_window_secs = value["grace_window_secs"].as_u64().ok_or_else(|| {
+            core_types::ValidationError::new("vault_status: missing grace_window_secs")
+        })?;
+        let grace_remaining_secs = value["grace_remaining_secs"].as_u64().ok_or_else(|| {
+            core_types::ValidationError::new("vault_status: missing grace_remaining_secs")
+        })?;
+        let grace_lock_pending = value["grace_lock_pending"].as_bool().ok_or_else(|| {
+            core_types::ValidationError::new("vault_status: missing grace_lock_pending")
+        })?;
+        let grace_zero_due = value["grace_zero_due"].as_bool().ok_or_else(|| {
+            core_types::ValidationError::new("vault_status: missing grace_zero_due")
+        })?;
+        let idle_timeout_secs = value["idle_timeout_secs"].as_u64().ok_or_else(|| {
+            core_types::ValidationError::new("vault_status: missing idle_timeout_secs")
+        })?;
+        let quiet_hours_start =
+            if value.get("quiet_hours_start").is_some() && !value["quiet_hours_start"].is_null() {
+                Some(value["quiet_hours_start"].as_u64().ok_or_else(|| {
+                    core_types::ValidationError::new("vault_status: invalid quiet_hours_start")
+                })? as u8)
+            } else {
+                None
+            };
+        let quiet_hours_end =
+            if value.get("quiet_hours_end").is_some() && !value["quiet_hours_end"].is_null() {
+                Some(value["quiet_hours_end"].as_u64().ok_or_else(|| {
+                    core_types::ValidationError::new("vault_status: invalid quiet_hours_end")
+                })? as u8)
+            } else {
+                None
+            };
+        let idle_secs = if value.get("idle_secs").is_some() && !value["idle_secs"].is_null() {
+            Some(value["idle_secs"].as_u64().ok_or_else(|| {
+                core_types::ValidationError::new("vault_status: invalid idle_secs")
+            })?)
+        } else {
+            None
+        };
+        Ok(Self {
+            posture,
+            unlocked,
+            live_vault_attached,
+            session_pin_count,
+            grace_window_secs,
+            grace_remaining_secs,
+            grace_lock_pending,
+            grace_zero_due,
+            idle_secs,
+            idle_timeout_secs,
+            quiet_hours_start,
+            quiet_hours_end,
+        })
+    }
+
+    fn local_fallback() -> Self {
+        Self {
+            posture: "hard-locked".to_string(),
+            unlocked: false,
+            live_vault_attached: false,
+            session_pin_count: 0,
+            grace_window_secs: 0,
+            grace_remaining_secs: 0,
+            grace_lock_pending: false,
+            grace_zero_due: false,
+            idle_secs: None,
+            idle_timeout_secs: 0,
+            quiet_hours_start: None,
+            quiet_hours_end: None,
+        }
+    }
+
+    fn summary_line(&self) -> String {
+        match self.posture.as_str() {
+            "interactive-unlocked" => format!(
+                "interactive-unlocked (live vault attached; {} session pin{})",
+                self.session_pin_count,
+                if self.session_pin_count == 1 { "" } else { "s" }
+            ),
+            "presence-locked-vault-pinned" => format!(
+                "presence-locked (live vault still attached; {} session pin{})",
+                self.session_pin_count,
+                if self.session_pin_count == 1 { "" } else { "s" }
+            ),
+            "presence-locked-vault-attached" if self.grace_lock_pending => format!(
+                "presence-locked (live vault still attached; {}s grace remaining)",
+                self.grace_remaining_secs
+            ),
+            "presence-locked-vault-attached" => {
+                "presence-locked (live vault still attached)".to_string()
+            }
+            "hard-locked" => "hard-locked (live vault detached)".to_string(),
+            other => other.to_string(),
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn render_vault_status_text(view: &VaultStatusView) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "VAULT LANE         {}", view.summary_line());
+    let _ = writeln!(
+        out,
+        "  Presence:  {}",
+        if view.unlocked { "unlocked" } else { "locked" }
+    );
+    let _ = writeln!(
+        out,
+        "  Live MEK:   {}",
+        if view.live_vault_attached {
+            "attached"
+        } else {
+            "detached"
+        }
+    );
+    let _ = writeln!(out, "  Session pins: {}", view.session_pin_count);
+    if let Some(idle_secs) = view.idle_secs {
+        let _ = writeln!(
+            out,
+            "  Idle:      {}s / {}s",
+            idle_secs, view.idle_timeout_secs
+        );
+    } else if view.idle_timeout_secs > 0 {
+        let _ = writeln!(out, "  Idle:      locked / {}s", view.idle_timeout_secs);
+    }
+    if view.grace_lock_pending {
+        let _ = writeln!(
+            out,
+            "  Grace:     active ({}s remaining)",
+            view.grace_remaining_secs
+        );
+    } else if view.grace_zero_due {
+        let _ = writeln!(out, "  Grace:     due (awaiting hard-lock cleanup)");
+    } else if view.grace_window_secs > 0 {
+        let _ = writeln!(
+            out,
+            "  Grace:     inactive ({}s window)",
+            view.grace_window_secs
+        );
+    }
+    match (view.quiet_hours_start, view.quiet_hours_end) {
+        (Some(start), Some(end)) => {
+            let _ = writeln!(out, "  Quiet hrs: {}:00-{}:00 UTC", start, end);
+        }
+        _ => {
+            let _ = writeln!(out, "  Quiet hrs: off");
+        }
+    }
+    out.trim_end().to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum InstalledLauncherIssue {
-    BrokenRepoBuildSymlink { path: PathBuf, target: PathBuf },
-    BrokenSymlink { path: PathBuf, target: PathBuf },
+    BrokenRepoBuildSymlink {
+        path: PathBuf,
+        target: PathBuf,
+    },
+    BrokenSymlink {
+        path: PathBuf,
+        target: PathBuf,
+    },
+    StaleManagedInstall {
+        path: PathBuf,
+        target: PathBuf,
+        newer_components: Vec<PathBuf>,
+    },
 }
 
 impl InstalledLauncherIssue {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::BrokenRepoBuildSymlink { .. } => "broken_repo_build_symlink",
+            Self::BrokenSymlink { .. } => "broken_symlink",
+            Self::StaleManagedInstall { .. } => "stale_managed_install",
+        }
+    }
+
     fn detail(&self) -> String {
         match self {
             Self::BrokenRepoBuildSymlink { path, target } => format!(
@@ -252,6 +456,20 @@ impl InstalledLauncherIssue {
                 "{} -> {} (missing target)",
                 path.display(),
                 target.display()
+            ),
+            Self::StaleManagedInstall {
+                path,
+                target,
+                newer_components,
+            } => format!(
+                "{} -> {} (older than managed runtime surface: {})",
+                path.display(),
+                target.display(),
+                newer_components
+                    .iter()
+                    .map(|component| component.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
         }
     }
@@ -268,7 +486,42 @@ impl InstalledLauncherIssue {
                 path.display(),
                 target.display()
             ),
+            Self::StaleManagedInstall { path, .. } => format!(
+                "Repair the installed `ember` launcher path first: {} is older than the managed daemon/construct binaries on this host. Reinstall the managed CLI artifact or release package so `/usr/local/bin/ember` matches the runtime surface. `sudo ember daemon install` refreshes daemon/runtime sidecars, but it does not rebuild `/usr/local/lib/ember.app`.",
+                path.display()
+            ),
         }
+    }
+}
+
+fn launcher_issue_json(launcher_issue: Option<&InstalledLauncherIssue>) -> serde_json::Value {
+    match launcher_issue {
+        Some(
+            issue @ InstalledLauncherIssue::BrokenRepoBuildSymlink { path, target }
+            | issue @ InstalledLauncherIssue::BrokenSymlink { path, target },
+        ) => serde_json::json!({
+            "kind": issue.kind(),
+            "path": path,
+            "target": target,
+            "detail": issue.detail(),
+            "repair_guidance": issue.repair_guidance(),
+            "newer_components": serde_json::Value::Null,
+        }),
+        Some(
+            issue @ InstalledLauncherIssue::StaleManagedInstall {
+                path,
+                target,
+                newer_components,
+            },
+        ) => serde_json::json!({
+            "kind": issue.kind(),
+            "path": path,
+            "target": target,
+            "detail": issue.detail(),
+            "repair_guidance": issue.repair_guidance(),
+            "newer_components": newer_components,
+        }),
+        None => serde_json::Value::Null,
     }
 }
 
@@ -279,8 +532,101 @@ struct VaultStoreResult {
 }
 
 const PROD_EMBER_LAUNCHER_PATH: &str = "/usr/local/bin/ember";
+const PROD_EMBER_APP_PATH: &str = "/usr/local/lib/ember.app/Contents/MacOS/ember";
+const PROD_EMBER_DAEMON_PATH: &str = "/usr/local/bin/emberd";
+const PROD_EMBER_PROXY_PATH: &str = "/usr/local/bin/ember-proxy";
+const PROD_EMBER_GH_PATH: &str = "/usr/local/lib/ember/binaries/ember-gh";
+const PROD_EMBER_GIT_PATH: &str = "/usr/local/lib/ember/binaries/ember-git";
+const PROD_EMBER_KUBECTL_PATH: &str = "/usr/local/lib/ember/binaries/ember-kubectl";
+const INSTALLED_LAUNCHER_DRIFT_THRESHOLD: Duration = Duration::from_secs(300);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CurrentLauncherLane {
+    InstalledHost { path: PathBuf },
+    RepoBuild { path: PathBuf },
+    Other { path: PathBuf },
+}
+
+impl CurrentLauncherLane {
+    fn detail(&self) -> String {
+        match self {
+            Self::InstalledHost { path } => format!(
+                "installed host (human dogfood lane) via {}",
+                path.display()
+            ),
+            Self::RepoBuild { path } => format!(
+                "repo build (no-sudo proof lane) via {}",
+                path.display()
+            ),
+            Self::Other { path } => format!("other binary via {}", path.display()),
+        }
+    }
+}
+
+fn detect_current_launcher_lane() -> Option<CurrentLauncherLane> {
+    let exe = std::env::current_exe().ok()?;
+    Some(classify_current_launcher_lane_at(&exe))
+}
+
+fn classify_current_launcher_lane_at(path: &Path) -> CurrentLauncherLane {
+    if path == Path::new(PROD_EMBER_LAUNCHER_PATH)
+        || path == Path::new(PROD_EMBER_APP_PATH)
+        || path.starts_with("/usr/local/lib/ember.app/")
+    {
+        return CurrentLauncherLane::InstalledHost {
+            path: path.to_path_buf(),
+        };
+    }
+
+    if path
+        .components()
+        .any(|component| component.as_os_str() == "target")
+        && path.file_name().is_some_and(|name| name == "ember")
+    {
+        return CurrentLauncherLane::RepoBuild {
+            path: path.to_path_buf(),
+        };
+    }
+
+    CurrentLauncherLane::Other {
+        path: path.to_path_buf(),
+    }
+}
 const CLAUDE_CODE_DEFAULT_SCOPE: &str = "claude-code-default-v1";
+const CODEX_DEFAULT_SCOPE: &str = "codex-default-v1";
 const CLAUDE_CODE_ANTHROPIC_RUNTIME_CREDENTIAL: &str = "anthropic-key";
+const CLAUDE_CODE_ANTHROPIC_OAUTH_RUNTIME_CREDENTIAL: &str = "anthropic/oauth-token";
+const CLAUDE_CODE_OAUTH_TOKEN_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnthropicRuntimeCredentialKind {
+    ApiKey,
+    OAuthToken,
+}
+
+impl AnthropicRuntimeCredentialKind {
+    fn credential_name(self) -> &'static str {
+        match self {
+            Self::ApiKey => CLAUDE_CODE_ANTHROPIC_RUNTIME_CREDENTIAL,
+            Self::OAuthToken => CLAUDE_CODE_ANTHROPIC_OAUTH_RUNTIME_CREDENTIAL,
+        }
+    }
+
+    fn env_var(self) -> &'static str {
+        match self {
+            Self::ApiKey => ANTHROPIC_API_KEY_ENV,
+            Self::OAuthToken => CLAUDE_CODE_OAUTH_TOKEN_ENV,
+        }
+    }
+
+    fn metadata(self) -> &'static str {
+        match self {
+            Self::ApiKey => "anthropic api key (claude code runtime)",
+            Self::OAuthToken => "claude subscription oauth token (claude code runtime)",
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 struct CompositeGrantCreateSpec {
@@ -306,8 +652,17 @@ impl CompositeGrantCreateSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AnthropicRuntimeCredentialAvailability {
     Absent,
-    ExistingVaultEntry,
-    StoredFromEnv,
+    ExistingVaultEntry(AnthropicRuntimeCredentialKind),
+    StoredFromEnv(AnthropicRuntimeCredentialKind),
+}
+
+impl AnthropicRuntimeCredentialAvailability {
+    fn credential_kind(self) -> Option<AnthropicRuntimeCredentialKind> {
+        match self {
+            Self::Absent => None,
+            Self::ExistingVaultEntry(kind) | Self::StoredFromEnv(kind) => Some(kind),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -316,6 +671,13 @@ struct ClaudeCodeGrantProvisioning {
     expires_at: Option<String>,
     created: bool,
     brokered_anthropic_runtime: bool,
+}
+
+#[derive(Debug, Clone)]
+struct CodexGrantProvisioning {
+    id: String,
+    expires_at: Option<String>,
+    created: bool,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -480,6 +842,30 @@ fn run_vault_unlock(
         let _ = Vault::open_from_config(config)
             .map_err(|e| core_types::ValidationError::new(format!("vault open: {e}")))?;
         Ok(VaultLockDispatch::LocalFallback)
+    }
+}
+
+fn run_vault_status(
+    config: &DaemonConfig,
+) -> Result<(VaultActionDispatch, VaultStatusView), core_types::ValidationError> {
+    let socket_path = config.socket_dir.join("daemon.sock");
+    if socket_path.exists() {
+        let result = emberlink_cli::call_daemon_method(
+            &socket_path,
+            "vault_status",
+            &serde_json::Value::Null,
+        )?;
+        Ok((
+            VaultActionDispatch::DaemonRpc,
+            VaultStatusView::from_json(&result)?,
+        ))
+    } else if uses_managed_separate_uid_topology(config) {
+        Err(managed_local_vault_fallback_refused())
+    } else {
+        Ok((
+            VaultActionDispatch::LocalFallback,
+            VaultStatusView::local_fallback(),
+        ))
     }
 }
 
@@ -688,26 +1074,69 @@ fn run_grant_create_composite(
     Ok((GrantActionDispatch::DaemonRpc, result))
 }
 
-fn is_anthropic_gateway_credential_name(credential_name: &str) -> bool {
-    credential_name == CLAUDE_CODE_ANTHROPIC_RUNTIME_CREDENTIAL
-        || credential_name.starts_with("anthropic/")
+fn claude_code_anthropic_runtime_credential_kind_from_name(
+    credential_name: &str,
+) -> Option<AnthropicRuntimeCredentialKind> {
+    match credential_name {
+        CLAUDE_CODE_ANTHROPIC_OAUTH_RUNTIME_CREDENTIAL => {
+            Some(AnthropicRuntimeCredentialKind::OAuthToken)
+        }
+        CLAUDE_CODE_ANTHROPIC_RUNTIME_CREDENTIAL => Some(AnthropicRuntimeCredentialKind::ApiKey),
+        _ => None,
+    }
 }
 
-fn build_claude_code_anthropic_runtime_statements() -> Vec<StatementProposal> {
+fn preferred_existing_claude_code_anthropic_runtime_credential(
+    entries: &[serde_json::Value],
+) -> Option<AnthropicRuntimeCredentialKind> {
+    [
+        AnthropicRuntimeCredentialKind::OAuthToken,
+        AnthropicRuntimeCredentialKind::ApiKey,
+    ]
+    .into_iter()
+    .find(|kind| {
+        entries.iter().any(|entry| {
+            entry
+                .get("name")
+                .and_then(|v| v.as_str())
+                .and_then(claude_code_anthropic_runtime_credential_kind_from_name)
+                == Some(*kind)
+        })
+    })
+}
+
+fn preferred_env_claude_code_anthropic_runtime_credential(
+) -> Option<(AnthropicRuntimeCredentialKind, String)> {
+    [
+        AnthropicRuntimeCredentialKind::OAuthToken,
+        AnthropicRuntimeCredentialKind::ApiKey,
+    ]
+    .into_iter()
+    .find_map(|kind| {
+        let value = std::env::var(kind.env_var()).ok()?;
+        let value = value.trim_end_matches(['\r', '\n']);
+        if value.trim().is_empty() {
+            return None;
+        }
+        Some((kind, value.to_string()))
+    })
+}
+
+fn build_claude_code_anthropic_runtime_statements(credential_name: &str) -> Vec<StatementProposal> {
     vec![
         StatementProposal {
             resource_type: ResourceType::Credential,
-            credential_name: CLAUDE_CODE_ANTHROPIC_RUNTIME_CREDENTIAL.to_string(),
+            credential_name: credential_name.to_string(),
             actions: vec!["credential:read".to_string()],
             resource: ResourceSelector::Exact {
-                value: CLAUDE_CODE_ANTHROPIC_RUNTIME_CREDENTIAL.to_string(),
+                value: credential_name.to_string(),
             },
             budget: None,
             conditions: vec![],
         },
         StatementProposal {
             resource_type: ResourceType::Session,
-            credential_name: CLAUDE_CODE_ANTHROPIC_RUNTIME_CREDENTIAL.to_string(),
+            credential_name: credential_name.to_string(),
             actions: vec!["llm:generate".to_string()],
             resource: ResourceSelector::Glob {
                 pattern: "anthropic/*".to_string(),
@@ -718,7 +1147,10 @@ fn build_claude_code_anthropic_runtime_statements() -> Vec<StatementProposal> {
     ]
 }
 
-fn grant_status_supports_anthropic_gateway(status: &serde_json::Value) -> bool {
+fn grant_status_supports_anthropic_gateway(
+    status: &serde_json::Value,
+    credential_name: &str,
+) -> bool {
     let Some(statements) = status.get("statements").and_then(|v| v.as_array()) else {
         return false;
     };
@@ -736,8 +1168,7 @@ fn grant_status_supports_anthropic_gateway(status: &serde_json::Value) -> bool {
                 })
             && stmt.get("resource").is_some_and(|resource| {
                 resource.get("kind").and_then(|v| v.as_str()) == Some("exact")
-                    && resource.get("value").and_then(|v| v.as_str())
-                        == Some(CLAUDE_CODE_ANTHROPIC_RUNTIME_CREDENTIAL)
+                    && resource.get("value").and_then(|v| v.as_str()) == Some(credential_name)
             })
     });
 
@@ -765,43 +1196,42 @@ fn ensure_claude_code_anthropic_runtime_credential(
     config: &DaemonConfig,
 ) -> Result<AnthropicRuntimeCredentialAvailability, core_types::ValidationError> {
     let (_, entries) = run_vault_list(config, None)?;
-    let already_present = entries.iter().any(|entry| {
-        entry.get("name").and_then(|v| v.as_str()) == Some(CLAUDE_CODE_ANTHROPIC_RUNTIME_CREDENTIAL)
-    });
-    if already_present {
-        return Ok(AnthropicRuntimeCredentialAvailability::ExistingVaultEntry);
+    if let Some(kind) = preferred_existing_claude_code_anthropic_runtime_credential(&entries) {
+        return Ok(AnthropicRuntimeCredentialAvailability::ExistingVaultEntry(
+            kind,
+        ));
     }
 
-    let key = match std::env::var("ANTHROPIC_API_KEY") {
-        Ok(value) if !value.trim().is_empty() => value,
-        _ => return Ok(AnthropicRuntimeCredentialAvailability::Absent),
+    let Some((kind, credential_value)) = preferred_env_claude_code_anthropic_runtime_credential()
+    else {
+        return Ok(AnthropicRuntimeCredentialAvailability::Absent);
     };
-    let key = key.trim_end_matches(['\r', '\n']);
 
     let _stored = run_vault_store(
         config,
-        CLAUDE_CODE_ANTHROPIC_RUNTIME_CREDENTIAL,
-        key.as_bytes(),
-        Some("anthropic api key (claude code runtime)"),
+        kind.credential_name(),
+        credential_value.as_bytes(),
+        Some(kind.metadata()),
     )?;
-    Ok(AnthropicRuntimeCredentialAvailability::StoredFromEnv)
+    Ok(AnthropicRuntimeCredentialAvailability::StoredFromEnv(kind))
 }
 
 fn render_claude_runtime_auth_status(
     availability: AnthropicRuntimeCredentialAvailability,
 ) -> String {
     match availability {
-        AnthropicRuntimeCredentialAvailability::StoredFromEnv => format!(
-            "  Claude:   stored {} from ANTHROPIC_API_KEY",
-            CLAUDE_CODE_ANTHROPIC_RUNTIME_CREDENTIAL
-        ),
-        AnthropicRuntimeCredentialAvailability::ExistingVaultEntry => format!(
-            "  Claude:   reusing {} from vault",
-            CLAUDE_CODE_ANTHROPIC_RUNTIME_CREDENTIAL
-        ),
+        AnthropicRuntimeCredentialAvailability::StoredFromEnv(kind) => {
+            format!(
+                "  Claude:   stored {} from {}",
+                kind.credential_name(),
+                kind.env_var()
+            )
+        }
+        AnthropicRuntimeCredentialAvailability::ExistingVaultEntry(kind) => {
+            format!("  Claude:   reusing {} from vault", kind.credential_name())
+        }
         AnthropicRuntimeCredentialAvailability::Absent => format!(
-            "  Claude:   runtime auth remains ambient (export ANTHROPIC_API_KEY before rerunning init, or run `ember vault add --name {}` later to broker it)",
-            CLAUDE_CODE_ANTHROPIC_RUNTIME_CREDENTIAL
+            "  Claude:   runtime auth remains ambient (prefer export {CLAUDE_CODE_OAUTH_TOKEN_ENV} before rerunning init, or run `ember vault add --name {CLAUDE_CODE_ANTHROPIC_OAUTH_RUNTIME_CREDENTIAL}` later; {ANTHROPIC_API_KEY_ENV}/{CLAUDE_CODE_ANTHROPIC_RUNTIME_CREDENTIAL} remains the fallback API-key lane)"
         ),
     }
 }
@@ -809,7 +1239,7 @@ fn render_claude_runtime_auth_status(
 fn ensure_claude_code_runtime_grant(
     config: &DaemonConfig,
     persona_id: &str,
-    anthropic_credential_available: bool,
+    anthropic_credential: Option<AnthropicRuntimeCredentialKind>,
 ) -> Result<ClaudeCodeGrantProvisioning, core_types::ValidationError> {
     let socket_path = config.socket_dir.join("daemon.sock");
     let grants_value = emberlink_cli::call_daemon_method(
@@ -820,12 +1250,13 @@ fn ensure_claude_code_runtime_grant(
     let empty_grants: Vec<serde_json::Value> = Vec::new();
     let grants = grants_value.as_array().unwrap_or(&empty_grants);
 
-    if anthropic_credential_available {
+    if let Some(anthropic_credential) = anthropic_credential {
+        let credential_name = anthropic_credential.credential_name();
         for grant in grants.iter().filter(|grant| {
             grant
                 .get("credential_name")
                 .and_then(|v| v.as_str())
-                .is_some_and(is_anthropic_gateway_credential_name)
+                == Some(credential_name)
         }) {
             let Some(grant_id) = grant.get("id").and_then(|v| v.as_str()) else {
                 continue;
@@ -835,7 +1266,7 @@ fn ensure_claude_code_runtime_grant(
                 "grant_status",
                 &serde_json::json!({"id": grant_id}),
             )?;
-            if grant_status_supports_anthropic_gateway(&status) {
+            if grant_status_supports_anthropic_gateway(&status, credential_name) {
                 return Ok(ClaudeCodeGrantProvisioning {
                     id: grant_id.to_string(),
                     expires_at: grant
@@ -850,10 +1281,10 @@ fn ensure_claude_code_runtime_grant(
 
         let spec = CompositeGrantCreateSpec {
             persona_id: persona_id.to_string(),
-            credential_name: CLAUDE_CODE_ANTHROPIC_RUNTIME_CREDENTIAL.to_string(),
+            credential_name: credential_name.to_string(),
             scope: CLAUDE_CODE_DEFAULT_SCOPE.to_string(),
             ttl_secs: Some(emberlink_cli::onboarding::claude_code::DEFAULT_GRANT_TTL_SECS),
-            statements: build_claude_code_anthropic_runtime_statements(),
+            statements: build_claude_code_anthropic_runtime_statements(credential_name),
         };
         let (_, created) = run_grant_create_composite(config, &spec)?;
         return finalize_claude_code_runtime_grant_response(config, created, true, persona_id);
@@ -949,15 +1380,115 @@ fn finalize_claude_code_runtime_grant_response(
     })
 }
 
+fn ensure_codex_runtime_grant(
+    config: &DaemonConfig,
+    persona_id: &str,
+) -> Result<CodexGrantProvisioning, core_types::ValidationError> {
+    let socket_path = config.socket_dir.join("daemon.sock");
+    let grants_value = emberlink_cli::call_daemon_method(
+        &socket_path,
+        "list_grants",
+        &serde_json::json!({"persona_id": persona_id}),
+    )?;
+    let empty_grants: Vec<serde_json::Value> = Vec::new();
+    let grants = grants_value.as_array().unwrap_or(&empty_grants);
+
+    if let Some(grant) = grants.iter().find(|grant| {
+        grant
+            .get("credential_name")
+            .and_then(|v| v.as_str())
+            .is_some_and(|name| name == CODEX_DEFAULT_SCOPE)
+    }) {
+        return Ok(CodexGrantProvisioning {
+            id: grant
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            expires_at: grant
+                .get("expires_at")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            created: false,
+        });
+    }
+
+    let created = emberlink_cli::call_daemon_method(
+        &socket_path,
+        "create_grant",
+        &serde_json::json!({
+            "persona_id": persona_id,
+            "credential_name": CODEX_DEFAULT_SCOPE,
+            "scope": CODEX_DEFAULT_SCOPE,
+            "ttl_secs": emberlink_cli::onboarding::codex::DEFAULT_GRANT_TTL_SECS,
+        }),
+    )?;
+    finalize_codex_runtime_grant_response(config, created, persona_id)
+}
+
+fn finalize_codex_runtime_grant_response(
+    config: &DaemonConfig,
+    response: serde_json::Value,
+    target_persona_id: &str,
+) -> Result<CodexGrantProvisioning, core_types::ValidationError> {
+    if response.get("status").and_then(|v| v.as_str()) == Some("pending_approval") {
+        let approval_id = response
+            .get("approval_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                core_types::ValidationError::new(
+                    "daemon create_grant returned pending_approval without approval_id",
+                )
+            })?;
+        let caller_persona_id =
+            resolve_claude_code_grant_approver_persona_id(config, target_persona_id)?;
+        let (_, resolved) = run_approval_resolve_with_caller(
+            config,
+            approval_id,
+            &ApprovalOutcome::Approved,
+            Some(&caller_persona_id),
+        )?;
+        let grant_id = resolved.result_grant_id.ok_or_else(|| {
+            core_types::ValidationError::new(
+                "approving codex init grant did not return result_grant_id",
+            )
+        })?;
+        return Ok(CodexGrantProvisioning {
+            id: grant_id,
+            expires_at: None,
+            created: true,
+        });
+    }
+
+    let grant_id = response
+        .get("id")
+        .and_then(|v| v.as_str())
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| {
+            core_types::ValidationError::new(
+                "daemon create_grant returned success without a grant id",
+            )
+        })?;
+    Ok(CodexGrantProvisioning {
+        id: grant_id.to_string(),
+        expires_at: response
+            .get("expires_at")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        created: true,
+    })
+}
+
 fn list_personas_via_daemon(
     config: &DaemonConfig,
 ) -> Result<Vec<serde_json::Value>, core_types::ValidationError> {
     let socket_path = config.socket_dir.join("daemon.sock");
     let personas_value =
         emberlink_cli::call_daemon_method(&socket_path, "list_personas", &serde_json::Value::Null)?;
-    personas_value.as_array().cloned().ok_or_else(|| {
-        core_types::ValidationError::new("daemon list_personas: expected array")
-    })
+    personas_value
+        .as_array()
+        .cloned()
+        .ok_or_else(|| core_types::ValidationError::new("daemon list_personas: expected array"))
 }
 
 fn resolve_operator_persona_id_from_list(
@@ -1008,10 +1539,7 @@ fn resolve_claude_code_grant_approver_persona_id(
     resolve_operator_persona_id(config, target_persona_id)
 }
 
-fn run_persona_revoke(
-    config: &DaemonConfig,
-    id: &str,
-) -> Result<(), core_types::ValidationError> {
+fn run_persona_revoke(config: &DaemonConfig, id: &str) -> Result<(), core_types::ValidationError> {
     let socket_path = config.socket_dir.join("daemon.sock");
     let personas = list_personas_via_daemon(config)?;
     let mut request = serde_json::json!({
@@ -2013,6 +2541,7 @@ fn build_status_banner(
     live_status: Option<&emberlink_cli::LiveDaemonStatus>,
     vault_backend: String,
     vault_addr: String,
+    vault_session: Option<VaultStatusView>,
 ) -> DaemonStatusBanner {
     let dashboard = match config.dashboard_addr {
         Some(addr) => match probe_dashboard_addr_bound(addr) {
@@ -2038,6 +2567,7 @@ fn build_status_banner(
             dashboard,
             vault_backend,
             vault_addr,
+            vault_session,
         },
         (false, Some(pid), _) => DaemonStatusBanner::StalePid { pid },
         _ => DaemonStatusBanner::NotRunning,
@@ -2121,30 +2651,93 @@ fn path_looks_like_repo_build_artifact(target: &Path) -> bool {
         .any(|component| component.as_os_str() == "target")
 }
 
-fn detect_installed_launcher_issue_at(path: &Path) -> Option<InstalledLauncherIssue> {
+fn prod_managed_runtime_component_paths() -> Vec<PathBuf> {
+    vec![
+        PathBuf::from(PROD_EMBER_DAEMON_PATH),
+        PathBuf::from(PROD_EMBER_PROXY_PATH),
+        PathBuf::from(PROD_EMBER_GH_PATH),
+        PathBuf::from(PROD_EMBER_GIT_PATH),
+        PathBuf::from(PROD_EMBER_KUBECTL_PATH),
+    ]
+}
+
+fn detect_installed_launcher_issue_at_with_managed_components(
+    path: &Path,
+    managed_components: &[PathBuf],
+    drift_threshold: Duration,
+) -> Option<InstalledLauncherIssue> {
     let target = fs::read_link(path).ok()?;
     let resolved = resolve_symlink_target(path, &target);
-    if resolved.exists() {
-        return None;
+    if !resolved.exists() {
+        return Some(if path_looks_like_repo_build_artifact(&resolved) {
+            InstalledLauncherIssue::BrokenRepoBuildSymlink {
+                path: path.to_path_buf(),
+                target: resolved,
+            }
+        } else {
+            InstalledLauncherIssue::BrokenSymlink {
+                path: path.to_path_buf(),
+                target: resolved,
+            }
+        });
     }
-    Some(if path_looks_like_repo_build_artifact(&resolved) {
-        InstalledLauncherIssue::BrokenRepoBuildSymlink {
-            path: path.to_path_buf(),
-            target: resolved,
-        }
+    let launcher_mtime = fs::metadata(&resolved).ok()?.modified().ok()?;
+    let newer_components: Vec<PathBuf> = managed_components
+        .iter()
+        .filter_map(|component| {
+            let component_mtime = fs::metadata(component).ok()?.modified().ok()?;
+            let drift = component_mtime.duration_since(launcher_mtime).ok()?;
+            (drift > drift_threshold).then(|| component.clone())
+        })
+        .collect();
+    if newer_components.is_empty() {
+        None
     } else {
-        InstalledLauncherIssue::BrokenSymlink {
+        Some(InstalledLauncherIssue::StaleManagedInstall {
             path: path.to_path_buf(),
             target: resolved,
-        }
-    })
+            newer_components,
+        })
+    }
+}
+
+fn detect_installed_launcher_issue_at(path: &Path) -> Option<InstalledLauncherIssue> {
+    detect_installed_launcher_issue_at_with_managed_components(
+        path,
+        &prod_managed_runtime_component_paths(),
+        INSTALLED_LAUNCHER_DRIFT_THRESHOLD,
+    )
 }
 
 fn detect_default_installed_launcher_issue() -> Option<InstalledLauncherIssue> {
     detect_installed_launcher_issue_at(Path::new(PROD_EMBER_LAUNCHER_PATH))
 }
 
-fn render_github_status_text(status: &GithubProviderStatusView) -> String {
+fn github_status_json_payload(
+    status: &GithubProviderStatusView,
+    launcher_issue: Option<&InstalledLauncherIssue>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "https_app_lane": match github_https_lane(status) {
+            GithubHttpsLane::ConfiguredApp => "configured_app",
+            GithubHttpsLane::ConfiguredPat => "configured_pat",
+            GithubHttpsLane::ConfiguredMock => "configured_mock",
+            GithubHttpsLane::Broken => "broken",
+            GithubHttpsLane::NotConfigured => "not_configured",
+        },
+        "detail": status.detail,
+        "app_id": status.app_id,
+        "installation_id": status.installation_id,
+        "ssh_lane": "substrate_exists_not_launcher_wired",
+        "pat_lane": "degraded_brokered_fallback",
+        "launcher_issue": launcher_issue_json(launcher_issue),
+    })
+}
+
+fn render_github_status_text(
+    status: &GithubProviderStatusView,
+    launcher_issue: Option<&InstalledLauncherIssue>,
+) -> String {
     let https_line = match github_https_lane(status) {
         GithubHttpsLane::ConfiguredApp => "configured (real GitHub App broker)",
         GithubHttpsLane::ConfiguredPat => {
@@ -2216,6 +2809,13 @@ fn render_github_status_text(status: &GithubProviderStatusView) -> String {
                 "  2. Then rerun `ember github status` and confirm the App lane is ready."
             );
         }
+    }
+
+    if let Some(issue) = launcher_issue {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "Host launcher boundary:");
+        let _ = writeln!(out, "  Install path: {}", issue.detail());
+        let _ = writeln!(out, "  Next step:    {}", issue.repair_guidance());
     }
 
     let _ = writeln!(out);
@@ -2305,7 +2905,10 @@ fn try_reload_daemon_after_github_setup(
     })
 }
 
-fn render_github_setup_success_text(followup: GithubSetupDaemonFollowup) -> String {
+fn render_github_setup_success_text(
+    followup: GithubSetupDaemonFollowup,
+    launcher_issue: Option<&InstalledLauncherIssue>,
+) -> String {
     let mut out = String::new();
     match followup {
         GithubSetupDaemonFollowup::Reloaded { old_pid, new_pid } => {
@@ -2354,14 +2957,22 @@ fn render_github_setup_success_text(followup: GithubSetupDaemonFollowup) -> Stri
             );
         }
     }
+    if let Some(issue) = launcher_issue {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "Host launcher boundary:");
+        let _ = writeln!(out, "  {}", issue.detail());
+        let _ = writeln!(out, "  {}", issue.repair_guidance());
+    }
     out
 }
 
 fn render_github_setup_retry_hint(err: &GithubSetupError) -> Option<String> {
     let msg = err.to_string();
-    if msg.contains("ember vault unlock") {
+    if msg.contains("managed separate-uid biometric unlock")
+        || msg.contains("EMBER_VAULT_PASSPHRASE")
+    {
         return Some(
-            "run `ember vault unlock` from an interactive operator shell, then rerun `ember github setup`."
+            "use the managed separate-uid biometric unlock flow if available, or restart the daemon with `EMBER_VAULT_PASSPHRASE`, then rerun `ember github setup`."
                 .to_string(),
         );
     }
@@ -2380,15 +2991,61 @@ fn render_github_setup_retry_hint(err: &GithubSetupError) -> Option<String> {
     None
 }
 
+fn render_github_setup_error_guidance(
+    err: &GithubSetupError,
+    launcher_issue: Option<&InstalledLauncherIssue>,
+) -> String {
+    let mut out = String::new();
+    if let Some(hint) = render_github_setup_retry_hint(err) {
+        let _ = writeln!(out, "       {hint}");
+    } else if let Some(issue) = launcher_issue {
+        let _ = writeln!(out, "       install path: {}", issue.detail());
+        let _ = writeln!(out, "       {}", issue.repair_guidance());
+    }
+    let _ = writeln!(
+        out,
+        "       run `ember github status` for the current posture, or `{}` to retry interactively",
+        github_setup_command()
+    );
+    out
+}
+
 fn render_github_status_retry_hint(err: &core_types::ValidationError) -> Option<String> {
     let msg = err.to_string();
-    if msg.contains("ember vault unlock") {
+    if msg.contains("managed separate-uid biometric unlock")
+        || msg.contains("EMBER_VAULT_PASSPHRASE")
+    {
         return Some(
-            "run `ember vault unlock` from an interactive operator shell, then rerun `ember github status`."
+            "use the managed separate-uid biometric unlock flow if available, or restart the daemon with `EMBER_VAULT_PASSPHRASE`, then rerun `ember github status`."
                 .to_string(),
         );
     }
     None
+}
+
+fn render_github_status_error_guidance(
+    err: &core_types::ValidationError,
+    launcher_issue: Option<&InstalledLauncherIssue>,
+) -> String {
+    if let Some(hint) = render_github_status_retry_hint(err) {
+        return format!("       {hint}\n");
+    }
+
+    let mut out = String::new();
+    if let Some(issue) = launcher_issue {
+        let _ = writeln!(out, "       install path: {}", issue.detail());
+        let _ = writeln!(out, "       {}", issue.repair_guidance());
+        let _ = writeln!(
+            out,
+            "       then run `ember status` to inspect daemon posture, or `sudo ember daemon install` to repair it"
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "       run `ember status` to inspect daemon posture, or `sudo ember daemon install` to repair it"
+        );
+    }
+    out
 }
 
 fn prompt_github_setup_field(prompt: &str, default: Option<&str>) -> Result<String, String> {
@@ -2619,12 +3276,10 @@ fn run_github_registration_flow(
 ) -> Result<(), i32> {
     if let Err(e) = register_github_from_setup_args(config, args, stdin_is_terminal, json_out) {
         eprintln!("error: {e}");
-        if let Some(hint) = render_github_setup_retry_hint(&e) {
-            eprintln!("       {hint}");
-        }
-        eprintln!(
-            "       run `ember github status` for the current posture, or `{}` to retry interactively",
-            github_setup_command()
+        let launcher_issue = detect_default_installed_launcher_issue();
+        eprint!(
+            "{}",
+            render_github_setup_error_guidance(&e, launcher_issue.as_ref())
         );
         return Err(e.exit_code());
     }
@@ -2632,7 +3287,13 @@ fn run_github_registration_flow(
     if !json_out {
         println!();
         match try_reload_daemon_after_github_setup(config) {
-            Ok(followup) => print!("{}", render_github_setup_success_text(followup)),
+            Ok(followup) => {
+                let launcher_issue = detect_default_installed_launcher_issue();
+                print!(
+                    "{}",
+                    render_github_setup_success_text(followup, launcher_issue.as_ref())
+                );
+            }
             Err(e) => {
                 eprintln!(
                     "warning: GitHub App credentials were stored, but daemon reload failed: {e}"
@@ -2641,7 +3302,10 @@ fn run_github_registration_flow(
                 println!();
                 print!(
                     "{}",
-                    render_github_setup_success_text(GithubSetupDaemonFollowup::NeedsManualReload)
+                    render_github_setup_success_text(
+                        GithubSetupDaemonFollowup::NeedsManualReload,
+                        detect_default_installed_launcher_issue().as_ref(),
+                    )
                 );
             }
         }
@@ -2676,6 +3340,7 @@ enum DaemonStatusBanner {
         dashboard: String,
         vault_backend: String,
         vault_addr: String,
+        vault_session: Option<VaultStatusView>,
     },
     StalePid {
         pid: u32,
@@ -2686,6 +3351,7 @@ enum DaemonStatusBanner {
 fn render_status_text(
     banner: DaemonStatusBanner,
     summary: &ember_daemon::infra::status::StatusSummary,
+    launcher_issue: Option<&InstalledLauncherIssue>,
 ) -> String {
     let personas = &summary.personas;
     let active = personas.iter().filter(|p| p.status == "active").count();
@@ -2705,11 +3371,15 @@ fn render_status_text(
             dashboard,
             vault_backend,
             vault_addr,
+            vault_session,
         } => {
             let _ = writeln!(out, "DAEMON             running (PID {pid})");
             let _ = writeln!(out, "  Socket:    {socket}");
             let _ = writeln!(out, "  Dashboard: {dashboard}");
             let _ = writeln!(out, "  Vault:     {vault_backend} ({vault_addr})");
+            if let Some(vault_session) = &vault_session {
+                let _ = writeln!(out, "  Vault lane: {}", vault_session.summary_line());
+            }
             if summary.quarantined {
                 let authority = summary.quarantine_authority.as_deref().unwrap_or("unknown");
                 let _ = writeln!(out, "  Quarantine: {authority}");
@@ -2719,6 +3389,7 @@ fn render_status_text(
                 );
                 let _ = writeln!(out, "  Repair:     ember audit verify");
             }
+            push_status_launcher_issue_note(&mut out, launcher_issue);
             let _ = writeln!(out);
 
             let _ = writeln!(
@@ -2784,6 +3455,7 @@ fn render_status_text(
                 out,
                 "  Note:      daemon-backed features are unavailable; showing local store summary only"
             );
+            push_status_launcher_issue_note(&mut out, launcher_issue);
             let _ = writeln!(out);
             let _ = writeln!(
                 out,
@@ -2803,6 +3475,7 @@ fn render_status_text(
                 out,
                 "  Note:      daemon-backed features are unavailable; showing local store summary only"
             );
+            push_status_launcher_issue_note(&mut out, launcher_issue);
             let _ = writeln!(out);
             let _ = writeln!(
                 out,
@@ -2819,6 +3492,16 @@ fn render_status_text(
     out
 }
 
+fn push_status_launcher_issue_note(
+    out: &mut String,
+    launcher_issue: Option<&InstalledLauncherIssue>,
+) {
+    if let Some(issue) = launcher_issue {
+        let _ = writeln!(out, "  Host launcher: {}", issue.detail());
+        let _ = writeln!(out, "  Attention:     {}", issue.repair_guidance());
+    }
+}
+
 fn render_status_troubleshoot_text(
     banner: &DaemonStatusBanner,
     summary: &ember_daemon::infra::status::StatusSummary,
@@ -2826,6 +3509,7 @@ fn render_status_troubleshoot_text(
     github_status: Option<&GithubProviderStatusView>,
     ember_initialized: bool,
     launcher_issue: Option<&InstalledLauncherIssue>,
+    current_launcher_lane: Option<&CurrentLauncherLane>,
 ) -> String {
     let mut out = String::new();
     let summary_source = match dispatch {
@@ -2837,6 +3521,9 @@ fn render_status_troubleshoot_text(
 
     let _ = writeln!(out, "TROUBLESHOOT");
     let _ = writeln!(out, "  Summary source: {summary_source}");
+    if let Some(lane) = current_launcher_lane {
+        let _ = writeln!(out, "  Current lane:   {}", lane.detail());
+    }
 
     match banner {
         DaemonStatusBanner::Running { .. } => {
@@ -3332,15 +4019,18 @@ enum Commands {
         /// standard first-run setup, creates or reuses the default Claude
         /// persona/grant wiring, patches `~/.claude/settings.json`, and
         /// reports whether GitHub is already ready or needs
-        /// `ember github setup`. If `ANTHROPIC_API_KEY` is present, init
-        /// stores it as `anthropic-key` and the launcher can reuse a
-        /// brokered Claude runtime grant; otherwise Claude's own upstream
-        /// auth remains ambient.
+        /// `ember github setup`. If `CLAUDE_CODE_OAUTH_TOKEN` is present,
+        /// init stores it as `anthropic/oauth-token` and the launcher can
+        /// reuse a brokered Claude subscription runtime grant. Otherwise,
+        /// if `ANTHROPIC_API_KEY` is present, init stores it as
+        /// `anthropic-key` for the fallback API-key lane; without either,
+        /// Claude's own upstream auth remains ambient.
         ///
         /// Codex (target value `codex`) is the parallel onboarding lane.
         /// When complete it patches `~/.codex/hooks.json` so the Codex CLI
         /// routes commands through ember's grant/audit surface, then
-        /// surfaces `codex login status` as the auth-readiness check
+        /// surfaces `codex login status` as the auth-readiness check and
+        /// `codex login --device-auth` as the headless sign-in escape hatch
         /// (Codex's native upstream auth lane — ember does not broker
         /// Codex auth today, by parity with the Claude lane's
         /// upstream-ambient default).
@@ -3366,18 +4056,20 @@ enum Commands {
     },
     /// Uninstall ember integrations.
     ///
-    /// Currently supports `--for claude`, which removes only the lines this
-    /// onboarding path added to `~/.claude/settings.json`.
-    /// Persona, grant, and vault entries are left in place — they may be
-    /// in use by other tools.
+    /// `--for claude` removes only the lines this onboarding path added to
+    /// `~/.claude/settings.json`. `--for codex` removes only the hook block
+    /// this onboarding path added to `~/.codex/hooks.json`.
+    /// Persona, grant, and vault entries are left in place — they may be in
+    /// use by other tools.
     Uninstall {
         /// Integration target to uninstall. Canonical: `claude`.
         #[arg(long = "for", value_name = "TARGET")]
         for_target: OnboardingTarget,
     },
-    /// Open an isolated Claude Code session.
+    /// Legacy hidden shortcut for the isolated Claude launcher.
     ///
-    /// Thin preset over `ember session open claude --isolated`.
+    /// Kept only to redirect older scripts to the canonical
+    /// `ember claude --isolated` surface.
     #[command(hide = true)]
     Up {
         /// Profile name selecting the compose service set (`dev` /
@@ -3560,6 +4252,9 @@ enum Commands {
     /// pre-rename invocation shape continues to work.
     ///
     /// `--prod` is implicit when neither lane flag is given.
+    /// `--isolated` starts Ember's isolated/container launcher path.
+    /// Trailing Claude args are forwarded on both host and isolated paths.
+    /// `--backend` / `--preset` only apply with `--isolated`.
     #[command(
         name = "claude",
         visible_aliases = ["claude-code"],
@@ -3579,13 +4274,15 @@ enum Commands {
         /// Force the host-resident launcher path.
         #[arg(long, conflicts_with = "isolated")]
         host: bool,
-        /// Force the isolated launcher path.
+        /// Force Ember's isolated/container launcher path.
         #[arg(long, conflicts_with = "host")]
         isolated: bool,
         /// Advanced isolated-path backend hint (docker, orbstack, podman).
+        /// Requires `--isolated`.
         #[arg(long, value_name = "NAME")]
         backend: Option<String>,
         /// Advanced isolated-path preset/profile hint (dev, headless, demo).
+        /// Requires `--isolated`.
         #[arg(long, value_name = "NAME")]
         preset: Option<String>,
         /// Launch the session from an Ember-managed git worktree.
@@ -3608,12 +4305,17 @@ enum Commands {
     /// model is `ember session open codex`; this top-level verb is the
     /// ergonomic alias.
     ///
+    /// Codex auth stays on Codex's native login lane. Run `codex login`
+    /// on the host first; if the host is headless or browser login is
+    /// blocked, use `codex login --device-auth`. `--isolated` reuses the
+    /// host `~/.codex` authority via bind-mount instead of creating a
+    /// separate container login.
+    ///
     /// `--prod` is implicit when neither lane flag is given.
-    #[command(
-        name = "codex",
-        trailing_var_arg = true,
-        allow_hyphen_values = true
-    )]
+    /// `--isolated` starts Ember's isolated/container launcher path.
+    /// Trailing Codex args are forwarded on both host and isolated paths.
+    /// `--backend` / `--preset` only apply with `--isolated`.
+    #[command(name = "codex", trailing_var_arg = true, allow_hyphen_values = true)]
     Codex {
         /// Use the current worktree's dev daemon flavor.
         /// Mutually exclusive with --prod.
@@ -3627,13 +4329,16 @@ enum Commands {
         /// Force the host-resident launcher path.
         #[arg(long, conflicts_with = "isolated")]
         host: bool,
-        /// Force the isolated launcher path.
+        /// Force Ember's isolated/container launcher path.
+        /// Reuses the host `~/.codex` auth state via bind-mount.
         #[arg(long, conflicts_with = "host")]
         isolated: bool,
         /// Advanced isolated-path backend hint (docker, orbstack, podman).
+        /// Leave unset to auto-detect. Requires `--isolated`.
         #[arg(long, value_name = "NAME")]
         backend: Option<String>,
         /// Advanced isolated-path preset/profile hint (dev, headless, demo).
+        /// Requires `--isolated`.
         #[arg(long, value_name = "NAME")]
         preset: Option<String>,
         /// Launch the session from an Ember-managed git worktree.
@@ -4209,13 +4914,15 @@ enum SessionAction {
         /// Force the host-resident launcher path.
         #[arg(long, conflicts_with = "isolated")]
         host: bool,
-        /// Force the isolated launcher path.
+        /// Force the isolated/container launcher path.
         #[arg(long, conflicts_with = "host")]
         isolated: bool,
         /// Advanced isolated-path backend hint (docker, orbstack, podman).
+        /// Requires `--isolated`.
         #[arg(long, value_name = "NAME")]
         backend: Option<String>,
         /// Advanced isolated-path preset/profile hint (dev, headless, demo).
+        /// Requires `--isolated`.
         #[arg(long, value_name = "NAME")]
         preset: Option<String>,
         /// Launch the session from an Ember-managed git worktree.
@@ -5766,6 +6473,10 @@ fn is_ember_initialized(config: &DaemonConfig) -> bool {
     config.data_dir.join("daemon.db").exists()
 }
 
+fn should_skip_basic_init(for_target: Option<OnboardingTarget>, config: &DaemonConfig) -> bool {
+    for_target.is_some() && is_ember_initialized(config)
+}
+
 /// Resolve an image digest via `docker inspect`. Returns None if docker is unavailable or fails.
 fn resolve_image_digest(image: &str) -> Option<String> {
     let output = std::process::Command::new("docker")
@@ -5852,6 +6563,124 @@ fn resolve_init_keyring_value(
 ) -> String {
     flag.or(env_value)
         .unwrap_or_else(|| default_value.to_string())
+}
+
+fn init_vault_salt(config: &DaemonConfig) -> [u8; 16] {
+    let salt_path = config.data_dir.join("vault.salt");
+    if salt_path.exists() {
+        match fs::read(&salt_path) {
+            Ok(raw) if raw.len() == 16 => {
+                let mut arr = [0u8; 16];
+                arr.copy_from_slice(&raw);
+                arr
+            }
+            Ok(raw) => {
+                eprintln!(
+                    "error: vault.salt has wrong length ({} bytes, expected 16)",
+                    raw.len()
+                );
+                process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("error: failed to read vault salt: {e}");
+                process::exit(1);
+            }
+        }
+    } else {
+        let salt = Vault::generate_salt();
+        if let Err(e) = fs::write(&salt_path, salt) {
+            eprintln!("warning: failed to write vault salt: {e}");
+        }
+        salt
+    }
+}
+
+fn init_local_vault_passphrase(service: &str, account: &str) -> (String, String) {
+    if let Ok(passphrase) = std::env::var("EMBER_VAULT_PASSPHRASE") {
+        unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
+        return (
+            passphrase,
+            "passphrase source: EMBER_VAULT_PASSPHRASE".to_string(),
+        );
+    }
+
+    if keyring_writes_suppressed() {
+        return (
+            "ember-test-fallback-passphrase".to_string(),
+            "keyring write skipped (test/mock gate)".to_string(),
+        );
+    }
+
+    if !is_cargo_test_binary() {
+        let home = match dirs_next::home_dir() {
+            Some(h) => h,
+            None => {
+                eprintln!(
+                    "error: refusing to write to production keyring: home directory not \
+                         resolvable (no $HOME)"
+                );
+                process::exit(1);
+            }
+        };
+        if let Err(e) = check_production_sentinel(service, DEFAULT_KEYRING_SERVICE, &home) {
+            eprintln!("error: {e}");
+            process::exit(1);
+        }
+    }
+
+    let entry = match keyring_core::Entry::new(service, account) {
+        Ok(entry) => entry,
+        Err(e) => {
+            eprintln!("  Vault:    keyring unavailable ({e})");
+            eprintln!("           Set EMBER_VAULT_PASSPHRASE env var instead");
+            process::exit(1);
+        }
+    };
+
+    const ALPHABET: &[u8; 62] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut generated = String::with_capacity(32);
+    let mut scratch = [0u8; 64];
+    while generated.len() < 32 {
+        getrandom::fill(&mut scratch).expect("OS entropy failure");
+        for &b in &scratch {
+            if generated.len() == 32 {
+                break;
+            }
+            if b < 248 {
+                generated.push(ALPHABET[(b % 62) as usize] as char);
+            }
+        }
+    }
+
+    if let Err(e) = entry.set_password(&generated) {
+        eprintln!("  Vault:    keyring unavailable ({e})");
+        eprintln!("           Set EMBER_VAULT_PASSPHRASE env var instead");
+        process::exit(1);
+    }
+
+    let status = match verify_keyring_roundtrip(service, account, &generated) {
+        Ok(()) => {
+            format!("passphrase stored in system keyring (service={service}, account={account})")
+        }
+        Err(e) => {
+            eprintln!("  Vault:    keyring write succeeded but read-back failed ({e})");
+            eprintln!(
+                "           This usually means the keyring crate is using its in-memory mock backend."
+            );
+            eprintln!("           Set EMBER_VAULT_PASSPHRASE env var to bypass the keyring.");
+            "keyring unavailable (see above)".to_string()
+        }
+    };
+
+    (generated, status)
+}
+
+fn take_init_vault_passphrase_override() -> Option<String> {
+    let passphrase = std::env::var("EMBER_VAULT_PASSPHRASE").ok();
+    if passphrase.is_some() {
+        unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
+    }
+    passphrase
 }
 
 fn emit_first_grant_receipt_after_init(
@@ -5992,146 +6821,11 @@ account = \"{init_keyring_account}\"
         eprintln!("warning: failed to write policy: {e}");
     }
 
-    // `cmd_init` still owns the passphrase/salt bootstrap today so the CLI
-    // can provision first-run keyring state and clear `EMBER_VAULT_PASSPHRASE`
-    // from its own environment. Once the daemon socket is live, persona
-    // creation and first-grant receipt signing move behind daemon RPC.
-    //
-    // V0 schema: persona rows are vault-sealed at rest, so the no-daemon
-    // test fallback still needs a local vault. Order:
-    //   1. Write or reuse the salt file.
-    //   2. Resolve or provision the passphrase.
-    //   3. In the test-only no-daemon branch, build the vault from
-    //      passphrase + salt and attach it to the local store.
-    //   4. Otherwise let the daemon own persona-secret access.
-    let salt_path = config.data_dir.join("vault.salt");
-    let salt: [u8; 16] = if salt_path.exists() {
-        match fs::read(&salt_path) {
-            Ok(raw) if raw.len() == 16 => {
-                let mut arr = [0u8; 16];
-                arr.copy_from_slice(&raw);
-                arr
-            }
-            Ok(raw) => {
-                eprintln!(
-                    "error: vault.salt has wrong length ({} bytes, expected 16)",
-                    raw.len()
-                );
-                process::exit(1);
-            }
-            Err(e) => {
-                eprintln!("error: failed to read vault salt: {e}");
-                process::exit(1);
-            }
-        }
-    } else {
-        let s = Vault::generate_salt();
-        if let Err(e) = fs::write(&salt_path, s) {
-            eprintln!("warning: failed to write vault salt: {e}");
-        }
-        s
-    };
-
     let service = init_keyring_service.clone();
     let account = init_keyring_account.clone();
 
-    // Resolve the passphrase. Priority: env var → keyring (test/mock-gated
-    // fallback) → keyring (production provisioning). The first two branches
-    // never write to the keyring; the production branch generates a random
-    // passphrase and persists it.
-    let (passphrase, vault_status): (String, String) = if let Ok(p) =
-        std::env::var("EMBER_VAULT_PASSPHRASE")
-    {
-        // Capture then immediately zeroize from the process environment so
-        // it cannot be read from /proc/<pid>/environ by a second party.
-        // Called during init before any background threads spawn; the
-        // signal/thread race in remove_var is acceptable here.
-        // Safety: single-threaded init path; no other threads are reading env.
-        unsafe { std::env::remove_var("EMBER_VAULT_PASSPHRASE") };
-        (p, "passphrase source: EMBER_VAULT_PASSPHRASE".to_string())
-    } else if keyring_writes_suppressed() {
-        // Three-axis gate — `bin/ember.rs` isn't covered by the gate
-        // inside `resolve_passphrase` because it calls `keyring_core::Entry::new`
-        // directly. Keeps `cargo test` from firing real keychain popups
-        // (the 2026-04-22 leak).
-        (
-            "ember-test-fallback-passphrase".to_string(),
-            "keyring write skipped (test/mock gate)".to_string(),
-        )
-    } else {
-        // Belt-and-suspenders production checkpoint. Mirrors the check
-        // inside `Vault::open_from_config` (vault.rs:102-110) so the
-        // CLI init path cannot bypass it by calling `keyring_core::Entry::new`
-        // directly.
-        if !is_cargo_test_binary() {
-            let home = match dirs_next::home_dir() {
-                Some(h) => h,
-                None => {
-                    eprintln!(
-                        "error: refusing to write to production keyring: home directory not \
-                             resolvable (no $HOME)"
-                    );
-                    process::exit(1);
-                }
-            };
-            if let Err(e) = check_production_sentinel(&service, DEFAULT_KEYRING_SERVICE, &home) {
-                eprintln!("error: {e}");
-                process::exit(1);
-            }
-        }
-
-        let entry = match keyring_core::Entry::new(&service, &account) {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("  Vault:    keyring unavailable ({e})");
-                eprintln!("           Set EMBER_VAULT_PASSPHRASE env var instead");
-                process::exit(1);
-            }
-        };
-
-        // 32 chars from an alphanumeric alphabet (62 chars) → ~190 bits
-        // of entropy. Rejection-sampled from OS entropy to avoid modulo
-        // bias. Mirrors ember-daemon::vault::generate_passphrase.
-        const ALPHABET: &[u8; 62] =
-            b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-        let mut generated = String::with_capacity(32);
-        let mut scratch = [0u8; 64];
-        while generated.len() < 32 {
-            getrandom::fill(&mut scratch).expect("OS entropy failure");
-            for &b in &scratch {
-                if generated.len() == 32 {
-                    break;
-                }
-                if b < 248 {
-                    generated.push(ALPHABET[(b % 62) as usize] as char);
-                }
-            }
-        }
-
-        if let Err(e) = entry.set_password(&generated) {
-            eprintln!("  Vault:    keyring unavailable ({e})");
-            eprintln!("           Set EMBER_VAULT_PASSPHRASE env var instead");
-            process::exit(1);
-        }
-
-        let status = match verify_keyring_roundtrip(&service, &account, &generated) {
-            Ok(()) => format!(
-                "passphrase stored in system keyring (service={service}, account={account})"
-            ),
-            Err(e) => {
-                eprintln!("  Vault:    keyring write succeeded but read-back failed ({e})");
-                eprintln!(
-                    "           This usually means the keyring crate is using its in-memory mock backend."
-                );
-                eprintln!("           Set EMBER_VAULT_PASSPHRASE env var to bypass the keyring.");
-                "keyring unavailable (see above)".to_string()
-            }
-        };
-
-        (generated, status)
-    };
-
     let root_name = name.as_deref().unwrap_or("root");
+    let init_vault_passphrase_override = take_init_vault_passphrase_override();
 
     // init_persona_rpc_after_autostart_reorder: implementation-note-466
     // Autostart fires BEFORE the RPC so the socket is live when create_persona dispatches.
@@ -6162,19 +6856,28 @@ account = \"{init_keyring_account}\"
     // daemon socket is present, fall back to the old local store path.
     let daemon_socket_live = socket_path.exists();
     let mut direct_store: Option<DaemonStore> = None;
-    let (persona_id, persona_name, persona_public_key) =
+    let (persona_id, persona_name, persona_public_key, vault_status) =
         if skip_daemon_install_check && !socket_path.exists() {
             // [open-store-audit] MUTATOR-MIXED: cmd_init local fallback only.
             // The installed path now routes both persona creation and
-            // first-grant receipt signing through daemon RPC. A local store is
-            // still needed only for the test/isolated no-daemon branch.
+            // first-grant receipt signing through daemon RPC. A local store
+            // still needs the legacy salt/passphrase bootstrap, but only on
+            // this test/isolated no-daemon branch.
+            let salt = init_vault_salt(config);
+            let (passphrase, vault_status) = match init_vault_passphrase_override.clone() {
+                Some(passphrase) => (
+                    passphrase,
+                    "passphrase source: EMBER_VAULT_PASSPHRASE".to_string(),
+                ),
+                None => init_local_vault_passphrase(&service, &account),
+            };
             let vault = Rc::new(Vault::from_passphrase(&passphrase, &salt));
             let store = open_store(config);
             store.set_vault(Rc::clone(&vault));
             match store.create_persona(root_name) {
                 Ok(info) => {
                     direct_store = Some(store);
-                    (info.id, info.name, info.public_key)
+                    (info.id, info.name, info.public_key, vault_status)
                 }
                 Err(e) => {
                     eprintln!("error: failed to create root persona (direct): {e}");
@@ -6209,6 +6912,7 @@ account = \"{init_keyring_account}\"
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string(),
+                "managed by daemon (no CLI keychain bootstrap)".to_string(),
             )
         };
 
@@ -6261,12 +6965,9 @@ account = \"{init_keyring_account}\"
 fn cmd_migrate_path_shadow_layout() -> Result<(), Box<dyn std::error::Error>> {
     let home = emberlink_cli::onboarding::claude_code::home_dir_for_migrate()?;
     let shadow_root = home.join(".ember").join("shadow");
-    let specs =
-        emberlink_cli::launcher::claude_code::managed_prod_construct_specs();
-    let outcome = emberlink_cli::launcher::path_shadow::migrate_path_shadow_layout(
-        &shadow_root,
-        &specs,
-    )?;
+    let specs = emberlink_cli::launcher::claude_code::managed_prod_construct_specs();
+    let outcome =
+        emberlink_cli::launcher::path_shadow::migrate_path_shadow_layout(&shadow_root, &specs)?;
     use emberlink_cli::launcher::path_shadow::MigrationOutcome::*;
     match outcome {
         NoShimsAtAll => {
@@ -6418,10 +7119,10 @@ fn cmd_init_for_claude_code(
         .map_err(|e| format!("install managed shadow toolchain: {e}"))?;
     println!("  Shadow:   ready {}", shadow_root.display());
 
-    // 4. Seed or detect Anthropic runtime auth for Claude Code. When an
-    //    `anthropic-key` vault row is present we can shape the persona's
-    //    session grant as a brokered composite grant; otherwise the
-    //    friendly still uses ambient Claude auth for now.
+    // 4. Seed or detect Anthropic runtime auth for Claude Code. Prefer a
+    //    stored Claude subscription OAuth token when available; otherwise
+    //    fall back to the Anthropic API-key lane. Without either vault row
+    //    the friendly still uses ambient Claude auth for now.
     let anthropic_runtime = ensure_claude_code_anthropic_runtime_credential(config)
         .map_err(|e| format!("prepare anthropic runtime credential: {e}"))?;
     println!("{}", render_claude_runtime_auth_status(anthropic_runtime));
@@ -6432,7 +7133,7 @@ fn cmd_init_for_claude_code(
     let grant = ensure_claude_code_runtime_grant(
         config,
         &persona_id,
-        anthropic_runtime != AnthropicRuntimeCredentialAvailability::Absent,
+        anthropic_runtime.credential_kind(),
     )
     .map_err(|e| format!("ensure claude-code grant (rpc): {e}"))?;
     let expires = grant.expires_at.as_deref().unwrap_or("never");
@@ -6552,8 +7253,128 @@ fn cmd_init_for_claude_code(
     }
 
     // 8. Print the next two commands per design §2.
-    cc::print_next_commands(github_posture);
+    let launcher_boundary =
+        detect_default_installed_launcher_issue().map(|issue| cc::LauncherBoundaryNote {
+            detail: issue.detail(),
+            repair_guidance: issue.repair_guidance(),
+        });
+    cc::print_next_commands_with_launcher_boundary(github_posture, launcher_boundary.as_ref());
 
+    Ok(())
+}
+
+fn cmd_init_for_codex(
+    config: &DaemonConfig,
+    cli_config_path: Option<&PathBuf>,
+    non_interactive: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use emberlink_cli::onboarding::codex as co;
+
+    let persona_name = co::codex_persona_name();
+    let template_path = co::default_grant_template_path()?;
+    let hooks_path = co::default_hooks_json_path()?;
+
+    println!();
+    println!("Setting up Codex integration:");
+
+    if std::env::var("EMBER_SKIP_DAEMON_INSTALL_CHECK").is_err() {
+        ensure_managed_daemon_for_init(
+            config,
+            cli_config_path,
+            init_rerun_command(Some(OnboardingTarget::Codex)),
+            non_interactive,
+        )?;
+    }
+
+    let socket_path = config.socket_dir.join("daemon.sock");
+    let personas = list_personas_via_daemon(config)?;
+    let persona_id = match personas.iter().find(|p| {
+        p.get("name")
+            .and_then(|v| v.as_str())
+            .map(|n| n == persona_name)
+            .unwrap_or(false)
+    }) {
+        Some(persona) => {
+            let id = persona
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            println!("  Persona:  reused {id} ({persona_name})");
+            id
+        }
+        None => {
+            let created = emberlink_cli::call_daemon_method(
+                &socket_path,
+                "create_persona",
+                &serde_json::json!({"name": persona_name}),
+            )
+            .map_err(|e| format!("create persona {persona_name} (rpc): {e}"))?;
+            let id = created
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let name = created
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            println!("  Persona:  created {id} ({name})");
+            id
+        }
+    };
+
+    let template_written = co::write_grant_template_if_missing(&template_path)?;
+    if template_written {
+        println!("  Template: wrote {}", template_path.display());
+    } else {
+        println!(
+            "  Template: kept {} (already present)",
+            template_path.display()
+        );
+    }
+
+    let hooks_patched = co::patch_codex_hooks_file(&hooks_path)?;
+    if hooks_patched {
+        println!("  Hook:     patched {}", hooks_path.display());
+    } else {
+        println!(
+            "  Hook:     kept {} (already patched)",
+            hooks_path.display()
+        );
+    }
+
+    println!("{}", co::codex_auth_status_line());
+
+    let grant = ensure_codex_runtime_grant(config, &persona_id)
+        .map_err(|e| format!("ensure codex grant (rpc): {e}"))?;
+    let expires = grant.expires_at.as_deref().unwrap_or("never");
+    if grant.created {
+        println!("  Grant:    created {} (24h launcher grant)", grant.id);
+    } else {
+        println!("  Grant:    reused {} (active until {expires})", grant.id);
+    }
+
+    co::print_next_commands();
+    Ok(())
+}
+
+fn cmd_uninstall_for_codex() -> Result<(), Box<dyn std::error::Error>> {
+    use emberlink_cli::onboarding::codex as co;
+
+    let hooks_path = co::default_hooks_json_path()?;
+    println!("Uninstalling Codex integration:");
+    let removed = co::unpatch_codex_hooks_file(&hooks_path)?;
+    if removed {
+        println!("  Hook:     removed from {}", hooks_path.display());
+    } else {
+        println!(
+            "  Hook:     not present in {} (nothing to do)",
+            hooks_path.display()
+        );
+    }
+    println!("{}", co::codex_auth_status_line());
     Ok(())
 }
 
@@ -6689,24 +7510,65 @@ fn cmd_daemon_uninstall_agent() {
     }
 }
 
-/// Verify `sudo` is on `PATH` before invoking any subprocess that needs root.
-/// Returns `Ok(())` when present, `Err(message)` with manual-install
-/// instructions when missing.
-fn require_sudo() -> Result<(), String> {
-    let probe = std::process::Command::new("which").arg("sudo").output();
-    match probe {
-        Ok(output) if output.status.success() => Ok(()),
-        Ok(_) | Err(_) => Err(
-            "error: `sudo` not found on PATH — privileged daemon install steps require sudo.\n       \
-             Install sudo or run the install steps manually as root:\n         \
-             - macOS: `dseditgroup -o create ember`, `sysadminctl -addUser ember ...`, \
-             `dseditgroup -o create ember-clients`\n         \
-             - Linux: `groupadd --system ember`, `useradd --system ... ember`, \
-             `groupadd --system ember-clients`\n       \
-             See design §macOS install / §Linux install for the full sequence."
-                .to_string(),
-        ),
+/// Refuse privileged daemon install/migrate flows unless the current process
+/// is already running as root.
+///
+/// The canonical operator surface is `sudo ember daemon install` /
+/// `sudo ember daemon migrate ...`. A plain `ember daemon install` is not a
+/// wrapper that self-elevates — it shells directly into `dseditgroup`,
+/// `dscl`, `useradd`, and launch-service mutation. If we only check that
+/// `sudo` exists on `PATH`, the command falls through into low-level
+/// provisioning errors like `Username and password must be provided` instead
+/// of surfacing the real operator action. Keep the gate here so the failure
+/// is loud, early, and points at the exact supported command.
+fn require_root_install_invocation(command_hint: &str) -> Result<(), String> {
+    require_root_install_invocation_inner(
+        || {
+            // SAFETY: `geteuid` is a pure libc query with no preconditions.
+            unsafe { libc::geteuid() == 0 }
+        },
+        || {
+            std::process::Command::new("which")
+                .arg("sudo")
+                .output()
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        },
+        command_hint,
+    )
+}
+
+fn require_root_install_invocation_inner<IsRoot, HasSudo>(
+    is_root: IsRoot,
+    has_sudo: HasSudo,
+    command_hint: &str,
+) -> Result<(), String>
+where
+    IsRoot: FnOnce() -> bool,
+    HasSudo: FnOnce() -> bool,
+{
+    if is_root() {
+        return Ok(());
     }
+
+    if has_sudo() {
+        return Err(format!(
+            "error: `ember {command_hint}` must be run via sudo from your normal user shell.\n       \
+             Re-run exactly as:\n         \
+             sudo ember {command_hint}"
+        ));
+    }
+
+    Err(
+        "error: `sudo` not found on PATH — privileged daemon install steps require sudo.\n       \
+         Install sudo or run the install steps manually as root:\n         \
+         - macOS: `dseditgroup -o create ember`, `sysadminctl -addUser ember ...`, \
+         `dseditgroup -o create ember-clients`\n         \
+         - Linux: `groupadd --system ember`, `useradd --system ... ember`, \
+         `groupadd --system ember-clients`\n       \
+         See design §macOS install / §Linux install for the full sequence."
+            .to_string(),
+    )
 }
 
 /// Install the ember daemon under the separate-uid posture (design).
@@ -6785,7 +7647,7 @@ fn cmd_daemon_install(args: DaemonInstallArgs) {
 
     tracing::info!("installing separate-uid daemon posture (design)");
 
-    if let Err(msg) = require_sudo() {
+    if let Err(msg) = require_root_install_invocation("daemon install") {
         eprintln!("{msg}");
         process::exit(1);
     }
@@ -6865,6 +7727,7 @@ fn cmd_daemon_install(args: DaemonInstallArgs) {
     println!();
     println!("ember daemon installed (separate-uid posture, design)");
     println!("  Verify: ps -o uid,pid,comm | grep emberd");
+    println!("  Note:   {}", daemon_install_launcher_boundary_note());
 }
 
 /// Migrate a single-uid daemon installation to the separate-uid posture
@@ -6910,7 +7773,7 @@ fn migrate_to_separate_uid() {
 
     tracing::info!("detected single-uid posture; beginning migration to separate-uid");
 
-    if let Err(msg) = require_sudo() {
+    if let Err(msg) = require_root_install_invocation("daemon migrate") {
         eprintln!("{msg}");
         process::exit(1);
     }
@@ -7339,9 +8202,7 @@ fn cmd_daemon_diagnose(config: &DaemonConfig) {
     if let Some(issue) = launcher_issue.as_ref() {
         println!("  # First repair the installed `ember` launcher path:");
         println!("  # {}", issue.detail());
-        println!(
-            "  # Reinstall the managed CLI artifact or stop pointing the host launcher at repo build outputs."
-        );
+        println!("  # {}", issue.repair_guidance());
     }
     match pattern {
         "STATE-EMPTY" => {
@@ -7805,26 +8666,29 @@ fn run_sandbox_delete_local(
     }
 }
 
-/// implementation-note-438 — `ember up` body.
+fn up_redirect_command(profile: Option<&str>) -> String {
+    match profile {
+        Some(profile) => format!("ember claude --isolated --preset {profile}"),
+        None => "ember claude --isolated".to_string(),
+    }
+}
+
+/// Hidden legacy `ember up` redirect.
 ///
-/// Detects the host's container runtime (Docker / OrbStack / Podman),
-/// renders the bundled compose template at
-/// `crates/headless-runtime/templates/compose.yml.j2` against the operator-selected
-/// profile (`dev` / `headless` / `demo`; defaults to `dev`), writes the
-/// rendered YAML to `~/.ember/run/<run-id>/compose.yml`, and shells out to
-/// `<engine> compose -f <path> --profile <name> up -d`.
+/// The real isolated/container launcher truth moved to
+/// `ember claude --isolated` / `ember session open claude --isolated`.
+/// Keep this hidden verb fail-loud so older scripts see the canonical
+/// replacement instead of silently booting the stale compose scaffold.
 fn cmd_up(profile: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
-    emberlink_cli::up::open_claude_code_isolated(profile.as_deref(), None)?;
-    println!("Tear down with: ember down [--revoke-grants] [--purge]");
-    Ok(())
+    Err(format!(
+        "`ember up` is a hidden legacy scaffold and no longer tracks the isolated Claude launcher. Use `{}` instead.",
+        up_redirect_command(profile.as_deref())
+    )
+    .into())
 }
 
 /// implementation-note-438 — `ember down` body.
-fn cmd_down(
-    revoke_grants: bool,
-    yes: bool,
-    purge: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_down(revoke_grants: bool, yes: bool, purge: bool) -> Result<(), Box<dyn std::error::Error>> {
     let engine = emberlink_cli::up::detect_runtime_engine()?.ok_or_else(
         || -> Box<dyn std::error::Error> {
             emberlink_cli::up::missing_runtime_remediation().into()
@@ -7985,7 +8849,10 @@ fn confirm_revoke_prompt(total: usize) -> Result<bool, Box<dyn std::error::Error
     std::io::stderr().flush().ok();
     let mut input = String::new();
     std::io::stdin().read_line(&mut input)?;
-    Ok(matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+    Ok(matches!(
+        input.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 /// Install SIG_IGN on SIGINT for this scope; restore on drop. Used by the
@@ -8062,18 +8929,14 @@ fn latest_compose_yml(run_root: &std::path::Path) -> std::io::Result<Option<std:
 /// Returns the lexically-cleaned absolute path on success.
 ///
 /// Anchor: emit_file_path_validated
-fn validate_emit_file_path(
-    path: &std::path::Path,
-) -> Result<std::path::PathBuf, String> {
+fn validate_emit_file_path(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
     use std::path::{Component, PathBuf};
 
     let abs = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir()
-            .map_err(|e| {
-                format!("--emit-file: cannot resolve relative path (CWD: {e})")
-            })?
+            .map_err(|e| format!("--emit-file: cannot resolve relative path (CWD: {e})"))?
             .join(path)
     };
 
@@ -8101,9 +8964,7 @@ fn validate_emit_file_path(
     }
 
     let s = clean.to_string_lossy();
-    for forbidden in [
-        "/etc", "/var", "/usr", "/sys", "/proc", "/root", "/dev",
-    ] {
+    for forbidden in ["/etc", "/var", "/usr", "/sys", "/proc", "/root", "/dev"] {
         if s == forbidden || s.starts_with(&format!("{forbidden}/")) {
             return Err(format!(
                 "--emit-file: refused — path resolves to forbidden system prefix `{forbidden}`: {}",
@@ -8236,15 +9097,12 @@ fn main() {
                 }
             }
 
-            // implementation-note-463: when `--for claude` is set,
-            // skip basic init if the daemon DB already exists. Without this guard
-            // a friendly who ran `ember init --name "Foo"` and then ran
-            // `ember init --for claude` ended up with two extra root
-            // personas ("root" + their named one) in addition to the claude-code
-            // persona. We detect initialization by checking for daemon.db — the
-            // file written by `open_store` during every `cmd_init` run.
-            let skip_basic_init =
-                for_target == Some(OnboardingTarget::Claude) && is_ember_initialized(&config);
+            // Target-specific friendly onboarding (`--for claude` /
+            // `--for codex`) must not re-run the legacy base-init path once
+            // the managed daemon DB already exists. Otherwise a second
+            // onboarding pass re-enters root-persona bootstrap and the old
+            // keyring/bootstrap prompts.
+            let skip_basic_init = should_skip_basic_init(for_target, &config);
 
             if skip_basic_init {
                 // Already initialized — count existing personas for the log line.
@@ -8293,26 +9151,11 @@ fn main() {
                     }
                 }
             }
-            // Anchor: onboarding_target_codex_variant_landed
-            //
-            // Codex onboarding is in development. The flag parses (so
-            // operators can pin shell aliases and dotfiles to the
-            // canonical form today) and the base daemon init has
-            // already run above. The Codex-specific patcher
-            // (`~/.codex/hooks.json`, Codex auth-lane probe via
-            // `codex login status`) is broader work tracked outside
-            // this PR; until it lands, surface a clear-progress
-            // message so the operator can see init completed the
-            // base setup and route follow-up steps explicitly.
             if let Some(OnboardingTarget::Codex) = for_target {
-                println!(
-                    "ember init: base setup complete. Codex onboarding \
-                     (hooks.json patch + `codex login status` probe) is \
-                     in development; this run did not patch ~/.codex/. \
-                     Re-run with `--for claude` for the shipping lane, \
-                     or watch the v0.3.0 release notes for Codex \
-                     parity."
-                );
+                if let Err(e) = cmd_init_for_codex(&config, cli.config.as_ref(), non_interactive) {
+                    eprintln!("error: {e}");
+                    process::exit(1);
+                }
             }
         }
 
@@ -8325,20 +9168,13 @@ fn main() {
             }
         }
 
-        // Codex uninstall is a stub matching the Codex init shape:
-        // there is nothing for ember to clean up because the install
-        // arm never patched ~/.codex/hooks.json. Surface the
-        // operator-visible "nothing to do" message so the verb
-        // doesn't silently no-op.
         Commands::Uninstall {
             for_target: OnboardingTarget::Codex,
         } => {
-            println!(
-                "ember uninstall --for codex: nothing to uninstall. \
-                 Codex onboarding has not yet patched ~/.codex/, so \
-                 this verb is a no-op. Tracks parity with the Codex \
-                 init lane (see `ember init --for codex`)."
-            );
+            if let Err(e) = cmd_uninstall_for_codex() {
+                eprintln!("error: {e}");
+                process::exit(1);
+            }
         }
 
         Commands::Up { profile } => {
@@ -8637,15 +9473,13 @@ fn main() {
                         }
                     }
                 }
-                PersonaAction::Revoke { id } => {
-                    match run_persona_revoke(&config, &id) {
-                        Ok(_) => println!("Revoked persona {id}"),
-                        Err(e) => {
-                            eprintln!("error: {e}");
-                            process::exit(1);
-                        }
+                PersonaAction::Revoke { id } => match run_persona_revoke(&config, &id) {
+                    Ok(_) => println!("Revoked persona {id}"),
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        process::exit(1);
                     }
-                }
+                },
             }
         }
 
@@ -10693,6 +11527,7 @@ fn main() {
                         .unwrap_or_else(|| "<addr-not-configured>".to_string()),
                 ),
             };
+            let launcher_issue = detect_default_installed_launcher_issue();
 
             if cli.json {
                 if troubleshoot {
@@ -10703,24 +11538,63 @@ fn main() {
                 }
                 let (daemon_running, daemon_pid, daemon_socket) =
                     live_daemon_identity(runtime_status.as_ref(), live_daemon.as_ref());
+                let vault_session = if status_dispatch == StatusActionDispatch::DaemonRpc {
+                    match runtime_status {
+                        Some(ref status) if status.running => {
+                            run_vault_status(&config).ok().map(|(_, status)| status)
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
                 let status = serde_json::json!({
                     "version": env!("CARGO_PKG_VERSION"),
                     "daemon": { "running": daemon_running, "pid": daemon_pid, "socket": daemon_socket },
+                    "launcher_issue": launcher_issue_json(launcher_issue.as_ref()),
                     "personas": active,
                     "grants": { "active": summary.grants.len(), "expired_sweep_interval_sec": 60 },
                     "approvals": { "pending": summary.approvals.len() },
                     "standing_grants": summary.standing_grants,
                     "audit_events": total,
-                    "vault": { "backend": vault_backend, "addr": vault_addr },
+                    "vault": {
+                        "backend": vault_backend,
+                        "addr": vault_addr,
+                        "session": vault_session.as_ref().map(|status| serde_json::json!({
+                            "posture": status.posture,
+                            "unlocked": status.unlocked,
+                            "live_vault_attached": status.live_vault_attached,
+                            "session_pin_count": status.session_pin_count,
+                            "grace_window_secs": status.grace_window_secs,
+                            "grace_remaining_secs": status.grace_remaining_secs,
+                            "grace_lock_pending": status.grace_lock_pending,
+                            "grace_zero_due": status.grace_zero_due,
+                            "idle_secs": status.idle_secs,
+                            "idle_timeout_secs": status.idle_timeout_secs,
+                            "quiet_hours_start": status.quiet_hours_start,
+                            "quiet_hours_end": status.quiet_hours_end,
+                        })),
+                    },
                 });
                 println!("{}", serde_json::to_string_pretty(&status).unwrap());
             } else {
+                let vault_session = if status_dispatch == StatusActionDispatch::DaemonRpc {
+                    match runtime_status {
+                        Some(ref status) if status.running => {
+                            run_vault_status(&config).ok().map(|(_, status)| status)
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
                 let banner = build_status_banner(
                     &config,
                     runtime_status.as_ref(),
                     live_daemon.as_ref(),
                     vault_backend,
                     vault_addr,
+                    vault_session,
                 );
                 let github_status = if status_dispatch == StatusActionDispatch::DaemonRpc {
                     run_github_provider_status(&config).ok()
@@ -10729,7 +11603,11 @@ fn main() {
                 };
                 let ember_initialized = is_ember_initialized(&config);
                 let launcher_issue = detect_default_installed_launcher_issue();
-                println!("{}", render_status_text(banner.clone(), &summary));
+                let current_launcher_lane = detect_current_launcher_lane();
+                println!(
+                    "{}",
+                    render_status_text(banner.clone(), &summary, launcher_issue.as_ref())
+                );
                 if troubleshoot {
                     println!();
                     println!(
@@ -10740,7 +11618,8 @@ fn main() {
                             status_dispatch,
                             github_status.as_ref(),
                             ember_initialized,
-                            launcher_issue.as_ref()
+                            launcher_issue.as_ref(),
+                            current_launcher_lane.as_ref()
                         )
                     );
                 }
@@ -10766,35 +11645,24 @@ fn main() {
         Commands::Github { action } => match action {
             GithubAction::Status => match run_github_provider_status(&config) {
                 Ok(status) => {
+                    let launcher_issue = detect_default_installed_launcher_issue();
                     if cli.json {
-                        let payload = serde_json::json!({
-                                "https_app_lane": match github_https_lane(&status) {
-                                    GithubHttpsLane::ConfiguredApp => "configured_app",
-                                    GithubHttpsLane::ConfiguredPat => "configured_pat",
-                                    GithubHttpsLane::ConfiguredMock => "configured_mock",
-                                    GithubHttpsLane::Broken => "broken",
-                                    GithubHttpsLane::NotConfigured => "not_configured",
-                                },
-                            "detail": status.detail,
-                            "app_id": status.app_id,
-                            "installation_id": status.installation_id,
-                            "ssh_lane": "substrate_exists_not_launcher_wired",
-                            "pat_lane": "degraded_brokered_fallback",
-                        });
+                        let payload = github_status_json_payload(&status, launcher_issue.as_ref());
                         println!("{}", serde_json::to_string_pretty(&payload).unwrap());
                     } else {
-                        print!("{}", render_github_status_text(&status));
+                        print!(
+                            "{}",
+                            render_github_status_text(&status, launcher_issue.as_ref())
+                        );
                     }
                 }
                 Err(e) => {
                     eprintln!("error: {e}");
-                    if let Some(hint) = render_github_status_retry_hint(&e) {
-                        eprintln!("       {hint}");
-                    } else {
-                        eprintln!(
-                            "       run `ember status` to inspect daemon posture, or `sudo ember daemon install` to repair it"
-                        );
-                    }
+                    let launcher_issue = detect_default_installed_launcher_issue();
+                    eprint!(
+                        "{}",
+                        render_github_status_error_guidance(&e, launcher_issue.as_ref())
+                    );
                     process::exit(1);
                 }
             },
@@ -11651,7 +12519,13 @@ mod tests {
             "materialized_at": "2026-05-19T00:00:00Z",
             "terminal_reason": "revoked",
             "requested_scope": "repo:read",
-            "granted_scope": "repo:read"
+            "granted_scope": "repo:read",
+            "signed": true,
+            "workflow_template": null,
+            "claim_count_total": null,
+            "claim_events_truncated": false,
+            "claim_segment_count": null,
+            "claim_history_merkle_root": null
         })
     }
 
@@ -11813,7 +12687,8 @@ mod tests {
 
     #[test]
     fn render_status_text_offline_prioritizes_repair_over_detail() {
-        let rendered = render_status_text(DaemonStatusBanner::NotRunning, &fake_status_summary());
+        let rendered =
+            render_status_text(DaemonStatusBanner::NotRunning, &fake_status_summary(), None);
         assert!(
             rendered.contains("DAEMON             not running"),
             "offline status must lead with daemon-down state: {rendered}"
@@ -11852,8 +12727,10 @@ mod tests {
                 dashboard: "http://localhost:8123/".to_string(),
                 vault_backend: "local".to_string(),
                 vault_addr: "local-encrypted".to_string(),
+                vault_session: None,
             },
             &summary,
+            None,
         );
         assert!(
             rendered.contains("Quarantine: startup_audit_chain_break"),
@@ -11867,6 +12744,118 @@ mod tests {
             rendered.contains("Repair:     ember audit verify"),
             "running status must route the operator to audit repair: {rendered}"
         );
+    }
+
+    #[test]
+    fn render_status_text_running_surfaces_vault_lane_summary() {
+        let rendered = render_status_text(
+            DaemonStatusBanner::Running {
+                pid: 42,
+                socket: "/tmp/daemon.sock".to_string(),
+                dashboard: "http://localhost:8123/".to_string(),
+                vault_backend: "local".to_string(),
+                vault_addr: "local-encrypted".to_string(),
+                vault_session: Some(VaultStatusView {
+                    posture: "presence-locked-vault-pinned".to_string(),
+                    unlocked: false,
+                    live_vault_attached: true,
+                    session_pin_count: 1,
+                    grace_window_secs: 300,
+                    grace_remaining_secs: 0,
+                    grace_lock_pending: false,
+                    grace_zero_due: false,
+                    idle_secs: None,
+                    idle_timeout_secs: 300,
+                    quiet_hours_start: None,
+                    quiet_hours_end: None,
+                }),
+            },
+            &fake_status_summary(),
+            None,
+        );
+        assert!(
+            rendered
+                .contains("Vault lane: presence-locked (live vault still attached; 1 session pin)"),
+            "running status should distinguish a soft lock from a hard lock: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_status_text_running_calls_out_stale_launcher_boundary() {
+        let issue = InstalledLauncherIssue::StaleManagedInstall {
+            path: PathBuf::from("/usr/local/bin/ember"),
+            target: PathBuf::from("/usr/local/lib/ember.app/Contents/MacOS/ember"),
+            newer_components: vec![
+                PathBuf::from("/usr/local/bin/emberd"),
+                PathBuf::from("/usr/local/lib/ember/binaries/ember-gh"),
+            ],
+        };
+        let rendered = render_status_text(
+            DaemonStatusBanner::Running {
+                pid: 42,
+                socket: "/tmp/daemon.sock".to_string(),
+                dashboard: "http://localhost:8123/".to_string(),
+                vault_backend: "local".to_string(),
+                vault_addr: "local-encrypted".to_string(),
+                vault_session: None,
+            },
+            &fake_status_summary(),
+            Some(&issue),
+        );
+        assert!(
+            rendered.contains("Host launcher: /usr/local/bin/ember ->"),
+            "plain status must surface stale host launcher drift without `--troubleshoot`: {rendered}"
+        );
+        assert!(
+            rendered.contains("older than managed runtime surface"),
+            "plain status must explain the split install truth: {rendered}"
+        );
+        assert!(
+            rendered.contains("does not rebuild `/usr/local/lib/ember.app`"),
+            "plain status must carry the launcher boundary repair guidance: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_vault_status_text_calls_out_hard_lock() {
+        let rendered = render_vault_status_text(&VaultStatusView {
+            posture: "hard-locked".to_string(),
+            unlocked: false,
+            live_vault_attached: false,
+            session_pin_count: 0,
+            grace_window_secs: 300,
+            grace_remaining_secs: 0,
+            grace_lock_pending: false,
+            grace_zero_due: false,
+            idle_secs: None,
+            idle_timeout_secs: 300,
+            quiet_hours_start: None,
+            quiet_hours_end: None,
+        });
+        assert!(rendered.contains("VAULT LANE         hard-locked (live vault detached)"));
+        assert!(rendered.contains("Live MEK:   detached"));
+    }
+
+    #[test]
+    fn render_vault_status_text_reports_remaining_grace_countdown() {
+        let rendered = render_vault_status_text(&VaultStatusView {
+            posture: "presence-locked-vault-attached".to_string(),
+            unlocked: false,
+            live_vault_attached: true,
+            session_pin_count: 0,
+            grace_window_secs: 300,
+            grace_remaining_secs: 42,
+            grace_lock_pending: true,
+            grace_zero_due: false,
+            idle_secs: Some(301),
+            idle_timeout_secs: 300,
+            quiet_hours_start: None,
+            quiet_hours_end: None,
+        });
+        assert!(rendered.contains(
+            "VAULT LANE         presence-locked (live vault still attached; 42s grace remaining)"
+        ));
+        assert!(rendered.contains("Grace:     active (42s remaining)"));
     }
 
     #[test]
@@ -11892,6 +12881,59 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn detect_installed_launcher_issue_at_flags_stale_managed_runtime_surface() {
+        let tmp = tempfile::tempdir().unwrap();
+        let launcher_dir = tmp.path().join("launcher");
+        let runtime_dir = tmp.path().join("runtime");
+        std::fs::create_dir_all(&launcher_dir).unwrap();
+        std::fs::create_dir_all(&runtime_dir).unwrap();
+
+        let launcher_target = launcher_dir.join("ember");
+        std::fs::write(&launcher_target, "launcher").unwrap();
+        std::thread::sleep(Duration::from_secs(1));
+
+        let newer_component = runtime_dir.join("emberd");
+        std::fs::write(&newer_component, "daemon").unwrap();
+
+        let install = tmp.path().join("bin").join("ember");
+        std::fs::create_dir_all(install.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&launcher_target, &install).unwrap();
+
+        assert_eq!(
+            detect_installed_launcher_issue_at_with_managed_components(
+                &install,
+                std::slice::from_ref(&newer_component),
+                Duration::ZERO,
+            ),
+            Some(InstalledLauncherIssue::StaleManagedInstall {
+                path: install,
+                target: launcher_target,
+                newer_components: vec![newer_component],
+            })
+        );
+    }
+
+    #[test]
+    fn classify_current_launcher_lane_at_detects_installed_host() {
+        assert_eq!(
+            classify_current_launcher_lane_at(Path::new(PROD_EMBER_APP_PATH)),
+            CurrentLauncherLane::InstalledHost {
+                path: PathBuf::from(PROD_EMBER_APP_PATH),
+            }
+        );
+    }
+
+    #[test]
+    fn classify_current_launcher_lane_at_detects_repo_build() {
+        let path = PathBuf::from("/Users/operator/repos/emberlink-dev/target/release/ember");
+        assert_eq!(
+            classify_current_launcher_lane_at(&path),
+            CurrentLauncherLane::RepoBuild { path }
+        );
+    }
+
+    #[test]
     fn render_status_troubleshoot_offline_calls_out_broken_launcher_before_daemon_repair() {
         let issue = InstalledLauncherIssue::BrokenRepoBuildSymlink {
             path: PathBuf::from("/usr/local/bin/ember"),
@@ -11906,6 +12948,7 @@ mod tests {
             None,
             true,
             Some(&issue),
+            None,
         );
         assert!(
             rendered.contains("Install path:   /usr/local/bin/ember ->"),
@@ -11922,6 +12965,59 @@ mod tests {
     }
 
     #[test]
+    fn render_status_troubleshoot_discloses_current_launcher_lane() {
+        let lane = CurrentLauncherLane::RepoBuild {
+            path: PathBuf::from("/Users/operator/repos/emberlink-dev/target/release/ember"),
+        };
+        let rendered = render_status_troubleshoot_text(
+            &DaemonStatusBanner::NotRunning,
+            &fake_status_summary(),
+            StatusActionDispatch::LocalFallback,
+            None,
+            true,
+            None,
+            Some(&lane),
+        );
+        assert!(
+            rendered.contains("Current lane:   repo build (no-sudo proof lane)"),
+            "troubleshoot must disclose the active launcher lane: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_status_troubleshoot_offline_calls_out_stale_launcher_before_daemon_repair() {
+        let issue = InstalledLauncherIssue::StaleManagedInstall {
+            path: PathBuf::from("/usr/local/bin/ember"),
+            target: PathBuf::from("/usr/local/lib/ember.app/Contents/MacOS/ember"),
+            newer_components: vec![
+                PathBuf::from("/usr/local/bin/emberd"),
+                PathBuf::from("/usr/local/lib/ember/binaries/ember-gh"),
+            ],
+        };
+        let rendered = render_status_troubleshoot_text(
+            &DaemonStatusBanner::NotRunning,
+            &fake_status_summary(),
+            StatusActionDispatch::LocalFallback,
+            None,
+            true,
+            Some(&issue),
+            None,
+        );
+        assert!(
+            rendered.contains("older than managed runtime surface"),
+            "offline troubleshoot must surface the split install truth: {rendered}"
+        );
+        assert!(
+            rendered.contains("`sudo ember daemon install` refreshes daemon/runtime sidecars"),
+            "offline troubleshoot must explain why daemon install alone does not fix the launcher: {rendered}"
+        );
+        assert!(
+            rendered.contains("2. Run `sudo ember daemon install`"),
+            "offline troubleshoot must keep daemon repair as the second step: {rendered}"
+        );
+    }
+
+    #[test]
     fn render_status_troubleshoot_offline_routes_to_diagnose_when_state_exists() {
         let rendered = render_status_troubleshoot_text(
             &DaemonStatusBanner::NotRunning,
@@ -11929,6 +13025,7 @@ mod tests {
             StatusActionDispatch::LocalFallback,
             None,
             true,
+            None,
             None,
         );
         assert!(
@@ -11954,6 +13051,7 @@ mod tests {
                 dashboard: "http://localhost:8123/".to_string(),
                 vault_backend: "local".to_string(),
                 vault_addr: "local-encrypted".to_string(),
+                vault_session: None,
             },
             &fake_status_summary(),
             StatusActionDispatch::DaemonRpc,
@@ -11964,6 +13062,7 @@ mod tests {
                 installation_id: None,
             }),
             true,
+            None,
             None,
         );
         assert!(
@@ -11997,6 +13096,7 @@ mod tests {
                 dashboard: "http://localhost:8123/".to_string(),
                 vault_backend: "local".to_string(),
                 vault_addr: "local-encrypted".to_string(),
+                vault_session: None,
             },
             &fake_status_summary(),
             StatusActionDispatch::DaemonRpc,
@@ -12007,6 +13107,7 @@ mod tests {
                 installation_id: None,
             }),
             true,
+            None,
             None,
         );
         assert!(
@@ -12038,6 +13139,7 @@ mod tests {
                 dashboard: "http://localhost:8123/".to_string(),
                 vault_backend: "local".to_string(),
                 vault_addr: "local-encrypted".to_string(),
+                vault_session: None,
             },
             &fake_status_summary(),
             StatusActionDispatch::DaemonRpc,
@@ -12048,6 +13150,7 @@ mod tests {
                 installation_id: None,
             }),
             true,
+            None,
             None,
         );
         assert!(
@@ -12076,6 +13179,7 @@ mod tests {
                 dashboard: "http://localhost:8123/".to_string(),
                 vault_backend: "local".to_string(),
                 vault_addr: "local-encrypted".to_string(),
+                vault_session: None,
             },
             &summary,
             StatusActionDispatch::DaemonRpc,
@@ -12086,6 +13190,7 @@ mod tests {
                 installation_id: None,
             }),
             true,
+            None,
             None,
         );
         assert!(
@@ -12108,12 +13213,15 @@ mod tests {
 
     #[test]
     fn render_github_status_text_points_at_app_first() {
-        let rendered = render_github_status_text(&GithubProviderStatusView {
-            lane: "app".to_string(),
-            detail: None,
-            app_id: None,
-            installation_id: None,
-        });
+        let rendered = render_github_status_text(
+            &GithubProviderStatusView {
+                lane: "app".to_string(),
+                detail: None,
+                app_id: None,
+                installation_id: None,
+            },
+            None,
+        );
         assert!(
             rendered.contains("configured (real GitHub App broker)"),
             "github status must distinguish the real App lane: {rendered}"
@@ -12142,12 +13250,15 @@ mod tests {
 
     #[test]
     fn render_github_status_text_names_pat_as_degraded_lane() {
-        let rendered = render_github_status_text(&GithubProviderStatusView {
-            lane: "pat".to_string(),
-            detail: None,
-            app_id: None,
-            installation_id: None,
-        });
+        let rendered = render_github_status_text(
+            &GithubProviderStatusView {
+                lane: "pat".to_string(),
+                detail: None,
+                app_id: None,
+                installation_id: None,
+            },
+            None,
+        );
         assert!(
             rendered.contains("configured (degraded PAT fallback"),
             "github status must distinguish degraded PAT posture: {rendered}"
@@ -12171,16 +13282,52 @@ mod tests {
     }
 
     #[test]
+    fn daemon_install_requires_root_even_when_sudo_exists() {
+        let err = require_root_install_invocation_inner(|| false, || true, "daemon install")
+            .expect_err("non-root install must fail fast before provisioning");
+        assert!(
+            err.contains("sudo ember daemon install"),
+            "rerun hint must name the canonical command: {err}"
+        );
+        assert!(
+            err.contains("must be run via sudo"),
+            "failure must explain the privilege boundary: {err}"
+        );
+    }
+
+    #[test]
+    fn daemon_migrate_requires_root_even_when_sudo_exists() {
+        let err = require_root_install_invocation_inner(|| false, || true, "daemon migrate")
+            .expect_err("non-root migrate must fail fast before provisioning");
+        assert!(
+            err.contains("sudo ember daemon migrate"),
+            "rerun hint must preserve the original privileged command: {err}"
+        );
+    }
+
+    #[test]
+    fn daemon_install_allows_existing_root_context() {
+        let result = require_root_install_invocation_inner(|| true, || false, "daemon install");
+        assert!(
+            result.is_ok(),
+            "root context must not be rejected when sudo is absent"
+        );
+    }
+
+    #[test]
     fn render_github_status_text_surfaces_broken_detail() {
-        let rendered = render_github_status_text(&GithubProviderStatusView {
-            lane: "broken".to_string(),
-            detail: Some(
-                "github/apps/ember/install-123: partial credential triple (private-key=true, app-id=true, installation-id=false)"
-                    .to_string(),
-            ),
-            app_id: None,
-            installation_id: None,
-        });
+        let rendered = render_github_status_text(
+            &GithubProviderStatusView {
+                lane: "broken".to_string(),
+                detail: Some(
+                    "github/apps/ember/install-123: partial credential triple (private-key=true, app-id=true, installation-id=false)"
+                        .to_string(),
+                ),
+                app_id: None,
+                installation_id: None,
+            },
+            None,
+        );
         assert!(
             rendered.contains("local authority loading failed"),
             "broken posture must say the local App config is broken: {rendered}"
@@ -12192,6 +13339,89 @@ mod tests {
         assert!(
             rendered.contains("Re-run `ember github setup`"),
             "broken posture must point at the repair path: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_github_status_text_surfaces_stale_launcher_boundary_when_present() {
+        let rendered = render_github_status_text(
+            &GithubProviderStatusView {
+                lane: "app".to_string(),
+                detail: None,
+                app_id: None,
+                installation_id: None,
+            },
+            Some(&InstalledLauncherIssue::StaleManagedInstall {
+                path: PathBuf::from("/usr/local/bin/ember"),
+                target: PathBuf::from("/usr/local/lib/ember.app/Contents/MacOS/ember"),
+                newer_components: vec![
+                    PathBuf::from("/usr/local/bin/emberd"),
+                    PathBuf::from("/usr/local/lib/ember/binaries/ember-gh"),
+                ],
+            }),
+        );
+        assert!(
+            rendered.contains("Host launcher boundary:"),
+            "github status must surface stale host launcher drift when present: {rendered}"
+        );
+        assert!(
+            rendered
+                .contains("/usr/local/bin/ember -> /usr/local/lib/ember.app/Contents/MacOS/ember"),
+            "github status must disclose the split install path that drifted: {rendered}"
+        );
+        assert!(
+            rendered.contains("does not rebuild `/usr/local/lib/ember.app`"),
+            "github status must keep the stale-launcher repair truth explicit: {rendered}"
+        );
+    }
+
+    #[test]
+    fn github_status_json_payload_surfaces_stale_launcher_boundary_when_present() {
+        let payload = github_status_json_payload(
+            &GithubProviderStatusView {
+                lane: "app".to_string(),
+                detail: None,
+                app_id: Some("123456".to_string()),
+                installation_id: Some("654321".to_string()),
+            },
+            Some(&InstalledLauncherIssue::StaleManagedInstall {
+                path: PathBuf::from("/usr/local/bin/ember"),
+                target: PathBuf::from("/usr/local/lib/ember.app/Contents/MacOS/ember"),
+                newer_components: vec![
+                    PathBuf::from("/usr/local/bin/emberd"),
+                    PathBuf::from("/usr/local/lib/ember/binaries/ember-gh"),
+                ],
+            }),
+        );
+        assert_eq!(
+            payload["https_app_lane"],
+            serde_json::json!("configured_app"),
+            "github status json must preserve the real App posture: {payload}"
+        );
+        assert_eq!(
+            payload["launcher_issue"]["kind"],
+            serde_json::json!("stale_managed_install"),
+            "github status json must classify stale launcher drift for automation: {payload}"
+        );
+        assert_eq!(
+            payload["launcher_issue"]["path"],
+            serde_json::json!("/usr/local/bin/ember"),
+            "github status json must expose the drifting launcher path: {payload}"
+        );
+        assert_eq!(
+            payload["launcher_issue"]["newer_components"],
+            serde_json::json!([
+                "/usr/local/bin/emberd",
+                "/usr/local/lib/ember/binaries/ember-gh",
+            ]),
+            "github status json must expose the newer managed runtime components: {payload}"
+        );
+        assert_eq!(
+            payload["launcher_issue"]["repair_guidance"],
+            serde_json::json!(
+                "Repair the installed `ember` launcher path first: /usr/local/bin/ember is older than the managed daemon/construct binaries on this host. Reinstall the managed CLI artifact or release package so `/usr/local/bin/ember` matches the runtime surface. `sudo ember daemon install` refreshes daemon/runtime sidecars, but it does not rebuild `/usr/local/lib/ember.app`."
+            ),
+            "github status json must preserve the exact repair guidance already shown in text surfaces: {payload}"
         );
     }
 
@@ -12285,7 +13515,7 @@ mod tests {
     #[test]
     fn github_setup_success_text_manual_reload_points_back_to_status_and_init() {
         let rendered =
-            render_github_setup_success_text(GithubSetupDaemonFollowup::NeedsManualReload);
+            render_github_setup_success_text(GithubSetupDaemonFollowup::NeedsManualReload, None);
         assert!(rendered.contains("ember daemon reload"));
         assert!(rendered.contains("ember github status"));
         assert!(rendered.contains("ember init --for claude"));
@@ -12295,16 +13525,34 @@ mod tests {
 
     #[test]
     fn github_setup_success_text_reloaded_path_names_daemon_reload_result() {
-        let rendered = render_github_setup_success_text(GithubSetupDaemonFollowup::Reloaded {
-            old_pid: 11,
-            new_pid: Some(22),
-        });
+        let rendered = render_github_setup_success_text(
+            GithubSetupDaemonFollowup::Reloaded {
+                old_pid: 11,
+                new_pid: Some(22),
+            },
+            None,
+        );
         assert!(rendered.contains("Daemon reloaded: old pid 11, new pid 22"));
         assert!(rendered.contains("ember github status"));
         assert!(rendered.contains("HTTPS remotes"));
         assert!(rendered.contains("ember init --for claude"));
         assert!(rendered.contains("ember claude"));
         assert!(rendered.contains("ember receipt export --latest --format md"));
+    }
+
+    #[test]
+    fn github_setup_success_text_surfaces_stale_launcher_boundary_when_present() {
+        let rendered = render_github_setup_success_text(
+            GithubSetupDaemonFollowup::NeedsManualReload,
+            Some(&InstalledLauncherIssue::StaleManagedInstall {
+                path: PathBuf::from("/usr/local/bin/ember"),
+                target: PathBuf::from("/usr/local/lib/ember.app/Contents/MacOS/ember"),
+                newer_components: vec![PathBuf::from("/usr/local/bin/emberd")],
+            }),
+        );
+        assert!(rendered.contains("Host launcher boundary:"));
+        assert!(rendered.contains("/usr/local/bin/ember ->"));
+        assert!(rendered.contains("does not rebuild `/usr/local/lib/ember.app`"));
     }
 
     #[test]
@@ -12333,12 +13581,80 @@ mod tests {
     fn github_setup_retry_hint_names_vault_unlock_path() {
         let hint = render_github_setup_retry_hint(&GithubSetupError::Broker(
             emberlink_cli::broker::BrokerCliError::Guidance(
-                "this command needs operator presence on the daemon-managed vault lane. Approve the unlock flow if prompted, or run `ember vault unlock` from an interactive operator shell and retry.".to_string(),
+                "this command needs operator presence on the daemon-managed vault lane. Use the managed separate-uid biometric unlock flow when available, or restart the daemon with `EMBER_VAULT_PASSPHRASE` for a fresh dev-probe bootstrap; same-daemon operator-uid reopen is intentionally disabled.".to_string(),
             ),
         ))
         .expect("vault unlock hint");
-        assert!(hint.contains("ember vault unlock"));
+        assert!(hint.contains("managed separate-uid biometric unlock"));
+        assert!(hint.contains("EMBER_VAULT_PASSPHRASE"));
         assert!(hint.contains("ember github setup"));
+    }
+
+    #[test]
+    fn github_setup_error_guidance_keeps_generic_retry_path_without_launcher_drift() {
+        let guidance = render_github_setup_error_guidance(
+            &GithubSetupError::Broker(emberlink_cli::broker::BrokerCliError::InvalidArgs(
+                "github app registration failed".to_string(),
+            )),
+            None,
+        );
+        assert!(
+            guidance.contains("run `ember github status` for the current posture"),
+            "github setup failures without launcher drift must keep the generic retry path: {guidance}"
+        );
+        assert!(
+            !guidance.contains("install path:"),
+            "github setup failures without launcher drift should not invent launcher guidance: {guidance}"
+        );
+    }
+
+    #[test]
+    fn github_setup_error_guidance_surfaces_stale_launcher_boundary_when_present() {
+        let guidance = render_github_setup_error_guidance(
+            &GithubSetupError::Broker(emberlink_cli::broker::BrokerCliError::InvalidArgs(
+                "github app registration failed".to_string(),
+            )),
+            Some(&InstalledLauncherIssue::StaleManagedInstall {
+                path: PathBuf::from("/usr/local/bin/ember"),
+                target: PathBuf::from("/usr/local/lib/ember.app/Contents/MacOS/ember"),
+                newer_components: vec![PathBuf::from("/usr/local/bin/emberd")],
+            }),
+        );
+        assert!(
+            guidance.contains("install path: /usr/local/bin/ember -> /usr/local/lib/ember.app/Contents/MacOS/ember"),
+            "github setup failures must disclose the drifting launcher path when present: {guidance}"
+        );
+        assert!(
+            guidance.contains("does not rebuild `/usr/local/lib/ember.app`"),
+            "github setup failures must preserve the launcher repair truth: {guidance}"
+        );
+        assert!(
+            guidance.contains("run `ember github status` for the current posture"),
+            "github setup failures must still point back at posture confirmation after launcher repair: {guidance}"
+        );
+    }
+
+    #[test]
+    fn github_setup_error_guidance_preserves_unlock_retry_hint() {
+        let guidance = render_github_setup_error_guidance(
+            &GithubSetupError::Broker(emberlink_cli::broker::BrokerCliError::Guidance(
+                "use the managed separate-uid biometric unlock flow if available, or restart the daemon with `EMBER_VAULT_PASSPHRASE`, then rerun `ember github setup`.".to_string(),
+            )),
+            Some(&InstalledLauncherIssue::StaleManagedInstall {
+                path: PathBuf::from("/usr/local/bin/ember"),
+                target: PathBuf::from("/usr/local/lib/ember.app/Contents/MacOS/ember"),
+                newer_components: vec![PathBuf::from("/usr/local/bin/emberd")],
+            }),
+        );
+        assert!(
+            guidance.contains("managed separate-uid biometric unlock"),
+            "github setup failures must preserve the vault unlock retry hint when that is the real blocker: {guidance}"
+        );
+        assert!(guidance.contains("EMBER_VAULT_PASSPHRASE"));
+        assert!(
+            !guidance.contains("install path:"),
+            "vault unlock retry guidance should stay focused instead of layering stale-launcher text on top: {guidance}"
+        );
     }
 
     #[test]
@@ -12365,26 +13681,52 @@ mod tests {
     fn render_claude_runtime_auth_status_names_exact_follow_up_paths() {
         let rendered =
             render_claude_runtime_auth_status(AnthropicRuntimeCredentialAvailability::Absent);
+        assert!(rendered.contains("CLAUDE_CODE_OAUTH_TOKEN"));
+        assert!(rendered.contains("ember vault add --name anthropic/oauth-token"));
         assert!(rendered.contains("ANTHROPIC_API_KEY"));
-        assert!(rendered.contains("ember vault add --name anthropic-key"));
         assert!(rendered.contains("rerunning init"));
     }
 
     #[test]
     fn render_claude_runtime_auth_status_names_existing_vault_entry() {
         let rendered = render_claude_runtime_auth_status(
-            AnthropicRuntimeCredentialAvailability::ExistingVaultEntry,
+            AnthropicRuntimeCredentialAvailability::ExistingVaultEntry(
+                AnthropicRuntimeCredentialKind::ApiKey,
+            ),
         );
         assert!(rendered.contains("reusing anthropic-key from vault"));
     }
 
     #[test]
+    fn render_claude_runtime_auth_status_names_existing_oauth_vault_entry() {
+        let rendered = render_claude_runtime_auth_status(
+            AnthropicRuntimeCredentialAvailability::ExistingVaultEntry(
+                AnthropicRuntimeCredentialKind::OAuthToken,
+            ),
+        );
+        assert!(rendered.contains("reusing anthropic/oauth-token from vault"));
+    }
+
+    #[test]
+    fn preferred_existing_claude_runtime_credential_prefers_oauth() {
+        let entries = vec![
+            serde_json::json!({"name": "anthropic-key"}),
+            serde_json::json!({"name": "anthropic/oauth-token"}),
+        ];
+        assert_eq!(
+            preferred_existing_claude_code_anthropic_runtime_credential(&entries),
+            Some(AnthropicRuntimeCredentialKind::OAuthToken),
+        );
+    }
+
+    #[test]
     fn github_status_retry_hint_names_vault_unlock_path() {
         let hint = render_github_status_retry_hint(&core_types::ValidationError::new(
-            "this command needs operator presence on the daemon-managed vault lane. Approve the unlock flow if prompted, or run `ember vault unlock` from an interactive operator shell and retry.".to_string(),
+            "this command needs operator presence on the daemon-managed vault lane. Use the managed separate-uid biometric unlock flow when available, or restart the daemon with `EMBER_VAULT_PASSPHRASE` for a fresh dev-probe bootstrap; same-daemon operator-uid reopen is intentionally disabled.".to_string(),
         ))
         .expect("vault unlock hint");
-        assert!(hint.contains("ember vault unlock"));
+        assert!(hint.contains("managed separate-uid biometric unlock"));
+        assert!(hint.contains("EMBER_VAULT_PASSPHRASE"));
         assert!(hint.contains("ember github status"));
     }
 
@@ -12394,6 +13736,46 @@ mod tests {
             "ember daemon not running".to_string(),
         ));
         assert!(hint.is_none());
+    }
+
+    #[test]
+    fn github_status_error_guidance_falls_back_to_generic_daemon_repair() {
+        let guidance = render_github_status_error_guidance(
+            &core_types::ValidationError::new("ember daemon not running".to_string()),
+            None,
+        );
+        assert!(
+            guidance.contains("run `ember status` to inspect daemon posture"),
+            "github status failures without launcher drift must keep the generic daemon repair path: {guidance}"
+        );
+        assert!(
+            !guidance.contains("install path:"),
+            "github status failures without launcher drift should not invent launcher guidance: {guidance}"
+        );
+    }
+
+    #[test]
+    fn github_status_error_guidance_surfaces_stale_launcher_boundary_when_present() {
+        let guidance = render_github_status_error_guidance(
+            &core_types::ValidationError::new("ember daemon not running".to_string()),
+            Some(&InstalledLauncherIssue::StaleManagedInstall {
+                path: PathBuf::from("/usr/local/bin/ember"),
+                target: PathBuf::from("/usr/local/lib/ember.app/Contents/MacOS/ember"),
+                newer_components: vec![PathBuf::from("/usr/local/bin/emberd")],
+            }),
+        );
+        assert!(
+            guidance.contains("install path: /usr/local/bin/ember -> /usr/local/lib/ember.app/Contents/MacOS/ember"),
+            "github status failures must disclose the drifting launcher path when present: {guidance}"
+        );
+        assert!(
+            guidance.contains("does not rebuild `/usr/local/lib/ember.app`"),
+            "github status failures must preserve the launcher repair truth: {guidance}"
+        );
+        assert!(
+            guidance.contains("then run `ember status` to inspect daemon posture"),
+            "github status failures must still point back at daemon posture after the launcher repair: {guidance}"
+        );
     }
 
     #[test]
@@ -12493,7 +13875,9 @@ mod tests {
 
     fn parse_cli(args: &[&str]) -> Cli {
         use clap::Parser as _;
-        let full: Vec<&str> = std::iter::once("ember").chain(args.iter().copied()).collect();
+        let full: Vec<&str> = std::iter::once("ember")
+            .chain(args.iter().copied())
+            .collect();
         Cli::try_parse_from(&full).expect("parse failed")
     }
 
@@ -12514,10 +13898,8 @@ mod tests {
     /// Anchor: onboarding_target_codex_variant_landed
     ///
     /// `ember init --for codex` parses to `OnboardingTarget::Codex`.
-    /// The dispatch arm is a stub (Codex onboarding implementation is
-    /// out of scope for the variant-add PR), but the parse-level
-    /// surface is committed so operators can pin shell aliases to the
-    /// canonical form today.
+    /// The target is now wired to the Codex onboarding lane, but this test
+    /// stays focused on the canonical parse surface.
     #[test]
     fn init_for_codex_parses_to_canonical_target() {
         match parse_cli(&["init", "--for", "codex"]).command {
@@ -12570,7 +13952,10 @@ mod tests {
                 ..
             } => {
                 assert_eq!(worktree.as_deref(), Some("auth-posture"));
-                assert_eq!(branch.as_deref(), Some("agent/auth-posture/20260522-170000"));
+                assert_eq!(
+                    branch.as_deref(),
+                    Some("agent/auth-posture/20260522-170000")
+                );
                 assert_eq!(purpose.as_deref(), Some("release proof"));
                 assert_eq!(args, vec!["--print".to_string(), "hello".to_string()]);
             }
@@ -12601,7 +13986,10 @@ mod tests {
                 ..
             } => {
                 assert_eq!(worktree.as_deref(), Some("auth-posture"));
-                assert_eq!(branch.as_deref(), Some("agent/auth-posture/20260522-170000"));
+                assert_eq!(
+                    branch.as_deref(),
+                    Some("agent/auth-posture/20260522-170000")
+                );
                 assert_eq!(purpose.as_deref(), Some("release proof"));
                 assert_eq!(args, vec!["--no-alt-screen".to_string()]);
             }
@@ -12724,12 +14112,20 @@ mod tests {
         );
     }
 
+    fn short_tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("ember-cli-")
+            .tempdir_in("/tmp")
+            .or_else(|_| tempfile::tempdir())
+            .expect("tempdir")
+    }
+
     /// implementation-note-473:
     /// Path under $HOME is accepted; validator returns the canonical
     /// lexically-cleaned form.
     #[test]
     fn emit_file_path_under_home_accepted() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = short_tempdir();
         let prev_home = std::env::var_os("HOME");
         // SAFETY: tests in this binary run single-threaded; HOME is
         // restored before this scope exits. Matches the existing
@@ -12758,8 +14154,7 @@ mod tests {
     #[test]
     fn emit_file_path_etc_passwd_rejected() {
         let path = std::path::PathBuf::from("/etc/passwd");
-        let err = validate_emit_file_path(&path)
-            .expect_err("/etc paths must be rejected outright");
+        let err = validate_emit_file_path(&path).expect_err("/etc paths must be rejected outright");
         assert!(
             err.contains("/etc"),
             "refusal must name the forbidden prefix `/etc`, got: {err}"
@@ -12788,9 +14183,8 @@ mod tests {
                 None => std::env::remove_var("HOME"),
             }
         }
-        result.expect_err(
-            "$HOME/../etc/passwd lexically resolves outside HOME and must be rejected",
-        );
+        result
+            .expect_err("$HOME/../etc/passwd lexically resolves outside HOME and must be rejected");
     }
 
     /// bridge_endpoint_emit_file_default_path_when_arg_omitted — verifies that
@@ -13162,6 +14556,7 @@ mod tests {
         let status = serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
             "daemon": { "running": false, "pid": null, "socket": null },
+            "launcher_issue": serde_json::Value::Null,
             "personas": 0_usize,
             "grants": { "active": 0_usize, "expired_sweep_interval_sec": 60_u64 },
             "approvals": { "pending": 0_usize },
@@ -13171,6 +14566,7 @@ mod tests {
         let obj = status.as_object().unwrap();
         assert!(obj.contains_key("version"), "missing version");
         assert!(obj.contains_key("daemon"), "missing daemon");
+        assert!(obj.contains_key("launcher_issue"), "missing launcher_issue");
         assert!(obj.contains_key("personas"), "missing personas");
         assert!(obj.contains_key("grants"), "missing grants");
         assert!(obj.contains_key("approvals"), "missing approvals");
@@ -13197,6 +14593,39 @@ mod tests {
         assert!(
             obj["audit_events"].is_number(),
             "audit_events should be a count"
+        );
+    }
+
+    #[test]
+    fn launcher_issue_json_reports_stale_managed_install_fields() {
+        let issue = InstalledLauncherIssue::StaleManagedInstall {
+            path: PathBuf::from("/usr/local/bin/ember"),
+            target: PathBuf::from("/usr/local/lib/ember.app/Contents/MacOS/ember"),
+            newer_components: vec![
+                PathBuf::from("/usr/local/bin/emberd"),
+                PathBuf::from("/usr/local/lib/ember/binaries/ember-gh"),
+            ],
+        };
+        let payload = launcher_issue_json(Some(&issue));
+        assert_eq!(payload["kind"], serde_json::json!("stale_managed_install"));
+        assert_eq!(payload["path"], serde_json::json!("/usr/local/bin/ember"));
+        assert_eq!(
+            payload["target"],
+            serde_json::json!("/usr/local/lib/ember.app/Contents/MacOS/ember")
+        );
+        assert_eq!(
+            payload["newer_components"],
+            serde_json::json!([
+                "/usr/local/bin/emberd",
+                "/usr/local/lib/ember/binaries/ember-gh"
+            ])
+        );
+        assert!(
+            payload["repair_guidance"]
+                .as_str()
+                .unwrap()
+                .contains("does not rebuild `/usr/local/lib/ember.app`"),
+            "launcher issue JSON must preserve the launcher boundary repair guidance: {payload}"
         );
     }
 
@@ -14728,7 +16157,7 @@ mod tests {
             credential_name: "anthropic-key".to_string(),
             scope: "claude-code-default-v1".to_string(),
             ttl_secs: Some(600),
-            statements: build_claude_code_anthropic_runtime_statements(),
+            statements: build_claude_code_anthropic_runtime_statements("anthropic-key"),
         };
 
         let (dispatch, response) =
@@ -14755,7 +16184,7 @@ mod tests {
             ]
         });
         assert!(
-            grant_status_supports_anthropic_gateway(&compatible),
+            grant_status_supports_anthropic_gateway(&compatible, "anthropic-key"),
             "expected matching credential + session statements to qualify"
         );
 
@@ -14769,8 +16198,34 @@ mod tests {
             ]
         });
         assert!(
-            !grant_status_supports_anthropic_gateway(&missing_session),
+            !grant_status_supports_anthropic_gateway(&missing_session, "anthropic-key"),
             "credential statement alone must not qualify as an Anthropic gateway grant"
+        );
+    }
+
+    #[test]
+    fn grant_status_supports_anthropic_gateway_matches_oauth_credential_name() {
+        let compatible = serde_json::json!({
+            "statements": [
+                {
+                    "resource_type": "credential",
+                    "actions": ["credential:read"],
+                    "resource": {"kind": "exact", "value": "anthropic/oauth-token"}
+                },
+                {
+                    "resource_type": "session",
+                    "actions": ["llm:generate"],
+                    "resource": {"kind": "glob", "pattern": "anthropic/*"}
+                }
+            ]
+        });
+        assert!(
+            grant_status_supports_anthropic_gateway(&compatible, "anthropic/oauth-token"),
+            "oauth credential name must qualify when the session statement matches"
+        );
+        assert!(
+            !grant_status_supports_anthropic_gateway(&compatible, "anthropic-key"),
+            "credential statement must match the selected anthropic credential name exactly"
         );
     }
 
@@ -15752,6 +17207,7 @@ mod tests {
             Some(&live),
             "local".to_string(),
             "local-encrypted".to_string(),
+            None,
         );
 
         match banner {
@@ -16079,7 +17535,10 @@ mod tests {
                             ],
                         }),
                         "revoke_persona" => {
-                            assert_eq!(request["params"]["id"], serde_json::json!("persona-target"));
+                            assert_eq!(
+                                request["params"]["id"],
+                                serde_json::json!("persona-target")
+                            );
                             assert_eq!(
                                 request["params"]["caller_persona_id"],
                                 serde_json::json!("persona-target")
@@ -16378,6 +17837,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn daemon_install_launcher_boundary_note_calls_out_release_package() {
+        let note = daemon_install_launcher_boundary_note();
+        assert!(
+            note.contains("daemon/runtime sidecars"),
+            "install note must name the sidecar-only refresh boundary: {note}"
+        );
+        assert!(
+            note.contains("/usr/local/bin/ember"),
+            "install note must call out the host launcher path explicitly: {note}"
+        );
+        assert!(
+            note.contains("release package"),
+            "install note must point at the managed CLI artifact / release package repair path: {note}"
+        );
+    }
+
     /// implementation-note-484: `ember daemon migrate --to separate-uid`
     /// must parse to `DaemonAction::Migrate { to: "separate-uid" }`.
     #[test]
@@ -16528,6 +18004,57 @@ mod tests {
         assert_eq!(
             personas[0].name, "Foo",
             "persona name must match --name argument"
+        );
+    }
+
+    #[test]
+    fn init_for_codex_skips_basic_init_when_already_initialized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let run_dir = tmp.path().join("run");
+
+        let config = ember_daemon::infra::config::DaemonConfig {
+            socket_dir: run_dir.clone(),
+            data_dir: data_dir.clone(),
+            pid_file: run_dir.join("emberd.pid"),
+            policy_file: tmp.path().join("policy.toml"),
+            log_level: ember_daemon::infra::config::LogLevel::Info,
+            dashboard_addr: None,
+            git_proxy_addr: None,
+            llm_proxy_addr: None,
+            keyring: ember_daemon::infra::config::KeyringConfig::default(),
+            stale_approval_threshold_secs: 3600,
+            presence: ember_daemon::infra::config::PresenceConfigSection::default(),
+            snapshot_interval_secs: 3600,
+            snapshot_pull_interval_secs: 600,
+            snapshot_pull_endpoint: None,
+            snapshot_pull_cluster_id: None,
+            credential_store: None,
+            ..ember_daemon::infra::config::DaemonConfig::for_test(tmp.path())
+        };
+
+        let config_path = tmp.path().join("config.toml");
+        unsafe {
+            std::env::set_var("EMBER_VAULT_PASSPHRASE", "test-passphrase-t3-codex");
+            std::env::set_var("EMBER_SKIP_DAEMON_INSTALL_CHECK", "1");
+        };
+        cmd_init(
+            &config,
+            Some("Root".to_string()),
+            Some(&config_path),
+            None,
+            None,
+            false,
+            false,
+        );
+        unsafe {
+            std::env::remove_var("EMBER_VAULT_PASSPHRASE");
+            std::env::remove_var("EMBER_SKIP_DAEMON_INSTALL_CHECK");
+        };
+
+        assert!(
+            should_skip_basic_init(Some(OnboardingTarget::Codex), &config),
+            "Codex friendly init must skip the base-init path once daemon.db exists"
         );
     }
 

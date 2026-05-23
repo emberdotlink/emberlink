@@ -8,9 +8,9 @@
 The current public Ember CLI contract is intentionally narrower than the full
 binary surface. The user story is:
 
-1. `ember init --for claude-code`
+1. `ember init --for claude`
 2. `ember status`
-3. `ember claude-code`
+3. `ember claude`
 
 Everything else should support that journey, not compete with it.
 
@@ -22,9 +22,9 @@ For the core delegated-authority surface beyond that top-level flow, see
 These commands define the current public-friendly operator surface:
 
 - `ember init`
-- `ember uninstall --for claude-code`
+- `ember uninstall --for claude`
 - `ember status`
-- `ember claude-code`
+- `ember claude`
 - `ember vault ...`
 - `ember grant ...`
 - `ember approval ...`
@@ -83,4 +83,3 @@ For the read-only trust inspection surface, see
 
 For the current sandbox contract and Docker boundary, see
 [Sandbox and isolated execution](./sandbox-and-isolated-execution/).
-

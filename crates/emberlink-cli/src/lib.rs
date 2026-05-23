@@ -43,9 +43,9 @@ mod sync_support;
 pub mod trust;
 pub mod up;
 pub mod vault_io;
+mod vault_support;
 pub mod workflow;
 pub mod workflow_prompt;
-mod vault_support;
 
 pub use cli::{Args, Cmd};
 
@@ -1617,7 +1617,9 @@ impl std::fmt::Display for DaemonRpcError {
             DaemonRpcError::Unavailable(e) => write!(f, "daemon unavailable: {e}"),
             DaemonRpcError::Io(e) => write!(f, "io error: {e}"),
             DaemonRpcError::Protocol(m) => write!(f, "protocol error: {m}"),
-            DaemonRpcError::Rpc { code, message } => write!(f, "daemon error (code {code}): {message}"),
+            DaemonRpcError::Rpc { code, message } => {
+                write!(f, "daemon error (code {code}): {message}")
+            }
         }
     }
 }
@@ -1698,10 +1700,7 @@ pub(crate) fn format_daemon_socket_io_error(err: &std::io::Error) -> String {
     format!("daemon socket error: {err}")
 }
 
-pub fn format_daemon_unavailable(
-    socket_path: &std::path::Path,
-    source: &std::io::Error,
-) -> String {
+pub fn format_daemon_unavailable(socket_path: &std::path::Path, source: &std::io::Error) -> String {
     if is_daemon_socket_permission_denied(source) {
         return format!(
             "daemon socket access is denied at {}. Confirm the operator is in the `ember-clients` group, start a fresh login shell (or relogin), and retry. If the managed socket or daemon install drifted, repair with `sudo ember daemon install`.",
@@ -1817,17 +1816,20 @@ fn perform_vault_unlock_ceremony(
         "requested_method": requested_method,
     });
     let begin = match call_daemon_rpc_once(socket_path, "vault_unlock_begin", &begin_params) {
-            Ok(value) => value,
-            Err(DaemonRpcError::Rpc { code, message })
-                if code == -32601
-                    || message
-                        .contains("only required on the separate-uid managed daemon path")
-                    || message.contains("only supported on macOS managed-daemon installs") =>
-            {
-                return call_daemon_rpc_once(socket_path, "vault_unlock", &serde_json::Value::Null);
-            }
-            Err(err) => return Err(err),
-        };
+        Ok(value) => value,
+        Err(DaemonRpcError::Rpc { code, message })
+            if code == -32601
+                || message.contains("only required on the separate-uid managed daemon path")
+                || message.contains("only supported on macOS managed-daemon installs") =>
+        {
+            return call_daemon_rpc_once(
+                socket_path,
+                "vault_unlock",
+                &serde_json::json!({ "requested_method": requested_method }),
+            );
+        }
+        Err(err) => return Err(err),
+    };
 
     let request_id = begin
         .get("request_id")
@@ -1939,25 +1941,24 @@ fn specific_vault_unlock_reason(
     }
 
     fn sandbox_target_label(requested_params: &serde_json::Value) -> Option<String> {
-        first_present_string(requested_params, &["name", "id_or_name"]).map(|value| value.to_string())
+        first_present_string(requested_params, &["name", "id_or_name"])
+            .map(|value| value.to_string())
     }
 
     fn grant_target_label(requested_params: &serde_json::Value) -> Option<String> {
-        first_present_string(
-            requested_params,
-            &["grant_id", "id", "parent_grant_id"],
-        )
-        .map(shorten_id)
+        first_present_string(requested_params, &["grant_id", "id", "parent_grant_id"])
+            .map(shorten_id)
     }
 
-    fn create_grant_reason(
-        requested_params: &serde_json::Value,
-        composite: bool,
-    ) -> String {
+    fn create_grant_reason(requested_params: &serde_json::Value, composite: bool) -> String {
         let persona = first_present_string(requested_params, &["persona_id", "persona"]);
         let credential = first_present_string(requested_params, &["credential_name"]);
         let scope = first_present_string(requested_params, &["scope"]);
-        let kind = if composite { "composite grant" } else { "grant" };
+        let kind = if composite {
+            "composite grant"
+        } else {
+            "grant"
+        };
         match (persona, credential, scope) {
             (Some(persona), Some(credential), Some(scope)) => format!(
                 "create an Ember {kind} for persona \"{persona}\" to access \"{credential}\" ({scope})"
@@ -1996,9 +1997,7 @@ fn specific_vault_unlock_reason(
         "revoke_persona" => persona_target_label(requested_params)
             .map(|label| format!("revoke the Ember persona \"{label}\""))
             .unwrap_or_else(|| "revoke this Ember persona".to_string()),
-        "launcher_prepare_claude_code" => {
-            "start Claude Code with Ember".to_string()
-        }
+        "launcher_prepare_claude_code" => "start Claude Code with Ember".to_string(),
         "spawn_scoped_tool" => quoted_param(requested_params, "tool", "tool", "launch")
             .unwrap_or_else(|| "launch this mediated Ember tool".to_string()),
         "vault_add" | "vault_put" => quoted_param(requested_params, "name", "vault entry", "store")
@@ -2010,8 +2009,8 @@ fn specific_vault_unlock_reason(
         "vault_migrate_acl" => "update Ember vault access control".to_string(),
         "resolve_approval" => first_present_string(requested_params, &["id"])
             .map(|id| {
-                let decision = first_present_string(requested_params, &["decision"])
-                    .unwrap_or("resolve");
+                let decision =
+                    first_present_string(requested_params, &["decision"]).unwrap_or("resolve");
                 format!("{decision} the Ember approval \"{}\"", shorten_id(id))
             })
             .unwrap_or_else(|| "resolve this Ember approval".to_string()),
@@ -2149,16 +2148,18 @@ fn daemon_rpc_guidance(method: &str, code: i32, message: &str) -> Option<String>
         if matches!(method, "register_session" | "vault_unlock" | "vault_lock") {
             return Some(
                 "this command needs operator presence on the daemon-managed vault lane. \
-                 Retry from an interactive operator shell, approve the unlock flow if prompted, \
-                 or run `ember vault unlock` first and then retry."
+                 Use the managed separate-uid biometric unlock flow when available, or \
+                 restart the daemon with `EMBER_VAULT_PASSPHRASE` for a fresh dev-probe \
+                 bootstrap; same-daemon operator-uid reopen is intentionally disabled."
                     .to_string(),
             );
         }
 
         return Some(
             "this command needs operator presence on the daemon-managed vault lane. \
-             Approve the unlock flow if prompted, or run `ember vault unlock` from \
-             an interactive operator shell and retry."
+             Approve the managed separate-uid biometric unlock flow if prompted. If you \
+             are on a dev probe lane, restart the daemon with `EMBER_VAULT_PASSPHRASE`; \
+             same-daemon operator-uid reopen is intentionally disabled."
                 .to_string(),
         );
     }
@@ -2305,10 +2306,6 @@ fn resolve_encryption_key() -> Result<String, ValidationError> {
         const LEGACY_SERVICE: &str = "com.emberlink";
         const LEGACY_USER: &str = "local-state-key";
 
-        // Peek the legacy keychain (best-effort; may be absent).
-        let legacy_entry = keyring_core::Entry::new(LEGACY_SERVICE, LEGACY_USER).ok();
-        let legacy_key = legacy_entry.as_ref().and_then(|e| e.get_password().ok());
-
         // Fetch daemon's current key (auto-generates if missing).
         let get_params = serde_json::json!({ "caller": "cli" });
         let result = call_daemon_method(&socket_path, "local_state_key_get", &get_params)?;
@@ -2320,67 +2317,52 @@ fn resolve_encryption_key() -> Result<String, ValidationError> {
             })?
             .to_string();
 
-        // CRIT-2 race detection: if `local-state.enc` exists and the
-        // daemon's key does NOT decrypt it, but the legacy keychain key
-        // does, the daemon vended an orphan fresh key (someone else
-        // triggered get-then-generate before this CLI migration).
-        // Force-overwrite the daemon vault entry with the canonical legacy key.
-        let final_key = match probe_decrypt(&state_file, &daemon_key) {
-            ProbeOutcome::DecryptOk | ProbeOutcome::NoFile => daemon_key,
-            ProbeOutcome::DecryptFailed => match legacy_key.as_ref() {
-                Some(legacy)
-                    if matches!(probe_decrypt(&state_file, legacy), ProbeOutcome::DecryptOk) =>
-                {
-                    let set_params = serde_json::json!({
-                        "caller": "cli",
-                        "key": legacy,
-                        "force": true,
-                    });
-                    call_daemon_method(&socket_path, "local_state_key_set", &set_params).map_err(
-                        |e| {
-                            ValidationError::new(format!(
-                                "race recovery: failed to force-overwrite daemon vault: {e}"
-                            ))
-                        },
-                    )?;
-                    legacy.clone()
-                }
-                _ => {
-                    return Err(ValidationError::new(format!(
-                        "local-state encryption-key recovery failed: daemon vault key does not \
-                         decrypt {} and no legacy key matches. Manual recovery needed (export \
-                         EMBERLINK_KEY).",
-                        state_file.display()
-                    )));
-                }
-            },
-        };
+        // Only touch the legacy keychain item if the daemon's key fails to
+        // decrypt the current local-state file. Normal CLI launches should
+        // stay entirely on the daemon-vault lane and never probe the old
+        // `com.emberlink/local-state-key` item.
+        let resolution =
+            resolve_local_state_key_with_lazy_legacy_fallback(&state_file, daemon_key, || {
+                let entry = keyring_core::Entry::new(LEGACY_SERVICE, LEGACY_USER).ok()?;
+                let key = entry.get_password().ok()?;
+                Some((entry, key))
+            })?;
 
-        // After successful flow involving legacy → delete keychain item.
-        if legacy_key.is_some()
-            && let Some(entry) = legacy_entry
-            && let Err(e) = entry.delete_credential()
-        {
-            tracing::warn!(
-                error = %e,
-                "keychain migration: delete legacy keychain item failed (non-fatal)"
-            );
+        match resolution {
+            LocalStateKeyResolution::Daemon(key) => Ok(key),
+            LocalStateKeyResolution::LegacyRecovered { legacy, key } => {
+                let set_params = serde_json::json!({
+                    "caller": "cli",
+                    "key": key,
+                    "force": true,
+                });
+                call_daemon_method(&socket_path, "local_state_key_set", &set_params).map_err(
+                    |e| {
+                        ValidationError::new(format!(
+                            "race recovery: failed to force-overwrite daemon vault: {e}"
+                        ))
+                    },
+                )?;
+                if let Err(e) = legacy.delete_credential() {
+                    tracing::warn!(
+                        error = %e,
+                        "keychain migration: delete legacy keychain item failed (non-fatal)"
+                    );
+                }
+                Ok(key)
+            }
         }
-
-        Ok(final_key)
     }
 }
 
 /// Outcome of an attempt-decrypt-probe on the existing `local-state.enc`
 /// using a candidate key. Used by the CRIT-2 race-free migration logic.
-#[cfg(not(test))]
 enum ProbeOutcome {
     DecryptOk,
     DecryptFailed,
     NoFile,
 }
 
-#[cfg(not(test))]
 fn probe_decrypt(state_file: &Path, candidate_key: &str) -> ProbeOutcome {
     if !state_file.exists() {
         return ProbeOutcome::NoFile;
@@ -2392,6 +2374,103 @@ fn probe_decrypt(state_file: &Path, candidate_key: &str) -> ProbeOutcome {
     match decrypt_state(&bytes, candidate_key) {
         Ok(_) => ProbeOutcome::DecryptOk,
         Err(_) => ProbeOutcome::DecryptFailed,
+    }
+}
+
+enum LocalStateKeyResolution<L> {
+    Daemon(String),
+    LegacyRecovered { legacy: L, key: String },
+}
+
+fn resolve_local_state_key_with_lazy_legacy_fallback<L, F>(
+    state_file: &Path,
+    daemon_key: String,
+    load_legacy: F,
+) -> Result<LocalStateKeyResolution<L>, ValidationError>
+where
+    F: FnOnce() -> Option<(L, String)>,
+{
+    match probe_decrypt(state_file, &daemon_key) {
+        ProbeOutcome::DecryptOk | ProbeOutcome::NoFile => {
+            Ok(LocalStateKeyResolution::Daemon(daemon_key))
+        }
+        ProbeOutcome::DecryptFailed => match load_legacy() {
+            Some((legacy, legacy_key))
+                if matches!(
+                    probe_decrypt(state_file, &legacy_key),
+                    ProbeOutcome::DecryptOk
+                ) =>
+            {
+                Ok(LocalStateKeyResolution::LegacyRecovered {
+                    legacy,
+                    key: legacy_key,
+                })
+            }
+            _ => Err(ValidationError::new(format!(
+                "local-state encryption-key recovery failed: daemon vault key does not decrypt {} and no legacy key matches. Manual recovery needed (export EMBERLINK_KEY).",
+                state_file.display()
+            ))),
+        },
+    }
+}
+
+#[cfg(test)]
+mod local_state_key_resolution_tests {
+    use super::*;
+
+    #[test]
+    fn daemon_key_short_circuits_legacy_loader_when_state_file_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let called = std::cell::Cell::new(false);
+        let resolved = resolve_local_state_key_with_lazy_legacy_fallback(
+            tmp.path().join("missing.enc").as_path(),
+            "xchacha20-key:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+            || {
+                called.set(true);
+                Some(("legacy", "legacy-key".to_string()))
+            },
+        )
+        .expect("resolve without legacy");
+
+        assert!(
+            matches!(resolved, LocalStateKeyResolution::Daemon(_)),
+            "missing local-state file should keep daemon key"
+        );
+        assert!(
+            !called.get(),
+            "legacy loader must stay lazy when the daemon key path is already valid"
+        );
+    }
+
+    #[test]
+    fn daemon_key_short_circuits_legacy_loader_when_state_decrypts() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_file = tmp.path().join("local-state.enc");
+        let daemon_key =
+            "xchacha20-key:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let ciphertext = encrypt_state(br#"{"ok":true}"#, daemon_key).expect("encrypt state");
+        std::fs::write(&state_file, ciphertext).expect("write state file");
+        let called = std::cell::Cell::new(false);
+
+        let resolved = resolve_local_state_key_with_lazy_legacy_fallback(
+            &state_file,
+            daemon_key.to_string(),
+            || {
+                called.set(true);
+                Some(("legacy", "legacy-key".to_string()))
+            },
+        )
+        .expect("resolve with daemon key");
+
+        assert!(
+            matches!(resolved, LocalStateKeyResolution::Daemon(_)),
+            "decryptable state should keep daemon key"
+        );
+        assert!(
+            !called.get(),
+            "legacy loader must not run when the daemon key already decrypts the file"
+        );
     }
 }
 
@@ -2786,6 +2865,113 @@ mod tests {
         server.join().expect("fake daemon thread");
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn call_daemon_rpc_macos_fallback_unlock_passes_requested_method_to_vault_unlock() {
+        use std::io::{BufRead, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        let _guard = OPERATOR_PRESENCE_TOKEN_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_cached_operator_presence_token(None);
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let socket_path = tmp.path().join("daemon.sock");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn({
+            let socket_path = socket_path.clone();
+            move || {
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
+                ready_tx.send(()).expect("signal ready");
+
+                for expected_method in [
+                    "create_persona",
+                    "vault_unlock_begin",
+                    "vault_unlock",
+                    "create_persona",
+                ] {
+                    let mut stream =
+                        accept_with_timeout(&listener, std::time::Duration::from_secs(10));
+                    let mut reader = std::io::BufReader::new(
+                        stream.try_clone().expect("clone fake daemon stream"),
+                    );
+                    let mut line = String::new();
+                    reader
+                        .read_line(&mut line)
+                        .expect("read fake daemon request");
+                    let request: serde_json::Value =
+                        serde_json::from_str(line.trim()).expect("parse fake daemon request");
+                    assert_eq!(request["method"], serde_json::json!(expected_method));
+
+                    let response = match expected_method {
+                        "create_persona"
+                            if request["params"]["name"]
+                                == serde_json::json!("fallback-unlock-retry") =>
+                        {
+                            if request["params"].get("_presence_token").is_none() {
+                                serde_json::json!({
+                                    "id": request["id"],
+                                    "error": {
+                                        "code": -32001,
+                                        "message": "{\"error\":\"authority_class_not_met\",\"reason\":\"missing\"}",
+                                    }
+                                })
+                            } else {
+                                serde_json::json!({
+                                    "id": request["id"],
+                                    "result": { "id": "persona-fallback", "name": "fallback-unlock-retry" }
+                                })
+                            }
+                        }
+                        "vault_unlock_begin" => serde_json::json!({
+                            "id": request["id"],
+                            "error": {
+                                "code": -32030,
+                                "message": "vault_unlock_begin is only required on the separate-uid managed daemon path",
+                            }
+                        }),
+                        "vault_unlock" => {
+                            assert_eq!(
+                                request["params"]["requested_method"],
+                                serde_json::json!("create_persona"),
+                                "fallback vault_unlock must preserve the requested method scope"
+                            );
+                            serde_json::json!({
+                                "id": request["id"],
+                                "result": {
+                                    "unlocked": true,
+                                    "presence_token": fake_presence_token_value(501)
+                                }
+                            })
+                        }
+                        other => panic!("unexpected method sequence item: {other}"),
+                    };
+
+                    let mut encoded =
+                        serde_json::to_string(&response).expect("encode fake daemon response");
+                    encoded.push('\n');
+                    stream
+                        .write_all(encoded.as_bytes())
+                        .expect("write fake daemon response");
+                }
+            }
+        });
+
+        ready_rx.recv().expect("wait for fake daemon ready");
+        let result = call_daemon_rpc(
+            &socket_path,
+            "create_persona",
+            &serde_json::json!({"name": "fallback-unlock-retry"}),
+        )
+        .expect("fallback unlock should preserve requested method and retry");
+
+        assert_eq!(result["id"], serde_json::json!("persona-fallback"));
+        assert_eq!(result["name"], serde_json::json!("fallback-unlock-retry"));
+
+        server.join().expect("fake daemon thread");
+    }
+
     #[test]
     fn call_daemon_rpc_unlocks_and_retries_once_for_locked_session_error() {
         use std::io::{BufRead, Write as _};
@@ -2842,7 +3028,7 @@ mod tests {
                                 "id": request["id"],
                                 "error": {
                                     "code": -32030,
-                                    "message": "create_persona denied: session is locked; reopen with `ember vault unlock` or start a new session (`register_session` path). Ordinary lazy same-daemon re-auth is not fully wired yet",
+                                    "message": "create_persona denied: session is locked; same-daemon operator-uid reopen is disabled to avoid legacy login-keychain prompts. Supported lanes: managed separate-uid biometric unlock (`vault_unlock_begin/vault_unlock_complete`), a fresh daemon bootstrap via `EMBER_VAULT_PASSPHRASE` for dev probes, or future broker-mediated browser auth",
                                 }
                             })
                         }
@@ -2904,11 +3090,12 @@ mod tests {
         let guidance = daemon_rpc_guidance(
             "create_persona",
             -32030,
-            "create_persona denied: session is locked; reopen with `ember vault unlock` or start a new session (`register_session` path). Ordinary lazy same-daemon re-auth is not fully wired yet",
+            "create_persona denied: session is locked; same-daemon operator-uid reopen is disabled to avoid legacy login-keychain prompts. Supported lanes: managed separate-uid biometric unlock (`vault_unlock_begin/vault_unlock_complete`), a fresh daemon bootstrap via `EMBER_VAULT_PASSPHRASE` for dev probes, or future broker-mediated browser auth",
         )
         .expect("expected guidance");
         assert!(guidance.contains("operator presence"));
-        assert!(guidance.contains("ember vault unlock"));
+        assert!(guidance.contains("managed separate-uid biometric unlock"));
+        assert!(guidance.contains("EMBER_VAULT_PASSPHRASE"));
     }
 
     #[test]

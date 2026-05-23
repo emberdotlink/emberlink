@@ -3164,15 +3164,105 @@ pub struct StatementUsageDelta {
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
     use std::thread;
     use std::time::Duration as StdDuration;
 
     use super::*;
+    use crate::infra::claim_journal::{
+        AuditEvidenceInput, ClaimJournal, ClaimScopeKind, ScopeRef, SqliteClaimJournal,
+        SuccessfulClaimInput,
+    };
+    use crate::infra::receipt::{current_identity, init_identity};
+    use crate::infra::vault::Vault;
     use crate::infra::store::DaemonStore;
+    use core_events::receipt::{ClaudeCodeBody, RECEIPT_KIND_COMPOSITE_GRANT, TerminationReason};
     use core_grant_types::grant_chain::{ResourceSelector, ResourceType};
+    use once_cell::sync::OnceCell as SyncOnceCell;
 
     fn setup() -> DaemonStore {
-        DaemonStore::open_in_memory().expect("in-memory store")
+        let store = DaemonStore::open_in_memory().expect("in-memory store");
+        store.set_vault(Rc::new(Vault::new([0xAB; 32])));
+        store
+    }
+
+    fn ensure_test_identity() {
+        static INIT_DIR: SyncOnceCell<tempfile::TempDir> = SyncOnceCell::new();
+        let dir = INIT_DIR.get_or_init(|| tempfile::tempdir().expect("tempdir"));
+        let _ = init_identity(dir.path());
+        current_identity().expect("identity must be initialised for receipt tests");
+    }
+
+    fn seed_grant_claim_journal(
+        store: &DaemonStore,
+        grant_id: &str,
+        persona_id: &str,
+        credential_name: &str,
+        source_key: &str,
+    ) {
+        let journal = SqliteClaimJournal::new(store, 64);
+        journal
+            .record_successful_claim(
+                &ScopeRef {
+                    kind: ClaimScopeKind::Grant,
+                    id: grant_id.to_string(),
+                },
+                &SuccessfulClaimInput {
+                    source_key: source_key.to_string(),
+                    occurred_at: "2026-05-22T12:00:00Z".to_string(),
+                    claim_kind: core_events::receipt::ClaimKind::CredentialVended,
+                    tool: "gh.pr_create".to_string(),
+                    input_hash: format!("hash-{source_key}"),
+                    input_redacted: serde_json::json!({
+                        "kind": "broker_resolve",
+                        "grant_id": grant_id,
+                    }),
+                    resolved: serde_json::json!({"allowed": true}),
+                    audit: AuditEvidenceInput {
+                        agent_id: Some(persona_id.to_string()),
+                        action: "broker.resolve.materialized".to_string(),
+                        credential: Some(credential_name.to_string()),
+                        outcome: "allowed".to_string(),
+                        details: Some("{\"kind\":\"broker_resolve_materialized\"}".to_string()),
+                    },
+                    persona_id: Some(persona_id.to_string()),
+                    device_id: None,
+                    workflow_id: None,
+                    materialization_id: Some(format!("mat-{source_key}")),
+                    credential_name: Some(credential_name.to_string()),
+                },
+            )
+            .unwrap();
+    }
+
+    fn assert_composite_grant_v2_receipt(
+        store: &DaemonStore,
+        grant_id: &str,
+        expected_reason: TerminationReason,
+    ) {
+        let rows = store
+            .list_receipts_v2_envelopes(&[grant_id.to_string()])
+            .expect("list v2 receipts");
+        let matching: Vec<_> = rows
+            .into_iter()
+            .filter(|(_, kind, _, _)| kind == RECEIPT_KIND_COMPOSITE_GRANT)
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "expected exactly one session.composite_grant receipt for {grant_id}"
+        );
+        let (_, kind, stored_grant_id, envelope) = matching
+            .into_iter()
+            .next()
+            .expect("session.composite_grant receipt must exist");
+        assert_eq!(kind, RECEIPT_KIND_COMPOSITE_GRANT);
+        assert_eq!(stored_grant_id, grant_id);
+        let body: ClaudeCodeBody =
+            serde_json::from_value(envelope.body).expect("composite receipt body parses");
+        assert_eq!(body.base.claim_count_total, Some(1));
+        assert_eq!(body.base.claim_segment_summaries.len(), 1);
+        assert_eq!(body.termination_reason, Some(expected_reason));
     }
 
     #[test]
@@ -3815,16 +3905,56 @@ mod tests {
 
     #[test]
     fn wall_clock_sweep_exhausts_grant_past_limit() {
+        ensure_test_identity();
         let store = setup();
         let persona = store.create_persona("agent-wc").unwrap();
         // 10s limit, 11s elapsed — must exhaust.
         let gid = seed_wall_clock_grant(&store, &persona.id, "llm-key", 10, 11);
+        seed_grant_claim_journal(&store, &gid, &persona.id, "llm-key", "wall-clock-1");
 
         let (exhausted, _warned) = store.expire_grants_by_wall_clock().unwrap();
         assert!(exhausted >= 1, "expected exhaustion, got {exhausted}");
 
         let grant = store.get_grant(&gid).unwrap();
         assert_eq!(grant.status, "exhausted_by_budget");
+        assert_composite_grant_v2_receipt(&store, &gid, TerminationReason::ExhaustedByBudget);
+    }
+
+    #[test]
+    fn expire_grant_if_terminal_now_emits_composite_receipt_for_ttl() {
+        ensure_test_identity();
+        let store = setup();
+        let persona = store.create_persona("agent-sync-ttl").unwrap();
+        let grant = store
+            .create_grant(&persona.id, "github-token", "repo:read", Some(1))
+            .unwrap();
+        seed_grant_claim_journal(&store, &grant.id, &persona.id, "github-token", "sync-ttl-1");
+        store
+            .conn()
+            .execute(
+                "UPDATE grants SET expires_at = '2000-01-01T00:00:00Z' WHERE id = ?1",
+                rusqlite::params![grant.id],
+            )
+            .unwrap();
+
+        assert!(store.expire_grant_if_terminal_now(&grant.id).unwrap());
+        assert_eq!(store.get_grant(&grant.id).unwrap().status, "expired");
+        assert_composite_grant_v2_receipt(&store, &grant.id, TerminationReason::TtlExpired);
+        assert!(!store.expire_grant_if_terminal_now(&grant.id).unwrap());
+    }
+
+    #[test]
+    fn expire_grant_if_terminal_now_emits_composite_receipt_for_budget() {
+        ensure_test_identity();
+        let store = setup();
+        let persona = store.create_persona("agent-sync-budget").unwrap();
+        let gid = seed_wall_clock_grant(&store, &persona.id, "llm-key", 10, 11);
+        seed_grant_claim_journal(&store, &gid, &persona.id, "llm-key", "sync-budget-1");
+
+        assert!(store.expire_grant_if_terminal_now(&gid).unwrap());
+        assert_eq!(store.get_grant(&gid).unwrap().status, "exhausted_by_budget");
+        assert_composite_grant_v2_receipt(&store, &gid, TerminationReason::ExhaustedByBudget);
+        assert!(!store.expire_grant_if_terminal_now(&gid).unwrap());
     }
 
     #[test]
@@ -6240,6 +6370,7 @@ mod tests {
 
     #[test]
     fn revoke_standing_cascades() {
+        ensure_test_identity();
         let store = setup();
         let (parent_id, child_persona_id) = setup_standing_parent(&store, 5);
 
@@ -6262,6 +6393,8 @@ mod tests {
                 None,
             )
             .unwrap();
+        seed_grant_claim_journal(&store, &c1.id, &child_persona_id, "github-token", "cascade-child-1");
+        seed_grant_claim_journal(&store, &c2.id, &child_persona_id, "github-token", "cascade-child-2");
         assert_eq!(store.get_grant(&c1.id).unwrap().status, "active");
         assert_eq!(store.get_grant(&c2.id).unwrap().status, "active");
 
@@ -6270,6 +6403,8 @@ mod tests {
         assert_eq!(store.get_grant(&parent_id).unwrap().status, "revoked");
         assert_eq!(store.get_grant(&c1.id).unwrap().status, "revoked");
         assert_eq!(store.get_grant(&c2.id).unwrap().status, "revoked");
+        assert_composite_grant_v2_receipt(&store, &c1.id, TerminationReason::ParentCascadeRevoked);
+        assert_composite_grant_v2_receipt(&store, &c2.id, TerminationReason::ParentCascadeRevoked);
     }
 
     #[test]

@@ -16,6 +16,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde_json::{Value, json};
 
+const EMBER_OPERATOR_PRESENCE_TOKEN_ENV: &str = "EMBER_OPERATOR_PRESENCE_TOKEN";
+
 // ---------------------------------------------------------------------------
 // Daemon transport resolution
 // ---------------------------------------------------------------------------
@@ -185,11 +187,10 @@ fn call_daemon_rpc_inner(
         .try_clone()
         .map_err(|e| RpcError::Io(format!("clone socket: {e}")))?;
     let mut reader = BufReader::new(stream);
-
     let request = json!({
         "id": "1",
         "method": method,
-        "params": params,
+        "params": attach_presence_token_from_env(params)?,
     });
     let mut line = serde_json::to_string(&request).expect("serialize request");
     line.push('\n');
@@ -217,6 +218,37 @@ fn call_daemon_rpc_inner(
     }
 
     Ok(response.get("result").cloned().unwrap_or(Value::Null))
+}
+
+fn attach_presence_token_from_env(params: &Value) -> Result<Value, RpcError> {
+    let Some(raw) = std::env::var_os(EMBER_OPERATOR_PRESENCE_TOKEN_ENV) else {
+        return Ok(params.clone());
+    };
+    if raw.is_empty() {
+        return Ok(params.clone());
+    }
+    let raw = raw
+        .into_string()
+        .map_err(|_| {
+            RpcError::Protocol(format!(
+                "{EMBER_OPERATOR_PRESENCE_TOKEN_ENV} is not valid UTF-8"
+            ))
+        })?;
+    let token: Value = serde_json::from_str(&raw).map_err(|e| {
+        RpcError::Protocol(format!(
+            "invalid {EMBER_OPERATOR_PRESENCE_TOKEN_ENV} payload: {e}"
+        ))
+    })?;
+
+    Ok(match params {
+        Value::Object(map) => {
+            let mut map = map.clone();
+            map.insert("_presence_token".to_string(), token);
+            Value::Object(map)
+        }
+        Value::Null => json!({ "_presence_token": token }),
+        other => other.clone(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -305,6 +337,28 @@ mod tests {
     }
 
     #[test]
+    fn attach_presence_token_from_env_adds_presence_field() {
+        with_env(
+            &[(
+                EMBER_OPERATOR_PRESENCE_TOKEN_ENV,
+                Some(
+                    r#"{"uid":501,"scope":"class:session-runtime","expiry":{"secs_since_epoch":1,"nanos_since_epoch":0},"signature":[1,2,3]}"#,
+                ),
+            )],
+            || {
+                let params = json!({"binary":"/opt/homebrew/bin/gh"});
+                let attached =
+                    attach_presence_token_from_env(&params).expect("presence token attaches");
+                assert_eq!(
+                    attached.get("_presence_token").and_then(|v| v.get("uid")),
+                    Some(&json!(501)),
+                );
+                assert_eq!(attached.get("binary"), Some(&json!("/opt/homebrew/bin/gh")));
+            },
+        );
+    }
+
+    #[test]
     fn decide_transport_returns_uds_when_bridge_url_unset() {
         with_env(
             &[("EMBER_BRIDGE_URL", None), ("EMBER_SOCKET_PATH", None)],
@@ -323,10 +377,7 @@ mod tests {
     #[test]
     fn decide_transport_returns_uds_when_bridge_url_empty() {
         with_env(
-            &[
-                ("EMBER_BRIDGE_URL", Some("")),
-                ("EMBER_SOCKET_PATH", None),
-            ],
+            &[("EMBER_BRIDGE_URL", Some("")), ("EMBER_SOCKET_PATH", None)],
             || {
                 assert!(matches!(decide_transport(), DaemonTransport::Uds(_)));
             },
@@ -386,6 +437,28 @@ mod tests {
             &[("EMBER_SOCKET_PATH", Some("/tmp/test-daemon.sock"))],
             || {
                 assert_eq!(daemon_socket_path(), PathBuf::from("/tmp/test-daemon.sock"));
+            },
+        );
+    }
+
+    #[test]
+    fn attach_presence_token_from_env_injects_rpc_field() {
+        with_env(
+            &[(
+                EMBER_OPERATOR_PRESENCE_TOKEN_ENV,
+                Some(
+                    r#"{"uid":501,"scope_key":"class:session-runtime","issued_at":"2026-05-22T00:00:00Z","expires_at":"2026-05-22T01:00:00Z","signature":"sig"}"#,
+                ),
+            )],
+            || {
+                let enriched =
+                    attach_presence_token_from_env(&json!({"binary":"gh"})).expect("attach token");
+                assert_eq!(enriched["binary"], json!("gh"));
+                assert_eq!(enriched["_presence_token"]["uid"], json!(501));
+                assert_eq!(
+                    enriched["_presence_token"]["scope_key"],
+                    json!("class:session-runtime")
+                );
             },
         );
     }

@@ -12,7 +12,7 @@
 //!
 //! v0.1 scope (this module): the detection + render + acknowledgment
 //! state-management logic + control flags. The wiring into
-//! `ember claude-code` (and per-harness analogs) lands when the
+//! `ember claude` (and per-harness analogs) lands when the
 //! caller-side launcher refactors land.
 
 use std::collections::HashMap;

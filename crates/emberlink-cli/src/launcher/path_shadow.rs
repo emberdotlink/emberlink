@@ -1,4 +1,4 @@
-//! PATH-shadow directory installer for `ember claude-code` and analogous launchers.
+//! PATH-shadow directory installer for `ember claude` and analogous launchers.
 //!
 //!
 //! Implements design §3 PATH-shadow doctrine sub-A (implementation-note-506).
@@ -135,7 +135,7 @@ pub enum MigrationOutcome {
     /// `layout=none`: neither old-layout shim files nor new-layout
     /// `bin/` symlinks exist. The host has never been initialized for
     /// PATH-shadow; `--migrate` is a no-op and the operator should run
-    /// `ember init --for claude-code` (without `--migrate`) instead.
+    /// `ember init --for claude` (without `--migrate`) instead.
     NoShimsAtAll,
     /// `layout=new`: only the new `<shadow>/bin/<name>` entries exist.
     /// Nothing to migrate.

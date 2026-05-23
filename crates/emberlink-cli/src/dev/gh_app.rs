@@ -1,14 +1,16 @@
 //! design Phase 4 step 2: GH App interactive provisioning.
 //!
 //! Opens the pre-filled creation URL in the operator's browser, prompts
-//! for App ID + PEM path, persists to ~/.config/emberlink-dev/github.env
-//! (App ID) + github-app.pem (private key, mode 640 group ember-clients-dev).
+//! for App ID + PEM path, then persists them into the shared operator
+//! authority bundle (`github.env` + `github-app.pem`) used by dev runtimes.
 //!
 
 use std::fs;
 use std::io::{self, IsTerminal as _, Write as _};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+
+use crate::dev_runtime::DevRuntimeEnv;
 
 /// The pre-filled GitHub App creation URL for the dev ember GH App.
 pub fn gh_app_creation_url() -> &'static str {
@@ -19,15 +21,27 @@ pub fn gh_app_creation_url() -> &'static str {
 pub struct GhAppRecord {
     /// Numeric App ID from the GitHub App settings page.
     pub app_id: u64,
-    /// Absolute path to the PEM file on disk (within `~/.config/emberlink-dev/`).
+    /// Absolute path to the PEM file on disk inside the shared operator authority bundle.
     pub pem_path: PathBuf,
 }
 
-/// Resolve the dev config directory: `~/.config/emberlink-dev/`.
-pub fn dev_config_dir() -> Result<PathBuf, String> {
-    let home =
-        dirs_next::home_dir().ok_or_else(|| "cannot determine home directory".to_string())?;
-    Ok(home.join(".config").join("emberlink-dev"))
+fn operator_authority_dir_from_runtime(runtime: &DevRuntimeEnv) -> Result<PathBuf, String> {
+    runtime
+        .gh_app_env_path
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| {
+            format!(
+                "github env path has no parent directory: {}",
+                runtime.gh_app_env_path.display()
+            )
+        })
+}
+
+/// Resolve the shared operator authority directory used by dev runtimes.
+pub fn operator_authority_dir() -> Result<PathBuf, String> {
+    let runtime = crate::dev_runtime::resolve_current_dev_runtime()?;
+    operator_authority_dir_from_runtime(&runtime)
 }
 
 /// Copy PEM bytes from `src_bytes` to `dest`, setting mode 0640.
@@ -160,18 +174,17 @@ fn existing_gh_app_record(config_dir: &Path) -> Result<Option<GhAppRecord>, Stri
 /// Read the existing dev GitHub App record without prompting or mutating
 /// filesystem state.
 pub fn read_existing_gh_app() -> Result<Option<GhAppRecord>, String> {
-    let config_dir = dev_config_dir()?;
+    let config_dir = operator_authority_dir()?;
     existing_gh_app_record(&config_dir)
 }
 
-/// Idempotent: if `~/.config/emberlink-dev/github.env` and
-/// `~/.config/emberlink-dev/github-app.pem` both exist with non-empty content,
-/// return the existing record.
+/// Idempotent: if the shared operator authority bundle already has a populated
+/// `github.env` + `github-app.pem`, return the existing record.
 ///
 /// Otherwise print the creation URL, accept either env-var bypass input or
 /// interactive stdin prompts, and persist the resulting App ID + PEM.
 pub fn ensure_gh_app() -> Result<GhAppRecord, String> {
-    let config_dir = dev_config_dir()?;
+    let config_dir = operator_authority_dir()?;
 
     // Idempotency check: both files must exist and be non-empty.
     if let Some(record) = existing_gh_app_record(&config_dir)? {
@@ -222,7 +235,9 @@ pub fn ensure_gh_app() -> Result<GhAppRecord, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dev_runtime::derive_dev_runtime_env;
     use std::fs;
+    use std::path::Path;
     use tempfile::TempDir;
 
     #[test]
@@ -350,5 +365,18 @@ mod tests {
         assert_eq!(record.app_id, 31337);
         assert!(config_dir.join("github.env").exists());
         assert!(config_dir.join("github-app.pem").exists());
+    }
+
+    #[test]
+    fn operator_authority_dir_from_runtime_uses_shared_operator_authority_root() {
+        let runtime = derive_dev_runtime_env(
+            Path::new("/home/tester"),
+            Path::new("/tmp/emberlink-dev/worktree-a"),
+        );
+        let dir = operator_authority_dir_from_runtime(&runtime).expect("authority dir");
+        assert_eq!(
+            dir,
+            PathBuf::from("/home/tester/.config/emberlink-dev")
+        );
     }
 }

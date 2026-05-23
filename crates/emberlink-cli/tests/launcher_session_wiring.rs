@@ -1,7 +1,7 @@
 //! T2 integration tests for `ember claude-code` launcher wiring.
 //!
 //!
-//! Verifies implementation-note-532 acceptance criteria:
+//! Verifies implementation-note-531 acceptance criteria:
 //! - `EMBER_SESSION_ID` is injected into the child env from the daemon RPC response.
 //! - Child `PATH` starts with the shadow directory.
 //! - `close_session` is called with the same session_id on child exit.
@@ -25,8 +25,21 @@ use tempfile::TempDir;
 const MOCK_SESSION_ID: &str = "sess_wiring_test_001";
 const MOCK_GRANT_ID: &str = "grt_wiring_test_001";
 const MOCK_PROXY_URL: &str = "http://127.0.0.1:18484";
+const MOCK_PRESENCE_TOKEN_JSON: &str = r#"{"uid":501,"scope":"class:session-runtime","expiry":{"secs_since_epoch":1779507461,"nanos_since_epoch":807776000},"signature":[1,2,3]}"#;
 
 static LAUNCHER_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn mock_presence_token_value() -> serde_json::Value {
+    serde_json::from_str(MOCK_PRESENCE_TOKEN_JSON).expect("mock presence token json")
+}
+
+fn short_tempdir() -> TempDir {
+    tempfile::Builder::new()
+        .prefix("ember-cli-")
+        .tempdir_in("/tmp")
+        .or_else(|_| TempDir::new())
+        .expect("tempdir")
+}
 
 /// Spawn a minimal JSON-RPC mock daemon that handles one `register_session`
 /// call followed by one `close_session` call on separate connections.
@@ -94,6 +107,7 @@ fn spawn_mock_daemon(socket_path: PathBuf) -> Arc<AtomicBool> {
                         "session_id": MOCK_SESSION_ID,
                         "grant_id": MOCK_GRANT_ID,
                         "proxy_url": MOCK_PROXY_URL,
+                        "presence_token": mock_presence_token_value(),
                     }
                 }),
                 "close_session" => {
@@ -236,7 +250,7 @@ fn run_with_registration_injects_session_id_and_shadow_path() {
     use emberlink_cli::launcher::claude_code::{SessionRegistration, run_with_registration};
     use emberlink_cli::launcher::path_shadow::install_path_shadow;
 
-    let tmp = TempDir::new().unwrap();
+    let tmp = short_tempdir();
     let socket_path = tmp.path().join("mock-daemon-wiring.sock");
     let shadow_dir = tmp.path().join("shadow");
     let env_capture_file = tmp.path().join("child_path.txt");
@@ -255,6 +269,7 @@ fn run_with_registration_injects_session_id_and_shadow_path() {
         session_id: MOCK_SESSION_ID.to_string(),
         grant_id: MOCK_GRANT_ID.to_string(),
         proxy_url: MOCK_PROXY_URL.to_string(),
+        presence_token_json: Some(MOCK_PRESENCE_TOKEN_JSON.to_string()),
         anthropic_base_url: None,
         anthropic_custom_headers: None,
         git_proxy_url: None,
@@ -311,7 +326,7 @@ fn run_with_registration_injects_session_id_and_shadow_path() {
 fn install_path_shadow_creates_shadow_dir_with_discovered_specs() {
     use emberlink_cli::launcher::path_shadow::{ConstructSpec, install_path_shadow};
 
-    let tmp = TempDir::new().unwrap();
+    let tmp = short_tempdir();
     let shadow_dir = tmp.path().join("shadow");
     let fake_bin_dir = tmp.path().join("bins");
     std::fs::create_dir_all(&fake_bin_dir).unwrap();
@@ -350,7 +365,7 @@ fn child_env_contains_ember_session_id() {
     use emberlink_cli::launcher::claude_code::{SessionRegistration, run_with_registration};
     use emberlink_cli::launcher::path_shadow::install_path_shadow;
 
-    let tmp = TempDir::new().unwrap();
+    let tmp = short_tempdir();
     let socket_path = tmp.path().join("mock-daemon-session-id.sock");
     let shadow_dir = tmp.path().join("shadow");
     let env_capture_file = tmp.path().join("session_id.txt");
@@ -364,6 +379,7 @@ fn child_env_contains_ember_session_id() {
         session_id: MOCK_SESSION_ID.to_string(),
         grant_id: MOCK_GRANT_ID.to_string(),
         proxy_url: MOCK_PROXY_URL.to_string(),
+        presence_token_json: Some(MOCK_PRESENCE_TOKEN_JSON.to_string()),
         anthropic_base_url: None,
         anthropic_custom_headers: None,
         git_proxy_url: None,
@@ -412,7 +428,7 @@ fn launch_claude_code_registers_and_closes_session() {
 
     let _g = LAUNCHER_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    let tmp = TempDir::new().unwrap();
+    let tmp = short_tempdir();
     let socket_path = tmp.path().join("mock-daemon-launch.sock");
     let shadow_dir = tmp.path().join("shadow");
     let fake_bin_dir = tmp.path().join("bins");
@@ -441,7 +457,7 @@ fn launch_claude_code_registers_and_closes_session() {
 
     let capture_path_str = env_capture_file.display().to_string();
     let child_script = format!(
-        "printf '%s\\n%s\\n%s\\n%s\\n%s' \"$EMBER_SESSION_ID\" \"$EMBER_GRANT_ID\" \"$EMBER_PROXY_URL\" \"$EMBER_SOCKET_PATH\" \"$PATH\" > '{capture_path_str}'; exit 0"
+        "printf '%s\\n%s\\n%s\\n%s\\n%s\\n%s' \"$EMBER_SESSION_ID\" \"$EMBER_GRANT_ID\" \"$EMBER_PROXY_URL\" \"$EMBER_SOCKET_PATH\" \"$PATH\" \"$EMBER_OPERATOR_PRESENCE_TOKEN\" > '{capture_path_str}'; exit 0"
     );
 
     let code = launch_claude_code(&["-c".to_string(), child_script], &socket_path)
@@ -506,9 +522,89 @@ fn launch_claude_code_registers_and_closes_session() {
         path_line.starts_with(&shadow_dir.join("bin").display().to_string()),
         "launcher child PATH must start with shadow/bin: {path_line}"
     );
+    let token_line = lines.next().unwrap_or_default();
+    let token_json: serde_json::Value =
+        serde_json::from_str(token_line).expect("presence token env must be valid json");
+    assert_eq!(token_json.get("uid").and_then(|v| v.as_u64()), Some(501));
+    assert_eq!(
+        token_json.get("scope").and_then(|v| v.as_str()),
+        Some("class:session-runtime")
+    );
 }
 
-// implementation-note-533: the `--dev` flow
+#[test]
+fn launch_claude_code_closes_session_when_child_spawn_fails() {
+    use emberlink_cli::launcher::claude_code::launch_claude_code;
+
+    let _g = LAUNCHER_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let tmp = short_tempdir();
+    let socket_path = tmp.path().join("mock-daemon-launch-fail.sock");
+    let shadow_dir = tmp.path().join("shadow");
+    let fake_bin_dir = tmp.path().join("bins");
+    std::fs::create_dir_all(&fake_bin_dir).unwrap();
+    make_fake_ember_binary(&fake_bin_dir, "gh");
+
+    let prior_claude_bin = std::env::var("EMBER_CLAUDE_BIN").ok();
+    let prior_shadow_dir = std::env::var("EMBER_SHADOW_DIR").ok();
+    let prior_persona = std::env::var("EMBER_PERSONA").ok();
+    let prior_path = std::env::var("PATH").ok();
+
+    unsafe {
+        std::env::set_var(
+            "EMBER_CLAUDE_BIN",
+            "/no/such/binary-that-must-not-exist-launcher-session-wiring",
+        );
+        std::env::set_var("EMBER_SHADOW_DIR", shadow_dir.as_os_str());
+        std::env::set_var("EMBER_PERSONA", "claude-code-launch-fail-test");
+        let merged_path = match &prior_path {
+            Some(existing) => format!("{}:{existing}", fake_bin_dir.display()),
+            None => fake_bin_dir.display().to_string(),
+        };
+        std::env::set_var("PATH", merged_path);
+    }
+
+    let close_called = spawn_mock_daemon(socket_path.clone());
+    wait_for_socket(&socket_path);
+
+    let err = launch_claude_code(&[], &socket_path)
+        .expect_err("launch_claude_code must surface spawn failure");
+
+    unsafe {
+        match prior_claude_bin {
+            Some(v) => std::env::set_var("EMBER_CLAUDE_BIN", v),
+            None => std::env::remove_var("EMBER_CLAUDE_BIN"),
+        }
+        match prior_shadow_dir {
+            Some(v) => std::env::set_var("EMBER_SHADOW_DIR", v),
+            None => std::env::remove_var("EMBER_SHADOW_DIR"),
+        }
+        match prior_persona {
+            Some(v) => std::env::set_var("EMBER_PERSONA", v),
+            None => std::env::remove_var("EMBER_PERSONA"),
+        }
+        match prior_path {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+    }
+
+    assert!(
+        err.to_string().contains("failed to spawn"),
+        "spawn failure should be preserved: {err}"
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !close_called.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        close_called.load(Ordering::SeqCst),
+        "launch_claude_code must close the daemon session even when child spawn fails"
+    );
+}
+
+// implementation-note-532: the `--dev` flow
 // gate-checks `~/.ember-dev/envs/<worktree-id>/binaries/ember` exists
 // and would re-exec into it via `maybe_reexec_via_dev_cli` if the
 // current binary doesn't canonicalize to that path. The fixture below
@@ -525,7 +621,7 @@ fn launch_claude_code_registers_and_closes_session() {
 fn ember_cli_binary_claude_code_registers_grant_proxy_and_socket_path() {
     let _g = LAUNCHER_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    let tmp = TempDir::new().unwrap();
+    let tmp = short_tempdir();
     let home_dir = tmp.path().join("home");
     let workspace_root = tmp.path().join("dev-workspace");
     let fake_bin_dir = tmp.path().join("bins");
@@ -561,7 +657,7 @@ fn ember_cli_binary_claude_code_registers_grant_proxy_and_socket_path() {
 
     let capture_path_str = env_capture_file.display().to_string();
     let child_script = format!(
-        "printf '%s\\n%s\\n%s\\n%s\\n%s' \"$EMBER_SESSION_ID\" \"$EMBER_GRANT_ID\" \"$EMBER_PROXY_URL\" \"$EMBER_SOCKET_PATH\" \"$PATH\" > '{capture_path_str}'; exit 0"
+        "printf '%s\\n%s\\n%s\\n%s\\n%s\\n%s' \"$EMBER_SESSION_ID\" \"$EMBER_GRANT_ID\" \"$EMBER_PROXY_URL\" \"$EMBER_SOCKET_PATH\" \"$PATH\" \"$EMBER_OPERATOR_PRESENCE_TOKEN\" > '{capture_path_str}'; exit 0"
     );
 
     let status = std::process::Command::new(env!("CARGO_BIN_EXE_ember"))
@@ -572,6 +668,10 @@ fn ember_cli_binary_claude_code_registers_grant_proxy_and_socket_path() {
         .arg(&child_script)
         .env("HOME", &home_dir)
         .env("EMBER_DEV_WORKTREE_ROOT", &workspace_root)
+        .env(
+            emberlink_cli::dev_runtime::DEV_RUNTIME_ID_ENV,
+            &dev_runtime.worktree_id,
+        )
         .env("EMBER_CLAUDE_BIN", "/bin/sh")
         .env("EMBER_PERSONA", "claude-code-binary-test")
         .env("PATH", fake_bin_dir.display().to_string())
@@ -602,6 +702,14 @@ fn ember_cli_binary_claude_code_registers_grant_proxy_and_socket_path() {
         path_line.starts_with(&dev_runtime.shadow_root.join("bin").display().to_string()),
         "binary launcher PATH must start with dev shadow/bin: {path_line}"
     );
+    let token_line = lines.next().unwrap_or_default();
+    let token_json: serde_json::Value =
+        serde_json::from_str(token_line).expect("presence token env must be valid json");
+    assert_eq!(token_json.get("uid").and_then(|v| v.as_u64()), Some(501));
+    assert_eq!(
+        token_json.get("scope").and_then(|v| v.as_str()),
+        Some("class:session-runtime")
+    );
 }
 
 /// T2 wiring test: when the daemon returns an Anthropic gateway bundle, the
@@ -612,7 +720,7 @@ fn child_env_contains_anthropic_gateway_bundle_when_present() {
     use emberlink_cli::launcher::claude_code::{SessionRegistration, run_with_registration};
     use emberlink_cli::launcher::path_shadow::install_path_shadow;
 
-    let tmp = TempDir::new().unwrap();
+    let tmp = short_tempdir();
     let socket_path = tmp.path().join("mock-daemon-anthropic-gateway.sock");
     let shadow_dir = tmp.path().join("shadow");
     let env_capture_file = tmp.path().join("anthropic_gateway_env.txt");
@@ -626,6 +734,7 @@ fn child_env_contains_anthropic_gateway_bundle_when_present() {
         session_id: MOCK_SESSION_ID.to_string(),
         grant_id: MOCK_GRANT_ID.to_string(),
         proxy_url: MOCK_PROXY_URL.to_string(),
+        presence_token_json: None,
         anthropic_base_url: Some(MOCK_PROXY_URL.to_string()),
         anthropic_custom_headers: Some(
             "X-Ember-Persona: persona-main\nX-Ember-Credential: anthropic-key\nX-Ember-Target: https://api.anthropic.com\nX-Ember-Grant-Id: grt-anthropic".to_string(),
@@ -684,7 +793,7 @@ fn child_env_contains_ssh_auth_sock_when_present() {
     use emberlink_cli::launcher::claude_code::{SessionRegistration, run_with_registration};
     use emberlink_cli::launcher::path_shadow::install_path_shadow;
 
-    let tmp = TempDir::new().unwrap();
+    let tmp = short_tempdir();
     let socket_path = tmp.path().join("mock-daemon-ssh-auth.sock");
     let shadow_dir = tmp.path().join("shadow");
     let env_capture_file = tmp.path().join("ssh_auth_sock.txt");
@@ -698,6 +807,7 @@ fn child_env_contains_ssh_auth_sock_when_present() {
         session_id: MOCK_SESSION_ID.to_string(),
         grant_id: MOCK_GRANT_ID.to_string(),
         proxy_url: MOCK_PROXY_URL.to_string(),
+        presence_token_json: None,
         anthropic_base_url: None,
         anthropic_custom_headers: None,
         git_proxy_url: None,

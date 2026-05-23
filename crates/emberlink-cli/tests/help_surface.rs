@@ -146,6 +146,10 @@ fn init_help_centers_canonical_onboarding() {
         "expected init help to mention Codex's native auth lane; stdout:\n{stdout}"
     );
     assert!(
+        stdout.contains("codex login --device-auth"),
+        "expected init help to mention Codex's headless auth lane; stdout:\n{stdout}"
+    );
+    assert!(
         !stdout.contains("--touch-id"),
         "expected init help to hide the stub touch-id flag; stdout:\n{stdout}"
     );
@@ -175,6 +179,61 @@ fn claude_launcher_help_accepts_new_name_and_compat_alias() {
 }
 
 #[test]
+fn launcher_help_explains_isolated_controls() {
+    let (claude_stdout, claude_stderr, claude_code) = run_ember(&["claude", "--help"]);
+    assert_eq!(
+        claude_code, 0,
+        "exit non-zero for `claude --help`. stderr: {claude_stderr}"
+    );
+    assert!(
+        claude_stdout.contains("Trailing Claude args are forwarded on both host and isolated paths."),
+        "expected `claude --help` to describe isolated arg forwarding; stdout:\n{claude_stdout}"
+    );
+    assert!(
+        !claude_stdout.contains("custom trailing Claude args still require the host launcher path"),
+        "expected `claude --help` to drop the stale host-only caveat; stdout:\n{claude_stdout}"
+    );
+
+    for name in ["claude", "codex"] {
+        let (stdout, stderr, code) = run_ember(&[name, "--help"]);
+        assert_eq!(
+            code, 0,
+            "exit non-zero for `{name} --help`. stderr: {stderr}"
+        );
+        assert!(
+            stdout.contains("`--backend` / `--preset` only apply with `--isolated`."),
+            "expected `{name} --help` to explain isolated-only backend controls; stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("Requires `--isolated`"),
+            "expected `{name} --help` to mark backend/preset flags as isolated-only; stdout:\n{stdout}"
+        );
+    }
+
+    let (codex_stdout, codex_stderr, codex_code) = run_ember(&["codex", "--help"]);
+    assert_eq!(
+        codex_code, 0,
+        "exit non-zero for `codex --help`. stderr: {codex_stderr}"
+    );
+    assert!(
+        codex_stdout.contains("`codex login`"),
+        "expected `codex --help` to point operators at Codex's native login lane; stdout:\n{codex_stdout}"
+    );
+    assert!(
+        codex_stdout.contains("`codex login --device-auth`"),
+        "expected `codex --help` to mention Codex's headless auth lane; stdout:\n{codex_stdout}"
+    );
+    assert!(
+        codex_stdout.contains("`~/.codex`"),
+        "expected `codex --help` to explain the host auth bind-mount in isolated mode; stdout:\n{codex_stdout}"
+    );
+    assert!(
+        codex_stdout.contains("Leave unset to auto-detect."),
+        "expected `codex --help` to explain backend auto-detection; stdout:\n{codex_stdout}"
+    );
+}
+
+#[test]
 fn session_open_help_accepts_claude_target_and_compat_alias() {
     for target in ["claude", "claude-code"] {
         let (stdout, stderr, code) = run_ember(&["session", "open", target, "--help"]);
@@ -185,6 +244,25 @@ fn session_open_help_accepts_claude_target_and_compat_alias() {
         assert!(
             stdout.contains("Trailing arguments forwarded to the target surface"),
             "expected `session open {target} --help` to parse and show target help; stdout:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn session_open_help_marks_backend_and_preset_as_isolated_only() {
+    for target in ["claude", "codex"] {
+        let (stdout, stderr, code) = run_ember(&["session", "open", target, "--help"]);
+        assert_eq!(
+            code, 0,
+            "exit non-zero for `session open {target} --help`. stderr: {stderr}"
+        );
+        assert!(
+            stdout.contains("Requires `--isolated`"),
+            "expected `session open {target} --help` to mark backend/preset as isolated-only; stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("Force the isolated/container launcher path"),
+            "expected `session open {target} --help` to use the public isolated wording; stdout:\n{stdout}"
         );
     }
 }

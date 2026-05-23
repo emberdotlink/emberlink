@@ -4,7 +4,7 @@ Summary:
 - Decision status: accepted
 - Authority state: current
 - Implementation status: shipped
-- Last reviewed: 2026-05-20
+- Last reviewed: 2026-05-23
 
 # Emberlink
 
@@ -42,25 +42,32 @@ build, and `v0.3.1` is the first planned public supported build.
 
 If you are in the named friendly cohort, use the signed preview artifact
 and onboarding notes provided with your invite. Once `ember` is on your
-`PATH`, run:
+`PATH`, run the onboarding path you need:
 
 ```bash
-ember init --for claude-code
+ember init --for claude
+ember init --for codex
 ```
 
-If `ANTHROPIC_API_KEY` is present when you run init, Ember stores it as
-`anthropic-key` and `ember claude-code` can reuse a brokered Claude runtime
-grant. If not, Claude's own upstream auth remains ambient and Ember still
-brokers the Git/GitHub/tool side of the session. To move onto the brokered
-runtime lane later, rerun `ember init --for claude-code` with
+If `ANTHROPIC_API_KEY` is present when you run `ember init --for claude`,
+Ember stores it as `anthropic-key` and `ember claude` can reuse a brokered
+Claude runtime grant. If not, Claude's own upstream auth remains ambient and
+Ember still brokers the Git/GitHub/tool side of the session. To move onto the
+brokered runtime lane later, rerun `ember init --for claude` with
 `ANTHROPIC_API_KEY` exported or run `ember vault add --name anthropic-key`.
+
+Codex stays on Codex's native login lane. Run `codex login`, or
+`codex login --device-auth` on a headless host, then `ember init --for codex`;
+isolated `ember codex` reuses the host `~/.codex` authority via bind-mount
+instead of creating a separate container login.
 
 If you're evaluating from the public source mirror today, use the
 source-build path:
 
 ```bash
 cargo install --locked --path crates/emberlink-cli --bin ember
-ember init --for claude-code
+ember init --for claude
+ember init --for codex
 ```
 
 Use [QUICKSTART.md](QUICKSTART.md) for the current pre-release install and

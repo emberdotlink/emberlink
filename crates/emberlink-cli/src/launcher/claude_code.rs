@@ -1,11 +1,11 @@
-//! `ember claude-code` launcher.
+//! `ember claude` launcher.
 //!
 //! Per design §2 / implementation-note-499 + design §3 (PATH-shadow wiring, sub-B).
 //! Real daemon RPC shipped in #2318 (LAUNCHER-SESSION-RPC); see design §2
 //! for the full protocol contract.
 //!
 //! 1. Resolve persona: `$EMBER_PERSONA` env var if set; otherwise
-//!    `claude-code-{hostname}` (matching what `init --for claude-code`
+//!    `claude-code-{hostname}` (matching what `init --for claude`
 //!    creates). Install PATH-shadow symlinks via `install_path_shadow`
 //!    (idempotent; creates `~/.ember/shadow/bin/` on first launch, verifies
 //!    symlinks on subsequent launches).
@@ -45,48 +45,14 @@
 use std::io;
 use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use crate::install_paths::PROD_MANIFEST_PATH;
+use crate::launcher::core::{self, LauncherInvocation};
 use crate::launcher::path_shadow::{ConstructSpec, install_path_shadow, shadow_bin_dir};
-use crate::launcher::presence;
 use crate::launcher::session_prefs;
 
+pub use crate::launcher::core::SessionRegistration;
 use serde_json::{Value, json};
-
-/// Outcome of the daemon `register_session` RPC.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionRegistration {
-    pub session_id: String,
-    pub grant_id: String,
-    pub proxy_url: String,
-    /// Optional Anthropic gateway base URL for launcher-mediated Claude Code
-    /// sessions. Present only when the daemon has already resolved the active
-    /// session grant to a composite Anthropic grant shape.
-    pub anthropic_base_url: Option<String>,
-    /// Newline-separated `Name: Value` headers for Claude Code's
-    /// `ANTHROPIC_CUSTOM_HEADERS` env var. Present only alongside
-    /// `anthropic_base_url`.
-    pub anthropic_custom_headers: Option<String>,
-    /// Git credential-injection proxy URL (implementation-note-302).
-    /// When `Some`, the child process receives `EMBER_GIT_PROXY_URL=<url>`.
-    /// `None` when the daemon did not allocate a git proxy (git proxy disabled
-    /// or pre-fix daemon).
-    pub git_proxy_url: Option<String>,
-    /// Path to the daemon-managed ssh-agent socket for this session
-    /// (implementation-note-85). When `Some`, the child process
-    /// receives `SSH_AUTH_SOCK=<path>` so git/ssh in the child tree find
-    /// the daemon socket. `None` when the daemon did not allocate an
-    /// ssh-agent for this session (e.g. pre-design daemon).
-    pub ssh_auth_sock: Option<String>,
-    /// design §Component 3 — workflow grant ULID stamped by the daemon when
-    /// the launcher selected a workflow template at session-open. None when
-    /// the launcher opened the session without picking a template.
-    pub workflow_id: Option<String>,
-    /// design §Component 3 — workflow template name (e.g. `emberd-development`)
-    /// the operator picked at session-open. Paired with `workflow_id`.
-    pub workflow_template: Option<String>,
-}
 
 /// Call the daemon `register_session` RPC and return the session triple.
 ///
@@ -131,61 +97,7 @@ fn parse_register_session_result(
     result: &Value,
     socket_path: &Path,
 ) -> io::Result<SessionRegistration> {
-    if let (Some(tab_url), Some(prompt_id)) = (
-        result["presence_required"]["tab_url"].as_str(),
-        result["presence_required"]["prompt_id"].as_str(),
-    ) {
-        return Err(presence::session_open_presence_unavailable(
-            socket_path,
-            prompt_id,
-            tab_url,
-        ));
-    }
-
-    let session_id = result["session_id"]
-        .as_str()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "daemon: missing session_id"))?
-        .to_string();
-    let grant_id = result["grant_id"]
-        .as_str()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "daemon: missing grant_id"))?
-        .to_string();
-    // implementation-note-302: the daemon should always include
-    // proxy_url in the register_session response (it reads EMBER_PROXY_URL
-    // from runtime state). If the fallback to 8484 fires it means the daemon
-    // is pre-fix or the LLM proxy failed to bind — Claude Code will hit
-    // ECONNREFUSED. Emit a clear warning so the regression is visible.
-    let proxy_url = match result["proxy_url"].as_str() {
-        Some(url) => url.to_string(),
-        None => {
-            eprintln!(
-                "ember claude: WARNING — daemon did not return proxy_url in \
-                 register_session response; falling back to http://127.0.0.1:8484 which \
-                 is likely not bound. Claude Code may fail with ECONNREFUSED. \
-                 (implementation-note-302)"
-            );
-            "http://127.0.0.1:8484".to_string()
-        }
-    };
-    let anthropic_base_url = result["anthropic_base_url"].as_str().map(|s| s.to_string());
-    let anthropic_custom_headers = result["anthropic_custom_headers"]
-        .as_str()
-        .map(|s| s.to_string());
-    let git_proxy_url = result["git_proxy_url"].as_str().map(|s| s.to_string());
-    let ssh_auth_sock = result["ssh_auth_sock"].as_str().map(|s| s.to_string());
-    let workflow_id = result["workflow_id"].as_str().map(|s| s.to_string());
-    let workflow_template = result["workflow_template"].as_str().map(|s| s.to_string());
-    Ok(SessionRegistration {
-        session_id,
-        grant_id,
-        proxy_url,
-        anthropic_base_url,
-        anthropic_custom_headers,
-        git_proxy_url,
-        ssh_auth_sock,
-        workflow_id,
-        workflow_template,
-    })
+    crate::launcher::session_rpc::parse_register_session_result(result, socket_path, "ember claude")
 }
 
 /// Resolve a workflow template name for this launch (design §Component 3 /
@@ -230,7 +142,7 @@ fn is_safe_template_name(name: &str) -> bool {
 
 /// the legacy chain still applies and the launch never fails on template
 /// resolution.
-fn resolve_workflow_template_for_launch() -> Option<String> {
+pub(crate) fn resolve_workflow_template_for_launch() -> Option<String> {
     // 1. Explicit override via env var.
     if let Ok(name) = std::env::var("EMBER_WORKFLOW_TEMPLATE")
         && !name.is_empty()
@@ -331,10 +243,25 @@ fn workflow_template_install_root() -> PathBuf {
 /// Errors are logged to stderr but do not affect the launcher's exit code
 /// — the child has already exited by this point.
 pub fn close_session_rpc(session_id: &str, socket_path: &Path) {
-    let params = json!({ "session_id": session_id });
-    if let Err(e) = call_daemon(socket_path, "close_session", &params) {
-        eprintln!("ember claude: close_session failed: {e}");
-    }
+    crate::launcher::session_rpc::close_session_rpc(
+        session_id,
+        socket_path,
+        "ember claude",
+        "ember claude",
+    );
+}
+
+fn with_session_close<T, F>(session_id: &str, socket_path: &Path, f: F) -> io::Result<T>
+where
+    F: FnOnce() -> io::Result<T>,
+{
+    crate::launcher::session_rpc::with_session_close(
+        session_id,
+        socket_path,
+        "ember claude",
+        "ember claude",
+        f,
+    )
 }
 
 /// Resolve the shadow root directory: `~/.ember/shadow/`, overridable via
@@ -344,13 +271,7 @@ pub fn close_session_rpc(session_id: &str, socket_path: &Path) {
 /// live under `<shadow_dir>/bin/` — use [`shadow_bin_dir`] to obtain the
 /// PATH-prepend target.
 pub fn resolve_shadow_dir() -> PathBuf {
-    if let Ok(override_dir) = std::env::var("EMBER_SHADOW_DIR") {
-        return PathBuf::from(override_dir);
-    }
-    dirs_next::home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".ember")
-        .join("shadow")
+    core::resolve_shadow_dir()
 }
 
 /// Cohort-A canonical Construct set (Option 2 — hardcoded constant).
@@ -402,7 +323,8 @@ fn resolve_terminal_candidate(path: &Path) -> PathBuf {
 }
 
 fn path_looks_like_repo_build_artifact(path: &Path) -> bool {
-    path.components().any(|component| component.as_os_str() == "target")
+    path.components()
+        .any(|component| component.as_os_str() == "target")
 }
 
 fn prod_safe_construct_candidate(candidate: &Path) -> bool {
@@ -470,8 +392,8 @@ fn managed_prod_construct_specs_from_sources(
             .iter()
             .filter_map(|tool| {
                 let ember_name = format!("ember-{tool}");
-                let entry = ember_daemon::binary_manifest::lookup_construct(manifest, &ember_name)
-                    .ok()?;
+                let entry =
+                    ember_daemon::binary_manifest::lookup_construct(manifest, &ember_name).ok()?;
                 if prod_safe_construct_candidate(&entry.absolute_path) {
                     Some(ConstructSpec {
                         tool_name: (*tool).to_string(),
@@ -526,10 +448,13 @@ fn managed_prod_construct_specs_from_sources(
 }
 
 pub fn managed_prod_construct_specs() -> Vec<ConstructSpec> {
-    let manifest =
-        ember_daemon::binary_manifest::load_manifest(Path::new(PROD_MANIFEST_PATH)).ok();
+    let manifest = ember_daemon::binary_manifest::load_manifest(Path::new(PROD_MANIFEST_PATH)).ok();
     let bundled_dir = ember_daemon::binary_manifest::bundled_install_dir();
-    managed_prod_construct_specs_from_sources(manifest.as_ref(), &bundled_dir, std::env::var("PATH").ok().as_deref())
+    managed_prod_construct_specs_from_sources(
+        manifest.as_ref(),
+        &bundled_dir,
+        std::env::var("PATH").ok().as_deref(),
+    )
 }
 
 pub fn prod_required_constructs_present(specs: &[ConstructSpec]) -> bool {
@@ -580,75 +505,40 @@ fn run_with_registration_with_runtime_id(
     shadow_dir: &Path,
     dev_runtime_id: Option<&str>,
 ) -> io::Result<i32> {
-    eprintln!(
-        "ember claude: launching {bin} (session={}, grant={}, proxy={})",
-        registration.session_id, registration.grant_id, registration.proxy_url,
-    );
-
-    // Build child PATH: shadow_dir prepended to the parent's PATH.
-    // We use Command::env so the parent shell's PATH is never touched.
-    let parent_path = std::env::var("PATH").unwrap_or_default();
-    let child_path = format!("{}:{}", shadow_dir.display(), parent_path);
-
-    let mut cmd = Command::new(bin);
-    cmd.args(extra_args)
-        .env("EMBER_GRANT_ID", &registration.grant_id)
-        .env("EMBER_PROXY_URL", &registration.proxy_url)
-        .env("EMBER_SOCKET_PATH", socket_path.as_os_str())
-        .env("EMBER_DAEMON_SOCKET", socket_path.as_os_str())
-        // implementation-note-500: do NOT inject
-        // HTTPS_PROXY for Claude Code. The daemon's LLM proxy
-        // (`infra::proxy::run_proxy`) is a custom POST endpoint for the
-        // Anthropic SDK base_url use case — NOT a CONNECT-supporting
-        // transparent HTTPS_PROXY. Claude Code uses HTTPS_PROXY
-        // semantics (sends `CONNECT api.anthropic.com:443`), and
-        // run_proxy returns 400 (ERR_BAD_REQUEST) on CONNECT. Cohort-A
-        // value prop is still the broker for credentialed SUBPROCESS calls
-        // (gh / git push / kubectl) via Constructs + shadow PATH. Claude
-        // runtime mediation now lands via `ANTHROPIC_BASE_URL` +
-        // `ANTHROPIC_CUSTOM_HEADERS` when the session grant carries the
-        // right composite shape; without that bundle, Claude Code's own API
-        // auth remains the friendly's concern. EMBER_PROXY_URL is still
-        // injected so Constructs can use it via different code paths if
-        // needed.
-        .env("EMBER_SESSION_ID", &registration.session_id)
-        .env("EMBER_PERSONA", resolve_persona_name())
-        .env("PATH", &child_path)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+    let mut extra_env = vec![("EMBER_PERSONA".to_string(), resolve_persona_name())];
     if let Some(ref base_url) = registration.anthropic_base_url {
-        cmd.env("ANTHROPIC_BASE_URL", base_url);
+        extra_env.push(("ANTHROPIC_BASE_URL".to_string(), base_url.clone()));
     }
     if let Some(ref headers) = registration.anthropic_custom_headers {
-        cmd.env("ANTHROPIC_CUSTOM_HEADERS", headers);
+        extra_env.push(("ANTHROPIC_CUSTOM_HEADERS".to_string(), headers.clone()));
     }
-    // Inject the git proxy URL when the daemon provided one (implementation-note-302).
     if let Some(ref gpu) = registration.git_proxy_url {
-        cmd.env("EMBER_GIT_PROXY_URL", gpu);
+        extra_env.push(("EMBER_GIT_PROXY_URL".to_string(), gpu.clone()));
     }
-    // Inject daemon-managed ssh-agent socket when the broker provided one
-    // (implementation-note-85). git/ssh in the child tree pick this up
-    // automatically without any additional configuration.
     if let Some(ref sock) = registration.ssh_auth_sock {
-        cmd.env("SSH_AUTH_SOCK", sock);
+        extra_env.push(("SSH_AUTH_SOCK".to_string(), sock.clone()));
     }
     if let Some(runtime_id) = dev_runtime_id {
-        cmd.env(crate::dev_runtime::DEV_RUNTIME_ID_ENV, runtime_id);
+        extra_env.push((
+            crate::dev_runtime::DEV_RUNTIME_ID_ENV.to_string(),
+            runtime_id.to_string(),
+        ));
     }
-    let status = cmd.status().map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!("ember claude: failed to spawn {bin}: {e}"),
+
+    with_session_close(&registration.session_id, socket_path, || {
+        core::run_with_registration(
+            LauncherInvocation {
+                launcher_name: "claude",
+                binary: bin,
+                extra_args,
+                socket_path,
+                shadow_bin_dir: shadow_dir,
+                current_dir: None,
+            },
+            registration,
+            extra_env,
         )
-    })?;
-
-    // Exit trap: close session unconditionally on child exit, including
-    // signal-forwarded SIGINT/SIGTERM. close_session_rpc logs but does not
-    // propagate errors — the child exit code is what the user cares about.
-    close_session_rpc(&registration.session_id, socket_path);
-
-    Ok(status.code().unwrap_or(1))
+    })
 }
 
 /// Resolve the persona name for the session.
@@ -665,7 +555,7 @@ fn run_with_registration_with_runtime_id(
 ///
 /// Returns the persona name string. The caller is responsible for surfacing a
 /// clear error if the daemon rejects the persona (e.g. user never ran
-/// `ember init --for claude-code`).
+/// `ember init --for claude`).
 pub fn resolve_persona_name() -> String {
     if let Ok(v) = std::env::var("EMBER_PERSONA")
         && !v.is_empty()
@@ -722,7 +612,7 @@ pub fn maybe_print_host_mode_disclaimer() -> io::Result<()> {
     Ok(())
 }
 
-/// `ember claude-code [extra_args...]` entry point.
+/// `ember claude [extra_args...]` entry point.
 ///
 /// Resolves persona via `resolve_persona_name` (`$EMBER_PERSONA` env var or
 /// the cohort-A default `claude-code-{hostname}`), installs PATH-shadow
@@ -786,6 +676,7 @@ pub fn launch_claude_code_with_shadow_dir_and_constructs_with_runtime_id(
     construct_specs: &[ConstructSpec],
     dev_runtime_id: Option<&str>,
 ) -> io::Result<i32> {
+    core::ensure_broker_safe_launch_cwd("claude")?;
     install_path_shadow(shadow_dir, construct_specs)?;
 
     // Step 1.5: design §Component 3 — resolve a workflow template. When stdin
@@ -800,30 +691,27 @@ pub fn launch_claude_code_with_shadow_dir_and_constructs_with_runtime_id(
     // Step 2: Register session with the daemon (mints EMBER_SESSION_ID and,
     // when a workflow template was selected, issues a `WorkflowGrant` via
     // `workflow_grant::save_if_absent`).
-    let registration = register_session_rpc_with_workflow(
-        persona,
-        socket_path,
-        workflow_template_name.as_deref(),
-    )
-    .map_err(|e| {
-        let msg = e.to_string();
-        // When the daemon rejects a "no such persona" error for the cohort-A
-        // default name, surface a friendly hint so users know to run init.
-        if msg.contains("not found")
-            || msg.contains("no such persona")
-            || msg.contains("unknown persona")
-        {
-            io::Error::new(
-                e.kind(),
-                "no cohort-A persona found.\n  \
+    let registration =
+        register_session_rpc_with_workflow(persona, socket_path, workflow_template_name.as_deref())
+            .map_err(|e| {
+                let msg = e.to_string();
+                // When the daemon rejects a "no such persona" error for the cohort-A
+                // default name, surface a friendly hint so users know to run init.
+                if msg.contains("not found")
+                    || msg.contains("no such persona")
+                    || msg.contains("unknown persona")
+                {
+                    io::Error::new(
+                        e.kind(),
+                        "no cohort-A persona found.\n  \
                  Run `ember init --for claude` first, or set \
                  $EMBER_PERSONA to an existing persona name."
-                    .to_string(),
-            )
-        } else {
-            e
-        }
-    })?;
+                            .to_string(),
+                    )
+                } else {
+                    e
+                }
+            })?;
 
     // Step 3: Print the host-mode mediation disclaimer (design §Component 5a)
     // immediately before invoking the Claude Code child binary. Skipped when
@@ -878,6 +766,7 @@ fn launcher_guidance_for_rpc(method: &str, code: i32, message: &str) -> Option<S
         && (message.contains("session is locked")
             || message.contains("vault unavailable")
             || message.contains("session auto-locked"));
+    let is_no_active_grant = code == -32004 && message.contains("no active grant for persona");
     let is_quarantined =
         message.contains("daemon quarantined") && message.contains("write-class method");
 
@@ -886,8 +775,9 @@ fn launcher_guidance_for_rpc(method: &str, code: i32, message: &str) -> Option<S
     {
         return Some(
             "this Claude Code session needs operator presence on the daemon-managed vault lane. \
-             Approve the unlock flow if prompted, or run `ember vault unlock` from an interactive \
-             operator shell and then re-run `ember claude`."
+             Use the managed separate-uid biometric unlock flow when available. If you are on a \
+             dev probe lane, restart the daemon with `EMBER_VAULT_PASSPHRASE`; same-daemon \
+             operator-uid reopen is intentionally disabled. Then re-run `ember claude`."
                 .to_string(),
         );
     }
@@ -895,6 +785,13 @@ fn launcher_guidance_for_rpc(method: &str, code: i32, message: &str) -> Option<S
     if method == "register_session" && is_quarantined {
         return Some(
             "this Claude session is blocked because the daemon quarantined write-class methods after an audit-chain integrity failure. Run `ember audit verify` to inspect the chain, then repair the daemon before re-running `ember claude`."
+                .to_string(),
+        );
+    }
+
+    if method == "register_session" && is_no_active_grant {
+        return Some(
+            "no active grant is attached to this Claude persona. Run `ember init --for claude` to mint or refresh a launcher grant, approve or unlock if prompted, then re-run `ember claude`."
                 .to_string(),
         );
     }
@@ -911,6 +808,7 @@ mod tests {
             session_id: "sess_fixture".to_string(),
             grant_id: "grt_fixture".to_string(),
             proxy_url: "http://127.0.0.1:9999".to_string(),
+            presence_token_json: None,
             anthropic_base_url: None,
             anthropic_custom_headers: None,
             git_proxy_url: None,
@@ -940,9 +838,7 @@ mod tests {
     fn prod_safe_construct_candidate_accepts_managed_install_symlink() {
         let tmp = tempfile::tempdir().unwrap();
         let launcher = tmp.path().join("ember-git");
-        let installed_target = tmp
-            .path()
-            .join("usr/local/lib/ember/binaries/ember-git");
+        let installed_target = tmp.path().join("usr/local/lib/ember/binaries/ember-git");
         std::fs::create_dir_all(installed_target.parent().unwrap()).unwrap();
         std::fs::write(&installed_target, b"binary").unwrap();
         std::os::unix::fs::symlink(&installed_target, &launcher).unwrap();
@@ -1008,10 +904,14 @@ mod tests {
         let specs =
             managed_prod_construct_specs_from_sources(Some(&manifest), tmp.path(), Some(""));
         assert!(
-            specs.iter().any(|spec| spec.tool_name == "gh" && spec.target_binary == managed_gh)
+            specs
+                .iter()
+                .any(|spec| spec.tool_name == "gh" && spec.target_binary == managed_gh)
         );
         assert!(
-            specs.iter().any(|spec| spec.tool_name == "git" && spec.target_binary == managed_git)
+            specs
+                .iter()
+                .any(|spec| spec.tool_name == "git" && spec.target_binary == managed_git)
         );
     }
 
@@ -1028,10 +928,14 @@ mod tests {
 
         let specs = managed_prod_construct_specs_from_sources(None, &bundled_dir, Some(""));
         assert!(
-            specs.iter().any(|spec| spec.tool_name == "gh" && spec.target_binary == bundled_gh)
+            specs
+                .iter()
+                .any(|spec| spec.tool_name == "gh" && spec.target_binary == bundled_gh)
         );
         assert!(
-            specs.iter().any(|spec| spec.tool_name == "git" && spec.target_binary == bundled_git)
+            specs
+                .iter()
+                .any(|spec| spec.tool_name == "git" && spec.target_binary == bundled_git)
         );
     }
 
@@ -1161,7 +1065,8 @@ mod tests {
         )
         .expect("expected guidance");
         assert!(guidance.contains("operator presence"));
-        assert!(guidance.contains("ember vault unlock"));
+        assert!(guidance.contains("managed separate-uid biometric unlock"));
+        assert!(guidance.contains("EMBER_VAULT_PASSPHRASE"));
         assert!(guidance.contains("ember claude"));
     }
 
@@ -1170,11 +1075,12 @@ mod tests {
         let guidance = launcher_guidance_for_rpc(
             "register_session",
             -32030,
-            "register_session denied: session is locked; reopen with `ember vault unlock`",
+            "register_session denied: session is locked; same-daemon operator-uid reopen is disabled to avoid legacy login-keychain prompts",
         )
         .expect("expected guidance");
         assert!(guidance.contains("operator presence"));
-        assert!(guidance.contains("ember vault unlock"));
+        assert!(guidance.contains("managed separate-uid biometric unlock"));
+        assert!(guidance.contains("EMBER_VAULT_PASSPHRASE"));
         assert!(guidance.contains("ember claude"));
     }
 
@@ -1188,6 +1094,18 @@ mod tests {
         .expect("expected guidance");
         assert!(guidance.contains("daemon quarantined"));
         assert!(guidance.contains("ember audit verify"));
+        assert!(guidance.contains("ember claude"));
+    }
+
+    #[test]
+    fn launcher_guidance_maps_no_active_grant_register_session() {
+        let guidance = launcher_guidance_for_rpc(
+            "register_session",
+            -32004,
+            "no active grant for persona 'claude-code-default'",
+        )
+        .expect("expected guidance");
+        assert!(guidance.contains("ember init --for claude"));
         assert!(guidance.contains("ember claude"));
     }
 
@@ -1208,6 +1126,15 @@ mod tests {
             "anthropic_custom_headers": "X-Ember-Persona: persona-main\nX-Ember-Credential: anthropic-key",
             "git_proxy_url": "http://127.0.0.1:7002",
             "ssh_auth_sock": "/tmp/ember-ssh-agent.sock",
+            "presence_token": {
+                "uid": 501,
+                "scope": "class:session-runtime",
+                "expiry": {
+                    "secs_since_epoch": 1779507461u64,
+                    "nanos_since_epoch": 807776000u32
+                },
+                "signature": [1, 2, 3]
+            },
         });
         let parsed = parse_register_session_result(&raw, Path::new("/tmp/daemon.sock"))
             .expect("direct result must parse");
@@ -1229,6 +1156,25 @@ mod tests {
         assert_eq!(
             parsed.ssh_auth_sock.as_deref(),
             Some("/tmp/ember-ssh-agent.sock")
+        );
+        let token_json: serde_json::Value = serde_json::from_str(
+            parsed
+                .presence_token_json
+                .as_deref()
+                .expect("presence token must be serialized"),
+        )
+        .expect("presence token json");
+        assert_eq!(
+            token_json,
+            json!({
+                "uid": 501,
+                "scope": "class:session-runtime",
+                "expiry": {
+                    "secs_since_epoch": 1779507461u64,
+                    "nanos_since_epoch": 807776000u32
+                },
+                "signature": [1, 2, 3]
+            })
         );
     }
 
@@ -1325,9 +1271,7 @@ mod tests {
         // We drive this by testing the error-remapping closure logic directly:
         // create an io::Error with the "not found" substring and assert the
         // remapped message contains the init hint.
-        let raw_err = io::Error::other(
-            "daemon error: persona 'claude-code-myhost' not found",
-        );
+        let raw_err = io::Error::other("daemon error: persona 'claude-code-myhost' not found");
         let msg = raw_err.to_string();
         let remapped = if msg.contains("not found")
             || msg.contains("no such persona")
@@ -1360,6 +1304,7 @@ mod tests {
             session_id: "sess_test".to_string(),
             grant_id: "grt_test".to_string(),
             proxy_url: "http://127.0.0.1:61169".to_string(),
+            presence_token_json: None,
             anthropic_base_url: None,
             anthropic_custom_headers: None,
             git_proxy_url: Some("http://127.0.0.1:61170".to_string()),
@@ -1393,6 +1338,7 @@ mod tests {
             session_id: "sess_proxy_wire".to_string(),
             grant_id: "grt_proxy_wire".to_string(),
             proxy_url: "http://127.0.0.1:62000".to_string(),
+            presence_token_json: None,
             anthropic_base_url: None,
             anthropic_custom_headers: None,
             git_proxy_url: None,

@@ -218,6 +218,9 @@ tempfile = "3"
 # to avoid a duplicate compile of v2.
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7"
+# Force static/vendored OpenSSL on macOS so signed host builds do not pick up
+# Homebrew's libssl/libcrypto dylibs, which hardened runtime rejects at launch.
+openssl = { version = "0.10", features = ["vendored"] }
 
 [dev-dependencies]
 emberlink-agent = { path = "../emberlink-agent" }

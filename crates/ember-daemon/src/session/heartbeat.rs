@@ -79,21 +79,10 @@ pub fn write_heartbeat(session_dir: &Path, now: DateTime<Utc>) -> std::io::Resul
 
 /// Check whether a process with the given PID is still alive.
 ///
-/// `kill(pid, 0)` returns `0` when the PID exists, `-1` with `errno=ESRCH`
-/// when the PID is gone, `-1` with `errno=EPERM` when the PID exists but
-/// we can't signal it. Treats `EPERM` as alive.
+/// Uses the shared daemon PID liveness helper so macOS separate-uid posture
+/// does not misclassify live cross-uid launcher processes as gone.
 pub fn pid_alive(pid: u32) -> bool {
-    // SAFETY: kill(pid, 0) is a read-only syscall: it never delivers a signal.
-    // The only side effect is an errno value returned to us.
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if rc == 0 {
-        return true;
-    }
-    let os_err = std::io::Error::last_os_error();
-    let raw = os_err.raw_os_error().unwrap_or(0);
-    // ESRCH — process does not exist.
-    // EPERM — process exists but we can't signal it; treat as alive.
-    raw != libc::ESRCH
+    crate::infra::pid::process_exists(pid)
 }
 
 /// One pass of the heartbeat watcher. Visible for testing — production code

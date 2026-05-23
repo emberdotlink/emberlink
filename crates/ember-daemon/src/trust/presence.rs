@@ -441,9 +441,12 @@ pub fn require_user_presence_at(
     match m.state {
         SessionState::Locked => GateOutcome::Locked {
             reason: format!(
-                "{} denied: session is locked; reopen with `ember vault unlock` \
-                 or start a new session (`register_session` path). Ordinary lazy \
-                 same-daemon re-auth is not fully wired yet",
+                "{} denied: session is locked; same-daemon operator-uid reopen \
+                 is disabled to avoid legacy login-keychain prompts. Supported lanes: \
+                 managed separate-uid biometric unlock \
+                 (`vault_unlock_begin/vault_unlock_complete`), a fresh daemon \
+                 bootstrap via `EMBER_VAULT_PASSPHRASE` for dev probes, or future \
+                 broker-mediated browser auth",
                 op.as_str()
             ),
         },

@@ -2710,9 +2710,12 @@ pub async fn dispatch_method_with_context(
             return Err((
                 -32030,
                 format!(
-                    "{method} denied: session is locked; reopen with `ember vault unlock` \
-                     or start a new session (`register_session` path). Ordinary lazy \
-                     same-daemon re-auth is not fully wired yet"
+                    "{method} denied: session is locked; same-daemon operator-uid reopen \
+                     is disabled to avoid legacy login-keychain prompts. Supported lanes: \
+                     managed separate-uid biometric unlock \
+                     (`vault_unlock_begin/vault_unlock_complete`), a fresh daemon \
+                     bootstrap via `EMBER_VAULT_PASSPHRASE` for dev probes, or future \
+                     broker-mediated browser auth"
                 ),
             ));
         }
@@ -3963,10 +3966,15 @@ pub async fn dispatch_method_with_context(
                     "vault_unlock: separate-uid posture requires native biometric unlock; use an updated ember CLI that speaks vault_unlock_begin/vault_unlock_complete".to_string(),
                 ));
             }
-            crate::infra::interactive_unlock::ensure_vault_for_explicit_unlock(store)
+            crate::infra::interactive_unlock::ensure_live_vault_for_legacy_unlock(store)
                 .map_err(|msg| (-32030, msg))?;
             crate::infra::interactive_unlock::arm_non_session_grace_window();
-            let token = mint_operator_presence_token(ctx.peer.as_ref(), "vault_unlock")?;
+            let requested_method = params
+                .get("requested_method")
+                .and_then(|v| v.as_str())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("vault_unlock");
+            let token = mint_operator_presence_token(ctx.peer.as_ref(), requested_method)?;
             let mut response = json!({"unlocked": true});
             if let Some(token) = token {
                 response["presence_token"] = serde_json::to_value(token)
@@ -4097,10 +4105,28 @@ pub async fn dispatch_method_with_context(
             presence::record_activity();
             let (unlocked, idle_secs) = presence::snapshot();
             let cfg = presence::current_config();
+            let unlock = crate::infra::interactive_unlock::snapshot();
+            let live_vault_attached = store.vault().is_some();
+            let posture = if unlocked {
+                "interactive-unlocked"
+            } else if live_vault_attached && unlock.session_pin_count > 0 {
+                "presence-locked-vault-pinned"
+            } else if live_vault_attached {
+                "presence-locked-vault-attached"
+            } else {
+                "hard-locked"
+            };
             Ok(json!({
+                "posture": posture,
                 "unlocked": unlocked,
                 "idle_secs": idle_secs,
                 "idle_timeout_secs": cfg.idle_timeout.as_secs(),
+                "live_vault_attached": live_vault_attached,
+                "session_pin_count": unlock.session_pin_count,
+                "grace_window_secs": unlock.grace_window_secs,
+                "grace_remaining_secs": unlock.grace_remaining_secs,
+                "grace_lock_pending": unlock.grace_lock_pending,
+                "grace_zero_due": unlock.grace_zero_due,
                 "quiet_hours_start": cfg.quiet_hours_start,
                 "quiet_hours_end": cfg.quiet_hours_end,
             }))
@@ -13918,7 +13944,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn vault_unlock_reopens_live_vault_after_explicit_lock() {
+    async fn vault_unlock_fails_closed_after_explicit_lock() {
         let _guard = crate::PROCESS_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -13958,7 +13984,7 @@ mod tests {
             "explicit lock must clear live vault"
         );
 
-        let result = dispatch_method(
+        let err = dispatch_method(
             store.as_ref(),
             runtime_vault.as_ref(),
             &policy,
@@ -13967,24 +13993,24 @@ mod tests {
             &json!(null),
         )
         .await
-        .unwrap();
-        assert_eq!(result["unlocked"], json!(true));
+        .unwrap_err();
+        assert_eq!(err.0, -32030);
         assert!(
-            store.vault().is_some(),
-            "vault_unlock must repopulate the shared live-vault slot"
+            err.1
+                .contains("same-daemon operator-uid reopen is disabled to avoid legacy login-keychain prompts"),
+            "legacy unlock path must fail closed with explicit guidance"
         );
         assert!(
-            interactive_unlock::grace_zero_due_at(
-                std::time::Instant::now() + std::time::Duration::from_secs(2)
-            ),
-            "vault_unlock must arm the shared grace window for non-session unlocks"
+            err.1.contains("EMBER_VAULT_PASSPHRASE"),
+            "guidance should name the fresh bootstrap/dev probe lane"
         );
+        assert!(store.vault().is_none(), "hard lock must keep the live vault cleared");
 
         interactive_unlock::reset_for_tests();
     }
 
     #[tokio::test]
-    async fn vault_unlock_socket_path_mints_presence_token() {
+    async fn vault_unlock_socket_path_fails_closed_after_explicit_lock() {
         let _guard = crate::PROCESS_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -14035,7 +14061,7 @@ mod tests {
             presence_token: None,
             bypass_binary_pin_gate_for_test: false,
         };
-        let result = dispatch_method_with_context(
+        let err = dispatch_method_with_context(
             store.as_ref(),
             runtime_vault.as_ref(),
             &policy,
@@ -14046,13 +14072,196 @@ mod tests {
             &json!(null),
         )
         .await
-        .unwrap();
-        assert_eq!(result["unlocked"], json!(true));
+        .unwrap_err();
+        assert_eq!(err.0, -32030);
         assert!(
-            result.get("presence_token").is_some(),
-            "vault_unlock on the socket path must mint a replay token"
+            err.1.contains("vault_unlock_begin/vault_unlock_complete"),
+            "guidance should point socket callers at the managed biometric lane"
+        );
+        assert!(store.vault().is_none(), "hard lock must keep the live vault cleared");
+
+        interactive_unlock::reset_for_tests();
+    }
+
+    #[tokio::test]
+    async fn vault_unlock_requested_method_mints_method_scoped_presence_token() {
+        let _guard = crate::PROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        interactive_unlock::reset_for_tests();
+        crate::trust::presence::reset_for_tests();
+        ensure_test_presence_identity();
+        // SAFETY: serialized by PROCESS_TEST_LOCK for this test binary.
+        unsafe { std::env::set_var("EMBER_VAULT_TEST_KEYRING_PRESENT", "1") };
+
+        let config_root = tempfile::TempDir::new().unwrap();
+        let config = crate::infra::config::DaemonConfig::for_test(config_root.path());
+        let runtime_vault = std::rc::Rc::new(
+            crate::infra::vault::Vault::open_from_config(&config)
+                .expect("initial runtime vault open from config"),
         );
 
+        let store = DaemonStore::open_in_memory_without_vault().unwrap();
+        store.set_vault(std::rc::Rc::clone(&runtime_vault));
+        let store = std::rc::Rc::new(store);
+        crate::trust::presence::register_store(std::rc::Rc::clone(&store));
+        interactive_unlock::register_config(config);
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        dispatch_method(
+            store.as_ref(),
+            runtime_vault.as_ref(),
+            &policy,
+            &rl,
+            "vault_lock",
+            &json!(null),
+        )
+        .await
+        .unwrap();
+
+        let socket_ctx = RequestContext {
+            source: DispatchSource::Socket,
+            peer: Some(PeerCred {
+                uid: 501,
+                pid: Some(1234),
+            }),
+            principal: None,
+            sessions_dir: None,
+            llm_proxy_url: None,
+            git_proxy_url: None,
+            peer_cred_principal: None,
+            mtls_principal: None,
+            presence_token: None,
+            bypass_binary_pin_gate_for_test: false,
+        };
+        let unlock = dispatch_method_with_context(
+            store.as_ref(),
+            runtime_vault.as_ref(),
+            &policy,
+            &rl,
+            None,
+            socket_ctx.clone(),
+            "vault_unlock",
+            &json!({"requested_method": "create_persona"}),
+        )
+        .await
+        .unwrap();
+        let presence_token: crate::auth::presence_token::PresenceToken =
+            serde_json::from_value(unlock["presence_token"].clone())
+                .expect("decode presence token");
+
+        let mut create_ctx = socket_ctx;
+        create_ctx.presence_token = Some(presence_token);
+        let created = dispatch_method_with_context(
+            store.as_ref(),
+            runtime_vault.as_ref(),
+            &policy,
+            &rl,
+            None,
+            create_ctx,
+            "create_persona",
+            &json!({"name": "requested-method-unlock"}),
+        )
+        .await
+        .expect("requested-method vault unlock must authorize create_persona");
+        assert_eq!(created["name"], json!("requested-method-unlock"));
+
+        interactive_unlock::reset_for_tests();
+    }
+
+    #[tokio::test]
+    async fn vault_unlock_reuses_bootstrap_env_passphrase_after_startup_lock() {
+        let _guard = crate::PROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        interactive_unlock::reset_for_tests();
+        crate::trust::presence::reset_for_tests();
+        crate::infra::vault::clear_runtime_reopen_passphrase_cache();
+        ensure_test_presence_identity();
+        // SAFETY: serialized by PROCESS_TEST_LOCK for this test binary.
+        unsafe { std::env::set_var("EMBER_VAULT_PASSPHRASE", "bootstrap-reopen-passphrase") };
+
+        let config_root = tempfile::TempDir::new().unwrap();
+        let config = crate::infra::config::DaemonConfig::for_test(config_root.path());
+        let runtime_vault =
+            match crate::infra::vault::try_bootstrap_auto_unseal_from_keyring(&config) {
+                crate::infra::vault::AutoUnsealOutcome::Unsealed(vault) => std::rc::Rc::new(vault),
+                crate::infra::vault::AutoUnsealOutcome::NoKeyringEntry => {
+                    panic!(
+                        "bootstrap auto-unseal should use env passphrase, not miss the key source"
+                    )
+                }
+                crate::infra::vault::AutoUnsealOutcome::Error(err) => {
+                    panic!("bootstrap auto-unseal should use env passphrase: {err}")
+                }
+            };
+        assert!(
+            std::env::var("EMBER_VAULT_PASSPHRASE").is_err(),
+            "bootstrap auto-unseal must consume the env passphrase"
+        );
+
+        let store = DaemonStore::open_in_memory_without_vault().unwrap();
+        store.set_vault(std::rc::Rc::clone(&runtime_vault));
+        let store = std::rc::Rc::new(store);
+        crate::trust::presence::register_store(std::rc::Rc::clone(&store));
+        interactive_unlock::register_config(config);
+        crate::trust::presence::startup_lock();
+        assert!(
+            store.vault().is_none(),
+            "startup lock must clear the live vault before the reopen probe"
+        );
+
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+        let socket_ctx = RequestContext {
+            source: DispatchSource::Socket,
+            peer: Some(PeerCred {
+                uid: 501,
+                pid: Some(1234),
+            }),
+            principal: None,
+            sessions_dir: None,
+            llm_proxy_url: None,
+            git_proxy_url: None,
+            peer_cred_principal: None,
+            mtls_principal: None,
+            presence_token: None,
+            bypass_binary_pin_gate_for_test: false,
+        };
+        let unlock = dispatch_method_with_context(
+            store.as_ref(),
+            runtime_vault.as_ref(),
+            &policy,
+            &rl,
+            None,
+            socket_ctx.clone(),
+            "vault_unlock",
+            &json!({"requested_method": "create_persona"}),
+        )
+        .await
+        .expect("startup env bootstrap should support same-daemon vault_unlock reopen");
+        let presence_token: crate::auth::presence_token::PresenceToken =
+            serde_json::from_value(unlock["presence_token"].clone())
+                .expect("decode presence token");
+
+        let mut create_ctx = socket_ctx;
+        create_ctx.presence_token = Some(presence_token);
+        let created = dispatch_method_with_context(
+            store.as_ref(),
+            runtime_vault.as_ref(),
+            &policy,
+            &rl,
+            None,
+            create_ctx,
+            "create_persona",
+            &json!({"name": "bootstrap-env-reopen"}),
+        )
+        .await
+        .expect("requested-method unlock after startup lock must authorize create_persona");
+        assert_eq!(created["name"], json!("bootstrap-env-reopen"));
+
+        crate::infra::vault::clear_runtime_reopen_passphrase_cache();
         interactive_unlock::reset_for_tests();
     }
 
@@ -14066,11 +14275,93 @@ mod tests {
             .await
             .unwrap();
         // Shape contract: dashboard relies on these field names.
+        assert!(result["posture"].is_string());
         assert!(result["unlocked"].is_boolean());
         assert!(result["idle_timeout_secs"].is_u64());
+        assert!(result["live_vault_attached"].is_boolean());
+        assert!(result["session_pin_count"].is_u64());
+        assert!(result["grace_window_secs"].is_u64());
+        assert!(result["grace_remaining_secs"].is_u64());
+        assert!(result["grace_lock_pending"].is_boolean());
+        assert!(result["grace_zero_due"].is_boolean());
         // quiet_hours_* may be null, which is .is_null() (or .is_number() if set).
         assert!(result.get("quiet_hours_start").is_some());
         assert!(result.get("quiet_hours_end").is_some());
+    }
+
+    #[tokio::test]
+    async fn vault_status_distinguishes_presence_locked_from_hard_lock() {
+        let _presence_test_guard = crate::trust::presence::test_state_guard();
+        crate::trust::presence::reset_for_tests();
+        crate::infra::interactive_unlock::reset_for_tests();
+
+        let store = DaemonStore::open_in_memory().unwrap();
+        let runtime_vault = std::rc::Rc::new(test_vault());
+        store.set_vault(std::rc::Rc::clone(&runtime_vault));
+        crate::infra::interactive_unlock::register_vault_slot(store.vault_slot());
+        crate::trust::presence::lock();
+        store.set_vault(std::rc::Rc::clone(&runtime_vault));
+        crate::infra::interactive_unlock::acquire_session_pin("sess-soft");
+
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+        let result = dispatch_method(
+            &store,
+            runtime_vault.as_ref(),
+            &policy,
+            &rl,
+            "vault_status",
+            &json!(null),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["unlocked"], json!(false));
+        assert_eq!(result["live_vault_attached"], json!(true));
+        assert_eq!(result["session_pin_count"], json!(1));
+        assert_eq!(result["grace_remaining_secs"], json!(0));
+        assert_eq!(result["posture"], json!("presence-locked-vault-pinned"));
+    }
+
+    #[tokio::test]
+    async fn vault_lock_status_round_trip_reports_hard_lock() {
+        let _presence_test_guard = crate::trust::presence::test_state_guard();
+        crate::trust::presence::reset_for_tests();
+        crate::infra::interactive_unlock::reset_for_tests();
+
+        let store = DaemonStore::open_in_memory().unwrap();
+        let runtime_vault = std::rc::Rc::new(test_vault());
+        store.set_vault(std::rc::Rc::clone(&runtime_vault));
+        crate::infra::interactive_unlock::register_vault_slot(store.vault_slot());
+        crate::trust::presence::mark_unlocked();
+
+        let policy = test_policy();
+        let rl = test_rate_limiter();
+
+        dispatch_method(
+            &store,
+            runtime_vault.as_ref(),
+            &policy,
+            &rl,
+            "vault_lock",
+            &json!(null),
+        )
+        .await
+        .unwrap();
+
+        let result = dispatch_method(
+            &store,
+            runtime_vault.as_ref(),
+            &policy,
+            &rl,
+            "vault_status",
+            &json!(null),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["unlocked"], json!(false));
+        assert_eq!(result["live_vault_attached"], json!(false));
+        assert_eq!(result["session_pin_count"], json!(0));
+        assert_eq!(result["posture"], json!("hard-locked"));
     }
 
     #[tokio::test]
@@ -16986,7 +17277,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_session_reopens_live_vault_after_explicit_lock() {
+    async fn register_session_fails_closed_after_explicit_lock() {
         let _guard = crate::PROCESS_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -17063,7 +17354,7 @@ mod tests {
         let mut ctx = RequestContext::internal("test harness");
         ctx.sessions_dir = Some(sessions_root.path().to_path_buf());
 
-        let reg = dispatch_method_with_context(
+        let err = dispatch_method_with_context(
             store.as_ref(),
             runtime_vault.as_ref(),
             &policy,
@@ -17077,31 +17368,24 @@ mod tests {
             }),
         )
         .await
-        .unwrap();
+        .unwrap_err();
 
+        assert_eq!(err.0, -32030);
         assert!(
-            reg["session_id"].as_str().is_some(),
-            "register_session must succeed after reopening the live vault"
+            err.1
+                .contains("same-daemon operator-uid reopen is disabled to avoid legacy login-keychain prompts"),
+            "register_session must fail closed instead of reopening the locked daemon"
         );
         assert!(
-            store.vault().is_some(),
-            "register_session must repopulate the shared live-vault slot"
+            err.1.contains("EMBER_VAULT_PASSPHRASE"),
+            "guidance should name the fresh bootstrap/dev probe lane"
         );
+        assert!(store.vault().is_none(), "hard lock must keep the live vault cleared");
         assert_eq!(
             interactive_unlock::pin_count(),
-            1,
-            "reopened register_session must also acquire the interactive pin"
+            0,
+            "failed register_session must not acquire a session pin"
         );
-        let reopened_value = store
-            .vault()
-            .unwrap()
-            .get(
-                crate::infra::vault::VaultScope::Interactive,
-                store.as_ref(),
-                "reopen-proof/key",
-            )
-            .expect("reopened vault must decrypt pre-lock ciphertext");
-        assert_eq!(reopened_value, b"secret-after-lock");
 
         interactive_unlock::reset_for_tests();
         crate::trust::presence::reset_for_tests();

@@ -255,8 +255,9 @@ fn headless_guidance_for_rpc(method: &str, code: i32, message: &str) -> Option<S
     {
         return Some(
             "this headless action needs operator presence on the daemon-managed vault lane. \
-             Approve the unlock flow if prompted, or run `ember vault unlock` from an interactive \
-             operator shell and retry."
+             Use the managed separate-uid biometric unlock flow when available, or restart the \
+             daemon with `EMBER_VAULT_PASSPHRASE` for a fresh dev-probe bootstrap; same-daemon \
+             operator-uid reopen is intentionally disabled."
                 .to_string(),
         );
     }
@@ -859,7 +860,8 @@ mod tests {
         )
         .expect("expected guidance");
         assert!(guidance.contains("operator presence"));
-        assert!(guidance.contains("ember vault unlock"));
+        assert!(guidance.contains("managed separate-uid biometric unlock"));
+        assert!(guidance.contains("EMBER_VAULT_PASSPHRASE"));
     }
 
     #[test]
@@ -867,11 +869,12 @@ mod tests {
         let guidance = headless_guidance_for_rpc(
             "headless_status",
             -32030,
-            "headless_status denied: session is locked; reopen with `ember vault unlock`",
+            "headless_status denied: session is locked; same-daemon operator-uid reopen is disabled to avoid legacy login-keychain prompts",
         )
         .expect("expected guidance");
         assert!(guidance.contains("operator presence"));
-        assert!(guidance.contains("ember vault unlock"));
+        assert!(guidance.contains("managed separate-uid biometric unlock"));
+        assert!(guidance.contains("EMBER_VAULT_PASSPHRASE"));
     }
 
     // ─── implementation-note-295 — CLI table tests ─

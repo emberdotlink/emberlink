@@ -1,5 +1,5 @@
 //! emberlink_mcp_mtls_client_handshake — T2 smoke tests for the
-//! implementation-note-537 in-container bridge transport.
+//! implementation-note-536 in-container bridge transport.
 //!
 //! Mirrors the test substrate in `crates/ember-rpc/tests/listener_smoke.rs`:
 //! in-test CA + leaf certs minted via `rcgen`, no PEM fixtures committed

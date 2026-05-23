@@ -42,9 +42,14 @@ use core_crypto::{PublicKey, Signer};
 use core_events::receipt::envelope::{ReceiptEnvelope, ReceiptVersion, TerminationAuthority};
 use core_events::receipt::sign::{SignError, sign_receipt_v2};
 use ed25519_dalek::VerifyingKey;
+use once_cell::sync::Lazy;
 use rusqlite::{OptionalExtension, params};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use tracing::{info, warn};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 /// implementation-note-35 C5 — AAD domain-separator prefix byte. AEAD
 /// associated data for every C5+-sealed credential row is the byte
@@ -78,6 +83,36 @@ use crate::infra::store::{DaemonStore, StoreError};
 pub const DEFAULT_KEYRING_SERVICE: &str = "ember-daemon";
 /// Compile-time default keyring account name.
 pub const DEFAULT_KEYRING_ACCOUNT: &str = "vault";
+
+#[allow(clippy::type_complexity)]
+static RUNTIME_REOPEN_PASSPHRASE_CACHE: Lazy<Mutex<HashMap<PathBuf, Zeroizing<String>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn remember_runtime_reopen_passphrase(data_dir: &Path, passphrase: &str) {
+    let mut cache = RUNTIME_REOPEN_PASSPHRASE_CACHE
+        .lock()
+        .expect("runtime reopen passphrase cache poisoned");
+    cache.insert(
+        data_dir.to_path_buf(),
+        Zeroizing::new(passphrase.to_string()),
+    );
+}
+
+fn runtime_reopen_passphrase(data_dir: &Path) -> Option<String> {
+    let cache = RUNTIME_REOPEN_PASSPHRASE_CACHE
+        .lock()
+        .expect("runtime reopen passphrase cache poisoned");
+    cache.get(data_dir).map(|value| (**value).clone())
+}
+
+#[doc(hidden)]
+#[cfg(test)]
+pub(crate) fn clear_runtime_reopen_passphrase_cache() {
+    let mut cache = RUNTIME_REOPEN_PASSPHRASE_CACHE
+        .lock()
+        .expect("runtime reopen passphrase cache poisoned");
+    cache.clear();
+}
 
 // implementation-note-35 C4 — Argon2id KDF parameter pins. The MEK is
 // derived by `Vault::from_passphrase` via Argon2id; pinning the cost
@@ -897,6 +932,7 @@ fn open_from_config_with_presence(
     check_or_write_vault_params(config)?;
     let service = resolve_keyring_service(&config.keyring);
     let account = resolve_keyring_account(&config.keyring);
+    let env_passphrase_active = std::env::var("EMBER_VAULT_PASSPHRASE").is_ok();
 
     // implementation-note-366 — macOS separate-uid posture (design).
     // The system-uid LaunchDaemon install lane has no login keychain
@@ -932,6 +968,9 @@ fn open_from_config_with_presence(
     }
 
     let passphrase = resolve_passphrase(&service, &account)?;
+    if env_passphrase_active {
+        remember_runtime_reopen_passphrase(&config.data_dir, &passphrase);
+    }
     finish_open(&passphrase, &salt, &config.data_dir, presence)
 }
 
@@ -955,6 +994,7 @@ fn open_with_key_store_and_presence(
             // via `vault_salt(config)`.
             let service = resolve_keyring_service(&config.keyring);
             let account = resolve_keyring_account(&config.keyring);
+            let env_passphrase_active = std::env::var("EMBER_VAULT_PASSPHRASE").is_ok();
 
             if !is_cargo_test_binary() {
                 let home = dirs_next::home_dir().ok_or_else(|| {
@@ -967,6 +1007,9 @@ fn open_with_key_store_and_presence(
             }
 
             let passphrase = resolve_passphrase(&service, &account)?;
+            if env_passphrase_active {
+                remember_runtime_reopen_passphrase(&config.data_dir, &passphrase);
+            }
             finish_open(&passphrase, salt.as_bytes(), &config.data_dir, presence)
         }
         VaultKeyStore::EnvPassphrase => {
@@ -989,6 +1032,7 @@ fn open_with_key_store_and_presence(
                     ));
                 }
             };
+            remember_runtime_reopen_passphrase(&config.data_dir, &passphrase);
             let salt = vault_salt(config)?;
             finish_open(&passphrase, &salt, &config.data_dir, presence)
         }
@@ -1984,6 +2028,7 @@ fn try_auto_unseal_from_keyring_with_presence(
 ) -> AutoUnsealOutcome {
     let service = resolve_keyring_service(&config.keyring);
     let account = resolve_keyring_account(&config.keyring);
+    let env_passphrase_active = std::env::var("EMBER_VAULT_PASSPHRASE").is_ok();
 
     // Production checkpoint — same belt-and-suspenders as `open_from_config`.
     // Skip in cargo-test binaries (the passphrase branch below is also gated
@@ -2019,10 +2064,15 @@ fn try_auto_unseal_from_keyring_with_presence(
     // Resolve the passphrase WITHOUT auto-generating one. Distinguishes
     // "keyring miss" (NoKeyringEntry) from "platform error" (Error).
     match resolve_passphrase_no_provision(&service, &account) {
-        Ok(Some(passphrase)) => match finish_open(&passphrase, &salt, &config.data_dir, presence) {
-            Ok(vault) => AutoUnsealOutcome::Unsealed(vault),
-            Err(e) => AutoUnsealOutcome::Error(e),
-        },
+        Ok(Some(passphrase)) => {
+            if env_passphrase_active {
+                remember_runtime_reopen_passphrase(&config.data_dir, &passphrase);
+            }
+            match finish_open(&passphrase, &salt, &config.data_dir, presence) {
+                Ok(vault) => AutoUnsealOutcome::Unsealed(vault),
+                Err(e) => AutoUnsealOutcome::Error(e),
+            }
+        }
         Ok(None) => AutoUnsealOutcome::NoKeyringEntry,
         Err(e) => AutoUnsealOutcome::Error(e),
     }
@@ -2047,6 +2097,15 @@ pub(crate) fn reopen_from_runtime_config(config: &DaemonConfig) -> Result<Vault,
         && is_separate_uid_posture()
     {
         let passphrase = crate::infra::vault_macos_se::get_mek_passphrase(&config.data_dir)?;
+        return finish_open(
+            &passphrase,
+            &salt,
+            &config.data_dir,
+            PresenceAfterOpen::MarkUnlocked,
+        );
+    }
+
+    if let Some(passphrase) = runtime_reopen_passphrase(&config.data_dir) {
         return finish_open(
             &passphrase,
             &salt,

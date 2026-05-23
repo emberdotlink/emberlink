@@ -142,7 +142,7 @@ impl McpServer {
     }
 
     /// Build a server with a pre-constructed daemon transport. Used by the
-    /// in-container mTLS bridge path (implementation-note-537)
+    /// in-container mTLS bridge path (implementation-note-536)
     /// where the transport is an `Mtls` variant rather than a UDS path.
     /// Same observability semantics as [`Self::with_daemon_socket`].
     pub fn with_daemon_transport(runtime: AgentRuntime, transport: DaemonTransport) -> Self {

@@ -269,6 +269,9 @@ pub struct ExecOutcome {
     /// before exit; callers should map negative codes to `1` per the
     /// existing `run_construct_full` convention.
     pub exit_code: i64,
+    /// Captured stdout tail from the daemon's non-PTY branch. Empty on PTY
+    /// and passthrough paths.
+    pub stdout_tail: String,
     /// Captured stderr tail from the daemon's piped-stderr branch.
     /// Empty on the PTY path. Forwarded to the shim's stderr before
     /// return so daemon-side error messages reach the operator.
@@ -479,6 +482,11 @@ impl BrokerTransport for DaemonRpcTransport {
         });
         let resp = crate::rpc::call_daemon_rpc(&self.socket_path, "broker_exec", &params)?;
         let exit_code = resp.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(0);
+        let stdout_tail = resp
+            .get("stdout_tail")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let stderr_tail = resp
             .get("stderr_tail")
             .and_then(|v| v.as_str())
@@ -486,6 +494,7 @@ impl BrokerTransport for DaemonRpcTransport {
             .to_string();
         Ok(ExecOutcome {
             exit_code,
+            stdout_tail,
             stderr_tail,
         })
     }
@@ -627,6 +636,9 @@ pub fn run_construct_with_transport<C: ClassifyArgv, T: BrokerTransport>(
     // 5. Propagate child exit code. The daemon emits
     //    credential_provisioned only after BOTH phases reach this point
     //    (its `broker_exec` handler holds the resolve→exec transaction).
+    if !outcome.stdout_tail.is_empty() {
+        print!("{}", outcome.stdout_tail);
+    }
     if !outcome.stderr_tail.is_empty() {
         eprint!("{}", outcome.stderr_tail);
     }
@@ -674,7 +686,7 @@ pub fn run_construct_full<C: ConstructConfig>(argv: &[String], config: &C) -> Ex
                     action_key
                 );
                 eprintln!(
-                    "ember-construct: launch the canonical brokered session with `ember claude-code`"
+                    "ember-construct: launch the canonical brokered session with `ember claude`"
                 );
                 eprintln!(
                     "ember-construct: outside a session, only unclassified read-only passthrough verbs are allowed"
@@ -692,7 +704,7 @@ pub fn run_construct_full<C: ConstructConfig>(argv: &[String], config: &C) -> Ex
     }
 
     // v0.3.0 friendly truth gate: a shell that only carries the session id
-    // is not the same thing as the canonical `ember claude-code` launcher
+    // is not the same thing as the canonical `ember claude` launcher
     // posture. The launcher also injects EMBER_GRANT_ID, and construct
     // shims without it fall into a partial host/session shape that produces
     // confusing daemon authority failures. Refuse early and point the
@@ -703,7 +715,7 @@ pub fn run_construct_full<C: ConstructConfig>(argv: &[String], config: &C) -> Ex
             config.session_id_env()
         );
         eprintln!(
-            "ember-construct: for v0.3.0, launch the canonical brokered session with `ember claude-code`"
+            "ember-construct: for v0.3.0, launch the canonical brokered session with `ember claude`"
         );
         eprintln!(
             "ember-construct: host/headless shells are not yet a full substitute for the launcher path"
@@ -868,6 +880,13 @@ pub fn run_construct_full<C: ConstructConfig>(argv: &[String], config: &C) -> Ex
     // 8. Propagate exit code from child.
     match result {
         Ok(resp) => {
+            let stdout_tail = resp
+                .get("stdout_tail")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !stdout_tail.is_empty() {
+                print!("{stdout_tail}");
+            }
             let stderr_tail = resp
                 .get("stderr_tail")
                 .and_then(|v| v.as_str())
@@ -1007,6 +1026,7 @@ mod tests {
                 })),
                 exec_outcome: std::sync::Mutex::new(ExecOutcomeMock::Ok(ExecOutcome {
                     exit_code: 0,
+                    stdout_tail: String::new(),
                     stderr_tail: String::new(),
                 })),
                 recorded: std::sync::Mutex::new(Vec::new()),

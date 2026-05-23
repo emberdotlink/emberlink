@@ -412,7 +412,7 @@ fn find_se_key_by_label_with_reason(
         }
     }
     Err(format!(
-        "no SE key found for label '{label}' — run `ember daemon install` to provision"
+        "no SE key found for label '{label}' — run `sudo ember daemon install` to provision"
     ))
 }
 

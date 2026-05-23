@@ -1,4 +1,4 @@
-//! Subprocess launchers for friendly-dev integrations (`ember claude-code`,
+//! Subprocess launchers for friendly-dev integrations (`ember claude`,
 //! `ember codex`).
 //!
 //! Per design §2 / implementation-note-499: thin wrappers that register a session with
@@ -10,10 +10,12 @@
 
 pub mod banner;
 pub mod claude_code;
+pub mod core;
 pub mod codex;
 pub mod harness;
 pub mod path_shadow;
 pub mod presence;
+pub mod session_rpc;
 pub mod session_prefs;
 pub mod worktree;
 

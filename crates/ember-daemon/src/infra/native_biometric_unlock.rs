@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use core_crypto::presence::{
+    DaemonSignedHandle, PresenceProofRequest, bind_presence_challenge, verify_presence_handle,
+};
 use once_cell::sync::Lazy;
 use p256::ecdsa::{Signature, VerifyingKey, signature::hazmat::PrehashVerifier};
 use serde::Serialize;
@@ -19,6 +22,10 @@ pub struct UnlockBeginResponse {
     pub challenge_hex: String,
     pub expires_at_unix_ms: u64,
     pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_request: Option<PresenceProofRequest>,
 }
 
 #[derive(Debug, Clone)]
@@ -26,6 +33,8 @@ struct PendingRequest {
     challenge: [u8; 32],
     expires_at_unix_ms: u64,
     presence_scope_key: String,
+    expected_presence_challenge: [u8; 32],
+    expected_presence_persona: String,
 }
 
 #[derive(Debug, Clone)]
@@ -36,10 +45,29 @@ pub struct CompletedUnlock {
 static PENDING_REQUESTS: Lazy<Mutex<HashMap<String, PendingRequest>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
+const LOCAL_UNLOCK_SPIFFE_URI: &str = "spiffe://emberd/operator/local-cli";
+const LOCAL_UNLOCK_PERSONA_ID: &str = "operator-local";
+
 pub fn begin(
     data_dir: &Path,
     reason: &str,
     presence_scope_key: &str,
+) -> Result<UnlockBeginResponse, String> {
+    begin_with_presence_proof(
+        data_dir,
+        reason,
+        "vault_unlock",
+        presence_scope_key,
+        None,
+    )
+}
+
+pub fn begin_with_presence_proof(
+    data_dir: &Path,
+    reason: &str,
+    target_method: &str,
+    presence_scope_key: &str,
+    prompt_url: Option<String>,
 ) -> Result<UnlockBeginResponse, String> {
     let request_id = Uuid::new_v4().to_string();
     let mut nonce = [0u8; 16];
@@ -51,6 +79,27 @@ pub fn begin(
     hasher.update(nonce);
     let challenge: [u8; 32] = hasher.finalize().into();
     let expires_at_unix_ms = now_unix_ms() + REQUEST_TTL.as_millis() as u64;
+    let prompt_url = prompt_url.map(|base| {
+        let trimmed = base.trim_end_matches('/');
+        format!("{trimmed}/{}", request_id)
+    });
+    let presence_request = PresenceProofRequest {
+        workflow_id: request_id.clone(),
+        action_key: target_method.to_string(),
+        spiffe_uri: LOCAL_UNLOCK_SPIFFE_URI.to_string(),
+        nonce_hex: hex::encode(nonce),
+        persona_id: LOCAL_UNLOCK_PERSONA_ID.to_string(),
+        prompt_id: Some(request_id.clone()),
+        reason: Some(reason.to_string()),
+        caller_persona: None,
+        ttl_ms: None,
+    };
+    let expected_presence_challenge = bind_presence_challenge(
+        &presence_request.workflow_id,
+        &presence_request.action_key,
+        &presence_request.spiffe_uri,
+        &nonce,
+    );
 
     prune_expired_requests(now_unix_ms());
     PENDING_REQUESTS
@@ -62,6 +111,8 @@ pub fn begin(
                 challenge,
                 expires_at_unix_ms,
                 presence_scope_key: presence_scope_key.to_string(),
+                expected_presence_challenge,
+                expected_presence_persona: LOCAL_UNLOCK_PERSONA_ID.to_string(),
             },
         );
 
@@ -72,6 +123,8 @@ pub fn begin(
         challenge_hex: hex::encode(challenge),
         expires_at_unix_ms,
         reason: reason.to_string(),
+        prompt_url,
+        presence_request: Some(presence_request),
     })
 }
 
@@ -112,6 +165,33 @@ pub fn complete(
 
     if stored_pubkey.is_none() {
         store_trusted_pubkey(data_dir, public_key_hex)?;
+    }
+    Ok(CompletedUnlock {
+        presence_scope_key: pending.presence_scope_key,
+    })
+}
+
+pub fn complete_with_daemon_handle(
+    request_id: &str,
+    handle: &DaemonSignedHandle,
+    verifying_key: &ed25519_dalek::VerifyingKey,
+    now_unix_ms: u64,
+) -> Result<CompletedUnlock, String> {
+    let pending = take_pending_request(request_id)?
+        .ok_or_else(|| "native biometric unlock request missing or already consumed".to_string())?;
+    if pending.expires_at_unix_ms < now_unix_ms {
+        return Err("native biometric unlock request expired".to_string());
+    }
+    verify_presence_handle(handle, verifying_key, now_unix_ms)
+        .map_err(|e| format!("presence proof handle verify failed: {e}"))?;
+    if handle.persona_id != pending.expected_presence_persona {
+        return Err(format!(
+            "presence proof persona mismatch; expected {} got {}",
+            pending.expected_presence_persona, handle.persona_id
+        ));
+    }
+    if handle.challenge_hash != pending.expected_presence_challenge {
+        return Err("presence proof challenge mismatch for pending unlock request".to_string());
     }
     Ok(CompletedUnlock {
         presence_scope_key: pending.presence_scope_key,
@@ -290,5 +370,77 @@ mod tests {
 
         let completed = complete(dir.path(), &begin.request_id, &pubkey, &signature).unwrap();
         assert_eq!(completed.presence_scope_key, "class:session-runtime");
+    }
+
+    #[test]
+    fn begin_with_presence_proof_embeds_presence_request_and_prompt_url() {
+        clear_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let begin = begin_with_presence_proof(
+            dir.path(),
+            "Unlock your Ember vault.",
+            "vault_unlock",
+            "class:vault",
+            Some("http://localhost:3141/prompts".to_string()),
+        )
+        .unwrap();
+        let request = begin
+            .presence_request
+            .expect("presence request included in begin response");
+        assert_eq!(request.workflow_id, begin.request_id);
+        assert_eq!(request.action_key, "vault_unlock");
+        assert_eq!(request.persona_id, LOCAL_UNLOCK_PERSONA_ID);
+        assert_eq!(
+            request.prompt_id.as_deref(),
+            Some(begin.request_id.as_str())
+        );
+        assert_eq!(request.reason.as_deref(), Some("Unlock your Ember vault."));
+        let expected_prompt_url = format!("http://localhost:3141/prompts/{}", begin.request_id);
+        assert_eq!(
+            begin.prompt_url.as_deref(),
+            Some(expected_prompt_url.as_str())
+        );
+    }
+
+    #[test]
+    fn complete_with_daemon_handle_round_trips() {
+        clear_for_tests();
+        let dir = tempfile::tempdir().unwrap();
+        let begin = begin_with_presence_proof(
+            dir.path(),
+            "Unlock your Ember vault.",
+            "vault_unlock",
+            "class:vault",
+            None,
+        )
+        .unwrap();
+        let request = begin
+            .presence_request
+            .clone()
+            .expect("presence request included in begin response");
+        let nonce = hex::decode(&request.nonce_hex).expect("presence nonce hex");
+        let challenge_hash = bind_presence_challenge(
+            &request.workflow_id,
+            &request.action_key,
+            &request.spiffe_uri,
+            &nonce,
+        );
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x33u8; 32]);
+        let issued_at = now_unix_ms();
+        let handle = core_crypto::presence::sign_presence_handle(
+            challenge_hash,
+            &request.persona_id,
+            issued_at,
+            30_000,
+            &signing_key,
+        );
+        let completed = complete_with_daemon_handle(
+            &begin.request_id,
+            &handle,
+            &signing_key.verifying_key(),
+            issued_at,
+        )
+        .expect("daemon signed handle should satisfy pending unlock request");
+        assert_eq!(completed.presence_scope_key, "class:vault");
     }
 }

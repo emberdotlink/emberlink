@@ -1454,6 +1454,49 @@ function _rollupOutcomeStyle(outcome){
   if(outcome==='in_flight')return'color:var(--accent)';
   return'color:var(--text-muted)';
 }
+function _claimSummary(r){
+  const total=r.claim_count_total;
+  const segments=r.claim_segment_count;
+  if(total==null&&segments==null)return'';
+  const totalText=total==null?'':`${total} claim${total===1?'':'s'}`;
+  const segText=segments==null?'':`${segments} segment${segments===1?'':'s'}`;
+  const joined=[totalText,segText].filter(Boolean).join(' across ');
+  return r.claim_events_truncated?`${joined} (truncated tail)`:joined;
+}
+function _receiptReasonLabel(v){
+  const raw=String(v==null?'':v).trim();
+  if(!raw)return'—';
+  const cleaned=raw
+    .replace(/^\w+\s*/,'')
+    .replace(/[{}"]/g,'')
+    .replace(/_/g,' ')
+    .replace(/([a-z])([A-Z])/g,'$1 $2')
+    .trim()
+    .toLowerCase();
+  if(!cleaned)return'—';
+  if(cleaned==='exhausted by budget')return'budget exhausted';
+  if(cleaned==='parent cascade revoked')return'parent revoked';
+  return cleaned;
+}
+function _renderRawReceiptRow(r){
+  const signedHtml=r.signed
+    ?'<span class="signed-yes" title="Ed25519 signed by daemon identity">&#10003;</span>'
+    :'<span class="signed-no" title="No signature (placeholder)">—</span>';
+  const grantLink=`<a href="/grants/${r.grant_id}" class="mono" style="color:var(--accent)">${trunc(r.grant_id,16)}</a>`;
+  const kindBadge=`<span class="badge" style="margin-right:6px;font-size:10px;background:rgba(232,93,38,.12);border:1px solid rgba(232,93,38,.28);color:#ff9468">${safe(r.kind||'receipt')}</span>`;
+  const receiptLink=`<a href="/receipts/${encodeURIComponent(String(r.id||''))}" style="color:var(--text-muted);text-decoration:none">${safe(r.action_summary||'—')}</a>`;
+  const claimSummary=_claimSummary(r);
+  const ts=r.created_at?relTime(r.created_at):(r.created_at_epoch?relTime(new Date(r.created_at_epoch*1000).toISOString()):'—');
+  const reason=_receiptReasonLabel(r.terminal_reason).slice(0,32)||'—';
+  return`<tr>
+    <td class="ts">${ts}</td>
+    <td>${grantLink}</td>
+    <td class="mono">${personaLabel(r.persona_id,r.persona_name)}</td>
+    <td style="color:var(--text-muted);font-size:11px">${kindBadge}${receiptLink}${claimSummary?`<div style="font-size:10px;color:var(--text-dim);margin-top:2px">${safe(claimSummary)}</div>`:''}</td>
+    <td style="color:var(--text-dim);font-size:11px">${reason}</td>
+    <td style="text-align:center">${signedHtml}</td>
+  </tr>`;
+}
 function _toggleRollupDetail(mid){
   const el=document.getElementById('rollup-detail-'+mid);
   if(!el)return;
@@ -1498,6 +1541,10 @@ async function loadReceipts(){
         const ts=r.started_at?relTime(r.started_at):'—';
         const persona=r.persona||'—';
         const action=(r.action||'—').slice(0,32);
+        const claimSummary=_claimSummary(r);
+        const actionHtml=claimSummary
+          ?`${action}<div style="color:var(--text-dim);font-size:10px;margin-top:2px">${claimSummary}</div>`
+          :action;
         const outcomeStyle=_rollupOutcomeStyle(r.outcome||'');
         // Inline denial reason — no click-through required for primary scan.
         const outcomeLabel=r.denial_reason
@@ -1505,14 +1552,16 @@ async function loadReceipts(){
           :`<span style="${outcomeStyle}">${r.outcome||'—'}</span>`;
         const count=r.receipt_count||0;
         const subHtml=(r.sub_receipts||[]).map(s=>{
-          return`<span style="display:block;font-size:10px;color:var(--text-muted);padding:1px 0">${s.kind} <span style="color:var(--text-dim)">${(s.ts||'').slice(0,19)}</span> <a href="/receipts/${encodeURIComponent(String(s.receipt_hash||''))}" class="mono" style="font-size:9px;color:var(--text-primary);text-decoration:none">${(s.receipt_hash||'').slice(0,16)}</a></span>`;
+          const subClaimSummary=_claimSummary(s);
+          const subClaimHtml=subClaimSummary?` <span style="color:var(--text-dim)">· ${subClaimSummary}</span>`:'';
+          return`<span style="display:block;font-size:10px;color:var(--text-muted);padding:1px 0">${s.kind}${subClaimHtml} <span style="color:var(--text-dim)">${(s.ts||'').slice(0,19)}</span> <a href="/receipts/${encodeURIComponent(String(s.receipt_hash||''))}" class="mono" style="font-size:9px;color:var(--text-primary);text-decoration:none">${(s.receipt_hash||'').slice(0,16)}</a></span>`;
         }).join('');
         const detailRow=`<tr id="rollup-detail-${mid}" style="display:none"><td colspan="6" style="padding:4px 12px;background:var(--bg-hover)">${subHtml||'<span style="color:var(--text-dim);font-size:11px">no sub-receipts</span>'}</td></tr>`;
         const mainRow=`<tr style="cursor:pointer" onclick="_toggleRollupDetail('${mid}')" title="Click to expand sub-receipt detail">
           <td class="ts">${ts}</td>
           <td class="mono" style="font-size:11px" title="${mid}">${midShort}</td>
           <td class="mono" style="font-size:11px">${persona}</td>
-          <td style="color:var(--text-muted);font-size:11px">${action}</td>
+          <td style="color:var(--text-muted);font-size:11px">${actionHtml}</td>
           <td style="font-size:11px">${outcomeLabel}</td>
           <td style="color:var(--text-dim);font-size:11px;text-align:center">${count}</td>
         </tr>`;
@@ -1521,23 +1570,7 @@ async function loadReceipts(){
     }else{
       // Raw view: original per-receipt list shape.
       const receipts=data;
-      rb.innerHTML=receipts.map(r=>{
-        const signedHtml=r.signed
-          ?'<span class="signed-yes" title="Ed25519 signed by daemon identity">&#10003;</span>'
-          :'<span class="signed-no" title="No signature (placeholder)">—</span>';
-        const grantLink=`<a href="/grants/${r.grant_id}" class="mono" style="color:var(--accent)">${trunc(r.grant_id,16)}</a>`;
-        const receiptLink=`<a href="/receipts/${encodeURIComponent(String(r.id||''))}" style="color:var(--text-muted);text-decoration:none">${safe(r.action_summary||'—')}</a>`;
-        const ts=r.created_at_epoch?relTime(new Date(r.created_at_epoch*1000).toISOString()):'—';
-        const reason=(r.terminal_reason||'').replace(/^\w+\s*/,'').replace(/[{}"]/g,'').slice(0,32)||'—';
-        return`<tr>
-          <td class="ts">${ts}</td>
-          <td>${grantLink}</td>
-          <td class="mono">${personaLabel(r.persona_id,r.persona_name)}</td>
-          <td style="color:var(--text-muted);font-size:11px">${receiptLink}</td>
-          <td style="color:var(--text-dim);font-size:11px">${reason}</td>
-          <td style="text-align:center">${signedHtml}</td>
-        </tr>`;
-      }).join('');
+      rb.innerHTML=receipts.map(_renderRawReceiptRow).join('');
     }
   }catch(err){
     const rb=document.getElementById('receipts-body');
@@ -1568,23 +1601,7 @@ async function searchReceipts(){
       rb.innerHTML='<tr><td colspan="6" class="empty">No receipts match the current filter.</td></tr>';
       return;
     }
-    rb.innerHTML=receipts.map(r=>{
-      const signedHtml=r.signed
-        ?'<span class="signed-yes" title="Ed25519 signed by daemon identity">&#10003;</span>'
-        :'<span class="signed-no" title="No signature (placeholder)">—</span>';
-      const grantLink=`<a href="/grants/${r.grant_id}" class="mono" style="color:var(--accent)">${trunc(r.grant_id,16)}</a>`;
-      const receiptLink=`<a href="/receipts/${encodeURIComponent(String(r.id||''))}" style="color:var(--text-muted);text-decoration:none">${safe(r.action_summary||'—')}</a>`;
-      const ts=r.created_at_epoch?relTime(new Date(r.created_at_epoch*1000).toISOString()):'—';
-      const reason=(r.terminal_reason||'').replace(/^\w+\s*/,'').replace(/[{}"]/g,'').slice(0,32)||'—';
-      return `<tr>
-        <td class="ts">${ts}</td>
-        <td>${grantLink}</td>
-        <td class="mono">${personaLabel(r.persona_id,r.persona_name)}</td>
-        <td style="color:var(--text-muted);font-size:11px">${receiptLink}</td>
-        <td style="color:var(--text-dim);font-size:11px">${reason}</td>
-        <td style="text-align:center">${signedHtml}</td>
-      </tr>`;
-    }).join('');
+    rb.innerHTML=receipts.map(_renderRawReceiptRow).join('');
   }catch(err){
     const rb=document.getElementById('receipts-body');
     if(rb)rb.innerHTML='<tr><td colspan="6" class="empty">error searching receipts</td></tr>';
@@ -2478,7 +2495,7 @@ pub async fn handle_dashboard_request(
                 .unwrap_or((None, None, None, None));
 
             let filter = ReceiptFilter {
-                persona_id: persona.clone(),
+                persona_id: persona,
                 signed_only: false,
                 since_iso: None,
                 limit: Some(100),
@@ -4234,6 +4251,34 @@ fn build_signed_receipt_v2_html(
     envelope: &core_events::receipt::ReceiptEnvelope,
     grant_id_hint: Option<&str>,
 ) -> String {
+    fn normalize_terminal_reason_label(raw: &str) -> String {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return "-".to_string();
+        }
+        let cleaned = trimmed
+            .replace('_', " ")
+            .chars()
+            .enumerate()
+            .flat_map(|(idx, ch)| {
+                if idx > 0 && ch.is_uppercase() {
+                    vec![' ', ch]
+                } else {
+                    vec![ch]
+                }
+            })
+            .collect::<String>()
+            .split_whitespace()
+            .map(|word| word.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join(" ");
+        match cleaned.as_str() {
+            "exhausted by budget" => "budget exhausted".to_string(),
+            "parent cascade revoked" => "parent revoked".to_string(),
+            _ => cleaned,
+        }
+    }
+
     fn escape_html(s: &str) -> String {
         s.replace('&', "&amp;")
             .replace('<', "&lt;")
@@ -4252,7 +4297,8 @@ fn build_signed_receipt_v2_html(
         .body
         .get("termination_reason")
         .and_then(|v| v.as_str())
-        .unwrap_or("-");
+        .map(normalize_terminal_reason_label)
+        .unwrap_or_else(|| "-".to_string());
     let claim_count_total = envelope
         .body
         .get("claim_count_total")
@@ -4291,7 +4337,7 @@ fn build_signed_receipt_v2_html(
     };
     let kind = escape_html(&envelope.kind);
     let workflow_template = escape_html(workflow_template);
-    let terminal_reason = escape_html(terminal_reason);
+    let terminal_reason = escape_html(&terminal_reason);
     let termination_authority = escape_html(
         &serde_json::to_string(&envelope.termination_authority)
             .unwrap_or_else(|_| "\"unknown\"".to_string()),
@@ -5328,6 +5374,10 @@ struct DashboardRollupRow {
     action: Option<String>,
     exit_code: Option<i32>,
     denied_reason: Option<String>,
+    claim_count_total: Option<u64>,
+    claim_events_truncated: bool,
+    claim_segment_count: Option<u64>,
+    claim_history_merkle_root: Option<String>,
 }
 
 impl core_events::rollup::RollupReceiptView for DashboardRollupRow {
@@ -5398,6 +5448,10 @@ fn receipt_row_to_rollup(r: &crate::infra::receipt::ReceiptRow) -> DashboardRoll
         },
         exit_code: None,
         denied_reason: None,
+        claim_count_total: r.claim_count_total,
+        claim_events_truncated: r.claim_events_truncated,
+        claim_segment_count: r.claim_segment_count,
+        claim_history_merkle_root: r.claim_history_merkle_root.clone(),
     }
 }
 
@@ -5412,9 +5466,57 @@ fn rollup_view(rows: &[crate::infra::receipt::ReceiptRow]) -> serde_json::Value 
     use core_events::rollup::{RollupOutcome, compute_rollups};
 
     let adapted: Vec<DashboardRollupRow> = rows.iter().map(receipt_row_to_rollup).collect();
-    let rollups = compute_rollups(&adapted);
+    let mut session_singletons: Vec<serde_json::Value> = adapted
+        .iter()
+        .filter(|r| r.kind.starts_with("session."))
+        .map(|r| {
+            serde_json::json!({
+                "materialization_id": r.materialization_id,
+                "action": r.action,
+                "persona": r.persona,
+                "started_at": r.ts,
+                "ended_at": r.ts,
+                "outcome": "success",
+                "denial_reason": serde_json::Value::Null,
+                "receipt_count": 1,
+                "claim_count_total": r.claim_count_total,
+                "claim_events_truncated": r.claim_events_truncated,
+                "claim_segment_count": r.claim_segment_count,
+                "claim_history_merkle_root": r.claim_history_merkle_root,
+                "sub_receipts": [{
+                    "kind": r.kind,
+                    "ts": r.ts,
+                    "receipt_hash": r.receipt_hash,
+                    "claim_count_total": r.claim_count_total,
+                    "claim_events_truncated": r.claim_events_truncated,
+                    "claim_segment_count": r.claim_segment_count,
+                    "claim_history_merkle_root": r.claim_history_merkle_root,
+                }],
+            })
+        })
+        .collect();
+    let construct_adapted: Vec<DashboardRollupRow> = adapted
+        .into_iter()
+        .filter(|r| !r.kind.starts_with("session."))
+        .collect();
+    let rollups = compute_rollups(&construct_adapted);
+    let extras_by_hash: std::collections::BTreeMap<String, (Option<u64>, bool, Option<u64>, Option<String>)> =
+        construct_adapted
+            .iter()
+            .map(|r| {
+                (
+                    r.receipt_hash.clone(),
+                    (
+                        r.claim_count_total,
+                        r.claim_events_truncated,
+                        r.claim_segment_count,
+                        r.claim_history_merkle_root.clone(),
+                    ),
+                )
+            })
+            .collect();
 
-    let items: Vec<serde_json::Value> = rollups
+    let mut items: Vec<serde_json::Value> = rollups
         .into_iter()
         .map(|r| {
             let (outcome_str, denial_reason) = match &r.outcome {
@@ -5431,10 +5533,19 @@ fn rollup_view(rows: &[crate::infra::receipt::ReceiptRow]) -> serde_json::Value 
                 .sub_receipts
                 .iter()
                 .map(|s| {
+                    let (claim_count_total, claim_events_truncated, claim_segment_count, claim_history_merkle_root) =
+                        extras_by_hash
+                            .get(&s.receipt_hash)
+                            .cloned()
+                            .unwrap_or((None, false, None, None));
                     serde_json::json!({
                         "kind": s.kind,
                         "ts": s.ts,
                         "receipt_hash": s.receipt_hash,
+                        "claim_count_total": claim_count_total,
+                        "claim_events_truncated": claim_events_truncated,
+                        "claim_segment_count": claim_segment_count,
+                        "claim_history_merkle_root": claim_history_merkle_root,
                     })
                 })
                 .collect();
@@ -5451,6 +5562,12 @@ fn rollup_view(rows: &[crate::infra::receipt::ReceiptRow]) -> serde_json::Value 
             })
         })
         .collect();
+    items.append(&mut session_singletons);
+    items.sort_by(|a, b| {
+        let ak = a.get("started_at").and_then(|v| v.as_str()).unwrap_or("");
+        let bk = b.get("started_at").and_then(|v| v.as_str()).unwrap_or("");
+        bk.cmp(ak)
+    });
 
     serde_json::Value::Array(items)
 }
@@ -5462,6 +5579,55 @@ fn json_response(status: StatusCode, body: &serde_json::Value) -> Response<Full<
         .header("content-type", "application/json")
         .body(Full::new(Bytes::from(bytes)))
         .unwrap()
+}
+
+fn receipt_row_action_summary(r: &crate::infra::receipt::ReceiptRow) -> String {
+    match r.kind.as_str() {
+        "grant" => format!(
+            "{} · {}",
+            r.requested_scope
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("grant"),
+            r.resource.chars().take(40).collect::<String>()
+        ),
+        kind if kind.starts_with("session.") => {
+            let label = r
+                .workflow_template
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(r.resource.as_str());
+            format!("{kind} · {label}")
+        }
+        _ => {
+            if r.resource.is_empty() {
+                r.kind.clone()
+            } else {
+                format!("{} · {}", r.kind, r.resource.chars().take(40).collect::<String>())
+            }
+        }
+    }
+}
+
+fn receipt_row_json(
+    r: &crate::infra::receipt::ReceiptRow,
+    persona_name: Option<String>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": r.id,
+        "kind": r.kind,
+        "grant_id": r.grant_id,
+        "persona_id": r.actor,
+        "persona_name": persona_name,
+        "action_summary": receipt_row_action_summary(r),
+        "terminal_reason": r.terminal_reason,
+        "created_at": r.materialized_at,
+        "signed": r.signed,
+        "claim_count_total": r.claim_count_total,
+        "claim_events_truncated": r.claim_events_truncated,
+        "claim_segment_count": r.claim_segment_count,
+        "claim_history_merkle_root": r.claim_history_merkle_root,
+    })
 }
 
 fn error_response(status: u16, msg: &str) -> Response<Full<Bytes>> {
@@ -7436,6 +7602,18 @@ mod tests {
             s.contains("href=\"/receipts/${encodeURIComponent(String(s.receipt_hash||''))}\""),
             "rollup sub-receipt rows should deep-link hashes to receipt detail pages"
         );
+        assert!(
+            s.contains("function _renderRawReceiptRow(r){"),
+            "raw/search tables should share one receipt row renderer"
+        );
+        assert!(
+            s.contains("function _receiptReasonLabel(v){"),
+            "raw/search tables should normalize terminal reason copy"
+        );
+        assert!(
+            s.contains("const kindBadge=`<span class=\"badge\""),
+            "raw/search tables should surface receipt kind badges"
+        );
     }
 
     #[tokio::test]
@@ -8319,8 +8497,15 @@ mod tests {
             .store
             .create_grant(&persona.id, "anthropic", "chat", None)
             .unwrap();
-        let _receipt_id =
-            store_fixture_session_composite_receipt(&state.store, &grant.id, &persona.id);
+        let _receipt_id = store_fixture_session_composite_receipt(
+            &state.store,
+            &grant.id,
+            &persona.id,
+            "emberd-development",
+            9,
+            true,
+            2,
+        );
 
         let resp = call(state, "/api/receipts/stream").await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -8365,7 +8550,15 @@ mod tests {
             .store
             .create_grant(&persona.id, "anthropic", "chat", None)
             .unwrap();
-        let receipt_id = store_fixture_session_composite_receipt(&state.store, &grant.id, &persona.id);
+        let receipt_id = store_fixture_session_composite_receipt(
+            &state.store,
+            &grant.id,
+            &persona.id,
+            "emberd-development",
+            9,
+            true,
+            2,
+        );
 
         let resp = call(Arc::clone(&state), &format!("/receipts/{receipt_id}")).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -8379,6 +8572,7 @@ mod tests {
         assert!(html.contains("Claim Rollup"), "got:\n{html}");
         assert!(html.contains("Claim count total"), "got:\n{html}");
         assert!(html.contains("emberd-development"), "got:\n{html}");
+        assert!(html.contains("budget exhausted"), "got:\n{html}");
     }
 
     #[tokio::test]
@@ -8390,7 +8584,15 @@ mod tests {
             .store
             .create_grant(&persona.id, "anthropic", "chat", None)
             .unwrap();
-        let _receipt_id = store_fixture_session_composite_receipt(&state.store, &grant.id, &persona.id);
+        let _receipt_id = store_fixture_session_composite_receipt(
+            &state.store,
+            &grant.id,
+            &persona.id,
+            "emberd-development",
+            9,
+            true,
+            2,
+        );
 
         let resp = call(
             Arc::clone(&state),
@@ -9143,12 +9345,29 @@ mod tests {
         store: &crate::infra::store::DaemonStore,
         grant_id: &str,
         persona_id: &str,
+        workflow_template: &str,
+        claim_count_total: u64,
+        claim_events_truncated: bool,
+        claim_segment_count: usize,
     ) -> String {
         use core_events::receipt::body::{ClaimEvent, ClaimKind, ClaimSegmentDigest, ReceiptBody};
-        use core_events::receipt::cohort_a::{ClaudeCodeBody, RECEIPT_KIND_COMPOSITE_GRANT, TerminationReason};
+        use core_events::receipt::cohort_a::{
+            ClaudeCodeBody, RECEIPT_KIND_COMPOSITE_GRANT, TerminationReason,
+        };
         use core_events::receipt::envelope::{ReceiptEnvelope, ReceiptVersion, TerminationAuthority};
 
         let receipt_id = format!("rct-session-{grant_id}");
+        let claim_segments: Vec<ClaimSegmentDigest> = (0..claim_segment_count)
+            .map(|idx| ClaimSegmentDigest {
+                segment_no: idx as u64,
+                first_scope_seq: (idx as u64) + 1,
+                last_scope_seq: (idx as u64) + 1,
+                claim_count: 1,
+                started_at: "2026-05-22T12:00:00Z".to_string(),
+                ended_at: "2026-05-22T12:00:30Z".to_string(),
+                merkle_root: format!("root-{idx}"),
+            })
+            .collect();
         let body = ClaudeCodeBody {
             base: ReceiptBody {
                 claim_events: vec![ClaimEvent {
@@ -9156,33 +9375,14 @@ mod tests {
                     kind: ClaimKind::CredentialVended,
                     tool: "Claude".to_string(),
                     input_hash: "hash-1".to_string(),
-                    input_redacted: serde_json::json!({"prompt":"deploy"}),
-                    resolved: serde_json::json!({"allowed":true}),
+                    input_redacted: serde_json::json!({"prompt": "deploy"}),
+                    resolved: serde_json::json!({"allowed": true}),
                 }],
-                claim_count_total: Some(9),
-                claim_events_truncated: true,
-                claim_segment_summaries: vec![
-                    ClaimSegmentDigest {
-                        segment_no: 0,
-                        first_scope_seq: 1,
-                        last_scope_seq: 4,
-                        claim_count: 4,
-                        started_at: "2026-05-22T12:00:00Z".to_string(),
-                        ended_at: "2026-05-22T12:03:00Z".to_string(),
-                        merkle_root: "root-0".to_string(),
-                    },
-                    ClaimSegmentDigest {
-                        segment_no: 1,
-                        first_scope_seq: 5,
-                        last_scope_seq: 9,
-                        claim_count: 5,
-                        started_at: "2026-05-22T12:03:01Z".to_string(),
-                        ended_at: "2026-05-22T12:06:00Z".to_string(),
-                        merkle_root: "root-1".to_string(),
-                    },
-                ],
-                claim_history_merkle_root: "cafebabe".to_string(),
-                workflow_template: Some("emberd-development".to_string()),
+                claim_count_total: Some(claim_count_total),
+                claim_events_truncated,
+                claim_segment_summaries: claim_segments,
+                claim_history_merkle_root: "history-root".to_string(),
+                workflow_template: Some(workflow_template.to_string()),
                 ..Default::default()
             },
             audit_gaps: vec![],
@@ -9286,8 +9486,15 @@ mod tests {
             .store
             .create_grant(&persona.id, "anthropic", "chat", None)
             .unwrap();
-        let _receipt_id =
-            store_fixture_session_composite_receipt(&state.store, &grant.id, &persona.id);
+        let _receipt_id = store_fixture_session_composite_receipt(
+            &state.store,
+            &grant.id,
+            &persona.id,
+            "emberd-development",
+            9,
+            true,
+            2,
+        );
 
         let resp = call(Arc::clone(&state), "/api/receipts?view=raw&signed_only=true").await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -9371,8 +9578,15 @@ mod tests {
             .store
             .create_grant(&persona.id, "anthropic", "chat", None)
             .unwrap();
-        let _receipt_id =
-            store_fixture_session_composite_receipt(&state.store, &grant.id, &persona.id);
+        let _receipt_id = store_fixture_session_composite_receipt(
+            &state.store,
+            &grant.id,
+            &persona.id,
+            "emberd-development",
+            9,
+            true,
+            2,
+        );
 
         let resp = call(
             Arc::clone(&state),
@@ -9495,6 +9709,82 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn api_receipts_raw_surfaces_session_composite_claim_rollup_fields() {
+        ensure_receipt_identity();
+        let state = make_state();
+        let persona = state.store.create_persona("session-composite-ui").unwrap();
+        let grant = state
+            .store
+            .create_grant(&persona.id, "anthropic", "chat", None)
+            .unwrap();
+        store_fixture_session_composite_receipt(
+            &state.store,
+            &grant.id,
+            &persona.id,
+            "emberd-development",
+            9,
+            true,
+            2,
+        );
+
+        let resp = call(Arc::clone(&state), "/api/receipts?view=raw").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["kind"], "session.composite_grant");
+        assert_eq!(arr[0]["claim_count_total"], 9);
+        assert_eq!(arr[0]["claim_events_truncated"], true);
+        assert_eq!(arr[0]["claim_segment_count"], 2);
+        assert_eq!(arr[0]["signed"], true);
+        assert!(
+            arr[0]["action_summary"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("emberd-development")
+        );
+    }
+
+    #[tokio::test]
+    async fn api_receipts_signed_only_keeps_signed_session_composite_receipts() {
+        ensure_receipt_identity();
+        let state = make_state();
+        let persona = state.store.create_persona("session-composite-signed").unwrap();
+        let grant = state
+            .store
+            .create_grant(&persona.id, "anthropic", "chat", None)
+            .unwrap();
+        store_fixture_session_composite_receipt(
+            &state.store,
+            &grant.id,
+            &persona.id,
+            "emberd-development",
+            3,
+            false,
+            1,
+        );
+
+        let resp = call(
+            Arc::clone(&state),
+            "/api/receipts?view=raw&signed_only=true",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let arr = json.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "signed session envelope must survive signed_only filter");
+        assert_eq!(arr[0]["kind"], "session.composite_grant");
+    }
+
     // AP-CONSTRUCT-RECEIPT-ROLLUP-DASHBOARD — T1 unit tests for rollup_view
     // and T2 integration tests for ?view=rollup endpoint.
 
@@ -9524,6 +9814,12 @@ mod tests {
                 terminal_reason: "revoked".to_string(),
                 requested_scope: None,
                 granted_scope: None,
+                signed: true,
+                workflow_template: None,
+                claim_count_total: None,
+                claim_events_truncated: false,
+                claim_segment_count: None,
+                claim_history_merkle_root: None,
             },
             ReceiptRow {
                 id: "rct-2".to_string(),
@@ -9535,6 +9831,12 @@ mod tests {
                 terminal_reason: "expired".to_string(),
                 requested_scope: None,
                 granted_scope: None,
+                signed: true,
+                workflow_template: None,
+                claim_count_total: None,
+                claim_events_truncated: false,
+                claim_segment_count: None,
+                claim_history_merkle_root: None,
             },
         ];
         let val = rollup_view(&rows);
@@ -9562,6 +9864,12 @@ mod tests {
             terminal_reason: "rate_limited".to_string(),
             requested_scope: None,
             granted_scope: None,
+            signed: true,
+            workflow_template: None,
+            claim_count_total: None,
+            claim_events_truncated: false,
+            claim_segment_count: None,
+            claim_history_merkle_root: None,
         }];
         let val = rollup_view(&rows);
         let arr = val.as_array().unwrap();
@@ -9575,6 +9883,36 @@ mod tests {
             arr[0]["sub_receipts"].is_array(),
             "sub_receipts field must be present"
         );
+    }
+
+    #[test]
+    fn rollup_view_surfaces_singleton_session_receipt_claim_summary() {
+        use crate::infra::receipt::ReceiptRow;
+        let rows = vec![ReceiptRow {
+            id: "rct-session".to_string(),
+            kind: "session.composite_grant".to_string(),
+            actor: "persona-session".to_string(),
+            resource: "emberd-development".to_string(),
+            grant_id: "grant-session".to_string(),
+            materialized_at: "2026-05-22T12:00:00Z".to_string(),
+            terminal_reason: "exhausted_by_budget".to_string(),
+            requested_scope: None,
+            granted_scope: None,
+            signed: true,
+            workflow_template: Some("emberd-development".to_string()),
+            claim_count_total: Some(9),
+            claim_events_truncated: true,
+            claim_segment_count: Some(2),
+            claim_history_merkle_root: Some("history-root".to_string()),
+        }];
+        let val = rollup_view(&rows);
+        let arr = val.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["outcome"], "success");
+        assert_eq!(arr[0]["claim_count_total"], 9);
+        assert_eq!(arr[0]["claim_events_truncated"], true);
+        assert_eq!(arr[0]["claim_segment_count"], 2);
+        assert_eq!(arr[0]["sub_receipts"][0]["claim_count_total"], 9);
     }
 
     #[tokio::test]

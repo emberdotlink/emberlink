@@ -77,7 +77,7 @@ pub fn get_mek_passphrase(_data_dir: &Path) -> Result<Zeroizing<String>, VaultEr
             VaultError::Io(format!(
                 "MEK keychain item not found or not accessible \
                  (service={VAULT_MEK_SERVICE} account={VAULT_MEK_ACCOUNT}): \
-                 {e} — run `ember daemon install` to provision"
+                 {e} — run `sudo ember daemon install` to provision"
             ))
         })?;
 
@@ -110,13 +110,13 @@ mod tests {
     }
 
     /// T1 — missing keychain item produces an `Io` error pointing at
-    /// `ember daemon install`. This is the operator-facing "you forgot
+    /// `sudo ember daemon install`. This is the operator-facing "you forgot
     /// to install" diagnostic; the error text is part of the UX contract.
     ///
     /// `#[ignore]` because the test reads a process-global hardcoded
     /// service/account (`sh.emberlink.daemon` / `vault-mek`) from the
     /// real System.keychain and expects ABSENCE. On any host that has
-    /// run `ember daemon install` (i.e. the operator's dev host running
+    /// run `sudo ember daemon install` (i.e. the operator's dev host running
     /// the production daemon) the item is present and the test fails —
     /// even when invoked through `cargo-env.sh --keyring-service
     /// ember-daemon-qa --keyring-account qa`, because `get_mek_passphrase`

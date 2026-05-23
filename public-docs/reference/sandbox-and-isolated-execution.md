@@ -19,7 +19,7 @@ Today the truthful sandbox contract is:
 - `sandbox run` is still split at the final interactive handoff
 
 That means the sandbox surface is useful and real, but not as settled as the
-main `ember claude-code` path.
+main `ember claude` path.
 
 ## Commands that are real today
 
@@ -87,4 +87,3 @@ The current public story is narrower than that.
 - [CLI reference](./cli-reference/)
 - [Install and first run](../get-started/install-and-first-run/)
 - [Architecture overview](../concepts/architecture/)
-

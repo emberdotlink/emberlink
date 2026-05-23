@@ -13,7 +13,7 @@ The current public truth is:
 2. **MCP second**
 3. **SDKs are experimental**
 
-## Use `ember claude-code` when
+## Use `ember claude` when
 
 Choose the launcher path if you want the most complete current product story.
 
@@ -59,7 +59,7 @@ the launcher or MCP lanes.
 
 | Surface | Current state | Best for |
 |---|---|---|
-| `ember claude-code` | **Supported** | Friendly operators and the main pre-release user story |
+| `ember claude` | **Supported** | Friendly operators and the main pre-release user story |
 | `emberlink-mcp` | **Preview** | Tool/server integration in MCP-capable environments |
 | TypeScript / Python SDKs | **Experimental** | Custom programmatic integration against a moving and not-yet-fully-audited contract |
 
@@ -80,4 +80,3 @@ Pick the surface that matches your environment and your tolerance for churn.
 - [TypeScript SDK](../experimental/sdk-typescript/)
 - [Python SDK](../experimental/sdk-python/)
 - [Install and first run](../get-started/install-and-first-run/)
-

@@ -124,7 +124,7 @@ pub fn unpatch_codex_hooks_file(path: &Path) -> Result<bool, InitError> {
 }
 
 pub fn codex_auth_status_line() -> &'static str {
-    "  Codex:    auth remains managed by Codex itself (`codex login status` / `codex login`)"
+    "  Codex:    auth remains managed by Codex itself (`codex login status` / `codex login` / `codex login --device-auth`)"
 }
 
 pub fn print_next_commands() {
@@ -132,12 +132,16 @@ pub fn print_next_commands() {
     println!("Next steps:");
     println!("  ember codex              # launch Codex with an Ember-managed session");
     println!("  codex login status       # check Codex's own auth state if needed");
+    println!("  codex login --device-auth  # headless host sign-in if browser login is unavailable");
     println!("{CODEX_HOOK_REVIEW_HINT}");
     println!("  ember receipt show       # inspect the signed audit trail");
     println!();
     println!("`ember codex` is the launcher alias over `ember session open codex`.");
     println!(
         "The session + tool path are brokered by Ember; Codex's own OpenAI auth remains on Codex's native login lane."
+    );
+    println!(
+        "If the host is headless or browser sign-in is blocked, use `codex login --device-auth`; isolated `ember codex` reuses the host `~/.codex` auth state."
     );
     println!(
         "On first launch, Codex may require hook review before PreToolUse commands can run; if prompted, open `/hooks` and approve the Ember hook."

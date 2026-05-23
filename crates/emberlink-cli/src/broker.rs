@@ -1150,7 +1150,9 @@ fn broker_guidance_for_rpc(method: &str, code: i32, message: &str) -> Option<Str
             "ember broker list is an advanced operator surface, not part of the \
              friendly `ember init --for claude` path. Use `ember claude` \
              for construct-time brokering. If you intentionally need broker admin \
-             state, approve the unlock flow or run `ember vault unlock` and retry."
+             state, use the managed separate-uid biometric unlock flow when available, \
+             or restart the daemon with `EMBER_VAULT_PASSPHRASE` for a fresh dev-probe \
+             bootstrap."
                 .to_string(),
         );
     }
@@ -1166,8 +1168,9 @@ fn broker_guidance_for_rpc(method: &str, code: i32, message: &str) -> Option<Str
     {
         return Some(
             "this command needs operator presence on the daemon-managed vault lane. \
-             Approve the unlock flow if prompted, or run `ember vault unlock` from \
-             an interactive operator shell and retry."
+             Use the managed separate-uid biometric unlock flow when available, or \
+             restart the daemon with `EMBER_VAULT_PASSPHRASE` for a fresh dev-probe \
+             bootstrap; same-daemon operator-uid reopen is intentionally disabled."
                 .to_string(),
         );
     }
@@ -1366,11 +1369,12 @@ mod tests {
         let guidance = broker_guidance_for_rpc(
             "broker_list",
             -32030,
-            "broker_list denied: session is locked; reopen with `ember vault unlock`",
+            "broker_list denied: session is locked; same-daemon operator-uid reopen is disabled to avoid legacy login-keychain prompts",
         )
         .expect("expected friendly guidance");
         assert!(guidance.contains("advanced operator surface"));
-        assert!(guidance.contains("ember vault unlock"));
+        assert!(guidance.contains("managed separate-uid biometric unlock"));
+        assert!(guidance.contains("EMBER_VAULT_PASSPHRASE"));
     }
 
     #[test]
@@ -1385,7 +1389,8 @@ mod tests {
         let guidance =
             broker_guidance_for_rpc("vault_add", -32001, message).expect("expected vault guidance");
         assert!(guidance.contains("operator presence"));
-        assert!(guidance.contains("ember vault unlock"));
+        assert!(guidance.contains("managed separate-uid biometric unlock"));
+        assert!(guidance.contains("EMBER_VAULT_PASSPHRASE"));
     }
 
     #[test]
@@ -1394,7 +1399,8 @@ mod tests {
         let guidance = broker_guidance_for_rpc("vault_unlock", -32001, message)
             .expect("expected vault guidance");
         assert!(guidance.contains("operator presence"));
-        assert!(guidance.contains("ember vault unlock"));
+        assert!(guidance.contains("managed separate-uid biometric unlock"));
+        assert!(guidance.contains("EMBER_VAULT_PASSPHRASE"));
     }
 
     #[test]
@@ -1402,10 +1408,11 @@ mod tests {
         let guidance = broker_guidance_for_rpc(
             "vault_add",
             -32030,
-            "vault_add denied: session is locked; reopen with `ember vault unlock`",
+            "vault_add denied: session is locked; same-daemon operator-uid reopen is disabled to avoid legacy login-keychain prompts",
         )
         .expect("expected locked-session guidance");
-        assert!(guidance.contains("ember vault unlock"));
+        assert!(guidance.contains("managed separate-uid biometric unlock"));
+        assert!(guidance.contains("EMBER_VAULT_PASSPHRASE"));
     }
 
     #[test]
@@ -1413,10 +1420,11 @@ mod tests {
         let guidance = broker_guidance_for_rpc(
             "vault_remove",
             -32030,
-            "vault_remove denied: session is locked; reopen with `ember vault unlock`",
+            "vault_remove denied: session is locked; same-daemon operator-uid reopen is disabled to avoid legacy login-keychain prompts",
         )
         .expect("expected locked-session guidance");
-        assert!(guidance.contains("ember vault unlock"));
+        assert!(guidance.contains("managed separate-uid biometric unlock"));
+        assert!(guidance.contains("EMBER_VAULT_PASSPHRASE"));
     }
 
     #[test]

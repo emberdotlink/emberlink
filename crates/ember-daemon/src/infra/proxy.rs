@@ -1778,6 +1778,7 @@ pub async fn handle_request<B: PolicyBackend>(
         outgoing_req.headers_mut(),
         &target_host_lower,
         is_git_transport,
+        &credential_name,
         &credential_value,
     ) {
         Ok(scheme) => scheme,
@@ -2714,7 +2715,8 @@ where
 /// vault-resolved credential in the format the upstream provider expects:
 ///
 /// - **Anthropic** (`api.anthropic.com` and any subdomain): `x-api-key`
-///   header. Anthropic rejects `Authorization: Bearer ...` with 401.
+///   header for API-key credentials, or `Authorization: Bearer ...` for
+///   Claude subscription OAuth credentials.
 /// - **Git smart-HTTP**: `Authorization: Basic base64("x-access-token:{token}")`.
 /// - **Anything else**: `Authorization: Bearer {token}`.
 ///
@@ -2731,6 +2733,7 @@ pub(crate) fn inject_provider_auth(
     headers: &mut hyper::HeaderMap,
     target_host_lower: &str,
     is_git_transport: bool,
+    credential_name: &str,
     credential: &str,
 ) -> Result<AuthScheme, ()> {
     let credential = credential.trim_end_matches(['\r', '\n']);
@@ -2743,6 +2746,12 @@ pub(crate) fn inject_provider_auth(
     headers.remove("x-api-key");
 
     if host_matches_domain(target_host_lower, "anthropic.com") {
+        if credential_name == "anthropic/oauth-token" {
+            let bearer = format!("Bearer {}", credential);
+            let bearer_value = hyper::header::HeaderValue::from_str(&bearer).map_err(|_| ())?;
+            headers.insert("authorization", bearer_value);
+            return Ok(AuthScheme::Bearer);
+        }
         let key = hyper::header::HeaderValue::from_str(credential).map_err(|_| ())?;
         headers.insert("x-api-key", key);
         return Ok(AuthScheme::Anthropic);

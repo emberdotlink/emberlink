@@ -14,7 +14,7 @@ emberlink-agent = { path = "../emberlink-agent" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # `rt-multi-thread` + `time` + `net` are required for the in-container
-# mTLS bridge transport (design component 1, implementation-note-537):
+# mTLS bridge transport (design component 1, implementation-note-536):
 # the bridge transport owns its own multi-thread runtime so sync
 # `DaemonClient` callers (which are themselves called from main's
 # current_thread runtime) can block on tokio I/O without nested-runtime

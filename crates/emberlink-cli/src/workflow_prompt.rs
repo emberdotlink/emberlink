@@ -1,14 +1,14 @@
 //!
 //! Workflow template listing + interactive selector (implementation-note-529).
 //!
-//! `ember claude-code` is the canonical launcher (design §Component 6;
-//! design §Component 1). When the operator runs the launcher without a
-//! `--workflow <name>` flag, this module lists every bundled and overlay
-//! workflow template, prints a numbered menu of `name — description (TTL,
-//! scopes summary)`, and reads a stdin selection. The selected
-//! `TemplateMeta` is what the launcher uses to issue a `WorkflowGrant`
-//! (Touch ID + atomic session-open lands in subtask C; this slice is just
-//! the list-and-pick UX).
+//! `ember claude` is the canonical launcher (design §Component 6;
+//! design §Component 1). When the operator runs the launcher without an
+//! explicit workflow-template override, this module lists every bundled and
+//! overlay workflow template, prints a numbered menu of
+//! `name — description (TTL, scopes summary)`, and reads a stdin selection.
+//! The selected `TemplateMeta` is what the launcher uses to issue a
+//! `WorkflowGrant` (Touch ID + atomic session-open lands in subtask C; this
+//! slice is just the list-and-pick UX).
 //!
 //! Templates live in two roots:
 //!
@@ -47,7 +47,7 @@ const SCOPE_PREVIEW_MAX: usize = 5;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TemplateMeta {
     /// Workflow name (matches the `name` key in the TOML). Used as the
-    /// `--workflow <name>` argument and persisted as the workflow grant's
+    /// Explicit workflow-template name and persisted as the workflow grant's
     /// `template_name`.
     pub name: String,
     /// Operator-facing one-liner from the TOML `description` field.

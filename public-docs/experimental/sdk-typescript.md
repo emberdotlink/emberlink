@@ -62,8 +62,8 @@ Current proof bar:
 
 If you want the most stable public path today, prefer:
 
-- `ember init --for claude-code`
-- `ember claude-code`
+- `ember init --for claude`
+- `ember claude`
 - `emberlink-mcp`
 
 If you are deciding whether the SDK is the right fit, start with
@@ -75,4 +75,3 @@ The package-local README remains the detailed source for the package as it
 exists today:
 
 - `packages/agent-sdk-ts/README.md`
-

@@ -62,7 +62,7 @@ launcher and install flow expect.
 
 Examples:
 
-- `ember init --for claude-code` plus `ember claude-code` is the current
+- `ember init --for claude` plus `ember claude` is the current
   managed session path
 - inside that session, the mediated tool lane is what keeps Git/GitHub tool use
   inside the daemon-brokered boundary
@@ -85,4 +85,3 @@ Do not assume:
 - [Choose an integration surface](./choosing-an-integration-surface/)
 - [MCP integration](./mcp-integration/)
 - [Architecture overview](../concepts/architecture/)
-

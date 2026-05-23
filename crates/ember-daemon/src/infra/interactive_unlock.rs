@@ -33,12 +33,21 @@ impl std::fmt::Display for LiveVaultUnavailable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "vault unavailable; explicit lock drops the live vault. Use `ember vault unlock` or open a new session; lazy same-daemon re-auth is not fully wired yet"
+            "live vault is locked; same-daemon operator-uid reopen is disabled to avoid legacy login-keychain prompts. Supported lanes: managed separate-uid biometric unlock (`vault_unlock_begin/vault_unlock_complete`), a fresh daemon bootstrap via `EMBER_VAULT_PASSPHRASE` for dev probes, or future broker-mediated browser auth"
         )
     }
 }
 
 impl std::error::Error for LiveVaultUnavailable {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InteractiveUnlockSnapshot {
+    pub session_pin_count: usize,
+    pub grace_window_secs: u64,
+    pub grace_remaining_secs: u64,
+    pub grace_lock_pending: bool,
+    pub grace_zero_due: bool,
+}
 
 struct InteractiveUnlockManager {
     live_vault_slot: Option<LiveVaultSlot>,
@@ -108,6 +117,12 @@ pub(crate) fn current_live_vault(store: &DaemonStore) -> Result<Rc<Vault>, LiveV
     store.vault().ok_or(LiveVaultUnavailable)
 }
 
+fn same_daemon_reopen_guidance(op: &str) -> String {
+    format!(
+        "{op}: live vault is locked; same-daemon operator-uid reopen is disabled to avoid legacy login-keychain prompts. Supported lanes: managed separate-uid biometric unlock (`vault_unlock_begin/vault_unlock_complete`), a fresh daemon bootstrap via `EMBER_VAULT_PASSPHRASE` for dev probes, or future broker-mediated browser auth"
+    )
+}
+
 fn ensure_vault_reopened(store: &DaemonStore, op: &str) -> Result<Rc<Vault>, String> {
     if let Ok(vault) = current_live_vault(store) {
         return Ok(vault);
@@ -140,11 +155,11 @@ fn ensure_vault_reopened(store: &DaemonStore, op: &str) -> Result<Rc<Vault>, Str
     Ok(vault)
 }
 
-/// Return the current live vault if present, otherwise reopen it through the
-/// registered runtime config. Reserved for the current launcher/session-open
-/// seam after an explicit operator lock.
+/// Return the current live vault for session-open. Same-daemon operator-uid
+/// reopen is intentionally disabled so this seam fails closed instead of
+/// falling back to the legacy login-keychain prompt path.
 pub fn ensure_vault_for_session_open(store: &DaemonStore) -> Result<Rc<Vault>, String> {
-    ensure_vault_reopened(store, "register_session")
+    current_live_vault(store).map_err(|_| same_daemon_reopen_guidance("register_session"))
 }
 
 /// Explicit operator-triggered same-daemon reopen. This is narrower than the
@@ -153,6 +168,14 @@ pub fn ensure_vault_for_session_open(store: &DaemonStore) -> Result<Rc<Vault>, S
 /// before the reopen is attempted.
 pub fn ensure_vault_for_explicit_unlock(store: &DaemonStore) -> Result<Rc<Vault>, String> {
     ensure_vault_reopened(store, "vault_unlock")
+}
+
+/// Legacy operator-uid `vault_unlock` no longer reopens a hard-locked daemon.
+/// Managed separate-uid installs keep using `vault_unlock_begin` /
+/// `vault_unlock_complete`, while dev probes should start a fresh daemon with
+/// an explicit bootstrap source.
+pub fn ensure_live_vault_for_legacy_unlock(store: &DaemonStore) -> Result<Rc<Vault>, String> {
+    current_live_vault(store).map_err(|_| same_daemon_reopen_guidance("vault_unlock"))
 }
 
 /// Start the shared grace window for a non-session explicit unlock.
@@ -184,6 +207,19 @@ pub fn grace_window() -> Duration {
 /// window has elapsed.
 pub fn grace_zero_due() -> bool {
     MANAGER.with(|manager| manager.borrow().pins.should_zero())
+}
+
+pub fn snapshot() -> InteractiveUnlockSnapshot {
+    MANAGER.with(|manager| {
+        let pins = manager.borrow().pins.snapshot();
+        InteractiveUnlockSnapshot {
+            session_pin_count: pins.session_pin_count,
+            grace_window_secs: pins.grace_window_secs,
+            grace_remaining_secs: pins.grace_remaining_secs,
+            grace_lock_pending: pins.grace_lock_pending,
+            grace_zero_due: pins.grace_zero_due,
+        }
+    })
 }
 
 /// Explicit operator lock: clear the shared live vault and forget all active

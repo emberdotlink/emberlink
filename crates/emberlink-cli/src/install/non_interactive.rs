@@ -236,7 +236,15 @@ fn run_steps_with_phase_emission<P: InstallPrimitives>(
         }
     }
     emit_phase("done", PhaseResult::Ok("install complete".to_string()));
+    emit_phase(
+        "launcher-boundary",
+        PhaseResult::Note(launcher_boundary_phase_note().to_string()),
+    );
     Ok(())
+}
+
+fn launcher_boundary_phase_note() -> &'static str {
+    "`sudo ember daemon install` refreshed daemon/runtime sidecars only; reinstall the managed CLI artifact or release package if `/usr/local/bin/ember` must move with them."
 }
 
 /// Phase-line outcome variants. Kept private — callers only see strings via
@@ -505,5 +513,22 @@ mod tests {
         let opts = InstallNonInteractiveOptions::default();
         assert_eq!(opts.posture, Posture::SeparateUid);
         assert!(opts.accept_defaults);
+    }
+
+    #[test]
+    fn launcher_boundary_phase_note_calls_out_managed_cli_artifact() {
+        let note = launcher_boundary_phase_note();
+        assert!(
+            note.contains("daemon/runtime sidecars"),
+            "phase note must name the sidecar-only refresh boundary: {note}"
+        );
+        assert!(
+            note.contains("/usr/local/bin/ember"),
+            "phase note must call out the host launcher path explicitly: {note}"
+        );
+        assert!(
+            note.contains("release package"),
+            "phase note must preserve the managed artifact repair path: {note}"
+        );
     }
 }

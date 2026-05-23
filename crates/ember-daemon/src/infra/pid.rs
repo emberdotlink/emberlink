@@ -3,6 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+#[cfg(target_os = "macos")]
+use std::os::raw::{c_char, c_int};
+
 #[derive(Debug, Error)]
 pub enum PidError {
     #[error("I/O error during {op} {path}: {source}")]
@@ -121,10 +124,26 @@ impl Drop for PidFile {
 /// differed from the daemon uid (e.g. ember). Per session_watcher::pid_alive
 /// which has used this pattern for the heartbeat watcher.
 fn is_process_running(pid: u32) -> bool {
-    daemon_status_pid_liveness_check(pid)
+    process_exists(pid)
 }
 
-fn daemon_status_pid_liveness_check(pid: u32) -> bool {
+/// Cross-platform process existence probe used by daemon status and the
+/// session/launcher liveness watchers.
+///
+/// On macOS separate-uid posture the daemon runs as `ember` under a launchd
+/// sandbox while the launcher runs as the operator uid. In that posture
+/// `kill(pid, 0)` can return `ESRCH` for a live cross-uid process, which
+/// falsely trips the session and launcher orphan logic. Prefer
+/// `proc_pidpath(3)` there because it answers "does this pid still back a
+/// real process image?" without relying on signal permission.
+pub fn process_exists(pid: u32) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        if process_exists_via_proc_pidpath(pid) {
+            return true;
+        }
+    }
+
     // SAFETY: kill(pid, 0) is a read-only syscall — never delivers a signal.
     // The only effect is setting errno, which we inspect to discriminate.
     let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
@@ -136,6 +155,19 @@ fn daemon_status_pid_liveness_check(pid: u32) -> bool {
     // ESRCH — no such process → stale.
     // EPERM (or anything else) — process exists but inaccessible → alive.
     raw != libc::ESRCH
+}
+
+#[cfg(target_os = "macos")]
+fn process_exists_via_proc_pidpath(pid: u32) -> bool {
+    const PROC_PIDPATHINFO_MAXSIZE: usize = 4096;
+
+    unsafe extern "C" {
+        fn proc_pidpath(pid: c_int, buffer: *mut c_char, buffersize: u32) -> c_int;
+    }
+
+    let mut buf = vec![0u8; PROC_PIDPATHINFO_MAXSIZE];
+    let n = unsafe { proc_pidpath(pid as c_int, buf.as_mut_ptr() as *mut c_char, buf.len() as u32) };
+    n > 0
 }
 
 #[cfg(test)]
@@ -160,6 +192,16 @@ mod tests {
         let pf = PidFile::new(path);
         pf.write().unwrap();
         assert!(pf.is_running());
+    }
+
+    #[test]
+    fn process_exists_true_for_current_process() {
+        assert!(process_exists(std::process::id()));
+    }
+
+    #[test]
+    fn process_exists_false_for_unused_high_pid() {
+        assert!(!process_exists(0x7FFF_FFFE));
     }
 
     #[test]

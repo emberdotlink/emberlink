@@ -4,7 +4,7 @@ Summary:
 - Decision status: accepted
 - Authority state: current
 - Implementation status: shipped
-- Last reviewed: 2026-05-20
+- Last reviewed: 2026-05-23
 - Supersedes: docs/getting-started.md
 
 # Quickstart
@@ -38,7 +38,7 @@ cargo install --locked --path crates/emberlink-cli --bin ember
 ## 2. Run the canonical onboarding flow
 
 ```bash
-ember init --for claude-code
+ember init --for claude
 ```
 
 This is the load-bearing first-run path for friendly testers. It is
@@ -52,7 +52,7 @@ Claude runtime auth is conditional, not magic. If `ANTHROPIC_API_KEY` is in
 your environment when you run init, Ember stores it as `anthropic-key` and the
 launcher can reuse a brokered Claude runtime grant. Otherwise Claude's own
 upstream auth stays ambient while Ember still brokers the Git/GitHub/tool lane.
-To switch later, rerun `ember init --for claude-code` with
+To switch later, rerun `ember init --for claude` with
 `ANTHROPIC_API_KEY` exported or run `ember vault add --name anthropic-key`.
 
 ## 3. Confirm the daemon is up
@@ -68,10 +68,10 @@ Use `ember daemon start` only for manual foreground/dev starts.
 ## 4. Launch Claude Code through ember
 
 ```bash
-ember claude-code
+ember claude
 ```
 
-`ember init --for claude-code` creates or reuses the persona/grant surfaces it
+`ember init --for claude` creates or reuses the persona/grant surfaces it
 needs and patches the Claude settings the launcher depends on. If the shadow
 shims are missing, raw `gh` / `git` calls bypass the broker.
 
@@ -106,7 +106,7 @@ The launcher and the MCP server solve different layers: the launcher gives you t
 ## Troubleshooting
 
 - **Daemon install issues:** re-run `sudo ember daemon install`; this is the canonical way to repair install posture drift.
-- **Claude Code integration issues:** re-run `ember init --for claude-code` and confirm `~/.ember/shadow/` contains the expected shims.
+- **Claude Code integration issues:** re-run `ember init --for claude` and confirm `~/.ember/shadow/` contains the expected shims.
 - **Architecture questions:** start with `docs/current-architecture.md`, then use `CONTEXT.md` and the relevant accepted or amended ADRs.
 
 ## Related docs

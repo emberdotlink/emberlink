@@ -10,14 +10,15 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use clap::ValueEnum;
 use crate::launcher::harness::HarnessKind;
+use crate::launcher::session_rpc::{register_session_rpc, with_session_close};
 use crate::launcher::worktree::{
     LiveState, clear_stale_live_lock, ensure_worktree_from_base, git_current_branch,
     live_state_for_path, new_live_metadata, new_session_metadata, resolve_branch_for_launch,
     resolve_repo_root, runtime_id_for_worktree, worktree_path_for_session, write_live_meta,
     write_session_meta,
 };
+use clap::ValueEnum;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OpenSurface {
@@ -335,20 +336,52 @@ fn launch_claude_code_auto(request: &OpenRequest) -> Result<(), Box<dyn std::err
     }
 }
 
-fn launch_claude_code_isolated(
-    request: &OpenRequest,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if !request.extra_args.is_empty() {
-        return Err(
-            "isolated `session open claude` does not forward trailing Claude arguments yet; use the host launcher path for custom Claude args on current main"
-                .into(),
-        );
-    }
-    crate::up::open_claude_code_isolated(
-        request.preset.as_deref(),
-        request.backend_hint.as_deref(),
+fn launch_claude_code_isolated(request: &OpenRequest) -> Result<(), Box<dyn std::error::Error>> {
+    let env =
+        crate::claude_code_launcher::build_launch_env(crate::claude_code_launcher::Flavor::Prod)?;
+    crate::claude_code_launcher::ping_daemon(&env, crate::claude_code_launcher::Flavor::Prod)?;
+    let persona = crate::launcher::claude_code::resolve_persona_name();
+    let workflow_template = crate::launcher::claude_code::resolve_workflow_template_for_launch();
+    let registration = crate::launcher::claude_code::register_session_rpc_with_workflow(
+        &persona,
+        &env.ember_daemon_socket,
+        workflow_template.as_deref(),
+    )
+    .map_err(|e| {
+        let msg = e.to_string();
+        if msg.contains("not found")
+            || msg.contains("no such persona")
+            || msg.contains("unknown persona")
+        {
+            std::io::Error::new(
+                e.kind(),
+                "no cohort-A persona found.\n  Run `ember init --for claude` first, or set $EMBER_PERSONA to an existing persona name.".to_string(),
+            )
+        } else {
+            e
+        }
+    })?;
+    let code = with_session_close(
+        &registration.session_id,
+        &env.ember_daemon_socket,
+        "ember claude",
+        "ember claude --isolated",
+        || {
+            crate::up::launch_harness_isolated(crate::up::IsolatedHarnessLaunch {
+                harness: HarnessKind::Claude,
+                persona: persona.clone(),
+                registration: registration.clone(),
+                extra_args: request.extra_args.clone(),
+                backend_hint: request.backend_hint.clone(),
+                preset: request.preset.clone(),
+                workspace_root: std::env::current_dir()?,
+                shadow_root: env.shadow_root.clone(),
+                codex_runtime_source: None,
+                codex_config_source: None,
+            })
+        },
     )?;
-    Ok(())
+    std::process::exit(code);
 }
 
 fn launch_claude_code_host(
@@ -384,7 +417,9 @@ fn maybe_reexec_via_dev_cli() -> Result<(), Box<dyn std::error::Error>> {
     {
         use std::os::unix::process::CommandExt as _;
 
-        let err = Command::new(&dev_cli).args(std::env::args_os().skip(1)).exec();
+        let err = Command::new(&dev_cli)
+            .args(std::env::args_os().skip(1))
+            .exec();
         return Err(format!("re-exec dev CLI {}: {err}", dev_cli.display()).into());
     }
 
@@ -407,33 +442,113 @@ fn normalize_existing_path(path: &std::path::Path) -> PathBuf {
 
 fn cmd_session_open_codex(request: &OpenRequest) -> Result<(), Box<dyn std::error::Error>> {
     match request.lane {
-        OpenLane::Dev => match request.placement {
-            OpenPlacement::Host => launch_codex_host(request.lane, &request.extra_args),
-            OpenPlacement::Auto => {
-                eprintln!(
-                    "ember session open: isolated dev launch is not wired yet; using the host dev runtime for `codex --dev`"
-                );
-                launch_codex_host(request.lane, &request.extra_args)
+        OpenLane::Dev => {
+            maybe_reexec_via_dev_cli()?;
+            match request.placement {
+                OpenPlacement::Host => launch_codex_host(request.lane, &request.extra_args),
+                OpenPlacement::Auto => {
+                    eprintln!(
+                        "ember session open: isolated dev launch is not wired yet; using the host dev runtime for `codex --dev`"
+                    );
+                    launch_codex_host(request.lane, &request.extra_args)
+                }
+                OpenPlacement::Isolated => Err(
+                    "isolated `session open codex --dev` is not wired yet; the current dev lane remains host/worktree-scoped"
+                        .into(),
+                ),
             }
-            OpenPlacement::Isolated => Err(
-                "isolated `session open codex --dev` is not wired yet; the current dev lane remains host/worktree-scoped"
-                    .into(),
-            ),
-        },
+        }
         OpenLane::Prod => match request.placement {
             OpenPlacement::Host => launch_codex_host(request.lane, &request.extra_args),
-            OpenPlacement::Auto => {
-                eprintln!(
-                    "ember session open: isolated Codex launch is not wired yet; using the host launcher"
-                );
-                launch_codex_host(request.lane, &request.extra_args)
-            }
-            OpenPlacement::Isolated => Err(
-                "isolated `session open codex` is not wired yet on current main; use the host launcher path for now"
-                    .into(),
-            ),
+            OpenPlacement::Auto => launch_codex_auto(request),
+            OpenPlacement::Isolated => launch_codex_isolated(request),
         },
     }
+}
+
+fn launch_codex_auto(request: &OpenRequest) -> Result<(), Box<dyn std::error::Error>> {
+    let current_dir = std::env::current_dir()?;
+    match crate::up::detect_isolated_claude_code_capability(
+        &current_dir,
+        request.backend_hint.as_deref(),
+    )? {
+        crate::up::IsolatedClaudeCodeCapability::Ready { .. } => {
+            match (
+                crate::launcher::codex::require_codex_config_dir_for_isolated(),
+                crate::launcher::codex::resolve_container_codex_runtime_root(),
+            ) {
+                (Err(err), _) => {
+                    eprintln!(
+                        "ember session open: isolated Codex path unavailable ({err}); falling back to the host launcher"
+                    );
+                    launch_codex_host(request.lane, &request.extra_args)
+                }
+                (_, Err(err)) => {
+                    eprintln!(
+                        "ember session open: isolated Codex path unavailable ({err}); falling back to the host launcher"
+                    );
+                    launch_codex_host(request.lane, &request.extra_args)
+                }
+                (Ok(_), Ok(_)) => launch_codex_isolated(request),
+            }
+        }
+        crate::up::IsolatedClaudeCodeCapability::Unavailable { reason } => {
+            eprintln!(
+                "ember session open: isolated Codex path unavailable ({reason}); falling back to the host launcher"
+            );
+            launch_codex_host(request.lane, &request.extra_args)
+        }
+    }
+}
+
+fn launch_codex_isolated(request: &OpenRequest) -> Result<(), Box<dyn std::error::Error>> {
+    let env = crate::codex_launcher::build_launch_env(crate::codex_launcher::Flavor::Prod)?;
+    crate::codex_launcher::ping_daemon(&env, crate::codex_launcher::Flavor::Prod)?;
+    let codex_config_source = crate::launcher::codex::require_codex_config_dir_for_isolated()?;
+    let persona = crate::launcher::codex::resolve_persona_name();
+    let registration = register_session_rpc(
+        &persona,
+        &env.ember_daemon_socket,
+        "ember codex",
+        "ember codex --isolated",
+    )
+    .map_err(|e| {
+        let msg = e.to_string();
+        if msg.contains("not found")
+            || msg.contains("no such persona")
+            || msg.contains("unknown persona")
+        {
+            std::io::Error::new(
+                e.kind(),
+                "no Codex persona found.\n  Run `ember init --for codex` first, or set $EMBER_PERSONA to an existing persona name.".to_string(),
+            )
+        } else {
+            e
+        }
+    })?;
+    let code = with_session_close(
+        &registration.session_id,
+        &env.ember_daemon_socket,
+        "ember codex",
+        "ember codex --isolated",
+        || {
+            crate::up::launch_harness_isolated(crate::up::IsolatedHarnessLaunch {
+                harness: HarnessKind::Codex,
+                persona: persona.clone(),
+                registration: registration.clone(),
+                extra_args: request.extra_args.clone(),
+                backend_hint: request.backend_hint.clone(),
+                preset: request.preset.clone(),
+                workspace_root: std::env::current_dir()?,
+                shadow_root: env.shadow_root.clone(),
+                codex_runtime_source: Some(
+                    crate::launcher::codex::resolve_container_codex_runtime_root()?,
+                ),
+                codex_config_source: Some(codex_config_source.clone()),
+            })
+        },
+    )?;
+    std::process::exit(code);
 }
 
 fn launch_codex_host(
@@ -518,6 +633,92 @@ fn shell_escape(p: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct SessionEnvGuard {
+        home: Option<OsString>,
+        ember_dev_runtime_id: Option<OsString>,
+        ember_dev_worktree_root: Option<OsString>,
+        cwd: PathBuf,
+    }
+
+    impl SessionEnvGuard {
+        fn capture() -> Self {
+            Self {
+                home: std::env::var_os("HOME"),
+                ember_dev_runtime_id: std::env::var_os(crate::dev_runtime::DEV_RUNTIME_ID_ENV),
+                ember_dev_worktree_root: std::env::var_os("EMBER_DEV_WORKTREE_ROOT"),
+                cwd: std::env::current_dir().expect("current dir"),
+            }
+        }
+    }
+
+    impl Drop for SessionEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.home {
+                    Some(value) => std::env::set_var("HOME", value),
+                    None => std::env::remove_var("HOME"),
+                }
+                match &self.ember_dev_runtime_id {
+                    Some(value) => std::env::set_var(crate::dev_runtime::DEV_RUNTIME_ID_ENV, value),
+                    None => std::env::remove_var(crate::dev_runtime::DEV_RUNTIME_ID_ENV),
+                }
+                match &self.ember_dev_worktree_root {
+                    Some(value) => std::env::set_var("EMBER_DEV_WORKTREE_ROOT", value),
+                    None => std::env::remove_var("EMBER_DEV_WORKTREE_ROOT"),
+                }
+            }
+            std::env::set_current_dir(&self.cwd).expect("restore cwd");
+        }
+    }
+
+    fn dev_host_request(surface: OpenSurface) -> OpenRequest {
+        build_open_request(
+            surface,
+            true,
+            true,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+        )
+        .expect("dev host request")
+    }
+
+    fn assert_dev_launch_requires_staged_cli(surface: OpenSurface) {
+        let _guard = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = SessionEnvGuard::capture();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&home).expect("create home");
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        std::fs::write(workspace.join("Cargo.toml"), "[workspace]\n").expect("write Cargo.toml");
+
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::remove_var(crate::dev_runtime::DEV_RUNTIME_ID_ENV);
+            std::env::remove_var("EMBER_DEV_WORKTREE_ROOT");
+        }
+        std::env::set_current_dir(&workspace).expect("set cwd");
+
+        let err = cmd_session_open(&dev_host_request(surface)).expect_err("missing staged dev CLI");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("worktree dev CLI missing"),
+            "dev lane must fail fast on missing staged CLI, got: {msg}"
+        );
+    }
 
     #[test]
     fn build_open_request_defaults_to_prod_and_auto() {
@@ -698,6 +899,16 @@ mod tests {
         std::fs::write(&dev_cli, b"dev").expect("write dev");
 
         assert!(!should_reexec_via_dev_cli(&dev_cli, &dev_cli));
+    }
+
+    #[test]
+    fn claude_dev_launch_requires_staged_cli() {
+        assert_dev_launch_requires_staged_cli(OpenSurface::ClaudeCode);
+    }
+
+    #[test]
+    fn codex_dev_launch_requires_staged_cli() {
+        assert_dev_launch_requires_staged_cli(OpenSurface::Codex);
     }
 
     #[test]

@@ -16,10 +16,11 @@
 //!   a 1s timeout. POLLIN on a pidfd fires once the kernel has reaped the
 //!   bound process, giving us deterministic, reuse-immune exit detection.
 //! - macOS: `kqueue` with `EVFILT_PROC | NOTE_EXIT`. Phase 1 ships this path
-//!   as a polling stub (uses `kill(pid, 0)` at the same cadence) so the
-//!   structured-event surface lives behind the same API while the full kqueue
-//!   integration is deferred to a sibling task. The Linux path is the
-//!   load-bearing implementation for the headless fleet (Linux hosts).
+//!   as a polling stub that uses the shared daemon PID-existence helper at the
+//!   same cadence so separate-uid launchers are not falsely marked dead when
+//!   `kill(pid, 0)` is sandbox-blind. The full kqueue integration is deferred
+//!   to a sibling task. The Linux path is the load-bearing implementation for
+//!   the headless fleet (Linux hosts).
 //! - Other targets: the watcher loop is compiled but never detects an exit;
 //!   logs a startup warning.
 //!
@@ -130,21 +131,14 @@ fn pidfd_is_dead(fd: std::os::unix::io::RawFd) -> std::io::Result<bool> {
     Ok(dead)
 }
 
-/// macOS stub — Phase 1 polls `kill(pid, 0)` at the same cadence as the
-/// Linux fast path. The full `kqueue` + `EVFILT_PROC | NOTE_EXIT` integration
-/// is deferred to a sibling task; this preserves the structured-event surface
-/// on macOS dev boxes while the load-bearing Linux path ships first.
+/// macOS stub — Phase 1 polls the shared PID-existence helper at the same
+/// cadence as the Linux fast path. The full `kqueue` + `EVFILT_PROC |
+/// NOTE_EXIT` integration is deferred to a sibling task; this preserves the
+/// structured-event surface on macOS dev boxes while the load-bearing Linux
+/// path ships first.
 #[cfg(target_os = "macos")]
 fn macos_pid_is_dead(pid: u32) -> bool {
-    // SAFETY: `kill(pid, 0)` delivers no signal — it only returns ESRCH
-    // when no such process exists. Read-only syscall.
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if rc == 0 {
-        return false;
-    }
-    let raw = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-    // ESRCH — process gone. EPERM — exists but we can't signal it; alive.
-    raw == libc::ESRCH
+    !crate::infra::pid::process_exists(pid)
 }
 
 /// Tracked launcher entry.
@@ -305,8 +299,8 @@ fn register_session(state: &mut WatcherState, session_id: &str, launcher_pid: u3
 /// Check whether a tracked launcher has exited.
 ///
 /// Linux: consults the pidfd via non-blocking `poll(2)`. Reuse-immune.
-/// macOS: `kill(pid, 0)` stub at tick cadence. Reuse-prone, but the cadence
-/// is the same so the operator-visible behaviour matches.
+/// macOS: shared PID-existence stub at tick cadence. Reuse-prone, but the
+/// cadence is the same so the operator-visible behaviour matches.
 /// Other targets: always returns `false` (no detection available).
 fn launcher_is_dead(tracked: &TrackedLauncher) -> bool {
     #[cfg(target_os = "linux")]
@@ -408,6 +402,15 @@ mod tests {
         // Checkpoint — runtime body intentionally empty. Compilation of the
         // module (and the cfg-gated platform paths) is the load-bearing
         // assertion.
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_pid_stub_keeps_self_alive() {
+        assert!(
+            !macos_pid_is_dead(std::process::id()),
+            "macOS launcher watcher must not declare the current process dead"
+        );
     }
 
     #[test]

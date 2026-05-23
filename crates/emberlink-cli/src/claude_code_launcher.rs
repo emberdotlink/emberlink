@@ -1,4 +1,4 @@
-//! `ember claude-code [--dev|--prod]` compatibility wrapper.
+//! `ember claude [--dev|--prod]` compatibility wrapper.
 //!
 //! The real session/register/close + grant/proxy env wiring now lives in
 //! `launcher::claude_code`. This module remains only as the `--dev|--prod`

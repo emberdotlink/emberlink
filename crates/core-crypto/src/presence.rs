@@ -353,6 +353,17 @@ pub struct PresenceProofRequest {
     /// consult the freeze gate and (b) bind the resulting
     /// `DaemonSignedHandle`'s `persona_id` field.
     pub persona_id: String,
+    /// Optional stable prompt identifier chosen by the caller. When
+    /// present, runtime-local prompt transports may use it so the caller
+    /// can deterministically route the operator to the matching approval
+    /// surface while the proof RPC is in flight.
+    #[serde(default)]
+    pub prompt_id: Option<String>,
+    /// Optional operator-facing reason string for the prompt transport.
+    /// When absent, the verifier transport derives a generic reason from
+    /// `action_key` and `spiffe_uri`.
+    #[serde(default)]
+    pub reason: Option<String>,
     /// Optional caller_persona for peercred binding checks, mirrors the
     /// shape of sibling broker RPCs. When absent, no peercred check is
     /// performed on this surface.
@@ -760,6 +771,8 @@ mod tests {
             spiffe_uri: "spiffe://emberlink.dev/agent/rt".to_string(),
             nonce_hex: "deadbeef".to_string(),
             persona_id: "persona-rt".to_string(),
+            prompt_id: Some("prompt-rt-1".to_string()),
+            reason: Some("Approve grant proof.".to_string()),
             caller_persona: Some("persona-caller".to_string()),
             ttl_ms: Some(15_000),
         };
@@ -773,6 +786,8 @@ mod tests {
         assert_eq!(req.spiffe_uri, back.spiffe_uri);
         assert_eq!(req.nonce_hex, back.nonce_hex);
         assert_eq!(req.persona_id, back.persona_id);
+        assert_eq!(req.prompt_id, back.prompt_id);
+        assert_eq!(req.reason, back.reason);
         assert_eq!(req.caller_persona, back.caller_persona);
         assert_eq!(req.ttl_ms, back.ttl_ms);
     }
@@ -793,6 +808,8 @@ mod tests {
         let back: PresenceProofRequest =
             serde_json::from_str(json).expect("optional fields must accept omission");
         assert_eq!(back.workflow_id, "wf-omit");
+        assert_eq!(back.prompt_id, None);
+        assert_eq!(back.reason, None);
         assert_eq!(back.caller_persona, None);
         assert_eq!(back.ttl_ms, None);
     }

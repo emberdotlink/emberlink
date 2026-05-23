@@ -1404,6 +1404,19 @@ pub struct ReceiptRow {
     /// Effective (post-attenuation) scope from the parent grant. `None` when
     /// no grant matched.
     pub granted_scope: Option<String>,
+    /// Whether the stored receipt artifact carries a real signature.
+    pub signed: bool,
+    /// Workflow template or other session-lane human label when the receipt
+    /// body carries one.
+    pub workflow_template: Option<String>,
+    /// Total claims represented by a segmented session/composite receipt.
+    pub claim_count_total: Option<u64>,
+    /// Whether the inline `claim_events[]` are only a bounded tail.
+    pub claim_events_truncated: bool,
+    /// Number of segment digests carried by the receipt body.
+    pub claim_segment_count: Option<u64>,
+    /// Full-scope Merkle root over the segment digests when present.
+    pub claim_history_merkle_root: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2162,7 +2175,7 @@ impl DaemonStore {
         // vector aligned with the params slice we hand to rusqlite.
         let mut sql = String::from(
             "SELECT r.id, r.kind, r.persona_id, r.grant_id, r.terminal_reason, \
-                    r.created_at, r.receipt_json, g.scope \
+                    r.created_at, r.receipt_json, r.signer_pubkey, g.scope \
              FROM receipts r \
              LEFT JOIN grants g ON g.id = r.grant_id \
              WHERE 1=1",
@@ -2184,15 +2197,13 @@ impl DaemonStore {
             sql.push_str(&format!(" AND r.created_at >= ?{}", binds.len() + 1));
             binds.push(since.clone());
         }
-        if filter.signed_only {
-            sql.push_str(&format!(" AND r.signer_pubkey != '{}'", "0".repeat(64)));
-        }
         sql.push_str(" ORDER BY r.created_at DESC");
         let limit = filter.limit.unwrap_or(100);
         sql.push_str(&format!(" LIMIT {limit}"));
 
         let mut stmt = self.conn().prepare(&sql)?;
         type ReceiptRowTuple = (
+            String,
             String,
             String,
             String,
@@ -2212,6 +2223,7 @@ impl DaemonStore {
                 row.get(5)?,
                 row.get(6)?,
                 row.get(7)?,
+                row.get(8)?,
             ))
         };
 
@@ -2249,15 +2261,17 @@ impl DaemonStore {
             terminal_reason,
             created_at,
             receipt_json,
+            signer_pubkey,
             granted_scope,
         ) in rows
         {
+            let receipt_value = serde_json::from_str::<serde_json::Value>(&receipt_json).ok();
             // Pull the resource label out of the receipt body. Grant
             // receipts: `$.summary.resource`. Kms receipts: `$.key_name`.
             // Fall back to empty string when the field is missing.
             let resource = match kind.as_str() {
-                "grant" => serde_json::from_str::<serde_json::Value>(&receipt_json)
-                    .ok()
+                "grant" => receipt_value
+                    .as_ref()
                     .and_then(|v| {
                         v.get("summary")
                             .and_then(|s| s.get("resource"))
@@ -2266,8 +2280,8 @@ impl DaemonStore {
                     })
                     .unwrap_or_default(),
                 "kms_wrap" | "kms_unwrap" => {
-                    serde_json::from_str::<serde_json::Value>(&receipt_json)
-                        .ok()
+                    receipt_value
+                        .as_ref()
                         .and_then(|v| {
                             v.get("key_name")
                                 .and_then(|r| r.as_str())
@@ -2278,8 +2292,8 @@ impl DaemonStore {
                 "broker_materialization" | "broker_revocation" => {
                     // resource label for broker rows is the provider name,
                     // extracted from `$.provider` in the receipt JSON.
-                    serde_json::from_str::<serde_json::Value>(&receipt_json)
-                        .ok()
+                    receipt_value
+                        .as_ref()
                         .and_then(|v| {
                             v.get("provider")
                                 .and_then(|r| r.as_str())
@@ -2290,8 +2304,8 @@ impl DaemonStore {
                 "vault_retrieval" => {
                     // resource label for vault rows is the key name,
                     // extracted from `$.key_name` in the receipt JSON.
-                    serde_json::from_str::<serde_json::Value>(&receipt_json)
-                        .ok()
+                    receipt_value
+                        .as_ref()
                         .and_then(|v| {
                             v.get("key_name")
                                 .and_then(|r| r.as_str())
@@ -2299,26 +2313,25 @@ impl DaemonStore {
                         })
                         .unwrap_or_default()
                 }
-                k if k.starts_with("session.") => {
-                    serde_json::from_str::<serde_json::Value>(&receipt_json)
-                        .ok()
-                        .and_then(|v| {
-                            v.get("body")
-                                .and_then(|b| {
-                                    b.get("workflow_template")
-                                        .and_then(|r| r.as_str())
-                                        .map(|s| s.to_string())
-                                        .or_else(|| {
-                                            b.get("claim_events")
-                                                .and_then(|ev| ev.as_array())
-                                                .and_then(|ev| ev.last())
-                                                .and_then(|ev| ev.get("tool"))
-                                                .and_then(|tool| tool.as_str())
-                                                .map(|s| s.to_string())
-                                        })
-                                })
-                        })
-                        .unwrap_or_default()
+                kind if kind.starts_with("session.") => {
+                    let workflow = receipt_value
+                        .as_ref()
+                        .and_then(|v| v.get("body"))
+                        .and_then(|body| body.get("workflow_template"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    let last_tool = receipt_value
+                        .as_ref()
+                        .and_then(|v| v.get("body"))
+                        .and_then(|body| body.get("claim_events"))
+                        .and_then(|claims| claims.as_array())
+                        .and_then(|claims| claims.last())
+                        .and_then(|claim| claim.get("tool"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    workflow
+                        .or(last_tool)
+                        .unwrap_or_else(|| kind.to_string())
                 }
                 _ => String::new(),
             };
@@ -2337,13 +2350,12 @@ impl DaemonStore {
             let (requested_scope, granted_scope) = match kind.as_str() {
                 "grant" => (granted_scope.clone(), granted_scope.clone()),
                 "broker_materialization" | "broker_revocation" => {
-                    let v = serde_json::from_str::<serde_json::Value>(&receipt_json).ok();
-                    let req = v
+                    let req = receipt_value
                         .as_ref()
                         .and_then(|v| v.get("requested_scope"))
                         .and_then(|s| s.as_str())
                         .map(|s| s.to_string());
-                    let grnt = v
+                    let grnt = receipt_value
                         .as_ref()
                         .and_then(|v| v.get("granted_scope"))
                         .and_then(|s| s.as_str())
@@ -2352,6 +2364,51 @@ impl DaemonStore {
                 }
                 _ => (None, None),
             };
+
+            let signed = if kind.starts_with("session.") || kind.contains('.') {
+                receipt_value
+                    .as_ref()
+                    .and_then(|v| v.get("signature"))
+                    .and_then(|v| v.as_str())
+                    .map(|sig| !sig.is_empty())
+                    .unwrap_or(false)
+            } else {
+                signer_pubkey != "0".repeat(64) && !signer_pubkey.is_empty()
+            };
+            if filter.signed_only && !signed {
+                continue;
+            }
+
+            let workflow_template = receipt_value
+                .as_ref()
+                .and_then(|v| v.get("body"))
+                .and_then(|body| body.get("workflow_template"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let claim_count_total = receipt_value
+                .as_ref()
+                .and_then(|v| v.get("body"))
+                .and_then(|body| body.get("claim_count_total"))
+                .and_then(|v| v.as_u64());
+            let claim_events_truncated = receipt_value
+                .as_ref()
+                .and_then(|v| v.get("body"))
+                .and_then(|body| body.get("claim_events_truncated"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let claim_segment_count = receipt_value
+                .as_ref()
+                .and_then(|v| v.get("body"))
+                .and_then(|body| body.get("claim_segment_summaries"))
+                .and_then(|v| v.as_array())
+                .map(|v| v.len() as u64);
+            let claim_history_merkle_root = receipt_value
+                .as_ref()
+                .and_then(|v| v.get("body"))
+                .and_then(|body| body.get("claim_history_merkle_root"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
 
             out.push(ReceiptRow {
                 id,
@@ -2363,6 +2420,12 @@ impl DaemonStore {
                 terminal_reason,
                 requested_scope,
                 granted_scope,
+                signed,
+                workflow_template,
+                claim_count_total,
+                claim_events_truncated,
+                claim_segment_count,
+                claim_history_merkle_root,
             });
         }
         Ok(out)

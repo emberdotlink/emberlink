@@ -358,23 +358,33 @@ async fn handle_request_boxed(
     let credential_value: Zeroizing<String> =
         Zeroizing::new(String::from_utf8_lossy(&credential_bytes).into_owned());
 
-    // P69L.0a (test harness): mirror the production auth-injection
-    // branching so the test wrapper routes the same way as
-    // `handle_request`. implementation-note-202 — this now also
-    // detects Anthropic and emits `auth_mode = "anthropic"` so tests
-    // can assert the FINDING B routing without a real upstream socket.
+    // P69L.0a (test harness): derive auth mode by reusing the
+    // production helper, not by duplicating its host/provider logic.
+    // This keeps the harness honest when provider-specific auth formats
+    // evolve, such as Claude subscription OAuth staying on Bearer while
+    // Anthropic API-key traffic still uses x-api-key.
     let effective_path_and_query_test = effective_uri
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or(effective_uri.path());
     let is_git_transport_test = is_git_smart_http_path(effective_path_and_query_test);
     let target_host_lower_test: String = extract_host_from_url(&target_url).unwrap_or_default();
-    let auth_mode = if host_matches_domain(&target_host_lower_test, "anthropic.com") {
-        AuthScheme::Anthropic.as_str()
-    } else if is_git_transport_test {
-        AuthScheme::Basic.as_str()
-    } else {
-        AuthScheme::Bearer.as_str()
+    let auth_mode = {
+        let mut auth_headers = hyper::HeaderMap::new();
+        match inject_provider_auth(
+            &mut auth_headers,
+            &target_host_lower_test,
+            is_git_transport_test,
+            &credential_name,
+            &credential_value,
+        ) {
+            Ok(scheme) => scheme.as_str(),
+            Err(()) => {
+                return Ok(internal_error(
+                    "credential not representable as a header value",
+                ));
+            }
+        }
     };
 
     if let Err(e) = state.store.log_event(
@@ -3208,6 +3218,7 @@ fn inject_provider_auth_anthropic_uses_x_api_key() {
         &mut headers,
         "api.anthropic.com",
         false,
+        "anthropic-key",
         "sk-ant-test-token",
     )
     .expect("valid credential");
@@ -3231,6 +3242,7 @@ fn inject_provider_auth_anthropic_subdomain_still_routes_x_api_key() {
         &mut headers,
         "console.anthropic.com",
         false,
+        "anthropic-key",
         "sk-ant-test-token",
     )
     .expect("valid credential");
@@ -3246,8 +3258,14 @@ fn inject_provider_auth_lookalike_does_not_route_anthropic() {
     // development milestone invariant — `notanthropic.com` MUST NOT match
     // `anthropic.com`. The fallback is Bearer (generic).
     let mut headers = hyper::HeaderMap::new();
-    let scheme = inject_provider_auth(&mut headers, "notanthropic.com", false, "should-be-bearer")
-        .expect("valid credential");
+    let scheme = inject_provider_auth(
+        &mut headers,
+        "notanthropic.com",
+        false,
+        "anthropic-key",
+        "should-be-bearer",
+    )
+    .expect("valid credential");
     assert_eq!(scheme, AuthScheme::Bearer);
     assert!(
         !headers.contains_key("x-api-key"),
@@ -3256,6 +3274,28 @@ fn inject_provider_auth_lookalike_does_not_route_anthropic() {
     assert_eq!(
         headers.get("authorization").and_then(|v| v.to_str().ok()),
         Some("Bearer should-be-bearer"),
+    );
+}
+
+#[test]
+fn inject_provider_auth_anthropic_oauth_token_uses_bearer() {
+    let mut headers = hyper::HeaderMap::new();
+    let scheme = inject_provider_auth(
+        &mut headers,
+        "api.anthropic.com",
+        false,
+        "anthropic/oauth-token",
+        "claude-subscription-token",
+    )
+    .expect("valid credential");
+    assert_eq!(scheme, AuthScheme::Bearer);
+    assert!(
+        !headers.contains_key("x-api-key"),
+        "Claude subscription OAuth must not be rewritten into x-api-key"
+    );
+    assert_eq!(
+        headers.get("authorization").and_then(|v| v.to_str().ok()),
+        Some("Bearer claude-subscription-token"),
     );
 }
 
@@ -3271,8 +3311,14 @@ fn inject_provider_auth_strips_client_supplied_credentials() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("authorization", "Bearer client-supplied".parse().unwrap());
     headers.insert("x-api-key", "placeholder".parse().unwrap());
-    let scheme = inject_provider_auth(&mut headers, "api.anthropic.com", false, "sk-ant-real")
-        .expect("valid credential");
+    let scheme = inject_provider_auth(
+        &mut headers,
+        "api.anthropic.com",
+        false,
+        "anthropic-key",
+        "sk-ant-real",
+    )
+    .expect("valid credential");
     assert_eq!(scheme, AuthScheme::Anthropic);
     // Authorization stripped; only one x-api-key remains; value is ours.
     assert!(!headers.contains_key("authorization"));
@@ -3287,8 +3333,14 @@ fn inject_provider_auth_strips_client_supplied_credentials() {
 #[test]
 fn inject_provider_auth_git_uses_basic() {
     let mut headers = hyper::HeaderMap::new();
-    let scheme = inject_provider_auth(&mut headers, "github.com", true, "ghp_test_pat")
-        .expect("valid credential");
+    let scheme = inject_provider_auth(
+        &mut headers,
+        "github.com",
+        true,
+        "github/pat",
+        "ghp_test_pat",
+    )
+    .expect("valid credential");
     assert_eq!(scheme, AuthScheme::Basic);
     let auth = headers
         .get("authorization")
@@ -3303,8 +3355,14 @@ fn inject_provider_auth_git_uses_basic() {
 #[test]
 fn inject_provider_auth_default_is_bearer() {
     let mut headers = hyper::HeaderMap::new();
-    let scheme = inject_provider_auth(&mut headers, "api.openai.com", false, "sk-openai-test")
-        .expect("valid credential");
+    let scheme = inject_provider_auth(
+        &mut headers,
+        "api.openai.com",
+        false,
+        "openai/api-key",
+        "sk-openai-test",
+    )
+    .expect("valid credential");
     assert_eq!(scheme, AuthScheme::Bearer);
     assert_eq!(
         headers.get("authorization").and_then(|v| v.to_str().ok()),
@@ -3319,6 +3377,7 @@ fn inject_provider_auth_trims_trailing_line_endings() {
         &mut headers,
         "api.anthropic.com",
         false,
+        "anthropic-key",
         "sk-ant-test-token\r\n",
     )
     .expect("valid credential after newline trim");
@@ -3368,6 +3427,43 @@ async fn proxy_anthropic_target_routes_to_x_api_key_mode() {
             .and_then(|v| v.to_str().ok()),
         Some("anthropic"),
         "Anthropic target MUST route to x-api-key, NOT Bearer"
+    );
+}
+
+#[tokio::test]
+async fn proxy_anthropic_oauth_target_routes_to_bearer_mode() {
+    let state = make_state();
+    let persona = state.store.create_persona("anthropic-oauth-route").unwrap();
+    state
+        .vault
+        .add(
+            VaultScope::Interactive,
+            &state.store,
+            "anthropic/oauth-token",
+            b"claude-subscription-token",
+            None,
+        )
+        .unwrap();
+    state
+        .store
+        .create_grant(&persona.id, "anthropic/oauth-token", "*", None)
+        .unwrap();
+
+    let req = proxy_request_with_method_and_uri(
+        "POST",
+        "https://api.anthropic.com/v1/messages",
+        Some(&persona.id),
+        Some("anthropic/oauth-token"),
+        Some("https://api.anthropic.com"),
+    );
+    let resp = call(Arc::clone(&state), req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("x-ember-auth-mode")
+            .and_then(|v| v.to_str().ok()),
+        Some("bearer"),
+        "Claude subscription OAuth must preserve Bearer auth to Anthropic"
     );
 }
 

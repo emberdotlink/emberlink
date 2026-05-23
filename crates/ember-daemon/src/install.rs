@@ -1892,21 +1892,22 @@ where
     }
 
     // Walk every top-level entry under .ember/ and chown each recursively.
-    // This covers data/ (SQLite + WAL + journal), vault/, grants/, sessions/,
-    // run/, binaries/, and any future directories DaemonConfig introduces —
-    // without requiring a parallel update to this list.
+    // This covers daemon-owned state like data/ (SQLite + WAL + journal),
+    // vault/, grants/, sessions/, run/, and any future daemon runtime
+    // directories DaemonConfig introduces — without requiring a parallel
+    // update to this list.
     //
-    // Exception: `orchestrator.lock` is skipped. That file is created by the
-    // CLI running as the operator uid (not by the daemon). Since design moves
-    // `~/.ember/` to `ember:ember-clients` ownership, chowning the lock file
-    // would hand it to the daemon uid and prevent the CLI from acquiring it
-    // on subsequent `ember orchestrator spawn` runs. The lock path has moved
-    // to `/tmp/ember-orchestrator-<uid>.lock` (see orchestrator.rs), but we
-    // preserve this exclusion as defence-in-depth for any stale copy that
-    // might exist from an earlier install.
+    // Exceptions:
+    // - `orchestrator.lock` is created by the CLI running as the operator uid
+    //   (not by the daemon). Chowning it would hand it to the daemon uid and
+    //   prevent the CLI from acquiring it on subsequent runs.
+    // - `shadow/` is the launcher-managed PATH-shim tree under
+    //   `~/.ember/shadow/bin/`. The host launcher and `ember init --for claude`
+    //   mutate it as the operator uid before every session open. Chowning it
+    //   to `ember:ember-clients` makes those launcher writes fail with EPERM.
     for entry in std::fs::read_dir(&ember_root)? {
         let entry = entry?;
-        if entry.file_name() == "orchestrator.lock" {
+        if entry.file_name() == "orchestrator.lock" || entry.file_name() == "shadow" {
             continue;
         }
         chown_chmod_recursive_inner(&entry.path(), apply_ownership)?;
@@ -3317,7 +3318,7 @@ pub fn install_spawn_helper_plist(pool_uid_base: u32, pool_size: u32) -> Result<
         return Err(InstallError::Subprocess {
             cmd: "getgrnam_r(ember-clients)".to_string(),
             stderr: "the `ember-clients` connect group is not provisioned — \
-                     run `ember daemon install` (or `provision_ember_user`) first"
+                     run `sudo ember daemon install` (or `provision_ember_user`) first"
                 .to_string(),
             exit_code: None,
         });
@@ -3327,7 +3328,7 @@ pub fn install_spawn_helper_plist(pool_uid_base: u32, pool_size: u32) -> Result<
     let (ember_uid, _ember_gid) = ember_user_uid_gid().ok_or_else(|| InstallError::Subprocess {
         cmd: "getpwnam_r ember".to_string(),
         stderr: "the `ember` system user is not provisioned — run \
-                 `ember daemon install` (or `provision_ember_user`) first"
+                 `sudo ember daemon install` (or `provision_ember_user`) first"
             .to_string(),
         exit_code: None,
     })?;
@@ -3737,13 +3738,48 @@ mod tests {
         );
     }
 
+    /// T1 — `shadow/` is launcher-managed operator state and must be skipped.
+    ///
+    /// Regression: chowning `~/.ember/shadow` to `ember:ember-clients`
+    /// prevents `ember init --for claude` / `ember claude --host` from
+    /// repairing the PATH-shadow shims as the operator uid, surfacing
+    /// `Operation not permitted` after `sudo ember daemon install`.
+    #[test]
+    fn chown_ember_data_dirs_skips_shadow_tree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ember_root = tmp.path().join(".ember");
+        let shadow_dir = ember_root.join("shadow");
+        let shadow_bin = shadow_dir.join("bin");
+        std::fs::create_dir_all(&shadow_bin).expect("mkdir .ember/shadow/bin");
+        std::fs::write(shadow_bin.join("gh"), b"shim").expect("write shadow shim");
+
+        let mut visited: Vec<std::path::PathBuf> = Vec::new();
+        let result = chown_ember_data_dirs_inner(tmp.path(), &mut |path, _is_dir| {
+            visited.push(path.to_path_buf());
+            Ok(())
+        });
+        assert!(
+            result.is_ok(),
+            "chown_ember_data_dirs_inner failed: {result:?}"
+        );
+
+        assert!(
+            !visited.contains(&shadow_dir),
+            "shadow dir must be skipped so launcher-managed shims stay operator-owned; visited={visited:?}"
+        );
+        assert!(
+            !visited.contains(&shadow_bin),
+            "shadow/bin must be skipped so launcher-managed shims stay operator-owned; visited={visited:?}"
+        );
+    }
+
     /// T1 — chown_ember_data_dirs_inner skips symlink entries entirely.
     ///
-    /// Regression: the managed install can encounter dangling shadow shims
-    /// like `~/.ember/shadow/docker -> ~/.cargo/bin/ember-docker` on hosts
-    /// where the target wrapper is absent. Plain `chmod`/`chown` on macOS
-    /// follows the link and fails with ENOENT. The chown walk must leave
-    /// symlink ownership alone instead of treating this as an install error.
+    /// Regression: before `shadow/` was excluded entirely, the chown walk had
+    /// to avoid following dangling shadow shims like
+    /// `~/.ember/shadow/docker -> ~/.cargo/bin/ember-docker`. The stronger
+    /// launcher fix is to skip the whole `shadow/` subtree, which also implies
+    /// dangling symlink entries under it are never visited.
     #[test]
     fn chown_ember_data_dirs_skips_dangling_symlink_entries() {
         #[cfg(unix)]
@@ -3767,12 +3803,12 @@ mod tests {
             "chown_ember_data_dirs_inner must ignore dangling symlinks, got: {result:?}"
         );
         assert!(
-            visited.contains(&shadow_dir),
-            "containing shadow dir must still be visited; visited={visited:?}"
+            !visited.contains(&shadow_dir),
+            "shadow dir must be skipped entirely; visited={visited:?}"
         );
         assert!(
             !visited.contains(&symlink_path),
-            "dangling symlink entry must be skipped; visited={visited:?}"
+            "dangling shadow symlink entry must be skipped; visited={visited:?}"
         );
     }
 

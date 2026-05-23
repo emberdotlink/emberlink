@@ -25,24 +25,11 @@ const ORPHAN_GRACE: Duration = Duration::minutes(5);
 
 /// Check whether a process with the given PID is still alive.
 ///
-/// Uses `kill(pid, 0)` — sends signal 0 which does no harm but returns an
-/// error with `ESRCH` when the PID does not exist. Returns `true` when the
-/// process is alive (or the caller lacks permission to signal it, which means
-/// it exists).
+/// Uses the shared daemon PID liveness helper so macOS separate-uid posture
+/// can distinguish "cross-uid process hidden behind sandboxed kill(0)" from
+/// "process truly gone".
 fn pid_alive(pid: u32) -> bool {
-    // SAFETY: kill(pid, 0) is a read-only syscall: it never delivers a signal.
-    // The only side effect is an errno value returned to us.
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if rc == 0 {
-        return true;
-    }
-    // Read errno via std so this compiles on macOS and Linux without
-    // platform-specific accessor function selection.
-    let os_err = std::io::Error::last_os_error();
-    let raw = os_err.raw_os_error().unwrap_or(0);
-    // ESRCH — process does not exist.
-    // EPERM — process exists but we can't signal it; treat as alive.
-    raw != libc::ESRCH
+    crate::infra::pid::process_exists(pid)
 }
 
 /// Derive the sessions directory from the data directory.

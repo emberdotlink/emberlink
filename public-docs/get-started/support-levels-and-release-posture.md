@@ -73,9 +73,9 @@ If you are in the named friendly cohort:
 - start with:
 
 ```bash
-ember init --for claude-code
+ember init --for claude
 ember status
-ember claude-code
+ember claude
 ```
 
 ### 2. Public source-evaluation path
@@ -84,7 +84,7 @@ If you are evaluating from the public source mirror:
 
 ```bash
 cargo install --locked --path crates/emberlink-cli --bin ember
-ember init --for claude-code
+ember init --for claude
 ```
 
 This path is real, but it is still a pre-release source-build path rather than
@@ -107,4 +107,3 @@ So the docs site distinguishes:
 - [Install and first run](./install-and-first-run/)
 - [CLI and troubleshooting](../use/cli-and-troubleshooting/)
 - [GitHub setup and auth](../use/github-setup-and-auth/)
-

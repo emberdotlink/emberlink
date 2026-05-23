@@ -344,7 +344,7 @@ pub fn remove_pretooluse_hook(settings: &mut Value) -> Result<bool, PatchError> 
 }
 
 /// Top-level convenience: parse → patch (add) → re-serialize.
-/// Used by `ember init --for claude-code` (implementation-note-477).
+/// Used by `ember init --for claude` (implementation-note-477).
 pub fn patch_settings_json(input: &str) -> Result<String, PatchError> {
     let mut value = if input.trim().is_empty() {
         json!({})

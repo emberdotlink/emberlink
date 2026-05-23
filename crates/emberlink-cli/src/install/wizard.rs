@@ -1060,6 +1060,11 @@ fn print_relogin_banner(platform: &Platform) {
         }
         Platform::Unsupported(_) => {}
     }
+    println!("  Note: {}", launcher_boundary_banner_note());
+}
+
+fn launcher_boundary_banner_note() -> &'static str {
+    "`sudo ember daemon install` refreshed daemon/runtime sidecars, but it did not rebuild `/usr/local/lib/ember.app` or move `/usr/local/bin/ember`. Reinstall the managed CLI artifact or release package if the host launcher changed."
 }
 
 /// Prime the sudo credential cache.
@@ -2555,6 +2560,23 @@ mod tests {
         assert!(
             stub.calls.borrow().is_empty(),
             "load_apparmor_profile must not be called on macOS"
+        );
+    }
+
+    #[test]
+    fn launcher_boundary_banner_note_calls_out_release_package() {
+        let note = launcher_boundary_banner_note();
+        assert!(
+            note.contains("daemon/runtime sidecars"),
+            "wizard banner note must name the sidecar-only refresh boundary: {note}"
+        );
+        assert!(
+            note.contains("/usr/local/bin/ember"),
+            "wizard banner note must call out the host launcher path explicitly: {note}"
+        );
+        assert!(
+            note.contains("release package"),
+            "wizard banner note must preserve the managed artifact repair path: {note}"
         );
     }
 }

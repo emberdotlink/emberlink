@@ -14,9 +14,9 @@ local daemon.
 Use MCP when you want daemon tools exposed directly into an MCP-capable agent
 environment.
 
-This is a different layer than `ember claude-code`:
+This is a different layer than `ember claude`:
 
-- `ember claude-code` is the canonical managed launcher path
+- `ember claude` is the canonical managed launcher path
 - `emberlink-mcp` is the daemon tool surface exposed as MCP
 
 If you are choosing between surfaces, start with
@@ -103,4 +103,3 @@ onboarding path for the pre-release operator story.
 ## Next page
 
 - [MCP tool reference](../reference/mcp-tools/)
-

@@ -6,8 +6,8 @@
 //! unlock retry path exhausts:
 //!
 //! - first RPC returns a locked-session daemon error
-//! - auto-unlock retry calls `vault_unlock`
-//! - `vault_unlock` also returns a locked-session daemon error
+//! - auto-unlock retry calls `vault_unlock_begin`
+//! - `vault_unlock_begin` also returns a locked-session daemon error
 //! - the surfaced `ValidationError` must contain guidance, not the raw daemon
 //!   payload
 
@@ -53,7 +53,7 @@ fn call_daemon_method_locked_retry_exhaustion_surfaces_guidance() {
             let listener = UnixListener::bind(&socket_path).expect("bind fake daemon");
             ready_tx.send(()).expect("signal ready");
 
-            for expected_method in ["create_persona", "vault_unlock"] {
+            for expected_method in ["create_persona", "vault_unlock_begin"] {
                 let mut stream = accept_with_timeout(&listener, Duration::from_secs(10));
                 let mut reader = std::io::BufReader::new(
                     stream.try_clone().expect("clone fake daemon stream"),
@@ -70,7 +70,7 @@ fn call_daemon_method_locked_retry_exhaustion_surfaces_guidance() {
                     "id": request["id"],
                     "error": {
                         "code": -32030,
-                        "message": "create_persona denied: session is locked; reopen with `ember vault unlock` or start a new session (`register_session` path). Ordinary lazy same-daemon re-auth is not fully wired yet",
+                        "message": "create_persona denied: session is locked; same-daemon operator-uid reopen is disabled to avoid legacy login-keychain prompts. Supported lanes: managed separate-uid biometric unlock (`vault_unlock_begin/vault_unlock_complete`), a fresh daemon bootstrap via `EMBER_VAULT_PASSPHRASE` for dev probes, or future broker-mediated browser auth",
                     }
                 });
 
@@ -98,9 +98,10 @@ fn call_daemon_method_locked_retry_exhaustion_surfaces_guidance() {
         "expected operator-presence guidance, got: {msg}"
     );
     assert!(
-        msg.contains("ember vault unlock"),
+        msg.contains("managed separate-uid biometric unlock"),
         "expected unlock hint, got: {msg}"
     );
+    assert!(msg.contains("EMBER_VAULT_PASSPHRASE"), "expected bootstrap hint, got: {msg}");
 
     server.join().expect("fake daemon thread");
 }
